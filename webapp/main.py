@@ -680,7 +680,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
 class PoolsRunRequest(BaseModel):
     pairs: list[str] = Field(default_factory=list, description="Up to 4 pairs: tokenA,tokenB")
     include_chains: list[str] = Field(default_factory=list)
-    min_tvl: float = 10000.0
+    min_tvl: float = 1000000.0
     days: int = 30
     min_fee_pct: float = 0.0
     max_fee_pct: float = 2.0
@@ -1152,6 +1152,15 @@ HTML_PAGE = """
     }
     .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
     .meta-badge { border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #475569; background: #f8fafc; }
+    .info-chip {
+      border: 1px solid #cbd5e1;
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 12px;
+      color: #475569;
+      background: #f1f5f9;
+      white-space: nowrap;
+    }
     .small-btn { border: 1px solid #d1d5db; background: #f8fafc; color: #334155; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
     .line-swatch {
       display: inline-block;
@@ -1222,10 +1231,10 @@ HTML_PAGE = """
             <label title="Select up to 4 pairs for analysis">Pairs</label>
             <div>
               <div class="top-line">
-                <button class="small-btn" onclick="reviewTokens()">Review tokens</button>
                 <button class="small-btn" onclick="addPairRow()">+ pair</button>
                 <button class="small-btn" id="removePairBtn" onclick="removePairRow()">- pair</button>
-                <span class="meta-badge" id="tokensMeta">tokens: -</span>
+                <span class="meta-badge" id="tokensMeta">popular tokens: -</span>
+                <span class="info-chip">Popular list only - manual token input supported</span>
               </div>
               <div class="pair-row" id="pairRows">
                 <div class="pair-item" id="pairRow1">
@@ -1253,7 +1262,6 @@ HTML_PAGE = """
             <label title="Choose chains for analysis">Include chains</label>
             <div>
               <div class="top-line">
-                <button class="small-btn" onclick="reviewChains()">Review chains</button>
                 <span class="meta-badge" id="chainsMeta">chains: -</span>
               </div>
               <div class="chain-grid" id="chainChecks"></div>
@@ -1266,7 +1274,7 @@ HTML_PAGE = """
               <div class="inline-grid">
                 <div class="filter-item">
                   <div class="hint">Min TVL<br/>(USD)</div>
-                  <input id="minTvl" value="10000" type="number"/>
+                  <input id="minTvl" value="1000000" type="number"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">History<br/>days</div>
@@ -1357,6 +1365,13 @@ HTML_PAGE = """
 
     function formatUsd(v) {
       return new Intl.NumberFormat("en-US", {maximumFractionDigits: 0}).format(Number(v || 0));
+    }
+
+    function formatUsdShort(v) {
+      const n = Number(v || 0);
+      if (n >= 1000000) return "$" + (n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1) + "M";
+      if (n >= 1000) return "$" + (n / 1000).toFixed(n % 1000 === 0 ? 0 : 1) + "k";
+      return "$" + String(Math.round(n));
     }
 
     function getDaysValue() {
@@ -1591,7 +1606,8 @@ HTML_PAGE = """
         const chunks = [];
         for (const it of items.slice(0, 10)) {
           const req = it.request || {};
-          const head = `[${it.ts || "-"}] ${String(it.status || "").toUpperCase()} | pairs=${req.pairs || "-"} | days=${req.days ?? "-"} | min_tvl=${req.min_tvl ?? "-"} | chains=${(req.include_chains || []).join(",") || "all"}`;
+          const minTvlTxt = req.min_tvl != null ? formatUsdShort(req.min_tvl) : "-";
+          const head = `[${it.ts || "-"}] ${String(it.status || "").toUpperCase()} | pairs=${req.pairs || "-"} | days=${req.days ?? "-"} | min_tvl=${minTvlTxt} | chains=${(req.include_chains || []).join(",") || "all"}`;
           const err = it.error ? `ERROR: ${it.error}` : "";
           const body = (it.logs || []).join("\\n\\n");
           chunks.push([head, err, body].filter(Boolean).join("\\n"));
@@ -1707,7 +1723,7 @@ HTML_PAGE = """
         const tokenHints = document.getElementById("tokenHints");
         tokenHints.innerHTML = (meta.tokens || []).map(t => `<option value="${t}"></option>`).join("");
         const minTvl = Number(meta.token_catalog?.min_tvl_usd || 10000);
-        document.getElementById("tokensMeta").textContent = `tokens (TVL>$${minTvl}): ${meta.token_catalog?.count || 0}, updated: ${meta.token_catalog?.updated_at || "-"}`;
+        document.getElementById("tokensMeta").textContent = `popular tokens (TVL>${formatUsdShort(minTvl)}): ${meta.token_catalog?.count || 0}, updated: ${meta.token_catalog?.updated_at || "-"}`;
 
         availableChains = meta.chains || [];
         document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;
@@ -1752,7 +1768,7 @@ HTML_PAGE = """
         const payload = {
           pairs: pairCheck.pairs,
           include_chains: getSelectedChains(),
-          min_tvl: Number(document.getElementById("minTvl").value || 10000),
+          min_tvl: Number(document.getElementById("minTvl").value || 1000000),
           days: Number(document.getElementById("days").value || 30),
           max_fee_pct: Number(document.getElementById("maxFeePct").value || 2),
           min_fee_pct: Number(document.getElementById("minFeePct").value || 0),
