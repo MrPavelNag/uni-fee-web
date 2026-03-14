@@ -764,6 +764,7 @@ HTML_PAGE = """
       align-items: center;
       justify-content: flex-end;
     }
+    .actions .run-btn { order: 99; }
     .btn {
       border: 0;
       border-radius: 10px;
@@ -832,6 +833,7 @@ HTML_PAGE = """
     .summary-strip {
       display: flex;
       gap: 8px;
+      flex-wrap: nowrap;
       align-items: stretch;
       width: 100%;
       overflow-x: auto;
@@ -934,6 +936,8 @@ HTML_PAGE = """
       border-radius: 0;
       background: #f8fbff;
     }
+    /* Hide native datalist indicator to avoid double arrows with custom button */
+    .token-input-wrap input[list]::-webkit-calendar-picker-indicator { display: none !important; }
     .token-input-wrap .dd-btn {
       border: 0;
       background: #eef2f7;
@@ -986,6 +990,7 @@ HTML_PAGE = """
       display: flex;
       align-items: flex-end;
       line-height: 1.15;
+      white-space: normal;
     }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
@@ -1060,23 +1065,23 @@ HTML_PAGE = """
             <div>
               <div class="inline-grid">
                 <div class="filter-item">
-                  <div class="hint">Min TVL (USD)</div>
+                  <div class="hint">Min TVL<br/>(USD)</div>
                   <input id="minTvl" value="1000" type="number"/>
                 </div>
                 <div class="filter-item">
-                  <div class="hint">History days</div>
+                  <div class="hint">History<br/>days</div>
                   <input id="days" value="90" type="number"/>
                 </div>
                 <div class="filter-item">
-                  <div class="hint">Exclude below X% fee</div>
+                  <div class="hint">Exclude below<br/>X% fee</div>
                   <input id="minFeePct" value="0" type="number" step="0.1" min="0" max="99.9"/>
                 </div>
                 <div class="filter-item">
-                  <div class="hint">Exclude above X% fee</div>
+                  <div class="hint">Exclude above<br/>X% fee</div>
                   <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100"/>
                 </div>
                 <div class="filter-item">
-                  <div class="hint">Exclude address suffix (last 4)</div>
+                  <div class="hint">Exclude address suffix<br/>(last 4)</div>
                   <input id="excludeSuffixes" value="" type="text" placeholder="ab12,ff09"/>
                 </div>
               </div>
@@ -1085,9 +1090,9 @@ HTML_PAGE = """
         </div>
 
         <div class="actions" style="margin-top:14px">
-          <button class="btn" id="runBtn" onclick="runJob()">Run analysis</button>
           <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
           <button class="btn secondary" onclick="exportCsv()">Export CSV</button>
+          <button class="btn run-btn" id="runBtn" onclick="runJob()">Run analysis</button>
           <span id="status" class="status">Ready</span>
         </div>
         <div class="progress-wrap">
@@ -1103,7 +1108,6 @@ HTML_PAGE = """
       </section>
 
       <section class="card">
-        <h3>Summary</h3>
         <div class="summary-strip">
           <div class="summary-box"><div class="k">Pairs suffix</div><div class="v" id="mSuffix">-</div></div>
           <div class="summary-box"><div class="k">Total pools</div><div class="v" id="mTotal">0</div></div>
