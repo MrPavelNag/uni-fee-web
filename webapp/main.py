@@ -41,7 +41,7 @@ CATALOG_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
-TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "10000"))
+TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000000"))
 CHAIN_ID_TO_NAME = {
     1: "ethereum",
     10: "optimism",
@@ -257,7 +257,13 @@ def _fetch_tokens_by_chain_tvl(min_tvl_usd: float) -> tuple[set[str], dict[str, 
 def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
     cached = _read_json(TOKEN_CATALOG_PATH)
     if not refresh and cached and isinstance(cached.get("items"), list):
-        return cached
+        try:
+            cached_min_tvl = float(cached.get("min_tvl_usd") or 0)
+        except (TypeError, ValueError):
+            cached_min_tvl = 0.0
+        # Rebuild cache automatically when threshold changed (e.g. 10k -> 1M).
+        if abs(cached_min_tvl - TOKENS_MIN_TVL_USD) < 1e-9:
+            return cached
 
     by_chain: dict[str, list[str]] = {}
     all_tokens: set[str] = set()
