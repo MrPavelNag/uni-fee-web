@@ -41,7 +41,7 @@ CATALOG_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
-TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000"))
+TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "10000"))
 CHAIN_ID_TO_NAME = {
     1: "ethereum",
     10: "optimism",
@@ -455,6 +455,26 @@ def _merge_for_web(
     }
 
 
+def _canonical_token_symbol(sym: str) -> str:
+    s = (sym or "").strip().lower()
+    if s in {"eth", "weth", "weth.e", "weth9"}:
+        return "eth"
+    return s
+
+
+def _requested_pair_key(a: str, b: str) -> tuple[str, str]:
+    x = _canonical_token_symbol(a)
+    y = _canonical_token_symbol(b)
+    return tuple(sorted((x, y)))
+
+
+def _pair_label_key(pair_label: str) -> tuple[str, str] | None:
+    if "/" not in (pair_label or ""):
+        return None
+    a, b = pair_label.split("/", 1)
+    return _requested_pair_key(a, b)
+
+
 def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs: list[str]) -> None:
     cmd = [sys.executable, str(BASE_DIR / script_name), "--min-tvl", str(min_tvl)]
     proc = subprocess.run(
@@ -546,6 +566,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             job["progress"] = 100
         return
     token_pairs = _pairs_to_string(pairs)
+    requested_pair_keys = {_requested_pair_key(a, b) for a, b in pairs}
 
     include_chains = [c.strip().lower() for c in req.include_chains if c.strip()]
 
@@ -580,6 +601,15 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 v4_path = DATA_DIR / f"pools_v4_{pair_suffix}.json"
                 merged_raw.update(load_chart_data_json(str(v3_path)))
                 merged_raw.update(load_chart_data_json(str(v4_path)))
+
+        # Keep only pools that really match requested pairs.
+        # Protects against occasional cross-token resolution artifacts (e.g. POL instead of ETH).
+        if requested_pair_keys:
+            merged_raw = {
+                k: v
+                for k, v in merged_raw.items()
+                if (_pair_label_key(str(v.get("pair") or "")) in requested_pair_keys)
+            }
 
         _set_stage("merge", "Merging results for web", 85)
         result = _merge_for_web(
@@ -651,9 +681,9 @@ class PoolsRunRequest(BaseModel):
     pairs: list[str] = Field(default_factory=list, description="Up to 4 pairs: tokenA,tokenB")
     include_chains: list[str] = Field(default_factory=list)
     min_tvl: float = 100.0
-    days: int = 90
+    days: int = 30
     min_fee_pct: float = 0.0
-    max_fee_pct: float = 3.0
+    max_fee_pct: float = 2.0
     exclude_suffixes: list[str] = Field(default_factory=list, description="Exclude pool ids by last 4 chars")
 
 
@@ -1240,7 +1270,7 @@ HTML_PAGE = """
                 </div>
                 <div class="filter-item">
                   <div class="hint">History<br/>days</div>
-                  <input id="days" value="90" type="number"/>
+                  <input id="days" value="30" type="number"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">Exclude below<br/>X% fee</div>
@@ -1248,7 +1278,7 @@ HTML_PAGE = """
                 </div>
                 <div class="filter-item">
                   <div class="hint">Exclude above<br/>X% fee</div>
-                  <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100"/>
+                  <input id="maxFeePct" value="2" type="number" step="0.1" min="0.1" max="100"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">Exclude address suffix<br/>(last 4)</div>
@@ -1330,8 +1360,8 @@ HTML_PAGE = """
     }
 
     function getDaysValue() {
-      const v = Number(document.getElementById("days")?.value || 90);
-      return Number.isFinite(v) && v > 0 ? v : 90;
+      const v = Number(document.getElementById("days")?.value || 30);
+      return Number.isFinite(v) && v > 0 ? v : 30;
     }
 
     function setDays(v) {
@@ -1676,7 +1706,7 @@ HTML_PAGE = """
         const meta = await r.json();
         const tokenHints = document.getElementById("tokenHints");
         tokenHints.innerHTML = (meta.tokens || []).map(t => `<option value="${t}"></option>`).join("");
-        const minTvl = Number(meta.token_catalog?.min_tvl_usd || 1000);
+        const minTvl = Number(meta.token_catalog?.min_tvl_usd || 10000);
         document.getElementById("tokensMeta").textContent = `tokens (TVL>$${minTvl}): ${meta.token_catalog?.count || 0}, updated: ${meta.token_catalog?.updated_at || "-"}`;
 
         availableChains = meta.chains || [];
@@ -1723,8 +1753,8 @@ HTML_PAGE = """
           pairs: pairCheck.pairs,
           include_chains: getSelectedChains(),
           min_tvl: Number(document.getElementById("minTvl").value || 0),
-          days: Number(document.getElementById("days").value || 90),
-          max_fee_pct: Number(document.getElementById("maxFeePct").value || 3),
+          days: Number(document.getElementById("days").value || 30),
+          max_fee_pct: Number(document.getElementById("maxFeePct").value || 2),
           min_fee_pct: Number(document.getElementById("minFeePct").value || 0),
           exclude_suffixes: getExcludedSuffixes(),
         };
