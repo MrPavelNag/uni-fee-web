@@ -65,6 +65,7 @@ JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()  # prevent collisions in shared data/*.json files
 CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
+CATALOG_REFRESH_ON_STARTUP = os.environ.get("CATALOG_REFRESH_ON_STARTUP", "0").strip().lower() in ("1", "true", "yes", "on")
 CATALOG_REFRESH_STOP = threading.Event()
 CATALOG_REFRESH_THREAD: threading.Thread | None = None
 
@@ -275,9 +276,10 @@ def _refresh_catalogs_once() -> None:
         print(f"[catalog-refresh] tokens refresh failed: {e}")
 
 
-def _catalog_refresh_loop(interval_sec: int) -> None:
-    # Immediate refresh on startup, then every `interval_sec`.
-    _refresh_catalogs_once()
+def _catalog_refresh_loop(interval_sec: int, run_on_startup: bool) -> None:
+    # Optional refresh on startup, then every `interval_sec`.
+    if run_on_startup:
+        _refresh_catalogs_once()
     while not CATALOG_REFRESH_STOP.wait(interval_sec):
         _refresh_catalogs_once()
 
@@ -289,7 +291,7 @@ def _start_catalog_auto_refresh() -> None:
     CATALOG_REFRESH_STOP.clear()
     CATALOG_REFRESH_THREAD = threading.Thread(
         target=_catalog_refresh_loop,
-        args=(CATALOG_REFRESH_INTERVAL_SEC,),
+        args=(CATALOG_REFRESH_INTERVAL_SEC, CATALOG_REFRESH_ON_STARTUP),
         daemon=True,
         name="catalog-auto-refresh",
     )
@@ -998,7 +1000,9 @@ HTML_PAGE = """
 
     .chain-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(110px, max-content));
+      grid-template-rows: repeat(2, minmax(22px, auto));
+      grid-auto-flow: column;
+      grid-auto-columns: minmax(110px, max-content);
       gap: 4px 8px;
       margin-top: 2px;
     }
