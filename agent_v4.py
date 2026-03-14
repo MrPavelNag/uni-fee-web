@@ -147,7 +147,7 @@ def query_pools(endpoint: str, token_a: str, token_b: str, min_tvl: float) -> li
     result = []
     skip = 0
     while True:
-        data = graphql_query(endpoint, q, {"minTvl": str(min_tvl), "skip": skip})
+        data = graphql_query(endpoint, q, {"minTvl": str(min_tvl), "skip": skip}, retries=1)  # fallback path: fail fast
         d = data.get("data", {})
         p0, p1 = d.get("pools0", []), d.get("pools1", [])
         result.extend(p0)

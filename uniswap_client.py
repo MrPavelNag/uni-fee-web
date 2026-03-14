@@ -117,6 +117,7 @@ def query_pools_containing_both_tokens(
             endpoint,
             query,
             {"minTvl": str(min_tvl), "skip": skip},
+            retries=1,  # fallback path: fail fast on bad indexers
         )
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])

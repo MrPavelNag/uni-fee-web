@@ -477,20 +477,32 @@ def _pair_label_key(pair_label: str) -> tuple[str, str] | None:
 
 def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs: list[str]) -> None:
     cmd = [sys.executable, str(BASE_DIR / script_name), "--min-tvl", str(min_tvl)]
-    proc = subprocess.run(
-        cmd,
-        cwd=str(BASE_DIR),
-        env=env,
-        text=True,
-        capture_output=True,
-    )
-    logs.append(f"$ {' '.join(cmd)}")
-    if proc.stdout:
-        logs.append(proc.stdout[-4000:])
-    if proc.stderr:
-        logs.append(proc.stderr[-4000:])
-    if proc.returncode != 0:
-        raise RuntimeError(f"{script_name} failed with code {proc.returncode}")
+    timeout_sec = int(env.get("AGENT_TIMEOUT_SEC", "480"))
+    logs.append(f"$ {' '.join(cmd)}  # timeout={timeout_sec}s")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(BASE_DIR),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+        )
+        if proc.stdout:
+            logs.append(proc.stdout[-4000:])
+        if proc.stderr:
+            logs.append(proc.stderr[-4000:])
+        if proc.returncode != 0:
+            raise RuntimeError(f"{script_name} failed with code {proc.returncode}")
+    except subprocess.TimeoutExpired as e:
+        if e.stdout:
+            logs.append(str(e.stdout)[-4000:])
+        if e.stderr:
+            logs.append(str(e.stderr)[-4000:])
+        raise RuntimeError(
+            f"{script_name} timed out after {timeout_sec}s. "
+            "Try fewer chains or smaller history window."
+        )
 
 
 def _push_run_history(
