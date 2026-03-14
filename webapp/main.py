@@ -33,7 +33,6 @@ DATA_DIR.mkdir(exist_ok=True)
 TOKEN_CATALOG_PATH = DATA_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = DATA_DIR / "chain_catalog.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
-TOKENS_LOOKBACK_DAYS = int(os.environ.get("TOKENS_LOOKBACK_DAYS", "10"))
 TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000"))
 CHAIN_ID_TO_NAME = {
     1: "ethereum",
@@ -167,45 +166,6 @@ def _fetch_uniswap_verified_tokens() -> tuple[set[str], dict[str, list[str]]]:
     return all_tokens, by_chain
 
 
-def _fetch_active_symbols_from_endpoint(endpoint: str, start_ts: int, min_tvl_usd: float) -> set[str]:
-    query = """
-    query ActivePoolTokens($start: Int!, $minTvl: BigDecimal!, $skip: Int!) {
-      poolDayDatas(
-        first: 1000,
-        skip: $skip,
-        orderBy: date,
-        orderDirection: desc,
-        where: { date_gte: $start, tvlUSD_gte: $minTvl }
-      ) {
-        pool {
-          token0 { symbol }
-          token1 { symbol }
-        }
-      }
-    }
-    """
-    out: set[str] = set()
-    skip = 0
-    max_rows = 6000
-    while skip < max_rows:
-        data = graphql_query(endpoint, query, {"start": start_ts, "minTvl": str(min_tvl_usd), "skip": skip})
-        rows = data.get("data", {}).get("poolDayDatas", [])
-        if not rows:
-            break
-        for row in rows:
-            pool = row.get("pool") or {}
-            s0 = str((pool.get("token0") or {}).get("symbol") or "").strip()
-            s1 = str((pool.get("token1") or {}).get("symbol") or "").strip()
-            if _is_clean_symbol(s0):
-                out.add(s0.lower())
-            if _is_clean_symbol(s1):
-                out.add(s1.lower())
-        if len(rows) < 1000:
-            break
-        skip += 1000
-    return out
-
-
 def _fetch_tokens_by_tvl_endpoint(endpoint: str, min_tvl_usd: float) -> set[str]:
     query = """
     query TokenListByTvl($minTvl: BigDecimal!, $skip: Int!) {
@@ -237,8 +197,7 @@ def _fetch_tokens_by_tvl_endpoint(endpoint: str, min_tvl_usd: float) -> set[str]
     return out
 
 
-def _fetch_active_tokens_by_chain(days: int, min_tvl_usd: float) -> tuple[set[str], dict[str, list[str]]]:
-    start_ts = int(time.time()) - days * 86400
+def _fetch_tokens_by_chain_tvl(min_tvl_usd: float) -> tuple[set[str], dict[str, list[str]]]:
     all_tokens: set[str] = set()
     by_chain: dict[str, set[str]] = {}
     for chain in _supported_chains():
@@ -248,16 +207,9 @@ def _fetch_active_tokens_by_chain(days: int, min_tvl_usd: float) -> tuple[set[st
             if not endpoint:
                 continue
             try:
-                chain_set.update(_fetch_active_symbols_from_endpoint(endpoint, start_ts, min_tvl_usd))
+                chain_set.update(_fetch_tokens_by_tvl_endpoint(endpoint, min_tvl_usd))
             except Exception:
                 continue
-        if not chain_set:
-            endpoint_v3 = get_graph_endpoint(chain, "v3")
-            if endpoint_v3:
-                try:
-                    chain_set.update(_fetch_tokens_by_tvl_endpoint(endpoint_v3, min_tvl_usd))
-                except Exception:
-                    pass
         if chain_set:
             by_chain[chain] = chain_set
             all_tokens.update(chain_set)
@@ -271,9 +223,9 @@ def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
 
     by_chain: dict[str, list[str]] = {}
     all_tokens: set[str] = set()
-    source = "active-pools-last-10d"
+    source = "tokens-tvl-threshold"
     try:
-        all_tokens, by_chain = _fetch_active_tokens_by_chain(TOKENS_LOOKBACK_DAYS, TOKENS_MIN_TVL_USD)
+        all_tokens, by_chain = _fetch_tokens_by_chain_tvl(TOKENS_MIN_TVL_USD)
         try:
             verified_all, verified_by_chain = _fetch_uniswap_verified_tokens()
             if verified_all:
@@ -285,7 +237,7 @@ def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
                     if keep:
                         filtered_by_chain[chain] = keep
                 by_chain = filtered_by_chain
-                source = "active-pools-last-10d+verified"
+                source = "tokens-tvl-threshold+verified"
         except Exception:
             pass
     except Exception as e:
@@ -305,7 +257,6 @@ def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
         "items": sorted(all_tokens),
         "by_chain": by_chain,
         "source": source,
-        "lookback_days": TOKENS_LOOKBACK_DAYS,
         "min_tvl_usd": TOKENS_MIN_TVL_USD,
     }
     _write_json(TOKEN_CATALOG_PATH, out)
@@ -596,7 +547,6 @@ def meta() -> dict[str, Any]:
             "count": token_catalog.get("count", 0),
             "updated_at": token_catalog.get("updated_at"),
             "source": token_catalog.get("source", ""),
-            "lookback_days": token_catalog.get("lookback_days", TOKENS_LOOKBACK_DAYS),
             "min_tvl_usd": token_catalog.get("min_tvl_usd", TOKENS_MIN_TVL_USD),
         },
         "chain_catalog": {
@@ -910,8 +860,8 @@ HTML_PAGE = """
       color: #334155;
       font-size: 12px;
     }
-    .pair-row { display: grid; grid-template-columns: 1fr; gap: 4px; }
-    .pair-item { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+    .pair-row { display: grid; grid-template-columns: repeat(4, minmax(160px, 1fr)); gap: 6px; }
+    .pair-item { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
     .token-input-wrap { display: flex; align-items: center; gap: 0; }
     .token-input-wrap input { border-radius: 8px 0 0 8px; }
     .token-input-wrap .dd-btn {
@@ -965,7 +915,7 @@ HTML_PAGE = """
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
-      .pair-row { grid-template-columns: 1fr; }
+      .pair-row { grid-template-columns: 1fr 1fr; }
       .inline-grid { grid-template-columns: 1fr 1fr; }
     }
   </style>
@@ -1054,9 +1004,9 @@ HTML_PAGE = """
         </div>
 
         <div class="actions" style="margin-top:14px">
+          <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
           <button class="btn" id="runBtn" onclick="runJob()">Run analysis</button>
           <button class="btn secondary" onclick="exportCsv()">Export CSV</button>
-          <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
           <span id="status" class="status">Ready</span>
         </div>
         <div class="progress-wrap">
@@ -1090,7 +1040,6 @@ HTML_PAGE = """
 
       <section class="card">
         <h3>Pools Table</h3>
-        <div class="hint" style="margin-bottom:8px">Sorted by cumulative fee descending by default.</div>
         <div class="table-wrap">
           <table id="resultTable"></table>
         </div>
@@ -1325,12 +1274,15 @@ HTML_PAGE = """
         const color = colorMap[r.pool_id] || "#94a3b8";
         const dash = dashMap[r.pool_id] || "solid";
         const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
+        const poolIdDisplay = (r.version === "v4" && (r.pool_id || "").length > 24)
+          ? `${r.pool_id.slice(0, 12)}...${r.pool_id.slice(-8)}`
+          : r.pool_id;
         html += `<tr class="${cls}">`;
         html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};"></span></td>`;
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
         html += `<td>${r.pair}</td>`;
-        html += `<td class="mono">${r.pool_id}</td>`;
+        html += `<td class="mono">${poolIdDisplay}</td>`;
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
@@ -1390,8 +1342,7 @@ HTML_PAGE = """
         const tokenHints = document.getElementById("tokenHints");
         tokenHints.innerHTML = (meta.tokens || []).map(t => `<option value="${t}"></option>`).join("");
         const minTvl = Number(meta.token_catalog?.min_tvl_usd || 1000);
-        const lookback = Number(meta.token_catalog?.lookback_days || 10);
-        document.getElementById("tokensMeta").textContent = `tokens (TVL>$${minTvl}, ${lookback}d): ${meta.token_catalog?.count || 0}, updated: ${meta.token_catalog?.updated_at || "-"}`;
+        document.getElementById("tokensMeta").textContent = `tokens (TVL>$${minTvl}): ${meta.token_catalog?.count || 0}, updated: ${meta.token_catalog?.updated_at || "-"}`;
 
         availableChains = meta.chains || [];
         document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;
