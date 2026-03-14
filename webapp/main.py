@@ -776,9 +776,14 @@ HTML_PAGE = """
     .actions {
       display: flex;
       gap: 10px;
-      flex-wrap: wrap;
       align-items: center;
-      justify-content: flex-end;
+      justify-content: space-between;
+    }
+    .actions-left, .actions-right {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
     }
     .control-card .actions {
       margin-top: 12px;
@@ -1116,10 +1121,14 @@ HTML_PAGE = """
         </div>
 
         <div class="actions" style="margin-top:14px">
-          <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
-          <button class="btn secondary" onclick="exportCsv()">Export CSV</button>
-          <button class="btn run-btn" id="runBtn" onclick="runJob()">Run analysis</button>
-          <span id="status" class="status">Ready</span>
+          <div class="actions-left">
+            <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
+            <button class="btn secondary" onclick="exportCsv()">Export CSV</button>
+          </div>
+          <div class="actions-right">
+            <button class="btn run-btn" id="runBtn" onclick="runJob()">Run analysis</button>
+            <span id="status" class="status">Ready</span>
+          </div>
         </div>
         <div class="progress-wrap">
           <div class="progress-meta">
@@ -1350,7 +1359,9 @@ HTML_PAGE = """
     }
 
     function getSelectedChains() {
-      if (document.getElementById("allChains").checked) return [];
+      const allEl = document.getElementById("allChains");
+      if (!allEl) return [];
+      if (allEl.checked) return [];
       const out = [];
       for (const c of availableChains) {
         const el = document.getElementById("chain_" + c);
@@ -1360,7 +1371,9 @@ HTML_PAGE = """
     }
 
     function toggleAllChains() {
-      const all = document.getElementById("allChains").checked;
+      const allEl = document.getElementById("allChains");
+      if (!allEl) return;
+      const all = allEl.checked;
       for (const c of availableChains) {
         const el = document.getElementById("chain_" + c);
         if (el) el.checked = all;
@@ -1375,6 +1388,7 @@ HTML_PAGE = """
         if (el && el.checked) checkedCount += 1;
       }
       const allEl = document.getElementById("allChains");
+      if (!allEl) return;
       allEl.checked = checkedCount === availableChains.length && availableChains.length > 0;
       saveFormState();
     }
@@ -1514,37 +1528,42 @@ HTML_PAGE = """
     }
 
     async function runJob() {
-      const pairCheck = validatePairs();
-      const payload = {
-        pairs: pairCheck.pairs,
-        include_chains: getSelectedChains(),
-        min_tvl: Number(document.getElementById("minTvl").value || 0),
-        days: Number(document.getElementById("days").value || 90),
-        max_fee_pct: Number(document.getElementById("maxFeePct").value || 3),
-        min_fee_pct: Number(document.getElementById("minFeePct").value || 0),
-        exclude_suffixes: getExcludedSuffixes(),
-      };
-      if (!pairCheck.valid) {
-        setStatus("Invalid pairs: fill both tokens and avoid duplicates in a pair.", "fail");
-        return;
-      }
+      try {
+        const pairCheck = validatePairs();
+        const payload = {
+          pairs: pairCheck.pairs,
+          include_chains: getSelectedChains(),
+          min_tvl: Number(document.getElementById("minTvl").value || 0),
+          days: Number(document.getElementById("days").value || 90),
+          max_fee_pct: Number(document.getElementById("maxFeePct").value || 3),
+          min_fee_pct: Number(document.getElementById("minFeePct").value || 0),
+          exclude_suffixes: getExcludedSuffixes(),
+        };
+        if (!pairCheck.valid) {
+          setStatus("Invalid pairs: fill both tokens and avoid duplicates in a pair.", "fail");
+          return;
+        }
 
-      saveFormState();
-      setBusy(true);
-      setStatus("Starting...", "running");
-      updateProgress(2, "Submitting job");
-      const r = await fetch("/api/pools/run", {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify(payload)
-      });
-      const data = await r.json();
-      if (!r.ok) {
+        saveFormState();
+        setBusy(true);
+        setStatus("Starting...", "running");
+        updateProgress(2, "Submitting job");
+        const r = await fetch("/api/pools/run", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify(payload)
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          setBusy(false);
+          setStatus("Error: " + (data.detail || "request failed"), "fail");
+          return;
+        }
+        pollJob(data.job_id);
+      } catch (e) {
         setBusy(false);
-        setStatus("Error: " + (data.detail || "request failed"), "fail");
-        return;
+        setStatus("Frontend error: " + (e?.message || "unknown"), "fail");
       }
-      pollJob(data.job_id);
     }
 
     async function pollJob(jobId) {
@@ -1571,11 +1590,16 @@ HTML_PAGE = """
     }
 
     function renderResult(result) {
-      document.getElementById("mSuffix").textContent = result.suffix;
-      document.getElementById("mTotal").textContent = result.total;
-      document.getElementById("mChart").textContent = result.chart_pools;
-      document.getElementById("mErr").textContent = result.error_pools;
-      document.getElementById("logs").textContent = (result.logs || []).join("\\n\\n") || "No logs.";
+      const mSuffix = document.getElementById("mSuffix");
+      const mTotal = document.getElementById("mTotal");
+      const mChart = document.getElementById("mChart");
+      const mErr = document.getElementById("mErr");
+      if (mSuffix) mSuffix.textContent = result.suffix;
+      if (mTotal) mTotal.textContent = result.total;
+      if (mChart) mChart.textContent = result.chart_pools;
+      if (mErr) mErr.textContent = result.error_pools;
+      const logsEl = document.getElementById("logs");
+      if (logsEl) logsEl.textContent = (result.logs || []).join("\\n\\n") || "No logs.";
 
       const feeTraces = [];
       const tvlTraces = [];
