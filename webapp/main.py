@@ -331,6 +331,7 @@ def _merge_for_web(
     include_chains: list[str],
     min_fee_pct: float,
     max_fee_pct: float,
+    exclude_suffixes: list[str],
 ) -> dict[str, Any]:
     suffix = pairs_to_filename_suffix(token_pairs)
     v3_path = DATA_DIR / f"pools_v3_{suffix}.json"
@@ -346,12 +347,20 @@ def _merge_for_web(
     if in_chains:
         merged = {k: v for k, v in merged.items() if v.get("chain", "").lower() in in_chains}
 
+    suffix_set = {str(s).strip().lower().replace("0x", "")[-4:] for s in exclude_suffixes if str(s).strip()}
+
     def in_fee_range(item: dict) -> bool:
         try:
             pct = float(item.get("fee_pct") or 0)
         except (TypeError, ValueError):
             pct = 0.0
         return min_fee_pct <= pct <= max_fee_pct
+
+    def excluded_by_suffix(item: dict, pid: str) -> bool:
+        if not suffix_set:
+            return False
+        pool_id = str(item.get("pool_id") or pid or "").lower().replace("0x", "")
+        return any(pool_id.endswith(suf) for suf in suffix_set)
 
     all_items = sorted(merged.items(), key=lambda kv: _final_income(kv[1]), reverse=True)
 
@@ -361,7 +370,12 @@ def _merge_for_web(
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
-        status = "ok" if in_fee_range(v) else "filtered_fee_range"
+        if excluded_by_suffix(v, pool_id):
+            status = "filtered_suffix"
+        elif in_fee_range(v):
+            status = "ok"
+        else:
+            status = "filtered_fee_range"
         if status != "ok":
             filtered_out += 1
         row = {
@@ -380,6 +394,7 @@ def _merge_for_web(
                 {
                     "label": f"{row['chain']} {row['version']} {row['pair']} ...{row['pool_id'][-4:]}",
                     "chain": row["chain"],
+                    "version": row["version"],
                     "pair": row["pair"],
                     "fee_pct": row["fee_pct"],
                     "pool_id": row["pool_id"],
@@ -434,9 +449,9 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
         job["stage_label"] = "Preparing parameters"
         job["progress"] = 5
 
-    # Build up to 3 selected token pairs
+    # Build up to 4 selected token pairs
     pairs = []
-    for pair in req.pairs[:3]:
+    for pair in req.pairs[:4]:
         part = (pair or "").strip().lower()
         if "," not in part:
             continue
@@ -480,6 +495,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
             include_chains=include_chains,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
+            exclude_suffixes=req.exclude_suffixes,
         )
         with JOB_LOCK:
             job["status"] = "done"
@@ -494,6 +510,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
                     "include_chains": include_chains,
                     "min_fee_pct": req.min_fee_pct,
                     "max_fee_pct": req.max_fee_pct,
+                    "exclude_suffixes": req.exclude_suffixes,
                     "lp_allocation_usd": float(env.get("LP_ALLOCATION_USD", "1000")),
                 },
                 **result,
@@ -513,12 +530,13 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
 
 
 class PoolsRunRequest(BaseModel):
-    pairs: list[str] = Field(default_factory=list, description="Up to 3 pairs: tokenA,tokenB")
+    pairs: list[str] = Field(default_factory=list, description="Up to 4 pairs: tokenA,tokenB")
     include_chains: list[str] = Field(default_factory=list)
     min_tvl: float = 100.0
     days: int = 90
     min_fee_pct: float = 0.0
     max_fee_pct: float = 3.0
+    exclude_suffixes: list[str] = Field(default_factory=list, description="Exclude pool ids by last 4 chars")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -595,6 +613,11 @@ def run_pools(req: PoolsRunRequest) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="max_fee_pct must be between >0 and 100")
     if req.min_fee_pct >= req.max_fee_pct:
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
+    req.exclude_suffixes = [
+        str(x).strip().lower().replace("0x", "")[-4:]
+        for x in req.exclude_suffixes
+        if str(x).strip()
+    ]
 
     job_id = str(uuid.uuid4())
     with JOB_LOCK:
@@ -800,7 +823,7 @@ HTML_PAGE = """
       background: linear-gradient(90deg, var(--accent), var(--accent-2));
       transition: width 0.3s ease;
     }
-    .metrics { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 8px; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
     .metric {
       background: #f8fbff;
       border: 1px solid #cbd5e1;
@@ -861,15 +884,26 @@ HTML_PAGE = """
       font-size: 12px;
     }
     .pair-row { display: grid; grid-template-columns: repeat(4, minmax(160px, 1fr)); gap: 6px; }
-    .pair-item { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
-    .token-input-wrap { display: flex; align-items: center; gap: 0; }
-    .token-input-wrap input { border-radius: 8px 0 0 8px; }
-    .token-input-wrap .dd-btn {
+    .pair-item {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
       border: 1px solid #cbd5e1;
-      border-left: 0;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #eef2f7;
+    }
+    .token-input-wrap { display: flex; align-items: center; gap: 0; }
+    .token-input-wrap:first-child { border-right: 1px solid #cbd5e1; }
+    .token-input-wrap input {
+      border: 0;
+      border-radius: 0;
+      background: #f8fbff;
+    }
+    .token-input-wrap .dd-btn {
+      border: 0;
       background: #eef2f7;
       color: #334155;
-      border-radius: 0 8px 8px 0;
       height: 100%;
       min-width: 32px;
       cursor: pointer;
@@ -911,7 +945,7 @@ HTML_PAGE = """
       padding: 0;
     }
     
-    .inline-grid { display: grid; grid-template-columns: 100px 100px 140px 140px; gap: 6px; }
+    .inline-grid { display: grid; grid-template-columns: 90px 90px 120px 120px 220px; gap: 6px; }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
@@ -942,6 +976,7 @@ HTML_PAGE = """
               <div class="top-line">
                 <button class="small-btn" onclick="reviewTokens()">Review tokens</button>
                 <button class="small-btn" onclick="addPairRow()">+ pair</button>
+                <button class="small-btn" id="removePairBtn" onclick="removePairRow()">- pair</button>
                 <span class="meta-badge" id="tokensMeta">tokens: -</span>
               </div>
               <div class="pair-row" id="pairRows">
@@ -963,7 +998,6 @@ HTML_PAGE = """
                 </div>
               </div>
               <datalist id="tokenHints"></datalist>
-              <div class="hint">Start with one pair. Add more with "+ pair" (max 4).</div>
             </div>
           </div>
 
@@ -997,6 +1031,10 @@ HTML_PAGE = """
                 <div>
                   <div class="hint" style="margin-bottom:4px">Exclude above X% fee</div>
                   <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100"/>
+                </div>
+                <div>
+                  <div class="hint" style="margin-bottom:4px">Исключить адрес, последние 4 символа</div>
+                  <input id="excludeSuffixes" value="" type="text" placeholder="ab12,ff09"/>
                 </div>
               </div>
             </div>
@@ -1064,7 +1102,7 @@ HTML_PAGE = """
     let sortKey = "final_income";
     let sortDesc = true;
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
-    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "allChains"];
+    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "excludeSuffixes", "allChains"];
     let availableChains = [];
     let colorMap = {};
     let dashMap = {};
@@ -1138,7 +1176,8 @@ HTML_PAGE = """
             if (box) box.checked = true;
           }
         }
-        pairRowsVisible = Math.max(1, Math.min(4, Number(state.pairRowsVisible || 1)));
+        // Always start with one visible pair row.
+        pairRowsVisible = 1;
         updatePairRows();
       } catch (e) {
         console.warn("load form state failed", e);
@@ -1161,6 +1200,8 @@ HTML_PAGE = """
         if (!row) continue;
         row.style.display = i <= pairRowsVisible ? "grid" : "none";
       }
+      const removeBtn = document.getElementById("removePairBtn");
+      if (removeBtn) removeBtn.disabled = pairRowsVisible <= 1;
     }
 
     function addPairRow() {
@@ -1169,6 +1210,20 @@ HTML_PAGE = """
         updatePairRows();
         saveFormState();
       }
+    }
+
+    function removePairRow() {
+      if (pairRowsVisible <= 1) return;
+      for (const side of ["a", "b"]) {
+        const el = document.getElementById(`pair${pairRowsVisible}${side}`);
+        if (el) {
+          el.value = "";
+          el.classList.remove("invalid-input");
+        }
+      }
+      pairRowsVisible -= 1;
+      updatePairRows();
+      saveFormState();
     }
 
     function openTokenList(inputId) {
@@ -1218,6 +1273,16 @@ HTML_PAGE = """
 
     function getSelectedPairs() {
       return validatePairs().pairs;
+    }
+
+    function getExcludedSuffixes() {
+      const raw = (document.getElementById("excludeSuffixes").value || "").trim().toLowerCase();
+      if (!raw) return [];
+      return raw
+        .split(",")
+        .map(x => x.trim().replace(/^0x/, ""))
+        .filter(Boolean)
+        .map(x => x.slice(-4));
     }
 
     function getSelectedChains() {
@@ -1286,7 +1351,10 @@ HTML_PAGE = """
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
-        html += `<td>${r.status === "ok" ? "ok" : "filtered by fee range"}</td>`;
+        const statusLabel = r.status === "ok"
+          ? "ok"
+          : (r.status === "filtered_suffix" ? "excluded by suffix" : "filtered by fee range");
+        html += `<td>${statusLabel}</td>`;
         html += "</tr>";
       }
       table.innerHTML = html;
@@ -1389,7 +1457,8 @@ HTML_PAGE = """
         min_tvl: Number(document.getElementById("minTvl").value || 0),
         days: Number(document.getElementById("days").value || 90),
         max_fee_pct: Number(document.getElementById("maxFeePct").value || 3),
-        min_fee_pct: Number(document.getElementById("minFeePct").value || 0)
+        min_fee_pct: Number(document.getElementById("minFeePct").value || 0),
+        exclude_suffixes: getExcludedSuffixes(),
       };
       if (!pairCheck.valid) {
         setStatus("Invalid pairs: fill both tokens and avoid duplicates in a pair.", "fail");
@@ -1457,17 +1526,17 @@ HTML_PAGE = """
         const tvlY = s.tvl.map(p => p[1] / 1000.0);
         const c = palette[feeTraces.length % palette.length];
         const d = feeTraces.length < palette.length ? "solid" : dashes[(feeTraces.length - palette.length) % dashes.length];
-        const hoverData = feeX.map(() => [s.chain || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
+        const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
         colorMap[s.pool_id] = c;
         dashMap[s.pool_id] = d;
         feeTraces.push({
           x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
-          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} | %{customdata[1]}% | %{customdata[2]}<extra></extra>",
+          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
           line: {color: c, width: 2, dash: d}
         });
         tvlTraces.push({
           x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
-          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} | %{customdata[1]}% | %{customdata[2]}<extra></extra>",
+          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
           line: {color: c, width: 2, dash: d}
         });
       }
@@ -1499,7 +1568,27 @@ HTML_PAGE = """
       sortBy("final_income");
     }
 
+    function renderEmptyCharts() {
+      const now = new Date();
+      const start = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+      const baseline = [{x: [start, now], y: [0, 0], mode: "lines", line: {color: "rgba(0,0,0,0)", width: 1}, hoverinfo: "skip", showlegend: false}];
+      const emptyLayout = {
+        paper_bgcolor: "#ffffff",
+        plot_bgcolor: "#f8fbff",
+        font: {color: "#0f172a"},
+        showlegend: false,
+        margin: {t: 30, b: 24, l: 50, r: 14},
+        xaxis: {title: "Date", showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", range: [start, now]},
+        yaxis: {title: "Value", showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, range: [0, 1]},
+        annotations: [{text: "Run analysis to load data", x: 0.5, y: 0.5, xref: "paper", yref: "paper", showarrow: false, font: {color: "#64748b"}}],
+      };
+      Plotly.newPlot("feesChart", baseline, {title: "Cumulative Fees", ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "Cumulative fee (USD)"}}, {displaylogo: false, responsive: true});
+      Plotly.newPlot("tvlChart", baseline, {title: "TVL dynamics (thousands USD)", ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "TVL (k USD)"}}, {displaylogo: false, responsive: true});
+    }
+
     attachAutosave();
+    updatePairRows();
+    renderEmptyCharts();
     loadMeta();
   </script>
 </body>
