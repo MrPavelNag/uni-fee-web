@@ -680,7 +680,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
 class PoolsRunRequest(BaseModel):
     pairs: list[str] = Field(default_factory=list, description="Up to 4 pairs: tokenA,tokenB")
     include_chains: list[str] = Field(default_factory=list)
-    min_tvl: float = 100.0
+    min_tvl: float = 10000.0
     days: int = 30
     min_fee_pct: float = 0.0
     max_fee_pct: float = 2.0
@@ -1266,7 +1266,7 @@ HTML_PAGE = """
               <div class="inline-grid">
                 <div class="filter-item">
                   <div class="hint">Min TVL<br/>(USD)</div>
-                  <input id="minTvl" value="1000" type="number"/>
+                  <input id="minTvl" value="10000" type="number"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">History<br/>days</div>
@@ -1752,7 +1752,7 @@ HTML_PAGE = """
         const payload = {
           pairs: pairCheck.pairs,
           include_chains: getSelectedChains(),
-          min_tvl: Number(document.getElementById("minTvl").value || 0),
+          min_tvl: Number(document.getElementById("minTvl").value || 10000),
           days: Number(document.getElementById("days").value || 30),
           max_fee_pct: Number(document.getElementById("maxFeePct").value || 2),
           min_fee_pct: Number(document.getElementById("minFeePct").value || 0),

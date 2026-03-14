@@ -35,6 +35,7 @@ from uniswap_client import (
     get_graph_endpoint,
     query_pool_day_data,
     query_pools_containing_both_tokens,
+    query_pools_by_token_symbols,
     query_token_by_symbol,
 )
 
@@ -112,6 +113,9 @@ def discover_pools_v3(
                 pools = query_pools_containing_both_tokens(
                     endpoint, base_addrs[0], quote_addrs[0], _min_tvl(min_tvl)
                 )
+                if not pools:
+                    # Fallback for ambiguous symbol->address mappings (e.g. multiple tokens with same symbol).
+                    pools = query_pools_by_token_symbols(endpoint, base, quote, _min_tvl(min_tvl))
                 for p in pools:
                     p["chain"] = chain
                     p["version"] = "v3"

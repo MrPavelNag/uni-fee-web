@@ -159,6 +159,40 @@ def query_pools(endpoint: str, token_a: str, token_b: str, min_tvl: float) -> li
     return result
 
 
+def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str, min_tvl: float) -> list[dict]:
+    """Fallback: find pools by token symbols in either order."""
+    from uniswap_client import graphql_query
+
+    sa, sb = symbol_a.upper().strip(), symbol_b.upper().strip()
+    if not sa or not sb:
+        return []
+    q = """
+    query PoolsBySymbols($minTvl: BigDecimal!, $skip: Int!) {
+      pools0: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+        id feeTier liquidity token0 { id symbol } token1 { id symbol }
+        totalValueLockedUSD volumeUSD feesUSD
+      }
+      pools1: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+        id feeTier liquidity token0 { id symbol } token1 { id symbol }
+        totalValueLockedUSD volumeUSD feesUSD
+      }
+    }
+    """ % (sa, sb, sb, sa)
+    result = []
+    skip = 0
+    while True:
+        data = graphql_query(endpoint, q, {"minTvl": str(min_tvl), "skip": skip})
+        d = data.get("data", {})
+        p0, p1 = d.get("pools0", []), d.get("pools1", [])
+        result.extend(p0)
+        result.extend(p1)
+        if len(p0) < 100 and len(p1) < 100:
+            break
+        skip += 100
+        time.sleep(0.2)
+    return result
+
+
 def query_pool_day_data(endpoint: str, pool_id: str, start_ts: int, end_ts: int) -> list[dict]:
     """PoolDayData за период."""
     from uniswap_client import graphql_query
@@ -250,6 +284,11 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                     except Exception as e:
                         print(f"  [{chain}] {base}/{quote}: {e}")
                         continue
+            if not pools:
+                try:
+                    pools.extend(query_pools_by_symbols(endpoint, base, quote, min_tvl))
+                except Exception as e:
+                    print(f"  [{chain}] {base}/{quote} (symbol fallback): {e}")
 
             for p in pools:
                 p["chain"] = chain

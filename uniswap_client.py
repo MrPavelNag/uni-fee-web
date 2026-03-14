@@ -129,6 +129,67 @@ def query_pools_containing_both_tokens(
     return result
 
 
+def query_pools_by_token_symbols(
+    endpoint: str, symbol_a: str, symbol_b: str, min_tvl: float
+) -> list[dict]:
+    """
+    Fallback search by token symbols (when address resolution is ambiguous).
+    Returns pools where token symbols match in either order.
+    """
+    sa = symbol_a.upper().strip()
+    sb = symbol_b.upper().strip()
+    if not sa or not sb:
+        return []
+    result = []
+    query_tmpl = """
+    query PoolsBySymbols($minTvl: BigDecimal!, $skip: Int!) {
+      pools0: pools(
+        first: 100,
+        skip: $skip,
+        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl },
+        orderBy: totalValueLockedUSD,
+        orderDirection: desc
+      ) {
+        id feeTier liquidity
+        token0 { id symbol decimals name }
+        token1 { id symbol decimals name }
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        volumeUSD feesUSD txCount
+      }
+      pools1: pools(
+        first: 100,
+        skip: $skip,
+        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl },
+        orderBy: totalValueLockedUSD,
+        orderDirection: desc
+      ) {
+        id feeTier liquidity
+        token0 { id symbol decimals name }
+        token1 { id symbol decimals name }
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        volumeUSD feesUSD txCount
+      }
+    }
+    """
+    query = query_tmpl % (sa, sb, sb, sa)
+    skip = 0
+    while True:
+        data = graphql_query(
+            endpoint,
+            query,
+            {"minTvl": str(min_tvl), "skip": skip},
+        )
+        p0 = data.get("data", {}).get("pools0", [])
+        p1 = data.get("data", {}).get("pools1", [])
+        result.extend(p0)
+        result.extend(p1)
+        if len(p0) < 100 and len(p1) < 100:
+            break
+        skip += 100
+        time.sleep(0.3)
+    return result
+
+
 def query_pools_containing_both_tokens_no_tvl_filter(
     endpoint: str, token_a: str, token_b: str
 ) -> list[dict]:
