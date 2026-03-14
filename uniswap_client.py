@@ -40,10 +40,16 @@ def get_graph_endpoint(chain: str, version: str = "v3") -> Optional[str]:
     return None
 
 
-def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, retries: int = 4) -> dict:
+def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, retries: Optional[int] = None) -> dict:
     """Execute GraphQL query. Retries on 'bad indexers' (The Graph transient errors)."""
     payload = {"query": query, "variables": variables or {}}
     last_err = None
+    if retries is None:
+        try:
+            retries = int(os.environ.get("GRAPHQL_RETRIES", "4"))
+        except ValueError:
+            retries = 4
+    retries = max(1, retries)
     connect_timeout, read_timeout = 15, 60
     for attempt in range(retries):
         try:
