@@ -73,10 +73,31 @@ def _final_income(data: dict) -> float:
     return float(fees[-1][1]) if fees else 0.0
 
 
+def _fee_over_threshold(data: dict, threshold_pct: float) -> bool:
+    """True when pool fee is above configured threshold."""
+    try:
+        if float(data.get("fee_pct") or 0) > threshold_pct:
+            return True
+    except (TypeError, ValueError):
+        pass
+    raw = data.get("raw_fee_tier")
+    if raw is None:
+        return False
+    try:
+        raw_int = int(raw)
+    except (TypeError, ValueError):
+        return False
+    if (raw_int / 10000.0) > threshold_pct:
+        return True
+    if raw_int > 100000 and (raw_int / 1e6) > threshold_pct:
+        return True
+    return False
+
+
 def _merge_for_web(
     token_pairs: str,
-    exclude_chains: list[str],
-    exclude_suffixes: list[str],
+    include_chains: list[str],
+    max_fee_pct: float,
 ) -> dict[str, Any]:
     suffix = pairs_to_filename_suffix(token_pairs)
     v3_path = DATA_DIR / f"pools_v3_{suffix}.json"
@@ -88,21 +109,11 @@ def _merge_for_web(
     merged.update(v3_data)
     merged.update(v4_data)
 
-    ex_chains = {x.strip().lower() for x in exclude_chains if x.strip()}
-    if ex_chains:
-        merged = {k: v for k, v in merged.items() if v.get("chain", "").lower() not in ex_chains}
+    in_chains = {x.strip().lower() for x in include_chains if x.strip()}
+    if in_chains:
+        merged = {k: v for k, v in merged.items() if v.get("chain", "").lower() in in_chains}
 
-    ex_suffixes = {x.strip().lower() for x in exclude_suffixes if x.strip()}
-    if ex_suffixes:
-        filtered = {}
-        for k, v in merged.items():
-            pid = (v.get("pool_id") or k or "").lower()
-            tail4 = pid[-4:] if len(pid) >= 4 else pid
-            if tail4 not in ex_suffixes:
-                filtered[k] = v
-        merged = filtered
-
-    bad = {k: v for k, v in merged.items() if _is_bad_fee_entry(v)}
+    bad = {k: v for k, v in merged.items() if _is_bad_fee_entry(v) or _fee_over_threshold(v, max_fee_pct)}
     good = {k: v for k, v in merged.items() if k not in bad}
 
     sorted_good = sorted(good.items(), key=lambda kv: _final_income(kv[1]), reverse=True)
@@ -181,12 +192,16 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
         job["stage_label"] = "Preparing parameters"
         job["progress"] = 5
 
-    # Build token pairs from manual pairs + quick token picks
-    pairs = _parse_pairs_str(req.pairs)
-    for token in [t.strip().lower() for t in req.tokens if t.strip()]:
-        for quote in [q.strip().lower() for q in req.quote_tokens if q.strip()]:
-            if token != quote:
-                pairs.append((token, quote))
+    # Build up to 3 selected token pairs
+    pairs = []
+    for pair in req.pairs[:3]:
+        part = (pair or "").strip().lower()
+        if "," not in part:
+            continue
+        a, b = part.split(",", 1)
+        a, b = a.strip(), b.strip()
+        if a and b and a != b:
+            pairs.append((a, b))
     pairs = list(dict.fromkeys(pairs))
     if not pairs:
         with JOB_LOCK:
@@ -199,8 +214,6 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
     token_pairs = _pairs_to_string(pairs)
 
     include_chains = [c.strip().lower() for c in req.include_chains if c.strip()]
-    exclude_chains = [c.strip().lower() for c in req.exclude_chains if c.strip()]
-    exclude_suffixes = [s.strip().lower() for s in req.exclude_pool_suffix if s.strip()]
 
     logs: list[str] = []
     env = os.environ.copy()
@@ -220,7 +233,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
             _set_stage("v4", "Running v4 discovery and calculations", 55)
             _run_subprocess("agent_v4.py", env, req.min_tvl, logs)
         _set_stage("merge", "Merging results for web", 80)
-        result = _merge_for_web(token_pairs, exclude_chains=exclude_chains, exclude_suffixes=exclude_suffixes)
+        result = _merge_for_web(token_pairs, include_chains=include_chains, max_fee_pct=req.max_fee_pct)
         with JOB_LOCK:
             job["status"] = "done"
             job["stage"] = "done"
@@ -232,8 +245,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
                     "days": req.days,
                     "min_tvl": req.min_tvl,
                     "include_chains": include_chains,
-                    "exclude_chains": exclude_chains,
-                    "exclude_pool_suffix": exclude_suffixes,
+                    "max_fee_pct": req.max_fee_pct,
                 },
                 **result,
                 "logs": logs[-8:],
@@ -252,14 +264,11 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
 
 
 class PoolsRunRequest(BaseModel):
-    pairs: str = Field(default="", description="Manual pairs: tokenA,tokenB;tokenC,tokenD")
-    tokens: list[str] = Field(default_factory=list, description="Quick tokens list to pair with quote_tokens")
-    quote_tokens: list[str] = Field(default_factory=lambda: ["usdt", "usdc", "eth"])
+    pairs: list[str] = Field(default_factory=list, description="Up to 3 pairs: tokenA,tokenB")
     include_chains: list[str] = Field(default_factory=list)
-    exclude_chains: list[str] = Field(default_factory=list)
-    exclude_pool_suffix: list[str] = Field(default_factory=list)
     min_tvl: float = 100.0
     days: int = 90
+    max_fee_pct: float = 3.0
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -299,6 +308,8 @@ def run_pools(req: PoolsRunRequest) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="days must be between 1 and 3650")
     if req.min_tvl < 0:
         raise HTTPException(status_code=400, detail="min_tvl must be >= 0")
+    if req.max_fee_pct <= 0 or req.max_fee_pct > 100:
+        raise HTTPException(status_code=400, detail="max_fee_pct must be between 0 and 100")
 
     job_id = str(uuid.uuid4())
     with JOB_LOCK:
@@ -332,26 +343,26 @@ HTML_PAGE = """
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Uni Fee - Pools Analysis</title>
+  <title>Uni Fee - Pools</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     :root {
-      --bg: #0f172a;
-      --card: #111827;
-      --muted: #94a3b8;
-      --text: #e2e8f0;
-      --border: #334155;
+      --bg: #f3f7ff;
+      --card: #ffffff;
+      --muted: #64748b;
+      --text: #0f172a;
+      --border: #d9e2f0;
       --ok: #22c55e;
       --warn: #eab308;
       --danger: #ef4444;
-      --accent: #4f46e5;
-      --accent-2: #22d3ee;
+      --accent: #2563eb;
+      --accent-2: #06b6d4;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       font-family: Inter, Arial, sans-serif;
-      background: radial-gradient(circle at top right, #1d4ed8 0%, var(--bg) 40%);
+      background: linear-gradient(180deg, #eef5ff 0%, var(--bg) 100%);
       color: var(--text);
     }
     .container {
@@ -383,13 +394,13 @@ HTML_PAGE = """
       flex-wrap: wrap;
     }
     .nav a {
-      color: #c7d2fe;
+      color: #1d4ed8;
       text-decoration: none;
-      border: 1px solid #4338ca;
+      border: 1px solid #bfdbfe;
       border-radius: 999px;
       padding: 6px 12px;
       font-size: 13px;
-      background: rgba(67, 56, 202, 0.18);
+      background: #eff6ff;
     }
     .grid {
       display: grid;
@@ -397,11 +408,11 @@ HTML_PAGE = """
       gap: 14px;
     }
     .card {
-      background: linear-gradient(180deg, rgba(17,24,39,0.98), rgba(17,24,39,0.85));
+      background: var(--card);
       border: 1px solid var(--border);
       border-radius: 14px;
       padding: 14px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+      box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06);
     }
     .card h3 {
       margin: 0 0 10px;
@@ -414,7 +425,7 @@ HTML_PAGE = """
     }
     .row {
       display: grid;
-      grid-template-columns: 220px 1fr;
+      grid-template-columns: 180px 1fr;
       gap: 12px;
       align-items: start;
     }
@@ -428,16 +439,16 @@ HTML_PAGE = """
       font-size: 12px;
       margin-top: 5px;
     }
-    input, textarea {
+    input, textarea, select {
       width: 100%;
-      background: #0b1220;
-      border: 1px solid #374151;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
       color: var(--text);
       border-radius: 8px;
       padding: 10px;
       font-size: 14px;
     }
-    textarea { min-height: 76px; resize: vertical; }
+    select { appearance: auto; }
     .actions {
       display: flex;
       gap: 10px;
@@ -455,9 +466,9 @@ HTML_PAGE = """
       background: linear-gradient(90deg, var(--accent), #4338ca);
     }
     .btn.secondary {
-      background: #1f2937;
-      border: 1px solid #334155;
-      color: #dbeafe;
+      background: #f8fafc;
+      border: 1px solid #d1d5db;
+      color: #334155;
     }
     .chips {
       display: flex;
@@ -467,9 +478,9 @@ HTML_PAGE = """
     }
     .chip {
       border-radius: 999px;
-      border: 1px solid #334155;
-      background: #0b1220;
-      color: #bfdbfe;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      color: #334155;
       padding: 5px 10px;
       font-size: 12px;
       cursor: pointer;
@@ -509,8 +520,8 @@ HTML_PAGE = """
       gap: 10px;
     }
     .metric {
-      background: #0b1220;
-      border: 1px solid #263445;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
       border-radius: 10px;
       padding: 10px;
     }
@@ -531,13 +542,13 @@ HTML_PAGE = """
     .plot {
       width: 100%;
       min-height: 420px;
-      border: 1px solid #263445;
+      border: 1px solid #dbe3ef;
       border-radius: 10px;
-      background: #0b1220;
+      background: #ffffff;
     }
     .table-wrap {
       overflow-x: auto;
-      border: 1px solid #263445;
+      border: 1px solid #dbe3ef;
       border-radius: 10px;
     }
     table {
@@ -547,13 +558,13 @@ HTML_PAGE = """
       min-width: 900px;
     }
     th, td {
-      border-bottom: 1px solid #223040;
+      border-bottom: 1px solid #e2e8f0;
       padding: 8px;
       text-align: left;
     }
     th {
-      background: #111b2d;
-      color: #93c5fd;
+      background: #eff6ff;
+      color: #1e3a8a;
       position: sticky;
       top: 0;
       cursor: pointer;
@@ -566,16 +577,52 @@ HTML_PAGE = """
     pre {
       max-height: 220px;
       overflow: auto;
-      background: #0b1220;
-      border: 1px solid #263445;
+      background: #f8fafc;
+      border: 1px solid #dbe3ef;
       border-radius: 8px;
       padding: 10px;
-      color: #9fb3c8;
+      color: #334155;
       font-size: 12px;
+    }
+    .pair-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(180px, 1fr));
+      gap: 8px;
+    }
+    .chain-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 6px 10px;
+      margin-top: 4px;
+    }
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: #334155;
+    }
+    .check input {
+      width: auto;
+      padding: 0;
+    }
+    .tooltip {
+      color: #475569;
+      font-size: 12px;
+      margin-left: 6px;
+      cursor: help;
+      border-bottom: 1px dotted #94a3b8;
+    }
+    .inline-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
     }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
+      .pair-row { grid-template-columns: 1fr; }
+      .inline-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -594,82 +641,57 @@ HTML_PAGE = """
 
     <div class="grid">
       <section class="card">
-        <h3>Run Configuration</h3>
         <div class="form-grid">
           <div class="row">
-            <label for="pairs" title="Manual token pairs in format tokenA,tokenB;tokenC,tokenD">Pairs (manual)</label>
+            <label title="Select up to 3 pairs for analysis">Pairs <span class="tooltip" title="Select up to 3 pairs from the list. Search by typing first letters.">?</span></label>
             <div>
-              <textarea id="pairs" placeholder="wbtc,usdt;wbtc,usdc" title="Example: wbtc,usdt;wbtc,usdc"></textarea>
-              <div class="hint">Format: tokenA,tokenB;tokenC,tokenD</div>
+              <div class="pair-row">
+                <input id="pair1" list="pairHints" placeholder="pair 1 (e.g. wbtc,usdt)" title="Pair #1"/>
+                <input id="pair2" list="pairHints" placeholder="pair 2" title="Pair #2"/>
+                <input id="pair3" list="pairHints" placeholder="pair 3" title="Pair #3"/>
+              </div>
+              <datalist id="pairHints"></datalist>
+              <div class="hint">Maximum 3 pairs.</div>
             </div>
           </div>
 
           <div class="row">
-            <label for="tokens" title="List base tokens; each will be paired with quote tokens">Quick tokens list</label>
+            <label title="Choose chains for analysis">Include chains <span class="tooltip" title="Choose 'all' or select specific chains">?</span></label>
             <div>
-              <input id="tokens" list="tokenHints" placeholder="paxg,fluid,wbtc" title="Comma-separated list: paxg,fluid,wbtc"/>
-              <datalist id="tokenHints"></datalist>
-              <div class="hint">Each token will be paired with quote tokens below.</div>
+              <label class="check"><input type="checkbox" id="allChains" checked onchange="toggleAllChains()"> all</label>
+              <div class="chain-grid" id="chainChecks"></div>
             </div>
           </div>
 
           <div class="row">
-            <label for="quotes" title="Quote tokens for quick-token pairing">Quote tokens</label>
+            <label>Filters <span class="tooltip" title="Control TVL/history and fee cutoff for chart inclusion">?</span></label>
             <div>
-              <input id="quotes" value="usdt,usdc,eth" title="Comma-separated quote tokens, e.g. usdt,usdc,eth"/>
-              <div class="chips">
-                <button class="chip" onclick="setQuotes('usdt,usdc,eth')">USDT/USDC/ETH</button>
-                <button class="chip" onclick="setQuotes('usdc,eth')">USDC/ETH</button>
-                <button class="chip" onclick="setQuotes('usdt,eth')">USDT/ETH</button>
+              <div class="inline-grid">
+                <div>
+                  <div class="hint" style="margin-bottom:4px">Min TVL (USD)</div>
+                  <input id="minTvl" value="1000" type="number" title="Pools below this TVL are ignored"/>
+                </div>
+                <div>
+                  <div class="hint" style="margin-bottom:4px">History days</div>
+                  <input id="days" value="90" type="number" title="How many historical days to load"/>
+                </div>
               </div>
             </div>
           </div>
 
           <div class="row">
-            <label for="includeChains" title="If empty, all supported chains are included">Include chains (empty = all)</label>
+            <label for="maxFeePct" title="Pools above this fee are excluded from chart and flagged as error">Fee cutoff <span class="tooltip" title="Exclude pools with fee higher than X%">?</span></label>
             <div>
-              <input id="includeChains" list="chainHints" placeholder="ethereum,arbitrum-one,polygon" title="Comma-separated chain slugs"/>
-              <datalist id="chainHints"></datalist>
-              <div class="chips" id="chainChips"></div>
+              <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100" title="Exclude pools with fee above this value"/>
+              <div class="hint">Exclude pools above X% fee.</div>
             </div>
-          </div>
-
-          <div class="row">
-            <label for="minTvl" title="Minimum pool TVL in USD">Min TVL</label>
-            <input id="minTvl" value="1000" type="number" title="Pools below this TVL are ignored"/>
-          </div>
-
-          <div class="row">
-            <label for="days" title="History depth in days for fee/TVL dynamics">History days</label>
-            <div>
-              <input id="days" value="90" type="number" title="How many days of historical data to load"/>
-              <div class="chips">
-                <button class="chip" onclick="setDays(30)">30d</button>
-                <button class="chip" onclick="setDays(90)">90d</button>
-                <button class="chip" onclick="setDays(180)">180d</button>
-                <button class="chip" onclick="setDays(365)">365d</button>
-              </div>
-            </div>
-          </div>
-
-          <div class="row">
-            <label for="excludeChains" title="Chains to exclude from final chart/table">Exclude chains</label>
-            <input id="excludeChains" placeholder="base,polygon" title="Comma-separated chain slugs to exclude"/>
-          </div>
-
-          <div class="row">
-            <label for="excludeSuffix" title="Filter out pools by the last 4 chars of pool_id">Exclude pool suffix (last 4)</label>
-            <input id="excludeSuffix" placeholder="1a2b,dead" title="Comma-separated suffixes; each compared to pool_id tail"/>
           </div>
         </div>
 
         <div class="actions" style="margin-top:14px">
           <button class="btn" id="runBtn" onclick="runJob()">Run analysis</button>
-          <button class="btn secondary" onclick="applyPreset('gold')">Preset: Gold</button>
-          <button class="btn secondary" onclick="applyPreset('btc')">Preset: BTC</button>
-          <button class="btn secondary" onclick="applyPreset('majors')">Preset: Majors</button>
           <button class="btn secondary" onclick="exportCsv()">Export CSV</button>
-          <span id="status" class="status">Idle</span>
+          <span id="status" class="status">Ready</span>
         </div>
         <div class="progress-wrap">
           <div class="progress-meta">
@@ -727,8 +749,9 @@ HTML_PAGE = """
     let renderedRows = [];
     let sortKey = "final_income";
     let sortDesc = true;
-    const FORM_STORAGE_KEY = "uni_fee_form_v1";
-    const FIELD_IDS = ["pairs", "tokens", "quotes", "includeChains", "minTvl", "days", "excludeChains", "excludeSuffix"];
+    const FORM_STORAGE_KEY = "uni_fee_form_v2";
+    const FIELD_IDS = ["pair1", "pair2", "pair3", "minTvl", "days", "maxFeePct", "allChains"];
+    let availableChains = [];
 
     function splitCSV(v) {
       return (v || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
@@ -738,36 +761,8 @@ HTML_PAGE = """
       return new Intl.NumberFormat("en-US", {maximumFractionDigits: 0}).format(Number(v || 0));
     }
 
-    function setQuotes(v) {
-      document.getElementById("quotes").value = v;
-      saveFormState();
-    }
-
     function setDays(v) {
       document.getElementById("days").value = v;
-      saveFormState();
-    }
-
-    function applyPreset(name) {
-      if (name === "gold") {
-        document.getElementById("pairs").value = "paxg,usdt;paxg,usdc;xaut,usdt;xaut,usdc";
-        document.getElementById("tokens").value = "paxg,xaut";
-        document.getElementById("includeChains").value = "ethereum,arbitrum-one,polygon";
-        document.getElementById("minTvl").value = "1000";
-        document.getElementById("days").value = "90";
-      } else if (name === "btc") {
-        document.getElementById("pairs").value = "wbtc,usdt;wbtc,usdc;wbtc,eth";
-        document.getElementById("tokens").value = "wbtc";
-        document.getElementById("includeChains").value = "ethereum,arbitrum-one,polygon";
-        document.getElementById("minTvl").value = "10000";
-        document.getElementById("days").value = "90";
-      } else if (name === "majors") {
-        document.getElementById("pairs").value = "eth,usdt;eth,usdc;wbtc,usdt;wbtc,usdc";
-        document.getElementById("tokens").value = "wbtc,eth";
-        document.getElementById("includeChains").value = "";
-        document.getElementById("minTvl").value = "5000";
-        document.getElementById("days").value = "90";
-      }
       saveFormState();
     }
 
@@ -794,8 +789,14 @@ HTML_PAGE = """
       const state = {};
       for (const id of FIELD_IDS) {
         const el = document.getElementById(id);
-        if (el) state[id] = el.value;
+        if (!el) continue;
+        if (el.type === "checkbox") {
+          state[id] = !!el.checked;
+        } else {
+          state[id] = el.value;
+        }
       }
+      state.selectedChains = getSelectedChains();
       localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(state));
     }
 
@@ -806,8 +807,17 @@ HTML_PAGE = """
         const state = JSON.parse(raw);
         for (const id of FIELD_IDS) {
           const el = document.getElementById(id);
-          if (el && typeof state[id] === "string") {
+          if (!el || state[id] == null) continue;
+          if (el.type === "checkbox") {
+            el.checked = !!state[id];
+          } else if (typeof state[id] === "string") {
             el.value = state[id];
+          }
+        }
+        if (Array.isArray(state.selectedChains)) {
+          for (const c of state.selectedChains) {
+            const box = document.getElementById("chain_" + c);
+            if (box) box.checked = true;
           }
         }
       } catch (e) {
@@ -823,6 +833,31 @@ HTML_PAGE = """
           el.addEventListener("change", saveFormState);
         }
       }
+    }
+
+    function getSelectedPairs() {
+      return [document.getElementById("pair1").value, document.getElementById("pair2").value, document.getElementById("pair3").value]
+        .map(v => (v || "").trim().toLowerCase())
+        .filter(Boolean);
+    }
+
+    function getSelectedChains() {
+      if (document.getElementById("allChains").checked) return [];
+      const out = [];
+      for (const c of availableChains) {
+        const el = document.getElementById("chain_" + c);
+        if (el && el.checked) out.push(c);
+      }
+      return out;
+    }
+
+    function toggleAllChains() {
+      const all = document.getElementById("allChains").checked;
+      for (const c of availableChains) {
+        const el = document.getElementById("chain_" + c);
+        if (el) el.disabled = all;
+      }
+      saveFormState();
     }
 
     function renderTable(rows) {
@@ -902,40 +937,38 @@ HTML_PAGE = """
       try {
         const r = await fetch("/api/meta");
         const meta = await r.json();
-        const tokenHints = document.getElementById("tokenHints");
-        tokenHints.innerHTML = meta.tokens.map(t => `<option value="${t}"></option>`).join("");
-        const chainHints = document.getElementById("chainHints");
-        chainHints.innerHTML = meta.chains.map(c => `<option value="${c}"></option>`).join("");
+        const commonQuotes = ["usdt", "usdc", "eth"];
+        const pairs = [];
+        for (const t of meta.tokens) {
+          for (const q of commonQuotes) {
+            if (t !== q) pairs.push(`${t},${q}`);
+          }
+        }
+        const pairHints = document.getElementById("pairHints");
+        pairHints.innerHTML = pairs.slice(0, 500).map(p => `<option value="${p}"></option>`).join("");
 
-        const chips = document.getElementById("chainChips");
-        chips.innerHTML = meta.chains.map(c => `<button class="chip" onclick="toggleChain('${c}')">${c}</button>`).join("");
+        availableChains = meta.chains || [];
+        const checks = document.getElementById("chainChecks");
+        checks.innerHTML = availableChains.map(c => (
+          `<label class="check"><input type="checkbox" id="chain_${c}" onchange="saveFormState()"> ${c}</label>`
+        )).join("");
+        loadFormState();
+        toggleAllChains();
       } catch (e) {
         console.warn("meta load failed", e);
       }
     }
 
-    function toggleChain(chain) {
-      const input = document.getElementById("includeChains");
-      const list = splitCSV(input.value);
-      const idx = list.indexOf(chain);
-      if (idx >= 0) list.splice(idx, 1); else list.push(chain);
-      input.value = list.join(",");
-      saveFormState();
-    }
-
     async function runJob() {
       const payload = {
-        pairs: document.getElementById("pairs").value,
-        tokens: splitCSV(document.getElementById("tokens").value),
-        quote_tokens: splitCSV(document.getElementById("quotes").value),
-        include_chains: splitCSV(document.getElementById("includeChains").value),
-        exclude_chains: splitCSV(document.getElementById("excludeChains").value),
-        exclude_pool_suffix: splitCSV(document.getElementById("excludeSuffix").value),
+        pairs: getSelectedPairs(),
+        include_chains: getSelectedChains(),
         min_tvl: Number(document.getElementById("minTvl").value || 0),
-        days: Number(document.getElementById("days").value || 90)
+        days: Number(document.getElementById("days").value || 90),
+        max_fee_pct: Number(document.getElementById("maxFeePct").value || 3)
       };
-      if (!payload.pairs && payload.tokens.length === 0) {
-        setStatus("Add pairs or quick tokens list first.", "fail");
+      if (payload.pairs.length === 0) {
+        setStatus("Select at least one pair.", "fail");
         return;
       }
 
@@ -999,15 +1032,15 @@ HTML_PAGE = """
       }
       Plotly.newPlot("feesChart", feeTraces, {
         title: "Cumulative Fees",
-        paper_bgcolor: "#0b1220",
-        plot_bgcolor: "#0b1220",
-        font: {color: "#cbd5e1"}
+        paper_bgcolor: "#ffffff",
+        plot_bgcolor: "#ffffff",
+        font: {color: "#0f172a"}
       }, {displaylogo: false, responsive: true});
       Plotly.newPlot("tvlChart", tvlTraces, {
         title: "TVL dynamics (thousands USD)",
-        paper_bgcolor: "#0b1220",
-        plot_bgcolor: "#0b1220",
-        font: {color: "#cbd5e1"}
+        paper_bgcolor: "#ffffff",
+        plot_bgcolor: "#ffffff",
+        font: {color: "#0f172a"}
       }, {displaylogo: false, responsive: true});
 
       lastRows = result.rows || [];
@@ -1016,7 +1049,6 @@ HTML_PAGE = """
       sortBy("final_income");
     }
 
-    loadFormState();
     attachAutosave();
     loadMeta();
   </script>
