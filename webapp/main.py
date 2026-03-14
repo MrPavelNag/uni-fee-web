@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from agent_common import load_chart_data_json, pairs_to_filename_suffix
 from config import GOLDSKY_ENDPOINTS, TOKEN_ADDRESSES, UNISWAP_V3_SUBGRAPHS, UNISWAP_V4_SUBGRAPHS
+from uniswap_client import get_graph_endpoint, graphql_query
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -32,6 +33,8 @@ DATA_DIR.mkdir(exist_ok=True)
 TOKEN_CATALOG_PATH = DATA_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = DATA_DIR / "chain_catalog.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
+TOKENS_LOOKBACK_DAYS = int(os.environ.get("TOKENS_LOOKBACK_DAYS", "10"))
+TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000"))
 CHAIN_ID_TO_NAME = {
     1: "ethereum",
     10: "optimism",
@@ -164,20 +167,135 @@ def _fetch_uniswap_verified_tokens() -> tuple[set[str], dict[str, list[str]]]:
     return all_tokens, by_chain
 
 
+def _fetch_active_symbols_from_endpoint(endpoint: str, start_ts: int, min_tvl_usd: float) -> set[str]:
+    query = """
+    query ActivePoolTokens($start: Int!, $minTvl: BigDecimal!, $skip: Int!) {
+      poolDayDatas(
+        first: 1000,
+        skip: $skip,
+        orderBy: date,
+        orderDirection: desc,
+        where: { date_gte: $start, tvlUSD_gte: $minTvl }
+      ) {
+        pool {
+          token0 { symbol }
+          token1 { symbol }
+        }
+      }
+    }
+    """
+    out: set[str] = set()
+    skip = 0
+    max_rows = 6000
+    while skip < max_rows:
+        data = graphql_query(endpoint, query, {"start": start_ts, "minTvl": str(min_tvl_usd), "skip": skip})
+        rows = data.get("data", {}).get("poolDayDatas", [])
+        if not rows:
+            break
+        for row in rows:
+            pool = row.get("pool") or {}
+            s0 = str((pool.get("token0") or {}).get("symbol") or "").strip()
+            s1 = str((pool.get("token1") or {}).get("symbol") or "").strip()
+            if _is_clean_symbol(s0):
+                out.add(s0.lower())
+            if _is_clean_symbol(s1):
+                out.add(s1.lower())
+        if len(rows) < 1000:
+            break
+        skip += 1000
+    return out
+
+
+def _fetch_tokens_by_tvl_endpoint(endpoint: str, min_tvl_usd: float) -> set[str]:
+    query = """
+    query TokenListByTvl($minTvl: BigDecimal!, $skip: Int!) {
+      tokens(
+        first: 1000,
+        skip: $skip,
+        orderBy: totalValueLockedUSD,
+        orderDirection: desc,
+        where: { totalValueLockedUSD_gte: $minTvl }
+      ) {
+        symbol
+      }
+    }
+    """
+    out: set[str] = set()
+    skip = 0
+    while skip < 10000:
+        data = graphql_query(endpoint, query, {"minTvl": str(min_tvl_usd), "skip": skip})
+        rows = data.get("data", {}).get("tokens", [])
+        if not rows:
+            break
+        for row in rows:
+            sym = str(row.get("symbol") or "").strip()
+            if _is_clean_symbol(sym):
+                out.add(sym.lower())
+        if len(rows) < 1000:
+            break
+        skip += 1000
+    return out
+
+
+def _fetch_active_tokens_by_chain(days: int, min_tvl_usd: float) -> tuple[set[str], dict[str, list[str]]]:
+    start_ts = int(time.time()) - days * 86400
+    all_tokens: set[str] = set()
+    by_chain: dict[str, set[str]] = {}
+    for chain in _supported_chains():
+        chain_set: set[str] = set()
+        for version in ("v3", "v4"):
+            endpoint = get_graph_endpoint(chain, version)
+            if not endpoint:
+                continue
+            try:
+                chain_set.update(_fetch_active_symbols_from_endpoint(endpoint, start_ts, min_tvl_usd))
+            except Exception:
+                continue
+        if not chain_set:
+            endpoint_v3 = get_graph_endpoint(chain, "v3")
+            if endpoint_v3:
+                try:
+                    chain_set.update(_fetch_tokens_by_tvl_endpoint(endpoint_v3, min_tvl_usd))
+                except Exception:
+                    pass
+        if chain_set:
+            by_chain[chain] = chain_set
+            all_tokens.update(chain_set)
+    return all_tokens, {k: sorted(v) for k, v in by_chain.items()}
+
+
 def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
-    if not refresh:
-        cached = _read_json(TOKEN_CATALOG_PATH)
-        if cached and isinstance(cached.get("items"), list):
-            return cached
+    cached = _read_json(TOKEN_CATALOG_PATH)
+    if not refresh and cached and isinstance(cached.get("items"), list):
+        return cached
+
     by_chain: dict[str, list[str]] = {}
     all_tokens: set[str] = set()
-    source = "uniswap-token-list"
+    source = "active-pools-last-10d"
     try:
-        all_tokens, by_chain = _fetch_uniswap_verified_tokens()
+        all_tokens, by_chain = _fetch_active_tokens_by_chain(TOKENS_LOOKBACK_DAYS, TOKENS_MIN_TVL_USD)
+        try:
+            verified_all, verified_by_chain = _fetch_uniswap_verified_tokens()
+            if verified_all:
+                all_tokens = {t for t in all_tokens if t in verified_all}
+                filtered_by_chain: dict[str, list[str]] = {}
+                for chain, items in by_chain.items():
+                    allowed = set(verified_by_chain.get(chain, []))
+                    keep = [t for t in items if t in allowed]
+                    if keep:
+                        filtered_by_chain[chain] = keep
+                by_chain = filtered_by_chain
+                source = "active-pools-last-10d+verified"
+        except Exception:
+            pass
     except Exception as e:
-        print(f"[catalog-refresh] verified token list fetch failed: {e}")
+        print(f"[catalog-refresh] active pools tokens fetch failed: {e}")
 
-    # Fallback to config tokens if online list is unavailable.
+    # If live refresh fails, keep previously cached catalog (avoid shrinking to tiny fallback sets).
+    if not all_tokens and cached and isinstance(cached.get("items"), list):
+        return cached
+
+    # Last-resort fallback.
     if not all_tokens:
         source = "local-config-fallback"
         all_tokens.update(_supported_tokens())
@@ -187,6 +305,8 @@ def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
         "items": sorted(all_tokens),
         "by_chain": by_chain,
         "source": source,
+        "lookback_days": TOKENS_LOOKBACK_DAYS,
+        "min_tvl_usd": TOKENS_MIN_TVL_USD,
     }
     _write_json(TOKEN_CATALOG_PATH, out)
     return out
@@ -308,6 +428,9 @@ def _merge_for_web(
             chart_series.append(
                 {
                     "label": f"{row['chain']} {row['version']} {row['pair']} ...{row['pool_id'][-4:]}",
+                    "chain": row["chain"],
+                    "pair": row["pair"],
+                    "fee_pct": row["fee_pct"],
                     "pool_id": row["pool_id"],
                     "fees": fees,
                     "tvl": tvl,
@@ -420,6 +543,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
                     "include_chains": include_chains,
                     "min_fee_pct": req.min_fee_pct,
                     "max_fee_pct": req.max_fee_pct,
+                    "lp_allocation_usd": float(env.get("LP_ALLOCATION_USD", "1000")),
                 },
                 **result,
                 "logs": logs[-8:],
@@ -471,6 +595,9 @@ def meta() -> dict[str, Any]:
         "token_catalog": {
             "count": token_catalog.get("count", 0),
             "updated_at": token_catalog.get("updated_at"),
+            "source": token_catalog.get("source", ""),
+            "lookback_days": token_catalog.get("lookback_days", TOKENS_LOOKBACK_DAYS),
+            "min_tvl_usd": token_catalog.get("min_tvl_usd", TOKENS_MIN_TVL_USD),
         },
         "chain_catalog": {
             "count": chain_catalog.get("count", 0),
@@ -783,12 +910,26 @@ HTML_PAGE = """
       color: #334155;
       font-size: 12px;
     }
-    .pair-row {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(180px, 1fr));
-      gap: 8px;
+    .pair-row { display: grid; grid-template-columns: 1fr; gap: 4px; }
+    .pair-item { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+    .token-input-wrap { display: flex; align-items: center; gap: 0; }
+    .token-input-wrap input { border-radius: 8px 0 0 8px; }
+    .token-input-wrap .dd-btn {
+      border: 1px solid #cbd5e1;
+      border-left: 0;
+      background: #eef2f7;
+      color: #334155;
+      border-radius: 0 8px 8px 0;
+      height: 100%;
+      min-width: 32px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 700;
     }
-    .pair-item { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .invalid-input {
+      border: 1px solid #ef4444 !important;
+      box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18);
+    }
     .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
     .meta-badge { border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #475569; background: #f8fafc; }
     .small-btn { border: 1px solid #d1d5db; background: #f8fafc; color: #334155; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
@@ -846,28 +987,33 @@ HTML_PAGE = """
       <section class="card">
         <div class="form-grid">
           <div class="row">
-            <label title="Select up to 3 pairs for analysis">Pairs</label>
+            <label title="Select up to 4 pairs for analysis">Pairs</label>
             <div>
               <div class="top-line">
                 <button class="small-btn" onclick="reviewTokens()">Review tokens</button>
+                <button class="small-btn" onclick="addPairRow()">+ pair</button>
                 <span class="meta-badge" id="tokensMeta">tokens: -</span>
               </div>
-              <div class="pair-row">
-                <div class="pair-item">
-                  <input id="pair1a" list="tokenHints" placeholder="base token"/>
-                  <input id="pair1b" list="tokenHints" placeholder="quote token"/>
+              <div class="pair-row" id="pairRows">
+                <div class="pair-item" id="pairRow1">
+                  <div class="token-input-wrap"><input id="pair1a" list="tokenHints" placeholder="base token"/><button class="dd-btn" onclick="openTokenList('pair1a')">▼</button></div>
+                  <div class="token-input-wrap"><input id="pair1b" list="tokenHints" placeholder="quote token"/><button class="dd-btn" onclick="openTokenList('pair1b')">▼</button></div>
                 </div>
-                <div class="pair-item">
-                  <input id="pair2a" list="tokenHints" placeholder="base token"/>
-                  <input id="pair2b" list="tokenHints" placeholder="quote token"/>
+                <div class="pair-item" id="pairRow2" style="display:none">
+                  <div class="token-input-wrap"><input id="pair2a" list="tokenHints" placeholder="base token"/><button class="dd-btn" onclick="openTokenList('pair2a')">▼</button></div>
+                  <div class="token-input-wrap"><input id="pair2b" list="tokenHints" placeholder="quote token"/><button class="dd-btn" onclick="openTokenList('pair2b')">▼</button></div>
                 </div>
-                <div class="pair-item">
-                  <input id="pair3a" list="tokenHints" placeholder="base token"/>
-                  <input id="pair3b" list="tokenHints" placeholder="quote token"/>
+                <div class="pair-item" id="pairRow3" style="display:none">
+                  <div class="token-input-wrap"><input id="pair3a" list="tokenHints" placeholder="base token"/><button class="dd-btn" onclick="openTokenList('pair3a')">▼</button></div>
+                  <div class="token-input-wrap"><input id="pair3b" list="tokenHints" placeholder="quote token"/><button class="dd-btn" onclick="openTokenList('pair3b')">▼</button></div>
+                </div>
+                <div class="pair-item" id="pairRow4" style="display:none">
+                  <div class="token-input-wrap"><input id="pair4a" list="tokenHints" placeholder="base token"/><button class="dd-btn" onclick="openTokenList('pair4a')">▼</button></div>
+                  <div class="token-input-wrap"><input id="pair4b" list="tokenHints" placeholder="quote token"/><button class="dd-btn" onclick="openTokenList('pair4b')">▼</button></div>
                 </div>
               </div>
               <datalist id="tokenHints"></datalist>
-              <div class="hint">Maximum 3 pairs.</div>
+              <div class="hint">Start with one pair. Add more with "+ pair" (max 4).</div>
             </div>
           </div>
 
@@ -895,12 +1041,12 @@ HTML_PAGE = """
                   <input id="days" value="90" type="number"/>
                 </div>
                 <div>
-                  <div class="hint" style="margin-bottom:4px">Exclude above X% fee</div>
-                  <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100"/>
-                </div>
-                <div>
                   <div class="hint" style="margin-bottom:4px">Exclude below X% fee</div>
                   <input id="minFeePct" value="0" type="number" step="0.1" min="0" max="99.9"/>
+                </div>
+                <div>
+                  <div class="hint" style="margin-bottom:4px">Exclude above X% fee</div>
+                  <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100"/>
                 </div>
               </div>
             </div>
@@ -968,11 +1114,12 @@ HTML_PAGE = """
     let renderedRows = [];
     let sortKey = "final_income";
     let sortDesc = true;
-    const FORM_STORAGE_KEY = "uni_fee_form_v3";
-    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "minTvl", "days", "maxFeePct", "minFeePct", "allChains"];
+    const FORM_STORAGE_KEY = "uni_fee_form_v4";
+    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "allChains"];
     let availableChains = [];
     let colorMap = {};
     let dashMap = {};
+    let pairRowsVisible = 1;
 
     function splitCSV(v) {
       return (v || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
@@ -1018,6 +1165,7 @@ HTML_PAGE = """
         }
       }
       state.selectedChains = getSelectedChains();
+      state.pairRowsVisible = pairRowsVisible;
       localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(state));
     }
 
@@ -1041,6 +1189,8 @@ HTML_PAGE = """
             if (box) box.checked = true;
           }
         }
+        pairRowsVisible = Math.max(1, Math.min(4, Number(state.pairRowsVisible || 1)));
+        updatePairRows();
       } catch (e) {
         console.warn("load form state failed", e);
       }
@@ -1056,14 +1206,69 @@ HTML_PAGE = """
       }
     }
 
-    function getSelectedPairs() {
-      const out = [];
-      for (let i = 1; i <= 3; i++) {
-        const a = (document.getElementById(`pair${i}a`).value || "").trim().toLowerCase();
-        const b = (document.getElementById(`pair${i}b`).value || "").trim().toLowerCase();
-        if (a && b && a !== b) out.push(`${a},${b}`);
+    function updatePairRows() {
+      for (let i = 1; i <= 4; i++) {
+        const row = document.getElementById(`pairRow${i}`);
+        if (!row) continue;
+        row.style.display = i <= pairRowsVisible ? "grid" : "none";
       }
-      return out;
+    }
+
+    function addPairRow() {
+      if (pairRowsVisible < 4) {
+        pairRowsVisible += 1;
+        updatePairRows();
+        saveFormState();
+      }
+    }
+
+    function openTokenList(inputId) {
+      const el = document.getElementById(inputId);
+      if (!el) return;
+      el.value = "";
+      try {
+        if (typeof el.showPicker === "function") {
+          el.showPicker();
+          return;
+        }
+      } catch (_) {}
+      el.focus();
+      el.dispatchEvent(new KeyboardEvent("keydown", {key: "ArrowDown"}));
+      saveFormState();
+    }
+
+    function clearPairErrors() {
+      for (let i = 1; i <= 4; i++) {
+        for (const side of ["a", "b"]) {
+          const el = document.getElementById(`pair${i}${side}`);
+          if (el) el.classList.remove("invalid-input");
+        }
+      }
+    }
+
+    function validatePairs() {
+      clearPairErrors();
+      const out = [];
+      let hasError = false;
+      for (let i = 1; i <= pairRowsVisible; i++) {
+        const aEl = document.getElementById(`pair${i}a`);
+        const bEl = document.getElementById(`pair${i}b`);
+        const a = (aEl?.value || "").trim().toLowerCase();
+        const b = (bEl?.value || "").trim().toLowerCase();
+        if (!a && !b) continue;
+        if (!a || !b || a === b) {
+          if (aEl) aEl.classList.add("invalid-input");
+          if (bEl) bEl.classList.add("invalid-input");
+          hasError = true;
+          continue;
+        }
+        out.push(`${a},${b}`);
+      }
+      return {pairs: out, valid: !hasError && out.length > 0};
+    }
+
+    function getSelectedPairs() {
+      return validatePairs().pairs;
     }
 
     function getSelectedChains() {
@@ -1119,7 +1324,7 @@ HTML_PAGE = """
         const cls = r.status === "ok" ? "ok-row" : "error-row";
         const color = colorMap[r.pool_id] || "#94a3b8";
         const dash = dashMap[r.pool_id] || "solid";
-        const cssDash = (dash === "solid") ? "solid" : "dashed";
+        const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
         html += `<tr class="${cls}">`;
         html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};"></span></td>`;
         html += `<td>${r.chain}</td>`;
@@ -1183,8 +1388,10 @@ HTML_PAGE = """
         const r = await fetch("/api/meta");
         const meta = await r.json();
         const tokenHints = document.getElementById("tokenHints");
-        tokenHints.innerHTML = (meta.tokens || []).slice(0, 5000).map(t => `<option value="${t}"></option>`).join("");
-        document.getElementById("tokensMeta").textContent = `tokens: ${meta.token_catalog?.count || 0}, updated: ${meta.token_catalog?.updated_at || "-"}`;
+        tokenHints.innerHTML = (meta.tokens || []).map(t => `<option value="${t}"></option>`).join("");
+        const minTvl = Number(meta.token_catalog?.min_tvl_usd || 1000);
+        const lookback = Number(meta.token_catalog?.lookback_days || 10);
+        document.getElementById("tokensMeta").textContent = `tokens (TVL>$${minTvl}, ${lookback}d): ${meta.token_catalog?.count || 0}, updated: ${meta.token_catalog?.updated_at || "-"}`;
 
         availableChains = meta.chains || [];
         document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;
@@ -1224,16 +1431,17 @@ HTML_PAGE = """
     }
 
     async function runJob() {
+      const pairCheck = validatePairs();
       const payload = {
-        pairs: getSelectedPairs(),
+        pairs: pairCheck.pairs,
         include_chains: getSelectedChains(),
         min_tvl: Number(document.getElementById("minTvl").value || 0),
         days: Number(document.getElementById("days").value || 90),
         max_fee_pct: Number(document.getElementById("maxFeePct").value || 3),
         min_fee_pct: Number(document.getElementById("minFeePct").value || 0)
       };
-      if (payload.pairs.length === 0) {
-        setStatus("Select at least one pair.", "fail");
+      if (!pairCheck.valid) {
+        setStatus("Invalid pairs: fill both tokens and avoid duplicates in a pair.", "fail");
         return;
       }
 
@@ -1289,28 +1497,38 @@ HTML_PAGE = """
       const tvlTraces = [];
       colorMap = {};
       dashMap = {};
-      const palette = ["#1d4ed8", "#0891b2", "#7c3aed", "#ea580c", "#059669", "#dc2626", "#4f46e5", "#0ea5e9", "#65a30d", "#be185d"];
-      const dashes = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"];
+      const palette = ["#1e3a8a", "#155e75", "#14532d", "#7e22ce", "#7f1d1d", "#1d4ed8", "#0e7490", "#166534", "#6d28d9", "#be123c"];
+      const dashes = ["dash", "dot", "dashdot", "longdash", "longdashdot"];
       for (const s of result.series) {
         const feeX = s.fees.map(p => new Date(p[0] * 1000));
         const feeY = s.fees.map(p => p[1]);
         const tvlX = s.tvl.map(p => new Date(p[0] * 1000));
         const tvlY = s.tvl.map(p => p[1] / 1000.0);
         const c = palette[feeTraces.length % palette.length];
-        const d = dashes[feeTraces.length % dashes.length];
+        const d = feeTraces.length < palette.length ? "solid" : dashes[(feeTraces.length - palette.length) % dashes.length];
+        const hoverData = feeX.map(() => [s.chain || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
         colorMap[s.pool_id] = c;
         dashMap[s.pool_id] = d;
-        feeTraces.push({x: feeX, y: feeY, mode: "lines", name: s.label, line: {color: c, width: 2, dash: d}});
-        tvlTraces.push({x: tvlX, y: tvlY, mode: "lines", name: s.label, line: {color: c, width: 2, dash: d}});
+        feeTraces.push({
+          x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
+          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} | %{customdata[1]}% | %{customdata[2]}<extra></extra>",
+          line: {color: c, width: 2, dash: d}
+        });
+        tvlTraces.push({
+          x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
+          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} | %{customdata[1]}% | %{customdata[2]}<extra></extra>",
+          line: {color: c, width: 2, dash: d}
+        });
       }
+      const alloc = Number(result?.request?.lp_allocation_usd || 1000);
       Plotly.newPlot("feesChart", feeTraces, {
-        title: "Cumulative Fees",
+        title: `Cumulative Fees (LP allocation: $${formatUsd(alloc)})`,
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
         showlegend: false,
         margin: {t: 30, b: 24, l: 50, r: 14},
-        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 16},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d"},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
       Plotly.newPlot("tvlChart", tvlTraces, {
@@ -1320,7 +1538,7 @@ HTML_PAGE = """
         font: {color: "#0f172a"},
         showlegend: false,
         margin: {t: 30, b: 24, l: 50, r: 14},
-        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 16},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d"},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
 
