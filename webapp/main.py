@@ -722,6 +722,10 @@ HTML_PAGE = """
       padding: 14px;
       box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06);
     }
+    .control-card {
+      background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%);
+      border-color: #cfdcec;
+    }
     .card h3 {
       margin: 0 0 10px;
       font-size: 18px;
@@ -731,16 +735,28 @@ HTML_PAGE = """
       grid-template-columns: 1fr;
       gap: 12px;
     }
+    .control-card .form-grid { gap: 10px; }
     .row {
       display: grid;
       grid-template-columns: 180px 1fr;
       gap: 12px;
       align-items: start;
     }
+    .control-card .row {
+      background: #f8fbff;
+      border: 1px solid #d7e1ef;
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+    }
     .row label {
       font-weight: 700;
       font-size: 14px;
       padding-top: 8px;
+    }
+    .control-card .row label {
+      color: #1f2f4a;
+      letter-spacing: 0.2px;
     }
     .row .hint {
       color: var(--muted);
@@ -763,6 +779,11 @@ HTML_PAGE = """
       flex-wrap: wrap;
       align-items: center;
       justify-content: flex-end;
+    }
+    .control-card .actions {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid #d7e1ef;
     }
     .actions .run-btn { order: 99; }
     .btn {
@@ -809,6 +830,11 @@ HTML_PAGE = """
     .status.ok { color: var(--ok); }
     .status.fail { color: var(--danger); }
     .progress-wrap { width: 100%; margin-top: 10px; }
+    .control-card .progress-wrap {
+      margin-top: 8px;
+      padding: 8px 10px 0;
+      border-top: 1px dashed #d7e1ef;
+    }
     .progress-meta {
       display: flex;
       justify-content: space-between;
@@ -952,7 +978,7 @@ HTML_PAGE = """
       border: 1px solid #ef4444 !important;
       box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18);
     }
-    .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+    .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
     .meta-badge { border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #475569; background: #f8fafc; }
     .small-btn { border: 1px solid #d1d5db; background: #f8fafc; color: #334155; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
     .line-swatch {
@@ -1016,7 +1042,7 @@ HTML_PAGE = """
     </div>
 
     <div class="grid">
-      <section class="card">
+      <section class="card control-card">
         <div class="form-grid">
           <div class="row">
             <label title="Select up to 4 pairs for analysis">Pairs</label>
@@ -1104,15 +1130,6 @@ HTML_PAGE = """
         </div>
         <div id="logsWrap" style="display:none; margin-top:10px">
           <pre id="logs">No logs yet.</pre>
-        </div>
-      </section>
-
-      <section class="card">
-        <div class="summary-strip">
-          <div class="summary-box"><div class="k">Pairs suffix</div><div class="v" id="mSuffix">-</div></div>
-          <div class="summary-box"><div class="k">Total pools</div><div class="v" id="mTotal">0</div></div>
-          <div class="summary-box"><div class="k">Pools in chart</div><div class="v" id="mChart">0</div></div>
-          <div class="summary-box"><div class="k">Filtered by fee range</div><div class="v" id="mErr">0</div></div>
         </div>
       </section>
 
