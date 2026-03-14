@@ -9,6 +9,7 @@ Cloud-ready web MVP for pool analysis.
 
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -71,6 +72,10 @@ def _on_shutdown() -> None:
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()  # prevent collisions in shared data/*.json files
+RUN_HISTORY: dict[str, list[dict[str, Any]]] = {}
+RUN_HISTORY_LIMIT = 10
+SESSION_COOKIE_NAME = "uni_fee_sid"
+SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", str(30 * 24 * 60 * 60)))
 CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
 CATALOG_REFRESH_ON_STARTUP = os.environ.get("CATALOG_REFRESH_ON_STARTUP", "0").strip().lower() in ("1", "true", "yes", "on")
 CATALOG_REFRESH_STOP = threading.Event()
@@ -132,6 +137,31 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=True, indent=2)
+
+
+def _new_session_id() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def _is_valid_session_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value or ""))
+
+
+def _ensure_session_cookie(request: Request, response: Response) -> str:
+    sid = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if _is_valid_session_id(sid):
+        return sid
+    sid = _new_session_id()
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=sid,
+        max_age=SESSION_TTL_SEC,
+        httponly=True,
+        samesite="lax",
+        secure=(request.url.scheme == "https"),
+        path="/",
+    )
+    return sid
 
 
 def _load_chain_catalog(refresh: bool = False) -> dict[str, Any]:
@@ -443,7 +473,42 @@ def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs:
         raise RuntimeError(f"{script_name} failed with code {proc.returncode}")
 
 
-def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
+def _push_run_history(
+    *,
+    session_id: str,
+    status: str,
+    token_pairs: str,
+    include_chains: list[str],
+    min_tvl: float,
+    days: int,
+    min_fee_pct: float,
+    max_fee_pct: float,
+    exclude_suffixes: list[str],
+    logs: list[str],
+    error: str | None = None,
+) -> None:
+    item = {
+        "ts": _iso_now(),
+        "status": status,
+        "request": {
+            "pairs": token_pairs,
+            "include_chains": include_chains,
+            "min_tvl": min_tvl,
+            "days": days,
+            "min_fee_pct": min_fee_pct,
+            "max_fee_pct": max_fee_pct,
+            "exclude_suffixes": exclude_suffixes,
+        },
+        "error": error or "",
+        "logs": logs[-8:],
+    }
+    with JOB_LOCK:
+        bucket = RUN_HISTORY.setdefault(session_id, [])
+        bucket.insert(0, item)
+        del bucket[RUN_HISTORY_LIMIT:]
+
+
+def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     def _set_stage(stage: str, label: str, progress: int) -> None:
         with JOB_LOCK:
             j = JOBS.get(job_id)
@@ -544,6 +609,18 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
                 **result,
                 "logs": logs[-8:],
             }
+        _push_run_history(
+            session_id=session_id,
+            status="done",
+            token_pairs=token_pairs,
+            include_chains=include_chains,
+            min_tvl=req.min_tvl,
+            days=req.days,
+            min_fee_pct=req.min_fee_pct,
+            max_fee_pct=req.max_fee_pct,
+            exclude_suffixes=req.exclude_suffixes,
+            logs=logs,
+        )
     except Exception as e:
         with JOB_LOCK:
             job["status"] = "failed"
@@ -552,6 +629,19 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
             job["stage_label"] = "Failed"
             job["progress"] = 100
             job["result"] = {"logs": logs[-8:]}
+        _push_run_history(
+            session_id=session_id,
+            status="failed",
+            token_pairs=token_pairs,
+            include_chains=include_chains,
+            min_tvl=req.min_tvl,
+            days=req.days,
+            min_fee_pct=req.min_fee_pct,
+            max_fee_pct=req.max_fee_pct,
+            exclude_suffixes=req.exclude_suffixes,
+            logs=logs,
+            error=str(e),
+        )
     finally:
         with JOB_LOCK:
             job["finished_at"] = time.time()
@@ -568,8 +658,10 @@ class PoolsRunRequest(BaseModel):
 
 
 @app.get("/", response_class=HTMLResponse)
-def home() -> str:
-    return HTML_PAGE
+def home(request: Request) -> HTMLResponse:
+    resp = HTMLResponse(HTML_PAGE)
+    _ensure_session_cookie(request, resp)
+    return resp
 
 
 @app.get("/stables", response_class=HTMLResponse)
@@ -628,7 +720,8 @@ def healthz() -> dict[str, str]:
 
 
 @app.post("/api/pools/run")
-def run_pools(req: PoolsRunRequest) -> dict[str, str]:
+def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dict[str, str]:
+    session_id = _ensure_session_cookie(request, response)
     if not os.environ.get("THE_GRAPH_API_KEY"):
         raise HTTPException(status_code=400, detail="Missing THE_GRAPH_API_KEY on server.")
     if req.days < 1 or req.days > 3650:
@@ -659,7 +752,7 @@ def run_pools(req: PoolsRunRequest) -> dict[str, str]:
             "result": None,
             "error": None,
         }
-    t = threading.Thread(target=_run_pool_job, args=(job_id, req), daemon=True)
+    t = threading.Thread(target=_run_pool_job, args=(job_id, req, session_id), daemon=True)
     t.start()
     return {"job_id": job_id}
 
@@ -671,6 +764,22 @@ def job_status(job_id: str) -> dict[str, Any]:
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.get("/api/runs/recent")
+def recent_runs(request: Request, response: Response) -> dict[str, Any]:
+    session_id = _ensure_session_cookie(request, response)
+    with JOB_LOCK:
+        items = list(RUN_HISTORY.get(session_id, []))
+    return {"items": items}
+
+
+@app.post("/api/runs/reset")
+def reset_runs(request: Request, response: Response) -> dict[str, Any]:
+    session_id = _ensure_session_cookie(request, response)
+    with JOB_LOCK:
+        RUN_HISTORY.pop(session_id, None)
+    return {"ok": True}
 
 
 HTML_PAGE = """
@@ -1153,6 +1262,7 @@ HTML_PAGE = """
         <div class="actions" style="margin-top:14px">
           <div class="actions-left">
             <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
+            <button class="btn secondary" onclick="resetLogs()">Reset logs</button>
             <button class="btn secondary" onclick="exportCsv()">Export CSV</button>
           </div>
           <div class="actions-right">
@@ -1432,6 +1542,49 @@ HTML_PAGE = """
     function toggleLogs() {
       const wrap = document.getElementById("logsWrap");
       wrap.style.display = wrap.style.display === "none" ? "block" : "none";
+      if (wrap.style.display !== "none") {
+        loadRecentLogs();
+      }
+    }
+
+    async function loadRecentLogs() {
+      const logsEl = document.getElementById("logs");
+      if (!logsEl) return;
+      try {
+        const r = await fetch("/api/runs/recent");
+        const data = await r.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        if (!items.length) {
+          logsEl.textContent = "No logs yet.";
+          return;
+        }
+        const chunks = [];
+        for (const it of items.slice(0, 10)) {
+          const req = it.request || {};
+          const head = `[${it.ts || "-"}] ${String(it.status || "").toUpperCase()} | pairs=${req.pairs || "-"} | days=${req.days ?? "-"} | min_tvl=${req.min_tvl ?? "-"} | chains=${(req.include_chains || []).join(",") || "all"}`;
+          const err = it.error ? `ERROR: ${it.error}` : "";
+          const body = (it.logs || []).join("\\n\\n");
+          chunks.push([head, err, body].filter(Boolean).join("\\n"));
+        }
+        logsEl.textContent = chunks.join("\\n\\n----------------------------------------\\n\\n");
+      } catch (e) {
+        logsEl.textContent = "Failed to load recent logs.";
+      }
+    }
+
+    async function resetLogs() {
+      try {
+        const r = await fetch("/api/runs/reset", {method: "POST"});
+        if (!r.ok) {
+          setStatus("Failed to reset logs", "fail");
+          return;
+        }
+        const logsEl = document.getElementById("logs");
+        if (logsEl) logsEl.textContent = "No logs yet.";
+        setStatus("Logs reset", "ok");
+      } catch (e) {
+        setStatus("Failed to reset logs", "fail");
+      }
     }
 
     function renderTable(rows) {
@@ -1634,8 +1787,7 @@ HTML_PAGE = """
       if (mTotal) mTotal.textContent = result.total;
       if (mChart) mChart.textContent = result.chart_pools;
       if (mErr) mErr.textContent = result.error_pools;
-      const logsEl = document.getElementById("logs");
-      if (logsEl) logsEl.textContent = (result.logs || []).join("\\n\\n") || "No logs.";
+      loadRecentLogs();
 
       const feeTraces = [];
       const tvlTraces = [];
