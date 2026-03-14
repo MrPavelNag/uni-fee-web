@@ -709,7 +709,7 @@ class PoolsRunRequest(BaseModel):
     pairs: list[str] = Field(default_factory=list, description="Up to 4 pairs: tokenA,tokenB")
     include_chains: list[str] = Field(default_factory=list)
     include_versions: list[str] = Field(default_factory=lambda: ["v3", "v4"])
-    min_tvl: float = 1000000.0
+    min_tvl: float = 1000.0
     days: int = 30
     min_fee_pct: float = 0.0
     max_fee_pct: float = 2.0
@@ -784,13 +784,13 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
     if not os.environ.get("THE_GRAPH_API_KEY"):
         raise HTTPException(status_code=400, detail="Missing THE_GRAPH_API_KEY on server.")
     if req.days < 1 or req.days > 3650:
-        raise HTTPException(status_code=400, detail="days must be between 1 and 3650")
-    if req.min_tvl < 0:
-        raise HTTPException(status_code=400, detail="min_tvl must be >= 0")
-    if req.min_fee_pct < 0 or req.min_fee_pct >= 100:
-        raise HTTPException(status_code=400, detail="min_fee_pct must be between 0 and <100")
-    if req.max_fee_pct <= 0 or req.max_fee_pct > 100:
-        raise HTTPException(status_code=400, detail="max_fee_pct must be between >0 and 100")
+        raise HTTPException(status_code=400, detail="days must be an integer between 1 and 3650")
+    if req.min_tvl < 0 or req.min_tvl > 10_000_000:
+        raise HTTPException(status_code=400, detail="min_tvl must be in range 0..10000000")
+    if req.min_fee_pct < 0 or req.min_fee_pct > 1:
+        raise HTTPException(status_code=400, detail="min_fee_pct must be in range 0..1")
+    if req.max_fee_pct < 1 or req.max_fee_pct > 3:
+        raise HTTPException(status_code=400, detail="max_fee_pct must be in range 1..3")
     if req.min_fee_pct >= req.max_fee_pct:
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
     req.include_versions = [str(v).strip().lower() for v in (req.include_versions or []) if str(v).strip()]
@@ -1250,7 +1250,11 @@ HTML_PAGE = """
       align-items: center;
       gap: 5px;
       font-size: 12px;
+      font-weight: 600;
       color: #334155;
+      padding-top: 0;
+      line-height: 1;
+      white-space: nowrap;
     }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
@@ -1325,19 +1329,19 @@ HTML_PAGE = """
               <div class="inline-grid">
                 <div class="filter-item">
                   <div class="hint">Min TVL<br/>(USD)</div>
-                  <input id="minTvl" value="1000000" type="number"/>
+                  <input id="minTvl" value="1000" type="number" min="0" max="10000000" step="1"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">History<br/>days</div>
-                  <input id="days" value="30" type="number"/>
+                  <input id="days" value="30" type="number" min="1" max="3650" step="1"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">Exclude below<br/>X% fee</div>
-                  <input id="minFeePct" value="0" type="number" step="0.1" min="0" max="99.9"/>
+                  <input id="minFeePct" value="0" type="number" step="0.1" min="0" max="1"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">Exclude above<br/>X% fee</div>
-                  <input id="maxFeePct" value="2" type="number" step="0.1" min="0.1" max="100"/>
+                  <input id="maxFeePct" value="2" type="number" step="0.1" min="1" max="3"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">Exclude address suffix<br/>(last 4)</div>
@@ -1834,7 +1838,7 @@ HTML_PAGE = """
           pairs: pairCheck.pairs,
           include_chains: getSelectedChains(),
           include_versions: getSelectedProtocols(),
-          min_tvl: Number(document.getElementById("minTvl").value || 1000000),
+          min_tvl: Number(document.getElementById("minTvl").value || 1000),
           days: Number(document.getElementById("days").value || 30),
           max_fee_pct: Number(document.getElementById("maxFeePct").value || 2),
           min_fee_pct: Number(document.getElementById("minFeePct").value || 0),
@@ -1842,6 +1846,26 @@ HTML_PAGE = """
         };
         if (!payload.include_versions.length) {
           setStatus("Select at least one protocol (V3/V4).", "fail");
+          return;
+        }
+        if (!Number.isInteger(payload.days) || payload.days < 1 || payload.days > 3650) {
+          setStatus("History days must be an integer in range 1..3650.", "fail");
+          return;
+        }
+        if (!Number.isFinite(payload.min_tvl) || payload.min_tvl < 0 || payload.min_tvl > 10000000) {
+          setStatus("Min TVL must be in range 0..10000000.", "fail");
+          return;
+        }
+        if (!Number.isFinite(payload.min_fee_pct) || payload.min_fee_pct < 0 || payload.min_fee_pct > 1) {
+          setStatus("Exclude below must be in range 0..1.", "fail");
+          return;
+        }
+        if (!Number.isFinite(payload.max_fee_pct) || payload.max_fee_pct < 1 || payload.max_fee_pct > 3) {
+          setStatus("Exclude above must be in range 1..3.", "fail");
+          return;
+        }
+        if (payload.min_fee_pct >= payload.max_fee_pct) {
+          setStatus("Exclude below must be lower than Exclude above.", "fail");
           return;
         }
         if (!pairCheck.valid) {
