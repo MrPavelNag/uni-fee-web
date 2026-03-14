@@ -301,7 +301,10 @@ def main() -> None:
     print(f"Найдено {len(pools)} v4 пулов")
 
     # PDF-список пулов (аналогично v3)
-    save_pdf(pools, f"data/available_pairs_v4_{suffix}.pdf")
+    if os.environ.get("DISABLE_PDF_OUTPUT", "").strip().lower() not in ("1", "true", "yes", "on"):
+        save_pdf(pools, f"data/available_pairs_v4_{suffix}.pdf")
+    else:
+        print("PDF output disabled (DISABLE_PDF_OUTPUT=1)")
 
     chart_data = {}
     for i, p in enumerate(pools):

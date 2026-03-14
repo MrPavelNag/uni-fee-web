@@ -479,6 +479,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
     env["TOKEN_PAIRS"] = token_pairs
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
+    env["DISABLE_PDF_OUTPUT"] = "1"
 
     # v4 endpoint config uses this list at import-time
     if include_chains:
@@ -1064,8 +1065,8 @@ HTML_PAGE = """
               </div>
               <div class="pair-row" id="pairRows">
                 <div class="pair-item" id="pairRow1">
-                  <div class="token-input-wrap"><input id="pair1a" list="tokenHints" placeholder="base token"/><button class="dd-btn" onclick="openTokenList('pair1a')">▼</button></div>
-                  <div class="token-input-wrap"><input id="pair1b" list="tokenHints" placeholder="quote token"/><button class="dd-btn" onclick="openTokenList('pair1b')">▼</button></div>
+                  <div class="token-input-wrap"><input id="pair1a" list="tokenHints" placeholder="base token" value="usdt"/><button class="dd-btn" onclick="openTokenList('pair1a')">▼</button></div>
+                  <div class="token-input-wrap"><input id="pair1b" list="tokenHints" placeholder="quote token" value="usdc"/><button class="dd-btn" onclick="openTokenList('pair1b')">▼</button></div>
                 </div>
                 <div class="pair-item" id="pairRow2" style="display:none">
                   <div class="token-input-wrap"><input id="pair2a" list="tokenHints" placeholder="base token"/><button class="dd-btn" onclick="openTokenList('pair2a')">▼</button></div>
@@ -1331,7 +1332,7 @@ HTML_PAGE = """
       clearPairErrors();
       const out = [];
       let hasError = false;
-      for (let i = 1; i <= pairRowsVisible; i++) {
+      for (let i = 1; i <= 4; i++) {
         const aEl = document.getElementById(`pair${i}a`);
         const bEl = document.getElementById(`pair${i}b`);
         const a = (aEl?.value || "").trim().toLowerCase();
@@ -1345,7 +1346,8 @@ HTML_PAGE = """
         }
         out.push(`${a},${b}`);
       }
-      return {pairs: out, valid: !hasError && out.length > 0};
+      const unique = Array.from(new Set(out));
+      return {pairs: unique, valid: !hasError && unique.length > 0};
     }
 
     function getSelectedPairs() {

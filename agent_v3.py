@@ -216,7 +216,10 @@ def main() -> None:
     pools = discover_pools_v3(token_pairs, args.min_tvl, fresh_token_lookup=fresh)
     print(f"Found {len(pools)} v3 pools")
 
-    save_pdf(pools, f"data/available_pairs_v3_{suffix}.pdf")
+    if os.environ.get("DISABLE_PDF_OUTPUT", "").strip().lower() not in ("1", "true", "yes", "on"):
+        save_pdf(pools, f"data/available_pairs_v3_{suffix}.pdf")
+    else:
+        print("PDF output disabled (DISABLE_PDF_OUTPUT=1)")
 
     pool_chart_data = {}
     for i, p in enumerate(pools):
