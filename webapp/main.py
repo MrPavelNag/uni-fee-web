@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,19 +21,35 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from agent_common import _is_bad_fee_entry, load_chart_data_json, pairs_to_filename_suffix
+from agent_common import load_chart_data_json, pairs_to_filename_suffix
 from config import GOLDSKY_ENDPOINTS, TOKEN_ADDRESSES, UNISWAP_V3_SUBGRAPHS, UNISWAP_V4_SUBGRAPHS
+from uniswap_client import get_graph_endpoint, graphql_query
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
+TOKEN_CATALOG_PATH = DATA_DIR / "token_catalog.json"
+CHAIN_CATALOG_PATH = DATA_DIR / "chain_catalog.json"
 
 app = FastAPI(title="Uni Fee Web", version="0.1.0")
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    _start_catalog_auto_refresh()
+
+
+@app.on_event("shutdown")
+def _on_shutdown() -> None:
+    _stop_catalog_auto_refresh()
 
 # Simple in-memory job storage (MVP)
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()  # prevent collisions in shared data/*.json files
+CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
+CATALOG_REFRESH_STOP = threading.Event()
+CATALOG_REFRESH_THREAD: threading.Thread | None = None
 
 
 def _parse_pairs_str(raw: str) -> list[tuple[str, str]]:
@@ -68,6 +85,144 @@ def _supported_chains() -> list[str]:
     return sorted(chains)
 
 
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        import json
+
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=True, indent=2)
+
+
+def _load_chain_catalog(refresh: bool = False) -> dict[str, Any]:
+    if not refresh:
+        cached = _read_json(CHAIN_CATALOG_PATH)
+        if cached and isinstance(cached.get("items"), list):
+            return cached
+    items = _supported_chains()
+    out = {"updated_at": _iso_now(), "count": len(items), "items": items}
+    _write_json(CHAIN_CATALOG_PATH, out)
+    return out
+
+
+def _fetch_v3_tokens(chain: str, limit: int = 4000) -> list[str]:
+    endpoint = get_graph_endpoint(chain, "v3")
+    if not endpoint:
+        return []
+    symbols: list[str] = []
+    seen = set()
+    skip = 0
+    page_size = 1000
+    query = """
+    query Tokens($skip: Int!) {
+      tokens(first: 1000, skip: $skip, orderBy: totalValueLockedUSD, orderDirection: desc) {
+        symbol
+      }
+    }
+    """
+    while skip < limit:
+        data = graphql_query(endpoint, query, {"skip": skip})
+        tokens = data.get("data", {}).get("tokens", [])
+        if not tokens:
+            break
+        for t in tokens:
+            sym = (t.get("symbol") or "").strip().lower()
+            if not sym:
+                continue
+            if sym not in seen:
+                seen.add(sym)
+                symbols.append(sym)
+        if len(tokens) < page_size:
+            break
+        skip += page_size
+    return symbols
+
+
+def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
+    if not refresh:
+        cached = _read_json(TOKEN_CATALOG_PATH)
+        if cached and isinstance(cached.get("items"), list):
+            return cached
+    by_chain: dict[str, list[str]] = {}
+    all_tokens: set[str] = set()
+    chains = _supported_chains()
+    for c in chains:
+        # Token entity is guaranteed in v3 schema; for v4 we still derive from supported list.
+        if c not in UNISWAP_V3_SUBGRAPHS and c not in GOLDSKY_ENDPOINTS:
+            continue
+        try:
+            syms = _fetch_v3_tokens(c)
+        except Exception:
+            syms = []
+        if syms:
+            by_chain[c] = syms
+            all_tokens.update(syms)
+
+    # Fallback to config tokens if endpoint data is limited.
+    if not all_tokens:
+        all_tokens.update(_supported_tokens())
+    out = {
+        "updated_at": _iso_now(),
+        "count": len(all_tokens),
+        "items": sorted(all_tokens),
+        "by_chain": by_chain,
+    }
+    _write_json(TOKEN_CATALOG_PATH, out)
+    return out
+
+
+def _refresh_catalogs_once() -> None:
+    """Refresh tokens/chains catalogs and keep app responsive on partial failures."""
+    try:
+        _load_chain_catalog(refresh=True)
+    except Exception as e:
+        print(f"[catalog-refresh] chains refresh failed: {e}")
+    try:
+        _load_token_catalog(refresh=True)
+    except Exception as e:
+        print(f"[catalog-refresh] tokens refresh failed: {e}")
+
+
+def _catalog_refresh_loop(interval_sec: int) -> None:
+    # Immediate refresh on startup, then every `interval_sec`.
+    _refresh_catalogs_once()
+    while not CATALOG_REFRESH_STOP.wait(interval_sec):
+        _refresh_catalogs_once()
+
+
+def _start_catalog_auto_refresh() -> None:
+    global CATALOG_REFRESH_THREAD
+    if CATALOG_REFRESH_THREAD and CATALOG_REFRESH_THREAD.is_alive():
+        return
+    CATALOG_REFRESH_STOP.clear()
+    CATALOG_REFRESH_THREAD = threading.Thread(
+        target=_catalog_refresh_loop,
+        args=(CATALOG_REFRESH_INTERVAL_SEC,),
+        daemon=True,
+        name="catalog-auto-refresh",
+    )
+    CATALOG_REFRESH_THREAD.start()
+
+
+def _stop_catalog_auto_refresh() -> None:
+    CATALOG_REFRESH_STOP.set()
+
+
 def _final_income(data: dict) -> float:
     fees = data.get("fees") or []
     return float(fees[-1][1]) if fees else 0.0
@@ -97,6 +252,7 @@ def _fee_over_threshold(data: dict, threshold_pct: float) -> bool:
 def _merge_for_web(
     token_pairs: str,
     include_chains: list[str],
+    min_fee_pct: float,
     max_fee_pct: float,
 ) -> dict[str, Any]:
     suffix = pairs_to_filename_suffix(token_pairs)
@@ -113,18 +269,24 @@ def _merge_for_web(
     if in_chains:
         merged = {k: v for k, v in merged.items() if v.get("chain", "").lower() in in_chains}
 
-    bad = {k: v for k, v in merged.items() if _is_bad_fee_entry(v) or _fee_over_threshold(v, max_fee_pct)}
-    good = {k: v for k, v in merged.items() if k not in bad}
+    def in_fee_range(item: dict) -> bool:
+        try:
+            pct = float(item.get("fee_pct") or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        return min_fee_pct <= pct <= max_fee_pct
 
-    sorted_good = sorted(good.items(), key=lambda kv: _final_income(kv[1]), reverse=True)
-    sorted_bad = sorted(bad.items(), key=lambda kv: _final_income(kv[1]), reverse=True)
+    all_items = sorted(merged.items(), key=lambda kv: _final_income(kv[1]), reverse=True)
 
     rows = []
     chart_series = []
-    for pool_id, v in sorted_good + sorted_bad:
+    filtered_out = 0
+    for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
-        status = "error_fee_gt_3pct" if pool_id in bad else "ok"
+        status = "ok" if in_fee_range(v) else "filtered_fee_range"
+        if status != "ok":
+            filtered_out += 1
         row = {
             "pool_id": v.get("pool_id", pool_id),
             "chain": v.get("chain", ""),
@@ -149,8 +311,8 @@ def _merge_for_web(
     return {
         "suffix": suffix,
         "total": len(merged),
-        "chart_pools": len(sorted_good),
-        "error_pools": len(sorted_bad),
+        "chart_pools": len(chart_series),
+        "error_pools": filtered_out,
         "rows": rows,
         "series": chart_series,
     }
@@ -233,7 +395,12 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
             _set_stage("v4", "Running v4 discovery and calculations", 55)
             _run_subprocess("agent_v4.py", env, req.min_tvl, logs)
         _set_stage("merge", "Merging results for web", 80)
-        result = _merge_for_web(token_pairs, include_chains=include_chains, max_fee_pct=req.max_fee_pct)
+        result = _merge_for_web(
+            token_pairs,
+            include_chains=include_chains,
+            min_fee_pct=req.min_fee_pct,
+            max_fee_pct=req.max_fee_pct,
+        )
         with JOB_LOCK:
             job["status"] = "done"
             job["stage"] = "done"
@@ -245,6 +412,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
                     "days": req.days,
                     "min_tvl": req.min_tvl,
                     "include_chains": include_chains,
+                    "min_fee_pct": req.min_fee_pct,
                     "max_fee_pct": req.max_fee_pct,
                 },
                 **result,
@@ -268,6 +436,7 @@ class PoolsRunRequest(BaseModel):
     include_chains: list[str] = Field(default_factory=list)
     min_tvl: float = 100.0
     days: int = 90
+    min_fee_pct: float = 0.0
     max_fee_pct: float = 3.0
 
 
@@ -288,10 +457,39 @@ def positions_page() -> str:
 
 @app.get("/api/meta")
 def meta() -> dict[str, Any]:
+    token_catalog = _load_token_catalog(refresh=False)
+    chain_catalog = _load_chain_catalog(refresh=False)
     return {
-        "tokens": _supported_tokens(),
-        "chains": _supported_chains(),
-        "quote_tokens": ["usdt", "usdc", "eth"],
+        "tokens": token_catalog.get("items", []),
+        "chains": chain_catalog.get("items", []),
+        "token_catalog": {
+            "count": token_catalog.get("count", 0),
+            "updated_at": token_catalog.get("updated_at"),
+        },
+        "chain_catalog": {
+            "count": chain_catalog.get("count", 0),
+            "updated_at": chain_catalog.get("updated_at"),
+        },
+    }
+
+
+@app.post("/api/catalog/tokens/review")
+def review_tokens() -> dict[str, Any]:
+    data = _load_token_catalog(refresh=True)
+    return {
+        "ok": True,
+        "count": data.get("count", 0),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+@app.post("/api/catalog/chains/review")
+def review_chains() -> dict[str, Any]:
+    data = _load_chain_catalog(refresh=True)
+    return {
+        "ok": True,
+        "count": data.get("count", 0),
+        "updated_at": data.get("updated_at"),
     }
 
 
@@ -308,8 +506,12 @@ def run_pools(req: PoolsRunRequest) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="days must be between 1 and 3650")
     if req.min_tvl < 0:
         raise HTTPException(status_code=400, detail="min_tvl must be >= 0")
+    if req.min_fee_pct < 0 or req.min_fee_pct >= 100:
+        raise HTTPException(status_code=400, detail="min_fee_pct must be between 0 and <100")
     if req.max_fee_pct <= 0 or req.max_fee_pct > 100:
-        raise HTTPException(status_code=400, detail="max_fee_pct must be between 0 and 100")
+        raise HTTPException(status_code=400, detail="max_fee_pct must be between >0 and 100")
+    if req.min_fee_pct >= req.max_fee_pct:
+        raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
 
     job_id = str(uuid.uuid4())
     with JOB_LOCK:
@@ -347,7 +549,7 @@ HTML_PAGE = """
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     :root {
-      --bg: #f3f7ff;
+      --bg: #e2eaf8;
       --card: #ffffff;
       --muted: #64748b;
       --text: #0f172a;
@@ -362,7 +564,7 @@ HTML_PAGE = """
     body {
       margin: 0;
       font-family: Inter, Arial, sans-serif;
-      background: linear-gradient(180deg, #eef5ff 0%, var(--bg) 100%);
+      background: linear-gradient(180deg, #d9e3f5 0%, var(--bg) 100%);
       color: var(--text);
     }
     .container {
@@ -445,7 +647,7 @@ HTML_PAGE = """
       border: 1px solid #cbd5e1;
       color: var(--text);
       border-radius: 8px;
-      padding: 10px;
+      padding: 8px;
       font-size: 14px;
     }
     select { appearance: auto; }
@@ -454,6 +656,7 @@ HTML_PAGE = """
       gap: 10px;
       flex-wrap: wrap;
       align-items: center;
+      justify-content: flex-end;
     }
     .btn {
       border: 0;
@@ -516,23 +719,23 @@ HTML_PAGE = """
     }
     .metrics {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
       gap: 10px;
     }
     .metric {
       background: #f8fafc;
       border: 1px solid #e2e8f0;
       border-radius: 10px;
-      padding: 10px;
+      padding: 8px;
     }
     .metric .k {
       color: var(--muted);
       font-size: 12px;
     }
     .metric .v {
-      font-size: 22px;
+      font-size: 18px;
       font-weight: 800;
-      margin-top: 3px;
+      margin-top: 1px;
     }
     .charts-grid {
       display: grid;
@@ -541,7 +744,7 @@ HTML_PAGE = """
     }
     .plot {
       width: 100%;
-      min-height: 420px;
+      min-height: 330px;
       border: 1px solid #dbe3ef;
       border-radius: 10px;
       background: #ffffff;
@@ -580,7 +783,7 @@ HTML_PAGE = """
       background: #f8fafc;
       border: 1px solid #dbe3ef;
       border-radius: 8px;
-      padding: 10px;
+      padding: 8px;
       color: #334155;
       font-size: 12px;
     }
@@ -589,6 +792,12 @@ HTML_PAGE = """
       grid-template-columns: repeat(3, minmax(180px, 1fr));
       gap: 8px;
     }
+    .pair-item { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+    .meta-badge { border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #475569; background: #f8fafc; }
+    .small-btn { border: 1px solid #d1d5db; background: #f8fafc; color: #334155; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
+    .color-dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 1px solid #64748b; }
+
     .chain-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -606,23 +815,17 @@ HTML_PAGE = """
       width: auto;
       padding: 0;
     }
-    .tooltip {
-      color: #475569;
-      font-size: 12px;
-      margin-left: 6px;
-      cursor: help;
-      border-bottom: 1px dotted #94a3b8;
-    }
+    
     .inline-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
+      grid-template-columns: 120px 120px 180px 180px;
+      gap: 8px;
     }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
       .pair-row { grid-template-columns: 1fr; }
-      .inline-grid { grid-template-columns: 1fr; }
+      .inline-grid { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
@@ -643,47 +846,64 @@ HTML_PAGE = """
       <section class="card">
         <div class="form-grid">
           <div class="row">
-            <label title="Select up to 3 pairs for analysis">Pairs <span class="tooltip" title="Select up to 3 pairs from the list. Search by typing first letters.">?</span></label>
+            <label title="Select up to 3 pairs for analysis">Pairs</label>
             <div>
-              <div class="pair-row">
-                <input id="pair1" list="pairHints" placeholder="pair 1 (e.g. wbtc,usdt)" title="Pair #1"/>
-                <input id="pair2" list="pairHints" placeholder="pair 2" title="Pair #2"/>
-                <input id="pair3" list="pairHints" placeholder="pair 3" title="Pair #3"/>
+              <div class="top-line">
+                <button class="small-btn" onclick="reviewTokens()">Review tokens</button>
+                <span class="meta-badge" id="tokensMeta">tokens: -</span>
               </div>
-              <datalist id="pairHints"></datalist>
+              <div class="pair-row">
+                <div class="pair-item">
+                  <input id="pair1a" list="tokenHints" placeholder="base token"/>
+                  <input id="pair1b" list="tokenHints" placeholder="quote token"/>
+                </div>
+                <div class="pair-item">
+                  <input id="pair2a" list="tokenHints" placeholder="base token"/>
+                  <input id="pair2b" list="tokenHints" placeholder="quote token"/>
+                </div>
+                <div class="pair-item">
+                  <input id="pair3a" list="tokenHints" placeholder="base token"/>
+                  <input id="pair3b" list="tokenHints" placeholder="quote token"/>
+                </div>
+              </div>
+              <datalist id="tokenHints"></datalist>
               <div class="hint">Maximum 3 pairs.</div>
             </div>
           </div>
 
           <div class="row">
-            <label title="Choose chains for analysis">Include chains <span class="tooltip" title="Choose 'all' or select specific chains">?</span></label>
+            <label title="Choose chains for analysis">Include chains</label>
             <div>
+              <div class="top-line">
+                <button class="small-btn" onclick="reviewChains()">Review chains</button>
+                <span class="meta-badge" id="chainsMeta">chains: -</span>
+              </div>
               <label class="check"><input type="checkbox" id="allChains" checked onchange="toggleAllChains()"> all</label>
               <div class="chain-grid" id="chainChecks"></div>
             </div>
           </div>
 
           <div class="row">
-            <label>Filters <span class="tooltip" title="Control TVL/history and fee cutoff for chart inclusion">?</span></label>
+            <label>Filters</label>
             <div>
               <div class="inline-grid">
                 <div>
                   <div class="hint" style="margin-bottom:4px">Min TVL (USD)</div>
-                  <input id="minTvl" value="1000" type="number" title="Pools below this TVL are ignored"/>
+                  <input id="minTvl" value="1000" type="number"/>
                 </div>
                 <div>
                   <div class="hint" style="margin-bottom:4px">History days</div>
-                  <input id="days" value="90" type="number" title="How many historical days to load"/>
+                  <input id="days" value="90" type="number"/>
+                </div>
+                <div>
+                  <div class="hint" style="margin-bottom:4px">Exclude pools above X% fee</div>
+                  <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100"/>
+                </div>
+                <div>
+                  <div class="hint" style="margin-bottom:4px">Exclude pools below X% fee</div>
+                  <input id="minFeePct" value="0" type="number" step="0.1" min="0" max="99.9"/>
                 </div>
               </div>
-            </div>
-          </div>
-
-          <div class="row">
-            <label for="maxFeePct" title="Pools above this fee are excluded from chart and flagged as error">Fee cutoff <span class="tooltip" title="Exclude pools with fee higher than X%">?</span></label>
-            <div>
-              <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100" title="Exclude pools with fee above this value"/>
-              <div class="hint">Exclude pools above X% fee.</div>
             </div>
           </div>
         </div>
@@ -708,7 +928,7 @@ HTML_PAGE = """
           <div class="metric"><div class="k">Pairs suffix</div><div class="v" id="mSuffix">-</div></div>
           <div class="metric"><div class="k">Total pools</div><div class="v" id="mTotal">0</div></div>
           <div class="metric"><div class="k">Pools in chart</div><div class="v" id="mChart">0</div></div>
-          <div class="metric"><div class="k">Error fee > 3%</div><div class="v" id="mErr">0</div></div>
+          <div class="metric"><div class="k">Filtered by fee range</div><div class="v" id="mErr">0</div></div>
         </div>
         <details>
           <summary>Latest run logs</summary>
@@ -717,7 +937,6 @@ HTML_PAGE = """
       </section>
 
       <section class="card">
-        <h3>Charts</h3>
         <div class="charts-grid">
           <div id="feesChart" class="plot"></div>
           <div id="tvlChart" class="plot"></div>
@@ -726,7 +945,7 @@ HTML_PAGE = """
 
       <section class="card">
         <h3>Pools Table</h3>
-        <div class="hint" style="margin-bottom:8px">Click a column header to sort.</div>
+        <div class="hint" style="margin-bottom:8px">Sorted by cumulative fee descending by default.</div>
         <div class="table-wrap">
           <table id="resultTable"></table>
         </div>
@@ -736,6 +955,7 @@ HTML_PAGE = """
 
   <script>
     const SORTABLE = {
+      color: (r) => r.pool_id || "",
       chain: (r) => r.chain || "",
       version: (r) => r.version || "",
       pair: (r) => r.pair || "",
@@ -749,9 +969,10 @@ HTML_PAGE = """
     let renderedRows = [];
     let sortKey = "final_income";
     let sortDesc = true;
-    const FORM_STORAGE_KEY = "uni_fee_form_v2";
-    const FIELD_IDS = ["pair1", "pair2", "pair3", "minTvl", "days", "maxFeePct", "allChains"];
+    const FORM_STORAGE_KEY = "uni_fee_form_v3";
+    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "minTvl", "days", "maxFeePct", "minFeePct", "allChains"];
     let availableChains = [];
+    let colorMap = {};
 
     function splitCSV(v) {
       return (v || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
@@ -836,9 +1057,13 @@ HTML_PAGE = """
     }
 
     function getSelectedPairs() {
-      return [document.getElementById("pair1").value, document.getElementById("pair2").value, document.getElementById("pair3").value]
-        .map(v => (v || "").trim().toLowerCase())
-        .filter(Boolean);
+      const out = [];
+      for (let i = 1; i <= 3; i++) {
+        const a = (document.getElementById(`pair${i}a`).value || "").trim().toLowerCase();
+        const b = (document.getElementById(`pair${i}b`).value || "").trim().toLowerCase();
+        if (a && b && a !== b) out.push(`${a},${b}`);
+      }
+      return out;
     }
 
     function getSelectedChains() {
@@ -863,7 +1088,7 @@ HTML_PAGE = """
     function renderTable(rows) {
       const table = document.getElementById("resultTable");
       const hdr = [
-        ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
+        ["color", ""], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
         ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["last_tvl", "TVL"], ["status", "Status"]
       ];
 
@@ -876,7 +1101,9 @@ HTML_PAGE = """
 
       for (const r of rows) {
         const cls = r.status === "ok" ? "ok-row" : "error-row";
+        const color = colorMap[r.pool_id] || "#94a3b8";
         html += `<tr class="${cls}">`;
+        html += `<td><span class="color-dot" style="background:${color}"></span></td>`;
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
         html += `<td>${r.pair}</td>`;
@@ -884,7 +1111,7 @@ HTML_PAGE = """
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
-        html += `<td>${r.status === "ok" ? "ok" : "error fee>3%"}</td>`;
+        html += `<td>${r.status === "ok" ? "ok" : "filtered by fee range"}</td>`;
         html += "</tr>";
       }
       table.innerHTML = html;
@@ -937,17 +1164,12 @@ HTML_PAGE = """
       try {
         const r = await fetch("/api/meta");
         const meta = await r.json();
-        const commonQuotes = ["usdt", "usdc", "eth"];
-        const pairs = [];
-        for (const t of meta.tokens) {
-          for (const q of commonQuotes) {
-            if (t !== q) pairs.push(`${t},${q}`);
-          }
-        }
-        const pairHints = document.getElementById("pairHints");
-        pairHints.innerHTML = pairs.slice(0, 500).map(p => `<option value="${p}"></option>`).join("");
+        const tokenHints = document.getElementById("tokenHints");
+        tokenHints.innerHTML = (meta.tokens || []).slice(0, 5000).map(t => `<option value="${t}"></option>`).join("");
+        document.getElementById("tokensMeta").textContent = `tokens: ${meta.token_catalog?.count || 0}, updated: ${meta.token_catalog?.updated_at || "-"}`;
 
         availableChains = meta.chains || [];
+        document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;
         const checks = document.getElementById("chainChecks");
         checks.innerHTML = availableChains.map(c => (
           `<label class="check"><input type="checkbox" id="chain_${c}" onchange="saveFormState()"> ${c}</label>`
@@ -959,13 +1181,36 @@ HTML_PAGE = """
       }
     }
 
+    async function reviewTokens() {
+      setStatus("Refreshing token catalog...", "running");
+      const r = await fetch("/api/catalog/tokens/review", {method: "POST"});
+      if (!r.ok) {
+        setStatus("Token refresh failed", "fail");
+        return;
+      }
+      await loadMeta();
+      setStatus("Token catalog updated", "ok");
+    }
+
+    async function reviewChains() {
+      setStatus("Refreshing chain catalog...", "running");
+      const r = await fetch("/api/catalog/chains/review", {method: "POST"});
+      if (!r.ok) {
+        setStatus("Chain refresh failed", "fail");
+        return;
+      }
+      await loadMeta();
+      setStatus("Chain catalog updated", "ok");
+    }
+
     async function runJob() {
       const payload = {
         pairs: getSelectedPairs(),
         include_chains: getSelectedChains(),
         min_tvl: Number(document.getElementById("minTvl").value || 0),
         days: Number(document.getElementById("days").value || 90),
-        max_fee_pct: Number(document.getElementById("maxFeePct").value || 3)
+        max_fee_pct: Number(document.getElementById("maxFeePct").value || 3),
+        min_fee_pct: Number(document.getElementById("minFeePct").value || 0)
       };
       if (payload.pairs.length === 0) {
         setStatus("Select at least one pair.", "fail");
@@ -998,7 +1243,7 @@ HTML_PAGE = """
         if (job.status === "done") {
           clearInterval(timer);
           setBusy(false);
-          setStatus("Done", "ok");
+          setStatus("Completed", "ok");
           renderResult(job.result);
         } else if (job.status === "failed") {
           clearInterval(timer);
@@ -1008,7 +1253,7 @@ HTML_PAGE = """
             document.getElementById("logs").textContent = job.result.logs.join("\\n\\n");
           }
         } else {
-          setStatus("Status: " + (job.stage_label || job.status), "running");
+          setStatus(job.stage_label || job.status, "running");
         }
       }, 2000);
     }
@@ -1022,25 +1267,33 @@ HTML_PAGE = """
 
       const feeTraces = [];
       const tvlTraces = [];
+      colorMap = {};
+      const palette = ["#1d4ed8", "#0891b2", "#7c3aed", "#ea580c", "#059669", "#dc2626", "#4f46e5", "#0ea5e9", "#65a30d", "#be185d"];
       for (const s of result.series) {
         const feeX = s.fees.map(p => new Date(p[0] * 1000));
         const feeY = s.fees.map(p => p[1]);
         const tvlX = s.tvl.map(p => new Date(p[0] * 1000));
         const tvlY = s.tvl.map(p => p[1] / 1000.0);
-        feeTraces.push({x: feeX, y: feeY, mode: "lines", name: s.label});
-        tvlTraces.push({x: tvlX, y: tvlY, mode: "lines", name: s.label});
+        const c = palette[feeTraces.length % palette.length];
+        colorMap[s.pool_id] = c;
+        feeTraces.push({x: feeX, y: feeY, mode: "lines", name: s.label, line: {color: c, width: 2}});
+        tvlTraces.push({x: tvlX, y: tvlY, mode: "lines", name: s.label, line: {color: c, width: 2}});
       }
       Plotly.newPlot("feesChart", feeTraces, {
         title: "Cumulative Fees",
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#ffffff",
-        font: {color: "#0f172a"}
+        font: {color: "#0f172a"},
+        showlegend: false,
+        margin: {t: 34, b: 28, l: 50, r: 16}
       }, {displaylogo: false, responsive: true});
       Plotly.newPlot("tvlChart", tvlTraces, {
         title: "TVL dynamics (thousands USD)",
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#ffffff",
-        font: {color: "#0f172a"}
+        font: {color: "#0f172a"},
+        showlegend: false,
+        margin: {t: 34, b: 28, l: 50, r: 16}
       }, {displaylogo: false, responsive: true});
 
       lastRows = result.rows || [];
