@@ -30,8 +30,15 @@ from uniswap_client import get_graph_endpoint, graphql_query
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-TOKEN_CATALOG_PATH = DATA_DIR / "token_catalog.json"
-CHAIN_CATALOG_PATH = DATA_DIR / "chain_catalog.json"
+_catalog_storage_dir = os.environ.get("CATALOG_STORAGE_DIR", "").strip()
+if _catalog_storage_dir:
+    CATALOG_DIR = Path(_catalog_storage_dir).expanduser()
+else:
+    render_disk = os.environ.get("RENDER_DISK_PATH", "").strip()
+    CATALOG_DIR = (Path(render_disk) / "uni_fee_cache") if render_disk else DATA_DIR
+CATALOG_DIR.mkdir(parents=True, exist_ok=True)
+TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
+CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
 TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000"))
 CHAIN_ID_TO_NAME = {
@@ -334,16 +341,19 @@ def _merge_for_web(
     min_fee_pct: float,
     max_fee_pct: float,
     exclude_suffixes: list[str],
+    merged_override: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     suffix = pairs_to_filename_suffix(token_pairs)
-    v3_path = DATA_DIR / f"pools_v3_{suffix}.json"
-    v4_path = DATA_DIR / f"pools_v4_{suffix}.json"
-
-    v3_data = load_chart_data_json(str(v3_path))
-    v4_data = load_chart_data_json(str(v4_path))
-    merged: dict[str, dict] = {}
-    merged.update(v3_data)
-    merged.update(v4_data)
+    if merged_override is None:
+        v3_path = DATA_DIR / f"pools_v3_{suffix}.json"
+        v4_path = DATA_DIR / f"pools_v4_{suffix}.json"
+        v3_data = load_chart_data_json(str(v3_path))
+        v4_data = load_chart_data_json(str(v4_path))
+        merged: dict[str, dict] = {}
+        merged.update(v3_data)
+        merged.update(v4_data)
+    else:
+        merged = dict(merged_override)
 
     in_chains = {x.strip().lower() for x in include_chains if x.strip()}
     if in_chains:
@@ -487,18 +497,33 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest") -> None:
         env["V4_CHAINS"] = ",".join(sorted(v4_supported))
 
     try:
+        merged_raw: dict[str, dict] = {}
         with RUN_LOCK:
-            _set_stage("v3", "Running v3 discovery and calculations", 25)
-            _run_subprocess("agent_v3.py", env, req.min_tvl, logs)
-            _set_stage("v4", "Running v4 discovery and calculations", 55)
-            _run_subprocess("agent_v4.py", env, req.min_tvl, logs)
-        _set_stage("merge", "Merging results for web", 80)
+            total_pairs = max(1, len(pairs))
+            for idx, (a, b) in enumerate(pairs, start=1):
+                pair_str = f"{a},{b}"
+                pair_suffix = pairs_to_filename_suffix(pair_str)
+                env["TOKEN_PAIRS"] = pair_str
+
+                base_progress = int(10 + (idx - 1) * (65 / total_pairs))
+                _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
+                _run_subprocess("agent_v3.py", env, req.min_tvl, logs)
+                _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
+                _run_subprocess("agent_v4.py", env, req.min_tvl, logs)
+
+                v3_path = DATA_DIR / f"pools_v3_{pair_suffix}.json"
+                v4_path = DATA_DIR / f"pools_v4_{pair_suffix}.json"
+                merged_raw.update(load_chart_data_json(str(v3_path)))
+                merged_raw.update(load_chart_data_json(str(v4_path)))
+
+        _set_stage("merge", "Merging results for web", 85)
         result = _merge_for_web(
             token_pairs,
             include_chains=include_chains,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
+            merged_override=merged_raw,
         )
         with JOB_LOCK:
             job["status"] = "done"
@@ -1194,6 +1219,11 @@ HTML_PAGE = """
       return new Intl.NumberFormat("en-US", {maximumFractionDigits: 0}).format(Number(v || 0));
     }
 
+    function getDaysValue() {
+      const v = Number(document.getElementById("days")?.value || 90);
+      return Number.isFinite(v) && v > 0 ? v : 90;
+    }
+
     function setDays(v) {
       document.getElementById("days").value = v;
       saveFormState();
@@ -1613,11 +1643,18 @@ HTML_PAGE = """
       dashMap = {};
       const palette = ["#1e3a8a", "#155e75", "#14532d", "#7e22ce", "#7f1d1d", "#1d4ed8", "#0e7490", "#166534", "#6d28d9", "#be123c"];
       const dashes = ["dash", "dot", "dashdot", "longdash", "longdashdot"];
+      let maxTs = 0;
       for (const s of result.series) {
         const feeX = s.fees.map(p => new Date(p[0] * 1000));
         const feeY = s.fees.map(p => p[1]);
         const tvlX = s.tvl.map(p => new Date(p[0] * 1000));
         const tvlY = s.tvl.map(p => p[1] / 1000.0);
+        const localMax = Math.max(
+          ...(s.fees || []).map(p => Number(p[0] || 0)),
+          ...(s.tvl || []).map(p => Number(p[0] || 0)),
+          0
+        );
+        if (localMax > maxTs) maxTs = localMax;
         const c = palette[feeTraces.length % palette.length];
         const d = feeTraces.length < palette.length ? "solid" : dashes[(feeTraces.length - palette.length) % dashes.length];
         const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
@@ -1635,6 +1672,9 @@ HTML_PAGE = """
         });
       }
       const alloc = Number(result?.request?.lp_allocation_usd || 1000);
+      const days = Number(result?.request?.days || getDaysValue());
+      const endDate = maxTs > 0 ? new Date(maxTs * 1000) : new Date();
+      const startDate = new Date(endDate.getTime() - days * 24 * 3600 * 1000);
       Plotly.newPlot("feesChart", feeTraces, {
         title: `Cumulative Fees (LP allocation: $${formatUsd(alloc)})`,
         paper_bgcolor: "#ffffff",
@@ -1642,7 +1682,7 @@ HTML_PAGE = """
         font: {color: "#0f172a"},
         showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
-        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
       Plotly.newPlot("tvlChart", tvlTraces, {
@@ -1652,7 +1692,7 @@ HTML_PAGE = """
         font: {color: "#0f172a"},
         showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
-        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
 
@@ -1664,7 +1704,7 @@ HTML_PAGE = """
 
     function renderEmptyCharts() {
       const now = new Date();
-      const start = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+      const start = new Date(now.getTime() - getDaysValue() * 24 * 3600 * 1000);
       const baseline = [{x: [start, now], y: [0, 0], mode: "lines", line: {color: "rgba(0,0,0,0)", width: 1}, hoverinfo: "skip", showlegend: false}];
       const emptyLayout = {
         paper_bgcolor: "#ffffff",
