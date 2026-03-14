@@ -797,6 +797,12 @@ HTML_PAGE = """
     .status {
       font-size: 14px;
       color: #cbd5e1;
+      display: inline-block;
+      width: 260px;
+      text-align: right;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .status.running { color: var(--warn); }
     .status.ok { color: var(--ok); }
@@ -823,16 +829,44 @@ HTML_PAGE = """
       background: linear-gradient(90deg, var(--accent), var(--accent-2));
       transition: width 0.3s ease;
     }
-    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-    .metric {
+    .summary-strip {
+      display: flex;
+      gap: 8px;
+      align-items: stretch;
+      width: 100%;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+    .summary-box {
+      flex: 1 1 0;
+      min-width: 0;
       background: #f8fbff;
       border: 1px solid #cbd5e1;
       border-radius: 8px;
-      padding: 7px 8px;
-      min-height: 58px;
+      padding: 8px 10px;
+      height: 56px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
     }
-    .metric .k { color: var(--muted); font-size: 11px; }
-    .metric .v { font-size: 16px; font-weight: 800; margin-top: 1px; }
+    .summary-box .k {
+      color: #64748b;
+      font-size: 11px;
+      line-height: 1.1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .summary-box .v {
+      font-size: 17px;
+      font-weight: 800;
+      line-height: 1.1;
+      margin-top: 2px;
+      color: #0f172a;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .charts-grid {
       display: grid;
       grid-template-columns: 1fr;
@@ -945,12 +979,21 @@ HTML_PAGE = """
       padding: 0;
     }
     
-    .inline-grid { display: grid; grid-template-columns: 90px 90px 120px 120px 220px; gap: 6px; }
+    .inline-grid { display: grid; grid-template-columns: 90px 90px 120px 120px 220px; gap: 6px; align-items: end; }
+    .filter-item .hint {
+      margin-bottom: 4px !important;
+      min-height: 34px;
+      display: flex;
+      align-items: flex-end;
+      line-height: 1.15;
+    }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
       .pair-row { grid-template-columns: 1fr 1fr; }
       .inline-grid { grid-template-columns: 1fr 1fr; }
+      .summary-strip { gap: 6px; }
+      .summary-box { min-width: 150px; }
     }
   </style>
 </head>
@@ -1016,24 +1059,24 @@ HTML_PAGE = """
             <label>Filters</label>
             <div>
               <div class="inline-grid">
-                <div>
-                  <div class="hint" style="margin-bottom:4px">Min TVL (USD)</div>
+                <div class="filter-item">
+                  <div class="hint">Min TVL (USD)</div>
                   <input id="minTvl" value="1000" type="number"/>
                 </div>
-                <div>
-                  <div class="hint" style="margin-bottom:4px">History days</div>
+                <div class="filter-item">
+                  <div class="hint">History days</div>
                   <input id="days" value="90" type="number"/>
                 </div>
-                <div>
-                  <div class="hint" style="margin-bottom:4px">Exclude below X% fee</div>
+                <div class="filter-item">
+                  <div class="hint">Exclude below X% fee</div>
                   <input id="minFeePct" value="0" type="number" step="0.1" min="0" max="99.9"/>
                 </div>
-                <div>
-                  <div class="hint" style="margin-bottom:4px">Exclude above X% fee</div>
+                <div class="filter-item">
+                  <div class="hint">Exclude above X% fee</div>
                   <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100"/>
                 </div>
-                <div>
-                  <div class="hint" style="margin-bottom:4px">Исключить адрес, последние 4 символа</div>
+                <div class="filter-item">
+                  <div class="hint">Exclude address suffix (last 4)</div>
                   <input id="excludeSuffixes" value="" type="text" placeholder="ab12,ff09"/>
                 </div>
               </div>
@@ -1042,8 +1085,8 @@ HTML_PAGE = """
         </div>
 
         <div class="actions" style="margin-top:14px">
-          <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
           <button class="btn" id="runBtn" onclick="runJob()">Run analysis</button>
+          <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
           <button class="btn secondary" onclick="exportCsv()">Export CSV</button>
           <span id="status" class="status">Ready</span>
         </div>
@@ -1061,11 +1104,11 @@ HTML_PAGE = """
 
       <section class="card">
         <h3>Summary</h3>
-        <div class="metrics">
-          <div class="metric"><div class="k">Pairs suffix</div><div class="v" id="mSuffix">-</div></div>
-          <div class="metric"><div class="k">Total pools</div><div class="v" id="mTotal">0</div></div>
-          <div class="metric"><div class="k">Pools in chart</div><div class="v" id="mChart">0</div></div>
-          <div class="metric"><div class="k">Filtered by fee range</div><div class="v" id="mErr">0</div></div>
+        <div class="summary-strip">
+          <div class="summary-box"><div class="k">Pairs suffix</div><div class="v" id="mSuffix">-</div></div>
+          <div class="summary-box"><div class="k">Total pools</div><div class="v" id="mTotal">0</div></div>
+          <div class="summary-box"><div class="k">Pools in chart</div><div class="v" id="mChart">0</div></div>
+          <div class="summary-box"><div class="k">Filtered by fee range</div><div class="v" id="mErr">0</div></div>
         </div>
       </section>
 
@@ -1547,8 +1590,8 @@ HTML_PAGE = """
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
         showlegend: false,
-        margin: {t: 30, b: 24, l: 50, r: 14},
-        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d"},
+        margin: {t: 30, b: 42, l: 50, r: 14},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
       Plotly.newPlot("tvlChart", tvlTraces, {
@@ -1557,8 +1600,8 @@ HTML_PAGE = """
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
         showlegend: false,
-        margin: {t: 30, b: 24, l: 50, r: 14},
-        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d"},
+        margin: {t: 30, b: 42, l: 50, r: 14},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
 
@@ -1577,8 +1620,8 @@ HTML_PAGE = """
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
         showlegend: false,
-        margin: {t: 30, b: 24, l: 50, r: 14},
-        xaxis: {title: "Date", showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", range: [start, now]},
+        margin: {t: 30, b: 42, l: 50, r: 14},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", range: [start, now], automargin: true},
         yaxis: {title: "Value", showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, range: [0, 1]},
         annotations: [{text: "Run analysis to load data", x: 0.5, y: 0.5, xref: "paper", yref: "paper", showarrow: false, font: {color: "#64748b"}}],
       };
