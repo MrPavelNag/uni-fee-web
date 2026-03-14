@@ -501,6 +501,7 @@ def _push_run_history(
     include_chains: list[str],
     min_tvl: float,
     days: int,
+    include_versions: list[str],
     min_fee_pct: float,
     max_fee_pct: float,
     exclude_suffixes: list[str],
@@ -515,6 +516,7 @@ def _push_run_history(
             "include_chains": include_chains,
             "min_tvl": min_tvl,
             "days": days,
+            "include_versions": include_versions,
             "min_fee_pct": min_fee_pct,
             "max_fee_pct": max_fee_pct,
             "exclude_suffixes": exclude_suffixes,
@@ -569,6 +571,9 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     requested_pair_keys = {_requested_pair_key(a, b) for a, b in pairs}
 
     include_chains = [c.strip().lower() for c in req.include_chains if c.strip()]
+    include_versions = [v.strip().lower() for v in req.include_versions if v.strip()]
+    run_v3 = "v3" in include_versions
+    run_v4 = "v4" in include_versions
 
     logs: list[str] = []
     env = os.environ.copy()
@@ -578,7 +583,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     env["DISABLE_PDF_OUTPUT"] = "1"
 
     # v4 endpoint config uses this list at import-time
-    if include_chains:
+    if run_v4 and include_chains:
         v4_supported = {c for c in include_chains if c in UNISWAP_V4_SUBGRAPHS}
         env["V4_CHAINS"] = ",".join(sorted(v4_supported))
 
@@ -592,15 +597,16 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 env["TOKEN_PAIRS"] = pair_str
 
                 base_progress = int(10 + (idx - 1) * (65 / total_pairs))
-                _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
-                _run_subprocess("agent_v3.py", env, req.min_tvl, logs)
-                _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
-                _run_subprocess("agent_v4.py", env, req.min_tvl, logs)
-
-                v3_path = DATA_DIR / f"pools_v3_{pair_suffix}.json"
-                v4_path = DATA_DIR / f"pools_v4_{pair_suffix}.json"
-                merged_raw.update(load_chart_data_json(str(v3_path)))
-                merged_raw.update(load_chart_data_json(str(v4_path)))
+                if run_v3:
+                    _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
+                    _run_subprocess("agent_v3.py", env, req.min_tvl, logs)
+                    v3_path = DATA_DIR / f"pools_v3_{pair_suffix}.json"
+                    merged_raw.update(load_chart_data_json(str(v3_path)))
+                if run_v4:
+                    _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
+                    _run_subprocess("agent_v4.py", env, req.min_tvl, logs)
+                    v4_path = DATA_DIR / f"pools_v4_{pair_suffix}.json"
+                    merged_raw.update(load_chart_data_json(str(v4_path)))
 
         # Keep only pools that really match requested pairs.
         # Protects against occasional cross-token resolution artifacts (e.g. POL instead of ETH).
@@ -631,6 +637,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     "days": req.days,
                     "min_tvl": req.min_tvl,
                     "include_chains": include_chains,
+                    "include_versions": include_versions,
                     "min_fee_pct": req.min_fee_pct,
                     "max_fee_pct": req.max_fee_pct,
                     "exclude_suffixes": req.exclude_suffixes,
@@ -646,6 +653,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             include_chains=include_chains,
             min_tvl=req.min_tvl,
             days=req.days,
+            include_versions=include_versions,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
@@ -666,6 +674,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             include_chains=include_chains,
             min_tvl=req.min_tvl,
             days=req.days,
+            include_versions=include_versions,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
@@ -680,6 +689,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
 class PoolsRunRequest(BaseModel):
     pairs: list[str] = Field(default_factory=list, description="Up to 4 pairs: tokenA,tokenB")
     include_chains: list[str] = Field(default_factory=list)
+    include_versions: list[str] = Field(default_factory=lambda: ["v3", "v4"])
     min_tvl: float = 1000000.0
     days: int = 30
     min_fee_pct: float = 0.0
@@ -764,6 +774,11 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         raise HTTPException(status_code=400, detail="max_fee_pct must be between >0 and 100")
     if req.min_fee_pct >= req.max_fee_pct:
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
+    req.include_versions = [str(v).strip().lower() for v in (req.include_versions or []) if str(v).strip()]
+    req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
+    req.include_versions = list(dict.fromkeys(req.include_versions))
+    if not req.include_versions:
+        raise HTTPException(status_code=400, detail="Select at least one protocol version (v3 or v4)")
     req.exclude_suffixes = [
         str(x).strip().lower().replace("0x", "")[-4:]
         for x in req.exclude_suffixes
@@ -1192,7 +1207,7 @@ HTML_PAGE = """
       padding: 0;
     }
     
-    .inline-grid { display: grid; grid-template-columns: 90px 90px 120px 120px 220px; gap: 6px; align-items: end; }
+    .inline-grid { display: grid; grid-template-columns: 90px 90px 120px 120px 220px 130px; gap: 6px; align-items: end; }
     .filter-item .hint {
       margin-bottom: 4px !important;
       min-height: 34px;
@@ -1200,6 +1215,23 @@ HTML_PAGE = """
       align-items: flex-end;
       line-height: 1.15;
       white-space: normal;
+    }
+    .proto-checks {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      height: 34px;
+      padding: 0 4px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      background: #f8fbff;
+    }
+    .proto-checks label {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      color: #334155;
     }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
@@ -1292,6 +1324,13 @@ HTML_PAGE = """
                   <div class="hint">Exclude address suffix<br/>(last 4)</div>
                   <input id="excludeSuffixes" value="" type="text" placeholder="ab12,ff09"/>
                 </div>
+                <div class="filter-item">
+                  <div class="hint">Protocol<br/>version</div>
+                  <div class="proto-checks">
+                    <label><input id="protoV3" type="checkbox" checked/> V3</label>
+                    <label><input id="protoV4" type="checkbox" checked/> V4</label>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -1353,7 +1392,7 @@ HTML_PAGE = """
     let sortKey = "final_income";
     let sortDesc = true;
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
-    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "excludeSuffixes", "allChains"];
+    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "excludeSuffixes", "protoV3", "protoV4", "allChains"];
     let availableChains = [];
     let colorMap = {};
     let dashMap = {};
@@ -1547,6 +1586,13 @@ HTML_PAGE = """
         .map(x => x.trim().replace(/^0x/, ""))
         .filter(Boolean)
         .map(x => x.slice(-4));
+    }
+
+    function getSelectedProtocols() {
+      const out = [];
+      if (document.getElementById("protoV3")?.checked) out.push("v3");
+      if (document.getElementById("protoV4")?.checked) out.push("v4");
+      return out;
     }
 
     function getSelectedChains() {
@@ -1768,12 +1814,17 @@ HTML_PAGE = """
         const payload = {
           pairs: pairCheck.pairs,
           include_chains: getSelectedChains(),
+          include_versions: getSelectedProtocols(),
           min_tvl: Number(document.getElementById("minTvl").value || 1000000),
           days: Number(document.getElementById("days").value || 30),
           max_fee_pct: Number(document.getElementById("maxFeePct").value || 2),
           min_fee_pct: Number(document.getElementById("minFeePct").value || 0),
           exclude_suffixes: getExcludedSuffixes(),
         };
+        if (!payload.include_versions.length) {
+          setStatus("Select at least one protocol (V3/V4).", "fail");
+          return;
+        }
         if (!pairCheck.valid) {
           setStatus("Invalid pairs: fill both tokens and avoid duplicates in a pair.", "fail");
           return;
