@@ -8,6 +8,7 @@ Cloud-ready web MVP for pool analysis.
 """
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -16,6 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -23,13 +25,26 @@ from pydantic import BaseModel, Field
 
 from agent_common import load_chart_data_json, pairs_to_filename_suffix
 from config import GOLDSKY_ENDPOINTS, TOKEN_ADDRESSES, UNISWAP_V3_SUBGRAPHS, UNISWAP_V4_SUBGRAPHS
-from uniswap_client import get_graph_endpoint, graphql_query
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 TOKEN_CATALOG_PATH = DATA_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = DATA_DIR / "chain_catalog.json"
+UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
+CHAIN_ID_TO_NAME = {
+    1: "ethereum",
+    10: "optimism",
+    56: "bnb",
+    130: "unichain",
+    1301: "unichain",
+    137: "polygon",
+    324: "zksync",
+    8453: "base",
+    42161: "arbitrum-one",
+    43114: "avalanche",
+    81457: "blast",
+}
 
 app = FastAPI(title="Uni Fee Web", version="0.1.0")
 
@@ -120,37 +135,33 @@ def _load_chain_catalog(refresh: bool = False) -> dict[str, Any]:
     return out
 
 
-def _fetch_v3_tokens(chain: str, limit: int = 4000) -> list[str]:
-    endpoint = get_graph_endpoint(chain, "v3")
-    if not endpoint:
-        return []
-    symbols: list[str] = []
-    seen = set()
-    skip = 0
-    page_size = 1000
-    query = """
-    query Tokens($skip: Int!) {
-      tokens(first: 1000, skip: $skip, orderBy: totalValueLockedUSD, orderDirection: desc) {
-        symbol
-      }
-    }
-    """
-    while skip < limit:
-        data = graphql_query(endpoint, query, {"skip": skip})
-        tokens = data.get("data", {}).get("tokens", [])
-        if not tokens:
-            break
-        for t in tokens:
-            sym = (t.get("symbol") or "").strip().lower()
-            if not sym:
-                continue
-            if sym not in seen:
-                seen.add(sym)
-                symbols.append(sym)
-        if len(tokens) < page_size:
-            break
-        skip += page_size
-    return symbols
+def _is_clean_symbol(symbol: str) -> bool:
+    # keep only plain alnum symbols to avoid spam/malicious names
+    return bool(re.fullmatch(r"[A-Za-z0-9]{2,20}", symbol))
+
+
+def _fetch_uniswap_verified_tokens() -> tuple[set[str], dict[str, list[str]]]:
+    import json
+
+    with urlopen(UNISWAP_TOKEN_LIST_URL, timeout=20) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+
+    supported = set(_supported_chains())
+    by_chain_set: dict[str, set[str]] = {}
+    all_tokens: set[str] = set()
+    for item in payload.get("tokens", []):
+        symbol = str(item.get("symbol") or "").strip()
+        if not _is_clean_symbol(symbol):
+            continue
+        chain_name = CHAIN_ID_TO_NAME.get(int(item.get("chainId") or 0))
+        if not chain_name or chain_name not in supported:
+            continue
+        sym = symbol.lower()
+        by_chain_set.setdefault(chain_name, set()).add(sym)
+        all_tokens.add(sym)
+
+    by_chain = {k: sorted(v) for k, v in by_chain_set.items()}
+    return all_tokens, by_chain
 
 
 def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
@@ -160,27 +171,22 @@ def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
             return cached
     by_chain: dict[str, list[str]] = {}
     all_tokens: set[str] = set()
-    chains = _supported_chains()
-    for c in chains:
-        # Token entity is guaranteed in v3 schema; for v4 we still derive from supported list.
-        if c not in UNISWAP_V3_SUBGRAPHS and c not in GOLDSKY_ENDPOINTS:
-            continue
-        try:
-            syms = _fetch_v3_tokens(c)
-        except Exception:
-            syms = []
-        if syms:
-            by_chain[c] = syms
-            all_tokens.update(syms)
+    source = "uniswap-token-list"
+    try:
+        all_tokens, by_chain = _fetch_uniswap_verified_tokens()
+    except Exception as e:
+        print(f"[catalog-refresh] verified token list fetch failed: {e}")
 
-    # Fallback to config tokens if endpoint data is limited.
+    # Fallback to config tokens if online list is unavailable.
     if not all_tokens:
+        source = "local-config-fallback"
         all_tokens.update(_supported_tokens())
     out = {
         "updated_at": _iso_now(),
         "count": len(all_tokens),
         "items": sorted(all_tokens),
         "by_chain": by_chain,
+        "source": source,
     }
     _write_json(TOKEN_CATALOG_PATH, out)
     return out
@@ -550,7 +556,7 @@ HTML_PAGE = """
   <style>
     :root {
       --bg: #e2eaf8;
-      --card: #ffffff;
+      --card: #f4f7fc;
       --muted: #64748b;
       --text: #0f172a;
       --border: #d9e2f0;
@@ -643,7 +649,7 @@ HTML_PAGE = """
     }
     input, textarea, select {
       width: 100%;
-      background: #ffffff;
+      background: #f8fbff;
       border: 1px solid #cbd5e1;
       color: var(--text);
       border-radius: 8px;
@@ -717,26 +723,16 @@ HTML_PAGE = """
       background: linear-gradient(90deg, var(--accent), var(--accent-2));
       transition: width 0.3s ease;
     }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(120px, 1fr));
-      gap: 10px;
-    }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 8px; }
     .metric {
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      border-radius: 10px;
-      padding: 8px;
+      background: #f8fbff;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 7px 8px;
+      min-height: 58px;
     }
-    .metric .k {
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .metric .v {
-      font-size: 18px;
-      font-weight: 800;
-      margin-top: 1px;
-    }
+    .metric .k { color: var(--muted); font-size: 11px; }
+    .metric .v { font-size: 16px; font-weight: 800; margin-top: 1px; }
     .charts-grid {
       display: grid;
       grid-template-columns: 1fr;
@@ -747,7 +743,7 @@ HTML_PAGE = """
       min-height: 330px;
       border: 1px solid #dbe3ef;
       border-radius: 10px;
-      background: #ffffff;
+      background: #f8fbff;
     }
     .table-wrap {
       overflow-x: auto;
@@ -796,19 +792,27 @@ HTML_PAGE = """
     .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
     .meta-badge { border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #475569; background: #f8fafc; }
     .small-btn { border: 1px solid #d1d5db; background: #f8fafc; color: #334155; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
-    .color-dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 1px solid #64748b; }
+    .line-swatch {
+      display: inline-block;
+      width: 28px;
+      height: 0;
+      border-top-width: 3px;
+      border-top-style: solid;
+      border-top-color: #64748b;
+      vertical-align: middle;
+    }
 
     .chain-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-      gap: 6px 10px;
-      margin-top: 4px;
+      grid-template-columns: repeat(auto-fit, minmax(110px, max-content));
+      gap: 4px 8px;
+      margin-top: 2px;
     }
     .check {
       display: flex;
       align-items: center;
       gap: 6px;
-      font-size: 13px;
+      font-size: 12px;
       color: #334155;
     }
     .check input {
@@ -816,11 +820,7 @@ HTML_PAGE = """
       padding: 0;
     }
     
-    .inline-grid {
-      display: grid;
-      grid-template-columns: 120px 120px 180px 180px;
-      gap: 8px;
-    }
+    .inline-grid { display: grid; grid-template-columns: 100px 100px 140px 140px; gap: 6px; }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
@@ -878,7 +878,6 @@ HTML_PAGE = """
                 <button class="small-btn" onclick="reviewChains()">Review chains</button>
                 <span class="meta-badge" id="chainsMeta">chains: -</span>
               </div>
-              <label class="check"><input type="checkbox" id="allChains" checked onchange="toggleAllChains()"> all</label>
               <div class="chain-grid" id="chainChecks"></div>
             </div>
           </div>
@@ -896,11 +895,11 @@ HTML_PAGE = """
                   <input id="days" value="90" type="number"/>
                 </div>
                 <div>
-                  <div class="hint" style="margin-bottom:4px">Exclude pools above X% fee</div>
+                  <div class="hint" style="margin-bottom:4px">Exclude above X% fee</div>
                   <input id="maxFeePct" value="3" type="number" step="0.1" min="0.1" max="100"/>
                 </div>
                 <div>
-                  <div class="hint" style="margin-bottom:4px">Exclude pools below X% fee</div>
+                  <div class="hint" style="margin-bottom:4px">Exclude below X% fee</div>
                   <input id="minFeePct" value="0" type="number" step="0.1" min="0" max="99.9"/>
                 </div>
               </div>
@@ -911,6 +910,7 @@ HTML_PAGE = """
         <div class="actions" style="margin-top:14px">
           <button class="btn" id="runBtn" onclick="runJob()">Run analysis</button>
           <button class="btn secondary" onclick="exportCsv()">Export CSV</button>
+          <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
           <span id="status" class="status">Ready</span>
         </div>
         <div class="progress-wrap">
@@ -919,6 +919,9 @@ HTML_PAGE = """
             <span id="progressText">0%</span>
           </div>
           <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+        </div>
+        <div id="logsWrap" style="display:none; margin-top:10px">
+          <pre id="logs">No logs yet.</pre>
         </div>
       </section>
 
@@ -930,10 +933,6 @@ HTML_PAGE = """
           <div class="metric"><div class="k">Pools in chart</div><div class="v" id="mChart">0</div></div>
           <div class="metric"><div class="k">Filtered by fee range</div><div class="v" id="mErr">0</div></div>
         </div>
-        <details>
-          <summary>Latest run logs</summary>
-          <pre id="logs">No logs yet.</pre>
-        </details>
       </section>
 
       <section class="card">
@@ -973,6 +972,7 @@ HTML_PAGE = """
     const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "minTvl", "days", "maxFeePct", "minFeePct", "allChains"];
     let availableChains = [];
     let colorMap = {};
+    let dashMap = {};
 
     function splitCSV(v) {
       return (v || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
@@ -1080,9 +1080,25 @@ HTML_PAGE = """
       const all = document.getElementById("allChains").checked;
       for (const c of availableChains) {
         const el = document.getElementById("chain_" + c);
-        if (el) el.disabled = all;
+        if (el) el.checked = all;
       }
       saveFormState();
+    }
+
+    function onChainToggle() {
+      let checkedCount = 0;
+      for (const c of availableChains) {
+        const el = document.getElementById("chain_" + c);
+        if (el && el.checked) checkedCount += 1;
+      }
+      const allEl = document.getElementById("allChains");
+      allEl.checked = checkedCount === availableChains.length && availableChains.length > 0;
+      saveFormState();
+    }
+
+    function toggleLogs() {
+      const wrap = document.getElementById("logsWrap");
+      wrap.style.display = wrap.style.display === "none" ? "block" : "none";
     }
 
     function renderTable(rows) {
@@ -1102,8 +1118,10 @@ HTML_PAGE = """
       for (const r of rows) {
         const cls = r.status === "ok" ? "ok-row" : "error-row";
         const color = colorMap[r.pool_id] || "#94a3b8";
+        const dash = dashMap[r.pool_id] || "solid";
+        const cssDash = (dash === "solid") ? "solid" : "dashed";
         html += `<tr class="${cls}">`;
-        html += `<td><span class="color-dot" style="background:${color}"></span></td>`;
+        html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};"></span></td>`;
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
         html += `<td>${r.pair}</td>`;
@@ -1171,11 +1189,13 @@ HTML_PAGE = """
         availableChains = meta.chains || [];
         document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;
         const checks = document.getElementById("chainChecks");
-        checks.innerHTML = availableChains.map(c => (
-          `<label class="check"><input type="checkbox" id="chain_${c}" onchange="saveFormState()"> ${c}</label>`
-        )).join("");
+        checks.innerHTML = [
+          `<label class="check"><input type="checkbox" id="allChains" checked onchange="toggleAllChains()"> all</label>`,
+          ...availableChains.map(c => `<label class="check"><input type="checkbox" id="chain_${c}" checked onchange="onChainToggle()"> ${c}</label>`)
+        ].join("");
         loadFormState();
-        toggleAllChains();
+        if (document.getElementById("allChains").checked) toggleAllChains();
+        else onChainToggle();
       } catch (e) {
         console.warn("meta load failed", e);
       }
@@ -1268,32 +1288,40 @@ HTML_PAGE = """
       const feeTraces = [];
       const tvlTraces = [];
       colorMap = {};
+      dashMap = {};
       const palette = ["#1d4ed8", "#0891b2", "#7c3aed", "#ea580c", "#059669", "#dc2626", "#4f46e5", "#0ea5e9", "#65a30d", "#be185d"];
+      const dashes = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"];
       for (const s of result.series) {
         const feeX = s.fees.map(p => new Date(p[0] * 1000));
         const feeY = s.fees.map(p => p[1]);
         const tvlX = s.tvl.map(p => new Date(p[0] * 1000));
         const tvlY = s.tvl.map(p => p[1] / 1000.0);
         const c = palette[feeTraces.length % palette.length];
+        const d = dashes[feeTraces.length % dashes.length];
         colorMap[s.pool_id] = c;
-        feeTraces.push({x: feeX, y: feeY, mode: "lines", name: s.label, line: {color: c, width: 2}});
-        tvlTraces.push({x: tvlX, y: tvlY, mode: "lines", name: s.label, line: {color: c, width: 2}});
+        dashMap[s.pool_id] = d;
+        feeTraces.push({x: feeX, y: feeY, mode: "lines", name: s.label, line: {color: c, width: 2, dash: d}});
+        tvlTraces.push({x: tvlX, y: tvlY, mode: "lines", name: s.label, line: {color: c, width: 2, dash: d}});
       }
       Plotly.newPlot("feesChart", feeTraces, {
         title: "Cumulative Fees",
         paper_bgcolor: "#ffffff",
-        plot_bgcolor: "#ffffff",
+        plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
         showlegend: false,
-        margin: {t: 34, b: 28, l: 50, r: 16}
+        margin: {t: 30, b: 24, l: 50, r: 14},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 16},
+        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
       Plotly.newPlot("tvlChart", tvlTraces, {
         title: "TVL dynamics (thousands USD)",
         paper_bgcolor: "#ffffff",
-        plot_bgcolor: "#ffffff",
+        plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
         showlegend: false,
-        margin: {t: 34, b: 28, l: 50, r: 16}
+        margin: {t: 30, b: 24, l: 50, r: 14},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 16},
+        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
 
       lastRows = result.rows || [];
