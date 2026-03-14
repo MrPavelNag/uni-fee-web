@@ -1,0 +1,95 @@
+{
+  "0xe7a275f7100982c230af57b5c427b6114cbff0a9758bb66c7c9c088b3073d20b": {
+    "fees": [],
+    "tvl": [],
+    "pool_id": "0xe7a275f7100982c230af57b5c427b6114cbff0a9758bb66c7c9c088b3073d20b",
+    "fee_pct": 88.0,
+    "pair": "RLC/USDT",
+    "chain": "ethereum",
+    "version": "v4"
+  },
+  "0xcba18a06bfa484a44c2e03932ec39ea2dfecdf114e0f501a539fef4a7b518543": {
+    "fees": [],
+    "tvl": [],
+    "pool_id": "0xcba18a06bfa484a44c2e03932ec39ea2dfecdf114e0f501a539fef4a7b518543",
+    "fee_pct": 0.3,
+    "pair": "RLC/USDT",
+    "chain": "ethereum",
+    "version": "v4"
+  },
+  "0xba7d8a4e8d683a143052b1cb46999b1c723e6c97507eee2e81cdce47700852dd": {
+    "fees": [
+      [
+        1768608000,
+        0.0
+      ]
+    ],
+    "tvl": [
+      [
+        1768608000,
+        0.0
+      ]
+    ],
+    "pool_id": "0xba7d8a4e8d683a143052b1cb46999b1c723e6c97507eee2e81cdce47700852dd",
+    "fee_pct": 0.3,
+    "pair": "RLC/WETH",
+    "chain": "ethereum",
+    "version": "v4"
+  },
+  "0x7dc2fdb4780dff684c03915187a61eae6c90b740dbe281bb4bbb664f7fde1bec": {
+    "fees": [],
+    "tvl": [],
+    "pool_id": "0x7dc2fdb4780dff684c03915187a61eae6c90b740dbe281bb4bbb664f7fde1bec",
+    "fee_pct": 1.0,
+    "pair": "ETH/RLC",
+    "chain": "ethereum",
+    "version": "v4"
+  },
+  "0xf9ef78983048b3d1314900a9beef0e5c5f63ad89bd0f637246e8e21bea99f4b8": {
+    "fees": [],
+    "tvl": [],
+    "pool_id": "0xf9ef78983048b3d1314900a9beef0e5c5f63ad89bd0f637246e8e21bea99f4b8",
+    "fee_pct": 90.0,
+    "pair": "ETH/RLC",
+    "chain": "ethereum",
+    "version": "v4"
+  },
+  "0xda4022806d0fef7eb29f953f8a63c2759eda999773a52455d78f7f92f51f28b4": {
+    "fees": [
+      [
+        1766188800,
+        0.0
+      ]
+    ],
+    "tvl": [
+      [
+        1766188800,
+        0.0
+      ]
+    ],
+    "pool_id": "0xda4022806d0fef7eb29f953f8a63c2759eda999773a52455d78f7f92f51f28b4",
+    "fee_pct": 88.0,
+    "pair": "USDC/RLC",
+    "chain": "arbitrum-one",
+    "version": "v4"
+  },
+  "0xb12cfd0c97628ed5fc8dc9d1bdb07bdbd716a0a178718e7b610ddc150451d213": {
+    "fees": [
+      [
+        1771286400,
+        0.0
+      ]
+    ],
+    "tvl": [
+      [
+        1771286400,
+        0.0
+      ]
+    ],
+    "pool_id": "0xb12cfd0c97628ed5fc8dc9d1bdb07bdbd716a0a178718e7b610ddc150451d213",
+    "fee_pct": 95.0,
+    "pair": "ETH/RLC",
+    "chain": "arbitrum-one",
+    "version": "v4"
+  }
+}

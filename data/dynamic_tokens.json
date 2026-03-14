@@ -1,0 +1,50 @@
+{
+  "avalanche": {
+    "uni": "0xaac056d1349719d3d99ab75f64054407d24fed6d"
+  },
+  "polygon": {
+    "uni": "0x381609c8df46e971ca24b134ad48077b9dbb2d7f",
+    "rlc": "0x01e2d5434dfa2e386239fd3c0a62fef0dd3cf1ea",
+    "link": "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39",
+    "paxg": "0x4d44f2f760f2b98ffa74ea04cd3e3f9f102cee1c"
+  },
+  "base": {
+    "uni": "0x016841bfdc90d7563179059488c96a44006f1778",
+    "link": "0x162152925aa5503253a7bed2d403acd753334599",
+    "paxg": "0x149a7407d5beb1b9fa00910802708f55de5ed662",
+    "xaut": "0x1820a43072b6def9f6d92299148a35d8d6445f14",
+    "usdt": "0x09d3d2924ebfabb84e2b3860bddda42463077fb9"
+  },
+  "bsc": {
+    "uni": "0x915eac59fdbf8e411024f96d77276f5a4a13f1c0",
+    "link": "0xf8a0bf9cf54bb92f17374d9e9a321e6a111a51bd",
+    "xaut": "0xcac0c41a420fa8aae94a058e8d328a583f78ee37"
+  },
+  "celo": {
+    "uni": "0xee571697998ec64e32b57d754d700c4dda2f2a0e",
+    "link": "0xd07294e6e917e07dfdcee882dd1e2565085c2ae0"
+  },
+  "ethereum": {
+    "uni": "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+    "rlc": "0x589a4c73b69b6a2a5c4e5951c7deee8696ceaead",
+    "link": "0x514910771af9ca656af840dff83e8264ecf986ca",
+    "paxg": "0x45804880de22913dafe09f4980848ece6ecbaf78",
+    "xaut": "0xa288673076a5cdb43ee62ba220dfdf4ab7bd8c74"
+  },
+  "unichain": {
+    "uni": "0x8f187aa05619a017077f5308904739877ce9ea21",
+    "xaut": "0x9059d4708065b5d18ca9371c396b2684aacf4c42",
+    "usdt": "0x588ce4f028d8e7b53b687865d6a67b3a54c75518",
+    "link": "0x5a53b6d19d8edcb7923f0d840eebb3f09bbeefb7"
+  },
+  "optimism": {
+    "uni": "0x782783c530be42dedad9f42bca54f32b6b13513f",
+    "link": "0x350a791bfc2c21f9ed5d10980dad2e2638ffa7f6"
+  },
+  "arbitrum-one": {
+    "uni": "0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0",
+    "rlc": "0xe649e6a1f2afc63ca268c2363691cecaf75cf47c",
+    "link": "0xf97f4df75117a78c1a5a0dbb814af92458539fb4",
+    "paxg": "0xfeb4dfc8c4cf7ed305bb08065d08ec6ee6728429"
+  }
+}

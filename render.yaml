@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: uni-fee-web
+    runtime: python
+    plan: starter
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn webapp.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: THE_GRAPH_API_KEY
+        sync: false
