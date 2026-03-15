@@ -2107,7 +2107,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         }}
       }};
       try {{
-        const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
+        const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
         const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
         const wcMetadata = {{
           name: "DeFi Pools",
@@ -2126,11 +2126,18 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         }});
         provider.on("display_uri", showWcQrModal);
         window._wcProvider = provider;
+        let connected = false;
         try {{
           await provider.connect();
-        }} catch (connErr) {{
-          closeWcQrModal();
-          throw connErr;
+          connected = true;
+        }} catch (_) {{}}
+        if (!connected) {{
+          try {{
+            await provider.enable();
+          }} catch (connErr) {{
+            closeWcQrModal();
+            throw connErr;
+          }}
         }}
         window._wcProvider = null;
         closeWcQrModal();
@@ -2422,13 +2429,14 @@ def _render_admin_page() -> str:
       const normalizeAddress=(value)=>{{ const raw=String(value||"").trim(); if(!raw) return ""; const parts=raw.split(":"); return String(parts[parts.length-1]||"").trim(); }};
       const toHexMessage=(msg)=>{{ try {{ return "0x"+Array.from(new TextEncoder().encode(String(msg||""))).map((b)=>b.toString(16).padStart(2,"0")).join(""); }} catch(_) {{ return ""; }} }};
       try {{
-        const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
+        const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
         const wcChains=[1,10,56,137,8453,42161,43114];
         const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
         const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
         provider.on("display_uri",showWcQrModal);
         window._wcProvider=provider;
-        try {{ await provider.connect(); }} catch(connErr) {{ closeWcQrModal(); throw connErr; }}
+        let connected=false; try {{ await provider.connect(); connected=true; }} catch(_) {{}}
+        if(!connected) {{ try {{ await provider.enable(); }} catch(connErr) {{ closeWcQrModal(); throw connErr; }} }}
         window._wcProvider=null;
         closeWcQrModal();
         let accounts=provider.accounts||[];
@@ -2867,6 +2875,7 @@ def _render_help_page() -> str:
     .top-controls {{ display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }}
     .intent-prefix {{ font-size: 14px; font-weight: 700; color: #1d4ed8; white-space: nowrap; }}
     .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 240px; max-width: 280px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
+    .intent-select option {{ background: #eef4ff; color: #1f3a8a; }}
     .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; width: 190px; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }}
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
     .card {{ background: #f3f7ff; border: 1px solid #cfdcec; border-radius: 14px; padding: 16px; box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06); }}
@@ -2963,13 +2972,14 @@ def _render_help_page() -> str:
       const normalizeAddress=(value)=>{{ const raw=String(value||"").trim(); if(!raw) return ""; const parts=raw.split(":"); return String(parts[parts.length-1]||"").trim(); }};
       const toHexMessage=(msg)=>{{ try {{ return "0x"+Array.from(new TextEncoder().encode(String(msg||""))).map((b)=>b.toString(16).padStart(2,"0")).join(""); }} catch(_) {{ return ""; }} }};
       try {{
-        const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
+        const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
         const wcChains=[1,10,56,137,8453,42161,43114];
         const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
         const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
         provider.on("display_uri",showWcQrModal);
         window._wcProvider=provider;
-        try {{ await provider.connect(); }} catch(connErr) {{ closeWcQrModal(); throw connErr; }}
+        let connected=false; try {{ await provider.connect(); connected=true; }} catch(_) {{}}
+        if(!connected) {{ try {{ await provider.enable(); }} catch(connErr) {{ closeWcQrModal(); throw connErr; }} }}
         window._wcProvider=null;
         closeWcQrModal();
         let accounts=provider.accounts||[];
@@ -3279,6 +3289,7 @@ def auth_verify(req: AuthVerifyRequest, request: Request, response: Response) ->
         "wallet": auth["wallet"],
         "chain_id": auth["chain_id"],
         "authenticated_at": auth["authenticated_at"],
+        "is_admin": _is_admin_address(auth["address"]),
     }
 
 
@@ -4817,7 +4828,7 @@ HTML_PAGE = """
       };
       try {
         setStatus("Connecting WalletConnect...", "running");
-        const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
+        const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
         const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
         const wcMetadata = {
           name: "DeFi Pools",
@@ -4836,11 +4847,18 @@ HTML_PAGE = """
         });
         provider.on("display_uri", showWcQrModal);
         window._wcProvider = provider;
+        let connected = false;
         try {
           await provider.connect();
-        } catch (connErr) {
-          closeWcQrModal();
-          throw connErr;
+          connected = true;
+        } catch (_) {}
+        if (!connected) {
+          try {
+            await provider.enable();
+          } catch (connErr) {
+            closeWcQrModal();
+            throw connErr;
+          }
         }
         window._wcProvider = null;
         closeWcQrModal();
