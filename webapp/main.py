@@ -122,7 +122,11 @@ ADMIN_WALLETS_STATE_KEY_PLAIN = "admin_wallets_csv"
 ADMIN_WALLETS_STATE_KEY_ENC = "admin_wallets_csv_enc_v1"
 ANALYTICS_DB_PATH = Path(os.environ.get("ANALYTICS_DB_PATH", str(CATALOG_DIR / "analytics.sqlite3")))
 ANALYTICS_ENABLED = os.environ.get("ANALYTICS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-WALLETCONNECT_PROJECT_ID = os.environ.get("WALLETCONNECT_PROJECT_ID", "").strip()
+WALLETCONNECT_PROJECT_ID = (
+    os.environ.get("WALLETCONNECT_PROJECT_ID", "").strip()
+    or os.environ.get("REOWN_PROJECT_ID", "").strip()
+    or os.environ.get("NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID", "").strip()
+)
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -1860,7 +1864,14 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
 
     function getWalletChoices() {{
       const order = ["walletconnect", "rabby", "phantom", "metamask", "coinbase", "injected"];
-      return order.map((id) => ({{id, label: WALLET_LABELS[id], available: id === "walletconnect" ? !!WALLETCONNECT_PROJECT_ID : !!getWalletProvider(id)}}));
+      return order.map((id) => {{
+        const isWc = id === "walletconnect";
+        const available = isWc ? true : !!getWalletProvider(id);
+        let label = WALLET_LABELS[id];
+        if (isWc && !WALLETCONNECT_PROJECT_ID) label += " (setup required)";
+        else if (!available) label += " (not detected)";
+        return {{id, label, available}};
+      }});
     }}
 
     function openWalletModal() {{
@@ -1869,8 +1880,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       list.innerHTML = choices.map((w) => {{
         const cls = w.available ? "wallet-item" : "wallet-item disabled";
         const dis = w.available ? "" : "disabled";
-        const label = w.available ? w.label : `${{w.label}} (not detected)`;
-        return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{label}}</button>`;
+        return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{w.label}}</button>`;
       }}).join("");
       document.getElementById("walletModalBackdrop").style.display = "flex";
     }}
@@ -2319,8 +2329,8 @@ def _render_admin_page() -> str:
     function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:320px;max-width:360px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
     function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
     function getWalletProvider(wallet) {{ const providers=getEthereumProviders(); const pick=(pred)=>providers.find(pred)||null; if(wallet==="injected") return pick((p)=>!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isCoinbaseWallet)||providers[0]||window.ethereum||null; if(wallet==="rabby") return pick((p)=>!!p?.isRabby)||(window.ethereum?.isRabby?window.ethereum:null); if(wallet==="phantom"){{ if(window.phantom?.ethereum?.request) return window.phantom.ethereum; return pick((p)=>!!p?.isPhantom)||(window.ethereum?.isPhantom?window.ethereum:null); }} if(wallet==="metamask") return pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||((window.ethereum?.isMetaMask&&!window.ethereum?.isRabby&&!window.ethereum?.isPhantom&&!window.ethereum?.isCoinbaseWallet)?window.ethereum:null); if(wallet==="coinbase") return pick((p)=>!!p?.isCoinbaseWallet)||(window.ethereum?.isCoinbaseWallet?window.ethereum:null); return null; }}
-    function getWalletChoices() {{ const order=["walletconnect","rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>({{id,label:WALLET_LABELS[id],available:id==="walletconnect"?!!WALLETCONNECT_PROJECT_ID:!!getWalletProvider(id)}})); }}
-    function openWalletModal() {{ const list=document.getElementById("walletList"); const choices=getWalletChoices(); list.innerHTML=choices.map((w)=>{{ const cls=w.available?"wallet-item":"wallet-item disabled"; const dis=w.available?"":"disabled"; const label=w.available?w.label:`${{w.label}} (not detected)`; return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{label}}</button>`; }}).join(""); document.getElementById("walletModalBackdrop").style.display="flex"; }}
+    function getWalletChoices() {{ const order=["walletconnect","rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>{{ const isWc=id==="walletconnect"; const available=isWc?true:!!getWalletProvider(id); let label=WALLET_LABELS[id]; if(isWc&&!WALLETCONNECT_PROJECT_ID) label+=" (setup required)"; else if(!available) label+=" (not detected)"; return {{id,label,available}}; }}); }}
+    function openWalletModal() {{ const list=document.getElementById("walletList"); const choices=getWalletChoices(); list.innerHTML=choices.map((w)=>{{ const cls=w.available?"wallet-item":"wallet-item disabled"; const dis=w.available?"":"disabled"; return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{w.label}}</button>`; }}).join(""); document.getElementById("walletModalBackdrop").style.display="flex"; }}
     function closeWalletModal(event) {{ if(event&&event.target&&event.target.id!=="walletModalBackdrop") return; document.getElementById("walletModalBackdrop").style.display="none"; }}
     async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
     function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} refreshIntentMenu(); }}
@@ -2516,14 +2526,21 @@ def _render_admin_page() -> str:
       let html = "";
       for (let idx = 0; idx < filtered.length; idx++) {{
         const r = filtered[idx];
-        html += `<div class="ticket-card">`;
-        html += `<div class="ticket-author"><div><span class="label">Email:</span><span class="value">${{esc(r.email || "-")}}</span></div><div><span class="label">Wallet:</span><span class="value mono">${{esc(r.wallet_address || "-")}}</span></div><div><span class="label">Ticket #:</span><span class="value">${{esc(r.ticket_no || r.id)}}</span></div><div><span class="label">Created:</span><span class="value">${{esc(r.ts || "-")}}</span></div></div>`;
+        const statusNorm = normStatus(r.status || "");
+        const isClosed = statusNorm === "done" || statusNorm === "closed";
+        const subject = esc(r.subject || "");
         const thread = Array.isArray(r.thread) && r.thread.length
           ? r.thread
           : [
               {{author_type: "user", ts: r.ts || "", message: r.message || ""}},
               ...(r.admin_note ? [{{author_type: "admin", ts: "", message: r.admin_note}}] : [])
             ];
+        if (isClosed) {{
+          html += `<details class="ticket-card"><summary style="cursor:pointer;font-weight:700;color:#334155"><b>#${{esc(r.ticket_no || r.id)}}</b> [closed] ${{subject}} <span class="hint">(${{thread.length}} messages)</span></summary>`;
+        }} else {{
+          html += `<div class="ticket-card">`;
+        }}
+        html += `<div class="ticket-author"><div><span class="label">Email:</span><span class="value">${{esc(r.email || "-")}}</span></div><div><span class="label">Wallet:</span><span class="value mono">${{esc(r.wallet_address || "-")}}</span></div><div><span class="label">Ticket #:</span><span class="value">${{esc(r.ticket_no || r.id)}}</span></div><div><span class="label">Created:</span><span class="value">${{esc(r.ts || "-")}}</span></div></div>`;
         const threadHtml = thread.map((m) => {{
           const who = String(m.author_type || "user").toLowerCase() === "admin" ? "admin" : "user";
           const whoLabel = who === "admin" ? "Admin" : (String(r.name || "").trim() || "User");
@@ -2531,18 +2548,16 @@ def _render_admin_page() -> str:
           const msg = esc(m.message || "");
           return `<div class="admin-msg-bubble ${{who}}"><div class="admin-msg-head"><span>${{whoLabel}}</span><span>${{ts}}</span></div>${{msg}}</div>`;
         }}).join("\\n\\n");
-        const statusNorm = normStatus(r.status || "");
-        const isClosed = statusNorm === "done" || statusNorm === "closed";
         if (idx === 0 && !isClosed) {{
           html += `<div class="ticket-message-block"><div class="label">Conversation (${{thread.length}} messages)</div><div class="admin-thread">${{threadHtml}}</div></div>`;
         }} else {{
           html += `<div class="ticket-message-block"><details class="ticket-thread-details"><summary>Conversation (${{thread.length}} messages)</summary><div class="admin-thread">${{threadHtml}}</div></details></div>`;
         }}
         html += `<div class="ticket-reply-block">`;
-        html += `<div><div class="label">Reply</div><textarea class="ticket-reply" id="note_${{r.id}}" placeholder="Reply to user...">${{esc(r.admin_note)}}</textarea></div>`;
+        html += `<div><textarea class="ticket-reply" id="note_${{r.id}}" placeholder="Reply to user...">${{esc(r.admin_note)}}</textarea></div>`;
         html += `<div class="ticket-actions"><button class="btn btn-soft" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'in_progress', true)">Send + progress</button><button class="btn" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done', true)">Send + close</button><button class="btn btn-soft" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done', false)">Close</button><button class="btn btn-danger" style="padding:6px 10px;font-size:12px" onclick="deleteTicketAction(${{r.id}}, '${{esc(r.ticket_no || r.id)}}')">Delete ticket</button></div>`;
         html += `</div>`;
-        html += `</div>`;
+        html += isClosed ? `</details>` : `</div>`;
       }}
       if (!filtered.length) {{
         html = '<div class="hint">No tickets yet.</div>';
@@ -2839,8 +2854,8 @@ def _render_help_page() -> str:
     function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:320px;max-width:360px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
     function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
     function getWalletProvider(wallet) {{ const providers=getEthereumProviders(); const pick=(pred)=>providers.find(pred)||null; if(wallet==="injected") return pick((p)=>!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isCoinbaseWallet)||providers[0]||window.ethereum||null; if(wallet==="rabby") return pick((p)=>!!p?.isRabby)||(window.ethereum?.isRabby?window.ethereum:null); if(wallet==="phantom"){{ if(window.phantom?.ethereum?.request) return window.phantom.ethereum; return pick((p)=>!!p?.isPhantom)||(window.ethereum?.isPhantom?window.ethereum:null); }} if(wallet==="metamask") return pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||((window.ethereum?.isMetaMask&&!window.ethereum?.isRabby&&!window.ethereum?.isPhantom&&!window.ethereum?.isCoinbaseWallet)?window.ethereum:null); if(wallet==="coinbase") return pick((p)=>!!p?.isCoinbaseWallet)||(window.ethereum?.isCoinbaseWallet?window.ethereum:null); return null; }}
-    function getWalletChoices() {{ const order=["walletconnect","rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>({{id,label:WALLET_LABELS[id],available:id==="walletconnect"?!!WALLETCONNECT_PROJECT_ID:!!getWalletProvider(id)}})); }}
-    function openWalletModal() {{ const list=document.getElementById("walletList"); const choices=getWalletChoices(); list.innerHTML=choices.map((w)=>{{ const cls=w.available?"wallet-item":"wallet-item disabled"; const dis=w.available?"":"disabled"; const label=w.available?w.label:`${{w.label}} (not detected)`; return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{label}}</button>`; }}).join(""); document.getElementById("walletModalBackdrop").style.display="flex"; }}
+    function getWalletChoices() {{ const order=["walletconnect","rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>{{ const isWc=id==="walletconnect"; const available=isWc?true:!!getWalletProvider(id); let label=WALLET_LABELS[id]; if(isWc&&!WALLETCONNECT_PROJECT_ID) label+=" (setup required)"; else if(!available) label+=" (not detected)"; return {{id,label,available}}; }}); }}
+    function openWalletModal() {{ const list=document.getElementById("walletList"); const choices=getWalletChoices(); list.innerHTML=choices.map((w)=>{{ const cls=w.available?"wallet-item":"wallet-item disabled"; const dis=w.available?"":"disabled"; return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{w.label}}</button>`; }}).join(""); document.getElementById("walletModalBackdrop").style.display="flex"; }}
     function closeWalletModal(event) {{ if(event&&event.target&&event.target.id!=="walletModalBackdrop") return; document.getElementById("walletModalBackdrop").style.display="none"; }}
     async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
     function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} refreshIntentMenu(); }}
@@ -4553,7 +4568,14 @@ HTML_PAGE = """
 
     function getWalletChoices() {
       const order = ["walletconnect", "rabby", "phantom", "metamask", "coinbase", "injected"];
-      return order.map((id) => ({id, label: WALLET_LABELS[id], available: id === "walletconnect" ? !!WALLETCONNECT_PROJECT_ID : !!getWalletProvider(id)}));
+      return order.map((id) => {
+        const isWc = id === "walletconnect";
+        const available = isWc ? true : !!getWalletProvider(id);
+        let label = WALLET_LABELS[id];
+        if (isWc && !WALLETCONNECT_PROJECT_ID) label += " (setup required)";
+        else if (!available) label += " (not detected)";
+        return {id, label, available};
+      });
     }
 
     function openWalletModal() {
@@ -4562,8 +4584,7 @@ HTML_PAGE = """
       list.innerHTML = choices.map((w) => {
         const cls = w.available ? "wallet-item" : "wallet-item disabled";
         const dis = w.available ? "" : "disabled";
-        const label = w.available ? w.label : `${w.label} (not detected)`;
-        return `<button class="${cls}" ${dis} onclick="connectWalletFlow('${w.id}')">${label}</button>`;
+        return `<button class="${cls}" ${dis} onclick="connectWalletFlow('${w.id}')">${w.label}</button>`;
       }).join("");
       document.getElementById("walletModalBackdrop").style.display = "flex";
     }
