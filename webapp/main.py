@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+import shutil
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -60,7 +61,12 @@ def _resolve_catalog_dir() -> Path:
 
 
 CATALOG_DIR = _resolve_catalog_dir()
-CATALOG_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    CATALOG_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    # Fallback for platforms without mounted persistent disk (or no write access).
+    CATALOG_DIR = DATA_DIR
+    CATALOG_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
@@ -134,10 +140,40 @@ ANALYTICS_THREAD: threading.Thread | None = None
 
 
 def _analytics_conn() -> sqlite3.Connection:
-    ANALYTICS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(ANALYTICS_DB_PATH), timeout=10)
+    global ANALYTICS_DB_PATH
+    try:
+        ANALYTICS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(ANALYTICS_DB_PATH), timeout=10)
+    except Exception:
+        # Runtime-safe fallback to local writable path to prevent admin/help 500s.
+        fallback = DATA_DIR / "analytics.sqlite3"
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        if ANALYTICS_DB_PATH != fallback and not fallback.exists() and ANALYTICS_DB_PATH.exists():
+            try:
+                shutil.copy2(str(ANALYTICS_DB_PATH), str(fallback))
+            except Exception:
+                pass
+        ANALYTICS_DB_PATH = fallback
+        conn = sqlite3.connect(str(ANALYTICS_DB_PATH), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
+
+
+def _migrate_analytics_db_if_needed() -> None:
+    if ANALYTICS_DB_PATH.exists():
+        return
+    legacy_candidates = [
+        DATA_DIR / "analytics.sqlite3",
+        BASE_DIR / "analytics.sqlite3",
+    ]
+    for legacy in legacy_candidates:
+        if legacy.exists() and legacy.is_file():
+            try:
+                ANALYTICS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(legacy), str(ANALYTICS_DB_PATH))
+                return
+            except Exception:
+                continue
 
 
 def _init_analytics_db() -> None:
@@ -394,6 +430,7 @@ def _analytics_loop() -> None:
 
 def _start_analytics() -> None:
     global ANALYTICS_THREAD
+    _migrate_analytics_db_if_needed()
     _init_analytics_db()
     if not ANALYTICS_ENABLED:
         return
@@ -413,6 +450,10 @@ def _public_base_url(request: Request) -> str:
     if env_base:
         return env_base
     return f"{request.url.scheme}://{request.url.netloc}"
+
+
+def _walletconnect_js_value() -> str:
+    return WALLETCONNECT_PROJECT_ID.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _short_addr(address: str) -> str:
@@ -1417,6 +1458,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
     html {{
       overflow-y: scroll;
       scrollbar-gutter: stable;
+      overflow-x: hidden;
     }}
     body {{
       margin: 0;
@@ -1424,6 +1466,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%);
       color: #0f172a;
       min-height: 100vh;
+      overflow-x: hidden;
     }}
     .container {{
       max-width: 1200px;
@@ -1586,7 +1629,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
   </div>
   <script>
     let authState = {{authenticated: false}};
-    const WALLETCONNECT_PROJECT_ID = "{WALLETCONNECT_PROJECT_ID}";
+    const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
     const WALLET_LABELS = {{
       injected: "Browser Wallet",
       walletconnect: "WalletConnect (QR)",
@@ -1818,13 +1861,14 @@ def _render_admin_page() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Uni Fee - Admin</title>
   <style>
-    html {{ overflow-y: scroll; scrollbar-gutter: stable; }}
+    html {{ overflow-y: scroll; scrollbar-gutter: stable; overflow-x: hidden; }}
     body {{
       margin: 0;
       font-family: Inter, Arial, sans-serif;
       background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%);
       color: #0f172a;
       min-height: 100vh;
+      overflow-x: hidden;
     }}
     .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; }}
     .header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }}
@@ -1970,7 +2014,7 @@ def _render_admin_page() -> str:
   </div>
   <script>
     let authState = {{authenticated: false}};
-    const WALLETCONNECT_PROJECT_ID = "{WALLETCONNECT_PROJECT_ID}";
+    const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
     function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
@@ -2303,8 +2347,8 @@ def _render_help_page() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Uni Fee - Help</title>
   <style>
-    html {{ overflow-y: scroll; scrollbar-gutter: stable; }}
-    body {{ margin: 0; font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%); color: #0f172a; }}
+    html {{ overflow-y: scroll; scrollbar-gutter: stable; overflow-x: hidden; }}
+    body {{ margin: 0; font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%); color: #0f172a; overflow-x: hidden; }}
     body {{ min-height: 100vh; }}
     .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; }}
     .header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }}
@@ -2378,7 +2422,7 @@ def _render_help_page() -> str:
   </div>
   <script>
     let authState = {{authenticated: false}};
-    const WALLETCONNECT_PROJECT_ID = "{WALLETCONNECT_PROJECT_ID}";
+    const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
     function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
@@ -2471,8 +2515,7 @@ def _render_help_page() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
-    wc = WALLETCONNECT_PROJECT_ID.replace("\\", "\\\\").replace('"', '\\"')
-    html = HTML_PAGE.replace("__WALLETCONNECT_PROJECT_ID__", wc)
+    html = HTML_PAGE.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
     resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/")
@@ -2481,7 +2524,9 @@ def home(request: Request) -> HTMLResponse:
 
 @app.get("/stables", response_class=HTMLResponse)
 def stables_page(request: Request) -> HTMLResponse:
-    resp = HTMLResponse(_render_placeholder_page("Lending Stablecoin", "This page is a placeholder for the future stablecoin workflow.", "/stables"))
+    html = _render_placeholder_page("Lending Stablecoin", "This page is a placeholder for the future stablecoin workflow.", "/stables")
+    html = html.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+    resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/stables")
     return resp
@@ -2489,7 +2534,9 @@ def stables_page(request: Request) -> HTMLResponse:
 
 @app.get("/positions", response_class=HTMLResponse)
 def positions_page(request: Request) -> HTMLResponse:
-    resp = HTMLResponse(_render_placeholder_page("DeFi Positions", "This page is a placeholder for your positions dashboard.", "/positions"))
+    html = _render_placeholder_page("DeFi Positions", "This page is a placeholder for your positions dashboard.", "/positions")
+    html = html.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+    resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/positions")
     return resp
@@ -2497,7 +2544,9 @@ def positions_page(request: Request) -> HTMLResponse:
 
 @app.get("/pancake", response_class=HTMLResponse)
 def pancake_page(request: Request) -> HTMLResponse:
-    resp = HTMLResponse(_render_placeholder_page("Pancake Pool Finder", "This page is a placeholder for Pancake pool analysis.", "/pancake"))
+    html = _render_placeholder_page("Pancake Pool Finder", "This page is a placeholder for Pancake pool analysis.", "/pancake")
+    html = html.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+    resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/pancake")
     return resp
@@ -2505,7 +2554,8 @@ def pancake_page(request: Request) -> HTMLResponse:
 
 @app.get("/help", response_class=HTMLResponse)
 def help_page(request: Request) -> HTMLResponse:
-    resp = HTMLResponse(_render_help_page())
+    html = _render_help_page().replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+    resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/help")
     return resp
@@ -2513,7 +2563,9 @@ def help_page(request: Request) -> HTMLResponse:
 
 @app.get("/connect", response_class=HTMLResponse)
 def connect_page(request: Request) -> HTMLResponse:
-    resp = HTMLResponse(_render_placeholder_page("Connect", "Connect is a placeholder for wallet/account integration.", ""))
+    html = _render_placeholder_page("Connect", "Connect is a placeholder for wallet/account integration.", "")
+    html = html.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+    resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/connect")
     return resp
@@ -2521,10 +2573,12 @@ def connect_page(request: Request) -> HTMLResponse:
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(request: Request, response: Response) -> HTMLResponse:
-    _require_admin(request, response)
-    sid = _ensure_session_cookie(request, response)
+    html = _render_admin_page().replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+    resp = HTMLResponse(html)
+    _require_admin(request, resp)
+    sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/admin")
-    return HTMLResponse(_render_admin_page())
+    return resp
 
 
 @app.get("/api/auth/me")
@@ -3083,6 +3137,7 @@ HTML_PAGE = """
     html {
       overflow-y: scroll;
       scrollbar-gutter: stable;
+      overflow-x: hidden;
     }
     :root {
       --bg: #e2eaf8;
@@ -3103,6 +3158,7 @@ HTML_PAGE = """
       background: linear-gradient(180deg, #d9e3f5 0%, var(--bg) 100%);
       color: var(--text);
       min-height: 100vh;
+      overflow-x: hidden;
     }
     .container {
       max-width: 1200px;

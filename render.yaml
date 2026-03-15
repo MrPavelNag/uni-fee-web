@@ -7,8 +7,16 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn webapp.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
+    disk:
+      name: uni-fee-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: THE_GRAPH_API_KEY
         sync: false
+      - key: CATALOG_STORAGE_DIR
+        value: /var/data/uni_fee_cache
+      - key: ANALYTICS_DB_PATH
+        value: /var/data/uni_fee_cache/analytics.sqlite3
