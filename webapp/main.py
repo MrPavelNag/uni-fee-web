@@ -2242,15 +2242,23 @@ def _render_admin_page() -> str:
     .wallet-item {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 12px; background: #eff6ff; color: #1d4ed8; font-weight: 700; text-align: left; cursor: pointer; }}
     .wallet-item.disabled {{ opacity: 0.6; cursor: not-allowed; }}
     .wallet-note {{ color: #64748b; font-size: 12px; margin-top: 8px; }}
-    .ticket-filters {{ display: grid; grid-template-columns: 150px 230px 140px minmax(240px, 1fr); gap: 8px; margin-top: 8px; }}
+    .ticket-toolbar {{ display: grid; grid-template-columns: auto 150px 220px 130px minmax(220px, 1fr) auto; gap: 8px; align-items: end; margin-top: 8px; }}
+    .ticket-filters {{ display: contents; }}
     .ticket-filter-item label {{ display: block; font-size: 11px; color: #64748b; margin-bottom: 4px; }}
-    .ticket-filter-actions {{ display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }}
+    .ticket-filter-actions {{ display: contents; }}
+    .ticket-intro {{ margin: 0 0 8px; font-size: 15px; font-weight: 700; color: #1f3a8a; }}
+    .tickets-results {{ margin-top: 12px; border-top: 2px solid #dbeafe; padding-top: 10px; }}
     .tickets-board {{ display: grid; gap: 10px; margin-top: 10px; }}
     .ticket-card {{ border: 1px solid #dbe3ef; border-radius: 10px; background: #f8fbff; padding: 10px; }}
-    .ticket-head {{ display: grid; grid-template-columns: 90px 1fr 190px 120px; gap: 10px; align-items: start; }}
+    .ticket-head {{ display: grid; grid-template-columns: 120px 1fr 190px; gap: 10px; align-items: start; }}
     .ticket-head .meta {{ font-size: 12px; color: #334155; }}
     .ticket-head .mono {{ font-size: 11px; }}
     .ticket-status-badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #cbd5e1; font-weight: 700; font-size: 11px; }}
+    .ticket-status-badge.active {{ color: #15803d !important; border-color: #86efac; background: #f0fdf4; }}
+    .ticket-status-badge.done {{ color: #475569 !important; border-color: #cbd5e1; background: #f8fafc; }}
+    .ticket-author {{ margin-top: 8px; border: 1px dashed #bfdbfe; border-radius: 8px; background: #eef4ff; padding: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }}
+    .ticket-author .label {{ font-size: 11px; color: #64748b; margin-right: 4px; }}
+    .ticket-author .value {{ font-size: 12px; color: #0f172a; word-break: break-all; }}
     .ticket-preview {{ margin-top: 8px; padding: 8px; border: 1px dashed #cbd5e1; border-radius: 8px; font-size: 12px; color: #334155; background: #f8fbff; }}
     .ticket-preview b {{ color: #0f172a; }}
     .ticket-preview .who {{ display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 11px; border: 1px solid #bfdbfe; background: #eff6ff; color: #1d4ed8; margin-right: 6px; }}
@@ -2259,6 +2267,11 @@ def _render_admin_page() -> str:
     .ticket-message-block .label, .ticket-reply-block .label {{ font-size: 11px; color: #64748b; margin-bottom: 4px; }}
     .ticket-message {{ margin: 0; max-height: 120px; overflow: auto; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; font-size: 12px; white-space: pre-wrap; color: #334155; }}
     .ticket-thread-details > summary {{ cursor: pointer; color: #1d4ed8; font-size: 12px; font-weight: 700; margin-bottom: 4px; }}
+    .admin-thread {{ display: grid; gap: 8px; }}
+    .admin-msg-bubble {{ border: 1px solid #dbe3ef; border-radius: 10px; padding: 8px 10px; white-space: pre-wrap; font-size: 13px; color: #334155; background: #f8fbff; }}
+    .admin-msg-bubble.user {{ background: #eef4ff; border-color: #c7dbff; }}
+    .admin-msg-bubble.admin {{ background: #f0fdf4; border-color: #bbf7d0; }}
+    .admin-msg-head {{ font-size: 11px; color: #64748b; margin-bottom: 4px; display: flex; justify-content: space-between; gap: 8px; }}
     .ticket-reply-block {{ margin-top: 8px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }}
     .ticket-reply {{ min-height: 150px; resize: vertical; font-size: 13px; line-height: 1.35; }}
     .ticket-actions {{ display: flex; flex-direction: column; gap: 8px; min-width: 190px; }}
@@ -2266,7 +2279,9 @@ def _render_admin_page() -> str:
     .btn-danger {{ border-color: #fecaca; color: #b91c1c; background: #fef2f2; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
     @media (max-width: 1100px) {{
+      .ticket-toolbar {{ grid-template-columns: 1fr 1fr; }}
       .ticket-head {{ grid-template-columns: 1fr 1fr; }}
+      .ticket-author {{ grid-template-columns: 1fr; }}
       .ticket-reply-block {{ grid-template-columns: 1fr; }}
       .ticket-actions {{ flex-direction: row; flex-wrap: wrap; }}
     }}
@@ -2351,13 +2366,13 @@ def _render_admin_page() -> str:
     </div>
     <div class="grid" id="tabTickets" style="display:none">
       <section class="card">
-        <h3>Help tickets</h3>
-        <p class="hint">Tickets submitted from Get help page. Use quick actions and collapsed conversation view.</p>
-        <button class="btn" onclick="loadTickets()">Refresh tickets</button>
-        <div class="ticket-filters">
+        <p class="ticket-intro">Tickets submitted from Get help page. Use quick actions and collapsed conversation view.</p>
+        <div class="ticket-toolbar">
+          <button class="btn" onclick="loadTickets()">Refresh tickets</button>
+          <div class="ticket-filters">
           <div class="ticket-filter-item">
             <label>Status</label>
-            <select id="ticketFilterStatus"><option value="">all</option><option value="open">open</option><option value="in_progress">in_progress</option><option value="done">done</option></select>
+            <select id="ticketFilterStatus"><option value="">all</option><option value="open">active</option><option value="in_progress">in progress</option><option value="done">done</option></select>
           </div>
           <div class="ticket-filter-item">
             <label>Email</label>
@@ -2371,13 +2386,13 @@ def _render_admin_page() -> str:
             <label>Text</label>
             <input id="ticketFilterText" type="text" placeholder="search in subject/message/reply"/>
           </div>
-        </div>
-        <div class="ticket-filter-actions">
-          <button class="btn" onclick="applyTicketsFilter()">Apply filters</button>
+          </div>
+          <div class="ticket-filter-actions">
           <button class="btn" onclick="resetTicketsFilter()">Reset filters</button>
+          </div>
         </div>
         <span id="ticketsStatus" class="status">Ready</span>
-        <div id="ticketsBoard" class="tickets-board"></div>
+        <div class="tickets-results"><div id="ticketsBoard" class="tickets-board"></div></div>
       </section>
     </div>
     <div class="grid" id="tabFaq" style="display:none">
@@ -2586,6 +2601,12 @@ def _render_admin_page() -> str:
     function renderTickets(rows) {{
       const board = document.getElementById("ticketsBoard");
       const f = getTicketsFilter();
+      const statusLabel = (raw) => {{
+        const s = normStatus(raw || "");
+        if (s === "open") return "active";
+        if (s === "in_progress") return "in progress";
+        return "done";
+      }};
       const filtered = (rows || []).filter((r) => {{
         const status = normStatus(r.status || "");
         const email = String(r.email || "").toLowerCase();
@@ -2599,25 +2620,31 @@ def _render_admin_page() -> str:
         return true;
       }});
       let html = "";
-      for (const r of filtered) {{
+      for (let idx = 0; idx < filtered.length; idx++) {{
+        const r = filtered[idx];
         const normalizedStatus = normStatus(r.status || "");
-        const badge = normalizedStatus === "done" ? "#16a34a" : (normalizedStatus === "in_progress" ? "#ca8a04" : "#334155");
+        const unresolved = normalizedStatus !== "done";
+        const badgeCls = unresolved ? "active" : "done";
+        const badgeText = statusLabel(normalizedStatus);
         html += `<div class="ticket-card">`;
         html += `<div class="ticket-head">`;
         html += `<div class="meta"><div class="mono"><b>#${{esc(r.ticket_no || r.id)}}</b></div><div class="mono">${{esc(r.ts)}}</div></div>`;
-        html += `<div class="meta"><div><b>${{esc(r.subject)}}</b></div><div class="mono">${{esc(r.wallet_address)}}</div><div>${{esc(r.email)}}</div></div>`;
-        html += `<div class="meta"><span class="ticket-status-badge" style="color:${{badge}}">${{esc(normalizedStatus || "open")}}</span></div>`;
-        html += `<div class="meta mono">id=${{esc(r.id)}}</div>`;
+        html += `<div class="meta"><div><b>${{esc(r.subject)}}</b></div></div>`;
+        html += `<div class="meta"><span class="ticket-status-badge ${{badgeCls}}">${{esc(badgeText)}}</span></div>`;
         html += `</div>`;
+        html += `<div class="ticket-author"><div><span class="label">Name:</span><span class="value">${{esc(r.name || "-")}}</span></div><div><span class="label">Email:</span><span class="value">${{esc(r.email || "-")}}</span></div><div><span class="label">Wallet:</span><span class="value mono">${{esc(r.wallet_address || "-")}}</span></div><div><span class="label">Ticket #:</span><span class="value">${{esc(r.ticket_no || r.id)}}</span></div></div>`;
         const thread = Array.isArray(r.thread) && r.thread.length
           ? r.thread
           : [
               {{author_type: "user", ts: r.ts || "", message: r.message || ""}},
               ...(r.admin_note ? [{{author_type: "admin", ts: "", message: r.admin_note}}] : [])
             ];
-        const threadText = thread.map((m) => {{
-          const who = String(m.author_type || "user").toLowerCase() === "admin" ? "Admin" : "User";
-          return `[${{who}}] ${{String(m.ts || "")}} ${{String(m.message || "")}}`.trim();
+        const threadHtml = thread.map((m) => {{
+          const who = String(m.author_type || "user").toLowerCase() === "admin" ? "admin" : "user";
+          const whoLabel = who === "admin" ? "Admin" : "User";
+          const ts = esc(m.ts || "");
+          const msg = esc(m.message || "");
+          return `<div class="admin-msg-bubble ${{who}}"><div class="admin-msg-head"><span>${{whoLabel}}</span><span>${{ts}}</span></div>${{msg}}</div>`;
         }}).join("\\n\\n");
         const lastMsgObj = thread.length ? thread[thread.length - 1] : null;
         const lastWhoRaw = String(lastMsgObj?.author_type || "user").toLowerCase();
@@ -2627,10 +2654,14 @@ def _render_admin_page() -> str:
         const lastBody = String(lastMsgObj?.message || "").replace(/\\s+/g, " ").trim();
         const lastShort = lastBody.length > 140 ? (lastBody.slice(0, 140) + "...") : lastBody;
         html += `<div class="ticket-preview"><b>Last message:</b> <span class="who ${{lastWho}}">${{lastWhoLabel}}</span><span class="mono">${{esc(lastTs)}}</span><div style="margin-top:4px">${{esc(lastShort || "(empty)")}}</div></div>`;
-        html += `<div class="ticket-message-block"><details class="ticket-thread-details"><summary>Conversation (${{thread.length}} messages)</summary><pre class="ticket-message">${{esc(threadText)}}</pre></details></div>`;
+        if (idx === 0) {{
+          html += `<div class="ticket-message-block"><div class="label">Conversation (${{thread.length}} messages)</div><div class="admin-thread">${{threadHtml}}</div></div>`;
+        }} else {{
+          html += `<div class="ticket-message-block"><details class="ticket-thread-details"><summary>Conversation (${{thread.length}} messages)</summary><div class="admin-thread">${{threadHtml}}</div></details></div>`;
+        }}
         html += `<div class="ticket-reply-block">`;
         html += `<div><div class="label">Reply</div><textarea class="ticket-reply" id="note_${{r.id}}" placeholder="Reply to user...">${{esc(r.admin_note)}}</textarea></div>`;
-        html += `<div class="ticket-actions"><button class="btn btn-soft" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'open')">Mark open</button><button class="btn btn-soft" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'in_progress')">Save / in progress</button><button class="btn" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done')">Send + done</button><button class="btn btn-danger" style="padding:6px 10px;font-size:12px" onclick="deleteTicketAction(${{r.id}}, '${{esc(r.ticket_no || r.id)}}')">Delete ticket</button></div>`;
+        html += `<div class="ticket-actions"><button class="btn btn-soft" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'in_progress', true)">Send + progress</button><button class="btn" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done', true)">Send + close</button><button class="btn btn-soft" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done', false)">Close</button><button class="btn btn-danger" style="padding:6px 10px;font-size:12px" onclick="deleteTicketAction(${{r.id}}, '${{esc(r.ticket_no || r.id)}}')">Delete ticket</button></div>`;
         html += `</div>`;
         html += `</div>`;
       }}
@@ -2651,13 +2682,16 @@ def _render_admin_page() -> str:
         setTicketsStatus("Load failed: " + (e?.message || "unknown"), true);
       }}
     }}
-    async function setTicketStatusAction(ticketId, status) {{
+    async function setTicketStatusAction(ticketId, status, sendReply = true) {{
       try {{
         const note = (document.getElementById(`note_${{ticketId}}`)?.value || "").trim();
-        const data = await postJson("/api/admin/help-tickets/update", {{ticket_id: ticketId, status, admin_note: note}});
+        const payload = {{ticket_id: ticketId, status}};
+        if (sendReply) payload.admin_note = note;
+        const data = await postJson("/api/admin/help-tickets/update", payload);
         const no = data.ticket_no || ticketId;
         const extra = data.email_info ? `, ${{data.email_info}}` : "";
-        setTicketsStatus(`Ticket #${{no}} updated${{extra}}`, false);
+        const verb = sendReply ? "updated" : "closed";
+        setTicketsStatus(`Ticket #${{no}} ${{verb}}${{extra}}`, false);
         await loadTickets();
       }} catch (e) {{
         setTicketsStatus("Update failed: " + (e?.message || "unknown"), true);
@@ -3051,7 +3085,7 @@ def _render_help_page() -> str:
         wrap.innerHTML = '<p class="hint">No tickets yet.</p>';
         return;
       }}
-      wrap.innerHTML = (items || []).map((t) => {{
+      wrap.innerHTML = (items || []).map((t, idx) => {{
         const subject = escHtml(t.subject || "");
         const status = escHtml(t.status || "open");
         const thread = Array.isArray(t.thread) && t.thread.length
@@ -3070,13 +3104,14 @@ def _render_help_page() -> str:
         const msgCount = thread.length;
         const lastMsgObj = thread.length ? thread[thread.length - 1] : null;
         const lastWhoRaw = String(lastMsgObj?.author_type || "user").toLowerCase();
-        const lastWho = lastWhoRaw === "admin" ? "admin" : "user";
-        const lastWhoLabel = lastWho === "admin" ? "Admin" : "You";
-        const lastTs = escHtml(lastMsgObj?.ts || "");
+        const lastWhoLabel = lastWhoRaw === "admin" ? "Admin" : "You";
         const lastBody = String(lastMsgObj?.message || "").replace(/\\s+/g, " ").trim();
-        const lastShort = escHtml(lastBody.length > 110 ? (lastBody.slice(0, 110) + "...") : (lastBody || ""));
-        const preview = `<div class="ticket-last-preview"><span class="who ${{lastWho}}">${{lastWhoLabel}}</span><span class="hint">${{lastTs}}</span><div style="margin-top:3px">${{lastShort || "(empty)"}}</div></div>`;
-        return `<details style="margin-bottom:10px"><summary><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}} <span class="hint">(${{msgCount}} messages)</span></summary>${{preview}}<div style="margin-top:8px" class="thread">${{threadHtml}}</div><div class="reply-compose"><textarea id="myReply_${{t.id}}" placeholder="Reply to admin in this ticket thread..."></textarea><button class="btn" onclick="replyToTicket(${{t.id}})">Send reply</button></div></details>`;
+        const lastShort = escHtml(lastBody.length > 90 ? (lastBody.slice(0, 90) + "...") : (lastBody || ""));
+        const summaryTail = lastShort ? ` - ${{lastWhoLabel}}: ${{lastShort}}` : "";
+        if (idx === 0) {{
+          return `<div style="margin-bottom:10px;border:1px solid #dbe3ef;border-radius:10px;padding:8px;background:#f8fbff"><div style="font-weight:700"><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}} <span class="hint">(${{msgCount}} messages)</span><span class="hint">${{summaryTail}}</span></div><div style="margin-top:8px" class="thread">${{threadHtml}}</div><div class="reply-compose"><textarea id="myReply_${{t.id}}" placeholder="Reply to admin in this ticket thread..."></textarea><button class="btn" onclick="replyToTicket(${{t.id}})">Send reply</button></div></div>`;
+        }}
+        return `<details style="margin-bottom:10px"><summary><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}} <span class="hint">(${{msgCount}} messages)</span><span class="hint">${{summaryTail}}</span></summary><div style="margin-top:8px" class="thread">${{threadHtml}}</div><div class="reply-compose"><textarea id="myReply_${{t.id}}" placeholder="Reply to admin in this ticket thread..."></textarea><button class="btn" onclick="replyToTicket(${{t.id}})">Send reply</button></div></details>`;
       }}).join("");
     }}
     async function replyToTicket(ticketId) {{
