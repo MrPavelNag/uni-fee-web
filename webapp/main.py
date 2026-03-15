@@ -227,6 +227,20 @@ def _init_analytics_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_help_tickets_status ON help_tickets(status)")
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS help_ticket_messages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ticket_id INTEGER NOT NULL,
+              ts TEXT NOT NULL,
+              author_type TEXT NOT NULL,
+              message TEXT NOT NULL,
+              session_id TEXT NOT NULL DEFAULT '',
+              wallet_address TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_help_ticket_messages_ticket_id ON help_ticket_messages(ticket_id, id)")
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS faq_items (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               created_at TEXT NOT NULL,
@@ -687,7 +701,75 @@ def _create_help_ticket(
         )
         conn.commit()
         ticket_id = int(cur.lastrowid or 0)
+    _append_help_ticket_message(
+        ticket_id=ticket_id,
+        author_type="user",
+        message=message,
+        session_id=session_id,
+        wallet_address=wallet_address,
+    )
     return ticket_id
+
+
+def _append_help_ticket_message(
+    *,
+    ticket_id: int,
+    author_type: str,
+    message: str,
+    session_id: str = "",
+    wallet_address: str = "",
+) -> None:
+    text = (message or "").strip()
+    if not text:
+        return
+    who = (author_type or "").strip().lower()
+    if who not in {"user", "admin"}:
+        who = "user"
+    with _analytics_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO help_ticket_messages(ticket_id, ts, author_type, message, session_id, wallet_address)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(ticket_id),
+                _iso_now(),
+                who,
+                text[:4000],
+                (session_id or "")[:128],
+                (wallet_address or "").strip().lower()[:64],
+            ),
+        )
+        conn.commit()
+
+
+def _ticket_messages_map(ticket_ids: list[int], limit_per_ticket: int = 200) -> dict[int, list[dict[str, Any]]]:
+    ids = [int(x) for x in ticket_ids if int(x) > 0]
+    if not ids:
+        return {}
+    placeholders = ",".join(["?"] * len(ids))
+    query = f"""
+        SELECT ticket_id, ts, author_type, message
+        FROM help_ticket_messages
+        WHERE ticket_id IN ({placeholders})
+        ORDER BY ticket_id ASC, id ASC
+    """
+    out: dict[int, list[dict[str, Any]]] = {}
+    with _analytics_conn() as conn:
+        rows = conn.execute(query, tuple(ids)).fetchall()
+    for r in rows:
+        tid = int(r[0])
+        bucket = out.setdefault(tid, [])
+        if len(bucket) >= limit_per_ticket:
+            continue
+        bucket.append(
+            {
+                "ts": str(r[1]),
+                "author_type": str(r[2]),
+                "message": str(r[3]),
+            }
+        )
+    return out
 
 
 def _list_help_tickets(limit: int = 100) -> list[dict[str, Any]]:
@@ -701,7 +783,7 @@ def _list_help_tickets(limit: int = 100) -> list[dict[str, Any]]:
             """,
             (max(1, min(500, int(limit))),),
         ).fetchall()
-    return [
+    items = [
         {
             "id": int(r[0]),
             "ts": str(r[1]),
@@ -717,6 +799,10 @@ def _list_help_tickets(limit: int = 100) -> list[dict[str, Any]]:
         }
         for r in rows
     ]
+    threads = _ticket_messages_map([int(x["id"]) for x in items])
+    for item in items:
+        item["thread"] = threads.get(int(item["id"]), [])
+    return items
 
 
 def _list_help_tickets_for_session(session_id: str, limit: int = 50, wallet_address: str = "") -> list[dict[str, Any]]:
@@ -745,7 +831,7 @@ def _list_help_tickets_for_session(session_id: str, limit: int = 50, wallet_addr
                 """,
                 (session_id, lim),
             ).fetchall()
-    return [
+    items = [
         {
             "id": int(r[0]),
             "ticket_no": _ticket_number(int(r[0])),
@@ -757,6 +843,10 @@ def _list_help_tickets_for_session(session_id: str, limit: int = 50, wallet_addr
         }
         for r in rows
     ]
+    threads = _ticket_messages_map([int(x["id"]) for x in items])
+    for item in items:
+        item["thread"] = threads.get(int(item["id"]), [])
+    return items
 
 
 def _list_faq_items(*, include_unpublished: bool = False, limit: int = 200) -> list[dict[str, Any]]:
@@ -1511,6 +1601,12 @@ class HelpTicketUpdate(BaseModel):
     admin_note: str | None = None
 
 
+class HelpTicketReply(BaseModel):
+    ticket_id: int
+    message: str
+    email: str = ""
+
+
 class AdminFaqUpsert(BaseModel):
     faq_id: int | None = None
     question: str
@@ -1628,6 +1724,10 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       background-repeat: no-repeat;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
     }}
+    .intent-select option {{
+      background: #eef4ff;
+      color: #1f3a8a;
+    }}
     .connect-btn {{
       border: 1px solid #bfdbfe;
       border-radius: 10px;
@@ -1646,7 +1746,8 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
     .wallet-modal-backdrop {{
       position: fixed;
       inset: 0;
-      background: rgba(15, 23, 42, 0.45);
+      background: linear-gradient(180deg, rgba(217, 227, 245, 0.82) 0%, rgba(236, 242, 255, 0.82) 100%);
+      backdrop-filter: blur(3px);
       display: none;
       align-items: center;
       justify-content: center;
@@ -1911,6 +2012,19 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         alert("WalletConnect is not configured on server (WALLETCONNECT_PROJECT_ID).");
         return;
       }}
+      const normalizeAddress = (value) => {{
+        const raw = String(value || "").trim();
+        if (!raw) return "";
+        const parts = raw.split(":");
+        return String(parts[parts.length - 1] || "").trim();
+      }};
+      const toHexMessage = (msg) => {{
+        try {{
+          return "0x" + Array.from(new TextEncoder().encode(String(msg || ""))).map((b) => b.toString(16).padStart(2, "0")).join("");
+        }} catch (_) {{
+          return "";
+        }}
+      }};
       try {{
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
         const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
@@ -1925,27 +2039,45 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
           chains: [1],
           optionalChains: wcChains.filter((c) => c !== 1),
           showQrModal: true,
-          methods: ["eth_requestAccounts", "eth_chainId", "personal_sign"],
-          optionalMethods: [],
+          methods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign"],
+          optionalMethods: ["wallet_switchEthereumChain"],
+          optionalEvents: ["accountsChanged", "chainChanged", "disconnect"],
           metadata: wcMetadata,
           rpcMap: {{}},
         }});
-        await provider.connect();
-        let accounts = provider.accounts || [];
-        if (!accounts.length) {{
-          accounts = (await provider.request({{method: "eth_requestAccounts"}})) || [];
+        try {{ await provider.disconnect(); }} catch (_) {{}}
+        let connected = false;
+        try {{
+          await provider.connect();
+          connected = true;
+        }} catch (_) {{}}
+        if (!connected) {{
+          await provider.enable();
         }}
-        const address = String(accounts[0] || "").trim();
-        if (!address) throw new Error("WalletConnect did not return an address");
+        let accounts = provider.accounts || [];
+        if (!accounts.length) accounts = (await provider.request({{method: "eth_accounts"}})) || [];
+        if (!accounts.length) accounts = (await provider.request({{method: "eth_requestAccounts"}})) || [];
+        const address = normalizeAddress(accounts[0] || "");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
         const chainHex = await provider.request({{method: "eth_chainId"}});
         const chainId = Number.parseInt(String(chainHex || "0x1"), 16) || 1;
         const nonceResp = await postJson("/api/auth/nonce", {{address, chain_id: chainId, wallet: "walletconnect"}});
+        const messageHex = toHexMessage(nonceResp.message || "");
+        const signVariants = [
+          [nonceResp.message, address],
+          [address, nonceResp.message],
+          [messageHex, address],
+          [address, messageHex],
+        ];
         let signature = "";
-        try {{
-          signature = await provider.request({{method: "personal_sign", params: [nonceResp.message, address]}});
-        }} catch (_) {{
-          signature = await provider.request({{method: "personal_sign", params: [address, nonceResp.message]}});
+        for (const params of signVariants) {{
+          try {{
+            if (!params[0]) continue;
+            signature = await provider.request({{method: "personal_sign", params}});
+            if (signature) break;
+          }} catch (_) {{}}
         }}
+        if (!signature) throw new Error("Failed to sign auth message via WalletConnect");
         const verifyResp = await postJson("/api/auth/verify", {{
           address,
           chain_id: chainId,
@@ -1957,7 +2089,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         setAuthUI();
         closeWalletModal({{target: {{id: "walletModalBackdrop"}}}});
       }} catch (e) {{
-        alert("WalletConnect failed: " + (e?.message || "unknown error") + ". Check WalletConnect Project settings (allowed origins) and retry.");
+        alert("WalletConnect failed: " + (e?.message || "unknown error") + ". Check Reown Domain allowlist and retry.");
       }}
     }}
 
@@ -1994,6 +2126,8 @@ def _render_admin_page() -> str:
     .top-controls {{ display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }}
     .intent-prefix {{ font-size: 14px; font-weight: 700; color: #1d4ed8; white-space: nowrap; }}
     .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 240px; max-width: 280px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
+    .intent-select option {{ background: #eef4ff; color: #1f3a8a; }}
+    .intent-select option {{ background: #eef4ff; color: #1f3a8a; }}
     .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; width: 190px; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }}
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
     .tabs {{ display: flex; gap: 8px; margin-bottom: 8px; }}
@@ -2013,7 +2147,7 @@ def _render_admin_page() -> str:
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
     pre {{ max-height: 320px; overflow: auto; background: #f8fafc; border: 1px solid #dbe3ef; border-radius: 8px; padding: 10px; color: #334155; font-size: 12px; white-space: pre-wrap; }}
-    .wallet-modal-backdrop {{ position: fixed; inset: 0; background: rgba(15,23,42,0.45); display: none; align-items: center; justify-content: center; z-index: 9999; }}
+    .wallet-modal-backdrop {{ position: fixed; inset: 0; background: linear-gradient(180deg, rgba(217,227,245,0.82) 0%, rgba(236,242,255,0.82) 100%); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 9999; }}
     .wallet-modal {{ width: min(460px, calc(100vw - 24px)); background: #f8fbff; border: 1px solid #cbd5e1; border-radius: 14px; box-shadow: 0 12px 36px rgba(15,23,42,0.25); padding: 14px; }}
     .wallet-modal h3 {{ margin: 0 0 8px; font-size: 18px; }}
     .wallet-list {{ display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 10px; }}
@@ -2023,10 +2157,24 @@ def _render_admin_page() -> str:
     .ticket-filters {{ display: grid; grid-template-columns: 150px 230px 140px minmax(240px, 1fr); gap: 8px; margin-top: 8px; }}
     .ticket-filter-item label {{ display: block; font-size: 11px; color: #64748b; margin-bottom: 4px; }}
     .ticket-filter-actions {{ display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }}
-    #ticketsTable {{ min-width: 1380px; }}
-    #ticketsTable .reply-cell {{ min-width: 340px; }}
-    #ticketsTable .ticket-reply {{ min-height: 130px; resize: vertical; font-size: 13px; line-height: 1.35; }}
+    .tickets-board {{ display: grid; gap: 10px; margin-top: 10px; }}
+    .ticket-card {{ border: 1px solid #dbe3ef; border-radius: 10px; background: #f8fbff; padding: 10px; }}
+    .ticket-head {{ display: grid; grid-template-columns: 90px 1fr 190px 120px; gap: 10px; align-items: start; }}
+    .ticket-head .meta {{ font-size: 12px; color: #334155; }}
+    .ticket-head .mono {{ font-size: 11px; }}
+    .ticket-status-badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #cbd5e1; font-weight: 700; font-size: 11px; }}
+    .ticket-message-block {{ margin-top: 8px; }}
+    .ticket-message-block .label, .ticket-reply-block .label {{ font-size: 11px; color: #64748b; margin-bottom: 4px; }}
+    .ticket-message {{ margin: 0; max-height: 120px; overflow: auto; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; font-size: 12px; white-space: pre-wrap; color: #334155; }}
+    .ticket-reply-block {{ margin-top: 8px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }}
+    .ticket-reply {{ min-height: 150px; resize: vertical; font-size: 13px; line-height: 1.35; }}
+    .ticket-actions {{ display: flex; flex-direction: column; gap: 8px; min-width: 160px; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 1100px) {{
+      .ticket-head {{ grid-template-columns: 1fr 1fr; }}
+      .ticket-reply-block {{ grid-template-columns: 1fr; }}
+      .ticket-actions {{ flex-direction: row; flex-wrap: wrap; }}
+    }}
   </style>
 </head>
 <body>
@@ -2134,9 +2282,7 @@ def _render_admin_page() -> str:
           <button class="btn" onclick="resetTicketsFilter()">Reset filters</button>
         </div>
         <span id="ticketsStatus" class="status">Ready</span>
-        <div class="table-wrap" style="margin-top:10px">
-          <table id="ticketsTable"></table>
-        </div>
+        <div id="ticketsBoard" class="tickets-board"></div>
       </section>
     </div>
     <div class="grid" id="tabFaq" style="display:none">
@@ -2176,11 +2322,48 @@ def _render_admin_page() -> str:
     function openWalletModal() {{ const list=document.getElementById("walletList"); const choices=getWalletChoices(); list.innerHTML=choices.map((w)=>{{ const cls=w.available?"wallet-item":"wallet-item disabled"; const dis=w.available?"":"disabled"; const label=w.available?w.label:`${{w.label}} (not detected)`; return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{label}}</button>`; }}).join(""); document.getElementById("walletModalBackdrop").style.display="flex"; }}
     function closeWalletModal(event) {{ if(event&&event.target&&event.target.id!=="walletModalBackdrop") return; document.getElementById("walletModalBackdrop").style.display="none"; }}
     async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
-    function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; if(authState?.authenticated) {{ btn.textContent=authState.address_short||"Wallet connected"; }} else {{ btn.textContent="Connect Wallet"; }} }}
+    function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} }}
+    function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; if(authState?.authenticated) {{ btn.textContent=authState.address_short||"Wallet connected"; }} else {{ btn.textContent="Connect Wallet"; }} syncAdminIntentOption(); }}
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
-    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const wcChains=[1,10,56,137,8453,42161,43114]; const wcMetadata={{name:"Simple DeFi",description:"Simple DeFi wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}}; const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains.filter((c)=>c!==1),showQrModal:true,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],metadata:wcMetadata,rpcMap:{{}}}}); await provider.connect(); let accounts=provider.accounts||[]; if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); let signature=""; try {{ signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); }} catch(_) {{ signature=await provider.request({{method:"personal_sign",params:[address,nonceResp.message]}}); }} const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ alert("WalletConnect failed: "+(e?.message||"unknown error")+". Check WalletConnect Project settings (allowed origins) and retry."); }} }}
+    async function connectWalletConnect() {{
+      if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID).");
+      const normalizeAddress=(value)=>{{ const raw=String(value||"").trim(); if(!raw) return ""; const parts=raw.split(":"); return String(parts[parts.length-1]||"").trim(); }};
+      const toHexMessage=(msg)=>{{ try {{ return "0x"+Array.from(new TextEncoder().encode(String(msg||""))).map((b)=>b.toString(16).padStart(2,"0")).join(""); }} catch(_) {{ return ""; }} }};
+      try {{
+        const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
+        const wcChains=[1,10,56,137,8453,42161,43114];
+        const wcMetadata={{name:"Simple DeFi",description:"Simple DeFi wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
+        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains.filter((c)=>c!==1),showQrModal:true,methods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign"],optionalMethods:["wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
+        try {{ await provider.disconnect(); }} catch (_) {{}}
+        let connected=false;
+        try {{ await provider.connect(); connected=true; }} catch (_) {{}}
+        if(!connected) await provider.enable();
+        let accounts=provider.accounts||[];
+        if(!accounts.length) accounts=(await provider.request({{method:"eth_accounts"}}))||[];
+        if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[];
+        const address=normalizeAddress(accounts[0]||"");
+        if(!/^0x[a-fA-F0-9]{{40}}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
+        const chainHex=await provider.request({{method:"eth_chainId"}});
+        const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1;
+        const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}});
+        const messageHex=toHexMessage(nonceResp.message||"");
+        const signVariants=[[nonceResp.message,address],[address,nonceResp.message],[messageHex,address],[address,messageHex]];
+        let signature="";
+        for (const params of signVariants) {{
+          try {{ if(!params[0]) continue; signature=await provider.request({{method:"personal_sign",params}}); if(signature) break; }} catch (_) {{}}
+        }}
+        if(!signature) throw new Error("Failed to sign auth message via WalletConnect");
+        const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}});
+        authState={{authenticated:true,...verifyResp}};
+        setAuthUI();
+        closeWalletModal({{target:{{id:"walletModalBackdrop"}}}});
+        location.reload();
+      }} catch(e) {{
+        alert("WalletConnect failed: "+(e?.message||"unknown error")+". Check Reown Domain allowlist and retry.");
+      }}
+    }}
     function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setStatsStatus(text, isErr) {{ const el=document.getElementById("statsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFailStatus(text, isErr) {{ const el=document.getElementById("failStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
@@ -2188,8 +2371,10 @@ def _render_admin_page() -> str:
     function setFaqStatus(text, isErr) {{ const el=document.getElementById("faqStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function normStatus(v) {{ return String(v || "").trim().toLowerCase().replace(/[\\s-]+/g, "_"); }}
     function getTicketsFilter() {{
+      const statusEl = document.getElementById("ticketFilterStatus");
+      const statusRaw = statusEl ? (statusEl.value || "") : "";
       return {{
-        status: normStatus((document.getElementById("ticketFilterStatus")?.value || "")),
+        status: normStatus(statusRaw),
         email: (document.getElementById("ticketFilterEmail")?.value || "").trim().toLowerCase(),
         ticketNo: (document.getElementById("ticketFilterNo")?.value || "").trim(),
         text: (document.getElementById("ticketFilterText")?.value || "").trim().toLowerCase(),
@@ -2294,7 +2479,7 @@ def _render_admin_page() -> str:
     }}
     function esc(v) {{ return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }}
     function renderTickets(rows) {{
-      const table = document.getElementById("ticketsTable");
+      const board = document.getElementById("ticketsBoard");
       const f = getTicketsFilter();
       const filtered = (rows || []).filter((r) => {{
         const status = normStatus(r.status || "");
@@ -2307,25 +2492,38 @@ def _render_admin_page() -> str:
         if (f.text && !hay.includes(f.text)) return false;
         return true;
       }});
-      let html = "<tr><th>Ticket #</th><th>Time</th><th>Subject</th><th>Message</th><th>Contact</th><th>Status</th><th style='min-width:340px'>Reply</th><th style='min-width:250px'>Actions</th></tr>";
+      let html = "";
       for (const r of filtered) {{
         const normalizedStatus = normStatus(r.status || "");
         const badge = normalizedStatus === "done" ? "#16a34a" : (normalizedStatus === "in_progress" ? "#ca8a04" : "#334155");
-        html += "<tr>";
-        html += `<td class="mono">#${{esc(r.ticket_no || r.id)}}</td>`;
-        html += `<td class="mono">${{esc(r.ts)}}</td>`;
-        html += `<td>${{esc(r.subject)}}</td>`;
-        html += `<td><pre style="max-height:120px;margin:0">${{esc(r.message)}}</pre></td>`;
-        html += `<td><div class="mono">${{esc(r.wallet_address)}}</div><div>${{esc(r.email)}}</div></td>`;
-        html += `<td><span style="display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #cbd5e1;color:${{badge}};font-weight:700">${{esc(normalizedStatus || "open")}}</span></td>`;
-        html += `<td class="reply-cell"><textarea class="ticket-reply" id="note_${{r.id}}" placeholder="Reply to user...">${{esc(r.admin_note)}}</textarea></td>`;
-        html += `<td><button class="btn" style="padding:5px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'in_progress')">Save/in progress</button> <button class="btn" style="padding:5px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done')">Send + done</button></td>`;
-        html += "</tr>";
+        html += `<div class="ticket-card">`;
+        html += `<div class="ticket-head">`;
+        html += `<div class="meta"><div class="mono"><b>#${{esc(r.ticket_no || r.id)}}</b></div><div class="mono">${{esc(r.ts)}}</div></div>`;
+        html += `<div class="meta"><div><b>${{esc(r.subject)}}</b></div><div class="mono">${{esc(r.wallet_address)}}</div><div>${{esc(r.email)}}</div></div>`;
+        html += `<div class="meta"><span class="ticket-status-badge" style="color:${{badge}}">${{esc(normalizedStatus || "open")}}</span></div>`;
+        html += `<div class="meta mono">id=${{esc(r.id)}}</div>`;
+        html += `</div>`;
+        const thread = Array.isArray(r.thread) && r.thread.length
+          ? r.thread
+          : [
+              {{author_type: "user", ts: r.ts || "", message: r.message || ""}},
+              ...(r.admin_note ? [{{author_type: "admin", ts: "", message: r.admin_note}}] : [])
+            ];
+        const threadText = thread.map((m) => {{
+          const who = String(m.author_type || "user").toLowerCase() === "admin" ? "Admin" : "User";
+          return `[${{who}}] ${{String(m.ts || "")}} ${{String(m.message || "")}}`.trim();
+        }}).join("\\n\\n");
+        html += `<div class="ticket-message-block"><div class="label">Message thread</div><pre class="ticket-message">${{esc(threadText)}}</pre></div>`;
+        html += `<div class="ticket-reply-block">`;
+        html += `<div><div class="label">Reply</div><textarea class="ticket-reply" id="note_${{r.id}}" placeholder="Reply to user...">${{esc(r.admin_note)}}</textarea></div>`;
+        html += `<div class="ticket-actions"><button class="btn" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'in_progress')">Save/in progress</button><button class="btn" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done')">Send + done</button></div>`;
+        html += `</div>`;
+        html += `</div>`;
       }}
       if (!filtered.length) {{
-        html += '<tr><td colspan="8">No tickets yet.</td></tr>';
+        html = '<div class="hint">No tickets yet.</div>';
       }}
-      table.innerHTML = html;
+      board.innerHTML = html;
       setTicketsStatus(`Showing ${{filtered.length}} / ${{(rows || []).length}} tickets`, false);
     }}
     async function loadTickets() {{
@@ -2560,7 +2758,14 @@ def _render_help_page() -> str:
     textarea {{ min-height: 140px; resize: vertical; }}
     .btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 9px 14px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; }}
     .status {{ font-size: 13px; color: #475569; margin-left: 8px; }}
-    .wallet-modal-backdrop {{ position: fixed; inset: 0; background: rgba(15,23,42,0.45); display: none; align-items: center; justify-content: center; z-index: 9999; }}
+    .thread {{ display: grid; gap: 8px; }}
+    .msg-bubble {{ border: 1px solid #dbe3ef; border-radius: 10px; padding: 8px 10px; background: #f8fbff; white-space: pre-wrap; font-size: 13px; color: #334155; }}
+    .msg-bubble.user {{ background: #eef4ff; border-color: #c7dbff; }}
+    .msg-bubble.admin {{ background: #f0fdf4; border-color: #bbf7d0; }}
+    .msg-head {{ font-size: 11px; color: #64748b; margin-bottom: 4px; display: flex; justify-content: space-between; gap: 8px; }}
+    .reply-compose {{ margin-top: 8px; display: grid; gap: 8px; }}
+    .reply-compose textarea {{ min-height: 90px; resize: vertical; }}
+    .wallet-modal-backdrop {{ position: fixed; inset: 0; background: linear-gradient(180deg, rgba(217,227,245,0.82) 0%, rgba(236,242,255,0.82) 100%); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 9999; }}
     .wallet-modal {{ width: min(460px, calc(100vw - 24px)); background: #f8fbff; border: 1px solid #cbd5e1; border-radius: 14px; box-shadow: 0 12px 36px rgba(15,23,42,0.25); padding: 14px; }}
     .wallet-modal h3 {{ margin: 0 0 8px; font-size: 18px; }}
     .wallet-list {{ display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 10px; }}
@@ -2585,6 +2790,11 @@ def _render_help_page() -> str:
     </div>
     <div class="grid">
       <section class="card">
+        <h3>FAQ</h3>
+        <p class="hint">Published answers.</p>
+        <div id="faqList">Loading FAQ...</div>
+      </section>
+      <section class="card">
         <h3>Send a ticket</h3>
         <p class="hint">Your ticket goes to the admin panel.</p>
         <div class="row"><label>Name</label><input id="tName" type="text" placeholder="Optional"/></div>
@@ -2593,11 +2803,6 @@ def _render_help_page() -> str:
         <div class="row"><label>Message</label><textarea id="tMessage" placeholder="Describe the issue or request"></textarea></div>
         <button class="btn" onclick="sendTicket()">Send ticket</button>
         <span class="status" id="ticketStatus">Ready</span>
-      </section>
-      <section class="card">
-        <h3>FAQ</h3>
-        <p class="hint">Published answers.</p>
-        <div id="faqList">Loading FAQ...</div>
       </section>
       <section class="card">
         <h3>My tickets</h3>
@@ -2629,7 +2834,42 @@ def _render_help_page() -> str:
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
-    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const wcChains=[1,10,56,137,8453,42161,43114]; const wcMetadata={{name:"Simple DeFi",description:"Simple DeFi wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}}; const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains.filter((c)=>c!==1),showQrModal:true,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],metadata:wcMetadata,rpcMap:{{}}}}); await provider.connect(); let accounts=provider.accounts||[]; if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); let signature=""; try {{ signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); }} catch(_) {{ signature=await provider.request({{method:"personal_sign",params:[address,nonceResp.message]}}); }} const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ alert("WalletConnect failed: "+(e?.message||"unknown error")+". Check WalletConnect Project settings (allowed origins) and retry."); }} }}
+    async function connectWalletConnect() {{
+      if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID).");
+      const normalizeAddress=(value)=>{{ const raw=String(value||"").trim(); if(!raw) return ""; const parts=raw.split(":"); return String(parts[parts.length-1]||"").trim(); }};
+      const toHexMessage=(msg)=>{{ try {{ return "0x"+Array.from(new TextEncoder().encode(String(msg||""))).map((b)=>b.toString(16).padStart(2,"0")).join(""); }} catch(_) {{ return ""; }} }};
+      try {{
+        const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
+        const wcChains=[1,10,56,137,8453,42161,43114];
+        const wcMetadata={{name:"Simple DeFi",description:"Simple DeFi wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
+        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains.filter((c)=>c!==1),showQrModal:true,methods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign"],optionalMethods:["wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
+        try {{ await provider.disconnect(); }} catch (_) {{}}
+        let connected=false;
+        try {{ await provider.connect(); connected=true; }} catch (_) {{}}
+        if(!connected) await provider.enable();
+        let accounts=provider.accounts||[];
+        if(!accounts.length) accounts=(await provider.request({{method:"eth_accounts"}}))||[];
+        if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[];
+        const address=normalizeAddress(accounts[0]||"");
+        if(!/^0x[a-fA-F0-9]{{40}}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
+        const chainHex=await provider.request({{method:"eth_chainId"}});
+        const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1;
+        const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}});
+        const messageHex=toHexMessage(nonceResp.message||"");
+        const signVariants=[[nonceResp.message,address],[address,nonceResp.message],[messageHex,address],[address,messageHex]];
+        let signature="";
+        for (const params of signVariants) {{
+          try {{ if(!params[0]) continue; signature=await provider.request({{method:"personal_sign",params}}); if(signature) break; }} catch (_) {{}}
+        }}
+        if(!signature) throw new Error("Failed to sign auth message via WalletConnect");
+        const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}});
+        authState={{authenticated:true,...verifyResp}};
+        setAuthUI();
+        closeWalletModal({{target:{{id:"walletModalBackdrop"}}}});
+      }} catch(e) {{
+        alert("WalletConnect failed: "+(e?.message||"unknown error")+". Check Reown Domain allowlist and retry.");
+      }}
+    }}
     function setTicketStatus(text, isErr) {{ const el=document.getElementById("ticketStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     async function sendTicket() {{
       try {{
@@ -2673,6 +2913,7 @@ def _render_help_page() -> str:
         document.getElementById("faqList").innerHTML = '<p class="hint">FAQ failed to load.</p>';
       }}
     }}
+    function escHtml(v) {{ return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }}
     function renderMyTickets(items) {{
       const wrap = document.getElementById("myTickets");
       if (!(items || []).length) {{
@@ -2680,12 +2921,39 @@ def _render_help_page() -> str:
         return;
       }}
       wrap.innerHTML = (items || []).map((t) => {{
-        const subject = String(t.subject || "").replace(/</g, "&lt;");
-        const message = String(t.message || "").replace(/</g, "&lt;");
-        const reply = String(t.admin_reply || "").replace(/</g, "&lt;");
-        const status = String(t.status || "open");
-        return `<details style="margin-bottom:8px"><summary><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}}</summary><div style="margin-top:6px"><div><b>Message:</b><br/>${{message}}</div>${{reply ? `<div style="margin-top:8px"><b>Admin reply:</b><br/>${{reply}}</div>` : ""}}</div></details>`;
+        const subject = escHtml(t.subject || "");
+        const status = escHtml(t.status || "open");
+        const thread = Array.isArray(t.thread) && t.thread.length
+          ? t.thread
+          : [
+              {{author_type: "user", ts: t.ts || "", message: t.message || ""}},
+              ...(t.admin_reply ? [{{author_type: "admin", ts: "", message: t.admin_reply}}] : [])
+            ];
+        const threadHtml = thread.map((m) => {{
+          const who = String(m.author_type || "user").toLowerCase() === "admin" ? "admin" : "user";
+          const whoLabel = who === "admin" ? "Admin" : "You";
+          const ts = escHtml(m.ts || "");
+          const msg = escHtml(m.message || "");
+          return `<div class="msg-bubble ${{who}}"><div class="msg-head"><span>${{whoLabel}}</span><span>${{ts}}</span></div>${{msg}}</div>`;
+        }}).join("");
+        return `<details style="margin-bottom:10px" open><summary><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}}</summary><div style="margin-top:8px" class="thread">${{threadHtml}}</div><div class="reply-compose"><textarea id="myReply_${{t.id}}" placeholder="Reply to admin in this ticket thread..."></textarea><button class="btn" onclick="replyToTicket(${{t.id}})">Send reply</button></div></details>`;
       }}).join("");
+    }}
+    async function replyToTicket(ticketId) {{
+      try {{
+        const el = document.getElementById(`myReply_${{ticketId}}`);
+        const message = (el?.value || "").trim();
+        if (message.length < 2) throw new Error("Reply is too short");
+        const email = (document.getElementById("tEmail")?.value || "").trim();
+        const data = await postJson("/api/help/tickets/reply", {{ticket_id: Number(ticketId), message, email}});
+        const no = data.ticket_no || ticketId;
+        const extra = data.email_info ? `, ${{data.email_info}}` : "";
+        setTicketStatus(`Reply sent for ticket #${{no}}${{extra}}`, false);
+        if (el) el.value = "";
+        await loadMyTickets();
+      }} catch (e) {{
+        setTicketStatus("Reply failed: " + (e?.message || "unknown"), true);
+      }}
     }}
     async function loadMyTickets() {{
       try {{
@@ -3094,6 +3362,54 @@ def my_help_tickets(request: Request, response: Response, limit: int = 50) -> di
     return {"items": items, "count": len(items)}
 
 
+@app.post("/api/help/tickets/reply")
+def reply_help_ticket(req: HelpTicketReply, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    msg = (req.message or "").strip()
+    if len(msg) < 2:
+        raise HTTPException(status_code=400, detail="Reply is too short.")
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    wallet = str(auth.get("address") or "").strip().lower()
+    with _analytics_conn() as conn:
+        row = conn.execute(
+            "SELECT id, session_id, wallet_address, email, subject FROM help_tickets WHERE id = ?",
+            (int(req.ticket_id),),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Ticket not found.")
+        ticket_id = int(row[0])
+        owner_sid = str(row[1] or "")
+        owner_wallet = str(row[2] or "").strip().lower()
+        ticket_email = str(row[3] or "").strip()
+        ticket_subject = str(row[4] or "").strip()
+    can_reply = (sid == owner_sid) or (_is_eth_address(wallet) and wallet == owner_wallet)
+    if not can_reply:
+        raise HTTPException(status_code=403, detail="You can reply only to your own ticket.")
+
+    _append_help_ticket_message(
+        ticket_id=ticket_id,
+        author_type="user",
+        message=msg,
+        session_id=sid,
+        wallet_address=wallet,
+    )
+    with _analytics_conn() as conn:
+        conn.execute("UPDATE help_tickets SET status = ? WHERE id = ?", ("open", ticket_id))
+        conn.commit()
+    _analytics_log_event(session_id=sid, event_type="help_ticket", path="/api/help/tickets/reply", payload=str(ticket_id))
+    ticket_no = _ticket_number(ticket_id)
+    email_info = ""
+    # Optional copy to user email (existing or explicitly provided)
+    to_email = (req.email or ticket_email or "").strip()
+    if to_email and _is_valid_email(to_email):
+        subject = _ticket_subject(ticket_no, ticket_subject or "Ticket reply")
+        body = f"Your reply for ticket #{ticket_no} was received.\n\nReply:\n{msg}\n"
+        ok, info = _send_ticket_email(to_email, subject, body)
+        email_info = "copy sent" if ok else f"copy failed: {info}"
+    return {"ok": True, "ticket_no": ticket_no, "email_info": email_info}
+
+
 @app.get("/api/faq")
 def public_faq(limit: int = 200) -> dict[str, Any]:
     items = _list_faq_items(include_unpublished=False, limit=limit)
@@ -3123,19 +3439,37 @@ def admin_help_ticket_update(req: HelpTicketUpdate, request: Request, response: 
     ticket_email = ""
     ticket_subject = ""
     ticket_no = 0
+    prev_admin_note = ""
+    ticket_session_id = ""
+    ticket_wallet = ""
     admin_note = req.admin_note if req.admin_note is not None else None
     with _analytics_conn() as conn:
-        row = conn.execute("SELECT id, email, subject FROM help_tickets WHERE id = ?", (int(req.ticket_id),)).fetchone()
+        row = conn.execute(
+            "SELECT id, session_id, wallet_address, email, subject, admin_note FROM help_tickets WHERE id = ?",
+            (int(req.ticket_id),),
+        ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Ticket not found.")
         ticket_no = _ticket_number(int(row[0]))
-        ticket_email = str(row[1] or "").strip()
-        ticket_subject = str(row[2] or "").strip()
+        ticket_session_id = str(row[1] or "")
+        ticket_wallet = str(row[2] or "")
+        ticket_email = str(row[3] or "").strip()
+        ticket_subject = str(row[4] or "").strip()
+        prev_admin_note = str(row[5] or "").strip()
         if status:
             conn.execute("UPDATE help_tickets SET status = ? WHERE id = ?", (status, int(req.ticket_id)))
         if admin_note is not None:
             conn.execute("UPDATE help_tickets SET admin_note = ? WHERE id = ?", ((admin_note or "")[:1000], int(req.ticket_id)))
         conn.commit()
+    new_admin_note = (admin_note or "").strip() if admin_note is not None else ""
+    if new_admin_note and new_admin_note != prev_admin_note:
+        _append_help_ticket_message(
+            ticket_id=int(req.ticket_id),
+            author_type="admin",
+            message=new_admin_note,
+            session_id=ticket_session_id,
+            wallet_address=ticket_wallet,
+        )
     email_info = ""
     if admin_note and ticket_email and _is_valid_email(ticket_email):
         subject = _ticket_subject(ticket_no, ticket_subject or "Admin reply")
@@ -3492,6 +3826,10 @@ HTML_PAGE = """
       background-repeat: no-repeat;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
     }
+    .intent-select option {
+      background: #eef4ff;
+      color: #1f3a8a;
+    }
     .connect-btn {
       border: 1px solid #bfdbfe;
       border-radius: 10px;
@@ -3510,7 +3848,8 @@ HTML_PAGE = """
     .wallet-modal-backdrop {
       position: fixed;
       inset: 0;
-      background: rgba(15, 23, 42, 0.45);
+      background: linear-gradient(180deg, rgba(217,227,245,0.82) 0%, rgba(236,242,255,0.82) 100%);
+      backdrop-filter: blur(3px);
       display: none;
       align-items: center;
       justify-content: center;
@@ -4297,6 +4636,19 @@ HTML_PAGE = """
         setStatus("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID).", "fail");
         return;
       }
+      const normalizeAddress = (value) => {
+        const raw = String(value || "").trim();
+        if (!raw) return "";
+        const parts = raw.split(":");
+        return String(parts[parts.length - 1] || "").trim();
+      };
+      const toHexMessage = (msg) => {
+        try {
+          return "0x" + Array.from(new TextEncoder().encode(String(msg || ""))).map((b) => b.toString(16).padStart(2, "0")).join("");
+        } catch (_) {
+          return "";
+        }
+      };
       try {
         setStatus("Connecting WalletConnect...", "running");
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
@@ -4312,27 +4664,45 @@ HTML_PAGE = """
           chains: [1],
           optionalChains: wcChains.filter((c) => c !== 1),
           showQrModal: true,
-          methods: ["eth_requestAccounts", "eth_chainId", "personal_sign"],
-          optionalMethods: [],
+          methods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign"],
+          optionalMethods: ["wallet_switchEthereumChain"],
+          optionalEvents: ["accountsChanged", "chainChanged", "disconnect"],
           metadata: wcMetadata,
           rpcMap: {},
         });
-        await provider.connect();
-        let accounts = provider.accounts || [];
-        if (!accounts.length) {
-          accounts = (await provider.request({method: "eth_requestAccounts"})) || [];
+        try { await provider.disconnect(); } catch (_) {}
+        let connected = false;
+        try {
+          await provider.connect();
+          connected = true;
+        } catch (_) {}
+        if (!connected) {
+          await provider.enable();
         }
-        const address = String(accounts[0] || "").trim();
-        if (!address) throw new Error("WalletConnect did not return an address");
+        let accounts = provider.accounts || [];
+        if (!accounts.length) accounts = (await provider.request({method: "eth_accounts"})) || [];
+        if (!accounts.length) accounts = (await provider.request({method: "eth_requestAccounts"})) || [];
+        const address = normalizeAddress(accounts[0] || "");
+        if (!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
         const chainHex = await provider.request({method: "eth_chainId"});
         const chainId = Number.parseInt(String(chainHex || "0x1"), 16) || 1;
         const nonceResp = await postJson("/api/auth/nonce", {address, chain_id: chainId, wallet: "walletconnect"});
+        const messageHex = toHexMessage(nonceResp.message || "");
+        const signVariants = [
+          [nonceResp.message, address],
+          [address, nonceResp.message],
+          [messageHex, address],
+          [address, messageHex],
+        ];
         let signature = "";
-        try {
-          signature = await provider.request({method: "personal_sign", params: [nonceResp.message, address]});
-        } catch (_) {
-          signature = await provider.request({method: "personal_sign", params: [address, nonceResp.message]});
+        for (const params of signVariants) {
+          try {
+            if (!params[0]) continue;
+            signature = await provider.request({method: "personal_sign", params});
+            if (signature) break;
+          } catch (_) {}
         }
+        if (!signature) throw new Error("Failed to sign auth message via WalletConnect");
         const verifyResp = await postJson("/api/auth/verify", {
           address,
           chain_id: chainId,
@@ -4345,7 +4715,7 @@ HTML_PAGE = """
         closeWalletModal({target: {id: "walletModalBackdrop"}});
         setStatus(`Connected: ${verifyResp.address_short}`, "ok");
       } catch (e) {
-        setStatus("WalletConnect auth failed: " + (e?.message || "unknown") + ". Check WalletConnect Project allowed origins.", "fail");
+        setStatus("WalletConnect auth failed: " + (e?.message || "unknown") + ". Check Reown Domain allowlist.", "fail");
       }
     }
 
