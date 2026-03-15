@@ -31,12 +31,30 @@ from uniswap_client import get_graph_endpoint, graphql_query
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-_catalog_storage_dir = os.environ.get("CATALOG_STORAGE_DIR", "").strip()
-if _catalog_storage_dir:
-    CATALOG_DIR = Path(_catalog_storage_dir).expanduser()
-else:
-    render_disk = os.environ.get("RENDER_DISK_PATH", "").strip()
-    CATALOG_DIR = (Path(render_disk) / "uni_fee_cache") if render_disk else DATA_DIR
+
+
+def _resolve_catalog_dir() -> Path:
+    # Highest priority: explicit path from env.
+    explicit = os.environ.get("CATALOG_STORAGE_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+
+    # Render disk mount can be exposed under different env names.
+    for env_name in ("RENDER_DISK_PATH", "RENDER_DISK_MOUNT_PATH", "RENDER_DISK_MOUNT"):
+        mount = os.environ.get(env_name, "").strip()
+        if mount:
+            return Path(mount) / "uni_fee_cache"
+
+    # Common Render persistent disk mount point.
+    default_render_mount = Path("/var/data")
+    if default_render_mount.exists():
+        return default_render_mount / "uni_fee_cache"
+
+    # Local/dev fallback.
+    return DATA_DIR
+
+
+CATALOG_DIR = _resolve_catalog_dir()
 CATALOG_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
@@ -319,9 +337,28 @@ def _refresh_catalogs_once() -> None:
         print(f"[catalog-refresh] tokens refresh failed: {e}")
 
 
+def _catalog_stale(path: Path, max_age_sec: int) -> bool:
+    cached = _read_json(path)
+    if not cached:
+        return True
+    updated_at_raw = str(cached.get("updated_at") or "").strip()
+    if not updated_at_raw:
+        return True
+    try:
+        updated_at = datetime.fromisoformat(updated_at_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    age_sec = (datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds()
+    return age_sec >= max_age_sec
+
+
 def _catalog_refresh_loop(interval_sec: int, run_on_startup: bool) -> None:
-    # Optional refresh on startup, then every `interval_sec`.
-    if run_on_startup:
+    # Optional refresh on startup, but only when cache is missing/stale.
+    if run_on_startup and (
+        _catalog_stale(TOKEN_CATALOG_PATH, interval_sec) or _catalog_stale(CHAIN_CATALOG_PATH, interval_sec)
+    ):
         _refresh_catalogs_once()
     while not CATALOG_REFRESH_STOP.wait(interval_sec):
         _refresh_catalogs_once()
@@ -415,6 +452,7 @@ def _merge_for_web(
     rows = []
     chart_series = []
     filtered_out = 0
+    default_visible = 0
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
@@ -437,7 +475,7 @@ def _merge_for_web(
             "status": status,
         }
         rows.append(row)
-        if status == "ok":
+        if fees or tvl:
             chart_series.append(
                 {
                     "label": f"{row['chain']} {row['version']} {row['pair']} ...{row['pool_id'][-4:]}",
@@ -445,16 +483,19 @@ def _merge_for_web(
                     "version": row["version"],
                     "pair": row["pair"],
                     "fee_pct": row["fee_pct"],
+                    "status": status,
                     "pool_id": row["pool_id"],
                     "fees": fees,
                     "tvl": tvl,
                 }
             )
+            if status == "ok":
+                default_visible += 1
 
     return {
         "suffix": suffix,
         "total": len(merged),
-        "chart_pools": len(chart_series),
+        "chart_pools": default_visible,
         "error_pools": filtered_out,
         "rows": rows,
         "series": chart_series,
@@ -1353,10 +1394,6 @@ HTML_PAGE = """
                   <input id="maxFeePct" value="2" type="number" step="0.1" min="1" max="3"/>
                 </div>
                 <div class="filter-item">
-                  <div class="hint">Exclude address suffix<br/>(last 4)</div>
-                  <input id="excludeSuffixes" value="" type="text" placeholder="ab12,ff09"/>
-                </div>
-                <div class="filter-item">
                   <div class="hint">Protocol<br/>version</div>
                   <div class="proto-checks">
                     <label><input id="protoV3" type="checkbox" checked/> V3</label>
@@ -1410,6 +1447,7 @@ HTML_PAGE = """
   <script>
     const SORTABLE = {
       color: (r) => r.pool_id || "",
+      visibility: (r) => r.pool_id || "",
       chain: (r) => r.chain || "",
       version: (r) => r.version || "",
       pair: (r) => r.pair || "",
@@ -1425,10 +1463,13 @@ HTML_PAGE = """
     let sortKey = "final_income";
     let sortDesc = true;
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
-    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "excludeSuffixes", "protoV3", "protoV4", "allChains"];
+    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "allChains"];
     let availableChains = [];
     let colorMap = {};
     let dashMap = {};
+    let visibilityMap = {};
+    let seriesByPool = {};
+    let currentRequest = {};
     let pairRowsVisible = 1;
 
     function splitCSV(v) {
@@ -1611,16 +1652,6 @@ HTML_PAGE = """
       return validatePairs().pairs;
     }
 
-    function getExcludedSuffixes() {
-      const raw = (document.getElementById("excludeSuffixes").value || "").trim().toLowerCase();
-      if (!raw) return [];
-      return raw
-        .split(",")
-        .map(x => x.trim().replace(/^0x/, ""))
-        .filter(Boolean)
-        .map(x => x.slice(-4));
-    }
-
     function getSelectedProtocols() {
       const out = [];
       if (document.getElementById("protoV3")?.checked) out.push("v3");
@@ -1712,10 +1743,80 @@ HTML_PAGE = """
       }
     }
 
+    function togglePoolVisibility(el) {
+      const poolId = el?.dataset?.poolId;
+      if (!poolId) return;
+      visibilityMap[poolId] = !!el.checked;
+      redrawCharts();
+    }
+
+    function redrawCharts() {
+      const palette = ["#1e3a8a", "#155e75", "#14532d", "#7e22ce", "#7f1d1d", "#1d4ed8", "#0e7490", "#166534", "#6d28d9", "#be123c"];
+      const dashes = ["dash", "dot", "dashdot", "longdash", "longdashdot"];
+      const feeTraces = [];
+      const tvlTraces = [];
+      let maxTs = 0;
+
+      const pools = Object.keys(seriesByPool);
+      for (let i = 0; i < pools.length; i++) {
+        const poolId = pools[i];
+        const s = seriesByPool[poolId];
+        if (!visibilityMap[poolId]) continue;
+        const feeX = (s.fees || []).map(p => new Date(p[0] * 1000));
+        const feeY = (s.fees || []).map(p => p[1]);
+        const tvlX = (s.tvl || []).map(p => new Date(p[0] * 1000));
+        const tvlY = (s.tvl || []).map(p => p[1] / 1000.0);
+        const localMax = Math.max(
+          ...((s.fees || []).map(p => Number(p[0] || 0))),
+          ...((s.tvl || []).map(p => Number(p[0] || 0))),
+          0
+        );
+        if (localMax > maxTs) maxTs = localMax;
+        const c = colorMap[poolId] || palette[i % palette.length];
+        const d = dashMap[poolId] || (i < palette.length ? "solid" : dashes[(i - palette.length) % dashes.length]);
+        const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
+        feeTraces.push({
+          x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
+          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
+          line: {color: c, width: 2, dash: d}
+        });
+        tvlTraces.push({
+          x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
+          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
+          line: {color: c, width: 2, dash: d}
+        });
+      }
+
+      const alloc = Number(currentRequest?.lp_allocation_usd || 1000);
+      const days = Number(currentRequest?.days || getDaysValue());
+      const endDate = maxTs > 0 ? new Date(maxTs * 1000) : new Date();
+      const startDate = new Date(endDate.getTime() - days * 24 * 3600 * 1000);
+      Plotly.newPlot("feesChart", feeTraces, {
+        title: `Cumulative Fees (LP allocation: $${formatUsd(alloc)})`,
+        paper_bgcolor: "#ffffff",
+        plot_bgcolor: "#f8fbff",
+        font: {color: "#0f172a"},
+        showlegend: false,
+        margin: {t: 30, b: 42, l: 50, r: 14},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
+        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
+      }, {displaylogo: false, responsive: true});
+      Plotly.newPlot("tvlChart", tvlTraces, {
+        title: "TVL dynamics (thousands USD)",
+        paper_bgcolor: "#ffffff",
+        plot_bgcolor: "#f8fbff",
+        font: {color: "#0f172a"},
+        showlegend: false,
+        margin: {t: 30, b: 42, l: 50, r: 14},
+        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
+        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
+      }, {displaylogo: false, responsive: true});
+    }
+
     function renderTable(rows) {
       const table = document.getElementById("resultTable");
       const hdr = [
-        ["color", ""], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
+        ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
         ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["status", "Status"]
       ];
 
@@ -1731,11 +1832,15 @@ HTML_PAGE = """
         const color = colorMap[r.pool_id] || "#94a3b8";
         const dash = dashMap[r.pool_id] || "solid";
         const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
+        const visible = !!visibilityMap[r.pool_id];
+        const hasSeries = !!seriesByPool[r.pool_id];
+        const disabled = hasSeries ? "" : "disabled";
         const poolIdDisplay = (r.version === "v4" && (r.pool_id || "").length > 24)
           ? `${r.pool_id.slice(0, 12)}...${r.pool_id.slice(-8)}`
           : r.pool_id;
         html += `<tr class="${cls}">`;
         html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};"></span></td>`;
+        html += `<td><input type="checkbox" data-pool-id="${r.pool_id}" ${visible ? "checked" : ""} ${disabled} onchange="togglePoolVisibility(this)"/></td>`;
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
         html += `<td>${r.pair}</td>`;
@@ -1778,11 +1883,12 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const headers = ["chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "status"];
+      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "status"];
       const lines = [headers.join(",")];
       for (const r of rows) {
         const vals = headers.map(h => {
-          const val = r[h] == null ? "" : String(r[h]);
+          const rawVal = (h === "visibility") ? (!!visibilityMap[r.pool_id]) : r[h];
+          const val = rawVal == null ? "" : String(rawVal);
           return `"${val.replace(/"/g, '""')}"`;
         });
         lines.push(vals.join(","));
@@ -1853,7 +1959,6 @@ HTML_PAGE = """
           days: Number(document.getElementById("days").value || 30),
           max_fee_pct: Number(document.getElementById("maxFeePct").value || 2),
           min_fee_pct: Number(document.getElementById("minFeePct").value || 0),
-          exclude_suffixes: getExcludedSuffixes(),
         };
         if (!payload.include_versions.length) {
           setStatus("Select at least one protocol (V3/V4).", "fail");
@@ -1940,71 +2045,31 @@ HTML_PAGE = """
       if (mErr) mErr.textContent = result.error_pools;
       loadRecentLogs();
 
-      const feeTraces = [];
-      const tvlTraces = [];
+      currentRequest = result?.request || {};
       colorMap = {};
       dashMap = {};
+      visibilityMap = {};
+      seriesByPool = {};
       const palette = ["#1e3a8a", "#155e75", "#14532d", "#7e22ce", "#7f1d1d", "#1d4ed8", "#0e7490", "#166534", "#6d28d9", "#be123c"];
       const dashes = ["dash", "dot", "dashdot", "longdash", "longdashdot"];
-      let maxTs = 0;
-      for (const s of result.series) {
-        const feeX = s.fees.map(p => new Date(p[0] * 1000));
-        const feeY = s.fees.map(p => p[1]);
-        const tvlX = s.tvl.map(p => new Date(p[0] * 1000));
-        const tvlY = s.tvl.map(p => p[1] / 1000.0);
-        const localMax = Math.max(
-          ...(s.fees || []).map(p => Number(p[0] || 0)),
-          ...(s.tvl || []).map(p => Number(p[0] || 0)),
-          0
-        );
-        if (localMax > maxTs) maxTs = localMax;
-        const c = palette[feeTraces.length % palette.length];
-        const d = feeTraces.length < palette.length ? "solid" : dashes[(feeTraces.length - palette.length) % dashes.length];
-        const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
+      for (let i = 0; i < (result.series || []).length; i++) {
+        const s = result.series[i];
+        const c = palette[i % palette.length];
+        const d = i < palette.length ? "solid" : dashes[(i - palette.length) % dashes.length];
         colorMap[s.pool_id] = c;
         dashMap[s.pool_id] = d;
-        feeTraces.push({
-          x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
-          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
-          line: {color: c, width: 2, dash: d}
-        });
-        tvlTraces.push({
-          x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
-          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
-          line: {color: c, width: 2, dash: d}
-        });
+        seriesByPool[s.pool_id] = s;
+        visibilityMap[s.pool_id] = (s.status === "ok");
       }
-      const alloc = Number(result?.request?.lp_allocation_usd || 1000);
-      const days = Number(result?.request?.days || getDaysValue());
-      const endDate = maxTs > 0 ? new Date(maxTs * 1000) : new Date();
-      const startDate = new Date(endDate.getTime() - days * 24 * 3600 * 1000);
-      Plotly.newPlot("feesChart", feeTraces, {
-        title: `Cumulative Fees (LP allocation: $${formatUsd(alloc)})`,
-        paper_bgcolor: "#ffffff",
-        plot_bgcolor: "#f8fbff",
-        font: {color: "#0f172a"},
-        showlegend: false,
-        margin: {t: 30, b: 42, l: 50, r: 14},
-        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
-        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
-      }, {displaylogo: false, responsive: true});
-      Plotly.newPlot("tvlChart", tvlTraces, {
-        title: "TVL dynamics (thousands USD)",
-        paper_bgcolor: "#ffffff",
-        plot_bgcolor: "#f8fbff",
-        font: {color: "#0f172a"},
-        showlegend: false,
-        margin: {t: 30, b: 42, l: 50, r: 14},
-        xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
-        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
-      }, {displaylogo: false, responsive: true});
 
       const daysForApy = Number(result?.request?.days || getDaysValue());
       lastRows = (result.rows || []).map((r) => {
         const income = Number(r.final_income || 0);
+        const alloc = Number(currentRequest?.lp_allocation_usd || 1000);
         const apyPct = (alloc > 0 && daysForApy > 0) ? (income / alloc) * (365 / daysForApy) * 100 : 0;
         return {...r, apy_pct: apyPct};
       });
+      redrawCharts();
       sortKey = "final_income";
       sortDesc = true;
       sortBy("final_income");
