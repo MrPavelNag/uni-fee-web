@@ -10,19 +10,24 @@ Cloud-ready web MVP for pool analysis.
 import os
 import re
 import secrets
+import smtplib
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
 from agent_common import load_chart_data_json, pairs_to_filename_suffix
 from config import GOLDSKY_ENDPOINTS, TOKEN_ADDRESSES, UNISWAP_V3_SUBGRAPHS, UNISWAP_V4_SUBGRAPHS
@@ -80,11 +85,13 @@ app = FastAPI(title="Uni Fee Web", version="0.1.0")
 @app.on_event("startup")
 def _on_startup() -> None:
     _start_catalog_auto_refresh()
+    _start_analytics()
 
 
 @app.on_event("shutdown")
 def _on_shutdown() -> None:
     _stop_catalog_auto_refresh()
+    _stop_analytics()
 
 # Simple in-memory job storage (MVP)
 JOBS: dict[str, dict[str, Any]] = {}
@@ -98,6 +105,301 @@ CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTER
 CATALOG_REFRESH_ON_STARTUP = os.environ.get("CATALOG_REFRESH_ON_STARTUP", "0").strip().lower() in ("1", "true", "yes", "on")
 CATALOG_REFRESH_STOP = threading.Event()
 CATALOG_REFRESH_THREAD: threading.Thread | None = None
+AUTH_NONCE_TTL_SEC = int(os.environ.get("AUTH_NONCE_TTL_SEC", "300"))
+AUTH_NONCES: dict[str, dict[str, Any]] = {}
+AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
+AUTH_LOCK = threading.Lock()
+ANALYTICS_DB_PATH = Path(os.environ.get("ANALYTICS_DB_PATH", str(CATALOG_DIR / "analytics.sqlite3")))
+ANALYTICS_ENABLED = os.environ.get("ANALYTICS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+ANALYTICS_DAILY_EMAIL_ENABLED = os.environ.get("ANALYTICS_DAILY_EMAIL_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+ANALYTICS_REPORT_TO = os.environ.get("ANALYTICS_REPORT_TO", "nagibin@gmail.ru").strip()
+ANALYTICS_REPORT_HOUR_UTC = max(0, min(23, int(os.environ.get("ANALYTICS_REPORT_HOUR_UTC", "7"))))
+ANALYTICS_SMTP_HOST = os.environ.get("ANALYTICS_SMTP_HOST", "").strip()
+ANALYTICS_SMTP_PORT = int(os.environ.get("ANALYTICS_SMTP_PORT", "587"))
+ANALYTICS_SMTP_USER = os.environ.get("ANALYTICS_SMTP_USER", "").strip()
+ANALYTICS_SMTP_PASS = os.environ.get("ANALYTICS_SMTP_PASS", "").strip()
+ANALYTICS_SMTP_FROM = os.environ.get("ANALYTICS_SMTP_FROM", ANALYTICS_SMTP_USER).strip()
+ANALYTICS_SMTP_TLS = os.environ.get("ANALYTICS_SMTP_TLS", "1").strip().lower() in ("1", "true", "yes", "on")
+ANALYTICS_REPORT_SUBJECT_PREFIX = os.environ.get("ANALYTICS_REPORT_SUBJECT_PREFIX", "Uni Fee analytics").strip()
+ANALYTICS_STOP = threading.Event()
+ANALYTICS_THREAD: threading.Thread | None = None
+
+
+def _analytics_conn() -> sqlite3.Connection:
+    ANALYTICS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(ANALYTICS_DB_PATH), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _init_analytics_db() -> None:
+    if not ANALYTICS_ENABLED:
+        return
+    with _analytics_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analytics_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              path TEXT NOT NULL DEFAULT '',
+              payload TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_events_ts ON analytics_events(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_events_type ON analytics_events(event_type)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analytics_state (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _analytics_set_state(key: str, value: str) -> None:
+    if not ANALYTICS_ENABLED:
+        return
+    with _analytics_conn() as conn:
+        conn.execute(
+            "INSERT INTO analytics_state(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        conn.commit()
+
+
+def _analytics_get_state(key: str) -> str:
+    if not ANALYTICS_ENABLED:
+        return ""
+    with _analytics_conn() as conn:
+        row = conn.execute("SELECT value FROM analytics_state WHERE key = ?", (key,)).fetchone()
+    return str(row[0]) if row else ""
+
+
+def _analytics_log_event(session_id: str, event_type: str, path: str = "", payload: str = "") -> None:
+    if not ANALYTICS_ENABLED:
+        return
+    safe_sid = session_id if _is_valid_session_id(session_id) else "unknown"
+    try:
+        with _analytics_conn() as conn:
+            conn.execute(
+                "INSERT INTO analytics_events(ts, session_id, event_type, path, payload) VALUES(?, ?, ?, ?, ?)",
+                (_iso_now(), safe_sid, event_type, (path or "")[:128], (payload or "")[:2000]),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _analytics_report_window_utc(day_offset: int = 1) -> tuple[str, str, str]:
+    now = datetime.now(timezone.utc)
+    report_day = now.date().toordinal() - day_offset
+    start = datetime.fromordinal(report_day).replace(tzinfo=timezone.utc)
+    end = datetime.fromordinal(report_day + 1).replace(tzinfo=timezone.utc)
+    return (
+        start.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        end.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        start.date().isoformat(),
+    )
+
+
+def _analytics_build_daily_report(day_offset: int = 1) -> tuple[str, str]:
+    start_ts, end_ts, day_label = _analytics_report_window_utc(day_offset=day_offset)
+    if not ANALYTICS_ENABLED:
+        return day_label, "Analytics is disabled."
+    with _analytics_conn() as conn:
+        total_events = conn.execute(
+            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ?",
+            (start_ts, end_ts),
+        ).fetchone()[0]
+        page_views = conn.execute(
+            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'page_view'",
+            (start_ts, end_ts),
+        ).fetchone()[0]
+        visitors = conn.execute(
+            "SELECT COUNT(DISTINCT session_id) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'page_view'",
+            (start_ts, end_ts),
+        ).fetchone()[0]
+        runs_started = conn.execute(
+            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'run_start'",
+            (start_ts, end_ts),
+        ).fetchone()[0]
+        runs_done = conn.execute(
+            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'run_done'",
+            (start_ts, end_ts),
+        ).fetchone()[0]
+        runs_failed = conn.execute(
+            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'run_failed'",
+            (start_ts, end_ts),
+        ).fetchone()[0]
+        top_pages = conn.execute(
+            """
+            SELECT path, COUNT(*) c
+            FROM analytics_events
+            WHERE ts >= ? AND ts < ? AND event_type = 'page_view'
+            GROUP BY path
+            ORDER BY c DESC
+            LIMIT 8
+            """,
+            (start_ts, end_ts),
+        ).fetchall()
+        top_pairs = conn.execute(
+            """
+            SELECT payload, COUNT(*) c
+            FROM analytics_events
+            WHERE ts >= ? AND ts < ? AND event_type = 'run_start'
+            GROUP BY payload
+            ORDER BY c DESC
+            LIMIT 8
+            """,
+            (start_ts, end_ts),
+        ).fetchall()
+
+    lines = [
+        f"Uni Fee daily report (UTC): {day_label}",
+        "",
+        f"Visitors (unique sessions): {visitors}",
+        f"Page views: {page_views}",
+        f"Run starts: {runs_started}",
+        f"Run success: {runs_done}",
+        f"Run failed: {runs_failed}",
+        f"All tracked events: {total_events}",
+        "",
+        "Top pages:",
+    ]
+    if top_pages:
+        lines.extend([f"- {path or '/'}: {count}" for path, count in top_pages])
+    else:
+        lines.append("- no page views")
+    lines.append("")
+    lines.append("Top requested pairs:")
+    if top_pairs:
+        lines.extend([f"- {pairs}: {count}" for pairs, count in top_pairs if pairs])
+        if not any(pairs for pairs, _ in top_pairs):
+            lines.append("- no run requests")
+    else:
+        lines.append("- no run requests")
+    return day_label, "\n".join(lines)
+
+
+def _send_email_smtp(*, to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    if not ANALYTICS_SMTP_HOST or not ANALYTICS_SMTP_USER or not ANALYTICS_SMTP_PASS:
+        return False, "SMTP credentials are missing (ANALYTICS_SMTP_HOST/USER/PASS)."
+    if not to_email:
+        return False, "Recipient email is empty."
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = ANALYTICS_SMTP_FROM or ANALYTICS_SMTP_USER
+    msg["To"] = to_email
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(ANALYTICS_SMTP_HOST, ANALYTICS_SMTP_PORT, timeout=25) as smtp:
+            smtp.ehlo()
+            if ANALYTICS_SMTP_TLS:
+                smtp.starttls()
+                smtp.ehlo()
+            smtp.login(ANALYTICS_SMTP_USER, ANALYTICS_SMTP_PASS)
+            smtp.send_message(msg)
+        return True, "sent"
+    except Exception as e:
+        return False, str(e)
+
+
+def _send_daily_analytics_report(force: bool = False) -> tuple[bool, str]:
+    if not ANALYTICS_ENABLED:
+        return False, "Analytics disabled."
+    if not ANALYTICS_DAILY_EMAIL_ENABLED and not force:
+        return False, "Daily email disabled."
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    if not force:
+        if now.hour < ANALYTICS_REPORT_HOUR_UTC:
+            return False, "Too early for daily send."
+        last_sent = _analytics_get_state("last_daily_email_date_utc")
+        if last_sent == today:
+            return False, "Already sent today."
+    day_label, body = _analytics_build_daily_report(day_offset=1)
+    subject = f"{ANALYTICS_REPORT_SUBJECT_PREFIX} | {day_label}"
+    ok, info = _send_email_smtp(to_email=ANALYTICS_REPORT_TO, subject=subject, body=body)
+    if ok:
+        _analytics_set_state("last_daily_email_date_utc", today)
+        return True, f"Sent: {subject}"
+    return False, info
+
+
+def _send_test_analytics_email() -> tuple[bool, str]:
+    day_label, body = _analytics_build_daily_report(day_offset=0)
+    subject = f"{ANALYTICS_REPORT_SUBJECT_PREFIX} TEST | {day_label}"
+    return _send_email_smtp(to_email=ANALYTICS_REPORT_TO, subject=subject, body=body)
+
+
+def _analytics_loop() -> None:
+    # Lightweight scheduler: check once per minute.
+    while not ANALYTICS_STOP.wait(60):
+        try:
+            _send_daily_analytics_report(force=False)
+        except Exception:
+            continue
+
+
+def _start_analytics() -> None:
+    global ANALYTICS_THREAD
+    _init_analytics_db()
+    if not ANALYTICS_ENABLED:
+        return
+    if ANALYTICS_THREAD and ANALYTICS_THREAD.is_alive():
+        return
+    ANALYTICS_STOP.clear()
+    ANALYTICS_THREAD = threading.Thread(target=_analytics_loop, daemon=True, name="analytics-daily-email")
+    ANALYTICS_THREAD.start()
+
+
+def _stop_analytics() -> None:
+    ANALYTICS_STOP.set()
+
+
+def _public_base_url(request: Request) -> str:
+    env_base = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if env_base:
+        return env_base
+    return f"{request.url.scheme}://{request.url.netloc}"
+
+
+def _short_addr(address: str) -> str:
+    a = (address or "").strip()
+    if len(a) < 12:
+        return a
+    return f"{a[:6]}...{a[-4:]}"
+
+
+def _is_eth_address(value: str) -> bool:
+    return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", (value or "").strip()))
+
+
+def _new_nonce() -> str:
+    return secrets.token_urlsafe(18)
+
+
+def _siwe_message(*, domain: str, uri: str, address: str, chain_id: int, nonce: str, issued_at: str) -> str:
+    return (
+        f"{domain} wants you to sign in with your Ethereum account:\n"
+        f"{address}\n\n"
+        "Sign in to Uni Fee.\n\n"
+        f"URI: {uri}\n"
+        "Version: 1\n"
+        f"Chain ID: {chain_id}\n"
+        f"Nonce: {nonce}\n"
+        f"Issued At: {issued_at}"
+    )
 
 
 def _parse_pairs_str(raw: str) -> list[tuple[str, str]]:
@@ -587,6 +889,12 @@ def _push_run_history(
         bucket = RUN_HISTORY.setdefault(session_id, [])
         bucket.insert(0, item)
         del bucket[RUN_HISTORY_LIMIT:]
+    _analytics_log_event(
+        session_id=session_id,
+        event_type="run_done" if status == "done" else "run_failed",
+        path="/api/pools/run",
+        payload=token_pairs,
+    )
 
 
 def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
@@ -757,6 +1065,20 @@ class PoolsRunRequest(BaseModel):
     exclude_suffixes: list[str] = Field(default_factory=list, description="Exclude pool ids by last 4 chars")
 
 
+class AuthNonceRequest(BaseModel):
+    address: str
+    chain_id: int = 1
+    wallet: str = "injected"
+
+
+class AuthVerifyRequest(BaseModel):
+    address: str
+    chain_id: int = 1
+    wallet: str = "injected"
+    message: str
+    signature: str
+
+
 INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/", "Find the best pool on Uniswap"),
     ("/pancake", "Find the best pool on PancakeSwap"),
@@ -767,7 +1089,7 @@ INTENT_OPTIONS: list[tuple[str, str]] = [
 
 
 def _intent_options_html(selected_path: str) -> str:
-    rows = ['<option value="">I want to...</option>']
+    rows: list[str] = []
     for path, label in INTENT_OPTIONS:
         sel = " selected" if path == selected_path else ""
         rows.append(f'<option value="{path}"{sel}>{label}</option>')
@@ -814,26 +1136,32 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
     }}
     .top-controls {{
       display: flex;
-      gap: 8px;
+      gap: 10px;
       align-items: center;
       justify-content: flex-end;
       flex-wrap: nowrap;
     }}
+    .intent-prefix {{
+      font-size: 14px;
+      font-weight: 700;
+      color: #334155;
+      white-space: nowrap;
+    }}
     .intent-select {{
       border: 1px solid #cbd5e1;
       border-radius: 10px;
-      padding: 8px 10px;
-      font-size: 13px;
+      padding: 10px 12px;
+      font-size: 14px;
       color: #334155;
       background: #f8fbff;
-      min-width: 330px;
-      max-width: 430px;
+      min-width: 260px;
+      max-width: 300px;
     }}
     .connect-btn {{
       border: 1px solid #bfdbfe;
       border-radius: 10px;
-      padding: 8px 12px;
-      font-size: 13px;
+      padding: 10px 16px;
+      font-size: 14px;
       font-weight: 700;
       color: #1d4ed8;
       background: #eff6ff;
@@ -865,6 +1193,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         <p class="subtitle">Uniswap v3/v4 screening with on-screen charts, filtering and ranked pool table.</p>
       </div>
       <div class="top-controls">
+        <span class="intent-prefix">I want to</span>
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
           {options_html}
         </select>
@@ -890,43 +1219,55 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
     resp = HTMLResponse(HTML_PAGE)
-    _ensure_session_cookie(request, resp)
+    sid = _ensure_session_cookie(request, resp)
+    _analytics_log_event(session_id=sid, event_type="page_view", path="/")
     return resp
 
 
 @app.get("/stables", response_class=HTMLResponse)
 def stables_page(request: Request) -> HTMLResponse:
     resp = HTMLResponse(_render_placeholder_page("Lending Stablecoin", "This page is a placeholder for the future stablecoin workflow.", "/stables"))
-    _ensure_session_cookie(request, resp)
+    sid = _ensure_session_cookie(request, resp)
+    _analytics_log_event(session_id=sid, event_type="page_view", path="/stables")
     return resp
 
 
 @app.get("/positions", response_class=HTMLResponse)
 def positions_page(request: Request) -> HTMLResponse:
     resp = HTMLResponse(_render_placeholder_page("DeFi Positions", "This page is a placeholder for your positions dashboard.", "/positions"))
-    _ensure_session_cookie(request, resp)
+    sid = _ensure_session_cookie(request, resp)
+    _analytics_log_event(session_id=sid, event_type="page_view", path="/positions")
     return resp
 
 
 @app.get("/pancake", response_class=HTMLResponse)
 def pancake_page(request: Request) -> HTMLResponse:
     resp = HTMLResponse(_render_placeholder_page("Pancake Pool Finder", "This page is a placeholder for Pancake pool analysis.", "/pancake"))
-    _ensure_session_cookie(request, resp)
+    sid = _ensure_session_cookie(request, resp)
+    _analytics_log_event(session_id=sid, event_type="page_view", path="/pancake")
     return resp
 
 
 @app.get("/help", response_class=HTMLResponse)
 def help_page(request: Request) -> HTMLResponse:
     resp = HTMLResponse(_render_placeholder_page("Get a Hand", "This page is a placeholder for guided help.", "/help"))
-    _ensure_session_cookie(request, resp)
+    sid = _ensure_session_cookie(request, resp)
+    _analytics_log_event(session_id=sid, event_type="page_view", path="/help")
     return resp
 
 
 @app.get("/connect", response_class=HTMLResponse)
 def connect_page(request: Request) -> HTMLResponse:
     resp = HTMLResponse(_render_placeholder_page("Connect", "Connect is a placeholder for wallet/account integration.", ""))
-    _ensure_session_cookie(request, resp)
+    sid = _ensure_session_cookie(request, resp)
+    _analytics_log_event(session_id=sid, event_type="page_view", path="/connect")
     return resp
+
+
+@app.post("/api/analytics/send-test")
+def send_test_analytics_email() -> dict[str, Any]:
+    ok, info = _send_test_analytics_email()
+    return {"ok": ok, "info": info, "to": ANALYTICS_REPORT_TO}
 
 
 @app.get("/api/meta")
@@ -974,6 +1315,43 @@ def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def robots_txt(request: Request) -> str:
+    base = _public_base_url(request)
+    return "\n".join(
+        [
+            "User-agent: *",
+            "Allow: /",
+            "Disallow: /api/",
+            f"Sitemap: {base}/sitemap.xml",
+            "",
+        ]
+    )
+
+
+@app.get("/sitemap.xml")
+def sitemap_xml(request: Request) -> Response:
+    base = _public_base_url(request)
+    urls = ["/", "/pancake", "/stables", "/positions", "/help", "/connect"]
+    now = datetime.now(timezone.utc).date().isoformat()
+    body = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ]
+    for path in urls:
+        body.extend(
+            [
+                "  <url>",
+                f"    <loc>{base}{path}</loc>",
+                f"    <lastmod>{now}</lastmod>",
+                "    <changefreq>daily</changefreq>",
+                "  </url>",
+            ]
+        )
+    body.append("</urlset>")
+    return Response(content="\n".join(body), media_type="application/xml")
+
+
 @app.post("/api/pools/run")
 def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dict[str, str]:
     session_id = _ensure_session_cookie(request, response)
@@ -999,6 +1377,12 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         for x in req.exclude_suffixes
         if str(x).strip()
     ]
+    _analytics_log_event(
+        session_id=session_id,
+        event_type="run_start",
+        path="/api/pools/run",
+        payload=_pairs_to_string(_parse_pairs_str(";".join(req.pairs))),
+    )
 
     job_id = str(uuid.uuid4())
     with JOB_LOCK:
@@ -1095,26 +1479,32 @@ HTML_PAGE = """
     }
     .top-controls {
       display: flex;
-      gap: 8px;
+      gap: 10px;
       align-items: center;
       justify-content: flex-end;
       flex-wrap: nowrap;
     }
+    .intent-prefix {
+      font-size: 14px;
+      font-weight: 700;
+      color: #334155;
+      white-space: nowrap;
+    }
     .intent-select {
       border: 1px solid #cbd5e1;
       border-radius: 10px;
-      padding: 8px 10px;
-      font-size: 13px;
+      padding: 10px 12px;
+      font-size: 14px;
       color: #334155;
       background: #f8fbff;
-      min-width: 330px;
-      max-width: 430px;
+      min-width: 260px;
+      max-width: 300px;
     }
     .connect-btn {
       border: 1px solid #bfdbfe;
       border-radius: 10px;
-      padding: 8px 12px;
-      font-size: 13px;
+      padding: 10px 16px;
+      font-size: 14px;
       font-weight: 700;
       color: #1d4ed8;
       background: #eff6ff;
@@ -1493,8 +1883,8 @@ HTML_PAGE = """
         <p class="subtitle">Uniswap v3/v4 screening with on-screen charts, filtering and ranked pool table.</p>
       </div>
       <div class="top-controls">
+        <span class="intent-prefix">I want to</span>
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
-          <option value="">I want to...</option>
           <option value="/" selected>Find the best pool on Uniswap</option>
           <option value="/pancake">Find the best pool on PancakeSwap</option>
           <option value="/stables">Find the best stablecoin yield</option>
