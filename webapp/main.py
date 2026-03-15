@@ -162,6 +162,7 @@ AAVE_CHAIN_ID_TO_NAME: dict[int, str] = {
     534352: "scroll",
     57073: "ink",
 }
+_POSITION_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -259,6 +260,25 @@ def _init_analytics_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_help_ticket_messages_ticket_id ON help_ticket_messages(ticket_id, id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS help_feedback (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              wallet_address TEXT NOT NULL DEFAULT '',
+              name TEXT NOT NULL DEFAULT '',
+              email TEXT NOT NULL DEFAULT '',
+              subject TEXT NOT NULL DEFAULT '',
+              message TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'new',
+              reviewed_at TEXT NOT NULL DEFAULT '',
+              reviewed_by TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_help_feedback_ts ON help_feedback(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_help_feedback_status ON help_feedback(status)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS faq_items (
@@ -501,6 +521,11 @@ def _is_valid_email(value: str) -> bool:
 def _ticket_number(ticket_id: int) -> int:
     # First ticket id=1 -> number 12000.
     return 11999 + max(1, int(ticket_id))
+
+
+def _feedback_number(feedback_id: int) -> int:
+    # First feedback id=1 -> number 22000.
+    return 21999 + max(1, int(feedback_id))
 
 
 def _create_help_ticket(
@@ -816,6 +841,84 @@ def _list_faq_items(*, include_unpublished: bool = False, limit: int = 200) -> l
     ]
 
 
+def _create_help_feedback(
+    *,
+    session_id: str,
+    wallet_address: str,
+    name: str,
+    email: str,
+    subject: str,
+    message: str,
+) -> int:
+    with _analytics_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO help_feedback(ts, session_id, wallet_address, name, email, subject, message, status, reviewed_at, reviewed_by)
+            VALUES(?, ?, ?, ?, ?, ?, ?, 'new', '', '')
+            """,
+            (
+                _iso_now(),
+                (session_id or "")[:128],
+                (wallet_address or "").strip().lower()[:64],
+                (name or "").strip()[:120],
+                (email or "").strip()[:200],
+                (subject or "").strip()[:300],
+                (message or "").strip()[:4000],
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+
+
+def _list_help_feedback(limit: int = 200) -> list[dict[str, Any]]:
+    lim = max(1, min(500, int(limit)))
+    with _analytics_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, ts, session_id, wallet_address, name, email, subject, message, status, reviewed_at, reviewed_by
+            FROM help_feedback
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+    return [
+        {
+            "id": int(r[0]),
+            "feedback_no": _feedback_number(int(r[0])),
+            "ts": str(r[1] or ""),
+            "session_id": str(r[2] or ""),
+            "wallet_address": str(r[3] or ""),
+            "name": str(r[4] or ""),
+            "email": str(r[5] or ""),
+            "subject": str(r[6] or ""),
+            "message": str(r[7] or ""),
+            "status": str(r[8] or "new"),
+            "reviewed_at": str(r[9] or ""),
+            "reviewed_by": str(r[10] or ""),
+        }
+        for r in rows
+    ]
+
+
+def _mark_help_feedback_reviewed(feedback_id: int, reviewer_address: str = "") -> dict[str, Any]:
+    fid = int(feedback_id or 0)
+    if fid <= 0:
+        raise HTTPException(status_code=400, detail="feedback_id is required.")
+    reviewed_at = _iso_now()
+    reviewer = (reviewer_address or "").strip().lower()[:64]
+    with _analytics_conn() as conn:
+        row = conn.execute("SELECT id FROM help_feedback WHERE id = ?", (fid,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Feedback not found.")
+        conn.execute(
+            "UPDATE help_feedback SET status = 'reviewed', reviewed_at = ?, reviewed_by = ? WHERE id = ?",
+            (reviewed_at, reviewer, fid),
+        )
+        conn.commit()
+    return {"feedback_id": fid, "feedback_no": _feedback_number(fid), "reviewed_at": reviewed_at, "reviewed_by": reviewer}
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -918,6 +1021,29 @@ def _query_uniswap_positions_for_owner(endpoint: str, owner: str) -> list[dict[s
     return result
 
 
+def _endpoint_supports_uniswap_positions(endpoint: str) -> bool:
+    cached = _POSITION_SCHEMA_SUPPORT_CACHE.get(endpoint)
+    if cached is not None:
+        return cached
+    query = """
+    query PositionFields {
+      __type(name: "Position") {
+        fields { name }
+      }
+    }
+    """
+    ok = False
+    try:
+        data = graphql_query(endpoint, query, {}, retries=1)
+        fields = ((data.get("data") or {}).get("__type") or {}).get("fields") or []
+        names = {str(x.get("name") or "") for x in fields}
+        ok = ("pool" in names and "liquidity" in names)
+    except Exception:
+        ok = False
+    _POSITION_SCHEMA_SUPPORT_CACHE[endpoint] = ok
+    return ok
+
+
 def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -928,6 +1054,11 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
         for version in ("v3", "v4"):
             endpoint = get_graph_endpoint(chain_key, version=version)
             if not endpoint:
+                continue
+            if not _endpoint_supports_uniswap_positions(endpoint):
+                errors.append(
+                    f"Pool scan skipped [{chain_key}/{version}]: endpoint schema does not expose Position.pool/liquidity."
+                )
                 continue
             for owner in addresses:
                 try:
@@ -940,6 +1071,9 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                         # Hide closed/zero-liquidity historical NFTs; keep only active positions.
                         continue
                     pool = p.get("pool") or {}
+                    tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
+                    if tvl_usd <= 0:
+                        continue
                     t0 = (pool.get("token0") or {}).get("symbol") or "?"
                     t1 = (pool.get("token1") or {}).get("symbol") or "?"
                     rows.append(
@@ -953,7 +1087,7 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             "pair": f"{t0}/{t1}",
                             "fee_tier": str(pool.get("feeTier") or ""),
                             "liquidity": str(p.get("liquidity") or "0"),
-                            "tvl_usd": _safe_float(pool.get("totalValueLockedUSD")),
+                            "tvl_usd": tvl_usd,
                         }
                     )
     # Deduplicate by owner/protocol/pool id.
@@ -962,7 +1096,8 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
         key = (str(row.get("address")), str(row.get("protocol")), str(row.get("pool_id")))
         if key not in uniq:
             uniq[key] = row
-    return list(uniq.values()), errors
+    dedup_errors = list(dict.fromkeys(errors))
+    return list(uniq.values()), dedup_errors
 
 
 def _aave_markets_for_chains(chain_ids: list[int]) -> list[dict[str, Any]]:
@@ -1072,6 +1207,56 @@ def _scan_aave_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     "is_collateral": False,
                 }
             )
+    return rows, errors
+
+
+def _scan_aave_merit_rewards(addresses: list[str], chain_ids: list[int]) -> tuple[list[dict[str, Any]], list[str]]:
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    supported_ids = [int(x) for x in chain_ids if int(x) in AAVE_CHAIN_ID_TO_NAME]
+    if not supported_ids:
+        return rows, errors
+    query = """
+    query MeritRewards($user: EvmAddress!, $chainId: ChainId!) {
+      userMeritRewards(request: { user: $user, chainId: $chainId }) {
+        chain
+        claimable {
+          currency { symbol }
+          amount { amount { value } usd }
+        }
+      }
+    }
+    """
+    for owner in addresses:
+        for chain_id in supported_ids:
+            try:
+                data = graphql_query(
+                    AAVE_V3_GRAPHQL_ENDPOINT,
+                    query,
+                    {"user": owner, "chainId": int(chain_id)},
+                    retries=1,
+                )
+            except Exception:
+                continue
+            payload = ((data.get("data") or {}).get("userMeritRewards") or {})
+            claimable = payload.get("claimable") or []
+            for item in claimable:
+                amount_obj = item.get("amount") or {}
+                usd = _safe_float(amount_obj.get("usd"))
+                amount = _safe_float((amount_obj.get("amount") or {}).get("value"))
+                if usd <= 0 and amount <= 0:
+                    continue
+                rows.append(
+                    {
+                        "address": owner,
+                        "protocol": "aave_v3",
+                        "chain": AAVE_CHAIN_ID_TO_NAME.get(int(chain_id), str(chain_id)),
+                        "chain_id": int(chain_id),
+                        "asset": str((item.get("currency") or {}).get("symbol") or ""),
+                        "amount": amount,
+                        "usd": usd,
+                    }
+                )
     return rows, errors
 
 
@@ -1835,6 +2020,17 @@ class HelpTicketDelete(BaseModel):
     ticket_id: int
 
 
+class HelpFeedbackCreate(BaseModel):
+    name: str = ""
+    email: str = ""
+    subject: str
+    message: str
+
+
+class AdminFeedbackReview(BaseModel):
+    feedback_id: int
+
+
 class AdminFaqUpsert(BaseModel):
     faq_id: int | None = None
     question: str
@@ -1887,8 +2083,19 @@ def _render_placeholder_page(
     extra_css: str = "",
     extra_html: str = "",
     extra_script: str = "",
+    show_intro: bool = True,
 ) -> str:
     options_html = _intent_options_html(selected_path)
+    intro_html = (
+        f"""
+    <section class="card">
+      <h2>{page_title}</h2>
+      <p class="hint">{subtitle}</p>
+    </section>
+"""
+        if show_intro
+        else ""
+    )
     return f"""<!doctype html>
 <html>
 <head>
@@ -2068,10 +2275,7 @@ def _render_placeholder_page(
         <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
       </div>
     </div>
-    <section class="card">
-      <h2>{page_title}</h2>
-      <p class="hint">{subtitle}</p>
-    </section>
+    {intro_html}
     {extra_html}
   </div>
   <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
@@ -2434,22 +2638,26 @@ def _render_placeholder_page(
 
 def _render_positions_page() -> str:
     extra_css = """
-    .positions-grid { display:grid; gap:12px; margin-top:12px; }
-    .positions-form { background:#f3f7ff; border:1px solid #cfdcec; border-radius:14px; padding:14px; }
-    .positions-form h3 { margin:0 0 8px; font-size:18px; }
+    .positions-grid { display:grid; gap:14px; margin-top:4px; }
+    .positions-form, .result-card {
+      background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%);
+      border: 1px solid #d4deee;
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 6px 20px rgba(15,23,42,0.06);
+    }
+    .positions-form h3, .result-card h3 { margin:0 0 8px; font-size:17px; color:#1f3a8a; }
     .address-columns { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
-    .addr-box { border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:10px; }
-    .addr-box h4 { margin:0 0 8px; font-size:14px; color:#1e3a8a; }
+    .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
+    .addr-box h4 { margin:0 0 8px; font-size:14px; color:#1e40af; letter-spacing:0.1px; }
     .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
     .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; }
     .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; min-height:26px; }
     .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
     .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; }
     .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
-    .positions-actions { display:flex; gap:10px; align-items:center; }
+    .positions-actions { display:flex; gap:10px; align-items:center; margin-top:6px; }
     .pos-status { color:#475569; font-size:13px; }
-    .result-card { background:#f3f7ff; border:1px solid #cfdcec; border-radius:14px; padding:14px; }
-    .result-card h3 { margin:0 0 8px; font-size:17px; }
     .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:7px; text-align:left; vertical-align:top; }
@@ -2502,6 +2710,10 @@ def _render_positions_page() -> str:
       <section class="result-card">
         <h3>Lending positions</h3>
         <div class="table-wrap"><table id="posLendingTable"></table></div>
+      </section>
+      <section class="result-card">
+        <h3>Unclaimed lending rewards</h3>
+        <div class="table-wrap"><table id="posRewardsTable"></table></div>
         <div id="posErrors"></div>
       </section>
     </div>
@@ -2623,6 +2835,22 @@ def _render_positions_page() -> str:
       if (!(rows || []).length) html += "<tr><td colspan='10'>No lending positions found.</td></tr>";
       table.innerHTML = html;
     }
+    function renderRewards(rows) {
+      const table = document.getElementById("posRewardsTable");
+      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Asset</th><th>Amount</th><th>USD</th></tr>";
+      for (const r of (rows || [])) {
+        html += "<tr>";
+        html += `<td class='mono'>${esc(r.address || "")}</td>`;
+        html += `<td>${esc(r.chain || "")}</td>`;
+        html += `<td>${esc(r.protocol || "")}</td>`;
+        html += `<td>${esc(r.asset || "")}</td>`;
+        html += `<td>${Number(r.amount || 0).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>`;
+        html += `<td>${Number(r.usd || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}</td>`;
+        html += "</tr>";
+      }
+      if (!(rows || []).length) html += "<tr><td colspan='6'>No unclaimed rewards found.</td></tr>";
+      table.innerHTML = html;
+    }
     async function scanPositions() {
       if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
         setPosStatus("Add at least one address first.", true);
@@ -2643,6 +2871,7 @@ def _render_positions_page() -> str:
         if (!res.ok) throw new Error(data.detail || "Scan failed");
         renderPools(data.pool_positions || []);
         renderLending(data.lending_positions || []);
+        renderRewards(data.reward_positions || []);
         const errWrap = document.getElementById("posErrors");
         const errs = data.errors || [];
         const infos = data.infos || [];
@@ -2665,6 +2894,7 @@ def _render_positions_page() -> str:
         extra_css=extra_css,
         extra_html=extra_html,
         extra_script=extra_script,
+        show_intro=False,
     )
 
 
@@ -2756,6 +2986,8 @@ def _render_admin_page() -> str:
     .ticket-actions .btn {{ width: 100%; text-align: center; }}
     .btn-soft {{ background: #f8fbff; }}
     .btn-danger {{ border-color: #fecaca; color: #b91c1c; background: #fef2f2; }}
+    .feedback-board {{ display: grid; gap: 10px; margin-top: 10px; }}
+    .feedback-meta {{ margin-top: 6px; font-size: 12px; color: #64748b; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
     @media (max-width: 1100px) {{
       .ticket-controls {{ padding: 8px; }}
@@ -2785,6 +3017,7 @@ def _render_admin_page() -> str:
       <button class="tab-btn" id="tabBtnStats" onclick="switchTab('stats')">Stats</button>
       <button class="tab-btn" id="tabBtnFailures" onclick="switchTab('failures')">Failed runs</button>
       <button class="tab-btn" id="tabBtnTickets" onclick="switchTab('tickets')">Help tickets</button>
+      <button class="tab-btn" id="tabBtnFeedback" onclick="switchTab('feedback')">Feedback</button>
       <button class="tab-btn" id="tabBtnFaq" onclick="switchTab('faq')">FAQ</button>
     </div>
     <div class="grid" id="tabSettings">
@@ -2857,6 +3090,15 @@ def _render_admin_page() -> str:
           <span id="ticketsStatus" class="status">Ready</span>
         </div>
         <div class="tickets-results"><div id="ticketsBoard" class="tickets-board"></div></div>
+      </section>
+    </div>
+    <div class="grid" id="tabFeedback" style="display:none">
+      <section class="card">
+        <h3>Wishes and issue reports</h3>
+        <p class="hint">Messages from Get help page. Press Reviewed to archive and collapse.</p>
+        <button class="btn" onclick="loadFeedback()">Refresh feedback</button>
+        <span id="feedbackStatus" class="status">Ready</span>
+        <div id="feedbackBoard" class="feedback-board"></div>
       </section>
     </div>
     <div class="grid" id="tabFaq" style="display:none">
@@ -2943,6 +3185,7 @@ def _render_admin_page() -> str:
     function setStatsStatus(text, isErr) {{ const el=document.getElementById("statsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFailStatus(text, isErr) {{ const el=document.getElementById("failStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setTicketsStatus(text, isErr) {{ const el=document.getElementById("ticketsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function setFeedbackStatus(text, isErr) {{ const el=document.getElementById("feedbackStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFaqStatus(text, isErr) {{ const el=document.getElementById("faqStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function normStatus(v) {{ return String(v || "").trim().toLowerCase().replace(/[\\s-]+/g, "_"); }}
     function getTicketsFilter() {{
@@ -2984,6 +3227,8 @@ def _render_admin_page() -> str:
         const tab = document.getElementById("tabTickets");
         if (!tab) return;
         if (tab.style.display !== "none") loadTickets();
+        const feedbackTab = document.getElementById("tabFeedback");
+        if (feedbackTab && feedbackTab.style.display !== "none") loadFeedback();
       }}, 60000);
     }}
     function switchTab(tab) {{
@@ -2991,20 +3236,24 @@ def _render_admin_page() -> str:
       const isStats = tab === "stats";
       const isFailures = tab === "failures";
       const isTickets = tab === "tickets";
+      const isFeedback = tab === "feedback";
       const isFaq = tab === "faq";
       document.getElementById("tabSettings").style.display = isSettings ? "grid" : "none";
       document.getElementById("tabStats").style.display = isStats ? "grid" : "none";
       document.getElementById("tabFailures").style.display = isFailures ? "grid" : "none";
       document.getElementById("tabTickets").style.display = isTickets ? "grid" : "none";
+      document.getElementById("tabFeedback").style.display = isFeedback ? "grid" : "none";
       document.getElementById("tabFaq").style.display = isFaq ? "grid" : "none";
       document.getElementById("tabBtnSettings").classList.toggle("active", isSettings);
       document.getElementById("tabBtnStats").classList.toggle("active", isStats);
       document.getElementById("tabBtnFailures").classList.toggle("active", isFailures);
       document.getElementById("tabBtnTickets").classList.toggle("active", isTickets);
+      document.getElementById("tabBtnFeedback").classList.toggle("active", isFeedback);
       document.getElementById("tabBtnFaq").classList.toggle("active", isFaq);
       if (isStats) loadStats();
       if (isFailures) loadFailures();
       if (isTickets) loadTickets();
+      if (isFeedback) loadFeedback();
       if (isFaq) loadFaqAdmin();
     }}
     function renderStats(rows) {{
@@ -3168,6 +3417,53 @@ def _render_admin_page() -> str:
         await loadTickets();
       }} catch (e) {{
         setTicketsStatus("Delete failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    function renderFeedback(rows) {{
+      const board = document.getElementById("feedbackBoard");
+      const items = rows || [];
+      let html = "";
+      for (const r of items) {{
+        const isReviewed = normStatus(r.status || "") === "reviewed";
+        const no = esc(r.feedback_no || r.id);
+        const subject = esc(r.subject || "");
+        const message = esc(r.message || "");
+        const reviewedByTxt = r.reviewed_by ? ` | by: <span class="mono">${{esc(r.reviewed_by)}}</span>` : "";
+        const reviewedMeta = isReviewed
+          ? `<div class="feedback-meta">Reviewed at: ${{esc(r.reviewed_at || "-")}}${{reviewedByTxt}}</div>`
+          : "";
+        const author = `<div class="ticket-author"><div><span class="label">Name:</span><span class="value">${{esc(r.name || "-")}}</span></div><div><span class="label">Email:</span><span class="value">${{esc(r.email || "-")}}</span></div><div><span class="label">Wallet:</span><span class="value mono">${{esc(r.wallet_address || "-")}}</span></div><div><span class="label">Created:</span><span class="value">${{esc(r.ts || "-")}}</span></div></div>`;
+        const body = `<div class="ticket-message-block"><div class="label">Message</div><pre class="ticket-message">${{message}}</pre>${{reviewedMeta}}</div>`;
+        const action = isReviewed ? "" : `<div class="ticket-actions" style="margin-top:8px"><button class="btn" style="padding:6px 10px;font-size:12px" onclick="reviewFeedback(${{Number(r.id) || 0}})">Reviewed</button></div>`;
+        if (isReviewed) {{
+          html += `<details class="ticket-card"><summary style="cursor:pointer;font-weight:700;color:#334155"><b>#${{no}}</b> [reviewed] ${{subject}}</summary>${{author}}${{body}}</details>`;
+        }} else {{
+          html += `<div class="ticket-card"><div style="font-weight:700;color:#334155"><b>#${{no}}</b> [new] ${{subject}}</div>${{author}}${{body}}${{action}}</div>`;
+        }}
+      }}
+      if (!items.length) html = '<div class="hint">No feedback yet.</div>';
+      board.innerHTML = html;
+      const pending = items.filter((x) => normStatus(x.status || "") !== "reviewed").length;
+      setFeedbackStatus(`Loaded ${{items.length}} messages (${{pending}} new)`, false);
+    }}
+    async function loadFeedback() {{
+      try {{
+        const r = await fetch("/api/admin/help-feedback?limit=200");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Failed to load feedback");
+        window._feedbackRows = data.items || [];
+        renderFeedback(window._feedbackRows);
+      }} catch (e) {{
+        setFeedbackStatus("Load failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function reviewFeedback(feedbackId) {{
+      try {{
+        const data = await postJson("/api/admin/help-feedback/review", {{feedback_id: Number(feedbackId)}});
+        setFeedbackStatus(`Feedback #${{data.feedback_no || feedbackId}} archived`, false);
+        await loadFeedback();
+      }} catch (e) {{
+        setFeedbackStatus("Archive failed: " + (e?.message || "unknown"), true);
       }}
     }}
     function clearFaqForm() {{
@@ -3357,6 +3653,7 @@ def _render_help_page() -> str:
     .reply-actions {{ display: flex; flex-direction: column; gap: 8px; min-width: 150px; }}
     .reply-actions .btn {{ width: 100%; text-align: center; }}
     .ticket-reply-warning {{ margin-top: 6px; color: #64748b; font-size: 11px; }}
+    .feedback-form-card {{ border: 1px dashed #bfdbfe; background: #eef4ff; }}
     .wallet-modal-backdrop {{ position: fixed; inset: 0; background: linear-gradient(180deg, rgba(217,227,245,0.82) 0%, rgba(236,242,255,0.82) 100%); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 9999; }}
     .wallet-modal {{ width: min(460px, calc(100vw - 24px)); background: #f8fbff; border: 1px solid #cbd5e1; border-radius: 14px; box-shadow: 0 12px 36px rgba(15,23,42,0.25); padding: 14px; }}
     .wallet-modal h3 {{ margin: 0 0 8px; font-size: 18px; }}
@@ -3385,6 +3682,16 @@ def _render_help_page() -> str:
         <h3>FAQ</h3>
         <p class="hint">Published answers.</p>
         <div id="faqList">Loading FAQ...</div>
+      </section>
+      <section class="card feedback-form-card">
+        <h3>Send wishes and report issues</h3>
+        <p class="hint">Share product ideas or report problems. These messages go to admin review.</p>
+        <div class="row"><label>Name</label><input id="fName" type="text" placeholder="Optional"/></div>
+        <div class="row"><label>Email</label><input id="fEmail" type="email" placeholder="Optional"/></div>
+        <div class="row"><label>Subject</label><input id="fSubject" type="text" placeholder="Required"/></div>
+        <div class="row"><label>Message</label><textarea id="fMessage" placeholder="Tell us what to improve or what is broken"></textarea></div>
+        <button class="btn" onclick="sendFeedback()">Send message</button>
+        <span class="status" id="feedbackFormStatus">Ready</span>
       </section>
       <section class="card">
         <h3>Send a ticket</h3>
@@ -3464,6 +3771,24 @@ def _render_help_page() -> str:
       }} catch(e) {{ closeWcQrModal(); alert("WalletConnect failed: "+(e?.message||"unknown error")+". Add this site to Reown Domain allowlist and try again."); }}
     }}
     function setTicketStatus(text, isErr) {{ const el=document.getElementById("ticketStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function setFeedbackFormStatus(text, isErr) {{ const el=document.getElementById("feedbackFormStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    async function sendFeedback() {{
+      try {{
+        const payload = {{
+          name: (document.getElementById("fName").value || "").trim(),
+          email: (document.getElementById("fEmail").value || "").trim(),
+          subject: (document.getElementById("fSubject").value || "").trim(),
+          message: (document.getElementById("fMessage").value || "").trim(),
+        }};
+        const data = await postJson("/api/help/feedback", payload);
+        const no = data.feedback_no || data.feedback_id;
+        setFeedbackFormStatus(`Message #${{no}} sent`, false);
+        document.getElementById("fSubject").value = "";
+        document.getElementById("fMessage").value = "";
+      }} catch (e) {{
+        setFeedbackFormStatus("Send failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
     async function sendTicket() {{
       try {{
         const payload = {{
@@ -3915,9 +4240,11 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
     if evm_addresses:
         pool_rows, pool_errs = _scan_pool_positions(evm_addresses, selected_chain_ids)
         lending_rows, lending_errs = _scan_aave_positions(evm_addresses, selected_chain_ids)
+        reward_rows, reward_errs = _scan_aave_merit_rewards(evm_addresses, selected_chain_ids)
     else:
         pool_rows, pool_errs = [], []
         lending_rows, lending_errs = [], []
+        reward_rows, reward_errs = [], []
 
     info_notes: list[str] = []
     if solana_addresses:
@@ -3939,6 +4266,13 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
             -_safe_float(x.get("usd")),
         )
     )
+    reward_rows.sort(
+        key=lambda x: (
+            str(x.get("address") or ""),
+            str(x.get("chain") or ""),
+            -_safe_float(x.get("usd")),
+        )
+    )
 
     _analytics_log_event(
         session_id=sid,
@@ -3949,7 +4283,8 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
     return {
         "pool_positions": pool_rows,
         "lending_positions": lending_rows,
-        "errors": (pool_errs + lending_errs)[:40],
+        "reward_positions": reward_rows,
+        "errors": (pool_errs + lending_errs + reward_errs)[:40],
         "infos": info_notes[:20],
         "summary": {
             "evm_addresses": len(evm_addresses),
@@ -3958,6 +4293,7 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
             "chains": len(selected_chain_ids),
             "pool_count": len(pool_rows),
             "lending_count": len(lending_rows),
+            "reward_count": len(reward_rows),
         },
     }
 
@@ -3987,6 +4323,32 @@ def create_help_ticket(req: HelpTicketCreate, request: Request, response: Respon
     _analytics_log_event(session_id=sid, event_type="help_ticket", path="/api/help/tickets", payload=str(ticket_id))
     ticket_no = _ticket_number(ticket_id)
     return {"ok": True, "ticket_id": ticket_id, "ticket_no": ticket_no}
+
+
+@app.post("/api/help/feedback")
+def create_help_feedback(req: HelpFeedbackCreate, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    subject = (req.subject or "").strip()
+    message = (req.message or "").strip()
+    if len(subject) < 3:
+        raise HTTPException(status_code=400, detail="Subject is too short.")
+    if len(message) < 5:
+        raise HTTPException(status_code=400, detail="Message is too short.")
+    if req.email and not _is_valid_email(req.email):
+        raise HTTPException(status_code=400, detail="Invalid email format.")
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    wallet = str(auth.get("address") or "")
+    feedback_id = _create_help_feedback(
+        session_id=sid,
+        wallet_address=wallet,
+        name=req.name,
+        email=req.email,
+        subject=subject,
+        message=message,
+    )
+    _analytics_log_event(session_id=sid, event_type="help_feedback", path="/api/help/feedback", payload=str(feedback_id))
+    return {"ok": True, "feedback_id": feedback_id, "feedback_no": _feedback_number(feedback_id)}
 
 
 @app.get("/api/help/my-tickets")
@@ -4135,6 +4497,20 @@ def admin_help_ticket_delete(req: HelpTicketDelete, request: Request, response: 
         conn.execute("DELETE FROM help_tickets WHERE id = ?", (ticket_id,))
         conn.commit()
     return {"ok": True, "ticket_no": ticket_no, "info": f"Ticket #{ticket_no} deleted."}
+
+
+@app.get("/api/admin/help-feedback")
+def admin_help_feedback(request: Request, response: Response, limit: int = 200) -> dict[str, Any]:
+    _require_admin(request, response)
+    items = _list_help_feedback(limit=limit)
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/admin/help-feedback/review")
+def admin_help_feedback_review(req: AdminFeedbackReview, request: Request, response: Response) -> dict[str, Any]:
+    admin_address, _auth = _require_admin(request, response)
+    row = _mark_help_feedback_reviewed(req.feedback_id, reviewer_address=admin_address)
+    return {"ok": True, **row}
 
 
 @app.get("/api/admin/faq")
@@ -5076,6 +5452,7 @@ HTML_PAGE = """
     let sortKey = "final_income";
     let sortDesc = true;
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
+    const RESULT_STORAGE_KEY = "uni_fee_result_v1";
     const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "speedMode", "allChains"];
     let availableChains = [];
     let colorMap = {};
@@ -5493,6 +5870,40 @@ HTML_PAGE = """
       state.selectedChains = getSelectedChains();
       state.pairRowsVisible = pairRowsVisible;
       localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(state));
+    }
+
+    function saveResultState(result) {
+      try {
+        if (!result || typeof result !== "object") return;
+        const slim = {
+          suffix: result.suffix || "",
+          total: Number(result.total || 0),
+          chart_pools: Number(result.chart_pools || 0),
+          error_pools: Number(result.error_pools || 0),
+          request: result.request || {},
+          rows: Array.isArray(result.rows) ? result.rows : [],
+          series: Array.isArray(result.series) ? result.series : [],
+        };
+        localStorage.setItem(RESULT_STORAGE_KEY, JSON.stringify({saved_at: Date.now(), result: slim}));
+      } catch (e) {
+        console.warn("save result state failed", e);
+      }
+    }
+
+    function loadResultState() {
+      try {
+        const raw = localStorage.getItem(RESULT_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object") return null;
+        const result = parsed.result || null;
+        if (!result || typeof result !== "object") return null;
+        if (!Array.isArray(result.rows) || !Array.isArray(result.series)) return null;
+        return result;
+      } catch (e) {
+        console.warn("load result state failed", e);
+        return null;
+      }
     }
 
     function loadFormState() {
@@ -6051,6 +6462,7 @@ HTML_PAGE = """
       sortKey = "final_income";
       sortDesc = true;
       sortBy("final_income");
+      saveResultState(result);
     }
 
     function renderEmptyCharts() {
@@ -6076,7 +6488,13 @@ HTML_PAGE = """
     renderEmptyCharts();
     loadAuthState();
     refreshIntentMenu();
-    loadMeta();
+    loadMeta().then(() => {
+      const cached = loadResultState();
+      if (cached) {
+        renderResult(cached);
+        setStatus("Restored last result", "ok");
+      }
+    });
   </script>
 </body>
 </html>
