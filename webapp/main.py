@@ -1472,6 +1472,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       max-width: 1200px;
       margin: 0 auto;
       padding: 18px;
+      min-height: calc(100vh - 36px);
     }}
     .header {{
       display: flex;
@@ -1536,6 +1537,10 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       background: #eff6ff;
       cursor: pointer;
       white-space: nowrap;
+      width: 190px;
+      box-sizing: border-box;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }}
     .wallet-modal-backdrop {{
       position: fixed;
@@ -1807,29 +1812,30 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       }}
       try {{
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
-        const WalletConnectModalModule = await import("https://esm.sh/@walletconnect/modal@2.7.0");
         const provider = await EthereumProviderModule.EthereumProvider.init({{
           projectId: WALLETCONNECT_PROJECT_ID,
           chains: [1],
-          showQrModal: false,
+          showQrModal: true,
           methods: ["eth_requestAccounts", "eth_chainId", "personal_sign"],
           optionalMethods: [],
           rpcMap: {{}},
         }});
-        const modal = new WalletConnectModalModule.WalletConnectModal({{
-          projectId: WALLETCONNECT_PROJECT_ID,
-          chains: [1],
-          explorerRecommendedWalletIds: "NONE",
-        }});
-        provider.on("display_uri", (uri) => modal.openModal({{uri}}));
         await provider.connect();
-        const accounts = provider.accounts || [];
+        let accounts = provider.accounts || [];
+        if (!accounts.length) {{
+          accounts = (await provider.request({{method: "eth_requestAccounts"}})) || [];
+        }}
         const address = String(accounts[0] || "").trim();
         if (!address) throw new Error("WalletConnect did not return an address");
         const chainHex = await provider.request({{method: "eth_chainId"}});
         const chainId = Number.parseInt(String(chainHex || "0x1"), 16) || 1;
         const nonceResp = await postJson("/api/auth/nonce", {{address, chain_id: chainId, wallet: "walletconnect"}});
-        const signature = await provider.request({{method: "personal_sign", params: [nonceResp.message, address]}});
+        let signature = "";
+        try {{
+          signature = await provider.request({{method: "personal_sign", params: [nonceResp.message, address]}});
+        }} catch (_) {{
+          signature = await provider.request({{method: "personal_sign", params: [address, nonceResp.message]}});
+        }}
         const verifyResp = await postJson("/api/auth/verify", {{
           address,
           chain_id: chainId,
@@ -1841,7 +1847,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         setAuthUI();
         closeWalletModal({{target: {{id: "walletModalBackdrop"}}}});
       }} catch (e) {{
-        console.warn("walletconnect auth failed", e);
+        alert("WalletConnect failed: " + (e?.message || "unknown error"));
       }}
     }}
 
@@ -1870,14 +1876,14 @@ def _render_admin_page() -> str:
       min-height: 100vh;
       overflow-x: hidden;
     }}
-    .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; }}
+    .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; min-height: calc(100vh - 36px); }}
     .header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }}
     .title {{ margin: 0; font-size: 30px; font-weight: 800; letter-spacing: 0.2px; }}
     .subtitle {{ margin: 4px 0 0; color: #64748b; font-size: 14px; }}
     .top-controls {{ display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }}
     .intent-prefix {{ font-size: 14px; font-weight: 700; color: #1d4ed8; white-space: nowrap; }}
     .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 240px; max-width: 280px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
-    .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; }}
+    .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; width: 190px; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }}
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
     .tabs {{ display: flex; gap: 8px; margin-bottom: 8px; }}
     .tab-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 8px 12px; font-size: 13px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; }}
@@ -2027,7 +2033,7 @@ def _render_admin_page() -> str:
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
-    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const WalletConnectModalModule=await import("https://esm.sh/@walletconnect/modal@2.7.0"); const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],showQrModal:false,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],rpcMap:{{}}}}); const modal=new WalletConnectModalModule.WalletConnectModal({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],explorerRecommendedWalletIds:"NONE"}}); provider.on("display_uri",(uri)=>modal.openModal({{uri}})); await provider.connect(); const accounts=provider.accounts||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ console.warn("walletconnect auth failed",e); }} }}
+    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],showQrModal:true,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],rpcMap:{{}}}}); await provider.connect(); let accounts=provider.accounts||[]; if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); let signature=""; try {{ signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); }} catch(_) {{ signature=await provider.request({{method:"personal_sign",params:[address,nonceResp.message]}}); }} const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ alert("WalletConnect failed: "+(e?.message||"unknown error")); }} }}
     function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFailStatus(text, isErr) {{ const el=document.getElementById("failStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setTicketsStatus(text, isErr) {{ const el=document.getElementById("ticketsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
@@ -2350,14 +2356,14 @@ def _render_help_page() -> str:
     html {{ overflow-y: scroll; scrollbar-gutter: stable; overflow-x: hidden; }}
     body {{ margin: 0; font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%); color: #0f172a; overflow-x: hidden; }}
     body {{ min-height: 100vh; }}
-    .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; }}
+    .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; min-height: calc(100vh - 36px); }}
     .header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }}
     .title {{ margin: 0; font-size: 30px; font-weight: 800; letter-spacing: 0.2px; }}
     .subtitle {{ margin: 4px 0 0; color: #64748b; font-size: 14px; }}
     .top-controls {{ display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }}
     .intent-prefix {{ font-size: 14px; font-weight: 700; color: #1d4ed8; white-space: nowrap; }}
     .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 240px; max-width: 280px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
-    .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; }}
+    .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; width: 190px; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }}
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
     .card {{ background: #f3f7ff; border: 1px solid #cfdcec; border-radius: 14px; padding: 16px; box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06); }}
     .card h3 {{ margin: 0 0 10px; font-size: 18px; }}
@@ -2436,7 +2442,7 @@ def _render_help_page() -> str:
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
-    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const WalletConnectModalModule=await import("https://esm.sh/@walletconnect/modal@2.7.0"); const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],showQrModal:false,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],rpcMap:{{}}}}); const modal=new WalletConnectModalModule.WalletConnectModal({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],explorerRecommendedWalletIds:"NONE"}}); provider.on("display_uri",(uri)=>modal.openModal({{uri}})); await provider.connect(); const accounts=provider.accounts||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ console.warn("walletconnect auth failed",e); }} }}
+    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],showQrModal:true,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],rpcMap:{{}}}}); await provider.connect(); let accounts=provider.accounts||[]; if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); let signature=""; try {{ signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); }} catch(_) {{ signature=await provider.request({{method:"personal_sign",params:[address,nonceResp.message]}}); }} const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ alert("WalletConnect failed: "+(e?.message||"unknown error")); }} }}
     function setTicketStatus(text, isErr) {{ const el=document.getElementById("ticketStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     async function sendTicket() {{
       try {{
@@ -2573,12 +2579,20 @@ def connect_page(request: Request) -> HTMLResponse:
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(request: Request, response: Response) -> HTMLResponse:
-    html = _render_admin_page().replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
-    resp = HTMLResponse(html)
-    _require_admin(request, resp)
-    sid = _ensure_session_cookie(request, resp)
-    _analytics_log_event(session_id=sid, event_type="page_view", path="/admin")
-    return resp
+    try:
+        html = _render_admin_page().replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+        resp = HTMLResponse(html)
+        _require_admin(request, resp)
+        sid = _ensure_session_cookie(request, resp)
+        _analytics_log_event(session_id=sid, event_type="page_view", path="/admin")
+        return resp
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Keep page available even if admin template rendering has unexpected issue.
+        fallback = _render_placeholder_page("Admin page", f"Temporary error: {e}", "/admin")
+        fallback = fallback.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+        return HTMLResponse(fallback)
 
 
 @app.get("/api/auth/me")
@@ -2694,25 +2708,40 @@ def auth_logout(request: Request, response: Response) -> dict[str, Any]:
 @app.get("/api/admin/settings")
 def admin_settings(request: Request, response: Response) -> dict[str, Any]:
     _require_admin(request, response)
-    token_catalog = _load_token_catalog(refresh=False)
-    events_count = 0
-    if ANALYTICS_ENABLED:
-        with _analytics_conn() as conn:
-            events_count = int(conn.execute("SELECT COUNT(*) FROM analytics_events").fetchone()[0])
-    _, preview = _analytics_build_daily_report(day_offset=1)
-    return {
-        "daily_email_enabled": _analytics_daily_enabled_value(),
-        "report_to": _analytics_report_to_value(),
-        "report_hour_utc": _analytics_report_hour_value(),
-        "admin_wallets": _admin_wallets_value(),
-        "last_daily_sent": _analytics_get_state("last_daily_email_date_utc"),
-        "smtp_configured": bool(ANALYTICS_SMTP_HOST and ANALYTICS_SMTP_USER and ANALYTICS_SMTP_PASS),
-        "analytics_db_path": str(ANALYTICS_DB_PATH),
-        "events_count": events_count,
-        "token_catalog_updated_at": token_catalog.get("updated_at"),
-        "token_catalog_count": token_catalog.get("count", 0),
-        "daily_preview": preview,
-    }
+    try:
+        token_catalog = _load_token_catalog(refresh=False)
+        events_count = 0
+        if ANALYTICS_ENABLED:
+            with _analytics_conn() as conn:
+                events_count = int(conn.execute("SELECT COUNT(*) FROM analytics_events").fetchone()[0])
+        _, preview = _analytics_build_daily_report(day_offset=1)
+        return {
+            "daily_email_enabled": _analytics_daily_enabled_value(),
+            "report_to": _analytics_report_to_value(),
+            "report_hour_utc": _analytics_report_hour_value(),
+            "admin_wallets": _admin_wallets_value(),
+            "last_daily_sent": _analytics_get_state("last_daily_email_date_utc"),
+            "smtp_configured": bool(ANALYTICS_SMTP_HOST and ANALYTICS_SMTP_USER and ANALYTICS_SMTP_PASS),
+            "analytics_db_path": str(ANALYTICS_DB_PATH),
+            "events_count": events_count,
+            "token_catalog_updated_at": token_catalog.get("updated_at"),
+            "token_catalog_count": token_catalog.get("count", 0),
+            "daily_preview": preview,
+        }
+    except Exception as e:
+        return {
+            "daily_email_enabled": _analytics_daily_enabled_value(),
+            "report_to": _analytics_report_to_value(),
+            "report_hour_utc": _analytics_report_hour_value(),
+            "admin_wallets": _admin_wallets_value(),
+            "last_daily_sent": _analytics_get_state("last_daily_email_date_utc"),
+            "smtp_configured": bool(ANALYTICS_SMTP_HOST and ANALYTICS_SMTP_USER and ANALYTICS_SMTP_PASS),
+            "analytics_db_path": str(ANALYTICS_DB_PATH),
+            "events_count": 0,
+            "token_catalog_updated_at": None,
+            "token_catalog_count": 0,
+            "daily_preview": f"Admin settings fallback mode. Error: {e}",
+        }
 
 
 @app.post("/api/admin/settings")
@@ -3164,6 +3193,7 @@ HTML_PAGE = """
       max-width: 1200px;
       margin: 0 auto;
       padding: 18px;
+      min-height: calc(100vh - 36px);
     }
     .header {
       display: flex;
@@ -3228,6 +3258,10 @@ HTML_PAGE = """
       background: #eff6ff;
       cursor: pointer;
       white-space: nowrap;
+      width: 190px;
+      box-sizing: border-box;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .wallet-modal-backdrop {
       position: fixed;
@@ -4022,29 +4056,30 @@ HTML_PAGE = """
       try {
         setStatus("Connecting WalletConnect...", "running");
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
-        const WalletConnectModalModule = await import("https://esm.sh/@walletconnect/modal@2.7.0");
         const provider = await EthereumProviderModule.EthereumProvider.init({
           projectId: WALLETCONNECT_PROJECT_ID,
           chains: [1],
-          showQrModal: false,
+          showQrModal: true,
           methods: ["eth_requestAccounts", "eth_chainId", "personal_sign"],
           optionalMethods: [],
           rpcMap: {},
         });
-        const modal = new WalletConnectModalModule.WalletConnectModal({
-          projectId: WALLETCONNECT_PROJECT_ID,
-          chains: [1],
-          explorerRecommendedWalletIds: "NONE",
-        });
-        provider.on("display_uri", (uri) => modal.openModal({uri}));
         await provider.connect();
-        const accounts = provider.accounts || [];
+        let accounts = provider.accounts || [];
+        if (!accounts.length) {
+          accounts = (await provider.request({method: "eth_requestAccounts"})) || [];
+        }
         const address = String(accounts[0] || "").trim();
         if (!address) throw new Error("WalletConnect did not return an address");
         const chainHex = await provider.request({method: "eth_chainId"});
         const chainId = Number.parseInt(String(chainHex || "0x1"), 16) || 1;
         const nonceResp = await postJson("/api/auth/nonce", {address, chain_id: chainId, wallet: "walletconnect"});
-        const signature = await provider.request({method: "personal_sign", params: [nonceResp.message, address]});
+        let signature = "";
+        try {
+          signature = await provider.request({method: "personal_sign", params: [nonceResp.message, address]});
+        } catch (_) {
+          signature = await provider.request({method: "personal_sign", params: [address, nonceResp.message]});
+        }
         const verifyResp = await postJson("/api/auth/verify", {
           address,
           chain_id: chainId,
