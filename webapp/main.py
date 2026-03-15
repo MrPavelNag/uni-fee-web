@@ -127,6 +127,40 @@ WALLETCONNECT_PROJECT_ID = (
     or os.environ.get("REOWN_PROJECT_ID", "").strip()
     or os.environ.get("NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID", "").strip()
 )
+AAVE_V3_GRAPHQL_ENDPOINT = os.environ.get("AAVE_V3_GRAPHQL_ENDPOINT", "https://api.v3.aave.com/graphql").strip()
+CHAIN_ID_TO_KEY: dict[int, str] = {
+    1: "ethereum",
+    10: "optimism",
+    56: "bsc",
+    130: "unichain",
+    1301: "unichain",
+    137: "polygon",
+    324: "zksync",
+    8453: "base",
+    42161: "arbitrum-one",
+    43114: "avalanche",
+    81457: "blast",
+}
+AAVE_CHAIN_ID_TO_NAME: dict[int, str] = {
+    1: "ethereum",
+    10: "optimism",
+    56: "bsc",
+    100: "gnosis",
+    137: "polygon",
+    146: "sonic",
+    324: "zksync",
+    1088: "metis",
+    1868: "soneium",
+    42220: "celo",
+    43114: "avalanche",
+    5000: "mantle",
+    8453: "base",
+    9745: "plasma",
+    59144: "linea",
+    42161: "arbitrum-one",
+    534352: "scroll",
+    57073: "ink",
+}
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -779,6 +813,232 @@ def _list_faq_items(*, include_unpublished: bool = False, limit: int = 200) -> l
         }
         for r in rows
     ]
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _positions_chain_catalog() -> list[dict[str, Any]]:
+    chain_ids = set(CHAIN_ID_TO_KEY.keys()) | set(AAVE_CHAIN_ID_TO_NAME.keys())
+    items: list[dict[str, Any]] = []
+    for chain_id in sorted(chain_ids):
+        key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
+        display = AAVE_CHAIN_ID_TO_NAME.get(int(chain_id), CHAIN_ID_TO_NAME.get(int(chain_id), key or str(chain_id)))
+        has_pools = bool(key and (key in UNISWAP_V3_SUBGRAPHS or key in UNISWAP_V4_SUBGRAPHS or key in GOLDSKY_ENDPOINTS))
+        has_lending = int(chain_id) in AAVE_CHAIN_ID_TO_NAME
+        items.append(
+            {
+                "chain_id": int(chain_id),
+                "key": key,
+                "name": str(display),
+                "has_pools": has_pools,
+                "has_lending": has_lending,
+            }
+        )
+    return items
+
+
+def _parse_positions_addresses(raw_items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items or []:
+        for token in re.split(r"[,\s;]+", str(raw or "").strip()):
+            addr = token.strip().lower()
+            if not _is_eth_address(addr):
+                continue
+            if addr in seen:
+                continue
+            seen.add(addr)
+            out.append(addr)
+    return out
+
+
+def _query_uniswap_positions_for_owner(endpoint: str, owner: str) -> list[dict[str, Any]]:
+    query = """
+    query UserPositions($owner: String!, $skip: Int!) {
+      positions(first: 200, skip: $skip, where: { owner: $owner }) {
+        id
+        liquidity
+        pool {
+          id
+          feeTier
+          totalValueLockedUSD
+          token0 { symbol id }
+          token1 { symbol id }
+        }
+      }
+    }
+    """
+    result: list[dict[str, Any]] = []
+    skip = 0
+    owner_lc = str(owner or "").strip().lower()
+    while True:
+        data = graphql_query(endpoint, query, {"owner": owner_lc, "skip": skip}, retries=1)
+        batch = data.get("data", {}).get("positions", []) or []
+        result.extend(batch)
+        if len(batch) < 200:
+            break
+        skip += 200
+        time.sleep(0.15)
+    return result
+
+
+def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[list[dict[str, Any]], list[str]]:
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for chain_id in chain_ids:
+        chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
+        if not chain_key:
+            continue
+        for version in ("v3", "v4"):
+            endpoint = get_graph_endpoint(chain_key, version=version)
+            if not endpoint:
+                continue
+            for owner in addresses:
+                try:
+                    positions = _query_uniswap_positions_for_owner(endpoint, owner)
+                except Exception as e:
+                    errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
+                    continue
+                for p in positions:
+                    pool = p.get("pool") or {}
+                    t0 = (pool.get("token0") or {}).get("symbol") or "?"
+                    t1 = (pool.get("token1") or {}).get("symbol") or "?"
+                    rows.append(
+                        {
+                            "address": owner,
+                            "protocol": f"uniswap_{version}",
+                            "chain": chain_key,
+                            "chain_id": int(chain_id),
+                            "kind": "pool",
+                            "pool_id": str(pool.get("id") or ""),
+                            "pair": f"{t0}/{t1}",
+                            "fee_tier": str(pool.get("feeTier") or ""),
+                            "liquidity": str(p.get("liquidity") or "0"),
+                            "tvl_usd": _safe_float(pool.get("totalValueLockedUSD")),
+                        }
+                    )
+    # Deduplicate by owner/protocol/pool id.
+    uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("address")), str(row.get("protocol")), str(row.get("pool_id")))
+        if key not in uniq:
+            uniq[key] = row
+    return list(uniq.values()), errors
+
+
+def _aave_markets_for_chains(chain_ids: list[int]) -> list[dict[str, Any]]:
+    if not chain_ids:
+        return []
+    query = """
+    query AaveMarkets($ids: [ChainId!]!) {
+      markets(request: { chainIds: $ids }) {
+        address
+        chain { chainId name }
+        name
+      }
+    }
+    """
+    data = graphql_query(AAVE_V3_GRAPHQL_ENDPOINT, query, {"ids": [int(x) for x in chain_ids]}, retries=1)
+    markets = data.get("data", {}).get("markets", []) or []
+    out: list[dict[str, Any]] = []
+    for m in markets:
+        addr = str(m.get("address") or "").strip()
+        chain_id = int((m.get("chain") or {}).get("chainId") or 0)
+        if not _is_eth_address(addr) or chain_id <= 0:
+            continue
+        out.append({"address": addr, "chainId": chain_id, "name": str(m.get("name") or "")})
+    return out
+
+
+def _scan_aave_positions(addresses: list[str], chain_ids: list[int]) -> tuple[list[dict[str, Any]], list[str]]:
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    supported_ids = [int(x) for x in chain_ids if int(x) in AAVE_CHAIN_ID_TO_NAME]
+    if not supported_ids:
+        return rows, errors
+    try:
+        markets = _aave_markets_for_chains(supported_ids)
+    except Exception as e:
+        return rows, [f"Lending scan failed (markets): {e}"]
+    if not markets:
+        return rows, errors
+    query = """
+    query AaveUserPositions($user: EvmAddress!, $markets: [MarketInput!]!) {
+      userSupplies(request: { user: $user, markets: $markets, collateralsOnly: false, orderBy: { balance: DESC } }) {
+        market { name chain { chainId name } }
+        currency { symbol }
+        balance { amount { value } usd }
+        apy { value }
+        isCollateral
+      }
+      userBorrows(request: { user: $user, markets: $markets, orderBy: { debt: DESC } }) {
+        market { name chain { chainId name } }
+        currency { symbol }
+        debt { amount { value } usd }
+        apy { value }
+      }
+    }
+    """
+    for owner in addresses:
+        try:
+            data = graphql_query(
+                AAVE_V3_GRAPHQL_ENDPOINT,
+                query,
+                {"user": owner, "markets": [{"address": m["address"], "chainId": m["chainId"]} for m in markets]},
+                retries=1,
+            )
+        except Exception as e:
+            errors.append(f"Lending scan failed for {owner}: {e}")
+            continue
+        payload = data.get("data", {}) or {}
+        for s in payload.get("userSupplies", []) or []:
+            usd = _safe_float((s.get("balance") or {}).get("usd"))
+            if usd <= 0:
+                continue
+            chain_obj = ((s.get("market") or {}).get("chain") or {})
+            chain_id = int(chain_obj.get("chainId") or 0)
+            rows.append(
+                {
+                    "address": owner,
+                    "protocol": "aave_v3",
+                    "chain": str(chain_obj.get("name") or AAVE_CHAIN_ID_TO_NAME.get(chain_id, chain_id)),
+                    "chain_id": chain_id,
+                    "kind": "lending_supply",
+                    "market": str((s.get("market") or {}).get("name") or ""),
+                    "asset": str((s.get("currency") or {}).get("symbol") or ""),
+                    "amount": _safe_float(((s.get("balance") or {}).get("amount") or {}).get("value")),
+                    "usd": usd,
+                    "apy": _safe_float((s.get("apy") or {}).get("value")),
+                    "is_collateral": bool(s.get("isCollateral")),
+                }
+            )
+        for b in payload.get("userBorrows", []) or []:
+            usd = _safe_float((b.get("debt") or {}).get("usd"))
+            if usd <= 0:
+                continue
+            chain_obj = ((b.get("market") or {}).get("chain") or {})
+            chain_id = int(chain_obj.get("chainId") or 0)
+            rows.append(
+                {
+                    "address": owner,
+                    "protocol": "aave_v3",
+                    "chain": str(chain_obj.get("name") or AAVE_CHAIN_ID_TO_NAME.get(chain_id, chain_id)),
+                    "chain_id": chain_id,
+                    "kind": "lending_borrow",
+                    "market": str((b.get("market") or {}).get("name") or ""),
+                    "asset": str((b.get("currency") or {}).get("symbol") or ""),
+                    "amount": _safe_float(((b.get("debt") or {}).get("amount") or {}).get("value")),
+                    "usd": usd,
+                    "apy": _safe_float((b.get("apy") or {}).get("value")),
+                    "is_collateral": False,
+                }
+            )
+    return rows, errors
 
 
 def _parse_pairs_str(raw: str) -> list[tuple[str, str]]:
@@ -1545,8 +1805,13 @@ class AdminFaqPublish(BaseModel):
     is_published: bool
 
 
+class PositionsScanRequest(BaseModel):
+    addresses: list[str] = Field(default_factory=list)
+    chain_ids: list[int] = Field(default_factory=list)
+
+
 INTENT_OPTIONS: list[tuple[str, str]] = [
-    ("/", "Find the best pool on Uniswap"),
+    ("/", "Find the best fee on Uniswap"),
     ("/pancake", "Find the best pool on PancakeSwap"),
     ("/stables", "Find the best stablecoin yield"),
     ("/positions", "Analise my DeFi positions"),
@@ -1562,7 +1827,15 @@ def _intent_options_html(selected_path: str) -> str:
     return "\n".join(rows)
 
 
-def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str) -> str:
+def _render_placeholder_page(
+    page_title: str,
+    subtitle: str,
+    selected_path: str,
+    *,
+    extra_css: str = "",
+    extra_html: str = "",
+    extra_script: str = "",
+) -> str:
     options_html = _intent_options_html(selected_path)
     return f"""<!doctype html>
 <html>
@@ -1725,6 +1998,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       color: #475569;
       margin: 0;
     }}
+    {extra_css}
   </style>
 </head>
 <body>
@@ -1732,7 +2006,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
     <div class="header">
       <div>
         <h1 class="title">DeFi Pools</h1>
-        <p class="subtitle">Uniswap v3/v4 screening with on-screen charts, filtering and ranked pool table.</p>
+        <p class="subtitle">Find the best fee on Uniswap</p>
       </div>
       <div class="top-controls">
         <span class="intent-prefix">I want to</span>
@@ -1746,6 +2020,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       <h2>{page_title}</h2>
       <p class="hint">{subtitle}</p>
     </section>
+    {extra_html}
   </div>
   <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
     <div class="wallet-modal">
@@ -2096,12 +2371,177 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       }}
     }}
 
+    {extra_script}
     loadAuthState();
     refreshIntentMenu();
   </script>
 </body>
 </html>
 """
+
+
+def _render_positions_page() -> str:
+    chain_json = _positions_chain_catalog()
+    chain_items = "".join(
+        [
+            (
+                '<label class="chain-pill">'
+                f'<input type="checkbox" class="pos-chain" value="{int(c.get("chain_id") or 0)}" checked />'
+                f'<span>{str(c.get("name") or c.get("chain_id"))}</span>'
+                "<small>"
+                f'{"pool" if c.get("has_pools") else ""}'
+                f'{" + " if c.get("has_pools") and c.get("has_lending") else ""}'
+                f'{"lending" if c.get("has_lending") else ""}'
+                "</small>"
+                "</label>"
+            )
+            for c in chain_json
+        ]
+    )
+    extra_css = """
+    .positions-grid { display:grid; gap:12px; margin-top:12px; }
+    .positions-form { background:#f3f7ff; border:1px solid #cfdcec; border-radius:14px; padding:14px; }
+    .positions-form h3 { margin:0 0 8px; font-size:18px; }
+    .positions-form .row { display:grid; grid-template-columns:180px 1fr; gap:10px; align-items:start; margin-bottom:10px; }
+    .positions-form textarea { min-height:84px; width:100%; background:#f8fbff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:14px; }
+    .chains-wrap { display:flex; flex-wrap:wrap; gap:8px; max-height:220px; overflow:auto; padding:6px; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
+    .chain-pill { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:5px 9px; background:#eff6ff; font-size:12px; color:#1f3a8a; }
+    .chain-pill small { color:#64748b; font-size:11px; }
+    .positions-actions { display:flex; gap:10px; align-items:center; }
+    .pos-status { color:#475569; font-size:13px; }
+    .result-card { background:#f3f7ff; border:1px solid #cfdcec; border-radius:14px; padding:14px; }
+    .result-card h3 { margin:0 0 8px; font-size:17px; }
+    .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
+    table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
+    th, td { border-bottom:1px solid #e2e8f0; padding:7px; text-align:left; vertical-align:top; }
+    th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
+    .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
+    @media (max-width: 980px) { .positions-form .row { grid-template-columns:1fr; } }
+    """
+    extra_html = f"""
+    <div class="positions-grid">
+      <section class="positions-form">
+        <h3>Scan addresses across chains</h3>
+        <div class="row">
+          <label>Wallet addresses</label>
+          <div>
+            <textarea id="posAddresses" placeholder="One or many addresses separated by comma, space, or newline"></textarea>
+            <p class="hint" style="margin-top:6px">Example: 0xabc..., 0xdef...</p>
+          </div>
+        </div>
+        <div class="row">
+          <label>Where to search</label>
+          <div>
+            <div style="display:flex;gap:8px;margin-bottom:8px">
+              <button class="btn" type="button" onclick="selectAllPosChains(true)">Select all</button>
+              <button class="btn" type="button" onclick="selectAllPosChains(false)">Clear</button>
+            </div>
+            <div class="chains-wrap" id="posChainsWrap">{chain_items}</div>
+          </div>
+        </div>
+        <div class="positions-actions">
+          <button class="btn" type="button" onclick="scanPositions()">Find positions</button>
+          <span class="pos-status" id="posStatus">Ready</span>
+        </div>
+      </section>
+      <section class="result-card">
+        <h3>Pool positions</h3>
+        <div class="table-wrap"><table id="posPoolsTable"></table></div>
+      </section>
+      <section class="result-card">
+        <h3>Lending positions</h3>
+        <div class="table-wrap"><table id="posLendingTable"></table></div>
+        <div id="posErrors"></div>
+      </section>
+    </div>
+    """
+    extra_script = """
+    function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+    function selectedPosChains() {
+      return Array.from(document.querySelectorAll(".pos-chain:checked")).map((x) => Number(x.value || 0)).filter((x) => Number.isFinite(x) && x > 0);
+    }
+    function selectAllPosChains(flag) {
+      Array.from(document.querySelectorAll(".pos-chain")).forEach((el) => { el.checked = !!flag; });
+    }
+    function setPosStatus(text, isErr) {
+      const el = document.getElementById("posStatus");
+      if (!el) return;
+      el.textContent = text || "";
+      el.style.color = isErr ? "#b91c1c" : "#475569";
+    }
+    function renderPools(rows) {
+      const table = document.getElementById("posPoolsTable");
+      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>TVL USD</th></tr>";
+      for (const r of (rows || [])) {
+        html += "<tr>";
+        html += `<td class='mono'>${esc(r.address || "")}</td>`;
+        html += `<td>${esc(r.chain || "")}</td>`;
+        html += `<td>${esc(r.protocol || "")}</td>`;
+        html += `<td>${esc(r.pair || "")}</td>`;
+        html += `<td>${esc(r.fee_tier || "")}</td>`;
+        html += `<td class='mono'>${esc(r.pool_id || "")}</td>`;
+        html += `<td>${Number(r.tvl_usd || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}</td>`;
+        html += "</tr>";
+      }
+      if (!(rows || []).length) html += "<tr><td colspan='7'>No pool positions found.</td></tr>";
+      table.innerHTML = html;
+    }
+    function renderLending(rows) {
+      const table = document.getElementById("posLendingTable");
+      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Type</th><th>Market</th><th>Asset</th><th>Amount</th><th>USD</th><th>APY</th><th>Collateral</th></tr>";
+      for (const r of (rows || [])) {
+        html += "<tr>";
+        html += `<td class='mono'>${esc(r.address || "")}</td>`;
+        html += `<td>${esc(r.chain || "")}</td>`;
+        html += `<td>${esc(r.protocol || "")}</td>`;
+        html += `<td>${esc(r.kind || "")}</td>`;
+        html += `<td>${esc(r.market || "")}</td>`;
+        html += `<td>${esc(r.asset || "")}</td>`;
+        html += `<td>${Number(r.amount || 0).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>`;
+        html += `<td>${Number(r.usd || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}</td>`;
+        html += `<td>${Number(r.apy || 0).toFixed(4)}</td>`;
+        html += `<td>${r.is_collateral ? "yes" : ""}</td>`;
+        html += "</tr>";
+      }
+      if (!(rows || []).length) html += "<tr><td colspan='10'>No lending positions found.</td></tr>";
+      table.innerHTML = html;
+    }
+    async function scanPositions() {
+      const raw = String(document.getElementById("posAddresses")?.value || "").trim();
+      if (!raw) { setPosStatus("Enter at least one wallet address.", true); return; }
+      const addresses = raw.split(/[\\s,;]+/).map((x) => x.trim()).filter(Boolean);
+      const chainIds = selectedPosChains();
+      if (!chainIds.length) { setPosStatus("Select at least one chain.", true); return; }
+      try {
+        setPosStatus("Scanning pools and lending...", false);
+        const res = await fetch("/api/positions/scan", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ addresses, chain_ids: chainIds }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || "Scan failed");
+        renderPools(data.pool_positions || []);
+        renderLending(data.lending_positions || []);
+        const errWrap = document.getElementById("posErrors");
+        const errs = data.errors || [];
+        errWrap.innerHTML = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
+        setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}, Lending: ${(data.lending_positions || []).length}`, false);
+      } catch (e) {
+        setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
+      }
+    }
+    setPosStatus("Ready", false);
+    """
+    return _render_placeholder_page(
+        "DeFi Positions",
+        "Find where wallet funds are in pools and lending protocols.",
+        "/positions",
+        extra_css=extra_css,
+        extra_html=extra_html,
+        extra_script=extra_script,
+    )
 
 
 def _render_admin_page() -> str:
@@ -3049,7 +3489,7 @@ def stables_page(request: Request) -> HTMLResponse:
 
 @app.get("/positions", response_class=HTMLResponse)
 def positions_page(request: Request) -> HTMLResponse:
-    html = _render_placeholder_page("DeFi Positions", "This page is a placeholder for your positions dashboard.", "/positions")
+    html = _render_positions_page()
     html = html.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
     resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
@@ -3319,6 +3759,62 @@ def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Res
     wallets = [w for w in wallets if w != address]
     _set_admin_wallets(wallets)
     return {"ok": True, "info": "Admin wallet removed.", "items": _admin_wallets_value()}
+
+
+@app.get("/api/positions/chains")
+def positions_chains() -> dict[str, Any]:
+    items = _positions_chain_catalog()
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/positions/scan")
+def scan_positions(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    addresses = _parse_positions_addresses(req.addresses)
+    if not addresses:
+        raise HTTPException(status_code=400, detail="Provide at least one valid EVM address.")
+    if len(addresses) > 20:
+        raise HTTPException(status_code=400, detail="Too many addresses. Max 20.")
+
+    all_chain_ids = [int(x["chain_id"]) for x in _positions_chain_catalog()]
+    selected_chain_ids = sorted({int(x) for x in (req.chain_ids or []) if int(x) > 0}) or all_chain_ids
+    selected_chain_ids = selected_chain_ids[:64]
+
+    pool_rows, pool_errs = _scan_pool_positions(addresses, selected_chain_ids)
+    lending_rows, lending_errs = _scan_aave_positions(addresses, selected_chain_ids)
+
+    pool_rows.sort(
+        key=lambda x: (
+            str(x.get("address") or ""),
+            str(x.get("chain") or ""),
+            -_safe_float(x.get("tvl_usd")),
+        )
+    )
+    lending_rows.sort(
+        key=lambda x: (
+            str(x.get("address") or ""),
+            str(x.get("chain") or ""),
+            -_safe_float(x.get("usd")),
+        )
+    )
+
+    _analytics_log_event(
+        session_id=sid,
+        event_type="positions_scan",
+        path="/api/positions/scan",
+        payload=f"addresses={len(addresses)} chains={len(selected_chain_ids)}",
+    )
+    return {
+        "pool_positions": pool_rows,
+        "lending_positions": lending_rows,
+        "errors": (pool_errs + lending_errs)[:40],
+        "summary": {
+            "addresses": len(addresses),
+            "chains": len(selected_chain_ids),
+            "pool_count": len(pool_rows),
+            "lending_count": len(lending_rows),
+        },
+    }
 
 
 @app.post("/api/help/tickets")
@@ -4268,12 +4764,12 @@ HTML_PAGE = """
     <div class="header">
       <div>
         <h1 class="title">DeFi Pools</h1>
-        <p class="subtitle">Uniswap v3/v4 screening with on-screen charts, filtering and ranked pool table.</p>
+        <p class="subtitle">Find the best fee on Uniswap</p>
       </div>
       <div class="top-controls">
         <span class="intent-prefix">I want to</span>
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
-          <option value="/" selected>Find the best pool on Uniswap</option>
+          <option value="/" selected>Find the best fee on Uniswap</option>
           <option value="/pancake">Find the best pool on PancakeSwap</option>
           <option value="/stables">Find the best stablecoin yield</option>
           <option value="/positions">Analise my DeFi positions</option>
