@@ -109,6 +109,12 @@ AUTH_NONCE_TTL_SEC = int(os.environ.get("AUTH_NONCE_TTL_SEC", "300"))
 AUTH_NONCES: dict[str, dict[str, Any]] = {}
 AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 AUTH_LOCK = threading.Lock()
+ADMIN_WALLETS_DEFAULT = "0xD3155f6A7525F81595609E83789bbb95d91aaEdf"
+ADMIN_WALLET_ADDRESSES = {
+    a.strip().lower()
+    for a in os.environ.get("ADMIN_WALLET_ADDRESSES", ADMIN_WALLETS_DEFAULT).split(",")
+    if re.fullmatch(r"0x[a-fA-F0-9]{40}", a.strip())
+}
 ANALYTICS_DB_PATH = Path(os.environ.get("ANALYTICS_DB_PATH", str(CATALOG_DIR / "analytics.sqlite3")))
 ANALYTICS_ENABLED = os.environ.get("ANALYTICS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 ANALYTICS_DAILY_EMAIL_ENABLED = os.environ.get("ANALYTICS_DAILY_EMAIL_ENABLED", "1").strip().lower() in (
@@ -1079,6 +1085,12 @@ class AuthVerifyRequest(BaseModel):
     signature: str
 
 
+class AdminSettingsUpdate(BaseModel):
+    daily_email_enabled: bool | None = None
+    report_to: str | None = None
+    report_hour_utc: int | None = None
+
+
 INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/", "Find the best pool on Uniswap"),
     ("/pancake", "Find the best pool on PancakeSwap"),
@@ -1168,6 +1180,60 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       cursor: pointer;
       white-space: nowrap;
     }}
+    .auth-meta {{
+      color: #475569;
+      font-size: 12px;
+      max-width: 220px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .wallet-modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.45);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+    }}
+    .wallet-modal {{
+      width: min(460px, calc(100vw - 24px));
+      background: #f8fbff;
+      border: 1px solid #cbd5e1;
+      border-radius: 14px;
+      box-shadow: 0 12px 36px rgba(15, 23, 42, 0.25);
+      padding: 14px;
+    }}
+    .wallet-modal h3 {{
+      margin: 0 0 8px;
+      font-size: 18px;
+    }}
+    .wallet-list {{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .wallet-item {{
+      border: 1px solid #bfdbfe;
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #eff6ff;
+      color: #1d4ed8;
+      font-weight: 700;
+      text-align: left;
+      cursor: pointer;
+    }}
+    .wallet-item.disabled {{
+      opacity: 0.6;
+      cursor: not-allowed;
+    }}
+    .wallet-note {{
+      color: #64748b;
+      font-size: 12px;
+      margin-top: 8px;
+    }}
     .card {{
       background: #f3f7ff;
       border: 1px solid #cfdcec;
@@ -1197,7 +1263,8 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
           {options_html}
         </select>
-        <button class="connect-btn" onclick="window.location.href='/connect'">Connect Wallet</button>
+        <span id="authMeta" class="auth-meta"></span>
+        <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
       </div>
     </div>
     <section class="card">
@@ -1205,11 +1272,156 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       <p class="hint">{subtitle}</p>
     </section>
   </div>
+  <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
+    <div class="wallet-modal">
+      <h3>Connect wallet</h3>
+      <div class="wallet-list" id="walletList"></div>
+      <div class="wallet-note">Rabby and Phantom are supported. Sign-in uses a gasless message signature.</div>
+    </div>
+  </div>
   <script>
+    let authState = {{authenticated: false}};
+    const WALLET_LABELS = {{
+      injected: "Browser Wallet",
+      rabby: "Rabby",
+      metamask: "MetaMask",
+      phantom: "Phantom",
+      coinbase: "Coinbase Wallet",
+    }};
+
     function navigateIntent(path) {{
       if (!path) return;
       window.location.href = path;
     }}
+
+    function getEthereumProviders() {{
+      const out = [];
+      const eth = window.ethereum;
+      if (!eth) return out;
+      if (Array.isArray(eth.providers) && eth.providers.length) return eth.providers;
+      out.push(eth);
+      return out;
+    }}
+
+    function getWalletProvider(wallet) {{
+      const providers = getEthereumProviders();
+      const pick = (pred) => providers.find(pred) || null;
+      if (wallet === "rabby") {{
+        return pick((p) => !!p?.isRabby) || (window.ethereum?.isRabby ? window.ethereum : null);
+      }}
+      if (wallet === "phantom") {{
+        if (window.phantom?.ethereum?.request) return window.phantom.ethereum;
+        return pick((p) => !!p?.isPhantom) || (window.ethereum?.isPhantom ? window.ethereum : null);
+      }}
+      if (wallet === "metamask") {{
+        return pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom) || (window.ethereum?.isMetaMask ? window.ethereum : null);
+      }}
+      if (wallet === "coinbase") {{
+        return pick((p) => !!p?.isCoinbaseWallet) || (window.ethereum?.isCoinbaseWallet ? window.ethereum : null);
+      }}
+      return providers[0] || window.phantom?.ethereum || null;
+    }}
+
+    function getWalletChoices() {{
+      const order = ["rabby", "phantom", "metamask", "coinbase", "injected"];
+      return order.map((id) => ({{id, label: WALLET_LABELS[id], available: !!getWalletProvider(id)}}));
+    }}
+
+    function openWalletModal() {{
+      const list = document.getElementById("walletList");
+      const choices = getWalletChoices();
+      list.innerHTML = choices.map((w) => {{
+        const cls = w.available ? "wallet-item" : "wallet-item disabled";
+        const dis = w.available ? "" : "disabled";
+        const label = w.available ? w.label : `${{w.label}} (not detected)`;
+        return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{label}}</button>`;
+      }}).join("");
+      document.getElementById("walletModalBackdrop").style.display = "flex";
+    }}
+
+    function closeWalletModal(event) {{
+      if (event && event.target && event.target.id !== "walletModalBackdrop") return;
+      document.getElementById("walletModalBackdrop").style.display = "none";
+    }}
+
+    async function postJson(url, payload) {{
+      const r = await fetch(url, {{
+        method: "POST",
+        headers: {{"Content-Type": "application/json"}},
+        body: JSON.stringify(payload || {{}})
+      }});
+      const data = await r.json().catch(() => ({{}}));
+      if (!r.ok) {{
+        throw new Error(data.detail || data.info || "Request failed");
+      }}
+      return data;
+    }}
+
+    function setAuthUI() {{
+      const btn = document.getElementById("connectWalletBtn");
+      const meta = document.getElementById("authMeta");
+      if (!btn || !meta) return;
+      if (authState?.authenticated) {{
+        btn.textContent = authState.address_short || "Wallet connected";
+        meta.textContent = `${{WALLET_LABELS[authState.wallet] || authState.wallet || "Wallet"}} on chain ${{authState.chain_id || "-"}}`;
+      }} else {{
+        btn.textContent = "Connect Wallet";
+        meta.textContent = "";
+      }}
+    }}
+
+    async function loadAuthState() {{
+      try {{
+        const r = await fetch("/api/auth/me");
+        authState = await r.json();
+      }} catch (_) {{
+        authState = {{authenticated: false}};
+      }}
+      setAuthUI();
+    }}
+
+    async function onConnectWalletClick() {{
+      if (authState?.authenticated) {{
+        if (!confirm("Disconnect wallet?")) return;
+        try {{
+          await postJson("/api/auth/logout", {{}});
+          authState = {{authenticated: false}};
+          setAuthUI();
+        }} catch (e) {{
+          console.warn("disconnect failed", e);
+        }}
+        return;
+      }}
+      openWalletModal();
+    }}
+
+    async function connectWalletFlow(wallet) {{
+      const provider = getWalletProvider(wallet);
+      if (!provider) return;
+      try {{
+        const accounts = await provider.request({{method: "eth_requestAccounts"}});
+        const address = String((accounts || [])[0] || "").trim();
+        if (!address) throw new Error("Wallet did not return an address");
+        const chainHex = await provider.request({{method: "eth_chainId"}});
+        const chainId = Number.parseInt(String(chainHex || "0x1"), 16) || 1;
+        const nonceResp = await postJson("/api/auth/nonce", {{address, chain_id: chainId, wallet}});
+        const signature = await provider.request({{method: "personal_sign", params: [nonceResp.message, address]}});
+        const verifyResp = await postJson("/api/auth/verify", {{
+          address,
+          chain_id: chainId,
+          wallet,
+          message: nonceResp.message,
+          signature,
+        }});
+        authState = {{authenticated: true, ...verifyResp}};
+        setAuthUI();
+        closeWalletModal({{target: {{id: "walletModalBackdrop"}}}});
+      }} catch (e) {{
+        console.warn("wallet auth failed", e);
+      }}
+    }}
+
+    loadAuthState();
   </script>
 </body>
 </html>
@@ -1262,6 +1474,115 @@ def connect_page(request: Request) -> HTMLResponse:
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/connect")
     return resp
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    if not auth:
+        return {"authenticated": False}
+    return {
+        "authenticated": True,
+        "address": auth.get("address"),
+        "address_short": _short_addr(str(auth.get("address") or "")),
+        "wallet": auth.get("wallet", "injected"),
+        "chain_id": auth.get("chain_id"),
+        "authenticated_at": auth.get("authenticated_at"),
+    }
+
+
+@app.post("/api/auth/nonce")
+def auth_nonce(req: AuthNonceRequest, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    address = (req.address or "").strip()
+    if not _is_eth_address(address):
+        raise HTTPException(status_code=400, detail="Invalid wallet address.")
+    chain_id = int(req.chain_id or 1)
+    if chain_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid chain id.")
+    nonce = _new_nonce()
+    now_iso = _iso_now()
+    base = _public_base_url(request)
+    message = _siwe_message(
+        domain=request.url.hostname or "uni-fee.local",
+        uri=f"{base}/",
+        address=address,
+        chain_id=chain_id,
+        nonce=nonce,
+        issued_at=now_iso,
+    )
+    with AUTH_LOCK:
+        AUTH_NONCES[sid] = {
+            "nonce": nonce,
+            "message": message,
+            "address": address.lower(),
+            "chain_id": chain_id,
+            "wallet": (req.wallet or "injected")[:32],
+            "issued_at_ts": time.time(),
+        }
+    return {"nonce": nonce, "message": message, "issued_at": now_iso}
+
+
+@app.post("/api/auth/verify")
+def auth_verify(req: AuthVerifyRequest, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    address = (req.address or "").strip().lower()
+    signature = (req.signature or "").strip()
+    if not _is_eth_address(address):
+        raise HTTPException(status_code=400, detail="Invalid wallet address.")
+    if not signature:
+        raise HTTPException(status_code=400, detail="Signature is required.")
+    with AUTH_LOCK:
+        pending = dict(AUTH_NONCES.get(sid, {}))
+    if not pending:
+        raise HTTPException(status_code=400, detail="Nonce is missing or expired.")
+    age = time.time() - float(pending.get("issued_at_ts") or 0)
+    if age < 0 or age > AUTH_NONCE_TTL_SEC:
+        with AUTH_LOCK:
+            AUTH_NONCES.pop(sid, None)
+        raise HTTPException(status_code=400, detail="Nonce expired. Please retry.")
+    if (pending.get("address") or "") != address:
+        raise HTTPException(status_code=400, detail="Address mismatch.")
+    if int(pending.get("chain_id") or 1) != int(req.chain_id or 1):
+        raise HTTPException(status_code=400, detail="Chain mismatch.")
+    expected_message = str(pending.get("message") or "")
+    if expected_message != (req.message or ""):
+        raise HTTPException(status_code=400, detail="Message mismatch.")
+    try:
+        recovered = Account.recover_message(encode_defunct(text=expected_message), signature=signature).lower()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Signature verification failed: {e}") from e
+    if recovered != address:
+        raise HTTPException(status_code=400, detail="Invalid signature signer.")
+    auth = {
+        "address": address,
+        "wallet": (req.wallet or pending.get("wallet") or "injected")[:32],
+        "chain_id": int(req.chain_id or pending.get("chain_id") or 1),
+        "authenticated_at": _iso_now(),
+    }
+    with AUTH_LOCK:
+        AUTH_NONCES.pop(sid, None)
+        AUTH_SESSIONS[sid] = auth
+    _analytics_log_event(session_id=sid, event_type="wallet_auth", path="/api/auth/verify", payload=address)
+    return {
+        "ok": True,
+        "address": auth["address"],
+        "address_short": _short_addr(auth["address"]),
+        "wallet": auth["wallet"],
+        "chain_id": auth["chain_id"],
+        "authenticated_at": auth["authenticated_at"],
+    }
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    with AUTH_LOCK:
+        AUTH_SESSIONS.pop(sid, None)
+        AUTH_NONCES.pop(sid, None)
+    return {"ok": True}
 
 
 @app.post("/api/analytics/send-test")
@@ -1510,6 +1831,60 @@ HTML_PAGE = """
       background: #eff6ff;
       cursor: pointer;
       white-space: nowrap;
+    }
+    .wallet-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.45);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+    }
+    .wallet-modal {
+      width: min(460px, calc(100vw - 24px));
+      background: #f8fbff;
+      border: 1px solid #cbd5e1;
+      border-radius: 14px;
+      box-shadow: 0 12px 36px rgba(15, 23, 42, 0.25);
+      padding: 14px;
+    }
+    .wallet-modal h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+    .wallet-list {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .wallet-item {
+      border: 1px solid #bfdbfe;
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #eff6ff;
+      color: #1d4ed8;
+      font-weight: 700;
+      text-align: left;
+      cursor: pointer;
+    }
+    .wallet-item.disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .wallet-note {
+      color: #64748b;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    .auth-meta {
+      color: #475569;
+      font-size: 12px;
+      max-width: 220px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .grid {
       display: grid;
@@ -1891,7 +2266,8 @@ HTML_PAGE = """
           <option value="/positions">Analise my DeFi positions</option>
           <option value="/help">Get help</option>
         </select>
-        <button class="connect-btn" onclick="window.location.href='/connect'">Connect Wallet</button>
+        <span id="authMeta" class="auth-meta"></span>
+        <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
       </div>
     </div>
 
@@ -2010,6 +2386,14 @@ HTML_PAGE = """
     </div>
   </div>
 
+  <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
+    <div class="wallet-modal">
+      <h3>Connect wallet</h3>
+      <div class="wallet-list" id="walletList"></div>
+      <div class="wallet-note">Rabby and Phantom are supported. Sign-in uses a gasless message signature.</div>
+    </div>
+  </div>
+
   <script>
     const SORTABLE = {
       color: (r) => r.pool_id || "",
@@ -2037,6 +2421,15 @@ HTML_PAGE = """
     let seriesByPool = {};
     let currentRequest = {};
     let pairRowsVisible = 1;
+    let authState = {authenticated: false};
+
+    const WALLET_LABELS = {
+      injected: "Browser Wallet",
+      rabby: "Rabby",
+      metamask: "MetaMask",
+      phantom: "Phantom",
+      coinbase: "Coinbase Wallet",
+    };
 
     function splitCSV(v) {
       return (v || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
@@ -2066,6 +2459,140 @@ HTML_PAGE = """
     function navigateIntent(path) {
       if (!path) return;
       window.location.href = path;
+    }
+
+    function getEthereumProviders() {
+      const out = [];
+      const eth = window.ethereum;
+      if (!eth) return out;
+      if (Array.isArray(eth.providers) && eth.providers.length) return eth.providers;
+      out.push(eth);
+      return out;
+    }
+
+    function getWalletProvider(wallet) {
+      const providers = getEthereumProviders();
+      const pick = (pred) => providers.find(pred) || null;
+      if (wallet === "rabby") {
+        return pick((p) => !!p?.isRabby) || (window.ethereum?.isRabby ? window.ethereum : null);
+      }
+      if (wallet === "phantom") {
+        if (window.phantom?.ethereum?.request) return window.phantom.ethereum;
+        return pick((p) => !!p?.isPhantom) || (window.ethereum?.isPhantom ? window.ethereum : null);
+      }
+      if (wallet === "metamask") {
+        return pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom) || (window.ethereum?.isMetaMask ? window.ethereum : null);
+      }
+      if (wallet === "coinbase") {
+        return pick((p) => !!p?.isCoinbaseWallet) || (window.ethereum?.isCoinbaseWallet ? window.ethereum : null);
+      }
+      return providers[0] || window.phantom?.ethereum || null;
+    }
+
+    function getWalletChoices() {
+      const order = ["rabby", "phantom", "metamask", "coinbase", "injected"];
+      return order.map((id) => ({id, label: WALLET_LABELS[id], available: !!getWalletProvider(id)}));
+    }
+
+    function openWalletModal() {
+      const list = document.getElementById("walletList");
+      const choices = getWalletChoices();
+      list.innerHTML = choices.map((w) => {
+        const cls = w.available ? "wallet-item" : "wallet-item disabled";
+        const dis = w.available ? "" : "disabled";
+        const label = w.available ? w.label : `${w.label} (not detected)`;
+        return `<button class="${cls}" ${dis} onclick="connectWalletFlow('${w.id}')">${label}</button>`;
+      }).join("");
+      document.getElementById("walletModalBackdrop").style.display = "flex";
+    }
+
+    function closeWalletModal(event) {
+      if (event && event.target && event.target.id !== "walletModalBackdrop") return;
+      document.getElementById("walletModalBackdrop").style.display = "none";
+    }
+
+    async function postJson(url, payload) {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload || {})
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        throw new Error(data.detail || data.info || "Request failed");
+      }
+      return data;
+    }
+
+    function setAuthUI() {
+      const btn = document.getElementById("connectWalletBtn");
+      const meta = document.getElementById("authMeta");
+      if (!btn || !meta) return;
+      if (authState?.authenticated) {
+        btn.textContent = authState.address_short || "Wallet connected";
+        meta.textContent = `${WALLET_LABELS[authState.wallet] || authState.wallet || "Wallet"} on chain ${authState.chain_id || "-"}`;
+      } else {
+        btn.textContent = "Connect Wallet";
+        meta.textContent = "";
+      }
+    }
+
+    async function loadAuthState() {
+      try {
+        const r = await fetch("/api/auth/me");
+        authState = await r.json();
+      } catch (_) {
+        authState = {authenticated: false};
+      }
+      setAuthUI();
+    }
+
+    async function onConnectWalletClick() {
+      if (authState?.authenticated) {
+        if (!confirm("Disconnect wallet?")) return;
+        try {
+          await postJson("/api/auth/logout", {});
+          authState = {authenticated: false};
+          setAuthUI();
+          setStatus("Wallet disconnected", "ok");
+        } catch (e) {
+          setStatus("Disconnect failed: " + (e?.message || "unknown"), "fail");
+        }
+        return;
+      }
+      openWalletModal();
+    }
+
+    async function connectWalletFlow(wallet) {
+      const provider = getWalletProvider(wallet);
+      if (!provider) {
+        setStatus(`${WALLET_LABELS[wallet] || wallet} is not available in this browser`, "fail");
+        return;
+      }
+      try {
+        setStatus(`Connecting ${WALLET_LABELS[wallet] || wallet}...`, "running");
+        const accounts = await provider.request({method: "eth_requestAccounts"});
+        const address = String((accounts || [])[0] || "").trim();
+        if (!address) throw new Error("Wallet did not return an address");
+        const chainHex = await provider.request({method: "eth_chainId"});
+        const chainId = Number.parseInt(String(chainHex || "0x1"), 16) || 1;
+
+        const nonceResp = await postJson("/api/auth/nonce", {address, chain_id: chainId, wallet});
+        const signature = await provider.request({method: "personal_sign", params: [nonceResp.message, address]});
+        const verifyResp = await postJson("/api/auth/verify", {
+          address,
+          chain_id: chainId,
+          wallet,
+          message: nonceResp.message,
+          signature,
+        });
+        authState = {authenticated: true, ...verifyResp};
+        setAuthUI();
+        closeWalletModal({target: {id: "walletModalBackdrop"}});
+        setStatus(`Connected: ${verifyResp.address_short}`, "ok");
+      } catch (e) {
+        setStatus("Wallet auth failed: " + (e?.message || "unknown"), "fail");
+      }
     }
 
     function setStatus(text, cssClass) {
@@ -2667,6 +3194,7 @@ HTML_PAGE = """
     attachAutosave();
     updatePairRows();
     renderEmptyCharts();
+    loadAuthState();
     loadMeta();
   </script>
 </body>
