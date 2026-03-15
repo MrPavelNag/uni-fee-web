@@ -163,6 +163,7 @@ AAVE_CHAIN_ID_TO_NAME: dict[int, str] = {
     57073: "ink",
 }
 _POSITION_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
+_POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -1001,21 +1002,23 @@ def _parse_tron_addresses(raw_items: list[str]) -> list[str]:
     return out
 
 
-def _query_uniswap_positions_for_owner(endpoint: str, owner: str) -> list[dict[str, Any]]:
-    query = """
-    query UserPositions($owner: String!, $skip: Int!) {
-      positions(first: 200, skip: $skip, where: { owner: $owner }) {
+def _query_uniswap_positions_for_owner(endpoint: str, owner: str, *, include_pool_liquidity: bool = False) -> list[dict[str, Any]]:
+    pool_liq_field = "liquidity" if include_pool_liquidity else ""
+    query = f"""
+    query UserPositions($owner: String!, $skip: Int!) {{
+      positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
         id
         liquidity
-        pool {
+        pool {{
           id
           feeTier
+          {pool_liq_field}
           totalValueLockedUSD
-          token0 { symbol id }
-          token1 { symbol id }
-        }
-      }
-    }
+          token0 {{ symbol id }}
+          token1 {{ symbol id }}
+        }}
+      }}
+    }}
     """
     result: list[dict[str, Any]] = []
     skip = 0
@@ -1054,6 +1057,29 @@ def _endpoint_supports_uniswap_positions(endpoint: str) -> bool:
     return ok
 
 
+def _endpoint_supports_pool_liquidity(endpoint: str) -> bool:
+    cached = _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE.get(endpoint)
+    if cached is not None:
+        return cached
+    query = """
+    query PoolFields {
+      __type(name: "Pool") {
+        fields { name }
+      }
+    }
+    """
+    ok = False
+    try:
+        data = graphql_query(endpoint, query, {}, retries=1)
+        fields = ((data.get("data") or {}).get("__type") or {}).get("fields") or []
+        names = {str(x.get("name") or "") for x in fields}
+        ok = ("liquidity" in names)
+    except Exception:
+        ok = False
+    _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE[endpoint] = ok
+    return ok
+
+
 def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -1070,9 +1096,14 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     f"Pool scan skipped [{chain_key}/{version}]: endpoint schema does not expose Position.pool/liquidity."
                 )
                 continue
+            has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint)
             for owner in addresses:
                 try:
-                    positions = _query_uniswap_positions_for_owner(endpoint, owner)
+                    positions = _query_uniswap_positions_for_owner(
+                        endpoint,
+                        owner,
+                        include_pool_liquidity=has_pool_liquidity,
+                    )
                 except Exception as e:
                     errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
                     continue
@@ -1084,6 +1115,21 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
                     if tvl_usd <= 0:
                         continue
+                    pos_liq = _safe_float(p.get("liquidity"))
+                    pool_liq = _safe_float(pool.get("liquidity"))
+                    # Estimate position TVL by liquidity share.
+                    # If pool liquidity is unavailable, keep it unknown (None).
+                    position_tvl_usd: float | None = None
+                    if pool_liq > 0 and pos_liq > 0:
+                        position_tvl_usd = max(0.0, tvl_usd * (pos_liq / pool_liq))
+                    fee_raw = str(pool.get("feeTier") or "").strip()
+                    fee_disp = fee_raw
+                    try:
+                        fee_int = int(fee_raw)
+                        if fee_int > 0:
+                            fee_disp = f"{fee_int / 10000.0:.2f}%"
+                    except Exception:
+                        fee_disp = fee_raw or "-"
                     t0 = (pool.get("token0") or {}).get("symbol") or "?"
                     t1 = (pool.get("token1") or {}).get("symbol") or "?"
                     rows.append(
@@ -1095,9 +1141,11 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             "kind": "pool",
                             "pool_id": str(pool.get("id") or ""),
                             "pair": f"{t0}/{t1}",
-                            "fee_tier": str(pool.get("feeTier") or ""),
+                            "fee_tier": fee_disp,
+                            "fee_tier_raw": fee_raw,
                             "liquidity": str(p.get("liquidity") or "0"),
-                            "tvl_usd": tvl_usd,
+                            "pool_tvl_usd": tvl_usd,
+                            "tvl_usd": position_tvl_usd,
                         }
                     )
     # Deduplicate by owner/protocol/pool id.
@@ -2073,7 +2121,7 @@ INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/", "Find the best fee on Uniswap"),
     ("/pancake", "Find the best pool on PancakeSwap"),
     ("/stables", "Find the best stablecoin yield"),
-    ("/positions", "Analise my DeFi positions"),
+    ("/positions", "Analyze my DeFi positions"),
     ("/help", "Send wishes or report issues"),
 ]
 
@@ -2671,12 +2719,19 @@ def _render_positions_page() -> str:
     .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
     .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
     .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; }
-    .btn-plus { width:34px; min-width:34px; height:34px; border-radius:8px; padding:0; font-size:18px; line-height:1; display:inline-flex; align-items:center; justify-content:center; }
+    .btn-plus { width:26px; min-width:26px; height:26px; border:none; border-radius:0; padding:0; font-size:22px; line-height:1; display:inline-flex; align-items:center; justify-content:center; background:transparent; color:#2563eb; font-weight:800; box-shadow:none; }
+    .btn-plus:hover { color:#1d4ed8; background:transparent; }
     .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; min-height:26px; }
     .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
     .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; }
     .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
-    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:13px; font-weight:700; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; }
+    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:13px; font-weight:700; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
+    .search-link-btn:hover { color:#1e40af; }
+    .collapse-btn { border:none; background:transparent; color:#334155; font-size:13px; font-weight:700; cursor:pointer; padding:0 2px; }
+    .section-actions { display:flex; align-items:center; gap:10px; }
+    .section-body { display:block; }
+    .section-body.collapsed { display:none; }
+    .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:12px; padding:0 0 0 4px; }
     .pos-status { color:#475569; font-size:13px; }
     .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
@@ -2685,7 +2740,28 @@ def _render_positions_page() -> str:
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
-    @media (max-width: 1100px) { .address-columns { grid-template-columns:1fr; } }
+    @media (max-width: 1100px) {
+      .address-columns { grid-template-columns:1fr; }
+      .positions-form, .result-card { padding: 12px; }
+      .section-head { flex-wrap: wrap; align-items: center; }
+      .section-head h3 { font-size: 16px; }
+      .search-link-btn { font-size: 12px; }
+    }
+    @media (max-width: 720px) {
+      .positions-grid { gap: 10px; }
+      .positions-form, .result-card { padding: 10px; border-radius: 12px; }
+      .addr-box { padding: 8px; }
+      .addr-input-row { gap: 6px; }
+      .addr-input-row input { font-size: 12px; padding: 7px; }
+      .btn-plus { width: 24px; min-width: 24px; height: 24px; font-size: 20px; }
+      .chip { font-size: 11px; padding: 3px 7px; }
+      .pos-status { font-size: 12px; }
+      .table-wrap { border-radius: 8px; }
+      table { min-width: 740px; font-size: 11px; }
+      th, td { padding: 6px; }
+      .mono { font-size: 10px; }
+      .errors-box, .info-box { font-size: 11px; padding: 7px; }
+    }
     """
     extra_html = f"""
     <div class="positions-grid">
@@ -2719,17 +2795,34 @@ def _render_positions_page() -> str:
         </div>
       </section>
       <section class="result-card">
-        <div class="section-head"><h3>Pool positions</h3><button class="search-link-btn" type="button" onclick="scanPositions()">Search</button></div>
-        <div class="table-wrap"><table id="posPoolsTable"></table></div>
+        <div class="section-head">
+          <h3>Pool positions</h3>
+          <div class="section-actions">
+            <button class="search-link-btn" type="button" onclick="scanPositions()">Search</button>
+            <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')">Collapse</button>
+          </div>
+        </div>
+        <div id="posPoolsBody" class="section-body"><div class="table-wrap"><table id="posPoolsTable"></table></div></div>
       </section>
       <section class="result-card">
-        <div class="section-head"><h3>Lending positions</h3><button class="search-link-btn" type="button" onclick="scanPositions()">Search</button></div>
-        <div class="table-wrap"><table id="posLendingTable"></table></div>
+        <div class="section-head">
+          <h3>Lending positions</h3>
+          <div class="section-actions">
+            <button class="search-link-btn" type="button" onclick="scanPositions()">Search</button>
+            <button class="collapse-btn" id="toggleLendingBtn" type="button" onclick="togglePosSection('lending')">Collapse</button>
+          </div>
+        </div>
+        <div id="posLendingBody" class="section-body"><div class="table-wrap"><table id="posLendingTable"></table></div></div>
       </section>
       <section class="result-card">
-        <div class="section-head"><h3>Unclaimed lending rewards</h3><button class="search-link-btn" type="button" onclick="scanPositions()">Search</button></div>
-        <div class="table-wrap"><table id="posRewardsTable"></table></div>
-        <div id="posErrors"></div>
+        <div class="section-head">
+          <h3>Unclaimed lending rewards</h3>
+          <div class="section-actions">
+            <button class="search-link-btn" type="button" onclick="scanPositions()">Search</button>
+            <button class="collapse-btn" id="toggleRewardsBtn" type="button" onclick="togglePosSection('rewards')">Collapse</button>
+          </div>
+        </div>
+        <div id="posRewardsBody" class="section-body"><div class="table-wrap"><table id="posRewardsTable"></table></div><div id="posErrors"></div></div>
       </section>
     </div>
     """
@@ -2807,24 +2900,53 @@ def _render_positions_page() -> str:
       savePosState();
       renderChips(kind);
     }
+    const posSectionState = {pools: false, lending: false, rewards: false};
+    const posCache = {pools: [], lending: [], rewards: []};
     function setPosStatus(text, isErr) {
       const el = document.getElementById("posStatus");
       if (!el) return;
       el.textContent = text || "";
       el.style.color = isErr ? "#b91c1c" : "#475569";
     }
+    function copyText(value) {
+      const text = String(value || "").trim();
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => setPosStatus("Copied to clipboard", false)).catch(() => {});
+    }
+    function setSectionCollapsed(key, collapsed) {
+      const bodyMap = {pools: "posPoolsBody", lending: "posLendingBody", rewards: "posRewardsBody"};
+      const btnMap = {pools: "togglePoolsBtn", lending: "toggleLendingBtn", rewards: "toggleRewardsBtn"};
+      const body = document.getElementById(bodyMap[key]);
+      const btn = document.getElementById(btnMap[key]);
+      if (!body || !btn) return;
+      posSectionState[key] = !!collapsed;
+      body.classList.toggle("collapsed", !!collapsed);
+      btn.textContent = collapsed ? "Expand" : "Collapse";
+    }
+    function togglePosSection(key) {
+      const next = !posSectionState[key];
+      setSectionCollapsed(key, next);
+      if (!next) {
+        if (key === "pools") renderPools(posCache.pools || []);
+        if (key === "lending") renderLending(posCache.lending || []);
+        if (key === "rewards") renderRewards(posCache.rewards || []);
+      }
+    }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
-      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>TVL USD</th></tr>";
+      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position TVL USD</th></tr>";
       for (const r of (rows || [])) {
         html += "<tr>";
-        html += `<td class='mono'>${esc(r.address || "")}</td>`;
+        html += `<td class='mono'>${esc(r.address || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(r.protocol || "")}</td>`;
         html += `<td>${esc(r.pair || "")}</td>`;
-        html += `<td>${esc(r.fee_tier || "")}</td>`;
-        html += `<td class='mono'>${esc(r.pool_id || "")}</td>`;
-        html += `<td>${Number(r.tvl_usd || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}</td>`;
+        const feeRaw = String(r.fee_tier_raw || "").trim();
+        const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
+        html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
+        html += `<td class='mono'>${esc(r.pool_id || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
+        const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
+        html += `<td>${tvlVal}</td>`;
         html += "</tr>";
       }
       if (!(rows || []).length) html += "<tr><td colspan='7'>No pool positions found.</td></tr>";
@@ -2884,9 +3006,12 @@ def _render_positions_page() -> str:
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || "Scan failed");
-        renderPools(data.pool_positions || []);
-        renderLending(data.lending_positions || []);
-        renderRewards(data.reward_positions || []);
+        posCache.pools = data.pool_positions || [];
+        posCache.lending = data.lending_positions || [];
+        posCache.rewards = data.reward_positions || [];
+        renderPools(posCache.pools);
+        renderLending(posCache.lending);
+        renderRewards(posCache.rewards);
         const errWrap = document.getElementById("posErrors");
         const errs = data.errors || [];
         const infos = data.infos || [];
@@ -2900,6 +3025,9 @@ def _render_positions_page() -> str:
     }
     loadPosState();
     renderAllChips();
+    setSectionCollapsed("pools", false);
+    setSectionCollapsed("lending", false);
+    setSectionCollapsed("rewards", false);
     setPosStatus("Ready", false);
     """
     return _render_placeholder_page(
@@ -2940,7 +3068,6 @@ def _render_admin_page() -> str:
     .intent-prefix {{ font-size: 14px; font-weight: 700; color: #1d4ed8; white-space: nowrap; }}
     .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 320px; max-width: 360px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
     .intent-select option {{ background: #eef4ff; color: #1f3a8a; }}
-    .intent-select option {{ background: #eef4ff; color: #1f3a8a; }}
     .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; width: 190px; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }}
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
     .tabs {{ display: flex; gap: 8px; margin-bottom: 8px; }}
@@ -2958,7 +3085,6 @@ def _render_admin_page() -> str:
     table {{ width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1100px; }}
     th, td {{ border-bottom: 1px solid #e2e8f0; padding: 8px; text-align: left; vertical-align: top; }}
     th {{ background: #eff6ff; color: #1e3a8a; position: sticky; top: 0; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
     pre {{ max-height: 320px; overflow: auto; background: #f8fafc; border: 1px solid #dbe3ef; border-radius: 8px; padding: 10px; color: #334155; font-size: 12px; white-space: pre-wrap; }}
     .wallet-modal-backdrop {{ position: fixed; inset: 0; background: linear-gradient(180deg, rgba(217,227,245,0.82) 0%, rgba(236,242,255,0.82) 100%); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 9999; }}
@@ -3673,6 +3799,8 @@ def _render_help_page() -> str:
     .row {{ display: grid; grid-template-columns: 170px 1fr; gap: 10px; align-items: center; margin-bottom: 8px; }}
     input, textarea {{ width: 100%; background: #f8fbff; border: 1px solid #cbd5e1; color: #0f172a; border-radius: 8px; padding: 8px; font-size: 14px; }}
     textarea {{ min-height: 140px; resize: vertical; }}
+    .compose-row {{ display:grid; grid-template-columns: 1fr auto; gap:10px; align-items:start; }}
+    .compose-row .btn {{ min-width: 140px; }}
     .btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 9px 14px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; }}
     .status {{ font-size: 13px; color: #475569; margin-left: 8px; }}
     .thread {{ display: grid; gap: 8px; }}
@@ -3696,7 +3824,7 @@ def _render_help_page() -> str:
     .wallet-item {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 12px; background: #eff6ff; color: #1d4ed8; font-weight: 700; text-align: left; cursor: pointer; }}
     .wallet-item.disabled {{ opacity: 0.6; cursor: not-allowed; }}
     .wallet-note {{ color: #64748b; font-size: 12px; margin-top: 8px; }}
-    @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} .compose-row {{ grid-template-columns: 1fr; }} .compose-row .btn {{ width: 100%; }} }}
   </style>
 </head>
 <body>
@@ -3719,11 +3847,9 @@ def _render_help_page() -> str:
         <div id="faqList">Loading FAQ...</div>
       </section>
       <section class="card feedback-form-card">
-        <h3>Send wishes and report issues</h3>
+        <h3>Feedback</h3>
         <p class="hint">Share product ideas or report problems. These messages go to admin review.</p>
-        <div class="row"><label>Message</label><textarea id="fMessage" placeholder="Tell us what to improve or what is broken"></textarea></div>
-        <p class="hint">Only wallet-authorized sessions can send tickets and feedback.</p>
-        <button class="btn" onclick="sendFeedback()">Send message</button>
+        <div class="compose-row"><textarea id="fMessage" placeholder="Tell us what to improve or what is broken. Only wallet-authorized sessions can send tickets and feedback."></textarea><button class="btn" onclick="sendFeedback()">Send message</button></div>
         <span class="status" id="feedbackFormStatus">Ready</span>
       </section>
       <section class="card">
@@ -3732,9 +3858,7 @@ def _render_help_page() -> str:
         <div class="row"><label>Name</label><input id="tName" type="text" placeholder="Optional"/></div>
         <div class="row"><label>Email</label><input id="tEmail" type="email" placeholder="Optional"/></div>
         <div class="row"><label>Subject</label><input id="tSubject" type="text" placeholder="Required"/></div>
-        <div class="row"><label>Message</label><textarea id="tMessage" placeholder="Describe the issue or request"></textarea></div>
-        <p class="hint">Only wallet-authorized sessions can send tickets and feedback.</p>
-        <button class="btn" onclick="sendTicket()">Send ticket</button>
+        <div class="compose-row"><textarea id="tMessage" placeholder="Describe the issue or request. Only wallet-authorized sessions can send tickets and feedback."></textarea><button class="btn" onclick="sendTicket()">Send ticket</button></div>
         <span class="status" id="ticketStatus">Ready</span>
       </section>
       <section class="card">
@@ -5329,7 +5453,7 @@ HTML_PAGE = """
           <option value="/" selected>Find the best fee on Uniswap</option>
           <option value="/pancake">Find the best pool on PancakeSwap</option>
           <option value="/stables">Find the best stablecoin yield</option>
-          <option value="/positions">Analise my DeFi positions</option>
+          <option value="/positions">Analyze my DeFi positions</option>
           <option value="/help">Send wishes or report issues</option>
         </select>
         <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
