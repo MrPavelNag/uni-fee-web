@@ -164,6 +164,7 @@ AAVE_CHAIN_ID_TO_NAME: dict[int, str] = {
 }
 _POSITION_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
+_POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -1002,13 +1003,20 @@ def _parse_tron_addresses(raw_items: list[str]) -> list[str]:
     return out
 
 
-def _query_uniswap_positions_for_owner(endpoint: str, owner: str, *, include_pool_liquidity: bool = False) -> list[dict[str, Any]]:
+def _query_uniswap_positions_for_owner(
+    endpoint: str,
+    owner: str,
+    *,
+    include_pool_liquidity: bool = False,
+    include_position_liquidity: bool = True,
+) -> list[dict[str, Any]]:
     pool_liq_field = "liquidity" if include_pool_liquidity else ""
+    pos_liq_field = "liquidity" if include_position_liquidity else ""
     query = f"""
     query UserPositions($owner: String!, $skip: Int!) {{
       positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
         id
-        liquidity
+        {pos_liq_field}
         pool {{
           id
           feeTier
@@ -1050,10 +1058,33 @@ def _endpoint_supports_uniswap_positions(endpoint: str) -> bool:
         data = graphql_query(endpoint, query, {}, retries=1)
         fields = ((data.get("data") or {}).get("__type") or {}).get("fields") or []
         names = {str(x.get("name") or "") for x in fields}
-        ok = ("pool" in names and "liquidity" in names)
+        ok = ("pool" in names)
     except Exception:
         ok = False
     _POSITION_SCHEMA_SUPPORT_CACHE[endpoint] = ok
+    return ok
+
+
+def _endpoint_supports_position_liquidity(endpoint: str) -> bool:
+    cached = _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE.get(endpoint)
+    if cached is not None:
+        return cached
+    query = """
+    query PositionFields {
+      __type(name: "Position") {
+        fields { name }
+      }
+    }
+    """
+    ok = False
+    try:
+        data = graphql_query(endpoint, query, {}, retries=1)
+        fields = ((data.get("data") or {}).get("__type") or {}).get("fields") or []
+        names = {str(x.get("name") or "") for x in fields}
+        ok = ("liquidity" in names)
+    except Exception:
+        ok = False
+    _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE[endpoint] = ok
     return ok
 
 
@@ -1092,23 +1123,24 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             if not endpoint:
                 continue
             if not _endpoint_supports_uniswap_positions(endpoint):
-                errors.append(
-                    f"Pool scan skipped [{chain_key}/{version}]: endpoint schema does not expose Position.pool/liquidity."
-                )
+                # Not a user-facing failure: some endpoints simply do not expose Position fields.
+                # Skip silently to avoid noisy red warnings in the UI.
                 continue
             has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint)
+            has_position_liquidity = _endpoint_supports_position_liquidity(endpoint)
             for owner in addresses:
                 try:
                     positions = _query_uniswap_positions_for_owner(
                         endpoint,
                         owner,
                         include_pool_liquidity=has_pool_liquidity,
+                        include_position_liquidity=has_position_liquidity,
                     )
                 except Exception as e:
                     errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
                     continue
                 for p in positions:
-                    if _safe_float(p.get("liquidity")) <= 0:
+                    if has_position_liquidity and _safe_float(p.get("liquidity")) <= 0:
                         # Hide closed/zero-liquidity historical NFTs; keep only active positions.
                         continue
                     pool = p.get("pool") or {}
@@ -2727,7 +2759,7 @@ def _render_positions_page() -> str:
     .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
     .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:13px; font-weight:700; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
-    .collapse-btn { border:none; background:transparent; color:#334155; font-size:13px; font-weight:700; cursor:pointer; padding:0 2px; }
+    .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
     .section-actions { display:flex; align-items:center; gap:10px; }
     .section-body { display:block; }
     .section-body.collapsed { display:none; }
@@ -2798,8 +2830,8 @@ def _render_positions_page() -> str:
         <div class="section-head">
           <h3>Pool positions</h3>
           <div class="section-actions">
-            <button class="search-link-btn" type="button" onclick="scanPositions()">Search</button>
-            <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')">Collapse</button>
+            <button class="search-link-btn" type="button" onclick="scanPositions('pools')">Search</button>
+            <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
         <div id="posPoolsBody" class="section-body"><div class="table-wrap"><table id="posPoolsTable"></table></div></div>
@@ -2808,8 +2840,8 @@ def _render_positions_page() -> str:
         <div class="section-head">
           <h3>Lending positions</h3>
           <div class="section-actions">
-            <button class="search-link-btn" type="button" onclick="scanPositions()">Search</button>
-            <button class="collapse-btn" id="toggleLendingBtn" type="button" onclick="togglePosSection('lending')">Collapse</button>
+            <button class="search-link-btn" type="button" onclick="scanPositions('lending')">Search</button>
+            <button class="collapse-btn" id="toggleLendingBtn" type="button" onclick="togglePosSection('lending')" title="Collapse/expand">▾</button>
           </div>
         </div>
         <div id="posLendingBody" class="section-body"><div class="table-wrap"><table id="posLendingTable"></table></div></div>
@@ -2818,8 +2850,8 @@ def _render_positions_page() -> str:
         <div class="section-head">
           <h3>Unclaimed lending rewards</h3>
           <div class="section-actions">
-            <button class="search-link-btn" type="button" onclick="scanPositions()">Search</button>
-            <button class="collapse-btn" id="toggleRewardsBtn" type="button" onclick="togglePosSection('rewards')">Collapse</button>
+            <button class="search-link-btn" type="button" onclick="scanPositions('rewards')">Search</button>
+            <button class="collapse-btn" id="toggleRewardsBtn" type="button" onclick="togglePosSection('rewards')" title="Collapse/expand">▾</button>
           </div>
         </div>
         <div id="posRewardsBody" class="section-body"><div class="table-wrap"><table id="posRewardsTable"></table></div><div id="posErrors"></div></div>
@@ -2921,7 +2953,7 @@ def _render_positions_page() -> str:
       if (!body || !btn) return;
       posSectionState[key] = !!collapsed;
       body.classList.toggle("collapsed", !!collapsed);
-      btn.textContent = collapsed ? "Expand" : "Collapse";
+      btn.textContent = collapsed ? "▸" : "▾";
     }
     function togglePosSection(key) {
       const next = !posSectionState[key];
@@ -2934,7 +2966,7 @@ def _render_positions_page() -> str:
     }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
-      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position TVL USD</th></tr>";
+      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th></tr>";
       for (const r of (rows || [])) {
         html += "<tr>";
         html += `<td class='mono'>${esc(r.address || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
@@ -2988,7 +3020,7 @@ def _render_positions_page() -> str:
       if (!(rows || []).length) html += "<tr><td colspan='6'>No unclaimed rewards found.</td></tr>";
       table.innerHTML = html;
     }
-    async function scanPositions() {
+    async function scanPositions(targetSection = "all") {
       if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
         setPosStatus("Add at least one address first.", true);
         return;
@@ -3009,15 +3041,17 @@ def _render_positions_page() -> str:
         posCache.pools = data.pool_positions || [];
         posCache.lending = data.lending_positions || [];
         posCache.rewards = data.reward_positions || [];
-        renderPools(posCache.pools);
-        renderLending(posCache.lending);
-        renderRewards(posCache.rewards);
+        if (targetSection === "all" || targetSection === "pools") renderPools(posCache.pools);
+        if (targetSection === "all" || targetSection === "lending") renderLending(posCache.lending);
+        if (targetSection === "all" || targetSection === "rewards") renderRewards(posCache.rewards);
         const errWrap = document.getElementById("posErrors");
         const errs = data.errors || [];
         const infos = data.infos || [];
         const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
         const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
-        errWrap.innerHTML = errHtml + infoHtml;
+        if (targetSection === "all" || targetSection === "rewards") {
+          errWrap.innerHTML = errHtml + infoHtml;
+        }
         setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}, Lending: ${(data.lending_positions || []).length}`, false);
       } catch (e) {
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
@@ -3801,6 +3835,7 @@ def _render_help_page() -> str:
     textarea {{ min-height: 140px; resize: vertical; }}
     .compose-row {{ display:grid; grid-template-columns: 1fr auto; gap:10px; align-items:start; }}
     .compose-row .btn {{ min-width: 140px; }}
+    .ticket-meta-wrap {{ max-width: 760px; }}
     .btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 9px 14px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; }}
     .status {{ font-size: 13px; color: #475569; margin-left: 8px; }}
     .thread {{ display: grid; gap: 8px; }}
@@ -3850,16 +3885,18 @@ def _render_help_page() -> str:
         <h3>Feedback</h3>
         <p class="hint">Share product ideas or report problems. These messages go to admin review.</p>
         <div class="compose-row"><textarea id="fMessage" placeholder="Tell us what to improve or what is broken. Only wallet-authorized sessions can send tickets and feedback."></textarea><button class="btn" onclick="sendFeedback()">Send message</button></div>
-        <span class="status" id="feedbackFormStatus">Ready</span>
+        <span class="status" id="feedbackFormStatus"></span>
       </section>
       <section class="card">
         <h3>Send a ticket</h3>
         <p class="hint">Your ticket goes to the admin panel.</p>
-        <div class="row"><label>Name</label><input id="tName" type="text" placeholder="Optional"/></div>
-        <div class="row"><label>Email</label><input id="tEmail" type="email" placeholder="Optional"/></div>
-        <div class="row"><label>Subject</label><input id="tSubject" type="text" placeholder="Required"/></div>
+        <div class="ticket-meta-wrap">
+          <div class="row"><label>Name</label><input id="tName" type="text" placeholder="Optional"/></div>
+          <div class="row"><label>Email</label><input id="tEmail" type="email" placeholder="Optional"/></div>
+          <div class="row"><label>Subject</label><input id="tSubject" type="text" placeholder="Required"/></div>
+        </div>
         <div class="compose-row"><textarea id="tMessage" placeholder="Describe the issue or request. Only wallet-authorized sessions can send tickets and feedback."></textarea><button class="btn" onclick="sendTicket()">Send ticket</button></div>
-        <span class="status" id="ticketStatus">Ready</span>
+        <span class="status" id="ticketStatus"></span>
       </section>
       <section class="card">
         <h3>My tickets</h3>
