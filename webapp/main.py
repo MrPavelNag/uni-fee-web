@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
@@ -610,7 +610,60 @@ def _merge_ticket_thread(
     return merged
 
 
+def _auto_close_stale_help_tickets(inactivity_days: int = 3) -> int:
+    """Auto-close tickets when the latest message is admin and user is inactive."""
+    days = max(1, int(inactivity_days or 3))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    with _analytics_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, ts, message, admin_note
+            FROM help_tickets
+            WHERE status IN ('open', 'in_progress')
+            ORDER BY id DESC
+            LIMIT 1000
+            """
+        ).fetchall()
+        if not rows:
+            return 0
+        base_map: dict[int, dict[str, str]] = {
+            int(r[0]): {
+                "ts": str(r[1] or ""),
+                "message": str(r[2] or ""),
+                "admin_note": str(r[3] or ""),
+            }
+            for r in rows
+        }
+        ticket_ids = list(base_map.keys())
+        threads = _ticket_messages_map(ticket_ids, limit_per_ticket=300)
+        to_close: list[int] = []
+        for ticket_id in ticket_ids:
+            base = base_map.get(ticket_id) or {}
+            merged = _merge_ticket_thread(
+                ts=str(base.get("ts") or ""),
+                base_message=str(base.get("message") or ""),
+                base_admin_note=str(base.get("admin_note") or ""),
+                thread=threads.get(ticket_id, []),
+            )
+            if not merged:
+                continue
+            last_msg = merged[-1]
+            if str(last_msg.get("author_type") or "").strip().lower() != "admin":
+                continue
+            last_ts = _parse_utc_iso(str(last_msg.get("ts") or "")) or _parse_utc_iso(str(base.get("ts") or ""))
+            if not last_ts:
+                continue
+            if last_ts <= cutoff:
+                to_close.append(ticket_id)
+        if not to_close:
+            return 0
+        conn.executemany("UPDATE help_tickets SET status = 'done' WHERE id = ?", ((x,) for x in to_close))
+        conn.commit()
+    return len(to_close)
+
+
 def _list_help_tickets(limit: int = 100) -> list[dict[str, Any]]:
+    _auto_close_stale_help_tickets(inactivity_days=3)
     with _analytics_conn() as conn:
         rows = conn.execute(
             """
@@ -649,6 +702,7 @@ def _list_help_tickets(limit: int = 100) -> list[dict[str, Any]]:
 
 
 def _list_help_tickets_for_session(session_id: str, limit: int = 50, wallet_address: str = "") -> list[dict[str, Any]]:
+    _auto_close_stale_help_tickets(inactivity_days=3)
     lim = max(1, min(200, int(limit)))
     wallet = (wallet_address or "").strip().lower()
     with _analytics_conn() as conn:
@@ -758,6 +812,19 @@ def _supported_chains() -> list[str]:
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_utc_iso(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -1448,6 +1515,10 @@ class HelpTicketReply(BaseModel):
     message: str
 
 
+class HelpTicketClose(BaseModel):
+    ticket_id: int
+
+
 class HelpTicketDelete(BaseModel):
     ticket_id: int
 
@@ -1555,8 +1626,8 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       font-weight: 600;
       color: #1f3a8a;
       background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%);
-      min-width: 240px;
-      max-width: 280px;
+      min-width: 320px;
+      max-width: 360px;
       appearance: none;
       -webkit-appearance: none;
       background-image:
@@ -1706,7 +1777,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       if (!wrap) {{
         wrap = document.createElement("div");
         wrap.id = "intentMenuWrap";
-        wrap.style.cssText = "position:relative;min-width:240px;max-width:280px;";
+        wrap.style.cssText = "position:relative;min-width:320px;max-width:360px;";
         const btn = document.createElement("button");
         btn.type = "button";
         btn.id = "intentMenuBtn";
@@ -1732,8 +1803,8 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       list.innerHTML = options.map((o) => {{
         const active = o.value === sel.value;
         const style = active
-          ? "display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;"
-          : "display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;";
+          ? "display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;"
+          : "display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;";
         return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`;
       }}).join("");
       Array.from(list.querySelectorAll("button[data-v]")).forEach((b) => {{
@@ -2048,7 +2119,7 @@ def _render_admin_page() -> str:
     .subtitle {{ margin: 4px 0 0; color: #64748b; font-size: 14px; }}
     .top-controls {{ display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }}
     .intent-prefix {{ font-size: 14px; font-weight: 700; color: #1d4ed8; white-space: nowrap; }}
-    .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 240px; max-width: 280px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
+    .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 320px; max-width: 360px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
     .intent-select option {{ background: #eef4ff; color: #1f3a8a; }}
     .intent-select option {{ background: #eef4ff; color: #1f3a8a; }}
     .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; width: 190px; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }}
@@ -2062,6 +2133,7 @@ def _render_admin_page() -> str:
     input, select, textarea {{ width: 100%; background: #f8fbff; border: 1px solid #cbd5e1; color: #0f172a; border-radius: 8px; padding: 8px; font-size: 14px; }}
     .row {{ display: grid; grid-template-columns: 170px 1fr; gap: 10px; align-items: center; margin-bottom: 8px; }}
     .btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 9px 14px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; }}
+    .btn-soft {{ background: #f8fbff; }}
     .status {{ font-size: 13px; color: #475569; margin-left: 8px; }}
     .table-wrap {{ overflow-x: auto; border: 1px solid #dbe3ef; border-radius: 10px; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1100px; }}
@@ -2078,7 +2150,7 @@ def _render_admin_page() -> str:
     .wallet-item.disabled {{ opacity: 0.6; cursor: not-allowed; }}
     .wallet-note {{ color: #64748b; font-size: 12px; margin-top: 8px; }}
     .ticket-controls {{ margin-top: 8px; padding: 10px; border: 1px solid #dbeafe; border-radius: 10px; background: #f8fbff; }}
-    .ticket-toolbar {{ display: grid; grid-template-columns: auto 150px 220px 130px minmax(220px, 1fr) auto; gap: 8px; align-items: end; margin-top: 2px; }}
+    .ticket-toolbar {{ display: grid; grid-template-columns: 150px 220px 130px minmax(220px, 1fr) auto; gap: 8px; align-items: end; margin-top: 2px; }}
     .ticket-filters {{ display: contents; }}
     .ticket-filter-item label {{ display: block; font-size: 11px; color: #64748b; margin-bottom: 4px; }}
     .ticket-filter-actions {{ display: contents; }}
@@ -2107,6 +2179,7 @@ def _render_admin_page() -> str:
     .ticket-reply-block {{ margin-top: 8px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }}
     .ticket-reply {{ min-height: 150px; resize: vertical; font-size: 13px; line-height: 1.35; }}
     .ticket-actions {{ display: flex; flex-direction: column; gap: 8px; min-width: 190px; }}
+    .ticket-actions .btn {{ width: 100%; text-align: center; }}
     .btn-soft {{ background: #f8fbff; }}
     .btn-danger {{ border-color: #fecaca; color: #b91c1c; background: #fef2f2; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
@@ -2185,11 +2258,10 @@ def _render_admin_page() -> str:
         <p class="ticket-intro">Tickets submitted from Get help page. Use quick actions and collapsed conversation view.</p>
         <div class="ticket-controls">
           <div class="ticket-toolbar">
-            <button class="btn" onclick="loadTickets()">Refresh tickets</button>
             <div class="ticket-filters">
             <div class="ticket-filter-item">
               <label>Status</label>
-              <select id="ticketFilterStatus"><option value="">all</option><option value="open">active</option><option value="in_progress">in progress</option><option value="done">done</option></select>
+              <select id="ticketFilterStatus"><option value="">all</option><option value="open">active</option><option value="in_progress">in progress</option><option value="done">closed</option></select>
             </div>
             <div class="ticket-filter-item">
               <label>Email</label>
@@ -2244,7 +2316,7 @@ def _render_admin_page() -> str:
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
-    function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:240px;max-width:280px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
+    function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:320px;max-width:360px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
     function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
     function getWalletProvider(wallet) {{ const providers=getEthereumProviders(); const pick=(pred)=>providers.find(pred)||null; if(wallet==="injected") return pick((p)=>!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isCoinbaseWallet)||providers[0]||window.ethereum||null; if(wallet==="rabby") return pick((p)=>!!p?.isRabby)||(window.ethereum?.isRabby?window.ethereum:null); if(wallet==="phantom"){{ if(window.phantom?.ethereum?.request) return window.phantom.ethereum; return pick((p)=>!!p?.isPhantom)||(window.ethereum?.isPhantom?window.ethereum:null); }} if(wallet==="metamask") return pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||((window.ethereum?.isMetaMask&&!window.ethereum?.isRabby&&!window.ethereum?.isPhantom&&!window.ethereum?.isCoinbaseWallet)?window.ethereum:null); if(wallet==="coinbase") return pick((p)=>!!p?.isCoinbaseWallet)||(window.ethereum?.isCoinbaseWallet?window.ethereum:null); return null; }}
     function getWalletChoices() {{ const order=["walletconnect","rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>({{id,label:WALLET_LABELS[id],available:id==="walletconnect"?!!WALLETCONNECT_PROJECT_ID:!!getWalletProvider(id)}})); }}
@@ -2330,6 +2402,15 @@ def _render_admin_page() -> str:
         el.addEventListener(evt, () => applyTicketsFilter());
         el.dataset.bound = "1";
       }}
+    }}
+    function startTicketsAutoRefresh() {{
+      if (window._ticketsAutoRefreshStarted) return;
+      window._ticketsAutoRefreshStarted = true;
+      setInterval(() => {{
+        const tab = document.getElementById("tabTickets");
+        if (!tab) return;
+        if (tab.style.display !== "none") loadTickets();
+      }}, 60000);
     }}
     function switchTab(tab) {{
       const isSettings = tab === "settings";
@@ -2436,7 +2517,7 @@ def _render_admin_page() -> str:
       for (let idx = 0; idx < filtered.length; idx++) {{
         const r = filtered[idx];
         html += `<div class="ticket-card">`;
-        html += `<div class="ticket-author"><div><span class="label">Name:</span><span class="value">${{esc(r.name || "-")}}</span></div><div><span class="label">Email:</span><span class="value">${{esc(r.email || "-")}}</span></div><div><span class="label">Wallet:</span><span class="value mono">${{esc(r.wallet_address || "-")}}</span></div><div><span class="label">Ticket #:</span><span class="value">${{esc(r.ticket_no || r.id)}}</span></div><div><span class="label">Created:</span><span class="value">${{esc(r.ts || "-")}}</span></div></div>`;
+        html += `<div class="ticket-author"><div><span class="label">Email:</span><span class="value">${{esc(r.email || "-")}}</span></div><div><span class="label">Wallet:</span><span class="value mono">${{esc(r.wallet_address || "-")}}</span></div><div><span class="label">Ticket #:</span><span class="value">${{esc(r.ticket_no || r.id)}}</span></div><div><span class="label">Created:</span><span class="value">${{esc(r.ts || "-")}}</span></div></div>`;
         const thread = Array.isArray(r.thread) && r.thread.length
           ? r.thread
           : [
@@ -2445,12 +2526,14 @@ def _render_admin_page() -> str:
             ];
         const threadHtml = thread.map((m) => {{
           const who = String(m.author_type || "user").toLowerCase() === "admin" ? "admin" : "user";
-          const whoLabel = who === "admin" ? "Admin" : "User";
+          const whoLabel = who === "admin" ? "Admin" : (String(r.name || "").trim() || "User");
           const ts = esc(m.ts || "");
           const msg = esc(m.message || "");
           return `<div class="admin-msg-bubble ${{who}}"><div class="admin-msg-head"><span>${{whoLabel}}</span><span>${{ts}}</span></div>${{msg}}</div>`;
         }}).join("\\n\\n");
-        if (idx === 0) {{
+        const statusNorm = normStatus(r.status || "");
+        const isClosed = statusNorm === "done" || statusNorm === "closed";
+        if (idx === 0 && !isClosed) {{
           html += `<div class="ticket-message-block"><div class="label">Conversation (${{thread.length}} messages)</div><div class="admin-thread">${{threadHtml}}</div></div>`;
         }} else {{
           html += `<div class="ticket-message-block"><details class="ticket-thread-details"><summary>Conversation (${{thread.length}} messages)</summary><div class="admin-thread">${{threadHtml}}</div></details></div>`;
@@ -2643,6 +2726,7 @@ def _render_admin_page() -> str:
     loadAuthState();
     loadAdmin();
     setupTicketFiltersAutoApply();
+    startTicketsAutoRefresh();
     refreshIntentMenu();
   </script>
 </body>
@@ -2669,7 +2753,7 @@ def _render_help_page() -> str:
     .subtitle {{ margin: 4px 0 0; color: #64748b; font-size: 14px; }}
     .top-controls {{ display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }}
     .intent-prefix {{ font-size: 14px; font-weight: 700; color: #1d4ed8; white-space: nowrap; }}
-    .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 240px; max-width: 280px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
+    .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 320px; max-width: 360px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
     .intent-select option {{ background: #eef4ff; color: #1f3a8a; }}
     .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; width: 190px; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }}
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
@@ -2689,8 +2773,11 @@ def _render_help_page() -> str:
     .ticket-last-preview {{ margin-top: 6px; font-size: 12px; color: #334155; padding: 6px 8px; border: 1px dashed #cbd5e1; border-radius: 8px; background: #f8fbff; }}
     .ticket-last-preview .who {{ display: inline-block; padding: 1px 6px; border-radius: 999px; border: 1px solid #bfdbfe; background: #eff6ff; color: #1d4ed8; margin-right: 6px; font-size: 11px; }}
     .ticket-last-preview .who.admin {{ border-color: #bbf7d0; background: #f0fdf4; color: #15803d; }}
-    .reply-compose {{ margin-top: 8px; display: grid; gap: 8px; }}
+    .reply-compose {{ margin-top: 8px; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: start; }}
     .reply-compose textarea {{ min-height: 90px; resize: vertical; }}
+    .reply-actions {{ display: flex; flex-direction: column; gap: 8px; min-width: 150px; }}
+    .reply-actions .btn {{ width: 100%; text-align: center; }}
+    .ticket-reply-warning {{ margin-top: 6px; color: #64748b; font-size: 11px; }}
     .wallet-modal-backdrop {{ position: fixed; inset: 0; background: linear-gradient(180deg, rgba(217,227,245,0.82) 0%, rgba(236,242,255,0.82) 100%); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 9999; }}
     .wallet-modal {{ width: min(460px, calc(100vw - 24px)); background: #f8fbff; border: 1px solid #cbd5e1; border-radius: 14px; box-shadow: 0 12px 36px rgba(15,23,42,0.25); padding: 14px; }}
     .wallet-modal h3 {{ margin: 0 0 8px; font-size: 18px; }}
@@ -2749,7 +2836,7 @@ def _render_help_page() -> str:
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
-    function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:240px;max-width:280px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
+    function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:320px;max-width:360px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
     function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
     function getWalletProvider(wallet) {{ const providers=getEthereumProviders(); const pick=(pred)=>providers.find(pred)||null; if(wallet==="injected") return pick((p)=>!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isCoinbaseWallet)||providers[0]||window.ethereum||null; if(wallet==="rabby") return pick((p)=>!!p?.isRabby)||(window.ethereum?.isRabby?window.ethereum:null); if(wallet==="phantom"){{ if(window.phantom?.ethereum?.request) return window.phantom.ethereum; return pick((p)=>!!p?.isPhantom)||(window.ethereum?.isPhantom?window.ethereum:null); }} if(wallet==="metamask") return pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||((window.ethereum?.isMetaMask&&!window.ethereum?.isRabby&&!window.ethereum?.isPhantom&&!window.ethereum?.isCoinbaseWallet)?window.ethereum:null); if(wallet==="coinbase") return pick((p)=>!!p?.isCoinbaseWallet)||(window.ethereum?.isCoinbaseWallet?window.ethereum:null); return null; }}
     function getWalletChoices() {{ const order=["walletconnect","rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>({{id,label:WALLET_LABELS[id],available:id==="walletconnect"?!!WALLETCONNECT_PROJECT_ID:!!getWalletProvider(id)}})); }}
@@ -2816,6 +2903,14 @@ def _render_help_page() -> str:
         setTicketStatus("Send failed: " + (e?.message || "unknown"), true);
       }}
     }}
+    async function closeMyTicket(ticketId) {{
+      try {{
+        await postJson("/api/help/tickets/close", {{ ticket_id: Number(ticketId) }});
+        await loadMyTickets();
+      }} catch (e) {{
+        setTicketStatus("Close failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
     function renderFaqList(items) {{
       const wrap = document.getElementById("faqList");
       if (!(items || []).length) {{
@@ -2848,7 +2943,9 @@ def _render_help_page() -> str:
       }}
       wrap.innerHTML = (items || []).map((t, idx) => {{
         const subject = escHtml(t.subject || "");
-        const status = escHtml(t.status || "open");
+        const rawStatus = String(t.status || "open").toLowerCase();
+        const isClosed = rawStatus === "done" || rawStatus === "closed";
+        const status = escHtml(isClosed ? "closed" : rawStatus);
         const thread = Array.isArray(t.thread) && t.thread.length
           ? t.thread
           : [
@@ -2869,10 +2966,16 @@ def _render_help_page() -> str:
         const lastBody = String(lastMsgObj?.message || "").replace(/\\s+/g, " ").trim();
         const lastShort = escHtml(lastBody.length > 90 ? (lastBody.slice(0, 90) + "...") : (lastBody || ""));
         const summaryTail = lastShort ? ` - ${{lastWhoLabel}}: ${{lastShort}}` : "";
-        if (idx === 0) {{
-          return `<div style="margin-bottom:10px;border:1px solid #dbe3ef;border-radius:10px;padding:8px;background:#f8fbff"><div style="font-weight:700"><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}} <span class="hint">(${{msgCount}} messages)</span><span class="hint">${{summaryTail}}</span></div><div style="margin-top:8px" class="thread">${{threadHtml}}</div><div class="reply-compose"><textarea id="myReply_${{t.id}}" placeholder="Reply to admin in this ticket thread..."></textarea><button class="btn" onclick="replyToTicket(${{t.id}})">Send reply</button></div></div>`;
+        const warning = isClosed
+          ? ""
+          : '<div class="ticket-reply-warning">Please reply within three days, otherwise this ticket will be closed automatically.</div>';
+        const replyBlock = isClosed
+          ? ""
+          : `<div class="reply-compose"><textarea id="myReply_${{t.id}}" placeholder="Reply to admin in this ticket thread..."></textarea><div class="reply-actions"><button class="btn" onclick="replyToTicket(${{t.id}})">Send reply</button><button class="btn btn-soft" onclick="closeMyTicket(${{t.id}})">Close</button></div></div>${{warning}}`;
+        if (idx === 0 && !isClosed) {{
+          return `<div style="margin-bottom:10px;border:1px solid #dbe3ef;border-radius:10px;padding:8px;background:#f8fbff"><div style="font-weight:700"><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}} <span class="hint">(${{msgCount}} messages)</span><span class="hint">${{summaryTail}}</span></div><div style="margin-top:8px" class="thread">${{threadHtml}}</div>${{replyBlock}}</div>`;
         }}
-        return `<details style="margin-bottom:10px"><summary><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}} <span class="hint">(${{msgCount}} messages)</span><span class="hint">${{summaryTail}}</span></summary><div style="margin-top:8px" class="thread">${{threadHtml}}</div><div class="reply-compose"><textarea id="myReply_${{t.id}}" placeholder="Reply to admin in this ticket thread..."></textarea><button class="btn" onclick="replyToTicket(${{t.id}})">Send reply</button></div></details>`;
+        return `<details style="margin-bottom:10px"><summary><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}} <span class="hint">(${{msgCount}} messages)</span><span class="hint">${{summaryTail}}</span></summary><div style="margin-top:8px" class="thread">${{threadHtml}}</div>${{replyBlock}}</details>`;
       }}).join("");
     }}
     async function replyToTicket(ticketId) {{
@@ -3278,6 +3381,30 @@ def reply_help_ticket(req: HelpTicketReply, request: Request, response: Response
     return {"ok": True, "ticket_no": ticket_no}
 
 
+@app.post("/api/help/tickets/close")
+def close_help_ticket(req: HelpTicketClose, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    wallet = str(auth.get("address") or "").strip().lower()
+    with _analytics_conn() as conn:
+        row = conn.execute(
+            "SELECT id, session_id, wallet_address FROM help_tickets WHERE id = ?",
+            (int(req.ticket_id),),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Ticket not found.")
+        ticket_id = int(row[0])
+        owner_sid = str(row[1] or "")
+        owner_wallet = str(row[2] or "").strip().lower()
+        can_close = (sid == owner_sid) or (_is_eth_address(wallet) and wallet == owner_wallet)
+        if not can_close:
+            raise HTTPException(status_code=403, detail="You can close only your own ticket.")
+        conn.execute("UPDATE help_tickets SET status = ? WHERE id = ?", ("done", ticket_id))
+        conn.commit()
+    return {"ok": True, "ticket_no": _ticket_number(ticket_id), "status": "closed"}
+
+
 @app.get("/api/faq")
 def public_faq(limit: int = 200) -> dict[str, Any]:
     items = _list_faq_items(include_unpublished=False, limit=limit)
@@ -3677,8 +3804,8 @@ HTML_PAGE = """
       font-weight: 600;
       color: #1f3a8a;
       background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%);
-      min-width: 240px;
-      max-width: 280px;
+      min-width: 320px;
+      max-width: 360px;
       appearance: none;
       -webkit-appearance: none;
       background-image:
@@ -4343,7 +4470,7 @@ HTML_PAGE = """
       if (!wrap) {
         wrap = document.createElement("div");
         wrap.id = "intentMenuWrap";
-        wrap.style.cssText = "position:relative;min-width:240px;max-width:280px;";
+        wrap.style.cssText = "position:relative;min-width:320px;max-width:360px;";
         const btn = document.createElement("button");
         btn.type = "button";
         btn.id = "intentMenuBtn";
@@ -4369,8 +4496,8 @@ HTML_PAGE = """
       list.innerHTML = options.map((o) => {
         const active = o.value === sel.value;
         const style = active
-          ? "display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;"
-          : "display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;";
+          ? "display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;"
+          : "display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;";
         return `<button type="button" data-v="${o.value}" style="${style}">${o.textContent}</button>`;
       }).join("");
       Array.from(list.querySelectorAll("button[data-v]")).forEach((b) => {
