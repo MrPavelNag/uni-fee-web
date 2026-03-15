@@ -772,6 +772,54 @@ def _ticket_messages_map(ticket_ids: list[int], limit_per_ticket: int = 200) -> 
     return out
 
 
+def _merge_ticket_thread(
+    *,
+    ts: str,
+    base_message: str,
+    base_admin_note: str,
+    thread: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for item in thread or []:
+        msg = str(item.get("message") or "").strip()
+        if not msg:
+            continue
+        who = str(item.get("author_type") or "user").strip().lower()
+        if who not in {"user", "admin"}:
+            who = "user"
+        merged.append(
+            {
+                "ts": str(item.get("ts") or ""),
+                "author_type": who,
+                "message": msg,
+            }
+        )
+
+    has_user = any(str(x.get("author_type") or "") == "user" for x in merged)
+    has_admin = any(str(x.get("author_type") or "") == "admin" for x in merged)
+
+    base_user = (base_message or "").strip()
+    base_admin = (base_admin_note or "").strip()
+    if base_user and not has_user:
+        merged.insert(
+            0,
+            {
+                "ts": ts or "",
+                "author_type": "user",
+                "message": base_user,
+            },
+        )
+    if base_admin and not has_admin:
+        merged.append(
+            {
+                "ts": "",
+                "author_type": "admin",
+                "message": base_admin,
+            }
+        )
+    return merged
+
+
 def _list_help_tickets(limit: int = 100) -> list[dict[str, Any]]:
     with _analytics_conn() as conn:
         rows = conn.execute(
@@ -801,7 +849,12 @@ def _list_help_tickets(limit: int = 100) -> list[dict[str, Any]]:
     ]
     threads = _ticket_messages_map([int(x["id"]) for x in items])
     for item in items:
-        item["thread"] = threads.get(int(item["id"]), [])
+        item["thread"] = _merge_ticket_thread(
+            ts=str(item.get("ts") or ""),
+            base_message=str(item.get("message") or ""),
+            base_admin_note=str(item.get("admin_note") or ""),
+            thread=threads.get(int(item["id"]), []),
+        )
     return items
 
 
@@ -845,7 +898,12 @@ def _list_help_tickets_for_session(session_id: str, limit: int = 50, wallet_addr
     ]
     threads = _ticket_messages_map([int(x["id"]) for x in items])
     for item in items:
-        item["thread"] = threads.get(int(item["id"]), [])
+        item["thread"] = _merge_ticket_thread(
+            ts=str(item.get("ts") or ""),
+            base_message=str(item.get("message") or ""),
+            base_admin_note=str(item.get("admin_reply") or ""),
+            thread=threads.get(int(item["id"]), []),
+        )
     return items
 
 
@@ -1607,6 +1665,10 @@ class HelpTicketReply(BaseModel):
     email: str = ""
 
 
+class HelpTicketDelete(BaseModel):
+    ticket_id: int
+
+
 class AdminFaqUpsert(BaseModel):
     faq_id: int | None = None
     question: str
@@ -1811,7 +1873,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
   <div class="container">
     <div class="header">
       <div>
-        <h1 class="title">Simple DeFi</h1>
+        <h1 class="title">DeFi Pools</h1>
         <p class="subtitle">Uniswap v3/v4 screening with on-screen charts, filtering and ranked pool table.</p>
       </div>
       <div class="top-controls">
@@ -2007,6 +2069,25 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       }}
     }}
 
+    function showWcQrModal(uri) {{
+      let el = document.getElementById("wcQrBackdrop");
+      if (!el) {{
+        el = document.createElement("div");
+        el.id = "wcQrBackdrop";
+        el.style.cssText = "position:fixed;inset:0;background:linear-gradient(180deg,rgba(217,227,245,0.95),rgba(236,242,255,0.95));backdrop-filter:blur(4px);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10001;";
+        el.innerHTML = '<div style="background:#f8fbff;border:1px solid #cbd5e1;border-radius:14px;padding:20px;text-align:center;box-shadow:0 12px 36px rgba(15,23,42,0.2)"><p style="margin:0 0 12px;font-size:16px;font-weight:700;color:#0f172a">Scan with your wallet app</p><img id="wcQrImg" alt="QR" style="display:block;background:#fff;padding:10px;border-radius:10px;width:260px;height:260px"/><p style="margin:10px 0 0;font-size:12px;color:#64748b">Or open the link on your phone</p><button id="wcQrCancel" type="button" style="margin-top:14px;padding:8px 16px;border-radius:10px;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:700;cursor:pointer">Cancel</button></div>';
+        document.body.appendChild(el);
+        document.getElementById("wcQrCancel").onclick = closeWcQrModal;
+      }}
+      document.getElementById("wcQrImg").src = "https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=" + encodeURIComponent(uri);
+      el.style.display = "flex";
+    }}
+    function closeWcQrModal() {{
+      const el = document.getElementById("wcQrBackdrop");
+      if (el) el.style.display = "none";
+      if (window._wcProvider) try {{ window._wcProvider.disconnect(); }} catch (_) {{}}
+      window._wcProvider = null;
+    }}
     async function connectWalletConnect() {{
       if (!WALLETCONNECT_PROJECT_ID) {{
         alert("WalletConnect is not configured on server (WALLETCONNECT_PROJECT_ID).");
@@ -2029,31 +2110,30 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
         const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
         const wcMetadata = {{
-          name: "Simple DeFi",
-          description: "Simple DeFi wallet sign-in",
+          name: "DeFi Pools",
+          description: "DeFi Pools wallet sign-in",
           url: window.location.origin,
           icons: [window.location.origin + "/favicon.ico"],
         }};
         const provider = await EthereumProviderModule.EthereumProvider.init({{
           projectId: WALLETCONNECT_PROJECT_ID,
-          chains: [1],
-          optionalChains: wcChains.filter((c) => c !== 1),
-          showQrModal: true,
-          methods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign"],
-          optionalMethods: ["wallet_switchEthereumChain"],
+          optionalChains: wcChains,
+          showQrModal: false,
+          optionalMethods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign", "wallet_switchEthereumChain"],
           optionalEvents: ["accountsChanged", "chainChanged", "disconnect"],
           metadata: wcMetadata,
           rpcMap: {{}},
         }});
-        try {{ await provider.disconnect(); }} catch (_) {{}}
-        let connected = false;
+        provider.on("display_uri", showWcQrModal);
+        window._wcProvider = provider;
         try {{
           await provider.connect();
-          connected = true;
-        }} catch (_) {{}}
-        if (!connected) {{
-          await provider.enable();
+        }} catch (connErr) {{
+          closeWcQrModal();
+          throw connErr;
         }}
+        window._wcProvider = null;
+        closeWcQrModal();
         let accounts = provider.accounts || [];
         if (!accounts.length) accounts = (await provider.request({{method: "eth_accounts"}})) || [];
         if (!accounts.length) accounts = (await provider.request({{method: "eth_requestAccounts"}})) || [];
@@ -2089,7 +2169,8 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         setAuthUI();
         closeWalletModal({{target: {{id: "walletModalBackdrop"}}}});
       }} catch (e) {{
-        alert("WalletConnect failed: " + (e?.message || "unknown error") + ". Check Reown Domain allowlist and retry.");
+        closeWcQrModal();
+        alert("WalletConnect failed: " + (e?.message || "unknown error") + ". Add this site to Reown Domain allowlist and try again.");
       }}
     }}
 
@@ -2163,12 +2244,19 @@ def _render_admin_page() -> str:
     .ticket-head .meta {{ font-size: 12px; color: #334155; }}
     .ticket-head .mono {{ font-size: 11px; }}
     .ticket-status-badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #cbd5e1; font-weight: 700; font-size: 11px; }}
+    .ticket-preview {{ margin-top: 8px; padding: 8px; border: 1px dashed #cbd5e1; border-radius: 8px; font-size: 12px; color: #334155; background: #f8fbff; }}
+    .ticket-preview b {{ color: #0f172a; }}
+    .ticket-preview .who {{ display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 11px; border: 1px solid #bfdbfe; background: #eff6ff; color: #1d4ed8; margin-right: 6px; }}
+    .ticket-preview .who.admin {{ border-color: #bbf7d0; background: #f0fdf4; color: #15803d; }}
     .ticket-message-block {{ margin-top: 8px; }}
     .ticket-message-block .label, .ticket-reply-block .label {{ font-size: 11px; color: #64748b; margin-bottom: 4px; }}
     .ticket-message {{ margin: 0; max-height: 120px; overflow: auto; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; font-size: 12px; white-space: pre-wrap; color: #334155; }}
+    .ticket-thread-details > summary {{ cursor: pointer; color: #1d4ed8; font-size: 12px; font-weight: 700; margin-bottom: 4px; }}
     .ticket-reply-block {{ margin-top: 8px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }}
     .ticket-reply {{ min-height: 150px; resize: vertical; font-size: 13px; line-height: 1.35; }}
-    .ticket-actions {{ display: flex; flex-direction: column; gap: 8px; min-width: 160px; }}
+    .ticket-actions {{ display: flex; flex-direction: column; gap: 8px; min-width: 190px; }}
+    .btn-soft {{ background: #f8fbff; }}
+    .btn-danger {{ border-color: #fecaca; color: #b91c1c; background: #fef2f2; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
     @media (max-width: 1100px) {{
       .ticket-head {{ grid-template-columns: 1fr 1fr; }}
@@ -2181,7 +2269,7 @@ def _render_admin_page() -> str:
   <div class="container">
     <div class="header">
       <div>
-        <h1 class="title">Simple DeFi</h1>
+        <h1 class="title">DeFi Pools</h1>
         <p class="subtitle">Administer project settings and analytics delivery.</p>
       </div>
       <div class="top-controls">
@@ -2257,7 +2345,7 @@ def _render_admin_page() -> str:
     <div class="grid" id="tabTickets" style="display:none">
       <section class="card">
         <h3>Help tickets</h3>
-        <p class="hint">Tickets submitted from Get help page.</p>
+        <p class="hint">Tickets submitted from Get help page. Use quick actions and collapsed conversation view.</p>
         <button class="btn" onclick="loadTickets()">Refresh tickets</button>
         <div class="ticket-filters">
           <div class="ticket-filter-item">
@@ -2274,7 +2362,7 @@ def _render_admin_page() -> str:
           </div>
           <div class="ticket-filter-item">
             <label>Text</label>
-            <input id="ticketFilterText" type="text" placeholder="search in subject/message"/>
+            <input id="ticketFilterText" type="text" placeholder="search in subject/message/reply"/>
           </div>
         </div>
         <div class="ticket-filter-actions">
@@ -2327,6 +2415,8 @@ def _render_admin_page() -> str:
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
+    function showWcQrModal(uri){{ let el=document.getElementById("wcQrBackdrop"); if(!el){{ el=document.createElement("div"); el.id="wcQrBackdrop"; el.style.cssText="position:fixed;inset:0;background:linear-gradient(180deg,rgba(217,227,245,0.95),rgba(236,242,255,0.95));backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:10001;"; el.innerHTML='<div style="background:#f8fbff;border:1px solid #cbd5e1;border-radius:14px;padding:20px;text-align:center"><p style="margin:0 0 12px;font-size:16px;font-weight:700;color:#0f172a">Scan with your wallet app</p><img id="wcQrImg" alt="QR" style="display:block;background:#fff;padding:10px;border-radius:10px;width:260px;height:260px"/><button id="wcQrCancel" type="button" style="margin-top:14px;padding:8px 16px;border-radius:10px;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:700;cursor:pointer">Cancel</button></div>'; document.body.appendChild(el); document.getElementById("wcQrCancel").onclick=closeWcQrModal; }} document.getElementById("wcQrImg").src="https://api.qrserver.com/v1/create-qr-code/?size=260x260&data="+encodeURIComponent(uri); el.style.display="flex"; }}
+    function closeWcQrModal(){{ const el=document.getElementById("wcQrBackdrop"); if(el) el.style.display="none"; if(window._wcProvider) try {{ window._wcProvider.disconnect(); }} catch(_) {{}} window._wcProvider=null; }}
     async function connectWalletConnect() {{
       if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID).");
       const normalizeAddress=(value)=>{{ const raw=String(value||"").trim(); if(!raw) return ""; const parts=raw.split(":"); return String(parts[parts.length-1]||"").trim(); }};
@@ -2334,12 +2424,13 @@ def _render_admin_page() -> str:
       try {{
         const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
         const wcChains=[1,10,56,137,8453,42161,43114];
-        const wcMetadata={{name:"Simple DeFi",description:"Simple DeFi wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
-        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains.filter((c)=>c!==1),showQrModal:true,methods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign"],optionalMethods:["wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
-        try {{ await provider.disconnect(); }} catch (_) {{}}
-        let connected=false;
-        try {{ await provider.connect(); connected=true; }} catch (_) {{}}
-        if(!connected) await provider.enable();
+        const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
+        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
+        provider.on("display_uri",showWcQrModal);
+        window._wcProvider=provider;
+        try {{ await provider.connect(); }} catch(connErr) {{ closeWcQrModal(); throw connErr; }}
+        window._wcProvider=null;
+        closeWcQrModal();
         let accounts=provider.accounts||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_accounts"}}))||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[];
@@ -2351,18 +2442,14 @@ def _render_admin_page() -> str:
         const messageHex=toHexMessage(nonceResp.message||"");
         const signVariants=[[nonceResp.message,address],[address,nonceResp.message],[messageHex,address],[address,messageHex]];
         let signature="";
-        for (const params of signVariants) {{
-          try {{ if(!params[0]) continue; signature=await provider.request({{method:"personal_sign",params}}); if(signature) break; }} catch (_) {{}}
-        }}
+        for (const params of signVariants) {{ try {{ if(!params[0]) continue; signature=await provider.request({{method:"personal_sign",params}}); if(signature) break; }} catch (_) {{}} }}
         if(!signature) throw new Error("Failed to sign auth message via WalletConnect");
         const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}});
         authState={{authenticated:true,...verifyResp}};
         setAuthUI();
         closeWalletModal({{target:{{id:"walletModalBackdrop"}}}});
         location.reload();
-      }} catch(e) {{
-        alert("WalletConnect failed: "+(e?.message||"unknown error")+". Check Reown Domain allowlist and retry.");
-      }}
+      }} catch(e) {{ closeWcQrModal(); alert("WalletConnect failed: "+(e?.message||"unknown error")+". Add this site to Reown Domain allowlist and try again."); }}
     }}
     function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setStatsStatus(text, isErr) {{ const el=document.getElementById("statsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
@@ -2391,6 +2478,16 @@ def _render_admin_page() -> str:
       if (document.getElementById("ticketFilterText")) document.getElementById("ticketFilterText").value = "";
       renderTickets(window._ticketRows || []);
       setTicketsStatus("Filters reset", false);
+    }}
+    function setupTicketFiltersAutoApply() {{
+      const ids = ["ticketFilterStatus", "ticketFilterEmail", "ticketFilterNo", "ticketFilterText"];
+      for (const id of ids) {{
+        const el = document.getElementById(id);
+        if (!el || el.dataset.bound === "1") continue;
+        const evt = el.tagName === "SELECT" ? "change" : "input";
+        el.addEventListener(evt, () => applyTicketsFilter());
+        el.dataset.bound = "1";
+      }}
     }}
     function switchTab(tab) {{
       const isSettings = tab === "settings";
@@ -2485,7 +2582,8 @@ def _render_admin_page() -> str:
         const status = normStatus(r.status || "");
         const email = String(r.email || "").toLowerCase();
         const ticketNo = String(r.ticket_no || r.id || "");
-        const hay = `${{String(r.subject || "").toLowerCase()}}\\n${{String(r.message || "").toLowerCase()}}\\n${{String(r.admin_note || "").toLowerCase()}}`;
+        const threadText = Array.isArray(r.thread) ? r.thread.map((m) => String(m?.message || "")).join("\\n") : "";
+        const hay = `${{String(r.subject || "").toLowerCase()}}\\n${{String(r.message || "").toLowerCase()}}\\n${{String(r.admin_note || "").toLowerCase()}}\\n${{threadText.toLowerCase()}}`;
         if (f.status && status !== f.status) return false;
         if (f.email && !email.includes(f.email)) return false;
         if (f.ticketNo && ticketNo !== f.ticketNo) return false;
@@ -2513,10 +2611,18 @@ def _render_admin_page() -> str:
           const who = String(m.author_type || "user").toLowerCase() === "admin" ? "Admin" : "User";
           return `[${{who}}] ${{String(m.ts || "")}} ${{String(m.message || "")}}`.trim();
         }}).join("\\n\\n");
-        html += `<div class="ticket-message-block"><div class="label">Message thread</div><pre class="ticket-message">${{esc(threadText)}}</pre></div>`;
+        const lastMsgObj = thread.length ? thread[thread.length - 1] : null;
+        const lastWhoRaw = String(lastMsgObj?.author_type || "user").toLowerCase();
+        const lastWho = lastWhoRaw === "admin" ? "admin" : "user";
+        const lastWhoLabel = lastWho === "admin" ? "Admin" : "User";
+        const lastTs = String(lastMsgObj?.ts || "");
+        const lastBody = String(lastMsgObj?.message || "").replace(/\\s+/g, " ").trim();
+        const lastShort = lastBody.length > 140 ? (lastBody.slice(0, 140) + "...") : lastBody;
+        html += `<div class="ticket-preview"><b>Last message:</b> <span class="who ${{lastWho}}">${{lastWhoLabel}}</span><span class="mono">${{esc(lastTs)}}</span><div style="margin-top:4px">${{esc(lastShort || "(empty)")}}</div></div>`;
+        html += `<div class="ticket-message-block"><details class="ticket-thread-details"><summary>Conversation (${{thread.length}} messages)</summary><pre class="ticket-message">${{esc(threadText)}}</pre></details></div>`;
         html += `<div class="ticket-reply-block">`;
         html += `<div><div class="label">Reply</div><textarea class="ticket-reply" id="note_${{r.id}}" placeholder="Reply to user...">${{esc(r.admin_note)}}</textarea></div>`;
-        html += `<div class="ticket-actions"><button class="btn" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'in_progress')">Save/in progress</button><button class="btn" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done')">Send + done</button></div>`;
+        html += `<div class="ticket-actions"><button class="btn btn-soft" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'open')">Mark open</button><button class="btn btn-soft" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'in_progress')">Save / in progress</button><button class="btn" style="padding:6px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done')">Send + done</button><button class="btn btn-danger" style="padding:6px 10px;font-size:12px" onclick="deleteTicketAction(${{r.id}}, '${{esc(r.ticket_no || r.id)}}')">Delete ticket</button></div>`;
         html += `</div>`;
         html += `</div>`;
       }}
@@ -2547,6 +2653,18 @@ def _render_admin_page() -> str:
         await loadTickets();
       }} catch (e) {{
         setTicketsStatus("Update failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function deleteTicketAction(ticketId, ticketNo) {{
+      const no = String(ticketNo || ticketId);
+      const ok = confirm(`Delete ticket #${{no}}?\\n\\nThis action is permanent and will remove all messages in this thread.`);
+      if (!ok) return;
+      try {{
+        const data = await postJson("/api/admin/help-tickets/delete", {{ticket_id: Number(ticketId)}});
+        setTicketsStatus(data.info || `Ticket #${{no}} deleted`, false);
+        await loadTickets();
+      }} catch (e) {{
+        setTicketsStatus("Delete failed: " + (e?.message || "unknown"), true);
       }}
     }}
     function clearFaqForm() {{
@@ -2722,6 +2840,7 @@ def _render_admin_page() -> str:
     }}
     loadAuthState();
     loadAdmin();
+    setupTicketFiltersAutoApply();
   </script>
 </body>
 </html>
@@ -2763,6 +2882,9 @@ def _render_help_page() -> str:
     .msg-bubble.user {{ background: #eef4ff; border-color: #c7dbff; }}
     .msg-bubble.admin {{ background: #f0fdf4; border-color: #bbf7d0; }}
     .msg-head {{ font-size: 11px; color: #64748b; margin-bottom: 4px; display: flex; justify-content: space-between; gap: 8px; }}
+    .ticket-last-preview {{ margin-top: 6px; font-size: 12px; color: #334155; padding: 6px 8px; border: 1px dashed #cbd5e1; border-radius: 8px; background: #f8fbff; }}
+    .ticket-last-preview .who {{ display: inline-block; padding: 1px 6px; border-radius: 999px; border: 1px solid #bfdbfe; background: #eff6ff; color: #1d4ed8; margin-right: 6px; font-size: 11px; }}
+    .ticket-last-preview .who.admin {{ border-color: #bbf7d0; background: #f0fdf4; color: #15803d; }}
     .reply-compose {{ margin-top: 8px; display: grid; gap: 8px; }}
     .reply-compose textarea {{ min-height: 90px; resize: vertical; }}
     .wallet-modal-backdrop {{ position: fixed; inset: 0; background: linear-gradient(180deg, rgba(217,227,245,0.82) 0%, rgba(236,242,255,0.82) 100%); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 9999; }}
@@ -2779,7 +2901,7 @@ def _render_help_page() -> str:
   <div class="container">
     <div class="header">
       <div>
-        <h1 class="title">Simple DeFi</h1>
+        <h1 class="title">DeFi Pools</h1>
         <p class="subtitle">Support and FAQ.</p>
       </div>
       <div class="top-controls">
@@ -2834,6 +2956,8 @@ def _render_help_page() -> str:
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
+    function showWcQrModal(uri){{ let el=document.getElementById("wcQrBackdrop"); if(!el){{ el=document.createElement("div"); el.id="wcQrBackdrop"; el.style.cssText="position:fixed;inset:0;background:linear-gradient(180deg,rgba(217,227,245,0.95),rgba(236,242,255,0.95));backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:10001;"; el.innerHTML='<div style="background:#f8fbff;border:1px solid #cbd5e1;border-radius:14px;padding:20px;text-align:center"><p style="margin:0 0 12px;font-size:16px;font-weight:700;color:#0f172a">Scan with your wallet app</p><img id="wcQrImg" alt="QR" style="display:block;background:#fff;padding:10px;border-radius:10px;width:260px;height:260px"/><button id="wcQrCancel" type="button" style="margin-top:14px;padding:8px 16px;border-radius:10px;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:700;cursor:pointer">Cancel</button></div>'; document.body.appendChild(el); document.getElementById("wcQrCancel").onclick=closeWcQrModal; }} document.getElementById("wcQrImg").src="https://api.qrserver.com/v1/create-qr-code/?size=260x260&data="+encodeURIComponent(uri); el.style.display="flex"; }}
+    function closeWcQrModal(){{ const el=document.getElementById("wcQrBackdrop"); if(el) el.style.display="none"; if(window._wcProvider) try {{ window._wcProvider.disconnect(); }} catch(_) {{}} window._wcProvider=null; }}
     async function connectWalletConnect() {{
       if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID).");
       const normalizeAddress=(value)=>{{ const raw=String(value||"").trim(); if(!raw) return ""; const parts=raw.split(":"); return String(parts[parts.length-1]||"").trim(); }};
@@ -2841,12 +2965,13 @@ def _render_help_page() -> str:
       try {{
         const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
         const wcChains=[1,10,56,137,8453,42161,43114];
-        const wcMetadata={{name:"Simple DeFi",description:"Simple DeFi wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
-        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains.filter((c)=>c!==1),showQrModal:true,methods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign"],optionalMethods:["wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
-        try {{ await provider.disconnect(); }} catch (_) {{}}
-        let connected=false;
-        try {{ await provider.connect(); connected=true; }} catch (_) {{}}
-        if(!connected) await provider.enable();
+        const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
+        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
+        provider.on("display_uri",showWcQrModal);
+        window._wcProvider=provider;
+        try {{ await provider.connect(); }} catch(connErr) {{ closeWcQrModal(); throw connErr; }}
+        window._wcProvider=null;
+        closeWcQrModal();
         let accounts=provider.accounts||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_accounts"}}))||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[];
@@ -2858,17 +2983,13 @@ def _render_help_page() -> str:
         const messageHex=toHexMessage(nonceResp.message||"");
         const signVariants=[[nonceResp.message,address],[address,nonceResp.message],[messageHex,address],[address,messageHex]];
         let signature="";
-        for (const params of signVariants) {{
-          try {{ if(!params[0]) continue; signature=await provider.request({{method:"personal_sign",params}}); if(signature) break; }} catch (_) {{}}
-        }}
+        for (const params of signVariants) {{ try {{ if(!params[0]) continue; signature=await provider.request({{method:"personal_sign",params}}); if(signature) break; }} catch (_) {{}} }}
         if(!signature) throw new Error("Failed to sign auth message via WalletConnect");
         const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}});
         authState={{authenticated:true,...verifyResp}};
         setAuthUI();
         closeWalletModal({{target:{{id:"walletModalBackdrop"}}}});
-      }} catch(e) {{
-        alert("WalletConnect failed: "+(e?.message||"unknown error")+". Check Reown Domain allowlist and retry.");
-      }}
+      }} catch(e) {{ closeWcQrModal(); alert("WalletConnect failed: "+(e?.message||"unknown error")+". Add this site to Reown Domain allowlist and try again."); }}
     }}
     function setTicketStatus(text, isErr) {{ const el=document.getElementById("ticketStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     async function sendTicket() {{
@@ -2936,7 +3057,16 @@ def _render_help_page() -> str:
           const msg = escHtml(m.message || "");
           return `<div class="msg-bubble ${{who}}"><div class="msg-head"><span>${{whoLabel}}</span><span>${{ts}}</span></div>${{msg}}</div>`;
         }}).join("");
-        return `<details style="margin-bottom:10px" open><summary><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}}</summary><div style="margin-top:8px" class="thread">${{threadHtml}}</div><div class="reply-compose"><textarea id="myReply_${{t.id}}" placeholder="Reply to admin in this ticket thread..."></textarea><button class="btn" onclick="replyToTicket(${{t.id}})">Send reply</button></div></details>`;
+        const msgCount = thread.length;
+        const lastMsgObj = thread.length ? thread[thread.length - 1] : null;
+        const lastWhoRaw = String(lastMsgObj?.author_type || "user").toLowerCase();
+        const lastWho = lastWhoRaw === "admin" ? "admin" : "user";
+        const lastWhoLabel = lastWho === "admin" ? "Admin" : "You";
+        const lastTs = escHtml(lastMsgObj?.ts || "");
+        const lastBody = String(lastMsgObj?.message || "").replace(/\\s+/g, " ").trim();
+        const lastShort = escHtml(lastBody.length > 110 ? (lastBody.slice(0, 110) + "...") : (lastBody || ""));
+        const preview = `<div class="ticket-last-preview"><span class="who ${{lastWho}}">${{lastWhoLabel}}</span><span class="hint">${{lastTs}}</span><div style="margin-top:3px">${{lastShort || "(empty)"}}</div></div>`;
+        return `<details style="margin-bottom:10px"><summary><b>#${{t.ticket_no}}</b> [${{status}}] ${{subject}} <span class="hint">(${{msgCount}} messages)</span></summary>${{preview}}<div style="margin-top:8px" class="thread">${{threadHtml}}</div><div class="reply-compose"><textarea id="myReply_${{t.id}}" placeholder="Reply to admin in this ticket thread..."></textarea><button class="btn" onclick="replyToTicket(${{t.id}})">Send reply</button></div></details>`;
       }}).join("");
     }}
     async function replyToTicket(ticketId) {{
@@ -3481,6 +3611,23 @@ def admin_help_ticket_update(req: HelpTicketUpdate, request: Request, response: 
         ok, info = _send_ticket_email(ticket_email, subject, body)
         email_info = "reply sent" if ok else f"reply failed: {info}"
     return {"ok": True, "ticket_no": ticket_no, "email_info": email_info}
+
+
+@app.post("/api/admin/help-tickets/delete")
+def admin_help_ticket_delete(req: HelpTicketDelete, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    ticket_id = int(req.ticket_id or 0)
+    if ticket_id <= 0:
+        raise HTTPException(status_code=400, detail="ticket_id is required.")
+    with _analytics_conn() as conn:
+        row = conn.execute("SELECT id FROM help_tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Ticket not found.")
+        ticket_no = _ticket_number(ticket_id)
+        conn.execute("DELETE FROM help_ticket_messages WHERE ticket_id = ?", (ticket_id,))
+        conn.execute("DELETE FROM help_tickets WHERE id = ?", (ticket_id,))
+        conn.commit()
+    return {"ok": True, "ticket_no": ticket_no, "info": f"Ticket #{ticket_no} deleted."}
 
 
 @app.get("/api/admin/faq")
@@ -4260,7 +4407,7 @@ HTML_PAGE = """
   <div class="container">
     <div class="header">
       <div>
-        <h1 class="title">Simple DeFi</h1>
+        <h1 class="title">DeFi Pools</h1>
         <p class="subtitle">Uniswap v3/v4 screening with on-screen charts, filtering and ranked pool table.</p>
       </div>
       <div class="top-controls">
@@ -4631,6 +4778,25 @@ HTML_PAGE = """
       }
     }
 
+    function showWcQrModal(uri) {
+      let el = document.getElementById("wcQrBackdrop");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "wcQrBackdrop";
+        el.style.cssText = "position:fixed;inset:0;background:linear-gradient(180deg,rgba(217,227,245,0.95),rgba(236,242,255,0.95));backdrop-filter:blur(4px);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10001;";
+        el.innerHTML = '<div style="background:#f8fbff;border:1px solid #cbd5e1;border-radius:14px;padding:20px;text-align:center;box-shadow:0 12px 36px rgba(15,23,42,0.2)"><p style="margin:0 0 12px;font-size:16px;font-weight:700;color:#0f172a">Scan with your wallet app</p><img id="wcQrImg" alt="QR" style="display:block;background:#fff;padding:10px;border-radius:10px;width:260px;height:260px"/><p style="margin:10px 0 0;font-size:12px;color:#64748b">Or open the link on your phone</p><button id="wcQrCancel" type="button" style="margin-top:14px;padding:8px 16px;border-radius:10px;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:700;cursor:pointer">Cancel</button></div>';
+        document.body.appendChild(el);
+        document.getElementById("wcQrCancel").onclick = closeWcQrModal;
+      }
+      document.getElementById("wcQrImg").src = "https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=" + encodeURIComponent(uri);
+      el.style.display = "flex";
+    }
+    function closeWcQrModal() {
+      const el = document.getElementById("wcQrBackdrop");
+      if (el) el.style.display = "none";
+      if (window._wcProvider) try { window._wcProvider.disconnect(); } catch (_) {}
+      window._wcProvider = null;
+    }
     async function connectWalletConnect() {
       if (!WALLETCONNECT_PROJECT_ID) {
         setStatus("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID).", "fail");
@@ -4654,31 +4820,30 @@ HTML_PAGE = """
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
         const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
         const wcMetadata = {
-          name: "Simple DeFi",
-          description: "Simple DeFi wallet sign-in",
+          name: "DeFi Pools",
+          description: "DeFi Pools wallet sign-in",
           url: window.location.origin,
           icons: [window.location.origin + "/favicon.ico"],
         };
         const provider = await EthereumProviderModule.EthereumProvider.init({
           projectId: WALLETCONNECT_PROJECT_ID,
-          chains: [1],
-          optionalChains: wcChains.filter((c) => c !== 1),
-          showQrModal: true,
-          methods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign"],
-          optionalMethods: ["wallet_switchEthereumChain"],
+          optionalChains: wcChains,
+          showQrModal: false,
+          optionalMethods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign", "wallet_switchEthereumChain"],
           optionalEvents: ["accountsChanged", "chainChanged", "disconnect"],
           metadata: wcMetadata,
           rpcMap: {},
         });
-        try { await provider.disconnect(); } catch (_) {}
-        let connected = false;
+        provider.on("display_uri", showWcQrModal);
+        window._wcProvider = provider;
         try {
           await provider.connect();
-          connected = true;
-        } catch (_) {}
-        if (!connected) {
-          await provider.enable();
+        } catch (connErr) {
+          closeWcQrModal();
+          throw connErr;
         }
+        window._wcProvider = null;
+        closeWcQrModal();
         let accounts = provider.accounts || [];
         if (!accounts.length) accounts = (await provider.request({method: "eth_accounts"})) || [];
         if (!accounts.length) accounts = (await provider.request({method: "eth_requestAccounts"})) || [];
@@ -4715,7 +4880,8 @@ HTML_PAGE = """
         closeWalletModal({target: {id: "walletModalBackdrop"}});
         setStatus(`Connected: ${verifyResp.address_short}`, "ok");
       } catch (e) {
-        setStatus("WalletConnect auth failed: " + (e?.message || "unknown") + ". Check Reown Domain allowlist.", "fail");
+        closeWcQrModal();
+        setStatus("WalletConnect failed: " + (e?.message || "unknown") + ". Add this site to Reown Domain allowlist.", "fail");
       }
     }
 
