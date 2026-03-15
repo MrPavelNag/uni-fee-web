@@ -85,7 +85,8 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-app = FastAPI(title="Uni Fee Web", version="0.1.0")
+APP_VERSION = "0.0.2"
+app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
 
 @app.on_event("startup")
