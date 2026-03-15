@@ -110,11 +110,7 @@ AUTH_NONCES: dict[str, dict[str, Any]] = {}
 AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 AUTH_LOCK = threading.Lock()
 ADMIN_WALLETS_DEFAULT = "0xD3155f6A7525F81595609E83789bbb95d91aaEdf"
-ADMIN_WALLET_ADDRESSES = {
-    a.strip().lower()
-    for a in os.environ.get("ADMIN_WALLET_ADDRESSES", ADMIN_WALLETS_DEFAULT).split(",")
-    if re.fullmatch(r"0x[a-fA-F0-9]{40}", a.strip())
-}
+ADMIN_WALLET_ADDRESSES_ENV = os.environ.get("ADMIN_WALLET_ADDRESSES", ADMIN_WALLETS_DEFAULT)
 ANALYTICS_DB_PATH = Path(os.environ.get("ANALYTICS_DB_PATH", str(CATALOG_DIR / "analytics.sqlite3")))
 ANALYTICS_ENABLED = os.environ.get("ANALYTICS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 ANALYTICS_DAILY_EMAIL_ENABLED = os.environ.get("ANALYTICS_DAILY_EMAIL_ENABLED", "1").strip().lower() in (
@@ -169,6 +165,44 @@ def _init_analytics_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS help_tickets (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              wallet_address TEXT NOT NULL DEFAULT '',
+              name TEXT NOT NULL DEFAULT '',
+              email TEXT NOT NULL DEFAULT '',
+              subject TEXT NOT NULL DEFAULT '',
+              message TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'open',
+              admin_note TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_help_tickets_ts ON help_tickets(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_help_tickets_status ON help_tickets(status)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS faq_items (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              question TEXT NOT NULL,
+              answer TEXT NOT NULL,
+              is_published INTEGER NOT NULL DEFAULT 1,
+              is_featured INTEGER NOT NULL DEFAULT 0,
+              sort_order INTEGER NOT NULL DEFAULT 100
+            )
+            """
+        )
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(faq_items)").fetchall()}
+        if "is_featured" not in cols:
+            conn.execute("ALTER TABLE faq_items ADD COLUMN is_featured INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_items_pub ON faq_items(is_published)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_items_feat ON faq_items(is_featured)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_items_sort ON faq_items(sort_order, id)")
         conn.commit()
 
 
@@ -323,19 +357,19 @@ def _send_email_smtp(*, to_email: str, subject: str, body: str) -> tuple[bool, s
 def _send_daily_analytics_report(force: bool = False) -> tuple[bool, str]:
     if not ANALYTICS_ENABLED:
         return False, "Analytics disabled."
-    if not ANALYTICS_DAILY_EMAIL_ENABLED and not force:
+    if not _analytics_daily_enabled_value() and not force:
         return False, "Daily email disabled."
     now = datetime.now(timezone.utc)
     today = now.date().isoformat()
     if not force:
-        if now.hour < ANALYTICS_REPORT_HOUR_UTC:
+        if now.hour < _analytics_report_hour_value():
             return False, "Too early for daily send."
         last_sent = _analytics_get_state("last_daily_email_date_utc")
         if last_sent == today:
             return False, "Already sent today."
     day_label, body = _analytics_build_daily_report(day_offset=1)
     subject = f"{ANALYTICS_REPORT_SUBJECT_PREFIX} | {day_label}"
-    ok, info = _send_email_smtp(to_email=ANALYTICS_REPORT_TO, subject=subject, body=body)
+    ok, info = _send_email_smtp(to_email=_analytics_report_to_value(), subject=subject, body=body)
     if ok:
         _analytics_set_state("last_daily_email_date_utc", today)
         return True, f"Sent: {subject}"
@@ -345,7 +379,7 @@ def _send_daily_analytics_report(force: bool = False) -> tuple[bool, str]:
 def _send_test_analytics_email() -> tuple[bool, str]:
     day_label, body = _analytics_build_daily_report(day_offset=0)
     subject = f"{ANALYTICS_REPORT_SUBJECT_PREFIX} TEST | {day_label}"
-    return _send_email_smtp(to_email=ANALYTICS_REPORT_TO, subject=subject, body=body)
+    return _send_email_smtp(to_email=_analytics_report_to_value(), subject=subject, body=body)
 
 
 def _analytics_loop() -> None:
@@ -406,6 +440,158 @@ def _siwe_message(*, domain: str, uri: str, address: str, chain_id: int, nonce: 
         f"Nonce: {nonce}\n"
         f"Issued At: {issued_at}"
     )
+
+
+def _is_admin_address(address: str) -> bool:
+    return (address or "").strip().lower() in set(_admin_wallets_value())
+
+
+def _require_admin(request: Request, response: Response) -> tuple[str, dict[str, Any]]:
+    sid = _ensure_session_cookie(request, response)
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    if not auth or not _is_admin_address(str(auth.get("address") or "")):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return sid, auth
+
+
+def _analytics_daily_enabled_value() -> bool:
+    raw = _analytics_get_state("daily_email_enabled")
+    if not raw:
+        return ANALYTICS_DAILY_EMAIL_ENABLED
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _analytics_report_to_value() -> str:
+    raw = _analytics_get_state("report_to")
+    return raw.strip() if raw.strip() else ANALYTICS_REPORT_TO
+
+
+def _analytics_report_hour_value() -> int:
+    raw = _analytics_get_state("report_hour_utc")
+    try:
+        return max(0, min(23, int(raw)))
+    except Exception:
+        return ANALYTICS_REPORT_HOUR_UTC
+
+
+def _parse_admin_wallets_csv(raw: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in (raw or "").split(","):
+        addr = x.strip().lower()
+        if not _is_eth_address(addr):
+            continue
+        if addr in seen:
+            continue
+        seen.add(addr)
+        out.append(addr)
+    return out
+
+
+def _default_admin_wallets() -> list[str]:
+    items = _parse_admin_wallets_csv(ADMIN_WALLET_ADDRESSES_ENV)
+    if items:
+        return items
+    return _parse_admin_wallets_csv(ADMIN_WALLETS_DEFAULT)
+
+
+def _admin_wallets_value() -> list[str]:
+    saved = _analytics_get_state("admin_wallets_csv")
+    items = _parse_admin_wallets_csv(saved)
+    if items:
+        return items
+    return _default_admin_wallets()
+
+
+def _set_admin_wallets(addresses: list[str]) -> None:
+    clean = _parse_admin_wallets_csv(",".join(addresses))
+    if not clean:
+        raise HTTPException(status_code=400, detail="At least one admin address is required.")
+    _analytics_set_state("admin_wallets_csv", ",".join(clean))
+
+
+def _create_help_ticket(
+    *,
+    session_id: str,
+    wallet_address: str,
+    name: str,
+    email: str,
+    subject: str,
+    message: str,
+) -> int:
+    with _analytics_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO help_tickets(ts, session_id, wallet_address, name, email, subject, message, status, admin_note)
+            VALUES(?, ?, ?, ?, ?, ?, ?, 'open', '')
+            """,
+            (
+                _iso_now(),
+                session_id,
+                (wallet_address or "")[:64],
+                (name or "").strip()[:120],
+                (email or "").strip()[:200],
+                (subject or "").strip()[:300],
+                (message or "").strip()[:4000],
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+
+
+def _list_help_tickets(limit: int = 100) -> list[dict[str, Any]]:
+    with _analytics_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, ts, session_id, wallet_address, name, email, subject, message, status, admin_note
+            FROM help_tickets
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, min(500, int(limit))),),
+        ).fetchall()
+    return [
+        {
+            "id": int(r[0]),
+            "ts": str(r[1]),
+            "session_id": str(r[2]),
+            "wallet_address": str(r[3]),
+            "name": str(r[4]),
+            "email": str(r[5]),
+            "subject": str(r[6]),
+            "message": str(r[7]),
+            "status": str(r[8]),
+            "admin_note": str(r[9]),
+        }
+        for r in rows
+    ]
+
+
+def _list_faq_items(*, include_unpublished: bool = False, limit: int = 200) -> list[dict[str, Any]]:
+    query = """
+        SELECT id, created_at, updated_at, question, answer, is_published, is_featured, sort_order
+        FROM faq_items
+        {where}
+        ORDER BY is_featured DESC, sort_order ASC, id ASC
+        LIMIT ?
+    """
+    where = "" if include_unpublished else "WHERE is_published = 1"
+    with _analytics_conn() as conn:
+        rows = conn.execute(query.format(where=where), (max(1, min(500, int(limit))),)).fetchall()
+    return [
+        {
+            "id": int(r[0]),
+            "created_at": str(r[1]),
+            "updated_at": str(r[2]),
+            "question": str(r[3]),
+            "answer": str(r[4]),
+            "is_published": bool(int(r[5])),
+            "is_featured": bool(int(r[6])),
+            "sort_order": int(r[7]),
+        }
+        for r in rows
+    ]
 
 
 def _parse_pairs_str(raw: str) -> list[tuple[str, str]]:
@@ -903,6 +1089,32 @@ def _push_run_history(
     )
 
 
+def _recent_failed_runs(limit: int = 50) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with JOB_LOCK:
+        for sid, items in RUN_HISTORY.items():
+            for item in items:
+                if str(item.get("status") or "") != "failed":
+                    continue
+                req = item.get("request") or {}
+                logs = item.get("logs") or []
+                rows.append(
+                    {
+                        "ts": item.get("ts", ""),
+                        "session_id": sid,
+                        "pairs": req.get("pairs", ""),
+                        "chains": ",".join(req.get("include_chains") or []),
+                        "versions": ",".join(req.get("include_versions") or []),
+                        "days": req.get("days"),
+                        "min_tvl": req.get("min_tvl"),
+                        "error": item.get("error", ""),
+                        "logs": "\n\n".join(str(x) for x in logs if str(x).strip())[:6000],
+                    }
+                )
+    rows.sort(key=lambda x: str(x.get("ts") or ""), reverse=True)
+    return rows[: max(1, min(200, int(limit)))]
+
+
 def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     def _set_stage(stage: str, label: str, progress: int) -> None:
         with JOB_LOCK:
@@ -1091,6 +1303,37 @@ class AdminSettingsUpdate(BaseModel):
     report_hour_utc: int | None = None
 
 
+class AdminWalletUpdate(BaseModel):
+    action: str
+    address: str
+
+
+class HelpTicketCreate(BaseModel):
+    name: str = ""
+    email: str = ""
+    subject: str
+    message: str
+
+
+class HelpTicketUpdate(BaseModel):
+    ticket_id: int
+    status: str | None = None
+    admin_note: str | None = None
+
+
+class AdminFaqUpsert(BaseModel):
+    faq_id: int | None = None
+    question: str
+    answer: str
+    is_published: bool = True
+    is_featured: bool = False
+    sort_order: int = 100
+
+
+class AdminFaqDelete(BaseModel):
+    faq_id: int
+
+
 INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/", "Find the best pool on Uniswap"),
     ("/pancake", "Find the best pool on PancakeSwap"),
@@ -1160,14 +1403,26 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       white-space: nowrap;
     }}
     .intent-select {{
-      border: 1px solid #cbd5e1;
+      border: 1px solid #bfdbfe;
       border-radius: 10px;
-      padding: 10px 12px;
+      padding: 10px 38px 10px 12px;
       font-size: 14px;
-      color: #334155;
-      background: #f8fbff;
-      min-width: 260px;
-      max-width: 300px;
+      font-weight: 600;
+      color: #1f3a8a;
+      background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%);
+      min-width: 240px;
+      max-width: 280px;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image:
+        linear-gradient(45deg, transparent 50%, #1d4ed8 50%),
+        linear-gradient(135deg, #1d4ed8 50%, transparent 50%);
+      background-position:
+        calc(100% - 18px) calc(50% + 1px),
+        calc(100% - 12px) calc(50% + 1px);
+      background-size: 6px 6px, 6px 6px;
+      background-repeat: no-repeat;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
     }}
     .connect-btn {{
       border: 1px solid #bfdbfe;
@@ -1179,14 +1434,6 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       background: #eff6ff;
       cursor: pointer;
       white-space: nowrap;
-    }}
-    .auth-meta {{
-      color: #475569;
-      font-size: 12px;
-      max-width: 220px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
     }}
     .wallet-modal-backdrop {{
       position: fixed;
@@ -1263,7 +1510,6 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
           {options_html}
         </select>
-        <span id="authMeta" class="auth-meta"></span>
         <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
       </div>
     </div>
@@ -1314,7 +1560,10 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         return pick((p) => !!p?.isPhantom) || (window.ethereum?.isPhantom ? window.ethereum : null);
       }}
       if (wallet === "metamask") {{
-        return pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom) || (window.ethereum?.isMetaMask ? window.ethereum : null);
+        return (
+          pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom && !p?.isCoinbaseWallet) ||
+          ((window.ethereum?.isMetaMask && !window.ethereum?.isRabby && !window.ethereum?.isPhantom && !window.ethereum?.isCoinbaseWallet) ? window.ethereum : null)
+        );
       }}
       if (wallet === "coinbase") {{
         return pick((p) => !!p?.isCoinbaseWallet) || (window.ethereum?.isCoinbaseWallet ? window.ethereum : null);
@@ -1357,17 +1606,30 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       return data;
     }}
 
+    function syncAdminIntentOption() {{
+      const sel = document.getElementById("intentSelect");
+      if (!sel) return;
+      const existing = Array.from(sel.options).find((o) => o.value === "/admin");
+      const isAdmin = !!authState?.authenticated && !!authState?.is_admin;
+      if (isAdmin && !existing) {{
+        const opt = document.createElement("option");
+        opt.value = "/admin";
+        opt.textContent = "Administer project";
+        sel.appendChild(opt);
+      }} else if (!isAdmin && existing) {{
+        existing.remove();
+      }}
+    }}
+
     function setAuthUI() {{
       const btn = document.getElementById("connectWalletBtn");
-      const meta = document.getElementById("authMeta");
-      if (!btn || !meta) return;
+      if (!btn) return;
       if (authState?.authenticated) {{
         btn.textContent = authState.address_short || "Wallet connected";
-        meta.textContent = `${{WALLET_LABELS[authState.wallet] || authState.wallet || "Wallet"}} on chain ${{authState.chain_id || "-"}}`;
       }} else {{
         btn.textContent = "Connect Wallet";
-        meta.textContent = "";
       }}
+      syncAdminIntentOption();
     }}
 
     async function loadAuthState() {{
@@ -1428,6 +1690,552 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
 """
 
 
+def _render_admin_page() -> str:
+    options_html = _intent_options_html("/admin") + '\n<option value="/admin" selected>Administer project</option>'
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Uni Fee - Admin</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: Inter, Arial, sans-serif;
+      background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%);
+      color: #0f172a;
+    }}
+    .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; }}
+    .header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }}
+    .title {{ margin: 0; font-size: 30px; font-weight: 800; letter-spacing: 0.2px; }}
+    .subtitle {{ margin: 4px 0 0; color: #64748b; font-size: 14px; }}
+    .top-controls {{ display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }}
+    .intent-prefix {{ font-size: 14px; font-weight: 700; color: #334155; white-space: nowrap; }}
+    .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 240px; max-width: 280px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
+    .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; }}
+    .grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
+    .tabs {{ display: flex; gap: 8px; margin-bottom: 8px; }}
+    .tab-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 8px 12px; font-size: 13px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; }}
+    .tab-btn.active {{ background: #dbeafe; border-color: #93c5fd; }}
+    .card {{ background: #f3f7ff; border: 1px solid #cfdcec; border-radius: 14px; padding: 16px; box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06); }}
+    .card h3 {{ margin: 0 0 10px; font-size: 18px; }}
+    .hint {{ color: #64748b; font-size: 13px; margin: 0 0 10px; }}
+    input, select, textarea {{ width: 100%; background: #f8fbff; border: 1px solid #cbd5e1; color: #0f172a; border-radius: 8px; padding: 8px; font-size: 14px; }}
+    .row {{ display: grid; grid-template-columns: 170px 1fr; gap: 10px; align-items: center; margin-bottom: 8px; }}
+    .btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 9px 14px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; }}
+    .status {{ font-size: 13px; color: #475569; margin-left: 8px; }}
+    .table-wrap {{ overflow-x: auto; border: 1px solid #dbe3ef; border-radius: 10px; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1100px; }}
+    th, td {{ border-bottom: 1px solid #e2e8f0; padding: 8px; text-align: left; vertical-align: top; }}
+    th {{ background: #eff6ff; color: #1e3a8a; position: sticky; top: 0; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
+    pre {{ max-height: 320px; overflow: auto; background: #f8fafc; border: 1px solid #dbe3ef; border-radius: 8px; padding: 10px; color: #334155; font-size: 12px; white-space: pre-wrap; }}
+    .wallet-modal-backdrop {{ position: fixed; inset: 0; background: rgba(15,23,42,0.45); display: none; align-items: center; justify-content: center; z-index: 9999; }}
+    .wallet-modal {{ width: min(460px, calc(100vw - 24px)); background: #f8fbff; border: 1px solid #cbd5e1; border-radius: 14px; box-shadow: 0 12px 36px rgba(15,23,42,0.25); padding: 14px; }}
+    .wallet-modal h3 {{ margin: 0 0 8px; font-size: 18px; }}
+    .wallet-list {{ display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 10px; }}
+    .wallet-item {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 12px; background: #eff6ff; color: #1d4ed8; font-weight: 700; text-align: left; cursor: pointer; }}
+    .wallet-item.disabled {{ opacity: 0.6; cursor: not-allowed; }}
+    .wallet-note {{ color: #64748b; font-size: 12px; margin-top: 8px; }}
+    @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div>
+        <h1 class="title">Pools Analysis</h1>
+        <p class="subtitle">Administer project settings and analytics delivery.</p>
+      </div>
+      <div class="top-controls">
+        <span class="intent-prefix">I want to</span>
+        <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">{options_html}</select>
+        <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
+      </div>
+    </div>
+    <div class="tabs">
+      <button class="tab-btn active" id="tabBtnSettings" onclick="switchTab('settings')">Settings</button>
+      <button class="tab-btn" id="tabBtnFailures" onclick="switchTab('failures')">Failed runs</button>
+      <button class="tab-btn" id="tabBtnTickets" onclick="switchTab('tickets')">Help tickets</button>
+      <button class="tab-btn" id="tabBtnFaq" onclick="switchTab('faq')">FAQ</button>
+    </div>
+    <div class="grid" id="tabSettings">
+      <section class="card">
+        <h3>Email stats delivery</h3>
+        <p class="hint">Daily digest settings and manual send.</p>
+        <div class="row"><label>Daily enabled</label><select id="dailyEnabled"><option value="true">enabled</option><option value="false">disabled</option></select></div>
+        <div class="row"><label>Send to email</label><input id="reportTo" type="email" placeholder="name@example.com"/></div>
+        <div class="row"><label>Hour (UTC)</label><input id="reportHour" type="number" min="0" max="23" step="1"/></div>
+        <div class="row"><label>SMTP configured</label><div id="smtpConfigured">-</div></div>
+        <div class="row"><label>Last daily sent</label><div id="lastDailySent">-</div></div>
+        <div class="row"><label>Add admin wallet</label><input id="newAdminWallet" type="text" placeholder="0x..."/></div>
+        <button class="btn" onclick="addAdminWallet()">Add admin</button>
+        <div class="row"><label>Admin wallets</label><div id="adminWalletsList">-</div></div>
+        <button class="btn" onclick="saveAdminSettings()">Save settings</button>
+        <button class="btn" onclick="sendNow()">Send report now</button>
+        <span id="adminStatus" class="status">Ready</span>
+      </section>
+      <section class="card">
+        <h3>Project summary</h3>
+        <div class="row"><label>Analytics DB</label><div id="dbPath">-</div></div>
+        <div class="row"><label>Tracked events</label><div id="eventsCount">-</div></div>
+        <div class="row"><label>Token catalog</label><div id="tokenCatalogInfo">-</div></div>
+      </section>
+      <section class="card">
+        <h3>Yesterday digest preview</h3>
+        <pre id="dailyPreview">Loading...</pre>
+      </section>
+    </div>
+    <div class="grid" id="tabFailures" style="display:none">
+      <section class="card">
+        <h3>Recent failed runs</h3>
+        <p class="hint">Manual review of latest run_failed records.</p>
+        <button class="btn" onclick="loadFailures()">Refresh failures</button>
+        <span id="failStatus" class="status">Ready</span>
+        <div class="table-wrap" style="margin-top:10px">
+          <table id="failuresTable"></table>
+        </div>
+      </section>
+    </div>
+    <div class="grid" id="tabTickets" style="display:none">
+      <section class="card">
+        <h3>Help tickets</h3>
+        <p class="hint">Tickets submitted from Get help page.</p>
+        <button class="btn" onclick="loadTickets()">Refresh tickets</button>
+        <span id="ticketsStatus" class="status">Ready</span>
+        <div class="table-wrap" style="margin-top:10px">
+          <table id="ticketsTable"></table>
+        </div>
+      </section>
+    </div>
+    <div class="grid" id="tabFaq" style="display:none">
+      <section class="card">
+        <h3>FAQ management</h3>
+        <p class="hint">Create, edit, publish FAQ items shown on Get help page.</p>
+        <input id="faqId" type="hidden" value="" />
+        <div class="row"><label>Question</label><input id="faqQuestion" type="text" placeholder="Question"/></div>
+        <div class="row"><label>Answer</label><textarea id="faqAnswer" placeholder="Answer text"></textarea></div>
+        <div class="row"><label>Featured</label><select id="faqFeatured"><option value="true">yes</option><option value="false">no</option></select></div>
+        <div class="row"><label>Sort order</label><input id="faqSortOrder" type="number" min="0" step="1" value="100"/></div>
+        <div class="row"><label>Published</label><select id="faqPublished"><option value="true">yes</option><option value="false">no</option></select></div>
+        <button class="btn" onclick="saveFaq()">Save FAQ</button>
+        <button class="btn" onclick="clearFaqForm()">New FAQ</button>
+        <span id="faqStatus" class="status">Ready</span>
+        <div class="table-wrap" style="margin-top:10px">
+          <table id="faqTable"></table>
+        </div>
+      </section>
+    </div>
+  </div>
+  <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
+    <div class="wallet-modal">
+      <h3>Connect wallet</h3>
+      <div class="wallet-list" id="walletList"></div>
+      <div class="wallet-note">Rabby and Phantom are supported. Sign-in uses a gasless message signature.</div>
+    </div>
+  </div>
+  <script>
+    let authState = {{authenticated: false}};
+    const WALLET_LABELS = {{ injected: "Browser Wallet", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
+    function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
+    function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
+    function getWalletProvider(wallet) {{ const providers=getEthereumProviders(); const pick=(pred)=>providers.find(pred)||null; if(wallet==="rabby") return pick((p)=>!!p?.isRabby)||(window.ethereum?.isRabby?window.ethereum:null); if(wallet==="phantom"){{ if(window.phantom?.ethereum?.request) return window.phantom.ethereum; return pick((p)=>!!p?.isPhantom)||(window.ethereum?.isPhantom?window.ethereum:null); }} if(wallet==="metamask") return pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||((window.ethereum?.isMetaMask&&!window.ethereum?.isRabby&&!window.ethereum?.isPhantom&&!window.ethereum?.isCoinbaseWallet)?window.ethereum:null); if(wallet==="coinbase") return pick((p)=>!!p?.isCoinbaseWallet)||(window.ethereum?.isCoinbaseWallet?window.ethereum:null); return providers[0]||window.phantom?.ethereum||null; }}
+    function getWalletChoices() {{ const order=["rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>({{id,label:WALLET_LABELS[id],available:!!getWalletProvider(id)}})); }}
+    function openWalletModal() {{ const list=document.getElementById("walletList"); const choices=getWalletChoices(); list.innerHTML=choices.map((w)=>{{ const cls=w.available?"wallet-item":"wallet-item disabled"; const dis=w.available?"":"disabled"; const label=w.available?w.label:`${{w.label}} (not detected)`; return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{label}}</button>`; }}).join(""); document.getElementById("walletModalBackdrop").style.display="flex"; }}
+    function closeWalletModal(event) {{ if(event&&event.target&&event.target.id!=="walletModalBackdrop") return; document.getElementById("walletModalBackdrop").style.display="none"; }}
+    async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
+    function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; if(authState?.authenticated) {{ btn.textContent=authState.address_short||"Wallet connected"; }} else {{ btn.textContent="Connect Wallet"; }} }}
+    async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
+    async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
+    async function connectWalletFlow(wallet) {{ const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
+    function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function setFailStatus(text, isErr) {{ const el=document.getElementById("failStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function setTicketsStatus(text, isErr) {{ const el=document.getElementById("ticketsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function setFaqStatus(text, isErr) {{ const el=document.getElementById("faqStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function switchTab(tab) {{
+      const isSettings = tab === "settings";
+      const isFailures = tab === "failures";
+      const isTickets = tab === "tickets";
+      const isFaq = tab === "faq";
+      document.getElementById("tabSettings").style.display = isSettings ? "grid" : "none";
+      document.getElementById("tabFailures").style.display = isFailures ? "grid" : "none";
+      document.getElementById("tabTickets").style.display = isTickets ? "grid" : "none";
+      document.getElementById("tabFaq").style.display = isFaq ? "grid" : "none";
+      document.getElementById("tabBtnSettings").classList.toggle("active", isSettings);
+      document.getElementById("tabBtnFailures").classList.toggle("active", isFailures);
+      document.getElementById("tabBtnTickets").classList.toggle("active", isTickets);
+      document.getElementById("tabBtnFaq").classList.toggle("active", isFaq);
+      if (isFailures) loadFailures();
+      if (isTickets) loadTickets();
+      if (isFaq) loadFaqAdmin();
+    }}
+    function renderFailures(rows) {{
+      const table = document.getElementById("failuresTable");
+      let html = "<tr><th>Time</th><th>Pairs</th><th>Chains</th><th>Versions</th><th>Days</th><th>Min TVL</th><th>Error</th><th>Logs</th><th>Session</th></tr>";
+      for (const r of (rows || [])) {{
+        html += "<tr>";
+        html += `<td class="mono">${{r.ts || ""}}</td>`;
+        html += `<td>${{r.pairs || ""}}</td>`;
+        html += `<td>${{r.chains || ""}}</td>`;
+        html += `<td>${{r.versions || ""}}</td>`;
+        html += `<td>${{r.days ?? ""}}</td>`;
+        html += `<td>${{r.min_tvl ?? ""}}</td>`;
+        html += `<td>${{(r.error || "").replace(/</g, "&lt;")}}</td>`;
+        html += `<td><pre style="max-height:140px;margin:0">${{(r.logs || "").replace(/</g, "&lt;")}}</pre></td>`;
+        html += `<td class="mono">${{r.session_id || ""}}</td>`;
+        html += "</tr>";
+      }}
+      if (!(rows || []).length) {{
+        html += '<tr><td colspan="9">No failed runs yet.</td></tr>';
+      }}
+      table.innerHTML = html;
+    }}
+    async function loadFailures() {{
+      try {{
+        const r = await fetch("/api/admin/failures?limit=50");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Failed to load failures");
+        renderFailures(data.items || []);
+        setFailStatus(`Loaded ${{(data.items || []).length}} rows`, false);
+      }} catch (e) {{
+        setFailStatus("Load failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    function esc(v) {{ return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }}
+    function renderTickets(rows) {{
+      const table = document.getElementById("ticketsTable");
+      let html = "<tr><th>ID</th><th>Time</th><th>Subject</th><th>Message</th><th>Wallet</th><th>Email</th><th>Status</th><th>Admin note</th><th>Actions</th></tr>";
+      for (const r of (rows || [])) {{
+        html += "<tr>";
+        html += `<td class="mono">${{esc(r.id)}}</td>`;
+        html += `<td class="mono">${{esc(r.ts)}}</td>`;
+        html += `<td>${{esc(r.subject)}}</td>`;
+        html += `<td><pre style="max-height:120px;margin:0">${{esc(r.message)}}</pre></td>`;
+        html += `<td class="mono">${{esc(r.wallet_address)}}</td>`;
+        html += `<td>${{esc(r.email)}}</td>`;
+        html += `<td>${{esc(r.status)}}</td>`;
+        html += `<td><input id="note_${{r.id}}" value="${{esc(r.admin_note)}}" type="text" placeholder="note"/></td>`;
+        html += `<td><button class="btn" style="padding:5px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'in_progress')">In progress</button> <button class="btn" style="padding:5px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done')">Done</button></td>`;
+        html += "</tr>";
+      }}
+      if (!(rows || []).length) {{
+        html += '<tr><td colspan="9">No tickets yet.</td></tr>';
+      }}
+      table.innerHTML = html;
+    }}
+    async function loadTickets() {{
+      try {{
+        const r = await fetch("/api/admin/help-tickets?limit=100");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Failed to load tickets");
+        renderTickets(data.items || []);
+        setTicketsStatus(`Loaded ${{(data.items || []).length}} tickets`, false);
+      }} catch (e) {{
+        setTicketsStatus("Load failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function setTicketStatusAction(ticketId, status) {{
+      try {{
+        const note = (document.getElementById(`note_${{ticketId}}`)?.value || "").trim();
+        await postJson("/api/admin/help-tickets/update", {{ticket_id: ticketId, status, admin_note: note}});
+        setTicketsStatus(`Ticket #${{ticketId}} updated`, false);
+        await loadTickets();
+      }} catch (e) {{
+        setTicketsStatus("Update failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    function clearFaqForm() {{
+      document.getElementById("faqId").value = "";
+      document.getElementById("faqQuestion").value = "";
+      document.getElementById("faqAnswer").value = "";
+      document.getElementById("faqFeatured").value = "false";
+      document.getElementById("faqSortOrder").value = 100;
+      document.getElementById("faqPublished").value = "true";
+    }}
+    function renderFaqTable(rows) {{
+      const table = document.getElementById("faqTable");
+      let html = "<tr><th>ID</th><th>Featured</th><th>Sort</th><th>Published</th><th>Question</th><th>Answer</th><th>Updated</th><th>Actions</th></tr>";
+      for (const r of (rows || [])) {{
+        html += "<tr>";
+        html += `<td class="mono">${{esc(r.id)}}</td>`;
+        html += `<td>${{r.is_featured ? "yes" : "no"}}</td>`;
+        html += `<td>${{esc(r.sort_order)}}</td>`;
+        html += `<td>${{r.is_published ? "yes" : "no"}}</td>`;
+        html += `<td>${{esc(r.question)}}</td>`;
+        html += `<td><pre style="max-height:120px;margin:0">${{esc(r.answer)}}</pre></td>`;
+        html += `<td class="mono">${{esc(r.updated_at)}}</td>`;
+        html += `<td><button class="btn" style="padding:5px 10px;font-size:12px" onclick="editFaq(${{r.id}})">Edit</button> <button class="btn" style="padding:5px 10px;font-size:12px" onclick="deleteFaq(${{r.id}})">Delete</button></td>`;
+        html += "</tr>";
+      }}
+      if (!(rows || []).length) html += '<tr><td colspan="8">No FAQ items yet.</td></tr>';
+      table.innerHTML = html;
+      window._faqRows = rows || [];
+    }}
+    function editFaq(id) {{
+      const row = (window._faqRows || []).find((x) => Number(x.id) === Number(id));
+      if (!row) return;
+      document.getElementById("faqId").value = row.id;
+      document.getElementById("faqQuestion").value = row.question || "";
+      document.getElementById("faqAnswer").value = row.answer || "";
+      document.getElementById("faqFeatured").value = row.is_featured ? "true" : "false";
+      document.getElementById("faqSortOrder").value = Number(row.sort_order || 100);
+      document.getElementById("faqPublished").value = row.is_published ? "true" : "false";
+    }}
+    async function loadFaqAdmin() {{
+      try {{
+        const r = await fetch("/api/admin/faq?limit=200");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Failed to load FAQ");
+        renderFaqTable(data.items || []);
+        setFaqStatus(`Loaded ${{(data.items || []).length}} FAQ items`, false);
+      }} catch (e) {{
+        setFaqStatus("Load failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function saveFaq() {{
+      try {{
+        const payload = {{
+          faq_id: Number(document.getElementById("faqId").value || 0) || null,
+          question: (document.getElementById("faqQuestion").value || "").trim(),
+          answer: (document.getElementById("faqAnswer").value || "").trim(),
+          is_featured: document.getElementById("faqFeatured").value === "true",
+          sort_order: Number(document.getElementById("faqSortOrder").value || 100),
+          is_published: document.getElementById("faqPublished").value === "true",
+        }};
+        const data = await postJson("/api/admin/faq/upsert", payload);
+        setFaqStatus(data.info || "Saved", false);
+        clearFaqForm();
+        await loadFaqAdmin();
+      }} catch (e) {{
+        setFaqStatus("Save failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function deleteFaq(id) {{
+      if (!confirm(`Delete FAQ #${{id}}?`)) return;
+      try {{
+        const data = await postJson("/api/admin/faq/delete", {{faq_id: Number(id)}});
+        setFaqStatus(data.info || "Deleted", false);
+        clearFaqForm();
+        await loadFaqAdmin();
+      }} catch (e) {{
+        setFaqStatus("Delete failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function loadAdmin() {{
+      try {{
+        const r = await fetch("/api/admin/settings");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Failed to load admin settings");
+        document.getElementById("dailyEnabled").value = data.daily_email_enabled ? "true" : "false";
+        document.getElementById("reportTo").value = data.report_to || "";
+        document.getElementById("reportHour").value = Number(data.report_hour_utc || 7);
+        document.getElementById("smtpConfigured").textContent = data.smtp_configured ? "yes" : "no";
+        document.getElementById("lastDailySent").textContent = data.last_daily_sent || "-";
+        document.getElementById("dbPath").textContent = data.analytics_db_path || "-";
+        document.getElementById("eventsCount").textContent = String(data.events_count || 0);
+        document.getElementById("tokenCatalogInfo").textContent = `updated: ${{data.token_catalog_updated_at || "-"}}, count: ${{data.token_catalog_count || 0}}`;
+        document.getElementById("dailyPreview").textContent = data.daily_preview || "";
+        renderAdminWallets(data.admin_wallets || []);
+      }} catch (e) {{
+        setAdminStatus("Load failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    function renderAdminWallets(items) {{
+      const wrap = document.getElementById("adminWalletsList");
+      const rows = (items || []).map((a) => `<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span class="mono">${{a}}</span><button class="btn" style="padding:5px 10px;font-size:12px" onclick="removeAdminWallet('${{a}}')">Remove</button></div>`);
+      wrap.innerHTML = rows.length ? rows.join("") : "-";
+    }}
+    async function addAdminWallet() {{
+      const address = (document.getElementById("newAdminWallet").value || "").trim();
+      if (!address) return;
+      try {{
+        const data = await postJson("/api/admin/admin-wallets", {{action: "add", address}});
+        setAdminStatus(data.info || "Added", false);
+        document.getElementById("newAdminWallet").value = "";
+        await loadAdmin();
+      }} catch (e) {{
+        setAdminStatus("Add admin failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function removeAdminWallet(address) {{
+      if (!confirm(`Remove admin wallet ${{address}}?`)) return;
+      try {{
+        const data = await postJson("/api/admin/admin-wallets", {{action: "remove", address}});
+        setAdminStatus(data.info || "Removed", false);
+        await loadAdmin();
+      }} catch (e) {{
+        setAdminStatus("Remove admin failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function saveAdminSettings() {{
+      try {{
+        const payload = {{
+          daily_email_enabled: document.getElementById("dailyEnabled").value === "true",
+          report_to: document.getElementById("reportTo").value.trim(),
+          report_hour_utc: Number(document.getElementById("reportHour").value || 7),
+        }};
+        const data = await postJson("/api/admin/settings", payload);
+        setAdminStatus(data.info || "Saved", false);
+        await loadAdmin();
+      }} catch (e) {{
+        setAdminStatus("Save failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function sendNow() {{
+      try {{
+        const data = await postJson("/api/admin/send-now", {{}});
+        setAdminStatus(data.info || (data.ok ? "Sent" : "Not sent"), !data.ok);
+      }} catch (e) {{
+        setAdminStatus("Send failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    loadAuthState();
+    loadAdmin();
+  </script>
+</body>
+</html>
+"""
+
+
+def _render_help_page() -> str:
+    options_html = _intent_options_html("/help")
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Uni Fee - Help</title>
+  <style>
+    body {{ margin: 0; font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%); color: #0f172a; }}
+    .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; }}
+    .header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }}
+    .title {{ margin: 0; font-size: 30px; font-weight: 800; letter-spacing: 0.2px; }}
+    .subtitle {{ margin: 4px 0 0; color: #64748b; font-size: 14px; }}
+    .top-controls {{ display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }}
+    .intent-prefix {{ font-size: 14px; font-weight: 700; color: #334155; white-space: nowrap; }}
+    .intent-select {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 38px 10px 12px; font-size: 14px; font-weight: 600; color: #1f3a8a; background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%); min-width: 240px; max-width: 280px; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #1d4ed8 50%), linear-gradient(135deg, #1d4ed8 50%, transparent 50%); background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 12px) calc(50% + 1px); background-size: 6px 6px, 6px 6px; background-repeat: no-repeat; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
+    .connect-btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; white-space: nowrap; }}
+    .grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
+    .card {{ background: #f3f7ff; border: 1px solid #cfdcec; border-radius: 14px; padding: 16px; box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06); }}
+    .card h3 {{ margin: 0 0 10px; font-size: 18px; }}
+    .hint {{ color: #64748b; font-size: 13px; margin: 0 0 10px; }}
+    .row {{ display: grid; grid-template-columns: 170px 1fr; gap: 10px; align-items: center; margin-bottom: 8px; }}
+    input, textarea {{ width: 100%; background: #f8fbff; border: 1px solid #cbd5e1; color: #0f172a; border-radius: 8px; padding: 8px; font-size: 14px; }}
+    textarea {{ min-height: 140px; resize: vertical; }}
+    .btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 9px 14px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; }}
+    .status {{ font-size: 13px; color: #475569; margin-left: 8px; }}
+    .wallet-modal-backdrop {{ position: fixed; inset: 0; background: rgba(15,23,42,0.45); display: none; align-items: center; justify-content: center; z-index: 9999; }}
+    .wallet-modal {{ width: min(460px, calc(100vw - 24px)); background: #f8fbff; border: 1px solid #cbd5e1; border-radius: 14px; box-shadow: 0 12px 36px rgba(15,23,42,0.25); padding: 14px; }}
+    .wallet-modal h3 {{ margin: 0 0 8px; font-size: 18px; }}
+    .wallet-list {{ display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 10px; }}
+    .wallet-item {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 12px; background: #eff6ff; color: #1d4ed8; font-weight: 700; text-align: left; cursor: pointer; }}
+    .wallet-item.disabled {{ opacity: 0.6; cursor: not-allowed; }}
+    .wallet-note {{ color: #64748b; font-size: 12px; margin-top: 8px; }}
+    @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div>
+        <h1 class="title">Pools Analysis</h1>
+        <p class="subtitle">Support and FAQ.</p>
+      </div>
+      <div class="top-controls">
+        <span class="intent-prefix">I want to</span>
+        <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">{options_html}</select>
+        <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
+      </div>
+    </div>
+    <div class="grid">
+      <section class="card">
+        <h3>Send a ticket</h3>
+        <p class="hint">Your ticket goes to the admin panel.</p>
+        <div class="row"><label>Name</label><input id="tName" type="text" placeholder="Optional"/></div>
+        <div class="row"><label>Email</label><input id="tEmail" type="email" placeholder="Optional"/></div>
+        <div class="row"><label>Subject</label><input id="tSubject" type="text" placeholder="Required"/></div>
+        <div class="row"><label>Message</label><textarea id="tMessage" placeholder="Describe the issue or request"></textarea></div>
+        <button class="btn" onclick="sendTicket()">Send ticket</button>
+        <span class="status" id="ticketStatus">Ready</span>
+      </section>
+      <section class="card">
+        <h3>FAQ</h3>
+        <p class="hint">Published answers.</p>
+        <div id="faqList">Loading FAQ...</div>
+      </section>
+    </div>
+  </div>
+  <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
+    <div class="wallet-modal">
+      <h3>Connect wallet</h3>
+      <div class="wallet-list" id="walletList"></div>
+      <div class="wallet-note">Rabby and Phantom are supported. Sign-in uses a gasless message signature.</div>
+    </div>
+  </div>
+  <script>
+    let authState = {{authenticated: false}};
+    const WALLET_LABELS = {{ injected: "Browser Wallet", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
+    function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
+    function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
+    function getWalletProvider(wallet) {{ const providers=getEthereumProviders(); const pick=(pred)=>providers.find(pred)||null; if(wallet==="rabby") return pick((p)=>!!p?.isRabby)||(window.ethereum?.isRabby?window.ethereum:null); if(wallet==="phantom"){{ if(window.phantom?.ethereum?.request) return window.phantom.ethereum; return pick((p)=>!!p?.isPhantom)||(window.ethereum?.isPhantom?window.ethereum:null); }} if(wallet==="metamask") return pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||((window.ethereum?.isMetaMask&&!window.ethereum?.isRabby&&!window.ethereum?.isPhantom&&!window.ethereum?.isCoinbaseWallet)?window.ethereum:null); if(wallet==="coinbase") return pick((p)=>!!p?.isCoinbaseWallet)||(window.ethereum?.isCoinbaseWallet?window.ethereum:null); return providers[0]||window.phantom?.ethereum||null; }}
+    function getWalletChoices() {{ const order=["rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>({{id,label:WALLET_LABELS[id],available:!!getWalletProvider(id)}})); }}
+    function openWalletModal() {{ const list=document.getElementById("walletList"); const choices=getWalletChoices(); list.innerHTML=choices.map((w)=>{{ const cls=w.available?"wallet-item":"wallet-item disabled"; const dis=w.available?"":"disabled"; const label=w.available?w.label:`${{w.label}} (not detected)`; return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{label}}</button>`; }}).join(""); document.getElementById("walletModalBackdrop").style.display="flex"; }}
+    function closeWalletModal(event) {{ if(event&&event.target&&event.target.id!=="walletModalBackdrop") return; document.getElementById("walletModalBackdrop").style.display="none"; }}
+    async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
+    function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} }}
+    function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; btn.textContent = authState?.authenticated ? (authState.address_short || "Wallet connected") : "Connect Wallet"; syncAdminIntentOption(); }}
+    async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
+    async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
+    async function connectWalletFlow(wallet) {{ const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
+    function setTicketStatus(text, isErr) {{ const el=document.getElementById("ticketStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    async function sendTicket() {{
+      try {{
+        const payload = {{
+          name: (document.getElementById("tName").value || "").trim(),
+          email: (document.getElementById("tEmail").value || "").trim(),
+          subject: (document.getElementById("tSubject").value || "").trim(),
+          message: (document.getElementById("tMessage").value || "").trim(),
+        }};
+        const data = await postJson("/api/help/tickets", payload);
+        setTicketStatus(`Ticket #${{data.ticket_id}} sent`, false);
+        document.getElementById("tSubject").value = "";
+        document.getElementById("tMessage").value = "";
+      }} catch (e) {{
+        setTicketStatus("Send failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    function renderFaqList(items) {{
+      const wrap = document.getElementById("faqList");
+      if (!(items || []).length) {{
+        wrap.innerHTML = '<p class="hint">No FAQ entries yet.</p>';
+        return;
+      }}
+      wrap.innerHTML = (items || []).map((f) => {{
+        const q = String(f.question || "").replace(/</g, "&lt;");
+        const a = String(f.answer || "").replace(/</g, "&lt;");
+        const badge = f.is_featured ? ' <span style="font-size:11px;color:#1d4ed8;border:1px solid #bfdbfe;border-radius:999px;padding:2px 6px;background:#eff6ff">featured</span>' : '';
+        return `<details style="margin-bottom:8px"><summary><b>${{q}}</b>${{badge}}</summary><div style="margin-top:6px;white-space:pre-wrap">${{a}}</div></details>`;
+      }}).join("");
+    }}
+    async function loadFaq() {{
+      try {{
+        const r = await fetch("/api/faq?limit=200");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Failed to load FAQ");
+        renderFaqList(data.items || []);
+      }} catch (_) {{
+        document.getElementById("faqList").innerHTML = '<p class="hint">FAQ failed to load.</p>';
+      }}
+    }}
+    loadAuthState();
+    loadFaq();
+  </script>
+</body>
+</html>
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
     resp = HTMLResponse(HTML_PAGE)
@@ -1462,7 +2270,7 @@ def pancake_page(request: Request) -> HTMLResponse:
 
 @app.get("/help", response_class=HTMLResponse)
 def help_page(request: Request) -> HTMLResponse:
-    resp = HTMLResponse(_render_placeholder_page("Get a Hand", "This page is a placeholder for guided help.", "/help"))
+    resp = HTMLResponse(_render_help_page())
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/help")
     return resp
@@ -1474,6 +2282,14 @@ def connect_page(request: Request) -> HTMLResponse:
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/connect")
     return resp
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(request: Request, response: Response) -> HTMLResponse:
+    _require_admin(request, response)
+    sid = _ensure_session_cookie(request, response)
+    _analytics_log_event(session_id=sid, event_type="page_view", path="/admin")
+    return HTMLResponse(_render_admin_page())
 
 
 @app.get("/api/auth/me")
@@ -1490,6 +2306,7 @@ def auth_me(request: Request, response: Response) -> dict[str, Any]:
         "wallet": auth.get("wallet", "injected"),
         "chain_id": auth.get("chain_id"),
         "authenticated_at": auth.get("authenticated_at"),
+        "is_admin": _is_admin_address(str(auth.get("address") or "")),
     }
 
 
@@ -1583,6 +2400,215 @@ def auth_logout(request: Request, response: Response) -> dict[str, Any]:
         AUTH_SESSIONS.pop(sid, None)
         AUTH_NONCES.pop(sid, None)
     return {"ok": True}
+
+
+@app.get("/api/admin/settings")
+def admin_settings(request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    token_catalog = _load_token_catalog(refresh=False)
+    events_count = 0
+    if ANALYTICS_ENABLED:
+        with _analytics_conn() as conn:
+            events_count = int(conn.execute("SELECT COUNT(*) FROM analytics_events").fetchone()[0])
+    _, preview = _analytics_build_daily_report(day_offset=1)
+    return {
+        "daily_email_enabled": _analytics_daily_enabled_value(),
+        "report_to": _analytics_report_to_value(),
+        "report_hour_utc": _analytics_report_hour_value(),
+        "admin_wallets": _admin_wallets_value(),
+        "last_daily_sent": _analytics_get_state("last_daily_email_date_utc"),
+        "smtp_configured": bool(ANALYTICS_SMTP_HOST and ANALYTICS_SMTP_USER and ANALYTICS_SMTP_PASS),
+        "analytics_db_path": str(ANALYTICS_DB_PATH),
+        "events_count": events_count,
+        "token_catalog_updated_at": token_catalog.get("updated_at"),
+        "token_catalog_count": token_catalog.get("count", 0),
+        "daily_preview": preview,
+    }
+
+
+@app.post("/api/admin/settings")
+def admin_settings_update(req: AdminSettingsUpdate, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    if req.daily_email_enabled is not None:
+        _analytics_set_state("daily_email_enabled", "1" if req.daily_email_enabled else "0")
+    if req.report_to is not None:
+        email = req.report_to.strip()
+        if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise HTTPException(status_code=400, detail="Invalid email format.")
+        _analytics_set_state("report_to", email)
+    if req.report_hour_utc is not None:
+        hour = int(req.report_hour_utc)
+        if hour < 0 or hour > 23:
+            raise HTTPException(status_code=400, detail="report_hour_utc must be in range 0..23.")
+        _analytics_set_state("report_hour_utc", str(hour))
+    return {"ok": True, "info": "Admin settings updated."}
+
+
+@app.post("/api/admin/admin-wallets")
+def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    action = (req.action or "").strip().lower()
+    address = (req.address or "").strip().lower()
+    if action not in {"add", "remove"}:
+        raise HTTPException(status_code=400, detail="action must be add or remove.")
+    if not _is_eth_address(address):
+        raise HTTPException(status_code=400, detail="Invalid wallet address.")
+    wallets = _admin_wallets_value()
+    if action == "add":
+        if address not in wallets:
+            wallets.append(address)
+            _set_admin_wallets(wallets)
+        return {"ok": True, "info": "Admin wallet added.", "items": _admin_wallets_value()}
+
+    # remove
+    if address not in wallets:
+        return {"ok": True, "info": "Wallet already absent.", "items": wallets}
+    if len(wallets) <= 1:
+        raise HTTPException(status_code=400, detail="Cannot remove the last admin wallet.")
+    wallets = [w for w in wallets if w != address]
+    _set_admin_wallets(wallets)
+    return {"ok": True, "info": "Admin wallet removed.", "items": _admin_wallets_value()}
+
+
+@app.post("/api/admin/send-now")
+def admin_send_now(request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    ok, info = _send_daily_analytics_report(force=True)
+    return {"ok": ok, "info": info}
+
+
+@app.post("/api/help/tickets")
+def create_help_ticket(req: HelpTicketCreate, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    subject = (req.subject or "").strip()
+    message = (req.message or "").strip()
+    if len(subject) < 3:
+        raise HTTPException(status_code=400, detail="Subject is too short.")
+    if len(message) < 10:
+        raise HTTPException(status_code=400, detail="Message is too short.")
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    wallet = str(auth.get("address") or "")
+    ticket_id = _create_help_ticket(
+        session_id=sid,
+        wallet_address=wallet,
+        name=req.name,
+        email=req.email,
+        subject=subject,
+        message=message,
+    )
+    _analytics_log_event(session_id=sid, event_type="help_ticket", path="/api/help/tickets", payload=str(ticket_id))
+    return {"ok": True, "ticket_id": ticket_id}
+
+
+@app.get("/api/faq")
+def public_faq(limit: int = 200) -> dict[str, Any]:
+    items = _list_faq_items(include_unpublished=False, limit=limit)
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/admin/failures")
+def admin_failures(request: Request, response: Response, limit: int = 50) -> dict[str, Any]:
+    _require_admin(request, response)
+    items = _recent_failed_runs(limit=limit)
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/admin/help-tickets")
+def admin_help_tickets(request: Request, response: Response, limit: int = 100) -> dict[str, Any]:
+    _require_admin(request, response)
+    items = _list_help_tickets(limit=limit)
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/admin/help-tickets/update")
+def admin_help_ticket_update(req: HelpTicketUpdate, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    status = (req.status or "").strip().lower()
+    if status and status not in {"open", "in_progress", "done"}:
+        raise HTTPException(status_code=400, detail="status must be open, in_progress, or done.")
+    with _analytics_conn() as conn:
+        row = conn.execute("SELECT id FROM help_tickets WHERE id = ?", (int(req.ticket_id),)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Ticket not found.")
+        if status:
+            conn.execute("UPDATE help_tickets SET status = ? WHERE id = ?", (status, int(req.ticket_id)))
+        if req.admin_note is not None:
+            conn.execute("UPDATE help_tickets SET admin_note = ? WHERE id = ?", ((req.admin_note or "")[:1000], int(req.ticket_id)))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.get("/api/admin/faq")
+def admin_faq_list(request: Request, response: Response, limit: int = 200) -> dict[str, Any]:
+    _require_admin(request, response)
+    items = _list_faq_items(include_unpublished=True, limit=limit)
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/admin/faq/upsert")
+def admin_faq_upsert(req: AdminFaqUpsert, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    question = (req.question or "").strip()
+    answer = (req.answer or "").strip()
+    if len(question) < 3:
+        raise HTTPException(status_code=400, detail="Question is too short.")
+    if len(answer) < 3:
+        raise HTTPException(status_code=400, detail="Answer is too short.")
+    sort_order = int(req.sort_order or 100)
+    now = _iso_now()
+    with _analytics_conn() as conn:
+        if req.faq_id:
+            row = conn.execute("SELECT id FROM faq_items WHERE id = ?", (int(req.faq_id),)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="FAQ item not found.")
+            conn.execute(
+                """
+                UPDATE faq_items
+                SET updated_at = ?, question = ?, answer = ?, is_published = ?, is_featured = ?, sort_order = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    question[:300],
+                    answer[:8000],
+                    1 if req.is_published else 0,
+                    1 if req.is_featured else 0,
+                    sort_order,
+                    int(req.faq_id),
+                ),
+            )
+            conn.commit()
+            return {"ok": True, "info": "FAQ updated.", "faq_id": int(req.faq_id)}
+        cur = conn.execute(
+            """
+            INSERT INTO faq_items(created_at, updated_at, question, answer, is_published, is_featured, sort_order)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                now,
+                question[:300],
+                answer[:8000],
+                1 if req.is_published else 0,
+                1 if req.is_featured else 0,
+                sort_order,
+            ),
+        )
+        conn.commit()
+        return {"ok": True, "info": "FAQ created.", "faq_id": int(cur.lastrowid or 0)}
+
+
+@app.post("/api/admin/faq/delete")
+def admin_faq_delete(req: AdminFaqDelete, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    with _analytics_conn() as conn:
+        row = conn.execute("SELECT id FROM faq_items WHERE id = ?", (int(req.faq_id),)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="FAQ item not found.")
+        conn.execute("DELETE FROM faq_items WHERE id = ?", (int(req.faq_id),))
+        conn.commit()
+    return {"ok": True, "info": "FAQ deleted."}
 
 
 @app.post("/api/analytics/send-test")
@@ -1812,14 +2838,26 @@ HTML_PAGE = """
       white-space: nowrap;
     }
     .intent-select {
-      border: 1px solid #cbd5e1;
+      border: 1px solid #bfdbfe;
       border-radius: 10px;
-      padding: 10px 12px;
+      padding: 10px 38px 10px 12px;
       font-size: 14px;
-      color: #334155;
-      background: #f8fbff;
-      min-width: 260px;
-      max-width: 300px;
+      font-weight: 600;
+      color: #1f3a8a;
+      background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%);
+      min-width: 240px;
+      max-width: 280px;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image:
+        linear-gradient(45deg, transparent 50%, #1d4ed8 50%),
+        linear-gradient(135deg, #1d4ed8 50%, transparent 50%);
+      background-position:
+        calc(100% - 18px) calc(50% + 1px),
+        calc(100% - 12px) calc(50% + 1px);
+      background-size: 6px 6px, 6px 6px;
+      background-repeat: no-repeat;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
     }
     .connect-btn {
       border: 1px solid #bfdbfe;
@@ -1877,14 +2915,6 @@ HTML_PAGE = """
       color: #64748b;
       font-size: 12px;
       margin-top: 8px;
-    }
-    .auth-meta {
-      color: #475569;
-      font-size: 12px;
-      max-width: 220px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
     }
     .grid {
       display: grid;
@@ -2266,7 +3296,6 @@ HTML_PAGE = """
           <option value="/positions">Analise my DeFi positions</option>
           <option value="/help">Get help</option>
         </select>
-        <span id="authMeta" class="auth-meta"></span>
         <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
       </div>
     </div>
@@ -2481,7 +3510,10 @@ HTML_PAGE = """
         return pick((p) => !!p?.isPhantom) || (window.ethereum?.isPhantom ? window.ethereum : null);
       }
       if (wallet === "metamask") {
-        return pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom) || (window.ethereum?.isMetaMask ? window.ethereum : null);
+        return (
+          pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom && !p?.isCoinbaseWallet) ||
+          ((window.ethereum?.isMetaMask && !window.ethereum?.isRabby && !window.ethereum?.isPhantom && !window.ethereum?.isCoinbaseWallet) ? window.ethereum : null)
+        );
       }
       if (wallet === "coinbase") {
         return pick((p) => !!p?.isCoinbaseWallet) || (window.ethereum?.isCoinbaseWallet ? window.ethereum : null);
@@ -2524,17 +3556,30 @@ HTML_PAGE = """
       return data;
     }
 
+    function syncAdminIntentOption() {
+      const sel = document.getElementById("intentSelect");
+      if (!sel) return;
+      const existing = Array.from(sel.options).find((o) => o.value === "/admin");
+      const isAdmin = !!authState?.authenticated && !!authState?.is_admin;
+      if (isAdmin && !existing) {
+        const opt = document.createElement("option");
+        opt.value = "/admin";
+        opt.textContent = "Administer project";
+        sel.appendChild(opt);
+      } else if (!isAdmin && existing) {
+        existing.remove();
+      }
+    }
+
     function setAuthUI() {
       const btn = document.getElementById("connectWalletBtn");
-      const meta = document.getElementById("authMeta");
-      if (!btn || !meta) return;
+      if (!btn) return;
       if (authState?.authenticated) {
         btn.textContent = authState.address_short || "Wallet connected";
-        meta.textContent = `${WALLET_LABELS[authState.wallet] || authState.wallet || "Wallet"} on chain ${authState.chain_id || "-"}`;
       } else {
         btn.textContent = "Connect Wallet";
-        meta.textContent = "";
       }
+      syncAdminIntentOption();
     }
 
     async function loadAuthState() {
