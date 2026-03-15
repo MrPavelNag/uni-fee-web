@@ -10,6 +10,7 @@ import argparse
 import os
 import time
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from config import (
@@ -298,8 +299,6 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
             if pools:
                 print(f"  [{chain}] {base}/{quote}: {len(pools)} pools")
 
-        time.sleep(0.3)
-
     # дедупликация по (chain, id)
     seen = set()
     unique = []
@@ -346,33 +345,43 @@ def main() -> None:
         print("PDF output disabled (DISABLE_PDF_OUTPUT=1)")
 
     chart_data = {}
-    for i, p in enumerate(pools):
-        chain = p.get("chain", "?")
-        t0 = (p.get("token0") or {}).get("symbol", "?")
-        t1 = (p.get("token1") or {}).get("symbol", "?")
-        pool_id = p.get("id", "")
-        raw_fee_tier = int(p.get("feeTier") or 0)
+    max_workers = max(1, min(16, int(os.environ.get("POOL_SERIES_WORKERS", "8"))))
+
+    def _process_pool(idx: int, pool: dict) -> tuple[int, str | None, dict | None, str]:
+        chain = pool.get("chain", "?")
+        t0 = (pool.get("token0") or {}).get("symbol", "?")
+        t1 = (pool.get("token1") or {}).get("symbol", "?")
+        pool_id = pool.get("id", "")
+        raw_fee_tier = int(pool.get("feeTier") or 0)
         fee_pct = _normalize_fee_pct(raw_fee_tier, "v4")
         pair_label = f"{t0}/{t1}"
         endpoint = get_endpoint(chain)
         if not endpoint:
-            continue
-        try:
-            series = compute_fee_series(p, endpoint)
-            chart_data[pool_id] = {
-                **series,
-                "pool_id": pool_id,
-                "fee_pct": fee_pct,
-                "raw_fee_tier": raw_fee_tier,
-                "pair": pair_label,
-                "chain": chain,
-                "version": "v4",
-            }
-            n_days = len(series.get("fees") or [])
-            print(f"  [{i+1}/{len(pools)}] {chain} {pair_label}: {n_days} дней")
-        except Exception as e:
-            print(f"  [{i+1}/{len(pools)}] {chain} {pair_label}: ошибка - {e}")
-        time.sleep(0.3)
+            return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: skipped (no endpoint)"
+        series = compute_fee_series(pool, endpoint)
+        payload = {
+            **series,
+            "pool_id": pool_id,
+            "fee_pct": fee_pct,
+            "raw_fee_tier": raw_fee_tier,
+            "pair": pair_label,
+            "chain": chain,
+            "version": "v4",
+        }
+        n_days = len(series.get("fees") or [])
+        return idx, pool_id, payload, f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: {n_days} days"
+
+    if pools:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_process_pool, i, p) for i, p in enumerate(pools)]
+            for fut in as_completed(futures):
+                try:
+                    _, pool_id, payload, msg = fut.result()
+                    if pool_id and payload:
+                        chart_data[pool_id] = payload
+                    print(msg)
+                except Exception as e:
+                    print(f"  [series] error - {e}")
 
     out_path = f"data/pools_v4_{suffix}.json"
     save_chart_data_json(chart_data, out_path)

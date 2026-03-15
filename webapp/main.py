@@ -858,6 +858,36 @@ def _parse_positions_addresses(raw_items: list[str]) -> list[str]:
     return out
 
 
+def _parse_solana_addresses(raw_items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items or []:
+        for token in re.split(r"[,\s;]+", str(raw or "").strip()):
+            addr = token.strip()
+            if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", addr):
+                continue
+            if addr in seen:
+                continue
+            seen.add(addr)
+            out.append(addr)
+    return out
+
+
+def _parse_tron_addresses(raw_items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items or []:
+        for token in re.split(r"[,\s;]+", str(raw or "").strip()):
+            addr = token.strip()
+            if not re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", addr):
+                continue
+            if addr in seen:
+                continue
+            seen.add(addr)
+            out.append(addr)
+    return out
+
+
 def _query_uniswap_positions_for_owner(endpoint: str, owner: str) -> list[dict[str, Any]]:
     query = """
     query UserPositions($owner: String!, $skip: Int!) {
@@ -906,6 +936,9 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
                     continue
                 for p in positions:
+                    if _safe_float(p.get("liquidity")) <= 0:
+                        # Hide closed/zero-liquidity historical NFTs; keep only active positions.
+                        continue
                     pool = p.get("pool") or {}
                     t0 = (pool.get("token0") or {}).get("symbol") or "?"
                     t1 = (pool.get("token1") or {}).get("symbol") or "?"
@@ -1515,6 +1548,7 @@ def _push_run_history(
     min_tvl: float,
     days: int,
     include_versions: list[str],
+    speed_mode: str,
     min_fee_pct: float,
     max_fee_pct: float,
     exclude_suffixes: list[str],
@@ -1530,6 +1564,7 @@ def _push_run_history(
             "min_tvl": min_tvl,
             "days": days,
             "include_versions": include_versions,
+            "speed_mode": speed_mode,
             "min_fee_pct": min_fee_pct,
             "max_fee_pct": max_fee_pct,
             "exclude_suffixes": exclude_suffixes,
@@ -1585,12 +1620,16 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             j["stage_label"] = label
             j["progress"] = max(0, min(100, progress))
 
+    speed_mode = str(req.speed_mode or "normal").strip().lower()
+    if speed_mode not in {"normal", "fast"}:
+        speed_mode = "normal"
+
     with JOB_LOCK:
         job = JOBS[job_id]
         job["status"] = "running"
         job["started_at"] = time.time()
         job["stage"] = "prepare"
-        job["stage_label"] = "Preparing parameters"
+        job["stage_label"] = f"Preparing parameters ({speed_mode})"
         job["progress"] = 5
 
     # Build up to 4 selected token pairs
@@ -1627,6 +1666,10 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
     env["DISABLE_PDF_OUTPUT"] = "1"
     env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "1")
+    env["POOL_SERIES_WORKERS"] = os.environ.get(
+        "WEB_POOL_SERIES_WORKERS_FAST" if speed_mode == "fast" else "WEB_POOL_SERIES_WORKERS_NORMAL",
+        "16" if speed_mode == "fast" else "8",
+    )
 
     # v4 endpoint config uses this list at import-time
     if run_v4 and include_chains:
@@ -1684,6 +1727,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     "min_tvl": req.min_tvl,
                     "include_chains": include_chains,
                     "include_versions": include_versions,
+                    "speed_mode": speed_mode,
                     "min_fee_pct": req.min_fee_pct,
                     "max_fee_pct": req.max_fee_pct,
                     "exclude_suffixes": req.exclude_suffixes,
@@ -1700,6 +1744,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             min_tvl=req.min_tvl,
             days=req.days,
             include_versions=include_versions,
+            speed_mode=speed_mode,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
@@ -1721,6 +1766,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             min_tvl=req.min_tvl,
             days=req.days,
             include_versions=include_versions,
+            speed_mode=speed_mode,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
@@ -1738,6 +1784,7 @@ class PoolsRunRequest(BaseModel):
     include_versions: list[str] = Field(default_factory=lambda: ["v3", "v4"])
     min_tvl: float = 1000.0
     days: int = 30
+    speed_mode: str = "normal"
     min_fee_pct: float = 0.0
     max_fee_pct: float = 2.0
     exclude_suffixes: list[str] = Field(default_factory=list, description="Exclude pool ids by last 4 chars")
@@ -1807,6 +1854,10 @@ class AdminFaqPublish(BaseModel):
 
 
 class PositionsScanRequest(BaseModel):
+    evm_addresses: list[str] = Field(default_factory=list)
+    solana_addresses: list[str] = Field(default_factory=list)
+    tron_addresses: list[str] = Field(default_factory=list)
+    # Backward-compatible fields from the previous UI version.
     addresses: list[str] = Field(default_factory=list)
     chain_ids: list[int] = Field(default_factory=list)
 
@@ -2382,32 +2433,19 @@ def _render_placeholder_page(
 
 
 def _render_positions_page() -> str:
-    chain_json = _positions_chain_catalog()
-    chain_items = "".join(
-        [
-            (
-                '<label class="chain-pill">'
-                f'<input type="checkbox" class="pos-chain" value="{int(c.get("chain_id") or 0)}" checked />'
-                f'<span>{str(c.get("name") or c.get("chain_id"))}</span>'
-                "<small>"
-                f'{"pool" if c.get("has_pools") else ""}'
-                f'{" + " if c.get("has_pools") and c.get("has_lending") else ""}'
-                f'{"lending" if c.get("has_lending") else ""}'
-                "</small>"
-                "</label>"
-            )
-            for c in chain_json
-        ]
-    )
     extra_css = """
     .positions-grid { display:grid; gap:12px; margin-top:12px; }
     .positions-form { background:#f3f7ff; border:1px solid #cfdcec; border-radius:14px; padding:14px; }
     .positions-form h3 { margin:0 0 8px; font-size:18px; }
-    .positions-form .row { display:grid; grid-template-columns:180px 1fr; gap:10px; align-items:start; margin-bottom:10px; }
-    .positions-form textarea { min-height:84px; width:100%; background:#f8fbff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:14px; }
-    .chains-wrap { display:flex; flex-wrap:wrap; gap:8px; max-height:220px; overflow:auto; padding:6px; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
-    .chain-pill { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:5px 9px; background:#eff6ff; font-size:12px; color:#1f3a8a; }
-    .chain-pill small { color:#64748b; font-size:11px; }
+    .address-columns { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+    .addr-box { border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:10px; }
+    .addr-box h4 { margin:0 0 8px; font-size:14px; color:#1e3a8a; }
+    .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
+    .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; }
+    .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; min-height:26px; }
+    .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
+    .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; }
+    .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
     .positions-actions { display:flex; gap:10px; align-items:center; }
     .pos-status { color:#475569; font-size:13px; }
     .result-card { background:#f3f7ff; border:1px solid #cfdcec; border-radius:14px; padding:14px; }
@@ -2418,27 +2456,38 @@ def _render_positions_page() -> str:
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
-    @media (max-width: 980px) { .positions-form .row { grid-template-columns:1fr; } }
+    .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
+    @media (max-width: 1100px) { .address-columns { grid-template-columns:1fr; } }
     """
     extra_html = f"""
     <div class="positions-grid">
       <section class="positions-form">
-        <h3>Scan addresses across chains</h3>
-        <div class="row">
-          <label>Wallet addresses</label>
-          <div>
-            <textarea id="posAddresses" placeholder="One or many addresses separated by comma, space, or newline"></textarea>
-            <p class="hint" style="margin-top:6px">Example: 0xabc..., 0xdef...</p>
-          </div>
-        </div>
-        <div class="row">
-          <label>Where to search</label>
-          <div>
-            <div style="display:flex;gap:8px;margin-bottom:8px">
-              <button class="btn" type="button" onclick="selectAllPosChains(true)">Select all</button>
-              <button class="btn" type="button" onclick="selectAllPosChains(false)">Clear</button>
+        <h3>Scan addresses by network type</h3>
+        <p class="hint" style="margin-bottom:10px">EVM addresses are scanned across all supported EVM chains automatically. Lending scan stays as is (Aave v3).</p>
+        <div class="address-columns">
+          <div class="addr-box">
+            <h4>EVM</h4>
+            <div class="addr-input-row">
+              <input id="evmInput" placeholder="0x..." />
+              <button class="btn" type="button" onclick="addAddress('evm')">Add</button>
             </div>
-            <div class="chains-wrap" id="posChainsWrap">{chain_items}</div>
+            <div class="chips" id="evmChips"></div>
+          </div>
+          <div class="addr-box">
+            <h4>Solana</h4>
+            <div class="addr-input-row">
+              <input id="solanaInput" placeholder="Solana address" />
+              <button class="btn" type="button" onclick="addAddress('solana')">Add</button>
+            </div>
+            <div class="chips" id="solanaChips"></div>
+          </div>
+          <div class="addr-box">
+            <h4>TRON</h4>
+            <div class="addr-input-row">
+              <input id="tronInput" placeholder="TRON address" />
+              <button class="btn" type="button" onclick="addAddress('tron')">Add</button>
+            </div>
+            <div class="chips" id="tronChips"></div>
           </div>
         </div>
         <div class="positions-actions">
@@ -2459,11 +2508,77 @@ def _render_positions_page() -> str:
     """
     extra_script = """
     function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
-    function selectedPosChains() {
-      return Array.from(document.querySelectorAll(".pos-chain:checked")).map((x) => Number(x.value || 0)).filter((x) => Number.isFinite(x) && x > 0);
+    const posState = { evm: [], solana: [], tron: [] };
+    const POS_STORAGE_KEY = "positions_form_v2";
+    function validAddress(kind, value) {
+      const v = String(value || "").trim();
+      if (!v) return false;
+      if (kind === "evm") return /^0x[a-fA-F0-9]{40}$/.test(v);
+      if (kind === "solana") return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
+      if (kind === "tron") return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(v);
+      return false;
     }
-    function selectAllPosChains(flag) {
-      Array.from(document.querySelectorAll(".pos-chain")).forEach((el) => { el.checked = !!flag; });
+    function inputId(kind) {
+      if (kind === "evm") return "evmInput";
+      if (kind === "solana") return "solanaInput";
+      return "tronInput";
+    }
+    function chipsId(kind) {
+      if (kind === "evm") return "evmChips";
+      if (kind === "solana") return "solanaChips";
+      return "tronChips";
+    }
+    function savePosState() {
+      localStorage.setItem(POS_STORAGE_KEY, JSON.stringify(posState));
+    }
+    function loadPosState() {
+      try {
+        const raw = localStorage.getItem(POS_STORAGE_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        for (const k of ["evm", "solana", "tron"]) {
+          if (Array.isArray(parsed[k])) posState[k] = parsed[k].map((x) => String(x || "").trim()).filter(Boolean);
+        }
+      } catch (_) {}
+    }
+    function renderChips(kind) {
+      const wrap = document.getElementById(chipsId(kind));
+      if (!wrap) return;
+      const rows = posState[kind] || [];
+      if (!rows.length) {
+        wrap.innerHTML = "<span class='chip muted'>No addresses</span>";
+        return;
+      }
+      wrap.innerHTML = rows.map((addr, i) => `<span class='chip'><span class='mono'>${esc(addr)}</span><button class='x' type='button' onclick=\"removeAddress('${kind}', ${i})\">×</button></span>`).join("");
+    }
+    function renderAllChips() {
+      renderChips("evm");
+      renderChips("solana");
+      renderChips("tron");
+    }
+    function addAddress(kind) {
+      const el = document.getElementById(inputId(kind));
+      const addrRaw = String(el?.value || "").trim();
+      if (!validAddress(kind, addrRaw)) {
+        setPosStatus(`Invalid ${kind.toUpperCase()} address format.`, true);
+        return;
+      }
+      const addr = kind === "evm" ? addrRaw.toLowerCase() : addrRaw;
+      if ((posState[kind] || []).includes(addr)) {
+        setPosStatus("Address already added.", true);
+        return;
+      }
+      posState[kind].push(addr);
+      if (el) el.value = "";
+      savePosState();
+      renderChips(kind);
+      setPosStatus("Address added.", false);
+    }
+    function removeAddress(kind, idx) {
+      if (!Array.isArray(posState[kind])) return;
+      posState[kind].splice(Number(idx) || 0, 1);
+      savePosState();
+      renderChips(kind);
     }
     function setPosStatus(text, isErr) {
       const el = document.getElementById("posStatus");
@@ -2509,17 +2624,20 @@ def _render_positions_page() -> str:
       table.innerHTML = html;
     }
     async function scanPositions() {
-      const raw = String(document.getElementById("posAddresses")?.value || "").trim();
-      if (!raw) { setPosStatus("Enter at least one wallet address.", true); return; }
-      const addresses = raw.split(/[\\s,;]+/).map((x) => x.trim()).filter(Boolean);
-      const chainIds = selectedPosChains();
-      if (!chainIds.length) { setPosStatus("Select at least one chain.", true); return; }
+      if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
+        setPosStatus("Add at least one address first.", true);
+        return;
+      }
       try {
-        setPosStatus("Scanning pools and lending...", false);
+        setPosStatus("Scanning latest positions...", false);
         const res = await fetch("/api/positions/scan", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
-          body: JSON.stringify({ addresses, chain_ids: chainIds }),
+          body: JSON.stringify({
+            evm_addresses: posState.evm,
+            solana_addresses: posState.solana,
+            tron_addresses: posState.tron,
+          }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || "Scan failed");
@@ -2527,12 +2645,17 @@ def _render_positions_page() -> str:
         renderLending(data.lending_positions || []);
         const errWrap = document.getElementById("posErrors");
         const errs = data.errors || [];
-        errWrap.innerHTML = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
+        const infos = data.infos || [];
+        const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
+        const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
+        errWrap.innerHTML = errHtml + infoHtml;
         setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}, Lending: ${(data.lending_positions || []).length}`, false);
       } catch (e) {
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
       }
     }
+    loadPosState();
+    renderAllChips();
     setPosStatus("Ready", false);
     """
     return _render_placeholder_page(
@@ -3771,18 +3894,36 @@ def positions_chains() -> dict[str, Any]:
 @app.post("/api/positions/scan")
 def scan_positions(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
     sid = _ensure_session_cookie(request, response)
-    addresses = _parse_positions_addresses(req.addresses)
-    if not addresses:
-        raise HTTPException(status_code=400, detail="Provide at least one valid EVM address.")
-    if len(addresses) > 20:
+    evm_raw = list(req.evm_addresses or []) + list(req.addresses or [])
+    evm_addresses = _parse_positions_addresses(evm_raw)
+    solana_addresses = _parse_solana_addresses(req.solana_addresses or [])
+    tron_addresses = _parse_tron_addresses(req.tron_addresses or [])
+
+    if not evm_addresses and not solana_addresses and not tron_addresses:
+        raise HTTPException(status_code=400, detail="Provide at least one valid address.")
+    if len(evm_addresses) > 20:
         raise HTTPException(status_code=400, detail="Too many addresses. Max 20.")
 
-    all_chain_ids = [int(x["chain_id"]) for x in _positions_chain_catalog()]
-    selected_chain_ids = sorted({int(x) for x in (req.chain_ids or []) if int(x) > 0}) or all_chain_ids
-    selected_chain_ids = selected_chain_ids[:64]
+    # Always scan all supported EVM chains when an EVM address is provided.
+    selected_chain_ids = sorted(
+        {
+            int(x.get("chain_id") or 0)
+            for x in _positions_chain_catalog()
+            if int(x.get("chain_id") or 0) > 0
+        }
+    )[:64]
+    if evm_addresses:
+        pool_rows, pool_errs = _scan_pool_positions(evm_addresses, selected_chain_ids)
+        lending_rows, lending_errs = _scan_aave_positions(evm_addresses, selected_chain_ids)
+    else:
+        pool_rows, pool_errs = [], []
+        lending_rows, lending_errs = [], []
 
-    pool_rows, pool_errs = _scan_pool_positions(addresses, selected_chain_ids)
-    lending_rows, lending_errs = _scan_aave_positions(addresses, selected_chain_ids)
+    info_notes: list[str] = []
+    if solana_addresses:
+        info_notes.append("Solana scanning is not available yet in this build.")
+    if tron_addresses:
+        info_notes.append("TRON scanning is not available yet in this build.")
 
     pool_rows.sort(
         key=lambda x: (
@@ -3803,14 +3944,17 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
         session_id=sid,
         event_type="positions_scan",
         path="/api/positions/scan",
-        payload=f"addresses={len(addresses)} chains={len(selected_chain_ids)}",
+        payload=f"evm={len(evm_addresses)} sol={len(solana_addresses)} tron={len(tron_addresses)} chains={len(selected_chain_ids)}",
     )
     return {
         "pool_positions": pool_rows,
         "lending_positions": lending_rows,
         "errors": (pool_errs + lending_errs)[:40],
+        "infos": info_notes[:20],
         "summary": {
-            "addresses": len(addresses),
+            "evm_addresses": len(evm_addresses),
+            "solana_addresses": len(solana_addresses),
+            "tron_addresses": len(tron_addresses),
             "chains": len(selected_chain_ids),
             "pool_count": len(pool_rows),
             "lending_count": len(lending_rows),
@@ -4177,6 +4321,9 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         raise HTTPException(status_code=400, detail="max_fee_pct must be in range 1..3")
     if req.min_fee_pct >= req.max_fee_pct:
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
+    req.speed_mode = str(req.speed_mode or "normal").strip().lower()
+    if req.speed_mode not in {"normal", "fast"}:
+        raise HTTPException(status_code=400, detail="speed_mode must be normal or fast")
     req.include_versions = [str(v).strip().lower() for v in (req.include_versions or []) if str(v).strip()]
     req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
     req.include_versions = list(dict.fromkeys(req.include_versions))
@@ -4851,6 +4998,13 @@ HTML_PAGE = """
                     <label><input id="protoV4" type="checkbox" checked/> V4</label>
                   </div>
                 </div>
+                <div class="filter-item">
+                  <div class="hint">Speed<br/>mode</div>
+                  <select id="speedMode">
+                    <option value="normal" selected>Normal</option>
+                    <option value="fast">Fast</option>
+                  </select>
+                </div>
               </div>
             </div>
           </div>
@@ -4922,7 +5076,7 @@ HTML_PAGE = """
     let sortKey = "final_income";
     let sortDesc = true;
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
-    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "allChains"];
+    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "speedMode", "allChains"];
     let availableChains = [];
     let colorMap = {};
     let dashMap = {};
@@ -5527,9 +5681,11 @@ HTML_PAGE = """
           const req = it.request || {};
           const minTvlTxt = req.min_tvl != null ? formatUsdShort(req.min_tvl) : "-";
           const head = `[${it.ts || "-"}] ${String(it.status || "").toUpperCase()} | pairs=${req.pairs || "-"} | days=${req.days ?? "-"} | min_tvl=${minTvlTxt} | chains=${(req.include_chains || []).join(",") || "all"}`;
+          const speed = String(req.speed_mode || "normal");
+          const headWithSpeed = `${head} | speed=${speed}`;
           const err = it.error ? `ERROR: ${it.error}` : "";
           const body = (it.logs || []).join("\\n\\n");
-          chunks.push([head, err, body].filter(Boolean).join("\\n"));
+          chunks.push([headWithSpeed, err, body].filter(Boolean).join("\\n"));
         }
         logsEl.textContent = chunks.join("\\n\\n----------------------------------------\\n\\n");
       } catch (e) {
@@ -5774,6 +5930,7 @@ HTML_PAGE = """
           include_versions: getSelectedProtocols(),
           min_tvl: Number(minTvlRaw),
           days: Number(daysRaw),
+          speed_mode: String(document.getElementById("speedMode")?.value || "normal").trim().toLowerCase(),
           max_fee_pct: Number(maxFeeRaw),
           min_fee_pct: Number(minFeeRaw),
         };
@@ -5799,6 +5956,10 @@ HTML_PAGE = """
         }
         if (payload.min_fee_pct >= payload.max_fee_pct) {
           setStatus("Exclude below must be lower than Exclude above.", "fail");
+          return;
+        }
+        if (!["normal", "fast"].includes(payload.speed_mode)) {
+          setStatus("Speed mode must be Normal or Fast.", "fail");
           return;
         }
         if (!pairCheck.valid) {

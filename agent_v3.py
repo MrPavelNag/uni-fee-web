@@ -10,8 +10,8 @@ Agent 1: Uniswap v3 (базовая версия).
 
 import argparse
 import os
-import time
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from config import (
@@ -123,8 +123,6 @@ def discover_pools_v3(
                     all_pools.append(p)
             except Exception as e:
                 print(f"  [{chain}] v3 {base}/{quote}: {e}")
-        time.sleep(0.5)
-
     seen = set()
     unique = []
     for p in all_pools:
@@ -226,31 +224,42 @@ def main() -> None:
         print("PDF output disabled (DISABLE_PDF_OUTPUT=1)")
 
     pool_chart_data = {}
-    for i, p in enumerate(pools):
-        chain = p.get("chain", "unknown")
-        t0 = (p.get("token0") or {}).get("symbol", "?")
-        t1 = (p.get("token1") or {}).get("symbol", "?")
-        pool_id = p.get("id", "")
-        raw_fee_tier = int(p.get("feeTier") or 0)
+    max_workers = max(1, min(16, int(os.environ.get("POOL_SERIES_WORKERS", "8"))))
+
+    def _process_pool(idx: int, pool: dict) -> tuple[int, str | None, dict | None, str]:
+        chain = pool.get("chain", "unknown")
+        t0 = (pool.get("token0") or {}).get("symbol", "?")
+        t1 = (pool.get("token1") or {}).get("symbol", "?")
+        pool_id = pool.get("id", "")
+        raw_fee_tier = int(pool.get("feeTier") or 0)
         fee_pct = raw_fee_tier / 10000
         pair = f"{t0}/{t1}"
         endpoint = get_graph_endpoint(chain, "v3")
-        if endpoint:
-            try:
-                data = compute_fee_and_tvl_series(p, endpoint)
-                pool_chart_data[pool_id] = {
-                    **data,
-                    "pool_id": pool_id,
-                    "fee_pct": fee_pct,
-                    "raw_fee_tier": raw_fee_tier,
-                    "pair": pair,
-                    "chain": chain,
-                    "version": "v3",
-                }
-                print(f"  [{i+1}/{len(pools)}] {chain} {pair}: {len(data.get('fees') or [])} days")
-            except Exception as e:
-                print(f"  [{i+1}/{len(pools)}] {chain} {pair}: error - {e}")
-            time.sleep(0.5)
+        if not endpoint:
+            return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair}: skipped (no endpoint)"
+        data = compute_fee_and_tvl_series(pool, endpoint)
+        payload = {
+            **data,
+            "pool_id": pool_id,
+            "fee_pct": fee_pct,
+            "raw_fee_tier": raw_fee_tier,
+            "pair": pair,
+            "chain": chain,
+            "version": "v3",
+        }
+        return idx, pool_id, payload, f"  [{idx+1}/{len(pools)}] {chain} {pair}: {len(data.get('fees') or [])} days"
+
+    if pools:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_process_pool, i, p) for i, p in enumerate(pools)]
+            for fut in as_completed(futures):
+                try:
+                    _, pool_id, payload, msg = fut.result()
+                    if pool_id and payload:
+                        pool_chart_data[pool_id] = payload
+                    print(msg)
+                except Exception as e:
+                    print(f"  [series] error - {e}")
 
     out_json = f"data/pools_v3_{suffix}.json"
     save_chart_data_json(pool_chart_data, out_json)
