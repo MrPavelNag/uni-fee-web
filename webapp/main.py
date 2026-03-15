@@ -1256,6 +1256,15 @@ HTML_PAGE = """
       line-height: 1;
       white-space: nowrap;
     }
+    .proto-checks input[type="checkbox"] {
+      width: auto;
+      min-width: 0;
+      padding: 0;
+      margin: 0;
+      flex: 0 0 auto;
+      accent-color: #2563eb;
+      transform: translateY(-1px);
+    }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
@@ -1406,6 +1415,7 @@ HTML_PAGE = """
       pair: (r) => r.pair || "",
       fee_pct: (r) => Number(r.fee_pct || 0),
       final_income: (r) => Number(r.final_income || 0),
+      apy_pct: (r) => Number(r.apy_pct || 0),
       last_tvl: (r) => Number(r.last_tvl || 0),
       status: (r) => r.status || ""
     };
@@ -1706,7 +1716,7 @@ HTML_PAGE = """
       const table = document.getElementById("resultTable");
       const hdr = [
         ["color", ""], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
-        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["last_tvl", "TVL"], ["status", "Status"]
+        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["status", "Status"]
       ];
 
       let html = "<tr>";
@@ -1732,6 +1742,7 @@ HTML_PAGE = """
         html += `<td class="mono">${poolIdDisplay}</td>`;
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
         html += `<td>$${formatUsd(r.final_income)}</td>`;
+        html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
         const statusLabel = r.status === "ok"
           ? "ok"
@@ -1748,7 +1759,7 @@ HTML_PAGE = """
         sortDesc = !sortDesc;
       } else {
         sortKey = key;
-        sortDesc = key === "final_income" || key === "last_tvl" || key === "fee_pct";
+        sortDesc = key === "final_income" || key === "apy_pct" || key === "last_tvl" || key === "fee_pct";
       }
       const fn = SORTABLE[sortKey];
       const sorted = [...lastRows].sort((a, b) => {
@@ -1767,7 +1778,7 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const headers = ["chain", "version", "pair", "pool_id", "fee_pct", "final_income", "last_tvl", "status"];
+      const headers = ["chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "status"];
       const lines = [headers.join(",")];
       for (const r of rows) {
         const vals = headers.map(h => {
@@ -1988,7 +1999,12 @@ HTML_PAGE = """
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
 
-      lastRows = result.rows || [];
+      const daysForApy = Number(result?.request?.days || getDaysValue());
+      lastRows = (result.rows || []).map((r) => {
+        const income = Number(r.final_income || 0);
+        const apyPct = (alloc > 0 && daysForApy > 0) ? (income / alloc) * (365 / daysForApy) * 100 : 0;
+        return {...r, apy_pct: apyPct};
+      });
       sortKey = "final_income";
       sortDesc = true;
       sortBy("final_income");
