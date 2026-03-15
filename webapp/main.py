@@ -8,6 +8,8 @@ Cloud-ready web MVP for pool analysis.
 """
 
 import os
+import base64
+import hashlib
 import re
 import secrets
 import smtplib
@@ -117,6 +119,9 @@ AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 AUTH_LOCK = threading.Lock()
 ADMIN_WALLETS_DEFAULT = "0xD3155f6A7525F81595609E83789bbb95d91aaEdf"
 ADMIN_WALLET_ADDRESSES_ENV = os.environ.get("ADMIN_WALLET_ADDRESSES", ADMIN_WALLETS_DEFAULT)
+ADMIN_WALLETS_ENC_KEY = os.environ.get("ADMIN_WALLETS_ENC_KEY", "").strip()
+ADMIN_WALLETS_STATE_KEY_PLAIN = "admin_wallets_csv"
+ADMIN_WALLETS_STATE_KEY_ENC = "admin_wallets_csv_enc_v1"
 ANALYTICS_DB_PATH = Path(os.environ.get("ANALYTICS_DB_PATH", str(CATALOG_DIR / "analytics.sqlite3")))
 ANALYTICS_ENABLED = os.environ.get("ANALYTICS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 ANALYTICS_DAILY_EMAIL_ENABLED = os.environ.get("ANALYTICS_DAILY_EMAIL_ENABLED", "1").strip().lower() in (
@@ -538,11 +543,70 @@ def _default_admin_wallets() -> list[str]:
     return _parse_admin_wallets_csv(ADMIN_WALLETS_DEFAULT)
 
 
+def _admin_wallets_fernet():
+    key_raw = (ADMIN_WALLETS_ENC_KEY or "").strip()
+    if not key_raw:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+    except Exception:
+        return None
+    # Accept either a Fernet key directly or derive one from a passphrase.
+    try:
+        if len(key_raw) == 44:
+            return Fernet(key_raw.encode("utf-8"))
+    except Exception:
+        pass
+    derived = base64.urlsafe_b64encode(hashlib.sha256(key_raw.encode("utf-8")).digest())
+    try:
+        return Fernet(derived)
+    except Exception:
+        return None
+
+
+def _encrypt_admin_wallets_csv(csv_value: str) -> str:
+    fernet = _admin_wallets_fernet()
+    if not fernet:
+        return ""
+    try:
+        token = fernet.encrypt((csv_value or "").encode("utf-8"))
+        return token.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _decrypt_admin_wallets_csv(token_value: str) -> str:
+    fernet = _admin_wallets_fernet()
+    if not fernet:
+        return ""
+    try:
+        raw = fernet.decrypt((token_value or "").encode("utf-8"))
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
 def _admin_wallets_value() -> list[str]:
-    saved = _analytics_get_state("admin_wallets_csv")
-    items = _parse_admin_wallets_csv(saved)
-    if items:
-        return items
+    fernet = _admin_wallets_fernet()
+    if fernet:
+        enc_saved = _analytics_get_state(ADMIN_WALLETS_STATE_KEY_ENC)
+        items = _parse_admin_wallets_csv(_decrypt_admin_wallets_csv(enc_saved))
+        if items:
+            return items
+        # Backward-compatible migration from plaintext state.
+        plain_saved = _analytics_get_state(ADMIN_WALLETS_STATE_KEY_PLAIN)
+        items = _parse_admin_wallets_csv(plain_saved)
+        if items:
+            enc = _encrypt_admin_wallets_csv(",".join(items))
+            if enc:
+                _analytics_set_state(ADMIN_WALLETS_STATE_KEY_ENC, enc)
+                _analytics_set_state(ADMIN_WALLETS_STATE_KEY_PLAIN, "")
+            return items
+    else:
+        saved = _analytics_get_state(ADMIN_WALLETS_STATE_KEY_PLAIN)
+        items = _parse_admin_wallets_csv(saved)
+        if items:
+            return items
     return _default_admin_wallets()
 
 
@@ -550,7 +614,16 @@ def _set_admin_wallets(addresses: list[str]) -> None:
     clean = _parse_admin_wallets_csv(",".join(addresses))
     if not clean:
         raise HTTPException(status_code=400, detail="At least one admin address is required.")
-    _analytics_set_state("admin_wallets_csv", ",".join(clean))
+    csv_value = ",".join(clean)
+    fernet = _admin_wallets_fernet()
+    if fernet:
+        enc = _encrypt_admin_wallets_csv(csv_value)
+        if not enc:
+            raise HTTPException(status_code=500, detail="Failed to encrypt admin wallets.")
+        _analytics_set_state(ADMIN_WALLETS_STATE_KEY_ENC, enc)
+        _analytics_set_state(ADMIN_WALLETS_STATE_KEY_PLAIN, "")
+        return
+    _analytics_set_state(ADMIN_WALLETS_STATE_KEY_PLAIN, csv_value)
 
 
 def _is_valid_email(value: str) -> bool:
@@ -2188,7 +2261,7 @@ def _render_admin_page() -> str:
         const pubBtn = r.is_published
           ? `<button class="btn" style="padding:5px 10px;font-size:12px" onclick="setFaqPublished(${{r.id}}, false)">Unpublish</button>`
           : `<button class="btn" style="padding:5px 10px;font-size:12px" onclick="setFaqPublished(${{r.id}}, true)">Publish</button>`;
-        html += `<td><button class="btn" style="padding:5px 10px;font-size:12px" onclick="editFaq(${{r.id}})">Edit</button> ${pubBtn} <button class="btn" style="padding:5px 10px;font-size:12px" onclick="deleteFaq(${{r.id}})">Delete</button></td>`;
+        html += `<td><button class="btn" style="padding:5px 10px;font-size:12px" onclick="editFaq(${{r.id}})">Edit</button> ${{pubBtn}} <button class="btn" style="padding:5px 10px;font-size:12px" onclick="deleteFaq(${{r.id}})">Delete</button></td>`;
         html += "</tr>";
       }}
       if (!(rows || []).length) html += '<tr><td colspan="8">No FAQ items yet.</td></tr>';
@@ -2720,6 +2793,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "report_to": _analytics_report_to_value(),
             "report_hour_utc": _analytics_report_hour_value(),
             "admin_wallets": _admin_wallets_value(),
+            "admin_wallets_encrypted": bool(_admin_wallets_fernet()),
             "last_daily_sent": _analytics_get_state("last_daily_email_date_utc"),
             "smtp_configured": bool(ANALYTICS_SMTP_HOST and ANALYTICS_SMTP_USER and ANALYTICS_SMTP_PASS),
             "analytics_db_path": str(ANALYTICS_DB_PATH),
@@ -2734,6 +2808,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "report_to": _analytics_report_to_value(),
             "report_hour_utc": _analytics_report_hour_value(),
             "admin_wallets": _admin_wallets_value(),
+            "admin_wallets_encrypted": bool(_admin_wallets_fernet()),
             "last_daily_sent": _analytics_get_state("last_daily_email_date_utc"),
             "smtp_configured": bool(ANALYTICS_SMTP_HOST and ANALYTICS_SMTP_USER and ANALYTICS_SMTP_PASS),
             "analytics_db_path": str(ANALYTICS_DB_PATH),
