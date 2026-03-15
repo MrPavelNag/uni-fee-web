@@ -757,6 +757,136 @@ class PoolsRunRequest(BaseModel):
     exclude_suffixes: list[str] = Field(default_factory=list, description="Exclude pool ids by last 4 chars")
 
 
+INTENT_OPTIONS: list[tuple[str, str]] = [
+    ("/", "Find the best pool on Uniswap"),
+    ("/pancake", "Find the best pool on PancakeSwap"),
+    ("/stables", "Find the best stablecoin yield"),
+    ("/positions", "Analise my DeFi positions"),
+    ("/help", "Get help"),
+]
+
+
+def _intent_options_html(selected_path: str) -> str:
+    rows = ['<option value="">I want to...</option>']
+    for path, label in INTENT_OPTIONS:
+        sel = " selected" if path == selected_path else ""
+        rows.append(f'<option value="{path}"{sel}>{label}</option>')
+    return "\n".join(rows)
+
+
+def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str) -> str:
+    options_html = _intent_options_html(selected_path)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Uni Fee - {page_title}</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: Inter, Arial, sans-serif;
+      background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%);
+      color: #0f172a;
+    }}
+    .container {{
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 18px;
+    }}
+    .header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+    }}
+    .title {{
+      margin: 0;
+      font-size: 30px;
+      font-weight: 800;
+      letter-spacing: 0.2px;
+    }}
+    .subtitle {{
+      margin: 4px 0 0;
+      color: #64748b;
+      font-size: 14px;
+    }}
+    .top-controls {{
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: nowrap;
+    }}
+    .intent-select {{
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 13px;
+      color: #334155;
+      background: #f8fbff;
+      min-width: 330px;
+      max-width: 430px;
+    }}
+    .connect-btn {{
+      border: 1px solid #bfdbfe;
+      border-radius: 10px;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #1d4ed8;
+      background: #eff6ff;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+    .card {{
+      background: #f3f7ff;
+      border: 1px solid #cfdcec;
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06);
+    }}
+    .card h2 {{
+      margin: 0 0 8px;
+      font-size: 22px;
+    }}
+    .hint {{
+      color: #475569;
+      margin: 0;
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div>
+        <h1 class="title">Pools Analysis</h1>
+        <p class="subtitle">Uniswap v3/v4 screening with on-screen charts, filtering and ranked pool table.</p>
+      </div>
+      <div class="top-controls">
+        <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
+          {options_html}
+        </select>
+        <button class="connect-btn" onclick="window.location.href='/connect'">Connect Wallet</button>
+      </div>
+    </div>
+    <section class="card">
+      <h2>{page_title}</h2>
+      <p class="hint">{subtitle}</p>
+    </section>
+  </div>
+  <script>
+    function navigateIntent(path) {{
+      if (!path) return;
+      window.location.href = path;
+    }}
+  </script>
+</body>
+</html>
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
     resp = HTMLResponse(HTML_PAGE)
@@ -765,13 +895,38 @@ def home(request: Request) -> HTMLResponse:
 
 
 @app.get("/stables", response_class=HTMLResponse)
-def stables_page() -> str:
-    return "<h2>Stables Analysis</h2><p>Coming soon.</p><p><a href='/'>Back</a></p>"
+def stables_page(request: Request) -> HTMLResponse:
+    resp = HTMLResponse(_render_placeholder_page("Lending Stablecoin", "This page is a placeholder for the future stablecoin workflow.", "/stables"))
+    _ensure_session_cookie(request, resp)
+    return resp
 
 
 @app.get("/positions", response_class=HTMLResponse)
-def positions_page() -> str:
-    return "<h2>My Open Positions</h2><p>Coming soon.</p><p><a href='/'>Back</a></p>"
+def positions_page(request: Request) -> HTMLResponse:
+    resp = HTMLResponse(_render_placeholder_page("DeFi Positions", "This page is a placeholder for your positions dashboard.", "/positions"))
+    _ensure_session_cookie(request, resp)
+    return resp
+
+
+@app.get("/pancake", response_class=HTMLResponse)
+def pancake_page(request: Request) -> HTMLResponse:
+    resp = HTMLResponse(_render_placeholder_page("Pancake Pool Finder", "This page is a placeholder for Pancake pool analysis.", "/pancake"))
+    _ensure_session_cookie(request, resp)
+    return resp
+
+
+@app.get("/help", response_class=HTMLResponse)
+def help_page(request: Request) -> HTMLResponse:
+    resp = HTMLResponse(_render_placeholder_page("Get a Hand", "This page is a placeholder for guided help.", "/help"))
+    _ensure_session_cookie(request, resp)
+    return resp
+
+
+@app.get("/connect", response_class=HTMLResponse)
+def connect_page(request: Request) -> HTMLResponse:
+    resp = HTMLResponse(_render_placeholder_page("Connect", "Connect is a placeholder for wallet/account integration.", ""))
+    _ensure_session_cookie(request, resp)
+    return resp
 
 
 @app.get("/api/meta")
@@ -938,19 +1093,33 @@ HTML_PAGE = """
       color: var(--muted);
       font-size: 14px;
     }
-    .nav {
+    .top-controls {
       display: flex;
       gap: 8px;
-      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: nowrap;
     }
-    .nav a {
-      color: #1d4ed8;
-      text-decoration: none;
-      border: 1px solid #bfdbfe;
-      border-radius: 999px;
-      padding: 6px 12px;
+    .intent-select {
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      padding: 8px 10px;
       font-size: 13px;
+      color: #334155;
+      background: #f8fbff;
+      min-width: 330px;
+      max-width: 430px;
+    }
+    .connect-btn {
+      border: 1px solid #bfdbfe;
+      border-radius: 10px;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #1d4ed8;
       background: #eff6ff;
+      cursor: pointer;
+      white-space: nowrap;
     }
     .grid {
       display: grid;
@@ -1323,9 +1492,16 @@ HTML_PAGE = """
         <h1 class="title">Pools Analysis</h1>
         <p class="subtitle">Uniswap v3/v4 screening with on-screen charts, filtering and ranked pool table.</p>
       </div>
-      <div class="nav">
-        <a href="/stables">Stables (later)</a>
-        <a href="/positions">My positions (later)</a>
+      <div class="top-controls">
+        <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
+          <option value="">I want to...</option>
+          <option value="/" selected>Find the best pool on Uniswap</option>
+          <option value="/pancake">Find the best pool on PancakeSwap</option>
+          <option value="/stables">Find the best stablecoin yield</option>
+          <option value="/positions">Analise my DeFi positions</option>
+          <option value="/help">Get help</option>
+        </select>
+        <button class="connect-btn" onclick="window.location.href='/connect'">Connect Wallet</button>
       </div>
     </div>
 
@@ -1495,6 +1671,11 @@ HTML_PAGE = """
     function setDays(v) {
       document.getElementById("days").value = v;
       saveFormState();
+    }
+
+    function navigateIntent(path) {
+      if (!path) return;
+      window.location.href = path;
     }
 
     function setStatus(text, cssClass) {
