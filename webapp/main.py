@@ -12,7 +12,6 @@ import base64
 import hashlib
 import re
 import secrets
-import smtplib
 import sqlite3
 import subprocess
 import sys
@@ -21,7 +20,6 @@ import time
 import uuid
 import shutil
 from datetime import datetime, timezone
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
@@ -124,24 +122,7 @@ ADMIN_WALLETS_STATE_KEY_PLAIN = "admin_wallets_csv"
 ADMIN_WALLETS_STATE_KEY_ENC = "admin_wallets_csv_enc_v1"
 ANALYTICS_DB_PATH = Path(os.environ.get("ANALYTICS_DB_PATH", str(CATALOG_DIR / "analytics.sqlite3")))
 ANALYTICS_ENABLED = os.environ.get("ANALYTICS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-ANALYTICS_DAILY_EMAIL_ENABLED = os.environ.get("ANALYTICS_DAILY_EMAIL_ENABLED", "1").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-ANALYTICS_REPORT_TO = os.environ.get("ANALYTICS_REPORT_TO", "nagibin@gmail.ru").strip()
-ANALYTICS_REPORT_HOUR_UTC = max(0, min(23, int(os.environ.get("ANALYTICS_REPORT_HOUR_UTC", "7"))))
-ANALYTICS_SMTP_HOST = os.environ.get("ANALYTICS_SMTP_HOST", "").strip()
-ANALYTICS_SMTP_PORT = int(os.environ.get("ANALYTICS_SMTP_PORT", "587"))
-ANALYTICS_SMTP_USER = os.environ.get("ANALYTICS_SMTP_USER", "").strip()
-ANALYTICS_SMTP_PASS = os.environ.get("ANALYTICS_SMTP_PASS", "").strip()
-ANALYTICS_SMTP_FROM = os.environ.get("ANALYTICS_SMTP_FROM", ANALYTICS_SMTP_USER).strip()
-ANALYTICS_SMTP_TLS = os.environ.get("ANALYTICS_SMTP_TLS", "1").strip().lower() in ("1", "true", "yes", "on")
-ANALYTICS_REPORT_SUBJECT_PREFIX = os.environ.get("ANALYTICS_REPORT_SUBJECT_PREFIX", "Uni Fee analytics").strip()
 WALLETCONNECT_PROJECT_ID = os.environ.get("WALLETCONNECT_PROJECT_ID", "").strip()
-ANALYTICS_STOP = threading.Event()
-ANALYTICS_THREAD: threading.Thread | None = None
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -296,18 +277,6 @@ def _analytics_log_event(session_id: str, event_type: str, path: str = "", paylo
         pass
 
 
-def _analytics_report_window_utc(day_offset: int = 1) -> tuple[str, str, str]:
-    now = datetime.now(timezone.utc)
-    report_day = now.date().toordinal() - day_offset
-    start = datetime.fromordinal(report_day).replace(tzinfo=timezone.utc)
-    end = datetime.fromordinal(report_day + 1).replace(tzinfo=timezone.utc)
-    return (
-        start.isoformat(timespec="seconds").replace("+00:00", "Z"),
-        end.isoformat(timespec="seconds").replace("+00:00", "Z"),
-        start.date().isoformat(),
-    )
-
-
 def _analytics_bucket_expr(period: str) -> str:
     p = (period or "day").strip().lower()
     # ts is ISO-like text in UTC: 2026-03-15T17:00:00Z
@@ -321,160 +290,13 @@ def _analytics_bucket_expr(period: str) -> str:
     return "substr(ts, 1, 10)"
 
 
-def _analytics_build_daily_report(day_offset: int = 1) -> tuple[str, str]:
-    start_ts, end_ts, day_label = _analytics_report_window_utc(day_offset=day_offset)
-    if not ANALYTICS_ENABLED:
-        return day_label, "Analytics is disabled."
-    with _analytics_conn() as conn:
-        total_events = conn.execute(
-            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ?",
-            (start_ts, end_ts),
-        ).fetchone()[0]
-        page_views = conn.execute(
-            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'page_view'",
-            (start_ts, end_ts),
-        ).fetchone()[0]
-        visitors = conn.execute(
-            "SELECT COUNT(DISTINCT session_id) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'page_view'",
-            (start_ts, end_ts),
-        ).fetchone()[0]
-        runs_started = conn.execute(
-            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'run_start'",
-            (start_ts, end_ts),
-        ).fetchone()[0]
-        runs_done = conn.execute(
-            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'run_done'",
-            (start_ts, end_ts),
-        ).fetchone()[0]
-        runs_failed = conn.execute(
-            "SELECT COUNT(*) FROM analytics_events WHERE ts >= ? AND ts < ? AND event_type = 'run_failed'",
-            (start_ts, end_ts),
-        ).fetchone()[0]
-        top_pages = conn.execute(
-            """
-            SELECT path, COUNT(*) c
-            FROM analytics_events
-            WHERE ts >= ? AND ts < ? AND event_type = 'page_view'
-            GROUP BY path
-            ORDER BY c DESC
-            LIMIT 8
-            """,
-            (start_ts, end_ts),
-        ).fetchall()
-        top_pairs = conn.execute(
-            """
-            SELECT payload, COUNT(*) c
-            FROM analytics_events
-            WHERE ts >= ? AND ts < ? AND event_type = 'run_start'
-            GROUP BY payload
-            ORDER BY c DESC
-            LIMIT 8
-            """,
-            (start_ts, end_ts),
-        ).fetchall()
-
-    lines = [
-        f"Uni Fee daily report (UTC): {day_label}",
-        "",
-        f"Visitors (unique sessions): {visitors}",
-        f"Page views: {page_views}",
-        f"Run starts: {runs_started}",
-        f"Run success: {runs_done}",
-        f"Run failed: {runs_failed}",
-        f"All tracked events: {total_events}",
-        "",
-        "Top pages:",
-    ]
-    if top_pages:
-        lines.extend([f"- {path or '/'}: {count}" for path, count in top_pages])
-    else:
-        lines.append("- no page views")
-    lines.append("")
-    lines.append("Top requested pairs:")
-    if top_pairs:
-        lines.extend([f"- {pairs}: {count}" for pairs, count in top_pairs if pairs])
-        if not any(pairs for pairs, _ in top_pairs):
-            lines.append("- no run requests")
-    else:
-        lines.append("- no run requests")
-    return day_label, "\n".join(lines)
-
-
-def _send_email_smtp(*, to_email: str, subject: str, body: str) -> tuple[bool, str]:
-    if not ANALYTICS_SMTP_HOST or not ANALYTICS_SMTP_USER or not ANALYTICS_SMTP_PASS:
-        return False, "SMTP credentials are missing (ANALYTICS_SMTP_HOST/USER/PASS)."
-    if not to_email:
-        return False, "Recipient email is empty."
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = ANALYTICS_SMTP_FROM or ANALYTICS_SMTP_USER
-    msg["To"] = to_email
-    msg.set_content(body)
-    try:
-        with smtplib.SMTP(ANALYTICS_SMTP_HOST, ANALYTICS_SMTP_PORT, timeout=25) as smtp:
-            smtp.ehlo()
-            if ANALYTICS_SMTP_TLS:
-                smtp.starttls()
-                smtp.ehlo()
-            smtp.login(ANALYTICS_SMTP_USER, ANALYTICS_SMTP_PASS)
-            smtp.send_message(msg)
-        return True, "sent"
-    except Exception as e:
-        return False, str(e)
-
-
-def _send_daily_analytics_report(force: bool = False) -> tuple[bool, str]:
-    if not ANALYTICS_ENABLED:
-        return False, "Analytics disabled."
-    if not _analytics_daily_enabled_value() and not force:
-        return False, "Daily email disabled."
-    now = datetime.now(timezone.utc)
-    today = now.date().isoformat()
-    if not force:
-        if now.hour < _analytics_report_hour_value():
-            return False, "Too early for daily send."
-        last_sent = _analytics_get_state("last_daily_email_date_utc")
-        if last_sent == today:
-            return False, "Already sent today."
-    day_label, body = _analytics_build_daily_report(day_offset=1)
-    subject = f"{ANALYTICS_REPORT_SUBJECT_PREFIX} | {day_label}"
-    ok, info = _send_email_smtp(to_email=_analytics_report_to_value(), subject=subject, body=body)
-    if ok:
-        _analytics_set_state("last_daily_email_date_utc", today)
-        return True, f"Sent: {subject}"
-    return False, info
-
-
-def _send_test_analytics_email() -> tuple[bool, str]:
-    day_label, body = _analytics_build_daily_report(day_offset=0)
-    subject = f"{ANALYTICS_REPORT_SUBJECT_PREFIX} TEST | {day_label}"
-    return _send_email_smtp(to_email=_analytics_report_to_value(), subject=subject, body=body)
-
-
-def _analytics_loop() -> None:
-    # Lightweight scheduler: check once per minute.
-    while not ANALYTICS_STOP.wait(60):
-        try:
-            _send_daily_analytics_report(force=False)
-        except Exception:
-            continue
-
-
 def _start_analytics() -> None:
-    global ANALYTICS_THREAD
     _migrate_analytics_db_if_needed()
     _init_analytics_db()
-    if not ANALYTICS_ENABLED:
-        return
-    if ANALYTICS_THREAD and ANALYTICS_THREAD.is_alive():
-        return
-    ANALYTICS_STOP.clear()
-    ANALYTICS_THREAD = threading.Thread(target=_analytics_loop, daemon=True, name="analytics-daily-email")
-    ANALYTICS_THREAD.start()
 
 
 def _stop_analytics() -> None:
-    ANALYTICS_STOP.set()
+    return
 
 
 def _public_base_url(request: Request) -> str:
@@ -527,26 +349,6 @@ def _require_admin(request: Request, response: Response) -> tuple[str, dict[str,
     if not auth or not _is_admin_address(str(auth.get("address") or "")):
         raise HTTPException(status_code=403, detail="Admin access required.")
     return sid, auth
-
-
-def _analytics_daily_enabled_value() -> bool:
-    raw = _analytics_get_state("daily_email_enabled")
-    if not raw:
-        return ANALYTICS_DAILY_EMAIL_ENABLED
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _analytics_report_to_value() -> str:
-    raw = _analytics_get_state("report_to")
-    return raw.strip() if raw.strip() else ANALYTICS_REPORT_TO
-
-
-def _analytics_report_hour_value() -> int:
-    raw = _analytics_get_state("report_hour_utc")
-    try:
-        return max(0, min(23, int(raw)))
-    except Exception:
-        return ANALYTICS_REPORT_HOUR_UTC
 
 
 def _parse_admin_wallets_csv(raw: str) -> list[str]:
@@ -660,18 +462,6 @@ def _is_valid_email(value: str) -> bool:
 def _ticket_number(ticket_id: int) -> int:
     # First ticket id=1 -> number 12000.
     return 11999 + max(1, int(ticket_id))
-
-
-def _ticket_subject(ticket_no: int, subject: str) -> str:
-    return f"[Ticket #{ticket_no}] {subject.strip()}"
-
-
-def _send_ticket_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
-    if not to_email:
-        return False, "Email is empty."
-    if not _is_valid_email(to_email):
-        return False, "Invalid email."
-    return _send_email_smtp(to_email=to_email, subject=subject, body=body)
 
 
 def _create_help_ticket(
@@ -1635,12 +1425,6 @@ class AuthVerifyRequest(BaseModel):
     signature: str
 
 
-class AdminSettingsUpdate(BaseModel):
-    daily_email_enabled: bool | None = None
-    report_to: str | None = None
-    report_hour_utc: int | None = None
-
-
 class AdminWalletUpdate(BaseModel):
     action: str
     address: str
@@ -1662,7 +1446,6 @@ class HelpTicketUpdate(BaseModel):
 class HelpTicketReply(BaseModel):
     ticket_id: int
     message: str
-    email: str = ""
 
 
 class HelpTicketDelete(BaseModel):
@@ -1912,6 +1695,56 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       if (!path) return;
       window.location.href = path;
     }}
+    function refreshIntentMenu() {{
+      const sel = document.getElementById("intentSelect");
+      if (!sel) return;
+      sel.style.position = "absolute";
+      sel.style.left = "-9999px";
+      sel.style.opacity = "0";
+      sel.style.pointerEvents = "none";
+      let wrap = document.getElementById("intentMenuWrap");
+      if (!wrap) {{
+        wrap = document.createElement("div");
+        wrap.id = "intentMenuWrap";
+        wrap.style.cssText = "position:relative;min-width:240px;max-width:280px;";
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.id = "intentMenuBtn";
+        btn.style.cssText = "width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);";
+        const list = document.createElement("div");
+        list.id = "intentMenuList";
+        list.style.cssText = "display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;";
+        wrap.appendChild(btn);
+        wrap.appendChild(list);
+        sel.insertAdjacentElement("afterend", wrap);
+        btn.onclick = () => {{
+          list.style.display = list.style.display === "block" ? "none" : "block";
+        }};
+        document.addEventListener("click", (e) => {{
+          if (!wrap.contains(e.target)) list.style.display = "none";
+        }});
+      }}
+      const btn = document.getElementById("intentMenuBtn");
+      const list = document.getElementById("intentMenuList");
+      const options = Array.from(sel.options || []);
+      const selected = options.find((o) => o.selected) || options[0];
+      btn.textContent = selected ? selected.textContent : "Select";
+      list.innerHTML = options.map((o) => {{
+        const active = o.value === sel.value;
+        const style = active
+          ? "display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;"
+          : "display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;";
+        return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`;
+      }}).join("");
+      Array.from(list.querySelectorAll("button[data-v]")).forEach((b) => {{
+        b.onclick = () => {{
+          const v = b.getAttribute("data-v") || "";
+          sel.value = v;
+          list.style.display = "none";
+          navigateIntent(v);
+        }};
+      }});
+    }}
 
     function getEthereumProviders() {{
       const out = [];
@@ -2002,6 +1835,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       }} else if (!isAdmin && existing) {{
         existing.remove();
       }}
+      refreshIntentMenu();
     }}
 
     function setAuthUI() {{
@@ -2182,6 +2016,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
     }}
 
     loadAuthState();
+    refreshIntentMenu();
   </script>
 </body>
 </html>
@@ -2242,12 +2077,13 @@ def _render_admin_page() -> str:
     .wallet-item {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 12px; background: #eff6ff; color: #1d4ed8; font-weight: 700; text-align: left; cursor: pointer; }}
     .wallet-item.disabled {{ opacity: 0.6; cursor: not-allowed; }}
     .wallet-note {{ color: #64748b; font-size: 12px; margin-top: 8px; }}
-    .ticket-toolbar {{ display: grid; grid-template-columns: auto 150px 220px 130px minmax(220px, 1fr) auto; gap: 8px; align-items: end; margin-top: 8px; }}
+    .ticket-controls {{ margin-top: 8px; padding: 10px; border: 1px solid #dbeafe; border-radius: 10px; background: #f8fbff; }}
+    .ticket-toolbar {{ display: grid; grid-template-columns: auto 150px 220px 130px minmax(220px, 1fr) auto; gap: 8px; align-items: end; margin-top: 2px; }}
     .ticket-filters {{ display: contents; }}
     .ticket-filter-item label {{ display: block; font-size: 11px; color: #64748b; margin-bottom: 4px; }}
     .ticket-filter-actions {{ display: contents; }}
-    .ticket-intro {{ margin: 0 0 8px; font-size: 15px; font-weight: 700; color: #1f3a8a; }}
-    .tickets-results {{ margin-top: 12px; border-top: 2px solid #dbeafe; padding-top: 10px; }}
+    .ticket-intro {{ margin: 8px 0 14px; font-size: 16px; font-weight: 700; color: #475569; line-height: 1.35; }}
+    .tickets-results {{ margin-top: 14px; border-top: 2px solid #dbeafe; padding-top: 12px; }}
     .tickets-board {{ display: grid; gap: 10px; margin-top: 10px; }}
     .ticket-card {{ border: 1px solid #dbe3ef; border-radius: 10px; background: #f8fbff; padding: 10px; }}
     .ticket-head {{ display: grid; grid-template-columns: 120px 1fr 190px; gap: 10px; align-items: start; }}
@@ -2256,13 +2092,9 @@ def _render_admin_page() -> str:
     .ticket-status-badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #cbd5e1; font-weight: 700; font-size: 11px; }}
     .ticket-status-badge.active {{ color: #15803d !important; border-color: #86efac; background: #f0fdf4; }}
     .ticket-status-badge.done {{ color: #475569 !important; border-color: #cbd5e1; background: #f8fafc; }}
-    .ticket-author {{ margin-top: 8px; border: 1px dashed #bfdbfe; border-radius: 8px; background: #eef4ff; padding: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }}
-    .ticket-author .label {{ font-size: 11px; color: #64748b; margin-right: 4px; }}
-    .ticket-author .value {{ font-size: 12px; color: #0f172a; word-break: break-all; }}
-    .ticket-preview {{ margin-top: 8px; padding: 8px; border: 1px dashed #cbd5e1; border-radius: 8px; font-size: 12px; color: #334155; background: #f8fbff; }}
-    .ticket-preview b {{ color: #0f172a; }}
-    .ticket-preview .who {{ display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 11px; border: 1px solid #bfdbfe; background: #eff6ff; color: #1d4ed8; margin-right: 6px; }}
-    .ticket-preview .who.admin {{ border-color: #bbf7d0; background: #f0fdf4; color: #15803d; }}
+    .ticket-author {{ margin-top: 2px; border: 1px dashed #bfdbfe; border-radius: 10px; background: #eef4ff; padding: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }}
+    .ticket-author .label {{ font-size: 12px; color: #64748b; margin-right: 4px; font-weight: 600; }}
+    .ticket-author .value {{ font-size: 14px; color: #0f172a; word-break: break-all; }}
     .ticket-message-block {{ margin-top: 8px; }}
     .ticket-message-block .label, .ticket-reply-block .label {{ font-size: 11px; color: #64748b; margin-bottom: 4px; }}
     .ticket-message {{ margin: 0; max-height: 120px; overflow: auto; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; font-size: 12px; white-space: pre-wrap; color: #334155; }}
@@ -2279,6 +2111,7 @@ def _render_admin_page() -> str:
     .btn-danger {{ border-color: #fecaca; color: #b91c1c; background: #fef2f2; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
     @media (max-width: 1100px) {{
+      .ticket-controls {{ padding: 8px; }}
       .ticket-toolbar {{ grid-template-columns: 1fr 1fr; }}
       .ticket-head {{ grid-template-columns: 1fr 1fr; }}
       .ticket-author {{ grid-template-columns: 1fr; }}
@@ -2316,28 +2149,11 @@ def _render_admin_page() -> str:
         <div class="row"><label>Admin wallets</label><div id="adminWalletsList">-</div></div>
       </section>
       <section class="card">
-        <h3>Email stats delivery</h3>
-        <p class="hint">Daily digest settings and manual send.</p>
-        <div class="row"><label>Daily enabled</label><select id="dailyEnabled"><option value="true">enabled</option><option value="false">disabled</option></select></div>
-        <div class="row"><label>Send to email</label><input id="reportTo" type="email" placeholder="name@example.com"/></div>
-        <div class="row"><label>Hour (UTC)</label><input id="reportHour" type="number" min="0" max="23" step="1"/></div>
-        <div class="row"><label>SMTP configured</label><div id="smtpConfigured">-</div></div>
-        <div class="row"><label>SMTP setup help</label><div id="smtpHelp" class="hint">-</div></div>
-        <div class="row"><label>Last daily sent</label><div id="lastDailySent">-</div></div>
-        <button class="btn" onclick="sendSmtpTest()">Send SMTP test</button>
-        <button class="btn" onclick="saveAdminSettings()">Save settings</button>
-        <button class="btn" onclick="sendNow()">Send report now</button>
-        <span id="adminStatus" class="status">Ready</span>
-      </section>
-      <section class="card">
         <h3>Project summary</h3>
         <div class="row"><label>Analytics DB</label><div id="dbPath">-</div></div>
         <div class="row"><label>Tracked events</label><div id="eventsCount">-</div></div>
         <div class="row"><label>Token catalog</label><div id="tokenCatalogInfo">-</div></div>
-      </section>
-      <section class="card">
-        <h3>Yesterday digest preview</h3>
-        <pre id="dailyPreview">Loading...</pre>
+        <span id="adminStatus" class="status">Ready</span>
       </section>
     </div>
     <div class="grid" id="tabStats" style="display:none">
@@ -2367,31 +2183,33 @@ def _render_admin_page() -> str:
     <div class="grid" id="tabTickets" style="display:none">
       <section class="card">
         <p class="ticket-intro">Tickets submitted from Get help page. Use quick actions and collapsed conversation view.</p>
-        <div class="ticket-toolbar">
-          <button class="btn" onclick="loadTickets()">Refresh tickets</button>
-          <div class="ticket-filters">
-          <div class="ticket-filter-item">
-            <label>Status</label>
-            <select id="ticketFilterStatus"><option value="">all</option><option value="open">active</option><option value="in_progress">in progress</option><option value="done">done</option></select>
+        <div class="ticket-controls">
+          <div class="ticket-toolbar">
+            <button class="btn" onclick="loadTickets()">Refresh tickets</button>
+            <div class="ticket-filters">
+            <div class="ticket-filter-item">
+              <label>Status</label>
+              <select id="ticketFilterStatus"><option value="">all</option><option value="open">active</option><option value="in_progress">in progress</option><option value="done">done</option></select>
+            </div>
+            <div class="ticket-filter-item">
+              <label>Email</label>
+              <input id="ticketFilterEmail" type="text" placeholder="example@domain.com"/>
+            </div>
+            <div class="ticket-filter-item">
+              <label>Ticket #</label>
+              <input id="ticketFilterNo" type="text" placeholder="12000"/>
+            </div>
+            <div class="ticket-filter-item">
+              <label>Text</label>
+              <input id="ticketFilterText" type="text" placeholder="search in subject/message/reply"/>
+            </div>
+            </div>
+            <div class="ticket-filter-actions">
+            <button class="btn" onclick="resetTicketsFilter()">Reset filters</button>
+            </div>
           </div>
-          <div class="ticket-filter-item">
-            <label>Email</label>
-            <input id="ticketFilterEmail" type="text" placeholder="example@domain.com"/>
-          </div>
-          <div class="ticket-filter-item">
-            <label>Ticket #</label>
-            <input id="ticketFilterNo" type="text" placeholder="12000"/>
-          </div>
-          <div class="ticket-filter-item">
-            <label>Text</label>
-            <input id="ticketFilterText" type="text" placeholder="search in subject/message/reply"/>
-          </div>
-          </div>
-          <div class="ticket-filter-actions">
-          <button class="btn" onclick="resetTicketsFilter()">Reset filters</button>
-          </div>
+          <span id="ticketsStatus" class="status">Ready</span>
         </div>
-        <span id="ticketsStatus" class="status">Ready</span>
         <div class="tickets-results"><div id="ticketsBoard" class="tickets-board"></div></div>
       </section>
     </div>
@@ -2426,13 +2244,14 @@ def _render_admin_page() -> str:
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
+    function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:240px;max-width:280px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
     function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
     function getWalletProvider(wallet) {{ const providers=getEthereumProviders(); const pick=(pred)=>providers.find(pred)||null; if(wallet==="injected") return pick((p)=>!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isCoinbaseWallet)||providers[0]||window.ethereum||null; if(wallet==="rabby") return pick((p)=>!!p?.isRabby)||(window.ethereum?.isRabby?window.ethereum:null); if(wallet==="phantom"){{ if(window.phantom?.ethereum?.request) return window.phantom.ethereum; return pick((p)=>!!p?.isPhantom)||(window.ethereum?.isPhantom?window.ethereum:null); }} if(wallet==="metamask") return pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||((window.ethereum?.isMetaMask&&!window.ethereum?.isRabby&&!window.ethereum?.isPhantom&&!window.ethereum?.isCoinbaseWallet)?window.ethereum:null); if(wallet==="coinbase") return pick((p)=>!!p?.isCoinbaseWallet)||(window.ethereum?.isCoinbaseWallet?window.ethereum:null); return null; }}
     function getWalletChoices() {{ const order=["walletconnect","rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>({{id,label:WALLET_LABELS[id],available:id==="walletconnect"?!!WALLETCONNECT_PROJECT_ID:!!getWalletProvider(id)}})); }}
     function openWalletModal() {{ const list=document.getElementById("walletList"); const choices=getWalletChoices(); list.innerHTML=choices.map((w)=>{{ const cls=w.available?"wallet-item":"wallet-item disabled"; const dis=w.available?"":"disabled"; const label=w.available?w.label:`${{w.label}} (not detected)`; return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{label}}</button>`; }}).join(""); document.getElementById("walletModalBackdrop").style.display="flex"; }}
     function closeWalletModal(event) {{ if(event&&event.target&&event.target.id!=="walletModalBackdrop") return; document.getElementById("walletModalBackdrop").style.display="none"; }}
     async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
-    function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} }}
+    function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} refreshIntentMenu(); }}
     function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; if(authState?.authenticated) {{ btn.textContent=authState.address_short||"Wallet connected"; }} else {{ btn.textContent="Connect Wallet"; }} syncAdminIntentOption(); }}
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
@@ -2601,12 +2420,6 @@ def _render_admin_page() -> str:
     function renderTickets(rows) {{
       const board = document.getElementById("ticketsBoard");
       const f = getTicketsFilter();
-      const statusLabel = (raw) => {{
-        const s = normStatus(raw || "");
-        if (s === "open") return "active";
-        if (s === "in_progress") return "in progress";
-        return "done";
-      }};
       const filtered = (rows || []).filter((r) => {{
         const status = normStatus(r.status || "");
         const email = String(r.email || "").toLowerCase();
@@ -2622,17 +2435,8 @@ def _render_admin_page() -> str:
       let html = "";
       for (let idx = 0; idx < filtered.length; idx++) {{
         const r = filtered[idx];
-        const normalizedStatus = normStatus(r.status || "");
-        const unresolved = normalizedStatus !== "done";
-        const badgeCls = unresolved ? "active" : "done";
-        const badgeText = statusLabel(normalizedStatus);
         html += `<div class="ticket-card">`;
-        html += `<div class="ticket-head">`;
-        html += `<div class="meta"><div class="mono"><b>#${{esc(r.ticket_no || r.id)}}</b></div><div class="mono">${{esc(r.ts)}}</div></div>`;
-        html += `<div class="meta"><div><b>${{esc(r.subject)}}</b></div></div>`;
-        html += `<div class="meta"><span class="ticket-status-badge ${{badgeCls}}">${{esc(badgeText)}}</span></div>`;
-        html += `</div>`;
-        html += `<div class="ticket-author"><div><span class="label">Name:</span><span class="value">${{esc(r.name || "-")}}</span></div><div><span class="label">Email:</span><span class="value">${{esc(r.email || "-")}}</span></div><div><span class="label">Wallet:</span><span class="value mono">${{esc(r.wallet_address || "-")}}</span></div><div><span class="label">Ticket #:</span><span class="value">${{esc(r.ticket_no || r.id)}}</span></div></div>`;
+        html += `<div class="ticket-author"><div><span class="label">Name:</span><span class="value">${{esc(r.name || "-")}}</span></div><div><span class="label">Email:</span><span class="value">${{esc(r.email || "-")}}</span></div><div><span class="label">Wallet:</span><span class="value mono">${{esc(r.wallet_address || "-")}}</span></div><div><span class="label">Ticket #:</span><span class="value">${{esc(r.ticket_no || r.id)}}</span></div><div><span class="label">Created:</span><span class="value">${{esc(r.ts || "-")}}</span></div></div>`;
         const thread = Array.isArray(r.thread) && r.thread.length
           ? r.thread
           : [
@@ -2646,14 +2450,6 @@ def _render_admin_page() -> str:
           const msg = esc(m.message || "");
           return `<div class="admin-msg-bubble ${{who}}"><div class="admin-msg-head"><span>${{whoLabel}}</span><span>${{ts}}</span></div>${{msg}}</div>`;
         }}).join("\\n\\n");
-        const lastMsgObj = thread.length ? thread[thread.length - 1] : null;
-        const lastWhoRaw = String(lastMsgObj?.author_type || "user").toLowerCase();
-        const lastWho = lastWhoRaw === "admin" ? "admin" : "user";
-        const lastWhoLabel = lastWho === "admin" ? "Admin" : "User";
-        const lastTs = String(lastMsgObj?.ts || "");
-        const lastBody = String(lastMsgObj?.message || "").replace(/\\s+/g, " ").trim();
-        const lastShort = lastBody.length > 140 ? (lastBody.slice(0, 140) + "...") : lastBody;
-        html += `<div class="ticket-preview"><b>Last message:</b> <span class="who ${{lastWho}}">${{lastWhoLabel}}</span><span class="mono">${{esc(lastTs)}}</span><div style="margin-top:4px">${{esc(lastShort || "(empty)")}}</div></div>`;
         if (idx === 0) {{
           html += `<div class="ticket-message-block"><div class="label">Conversation (${{thread.length}} messages)</div><div class="admin-thread">${{threadHtml}}</div></div>`;
         }} else {{
@@ -2689,9 +2485,12 @@ def _render_admin_page() -> str:
         if (sendReply) payload.admin_note = note;
         const data = await postJson("/api/admin/help-tickets/update", payload);
         const no = data.ticket_no || ticketId;
-        const extra = data.email_info ? `, ${{data.email_info}}` : "";
         const verb = sendReply ? "updated" : "closed";
-        setTicketsStatus(`Ticket #${{no}} ${{verb}}${{extra}}`, false);
+        setTicketsStatus(`Ticket #${{no}} ${{verb}}`, false);
+        if (sendReply) {{
+          const area = document.getElementById(`note_${{ticketId}}`);
+          if (area) area.value = "";
+        }}
         await loadTickets();
       }} catch (e) {{
         setTicketsStatus("Update failed: " + (e?.message || "unknown"), true);
@@ -2803,18 +2602,9 @@ def _render_admin_page() -> str:
         const r = await fetch("/api/admin/settings");
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || "Failed to load admin settings");
-        document.getElementById("dailyEnabled").value = data.daily_email_enabled ? "true" : "false";
-        document.getElementById("reportTo").value = data.report_to || "";
-        document.getElementById("reportHour").value = Number(data.report_hour_utc || 7);
-        document.getElementById("smtpConfigured").textContent = data.smtp_configured ? "yes" : "no";
-        document.getElementById("smtpHelp").textContent = data.smtp_configured
-          ? "SMTP is configured."
-          : "Set env vars: ANALYTICS_SMTP_HOST, ANALYTICS_SMTP_PORT, ANALYTICS_SMTP_USER, ANALYTICS_SMTP_PASS, ANALYTICS_SMTP_FROM, then redeploy.";
-        document.getElementById("lastDailySent").textContent = data.last_daily_sent || "-";
         document.getElementById("dbPath").textContent = data.analytics_db_path || "-";
         document.getElementById("eventsCount").textContent = String(data.events_count || 0);
         document.getElementById("tokenCatalogInfo").textContent = `updated: ${{data.token_catalog_updated_at || "-"}}, count: ${{data.token_catalog_count || 0}}`;
-        document.getElementById("dailyPreview").textContent = data.daily_preview || "";
         renderAdminWallets(data.admin_wallets || []);
       }} catch (e) {{
         setAdminStatus("Load failed: " + (e?.message || "unknown"), true);
@@ -2850,39 +2640,10 @@ def _render_admin_page() -> str:
         setAdminStatus("Remove admin failed: " + (e?.message || "unknown"), true);
       }}
     }}
-    async function saveAdminSettings() {{
-      try {{
-        const payload = {{
-          daily_email_enabled: document.getElementById("dailyEnabled").value === "true",
-          report_to: document.getElementById("reportTo").value.trim(),
-          report_hour_utc: Number(document.getElementById("reportHour").value || 7),
-        }};
-        const data = await postJson("/api/admin/settings", payload);
-        setAdminStatus(data.info || "Saved", false);
-        await loadAdmin();
-      }} catch (e) {{
-        setAdminStatus("Save failed: " + (e?.message || "unknown"), true);
-      }}
-    }}
-    async function sendNow() {{
-      try {{
-        const data = await postJson("/api/admin/send-now", {{}});
-        setAdminStatus(data.info || (data.ok ? "Sent" : "Not sent"), !data.ok);
-      }} catch (e) {{
-        setAdminStatus("Send failed: " + (e?.message || "unknown"), true);
-      }}
-    }}
-    async function sendSmtpTest() {{
-      try {{
-        const data = await postJson("/api/admin/smtp-test", {{}});
-        setAdminStatus(data.info || (data.ok ? "SMTP test sent" : "SMTP test failed"), !data.ok);
-      }} catch (e) {{
-        setAdminStatus("SMTP test failed: " + (e?.message || "unknown"), true);
-      }}
-    }}
     loadAuthState();
     loadAdmin();
     setupTicketFiltersAutoApply();
+    refreshIntentMenu();
   </script>
 </body>
 </html>
@@ -2988,13 +2749,14 @@ def _render_help_page() -> str:
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
+    function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:240px;max-width:280px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
     function getEthereumProviders() {{ const out=[]; const eth=window.ethereum; if(!eth) return out; if(Array.isArray(eth.providers)&&eth.providers.length) return eth.providers; out.push(eth); return out; }}
     function getWalletProvider(wallet) {{ const providers=getEthereumProviders(); const pick=(pred)=>providers.find(pred)||null; if(wallet==="injected") return pick((p)=>!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||pick((p)=>!!p?.isCoinbaseWallet)||providers[0]||window.ethereum||null; if(wallet==="rabby") return pick((p)=>!!p?.isRabby)||(window.ethereum?.isRabby?window.ethereum:null); if(wallet==="phantom"){{ if(window.phantom?.ethereum?.request) return window.phantom.ethereum; return pick((p)=>!!p?.isPhantom)||(window.ethereum?.isPhantom?window.ethereum:null); }} if(wallet==="metamask") return pick((p)=>!!p?.isMetaMask&&!p?.isRabby&&!p?.isPhantom&&!p?.isCoinbaseWallet)||((window.ethereum?.isMetaMask&&!window.ethereum?.isRabby&&!window.ethereum?.isPhantom&&!window.ethereum?.isCoinbaseWallet)?window.ethereum:null); if(wallet==="coinbase") return pick((p)=>!!p?.isCoinbaseWallet)||(window.ethereum?.isCoinbaseWallet?window.ethereum:null); return null; }}
     function getWalletChoices() {{ const order=["walletconnect","rabby","phantom","metamask","coinbase","injected"]; return order.map((id)=>({{id,label:WALLET_LABELS[id],available:id==="walletconnect"?!!WALLETCONNECT_PROJECT_ID:!!getWalletProvider(id)}})); }}
     function openWalletModal() {{ const list=document.getElementById("walletList"); const choices=getWalletChoices(); list.innerHTML=choices.map((w)=>{{ const cls=w.available?"wallet-item":"wallet-item disabled"; const dis=w.available?"":"disabled"; const label=w.available?w.label:`${{w.label}} (not detected)`; return `<button class="${{cls}}" ${{dis}} onclick="connectWalletFlow('${{w.id}}')">${{label}}</button>`; }}).join(""); document.getElementById("walletModalBackdrop").style.display="flex"; }}
     function closeWalletModal(event) {{ if(event&&event.target&&event.target.id!=="walletModalBackdrop") return; document.getElementById("walletModalBackdrop").style.display="none"; }}
     async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
-    function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} }}
+    function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} refreshIntentMenu(); }}
     function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; btn.textContent = authState?.authenticated ? (authState.address_short || "Wallet connected") : "Connect Wallet"; syncAdminIntentOption(); }}
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
@@ -3046,8 +2808,7 @@ def _render_help_page() -> str:
         }};
         const data = await postJson("/api/help/tickets", payload);
         const no = data.ticket_no || data.ticket_id;
-        const extra = data.email_info ? `, ${{data.email_info}}` : "";
-        setTicketStatus(`Ticket #${{no}} sent${{extra}}`, false);
+        setTicketStatus(`Ticket #${{no}} sent`, false);
         document.getElementById("tSubject").value = "";
         document.getElementById("tMessage").value = "";
         await loadMyTickets();
@@ -3119,11 +2880,9 @@ def _render_help_page() -> str:
         const el = document.getElementById(`myReply_${{ticketId}}`);
         const message = (el?.value || "").trim();
         if (message.length < 2) throw new Error("Reply is too short");
-        const email = (document.getElementById("tEmail")?.value || "").trim();
-        const data = await postJson("/api/help/tickets/reply", {{ticket_id: Number(ticketId), message, email}});
+        const data = await postJson("/api/help/tickets/reply", {{ticket_id: Number(ticketId), message}});
         const no = data.ticket_no || ticketId;
-        const extra = data.email_info ? `, ${{data.email_info}}` : "";
-        setTicketStatus(`Reply sent for ticket #${{no}}${{extra}}`, false);
+        setTicketStatus(`Reply sent for ticket #${{no}}`, false);
         if (el) el.value = "";
         await loadMyTickets();
       }} catch (e) {{
@@ -3143,6 +2902,7 @@ def _render_help_page() -> str:
     loadAuthState();
     loadFaq();
     loadMyTickets();
+    refreshIntentMenu();
     setInterval(() => loadMyTickets(), 30000);
   </script>
 </body>
@@ -3346,54 +3106,24 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
         if ANALYTICS_ENABLED:
             with _analytics_conn() as conn:
                 events_count = int(conn.execute("SELECT COUNT(*) FROM analytics_events").fetchone()[0])
-        _, preview = _analytics_build_daily_report(day_offset=1)
         return {
-            "daily_email_enabled": _analytics_daily_enabled_value(),
-            "report_to": _analytics_report_to_value(),
-            "report_hour_utc": _analytics_report_hour_value(),
             "admin_wallets": _admin_wallets_value(),
             "admin_wallets_encrypted": bool(_admin_wallets_fernet()),
-            "last_daily_sent": _analytics_get_state("last_daily_email_date_utc"),
-            "smtp_configured": bool(ANALYTICS_SMTP_HOST and ANALYTICS_SMTP_USER and ANALYTICS_SMTP_PASS),
             "analytics_db_path": str(ANALYTICS_DB_PATH),
             "events_count": events_count,
             "token_catalog_updated_at": token_catalog.get("updated_at"),
             "token_catalog_count": token_catalog.get("count", 0),
-            "daily_preview": preview,
         }
     except Exception as e:
         return {
-            "daily_email_enabled": _analytics_daily_enabled_value(),
-            "report_to": _analytics_report_to_value(),
-            "report_hour_utc": _analytics_report_hour_value(),
             "admin_wallets": _admin_wallets_value(),
             "admin_wallets_encrypted": bool(_admin_wallets_fernet()),
-            "last_daily_sent": _analytics_get_state("last_daily_email_date_utc"),
-            "smtp_configured": bool(ANALYTICS_SMTP_HOST and ANALYTICS_SMTP_USER and ANALYTICS_SMTP_PASS),
             "analytics_db_path": str(ANALYTICS_DB_PATH),
             "events_count": 0,
             "token_catalog_updated_at": None,
             "token_catalog_count": 0,
-            "daily_preview": f"Admin settings fallback mode. Error: {e}",
+            "info": f"Admin settings fallback mode. Error: {e}",
         }
-
-
-@app.post("/api/admin/settings")
-def admin_settings_update(req: AdminSettingsUpdate, request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
-    if req.daily_email_enabled is not None:
-        _analytics_set_state("daily_email_enabled", "1" if req.daily_email_enabled else "0")
-    if req.report_to is not None:
-        email = req.report_to.strip()
-        if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-            raise HTTPException(status_code=400, detail="Invalid email format.")
-        _analytics_set_state("report_to", email)
-    if req.report_hour_utc is not None:
-        hour = int(req.report_hour_utc)
-        if hour < 0 or hour > 23:
-            raise HTTPException(status_code=400, detail="report_hour_utc must be in range 0..23.")
-        _analytics_set_state("report_hour_utc", str(hour))
-    return {"ok": True, "info": "Admin settings updated."}
 
 
 @app.get("/api/admin/stats")
@@ -3473,20 +3203,6 @@ def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Res
     return {"ok": True, "info": "Admin wallet removed.", "items": _admin_wallets_value()}
 
 
-@app.post("/api/admin/send-now")
-def admin_send_now(request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
-    ok, info = _send_daily_analytics_report(force=True)
-    return {"ok": ok, "info": info}
-
-
-@app.post("/api/admin/smtp-test")
-def admin_smtp_test(request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
-    ok, info = _send_test_analytics_email()
-    return {"ok": ok, "info": info}
-
-
 @app.post("/api/help/tickets")
 def create_help_ticket(req: HelpTicketCreate, request: Request, response: Response) -> dict[str, Any]:
     sid = _ensure_session_cookie(request, response)
@@ -3511,21 +3227,7 @@ def create_help_ticket(req: HelpTicketCreate, request: Request, response: Respon
     )
     _analytics_log_event(session_id=sid, event_type="help_ticket", path="/api/help/tickets", payload=str(ticket_id))
     ticket_no = _ticket_number(ticket_id)
-    email_info = ""
-    if req.email:
-        email_subject = _ticket_subject(ticket_no, subject)
-        email_body = (
-            f"Ticket #{ticket_no}\n"
-            f"Created at: {_iso_now()}\n"
-            f"Name: {(req.name or '').strip()}\n"
-            f"Email: {(req.email or '').strip()}\n"
-            f"Wallet: {wallet}\n"
-            f"Subject: {subject}\n\n"
-            f"Message:\n{message}\n"
-        )
-        ok, info = _send_ticket_email(req.email.strip(), email_subject, email_body)
-        email_info = "copy sent" if ok else f"copy failed: {info}"
-    return {"ok": True, "ticket_id": ticket_id, "ticket_no": ticket_no, "email_info": email_info}
+    return {"ok": True, "ticket_id": ticket_id, "ticket_no": ticket_no}
 
 
 @app.get("/api/help/my-tickets")
@@ -3549,7 +3251,7 @@ def reply_help_ticket(req: HelpTicketReply, request: Request, response: Response
     wallet = str(auth.get("address") or "").strip().lower()
     with _analytics_conn() as conn:
         row = conn.execute(
-            "SELECT id, session_id, wallet_address, email, subject FROM help_tickets WHERE id = ?",
+            "SELECT id, session_id, wallet_address FROM help_tickets WHERE id = ?",
             (int(req.ticket_id),),
         ).fetchone()
         if not row:
@@ -3557,8 +3259,6 @@ def reply_help_ticket(req: HelpTicketReply, request: Request, response: Response
         ticket_id = int(row[0])
         owner_sid = str(row[1] or "")
         owner_wallet = str(row[2] or "").strip().lower()
-        ticket_email = str(row[3] or "").strip()
-        ticket_subject = str(row[4] or "").strip()
     can_reply = (sid == owner_sid) or (_is_eth_address(wallet) and wallet == owner_wallet)
     if not can_reply:
         raise HTTPException(status_code=403, detail="You can reply only to your own ticket.")
@@ -3575,15 +3275,7 @@ def reply_help_ticket(req: HelpTicketReply, request: Request, response: Response
         conn.commit()
     _analytics_log_event(session_id=sid, event_type="help_ticket", path="/api/help/tickets/reply", payload=str(ticket_id))
     ticket_no = _ticket_number(ticket_id)
-    email_info = ""
-    # Optional copy to user email (existing or explicitly provided)
-    to_email = (req.email or ticket_email or "").strip()
-    if to_email and _is_valid_email(to_email):
-        subject = _ticket_subject(ticket_no, ticket_subject or "Ticket reply")
-        body = f"Your reply for ticket #{ticket_no} was received.\n\nReply:\n{msg}\n"
-        ok, info = _send_ticket_email(to_email, subject, body)
-        email_info = "copy sent" if ok else f"copy failed: {info}"
-    return {"ok": True, "ticket_no": ticket_no, "email_info": email_info}
+    return {"ok": True, "ticket_no": ticket_no}
 
 
 @app.get("/api/faq")
@@ -3612,8 +3304,6 @@ def admin_help_ticket_update(req: HelpTicketUpdate, request: Request, response: 
     status = (req.status or "").strip().lower()
     if status and status not in {"open", "in_progress", "done"}:
         raise HTTPException(status_code=400, detail="status must be open, in_progress, or done.")
-    ticket_email = ""
-    ticket_subject = ""
     ticket_no = 0
     prev_admin_note = ""
     ticket_session_id = ""
@@ -3621,7 +3311,7 @@ def admin_help_ticket_update(req: HelpTicketUpdate, request: Request, response: 
     admin_note = req.admin_note if req.admin_note is not None else None
     with _analytics_conn() as conn:
         row = conn.execute(
-            "SELECT id, session_id, wallet_address, email, subject, admin_note FROM help_tickets WHERE id = ?",
+            "SELECT id, session_id, wallet_address, admin_note FROM help_tickets WHERE id = ?",
             (int(req.ticket_id),),
         ).fetchone()
         if not row:
@@ -3629,9 +3319,7 @@ def admin_help_ticket_update(req: HelpTicketUpdate, request: Request, response: 
         ticket_no = _ticket_number(int(row[0]))
         ticket_session_id = str(row[1] or "")
         ticket_wallet = str(row[2] or "")
-        ticket_email = str(row[3] or "").strip()
-        ticket_subject = str(row[4] or "").strip()
-        prev_admin_note = str(row[5] or "").strip()
+        prev_admin_note = str(row[3] or "").strip()
         if status:
             conn.execute("UPDATE help_tickets SET status = ? WHERE id = ?", (status, int(req.ticket_id)))
         if admin_note is not None:
@@ -3646,17 +3334,7 @@ def admin_help_ticket_update(req: HelpTicketUpdate, request: Request, response: 
             session_id=ticket_session_id,
             wallet_address=ticket_wallet,
         )
-    email_info = ""
-    if admin_note and ticket_email and _is_valid_email(ticket_email):
-        subject = _ticket_subject(ticket_no, ticket_subject or "Admin reply")
-        body = (
-            f"Reply to ticket #{ticket_no}\n"
-            f"Status: {status or 'unchanged'}\n\n"
-            f"Admin reply:\n{admin_note}\n"
-        )
-        ok, info = _send_ticket_email(ticket_email, subject, body)
-        email_info = "reply sent" if ok else f"reply failed: {info}"
-    return {"ok": True, "ticket_no": ticket_no, "email_info": email_info}
+    return {"ok": True, "ticket_no": ticket_no}
 
 
 @app.post("/api/admin/help-tickets/delete")
@@ -3761,12 +3439,6 @@ def admin_faq_publish(req: AdminFaqPublish, request: Request, response: Response
         )
         conn.commit()
     return {"ok": True, "info": "FAQ publish status updated."}
-
-
-@app.post("/api/analytics/send-test")
-def send_test_analytics_email() -> dict[str, Any]:
-    ok, info = _send_test_analytics_email()
-    return {"ok": ok, "info": info, "to": ANALYTICS_REPORT_TO}
 
 
 @app.get("/api/meta")
@@ -4660,6 +4332,56 @@ HTML_PAGE = """
       if (!path) return;
       window.location.href = path;
     }
+    function refreshIntentMenu() {
+      const sel = document.getElementById("intentSelect");
+      if (!sel) return;
+      sel.style.position = "absolute";
+      sel.style.left = "-9999px";
+      sel.style.opacity = "0";
+      sel.style.pointerEvents = "none";
+      let wrap = document.getElementById("intentMenuWrap");
+      if (!wrap) {
+        wrap = document.createElement("div");
+        wrap.id = "intentMenuWrap";
+        wrap.style.cssText = "position:relative;min-width:240px;max-width:280px;";
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.id = "intentMenuBtn";
+        btn.style.cssText = "width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);";
+        const list = document.createElement("div");
+        list.id = "intentMenuList";
+        list.style.cssText = "display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;";
+        wrap.appendChild(btn);
+        wrap.appendChild(list);
+        sel.insertAdjacentElement("afterend", wrap);
+        btn.onclick = () => {
+          list.style.display = list.style.display === "block" ? "none" : "block";
+        };
+        document.addEventListener("click", (e) => {
+          if (!wrap.contains(e.target)) list.style.display = "none";
+        });
+      }
+      const btn = document.getElementById("intentMenuBtn");
+      const list = document.getElementById("intentMenuList");
+      const options = Array.from(sel.options || []);
+      const selected = options.find((o) => o.selected) || options[0];
+      btn.textContent = selected ? selected.textContent : "Select";
+      list.innerHTML = options.map((o) => {
+        const active = o.value === sel.value;
+        const style = active
+          ? "display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;"
+          : "display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;";
+        return `<button type="button" data-v="${o.value}" style="${style}">${o.textContent}</button>`;
+      }).join("");
+      Array.from(list.querySelectorAll("button[data-v]")).forEach((b) => {
+        b.onclick = () => {
+          const v = b.getAttribute("data-v") || "";
+          sel.value = v;
+          list.style.display = "none";
+          navigateIntent(v);
+        };
+      });
+    }
 
     function getEthereumProviders() {
       const out = [];
@@ -4750,6 +4472,7 @@ HTML_PAGE = """
       } else if (!isAdmin && existing) {
         existing.remove();
       }
+      refreshIntentMenu();
     }
 
     function setAuthUI() {
@@ -5546,6 +5269,7 @@ HTML_PAGE = """
     updatePairRows();
     renderEmptyCharts();
     loadAuthState();
+    refreshIntentMenu();
     loadMeta();
   </script>
 </body>
