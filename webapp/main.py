@@ -410,6 +410,16 @@ def _require_admin(request: Request, response: Response) -> tuple[str, dict[str,
     return sid, auth
 
 
+def _require_authenticated_wallet(request: Request, response: Response) -> tuple[str, str, dict[str, Any]]:
+    sid = _ensure_session_cookie(request, response)
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    wallet = str(auth.get("address") or "").strip().lower()
+    if not auth or not _is_eth_address(wallet):
+        raise HTTPException(status_code=403, detail="Wallet authorization required. Connect wallet first.")
+    return sid, wallet, auth
+
+
 def _parse_admin_wallets_csv(raw: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -2021,13 +2031,14 @@ class HelpTicketDelete(BaseModel):
 
 
 class HelpFeedbackCreate(BaseModel):
-    name: str = ""
-    email: str = ""
-    subject: str
     message: str
 
 
 class AdminFeedbackReview(BaseModel):
+    feedback_id: int
+
+
+class AdminFeedbackDelete(BaseModel):
     feedback_id: int
 
 
@@ -2063,8 +2074,15 @@ INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/pancake", "Find the best pool on PancakeSwap"),
     ("/stables", "Find the best stablecoin yield"),
     ("/positions", "Analise my DeFi positions"),
-    ("/help", "Get help"),
+    ("/help", "Send wishes or report issues"),
 ]
+
+
+def _intent_label_for_path(path: str) -> str:
+    for p, label in INTENT_OPTIONS:
+        if p == path:
+            return label
+    return "Find the best fee on Uniswap"
 
 
 def _intent_options_html(selected_path: str) -> str:
@@ -2086,6 +2104,7 @@ def _render_placeholder_page(
     show_intro: bool = True,
 ) -> str:
     options_html = _intent_options_html(selected_path)
+    selected_label = _intent_label_for_path(selected_path)
     intro_html = (
         f"""
     <section class="card">
@@ -2265,7 +2284,7 @@ def _render_placeholder_page(
     <div class="header">
       <div>
         <h1 class="title">DeFi Pools</h1>
-        <p class="subtitle">Find the best fee on Uniswap</p>
+        <p class="subtitle">{selected_label}</p>
       </div>
       <div class="top-controls">
         <span class="intent-prefix">I want to</span>
@@ -2646,17 +2665,18 @@ def _render_positions_page() -> str:
       padding: 14px;
       box-shadow: 0 6px 20px rgba(15,23,42,0.06);
     }
-    .positions-form h3, .result-card h3 { margin:0 0 8px; font-size:17px; color:#1f3a8a; }
+    .positions-form h3, .result-card h3 { margin:0; font-size:17px; color:#1f3a8a; }
+    .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }
     .address-columns { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
     .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
-    .addr-box h4 { margin:0 0 8px; font-size:14px; color:#1e40af; letter-spacing:0.1px; }
     .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
     .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; }
+    .btn-plus { width:34px; min-width:34px; height:34px; border-radius:8px; padding:0; font-size:18px; line-height:1; display:inline-flex; align-items:center; justify-content:center; }
     .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; min-height:26px; }
     .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
     .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; }
     .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
-    .positions-actions { display:flex; gap:10px; align-items:center; margin-top:6px; }
+    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:13px; font-weight:700; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; }
     .pos-status { color:#475569; font-size:13px; }
     .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
@@ -2670,49 +2690,44 @@ def _render_positions_page() -> str:
     extra_html = f"""
     <div class="positions-grid">
       <section class="positions-form">
-        <h3>Scan addresses by network type</h3>
-        <p class="hint" style="margin-bottom:10px">EVM addresses are scanned across all supported EVM chains automatically. Lending scan stays as is (Aave v3).</p>
+        <div class="section-head">
+          <h3>My Crypto Portfolio</h3>
+          <span class="pos-status" id="posStatus">Ready</span>
+        </div>
         <div class="address-columns">
           <div class="addr-box">
-            <h4>EVM</h4>
             <div class="addr-input-row">
               <input id="evmInput" placeholder="0x..." />
-              <button class="btn" type="button" onclick="addAddress('evm')">Add</button>
+              <button class="btn btn-plus" type="button" onclick="addAddress('evm')" aria-label="Add EVM address">+</button>
             </div>
             <div class="chips" id="evmChips"></div>
           </div>
           <div class="addr-box">
-            <h4>Solana</h4>
             <div class="addr-input-row">
               <input id="solanaInput" placeholder="Solana address" />
-              <button class="btn" type="button" onclick="addAddress('solana')">Add</button>
+              <button class="btn btn-plus" type="button" onclick="addAddress('solana')" aria-label="Add Solana address">+</button>
             </div>
             <div class="chips" id="solanaChips"></div>
           </div>
           <div class="addr-box">
-            <h4>TRON</h4>
             <div class="addr-input-row">
               <input id="tronInput" placeholder="TRON address" />
-              <button class="btn" type="button" onclick="addAddress('tron')">Add</button>
+              <button class="btn btn-plus" type="button" onclick="addAddress('tron')" aria-label="Add TRON address">+</button>
             </div>
             <div class="chips" id="tronChips"></div>
           </div>
         </div>
-        <div class="positions-actions">
-          <button class="btn" type="button" onclick="scanPositions()">Find positions</button>
-          <span class="pos-status" id="posStatus">Ready</span>
-        </div>
       </section>
       <section class="result-card">
-        <h3>Pool positions</h3>
+        <div class="section-head"><h3>Pool positions</h3><button class="search-link-btn" type="button" onclick="scanPositions()">Search</button></div>
         <div class="table-wrap"><table id="posPoolsTable"></table></div>
       </section>
       <section class="result-card">
-        <h3>Lending positions</h3>
+        <div class="section-head"><h3>Lending positions</h3><button class="search-link-btn" type="button" onclick="scanPositions()">Search</button></div>
         <div class="table-wrap"><table id="posLendingTable"></table></div>
       </section>
       <section class="result-card">
-        <h3>Unclaimed lending rewards</h3>
+        <div class="section-head"><h3>Unclaimed lending rewards</h3><button class="search-link-btn" type="button" onclick="scanPositions()">Search</button></div>
         <div class="table-wrap"><table id="posRewardsTable"></table></div>
         <div id="posErrors"></div>
       </section>
@@ -3004,7 +3019,7 @@ def _render_admin_page() -> str:
     <div class="header">
       <div>
         <h1 class="title">DeFi Pools</h1>
-        <p class="subtitle">Administer project settings and analytics delivery.</p>
+        <p class="subtitle">Administer project</p>
       </div>
       <div class="top-controls">
         <span class="intent-prefix">I want to</span>
@@ -3062,7 +3077,7 @@ def _render_admin_page() -> str:
     </div>
     <div class="grid" id="tabTickets" style="display:none">
       <section class="card">
-        <p class="ticket-intro">Tickets submitted from Get help page. Use quick actions and collapsed conversation view.</p>
+        <p class="ticket-intro">Tickets submitted from Send wishes or report issues page. Use quick actions and collapsed conversation view.</p>
         <div class="ticket-controls">
           <div class="ticket-toolbar">
             <div class="ticket-filters">
@@ -3095,8 +3110,7 @@ def _render_admin_page() -> str:
     <div class="grid" id="tabFeedback" style="display:none">
       <section class="card">
         <h3>Wishes and issue reports</h3>
-        <p class="hint">Messages from Get help page. Press Reviewed to archive and collapse.</p>
-        <button class="btn" onclick="loadFeedback()">Refresh feedback</button>
+        <p class="hint">Messages from Send wishes or report issues page. Press Reviewed to archive and collapse.</p>
         <span id="feedbackStatus" class="status">Ready</span>
         <div id="feedbackBoard" class="feedback-board"></div>
       </section>
@@ -3104,7 +3118,7 @@ def _render_admin_page() -> str:
     <div class="grid" id="tabFaq" style="display:none">
       <section class="card">
         <h3>FAQ management</h3>
-        <p class="hint">Create, edit, publish FAQ items shown on Get help page.</p>
+        <p class="hint">Create, edit, publish FAQ items shown on Send wishes or report issues page.</p>
         <input id="faqId" type="hidden" value="" />
         <input id="faqPublished" type="hidden" value="true" />
         <div class="row"><label>Question</label><input id="faqQuestion" type="text" placeholder="Question"/></div>
@@ -3227,9 +3241,16 @@ def _render_admin_page() -> str:
         const tab = document.getElementById("tabTickets");
         if (!tab) return;
         if (tab.style.display !== "none") loadTickets();
-        const feedbackTab = document.getElementById("tabFeedback");
-        if (feedbackTab && feedbackTab.style.display !== "none") loadFeedback();
       }}, 60000);
+    }}
+    function startFeedbackAutoRefresh() {{
+      if (window._feedbackAutoRefreshStarted) return;
+      window._feedbackAutoRefreshStarted = true;
+      setInterval(() => {{
+        const tab = document.getElementById("tabFeedback");
+        if (!tab) return;
+        if (tab.style.display !== "none") loadFeedback();
+      }}, 3600000);
     }}
     function switchTab(tab) {{
       const isSettings = tab === "settings";
@@ -3434,11 +3455,13 @@ def _render_admin_page() -> str:
           : "";
         const author = `<div class="ticket-author"><div><span class="label">Name:</span><span class="value">${{esc(r.name || "-")}}</span></div><div><span class="label">Email:</span><span class="value">${{esc(r.email || "-")}}</span></div><div><span class="label">Wallet:</span><span class="value mono">${{esc(r.wallet_address || "-")}}</span></div><div><span class="label">Created:</span><span class="value">${{esc(r.ts || "-")}}</span></div></div>`;
         const body = `<div class="ticket-message-block"><div class="label">Message</div><pre class="ticket-message">${{message}}</pre>${{reviewedMeta}}</div>`;
-        const action = isReviewed ? "" : `<div class="ticket-actions" style="margin-top:8px"><button class="btn" style="padding:6px 10px;font-size:12px" onclick="reviewFeedback(${{Number(r.id) || 0}})">Reviewed</button></div>`;
+        const actions = isReviewed
+          ? `<div class="ticket-actions" style="margin-top:8px"><button class="btn btn-danger" style="padding:6px 10px;font-size:12px" onclick="deleteFeedback(${{Number(r.id) || 0}}, '${{no}}')">Delete</button></div>`
+          : `<div class="ticket-actions" style="margin-top:8px"><button class="btn" style="padding:6px 10px;font-size:12px" onclick="reviewFeedback(${{Number(r.id) || 0}})">Reviewed</button><button class="btn btn-danger" style="padding:6px 10px;font-size:12px" onclick="deleteFeedback(${{Number(r.id) || 0}}, '${{no}}')">Delete</button></div>`;
         if (isReviewed) {{
-          html += `<details class="ticket-card"><summary style="cursor:pointer;font-weight:700;color:#334155"><b>#${{no}}</b> [reviewed] ${{subject}}</summary>${{author}}${{body}}</details>`;
+          html += `<details class="ticket-card"><summary style="cursor:pointer;font-weight:700;color:#334155"><b>#${{no}}</b> [reviewed] ${{subject}}</summary>${{author}}${{body}}${{actions}}</details>`;
         }} else {{
-          html += `<div class="ticket-card"><div style="font-weight:700;color:#334155"><b>#${{no}}</b> [new] ${{subject}}</div>${{author}}${{body}}${{action}}</div>`;
+          html += `<div class="ticket-card"><div style="font-weight:700;color:#334155"><b>#${{no}}</b> [new] ${{subject}}</div>${{author}}${{body}}${{actions}}</div>`;
         }}
       }}
       if (!items.length) html = '<div class="hint">No feedback yet.</div>';
@@ -3464,6 +3487,17 @@ def _render_admin_page() -> str:
         await loadFeedback();
       }} catch (e) {{
         setFeedbackStatus("Archive failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function deleteFeedback(feedbackId, feedbackNo) {{
+      const no = String(feedbackNo || feedbackId);
+      if (!confirm(`Delete feedback #${{no}}?\\n\\nThis action is permanent.`)) return;
+      try {{
+        const data = await postJson("/api/admin/help-feedback/delete", {{feedback_id: Number(feedbackId)}});
+        setFeedbackStatus(data.info || `Feedback #${{no}} deleted`, false);
+        await loadFeedback();
+      }} catch (e) {{
+        setFeedbackStatus("Delete failed: " + (e?.message || "unknown"), true);
       }}
     }}
     function clearFaqForm() {{
@@ -3602,6 +3636,7 @@ def _render_admin_page() -> str:
     loadAdmin();
     setupTicketFiltersAutoApply();
     startTicketsAutoRefresh();
+    startFeedbackAutoRefresh();
     refreshIntentMenu();
   </script>
 </body>
@@ -3669,7 +3704,7 @@ def _render_help_page() -> str:
     <div class="header">
       <div>
         <h1 class="title">DeFi Pools</h1>
-        <p class="subtitle">Support and FAQ.</p>
+        <p class="subtitle">Send wishes or report issues</p>
       </div>
       <div class="top-controls">
         <span class="intent-prefix">I want to</span>
@@ -3686,10 +3721,8 @@ def _render_help_page() -> str:
       <section class="card feedback-form-card">
         <h3>Send wishes and report issues</h3>
         <p class="hint">Share product ideas or report problems. These messages go to admin review.</p>
-        <div class="row"><label>Name</label><input id="fName" type="text" placeholder="Optional"/></div>
-        <div class="row"><label>Email</label><input id="fEmail" type="email" placeholder="Optional"/></div>
-        <div class="row"><label>Subject</label><input id="fSubject" type="text" placeholder="Required"/></div>
         <div class="row"><label>Message</label><textarea id="fMessage" placeholder="Tell us what to improve or what is broken"></textarea></div>
+        <p class="hint">Only wallet-authorized sessions can send tickets and feedback.</p>
         <button class="btn" onclick="sendFeedback()">Send message</button>
         <span class="status" id="feedbackFormStatus">Ready</span>
       </section>
@@ -3700,6 +3733,7 @@ def _render_help_page() -> str:
         <div class="row"><label>Email</label><input id="tEmail" type="email" placeholder="Optional"/></div>
         <div class="row"><label>Subject</label><input id="tSubject" type="text" placeholder="Required"/></div>
         <div class="row"><label>Message</label><textarea id="tMessage" placeholder="Describe the issue or request"></textarea></div>
+        <p class="hint">Only wallet-authorized sessions can send tickets and feedback.</p>
         <button class="btn" onclick="sendTicket()">Send ticket</button>
         <span class="status" id="ticketStatus">Ready</span>
       </section>
@@ -3774,16 +3808,13 @@ def _render_help_page() -> str:
     function setFeedbackFormStatus(text, isErr) {{ const el=document.getElementById("feedbackFormStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     async function sendFeedback() {{
       try {{
+        if (!authState?.authenticated) throw new Error("Connect wallet first.");
         const payload = {{
-          name: (document.getElementById("fName").value || "").trim(),
-          email: (document.getElementById("fEmail").value || "").trim(),
-          subject: (document.getElementById("fSubject").value || "").trim(),
           message: (document.getElementById("fMessage").value || "").trim(),
         }};
         const data = await postJson("/api/help/feedback", payload);
         const no = data.feedback_no || data.feedback_id;
         setFeedbackFormStatus(`Message #${{no}} sent`, false);
-        document.getElementById("fSubject").value = "";
         document.getElementById("fMessage").value = "";
       }} catch (e) {{
         setFeedbackFormStatus("Send failed: " + (e?.message || "unknown"), true);
@@ -3791,6 +3822,7 @@ def _render_help_page() -> str:
     }}
     async function sendTicket() {{
       try {{
+        if (!authState?.authenticated) throw new Error("Connect wallet first.");
         const payload = {{
           name: (document.getElementById("tName").value || "").trim(),
           email: (document.getElementById("tEmail").value || "").trim(),
@@ -3809,6 +3841,7 @@ def _render_help_page() -> str:
     }}
     async function closeMyTicket(ticketId) {{
       try {{
+        if (!authState?.authenticated) throw new Error("Connect wallet first.");
         await postJson("/api/help/tickets/close", {{ ticket_id: Number(ticketId) }});
         await loadMyTickets();
       }} catch (e) {{
@@ -3884,6 +3917,7 @@ def _render_help_page() -> str:
     }}
     async function replyToTicket(ticketId) {{
       try {{
+        if (!authState?.authenticated) throw new Error("Connect wallet first.");
         const el = document.getElementById(`myReply_${{ticketId}}`);
         const message = (el?.value || "").trim();
         if (message.length < 2) throw new Error("Reply is too short");
@@ -4300,7 +4334,7 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
 
 @app.post("/api/help/tickets")
 def create_help_ticket(req: HelpTicketCreate, request: Request, response: Response) -> dict[str, Any]:
-    sid = _ensure_session_cookie(request, response)
+    sid, wallet, _auth = _require_authenticated_wallet(request, response)
     subject = (req.subject or "").strip()
     message = (req.message or "").strip()
     if len(subject) < 3:
@@ -4309,9 +4343,6 @@ def create_help_ticket(req: HelpTicketCreate, request: Request, response: Respon
         raise HTTPException(status_code=400, detail="Message is too short.")
     if req.email and not _is_valid_email(req.email):
         raise HTTPException(status_code=400, detail="Invalid email format.")
-    with AUTH_LOCK:
-        auth = dict(AUTH_SESSIONS.get(sid, {}))
-    wallet = str(auth.get("address") or "")
     ticket_id = _create_help_ticket(
         session_id=sid,
         wallet_address=wallet,
@@ -4327,24 +4358,16 @@ def create_help_ticket(req: HelpTicketCreate, request: Request, response: Respon
 
 @app.post("/api/help/feedback")
 def create_help_feedback(req: HelpFeedbackCreate, request: Request, response: Response) -> dict[str, Any]:
-    sid = _ensure_session_cookie(request, response)
-    subject = (req.subject or "").strip()
+    sid, wallet, _auth = _require_authenticated_wallet(request, response)
     message = (req.message or "").strip()
-    if len(subject) < 3:
-        raise HTTPException(status_code=400, detail="Subject is too short.")
     if len(message) < 5:
         raise HTTPException(status_code=400, detail="Message is too short.")
-    if req.email and not _is_valid_email(req.email):
-        raise HTTPException(status_code=400, detail="Invalid email format.")
-    with AUTH_LOCK:
-        auth = dict(AUTH_SESSIONS.get(sid, {}))
-    wallet = str(auth.get("address") or "")
     feedback_id = _create_help_feedback(
         session_id=sid,
         wallet_address=wallet,
-        name=req.name,
-        email=req.email,
-        subject=subject,
+        name="",
+        email="",
+        subject="Feedback / issue report",
         message=message,
     )
     _analytics_log_event(session_id=sid, event_type="help_feedback", path="/api/help/feedback", payload=str(feedback_id))
@@ -4363,13 +4386,10 @@ def my_help_tickets(request: Request, response: Response, limit: int = 50) -> di
 
 @app.post("/api/help/tickets/reply")
 def reply_help_ticket(req: HelpTicketReply, request: Request, response: Response) -> dict[str, Any]:
-    sid = _ensure_session_cookie(request, response)
+    sid, wallet, _auth = _require_authenticated_wallet(request, response)
     msg = (req.message or "").strip()
     if len(msg) < 2:
         raise HTTPException(status_code=400, detail="Reply is too short.")
-    with AUTH_LOCK:
-        auth = dict(AUTH_SESSIONS.get(sid, {}))
-    wallet = str(auth.get("address") or "").strip().lower()
     with _analytics_conn() as conn:
         row = conn.execute(
             "SELECT id, session_id, wallet_address FROM help_tickets WHERE id = ?",
@@ -4401,10 +4421,7 @@ def reply_help_ticket(req: HelpTicketReply, request: Request, response: Response
 
 @app.post("/api/help/tickets/close")
 def close_help_ticket(req: HelpTicketClose, request: Request, response: Response) -> dict[str, Any]:
-    sid = _ensure_session_cookie(request, response)
-    with AUTH_LOCK:
-        auth = dict(AUTH_SESSIONS.get(sid, {}))
-    wallet = str(auth.get("address") or "").strip().lower()
+    sid, wallet, _auth = _require_authenticated_wallet(request, response)
     with _analytics_conn() as conn:
         row = conn.execute(
             "SELECT id, session_id, wallet_address FROM help_tickets WHERE id = ?",
@@ -4511,6 +4528,22 @@ def admin_help_feedback_review(req: AdminFeedbackReview, request: Request, respo
     admin_address, _auth = _require_admin(request, response)
     row = _mark_help_feedback_reviewed(req.feedback_id, reviewer_address=admin_address)
     return {"ok": True, **row}
+
+
+@app.post("/api/admin/help-feedback/delete")
+def admin_help_feedback_delete(req: AdminFeedbackDelete, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    fid = int(req.feedback_id or 0)
+    if fid <= 0:
+        raise HTTPException(status_code=400, detail="feedback_id is required.")
+    with _analytics_conn() as conn:
+        row = conn.execute("SELECT id FROM help_feedback WHERE id = ?", (fid,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Feedback not found.")
+        feedback_no = _feedback_number(fid)
+        conn.execute("DELETE FROM help_feedback WHERE id = ?", (fid,))
+        conn.commit()
+    return {"ok": True, "feedback_no": feedback_no, "info": f"Feedback #{feedback_no} deleted."}
 
 
 @app.get("/api/admin/faq")
@@ -5297,7 +5330,7 @@ HTML_PAGE = """
           <option value="/pancake">Find the best pool on PancakeSwap</option>
           <option value="/stables">Find the best stablecoin yield</option>
           <option value="/positions">Analise my DeFi positions</option>
-          <option value="/help">Get help</option>
+          <option value="/help">Send wishes or report issues</option>
         </select>
         <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
       </div>
