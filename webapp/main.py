@@ -294,6 +294,19 @@ def _analytics_report_window_utc(day_offset: int = 1) -> tuple[str, str, str]:
     )
 
 
+def _analytics_bucket_expr(period: str) -> str:
+    p = (period or "day").strip().lower()
+    # ts is ISO-like text in UTC: 2026-03-15T17:00:00Z
+    # For week bucketing convert into SQLite datetime-friendly form first.
+    if p == "week":
+        return "strftime('%Y-W%W', replace(substr(ts, 1, 19), 'T', ' '))"
+    if p == "month":
+        return "substr(ts, 1, 7)"
+    if p == "year":
+        return "substr(ts, 1, 4)"
+    return "substr(ts, 1, 10)"
+
+
 def _analytics_build_daily_report(day_offset: int = 1) -> tuple[str, str]:
     start_ts, end_ts, day_label = _analytics_report_window_utc(day_offset=day_offset)
     if not ANALYTICS_ENABLED:
@@ -706,18 +719,32 @@ def _list_help_tickets(limit: int = 100) -> list[dict[str, Any]]:
     ]
 
 
-def _list_help_tickets_for_session(session_id: str, limit: int = 50) -> list[dict[str, Any]]:
+def _list_help_tickets_for_session(session_id: str, limit: int = 50, wallet_address: str = "") -> list[dict[str, Any]]:
+    lim = max(1, min(200, int(limit)))
+    wallet = (wallet_address or "").strip().lower()
     with _analytics_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, ts, subject, message, status, admin_note
-            FROM help_tickets
-            WHERE session_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (session_id, max(1, min(200, int(limit)))),
-        ).fetchall()
+        if _is_eth_address(wallet):
+            rows = conn.execute(
+                """
+                SELECT id, ts, subject, message, status, admin_note
+                FROM help_tickets
+                WHERE session_id = ? OR lower(wallet_address) = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, wallet, lim),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, ts, subject, message, status, admin_note
+                FROM help_tickets
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, lim),
+            ).fetchall()
     return [
         {
             "id": int(r[0]),
@@ -1528,6 +1555,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Uni Fee - {page_title}</title>
   <style>
+    * {{ box-sizing: border-box; }}
     html {{
       overflow-y: scroll;
       scrollbar-gutter: stable;
@@ -1885,12 +1913,21 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
       }}
       try {{
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
+        const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
+        const wcMetadata = {{
+          name: "Simple DeFi",
+          description: "Simple DeFi wallet sign-in",
+          url: window.location.origin,
+          icons: [window.location.origin + "/favicon.ico"],
+        }};
         const provider = await EthereumProviderModule.EthereumProvider.init({{
           projectId: WALLETCONNECT_PROJECT_ID,
           chains: [1],
+          optionalChains: wcChains.filter((c) => c !== 1),
           showQrModal: true,
           methods: ["eth_requestAccounts", "eth_chainId", "personal_sign"],
           optionalMethods: [],
+          metadata: wcMetadata,
           rpcMap: {{}},
         }});
         await provider.connect();
@@ -1920,7 +1957,7 @@ def _render_placeholder_page(page_title: str, subtitle: str, selected_path: str)
         setAuthUI();
         closeWalletModal({{target: {{id: "walletModalBackdrop"}}}});
       }} catch (e) {{
-        alert("WalletConnect failed: " + (e?.message || "unknown error"));
+        alert("WalletConnect failed: " + (e?.message || "unknown error") + ". Check WalletConnect Project settings (allowed origins) and retry.");
       }}
     }}
 
@@ -1940,6 +1977,7 @@ def _render_admin_page() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Uni Fee - Admin</title>
   <style>
+    * {{ box-sizing: border-box; }}
     html {{ overflow-y: scroll; scrollbar-gutter: stable; overflow-x: hidden; }}
     body {{
       margin: 0;
@@ -1982,6 +2020,12 @@ def _render_admin_page() -> str:
     .wallet-item {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 10px 12px; background: #eff6ff; color: #1d4ed8; font-weight: 700; text-align: left; cursor: pointer; }}
     .wallet-item.disabled {{ opacity: 0.6; cursor: not-allowed; }}
     .wallet-note {{ color: #64748b; font-size: 12px; margin-top: 8px; }}
+    .ticket-filters {{ display: grid; grid-template-columns: 150px 230px 140px minmax(240px, 1fr); gap: 8px; margin-top: 8px; }}
+    .ticket-filter-item label {{ display: block; font-size: 11px; color: #64748b; margin-bottom: 4px; }}
+    .ticket-filter-actions {{ display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }}
+    #ticketsTable {{ min-width: 1380px; }}
+    #ticketsTable .reply-cell {{ min-width: 340px; }}
+    #ticketsTable .ticket-reply {{ min-height: 130px; resize: vertical; font-size: 13px; line-height: 1.35; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
@@ -2000,6 +2044,7 @@ def _render_admin_page() -> str:
     </div>
     <div class="tabs">
       <button class="tab-btn active" id="tabBtnSettings" onclick="switchTab('settings')">Settings</button>
+      <button class="tab-btn" id="tabBtnStats" onclick="switchTab('stats')">Stats</button>
       <button class="tab-btn" id="tabBtnFailures" onclick="switchTab('failures')">Failed runs</button>
       <button class="tab-btn" id="tabBtnTickets" onclick="switchTab('tickets')">Help tickets</button>
       <button class="tab-btn" id="tabBtnFaq" onclick="switchTab('faq')">FAQ</button>
@@ -2037,6 +2082,19 @@ def _render_admin_page() -> str:
         <pre id="dailyPreview">Loading...</pre>
       </section>
     </div>
+    <div class="grid" id="tabStats" style="display:none">
+      <section class="card">
+        <h3>Stats by period</h3>
+        <p class="hint">Browse analytics by day, week, month, or year.</p>
+        <div class="row"><label>Period</label><select id="statsPeriod"><option value="day">day</option><option value="week">week</option><option value="month">month</option><option value="year">year</option></select></div>
+        <div class="row"><label>Rows</label><input id="statsLimit" type="number" min="1" max="365" step="1" value="30"/></div>
+        <button class="btn" onclick="loadStats()">Refresh stats</button>
+        <span id="statsStatus" class="status">Ready</span>
+        <div class="table-wrap" style="margin-top:10px">
+          <table id="statsTable"></table>
+        </div>
+      </section>
+    </div>
     <div class="grid" id="tabFailures" style="display:none">
       <section class="card">
         <h3>Recent failed runs</h3>
@@ -2053,12 +2111,28 @@ def _render_admin_page() -> str:
         <h3>Help tickets</h3>
         <p class="hint">Tickets submitted from Get help page.</p>
         <button class="btn" onclick="loadTickets()">Refresh tickets</button>
-        <div class="row" style="margin-top:8px"><label>Status filter</label><select id="ticketFilterStatus"><option value="">all</option><option value="open">open</option><option value="in_progress">in_progress</option><option value="done">done</option></select></div>
-        <div class="row"><label>Email filter</label><input id="ticketFilterEmail" type="text" placeholder="example@domain.com"/></div>
-        <div class="row"><label>Ticket # filter</label><input id="ticketFilterNo" type="text" placeholder="12000"/></div>
-        <div class="row"><label>Text search</label><input id="ticketFilterText" type="text" placeholder="search in subject/message"/></div>
-        <button class="btn" onclick="applyTicketsFilter()">Apply filters</button>
-        <button class="btn" onclick="resetTicketsFilter()">Reset filters</button>
+        <div class="ticket-filters">
+          <div class="ticket-filter-item">
+            <label>Status</label>
+            <select id="ticketFilterStatus"><option value="">all</option><option value="open">open</option><option value="in_progress">in_progress</option><option value="done">done</option></select>
+          </div>
+          <div class="ticket-filter-item">
+            <label>Email</label>
+            <input id="ticketFilterEmail" type="text" placeholder="example@domain.com"/>
+          </div>
+          <div class="ticket-filter-item">
+            <label>Ticket #</label>
+            <input id="ticketFilterNo" type="text" placeholder="12000"/>
+          </div>
+          <div class="ticket-filter-item">
+            <label>Text</label>
+            <input id="ticketFilterText" type="text" placeholder="search in subject/message"/>
+          </div>
+        </div>
+        <div class="ticket-filter-actions">
+          <button class="btn" onclick="applyTicketsFilter()">Apply filters</button>
+          <button class="btn" onclick="resetTicketsFilter()">Reset filters</button>
+        </div>
         <span id="ticketsStatus" class="status">Ready</span>
         <div class="table-wrap" style="margin-top:10px">
           <table id="ticketsTable"></table>
@@ -2106,14 +2180,16 @@ def _render_admin_page() -> str:
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
-    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],showQrModal:true,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],rpcMap:{{}}}}); await provider.connect(); let accounts=provider.accounts||[]; if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); let signature=""; try {{ signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); }} catch(_) {{ signature=await provider.request({{method:"personal_sign",params:[address,nonceResp.message]}}); }} const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ alert("WalletConnect failed: "+(e?.message||"unknown error")); }} }}
+    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const wcChains=[1,10,56,137,8453,42161,43114]; const wcMetadata={{name:"Simple DeFi",description:"Simple DeFi wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}}; const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains.filter((c)=>c!==1),showQrModal:true,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],metadata:wcMetadata,rpcMap:{{}}}}); await provider.connect(); let accounts=provider.accounts||[]; if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); let signature=""; try {{ signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); }} catch(_) {{ signature=await provider.request({{method:"personal_sign",params:[address,nonceResp.message]}}); }} const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ alert("WalletConnect failed: "+(e?.message||"unknown error")+". Check WalletConnect Project settings (allowed origins) and retry."); }} }}
     function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function setStatsStatus(text, isErr) {{ const el=document.getElementById("statsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFailStatus(text, isErr) {{ const el=document.getElementById("failStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setTicketsStatus(text, isErr) {{ const el=document.getElementById("ticketsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFaqStatus(text, isErr) {{ const el=document.getElementById("faqStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function normStatus(v) {{ return String(v || "").trim().toLowerCase().replace(/[\\s-]+/g, "_"); }}
     function getTicketsFilter() {{
       return {{
-        status: (document.getElementById("ticketFilterStatus")?.value || "").trim().toLowerCase(),
+        status: normStatus((document.getElementById("ticketFilterStatus")?.value || "")),
         email: (document.getElementById("ticketFilterEmail")?.value || "").trim().toLowerCase(),
         ticketNo: (document.getElementById("ticketFilterNo")?.value || "").trim(),
         text: (document.getElementById("ticketFilterText")?.value || "").trim().toLowerCase(),
@@ -2133,20 +2209,56 @@ def _render_admin_page() -> str:
     }}
     function switchTab(tab) {{
       const isSettings = tab === "settings";
+      const isStats = tab === "stats";
       const isFailures = tab === "failures";
       const isTickets = tab === "tickets";
       const isFaq = tab === "faq";
       document.getElementById("tabSettings").style.display = isSettings ? "grid" : "none";
+      document.getElementById("tabStats").style.display = isStats ? "grid" : "none";
       document.getElementById("tabFailures").style.display = isFailures ? "grid" : "none";
       document.getElementById("tabTickets").style.display = isTickets ? "grid" : "none";
       document.getElementById("tabFaq").style.display = isFaq ? "grid" : "none";
       document.getElementById("tabBtnSettings").classList.toggle("active", isSettings);
+      document.getElementById("tabBtnStats").classList.toggle("active", isStats);
       document.getElementById("tabBtnFailures").classList.toggle("active", isFailures);
       document.getElementById("tabBtnTickets").classList.toggle("active", isTickets);
       document.getElementById("tabBtnFaq").classList.toggle("active", isFaq);
+      if (isStats) loadStats();
       if (isFailures) loadFailures();
       if (isTickets) loadTickets();
       if (isFaq) loadFaqAdmin();
+    }}
+    function renderStats(rows) {{
+      const table = document.getElementById("statsTable");
+      let html = "<tr><th>Period</th><th>Unique sessions</th><th>Page views</th><th>Run start</th><th>Run done</th><th>Run failed</th><th>Wallet auth</th><th>Help tickets</th><th>Total events</th></tr>";
+      for (const r of (rows || [])) {{
+        html += "<tr>";
+        html += `<td class="mono">${{esc(r.bucket)}}</td>`;
+        html += `<td>${{Number(r.unique_sessions || 0)}}</td>`;
+        html += `<td>${{Number(r.page_views || 0)}}</td>`;
+        html += `<td>${{Number(r.runs_started || 0)}}</td>`;
+        html += `<td>${{Number(r.runs_done || 0)}}</td>`;
+        html += `<td>${{Number(r.runs_failed || 0)}}</td>`;
+        html += `<td>${{Number(r.wallet_auth || 0)}}</td>`;
+        html += `<td>${{Number(r.help_tickets || 0)}}</td>`;
+        html += `<td>${{Number(r.total_events || 0)}}</td>`;
+        html += "</tr>";
+      }}
+      if (!(rows || []).length) html += '<tr><td colspan="9">No stats yet.</td></tr>';
+      table.innerHTML = html;
+    }}
+    async function loadStats() {{
+      try {{
+        const period = (document.getElementById("statsPeriod")?.value || "day").trim();
+        const limit = Number(document.getElementById("statsLimit")?.value || 30) || 30;
+        const r = await fetch(`/api/admin/stats?period=${{encodeURIComponent(period)}}&limit=${{encodeURIComponent(limit)}}`);
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Failed to load stats");
+        renderStats(data.items || []);
+        setStatsStatus(`Loaded ${{(data.items || []).length}} ${{period}} rows`, false);
+      }} catch (e) {{
+        setStatsStatus("Load failed: " + (e?.message || "unknown"), true);
+      }}
     }}
     function renderFailures(rows) {{
       const table = document.getElementById("failuresTable");
@@ -2185,7 +2297,7 @@ def _render_admin_page() -> str:
       const table = document.getElementById("ticketsTable");
       const f = getTicketsFilter();
       const filtered = (rows || []).filter((r) => {{
-        const status = String(r.status || "").toLowerCase();
+        const status = normStatus(r.status || "");
         const email = String(r.email || "").toLowerCase();
         const ticketNo = String(r.ticket_no || r.id || "");
         const hay = `${{String(r.subject || "").toLowerCase()}}\\n${{String(r.message || "").toLowerCase()}}\\n${{String(r.admin_note || "").toLowerCase()}}`;
@@ -2195,17 +2307,18 @@ def _render_admin_page() -> str:
         if (f.text && !hay.includes(f.text)) return false;
         return true;
       }});
-      let html = "<tr><th>Ticket #</th><th>Time</th><th>Subject</th><th>Message</th><th>Contact</th><th>Status</th><th>Reply</th><th>Actions</th></tr>";
+      let html = "<tr><th>Ticket #</th><th>Time</th><th>Subject</th><th>Message</th><th>Contact</th><th>Status</th><th style='min-width:340px'>Reply</th><th style='min-width:250px'>Actions</th></tr>";
       for (const r of filtered) {{
-        const badge = r.status === "done" ? "#16a34a" : (r.status === "in_progress" ? "#ca8a04" : "#334155");
+        const normalizedStatus = normStatus(r.status || "");
+        const badge = normalizedStatus === "done" ? "#16a34a" : (normalizedStatus === "in_progress" ? "#ca8a04" : "#334155");
         html += "<tr>";
         html += `<td class="mono">#${{esc(r.ticket_no || r.id)}}</td>`;
         html += `<td class="mono">${{esc(r.ts)}}</td>`;
         html += `<td>${{esc(r.subject)}}</td>`;
         html += `<td><pre style="max-height:120px;margin:0">${{esc(r.message)}}</pre></td>`;
         html += `<td><div class="mono">${{esc(r.wallet_address)}}</div><div>${{esc(r.email)}}</div></td>`;
-        html += `<td><span style="display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #cbd5e1;color:${{badge}};font-weight:700">${{esc(r.status)}}</span></td>`;
-        html += `<td><textarea id="note_${{r.id}}" placeholder="Reply to user...">${{esc(r.admin_note)}}</textarea></td>`;
+        html += `<td><span style="display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #cbd5e1;color:${{badge}};font-weight:700">${{esc(normalizedStatus || "open")}}</span></td>`;
+        html += `<td class="reply-cell"><textarea class="ticket-reply" id="note_${{r.id}}" placeholder="Reply to user...">${{esc(r.admin_note)}}</textarea></td>`;
         html += `<td><button class="btn" style="padding:5px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'in_progress')">Save/in progress</button> <button class="btn" style="padding:5px 10px;font-size:12px" onclick="setTicketStatusAction(${{r.id}}, 'done')">Send + done</button></td>`;
         html += "</tr>";
       }}
@@ -2426,6 +2539,7 @@ def _render_help_page() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Uni Fee - Help</title>
   <style>
+    * {{ box-sizing: border-box; }}
     html {{ overflow-y: scroll; scrollbar-gutter: stable; overflow-x: hidden; }}
     body {{ margin: 0; font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%); color: #0f172a; overflow-x: hidden; }}
     body {{ min-height: 100vh; }}
@@ -2515,7 +2629,7 @@ def _render_help_page() -> str:
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
-    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],showQrModal:true,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],rpcMap:{{}}}}); await provider.connect(); let accounts=provider.accounts||[]; if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); let signature=""; try {{ signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); }} catch(_) {{ signature=await provider.request({{method:"personal_sign",params:[address,nonceResp.message]}}); }} const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ alert("WalletConnect failed: "+(e?.message||"unknown error")); }} }}
+    async function connectWalletConnect() {{ if(!WALLETCONNECT_PROJECT_ID) return alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); try {{ const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0"); const wcChains=[1,10,56,137,8453,42161,43114]; const wcMetadata={{name:"Simple DeFi",description:"Simple DeFi wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}}; const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains.filter((c)=>c!==1),showQrModal:true,methods:["eth_requestAccounts","eth_chainId","personal_sign"],optionalMethods:[],metadata:wcMetadata,rpcMap:{{}}}}); await provider.connect(); let accounts=provider.accounts||[]; if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[]; const address=String(accounts[0]||"").trim(); if(!address) throw new Error("WalletConnect did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}}); let signature=""; try {{ signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); }} catch(_) {{ signature=await provider.request({{method:"personal_sign",params:[address,nonceResp.message]}}); }} const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet:"walletconnect",message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ alert("WalletConnect failed: "+(e?.message||"unknown error")+". Check WalletConnect Project settings (allowed origins) and retry."); }} }}
     function setTicketStatus(text, isErr) {{ const el=document.getElementById("ticketStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     async function sendTicket() {{
       try {{
@@ -2586,6 +2700,7 @@ def _render_help_page() -> str:
     loadAuthState();
     loadFaq();
     loadMyTickets();
+    setInterval(() => loadMyTickets(), 30000);
   </script>
 </body>
 </html>
@@ -2837,6 +2952,57 @@ def admin_settings_update(req: AdminSettingsUpdate, request: Request, response: 
     return {"ok": True, "info": "Admin settings updated."}
 
 
+@app.get("/api/admin/stats")
+def admin_stats(request: Request, response: Response, period: str = "day", limit: int = 30) -> dict[str, Any]:
+    _require_admin(request, response)
+    p = (period or "day").strip().lower()
+    if p not in {"day", "week", "month", "year"}:
+        raise HTTPException(status_code=400, detail="period must be day, week, month, or year.")
+    lim = max(1, min(365, int(limit)))
+    if not ANALYTICS_ENABLED:
+        return {"period": p, "limit": lim, "items": [], "count": 0}
+
+    bucket_expr = _analytics_bucket_expr(p)
+    query = f"""
+        SELECT
+          bucket,
+          COUNT(*) AS total_events,
+          COUNT(DISTINCT session_id) AS unique_sessions,
+          SUM(CASE WHEN event_type = 'page_view' THEN 1 ELSE 0 END) AS page_views,
+          SUM(CASE WHEN event_type = 'run_start' THEN 1 ELSE 0 END) AS runs_started,
+          SUM(CASE WHEN event_type = 'run_done' THEN 1 ELSE 0 END) AS runs_done,
+          SUM(CASE WHEN event_type = 'run_failed' THEN 1 ELSE 0 END) AS runs_failed,
+          SUM(CASE WHEN event_type = 'wallet_auth' THEN 1 ELSE 0 END) AS wallet_auth,
+          SUM(CASE WHEN event_type = 'help_ticket' THEN 1 ELSE 0 END) AS help_tickets
+        FROM (
+          SELECT {bucket_expr} AS bucket, session_id, event_type
+          FROM analytics_events
+        ) e
+        WHERE bucket IS NOT NULL AND bucket != ''
+        GROUP BY bucket
+        ORDER BY bucket DESC
+        LIMIT ?
+    """
+    with _analytics_conn() as conn:
+        rows = conn.execute(query, (lim,)).fetchall()
+    items = []
+    for r in reversed(rows):
+        items.append(
+            {
+                "bucket": str(r[0]),
+                "total_events": int(r[1] or 0),
+                "unique_sessions": int(r[2] or 0),
+                "page_views": int(r[3] or 0),
+                "runs_started": int(r[4] or 0),
+                "runs_done": int(r[5] or 0),
+                "runs_failed": int(r[6] or 0),
+                "wallet_auth": int(r[7] or 0),
+                "help_tickets": int(r[8] or 0),
+            }
+        )
+    return {"period": p, "limit": lim, "items": items, "count": len(items)}
+
+
 @app.post("/api/admin/admin-wallets")
 def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Response) -> dict[str, Any]:
     _require_admin(request, response)
@@ -2921,7 +3087,10 @@ def create_help_ticket(req: HelpTicketCreate, request: Request, response: Respon
 @app.get("/api/help/my-tickets")
 def my_help_tickets(request: Request, response: Response, limit: int = 50) -> dict[str, Any]:
     sid = _ensure_session_cookie(request, response)
-    items = _list_help_tickets_for_session(session_id=sid, limit=limit)
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    wallet = str(auth.get("address") or "")
+    items = _list_help_tickets_for_session(session_id=sid, limit=limit, wallet_address=wallet)
     return {"items": items, "count": len(items)}
 
 
@@ -4131,12 +4300,21 @@ HTML_PAGE = """
       try {
         setStatus("Connecting WalletConnect...", "running");
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.17.0");
+        const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
+        const wcMetadata = {
+          name: "Simple DeFi",
+          description: "Simple DeFi wallet sign-in",
+          url: window.location.origin,
+          icons: [window.location.origin + "/favicon.ico"],
+        };
         const provider = await EthereumProviderModule.EthereumProvider.init({
           projectId: WALLETCONNECT_PROJECT_ID,
           chains: [1],
+          optionalChains: wcChains.filter((c) => c !== 1),
           showQrModal: true,
           methods: ["eth_requestAccounts", "eth_chainId", "personal_sign"],
           optionalMethods: [],
+          metadata: wcMetadata,
           rpcMap: {},
         });
         await provider.connect();
@@ -4167,7 +4345,7 @@ HTML_PAGE = """
         closeWalletModal({target: {id: "walletModalBackdrop"}});
         setStatus(`Connected: ${verifyResp.address_short}`, "ok");
       } catch (e) {
-        setStatus("WalletConnect auth failed: " + (e?.message || "unknown"), "fail");
+        setStatus("WalletConnect auth failed: " + (e?.message || "unknown") + ". Check WalletConnect Project allowed origins.", "fail");
       }
     }
 
