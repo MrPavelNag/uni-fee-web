@@ -92,6 +92,8 @@ TOKEN_ADDRESSES = {
         "wbtc": "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c",
         "eth": "0x2170ed0880ac9a755fd29b2688956bd959f933f8",  # ETH on BSC
         "weth": "0x2170ed0880ac9a755fd29b2688956bd959f933f8",
+        "bnb": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+        "wbnb": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
         "usdc": "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
         "usdt": "0x55d398326f99059ff775485246999027b3197955",
     },

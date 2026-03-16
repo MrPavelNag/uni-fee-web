@@ -203,6 +203,8 @@ TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
 TOKEN_SYMBOL_CACHE: dict[tuple[int, str], str] = {}
 TOKEN_SYMBOL_CACHE_LOCK = threading.Lock()
+MAJOR_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
+MAJOR_ASSET_PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("MAJOR_ASSET_PRICE_CACHE_TTL_SEC", "300")))
 getcontext().prec = 48
 
 UNISWAP_V3_NPM_BY_CHAIN_ID: dict[int, str] = {
@@ -1306,6 +1308,56 @@ def _fetch_token_price_usd_dexscreener(chain_id: int, token_address: str) -> flo
 
 
 def _get_token_prices_usd(chain_id: int, token_addresses: list[str]) -> dict[str, float]:
+    def _symbol_for_addr(addr: str) -> str:
+        chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
+        from_cfg = (_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key).lower(), {}) or {}).get(addr)
+        if from_cfg:
+            return str(from_cfg).upper()
+        onchain = _fetch_erc20_symbol_onchain(int(chain_id), addr)
+        return str(onchain or "").upper()
+
+    def _is_stable_symbol(sym: str) -> bool:
+        s = str(sym or "").strip().upper()
+        return s in {"USDC", "USDT", "DAI", "USDE", "FDUSD", "USDC.E", "USDT0", "USD₮"}
+
+    def _major_coingecko_id(sym: str) -> str:
+        s = str(sym or "").strip().upper()
+        mapping = {
+            "ETH": "ethereum",
+            "WETH": "ethereum",
+            "BTC": "bitcoin",
+            "WBTC": "bitcoin",
+            "BNB": "binancecoin",
+            "WBNB": "binancecoin",
+            "UNI": "uniswap",
+            "USDC": "usd-coin",
+            "USDT": "tether",
+            "USD₮": "tether",
+            "DAI": "dai",
+        }
+        return mapping.get(s, "")
+
+    def _fetch_major_price_usd(coin_id: str) -> float | None:
+        cid = str(coin_id or "").strip().lower()
+        if not cid:
+            return None
+        now_ts = time.time()
+        cached = MAJOR_ASSET_PRICE_CACHE.get(cid)
+        if cached and (now_ts - cached[0]) <= MAJOR_ASSET_PRICE_CACHE_TTL_SEC and cached[1] > 0:
+            return float(cached[1])
+        try:
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd"
+            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            with urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            px = float(((payload or {}).get(cid) or {}).get("usd") or 0.0)
+            if px > 0:
+                MAJOR_ASSET_PRICE_CACHE[cid] = (now_ts, px)
+                return px
+        except Exception:
+            return None
+        return None
+
     now = time.time()
     requested: list[str] = []
     result: dict[str, float] = {}
@@ -1340,6 +1392,25 @@ def _get_token_prices_usd(chain_id: int, token_addresses: list[str]) -> dict[str
                 for addr, price in updates.items():
                     TOKEN_PRICE_CACHE[(int(chain_id), addr)] = (now, float(price))
                     result[addr] = float(price)
+
+    # Sanity normalization and major-asset fallback.
+    for addr in requested:
+        sym = _symbol_for_addr(addr)
+        px = result.get(addr)
+        if _is_stable_symbol(sym):
+            if px is None or px <= 0 or px < 0.7 or px > 1.3:
+                result[addr] = 1.0
+                with TOKEN_PRICE_CACHE_LOCK:
+                    TOKEN_PRICE_CACHE[(int(chain_id), addr)] = (now, 1.0)
+            continue
+        if px is None or px <= 0:
+            cgid = _major_coingecko_id(sym)
+            if cgid:
+                fallback_px = _fetch_major_price_usd(cgid)
+                if fallback_px is not None and fallback_px > 0:
+                    result[addr] = float(fallback_px)
+                    with TOKEN_PRICE_CACHE_LOCK:
+                        TOKEN_PRICE_CACHE[(int(chain_id), addr)] = (now, float(fallback_px))
     return {a: result[a] for a in requested if a in result}
 
 
@@ -1552,10 +1623,8 @@ def _should_filter_spam_pair(
         return False
     spam0 = _is_probably_spam_symbol(s0)
     spam1 = _is_probably_spam_symbol(s1)
-    # If pair tokens are not from curated list, filter only clearly suspicious low-value rows.
-    tvl = None if position_tvl_usd is None else float(position_tvl_usd)
-    low_value = (tvl is None) or (tvl <= float(POSITIONS_SPAM_MAX_TVL_USD))
-    return bool((spam0 or spam1) and low_value)
+    # If pair tokens are not from curated list, filter clearly suspicious symbols.
+    return bool(spam0 or spam1)
 
 
 def _pool_token0_price_from_sqrt_x96(sqrt_price_x96: int, dec0: int, dec1: int) -> float | None:
