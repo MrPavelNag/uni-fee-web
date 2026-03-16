@@ -1241,6 +1241,7 @@ def _coingecko_platform_for_chain_id(chain_id: int) -> str:
         1: "ethereum",
         10: "optimism",
         56: "binance-smart-chain",
+        130: "unichain",
         137: "polygon-pos",
         324: "zksync",
         8453: "base",
@@ -1256,6 +1257,7 @@ def _dexscreener_chain_for_chain_id(chain_id: int) -> str:
         1: "ethereum",
         10: "optimism",
         56: "bsc",
+        130: "unichain",
         137: "polygon",
         8453: "base",
         42161: "arbitrum",
@@ -2007,6 +2009,75 @@ def _scan_pancake_infinity_cl_positions_onchain(
     return out
 
 
+def _scan_pancake_infinity_bin_positions_onchain(
+    owner: str,
+    chain_id: int,
+    *,
+    deadline_ts: float | None = None,
+) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    pm = PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid)
+    if not pm:
+        return []
+    owner_addr = str(owner or "").strip().lower()
+    if not _is_eth_address(owner_addr):
+        return []
+    try:
+        bal_data = "0x70a08231" + _encode_address_word(owner_addr)
+        balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
+    except Exception:
+        return []
+    if balance <= 0:
+        return []
+    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
+    out: list[dict[str, Any]] = []
+    for idx in range(int(balance) - 1, max(-1, int(balance) - limit - 1), -1):
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        try:
+            tok_data = "0x2f745c59" + _encode_address_word(owner_addr) + _encode_uint_word(idx)
+            token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, tok_data))
+            if token_id <= 0:
+                continue
+            pos_data = "0x99fbab88" + _encode_uint_word(token_id)
+            pos_words = _hex_words(_eth_call_hex(cid, pm, pos_data))
+            if len(pos_words) < 7:
+                continue
+            raw0 = _decode_address_from_word(pos_words[0])
+            raw1 = _decode_address_from_word(pos_words[1])
+            fee = _decode_uint_from_word(pos_words[4])
+            token0_addr, token0_sym, dec0 = _normalize_infinity_currency(cid, raw0)
+            token1_addr, token1_sym, dec1 = _normalize_infinity_currency(cid, raw1)
+            poolkey_blob = bytes.fromhex("".join(pos_words[:6]))
+            pool_id_hex = _keccak256_hex(poolkey_blob) or ("0x" + _encode_uint_word(token_id))
+            out.append(
+                {
+                    "id": f"inf-bin:{token_id}",
+                    "liquidity": "1",
+                    "tickLower": {"tickIdx": "0"},
+                    "tickUpper": {"tickIdx": "1"},
+                    "pool": {
+                        "id": pool_id_hex,
+                        "feeTier": str(fee),
+                        "liquidity": "0",
+                        "sqrtPrice": "0",
+                        "token0Price": "0",
+                        "totalValueLockedUSD": "0",
+                        "totalValueLockedToken0": "0",
+                        "totalValueLockedToken1": "0",
+                        "token0": {"id": token0_addr, "decimals": str(dec0), "symbol": token0_sym},
+                        "token1": {"id": token1_addr, "decimals": str(dec1), "symbol": token1_sym},
+                    },
+                    "_protocol_label": "pancake_infinity_bin",
+                    "_source": "onchain_pancake_infinity_bin",
+                    "_skip_enrich": True,
+                }
+            )
+        except Exception:
+            continue
+    return out
+
+
 def _estimate_position_tvl_usd_from_share_external(
     position: dict[str, Any], pool: dict[str, Any], chain_id: int
 ) -> float | None:
@@ -2688,7 +2759,44 @@ def _scan_pool_positions_chain(
                     }
                 )
 
-        if not positions:
+        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
+            try:
+                infinity_bin_positions = _scan_pancake_infinity_bin_positions_onchain(
+                    owner,
+                    int(chain_id),
+                    deadline_ts=deadline_ts,
+                )
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_bin",
+                        "count": len(infinity_bin_positions),
+                        "ok": True,
+                    }
+                )
+                if infinity_bin_positions:
+                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                    for p in infinity_bin_positions:
+                        pid = str((p or {}).get("id") or "")
+                        if pid and pid in seen:
+                            continue
+                        if pid:
+                            seen.add(pid)
+                        positions.append(p)
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_bin",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                    }
+                )
+
+        if endpoint and not positions:
             try:
                 positions = _query_uniswap_positions_for_owner(
                     endpoint,
@@ -2912,14 +3020,14 @@ def _scan_pool_positions_chain(
             timed_out = True
             break
         endpoint = get_graph_endpoint(chain_key, version=version)
-        if not endpoint:
+        if not endpoint and version != "v3":
             continue
-        if not _endpoint_supports_uniswap_positions(endpoint):
+        if endpoint and not _endpoint_supports_uniswap_positions(endpoint):
             # Keep v3 flow alive via on-chain fallback even if endpoint introspection says unsupported.
             if version != "v3":
                 continue
-        has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint)
-        has_position_liquidity = _endpoint_supports_position_liquidity(endpoint)
+        has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint) if endpoint else False
+        has_position_liquidity = _endpoint_supports_position_liquidity(endpoint) if endpoint else True
         owner_workers = max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(addresses)))
         if owner_workers <= 1 or len(addresses) <= 1:
             for owner in addresses:
@@ -4889,15 +4997,24 @@ def _render_positions_page() -> str:
           <div class="section-actions">
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
-            <button class="search-link-btn" type="button" onclick="scanPositions('pools')">Search</button>
+            <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
         <div id="posPoolsBody" class="section-body">
           <div class="table-wrap"><table id="posPoolsTable"></table></div>
-          <div id="posPoolChart" style="height:320px;margin-top:10px"></div>
           <div id="posErrors"></div>
         </div>
+      </section>
+      <section class="result-card">
+        <div class="section-head">
+          <h3>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:72px;margin-left:6px"/></h3>
+          <div class="section-actions">
+            <span class="pos-status" id="posHistoryStatus">Select pools and click Search</span>
+            <button class="search-link-btn" type="button" onclick="showSelectedPoolSeries()">Search</button>
+          </div>
+        </div>
+        <div id="posPoolChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
       </section>
     </div>
     """
@@ -4978,6 +5095,9 @@ def _render_positions_page() -> str:
     }
     const posSectionState = {pools: false};
     const posCache = {pools: []};
+    const posHistorySelected = new Set();
+    const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
+    let posHasScannedOnce = false;
     let posScanTicker = null;
     let posScanStartedAt = 0;
     function setPosStatus(text, isErr) {
@@ -4990,6 +5110,17 @@ def _render_positions_page() -> str:
       const el = document.getElementById("posProgress");
       if (!el) return;
       el.style.display = flag ? "block" : "none";
+    }
+    function updatePosSearchButton() {
+      const btn = document.getElementById("posSearchBtn");
+      if (!btn) return;
+      btn.textContent = posHasScannedOnce ? "Scan again" : "Scan";
+    }
+    function setPosHistoryStatus(text, isErr) {
+      const el = document.getElementById("posHistoryStatus");
+      if (!el) return;
+      el.textContent = text || "";
+      el.style.color = isErr ? "#b91c1c" : "#475569";
     }
     function stopPosScanProgressTicker() {
       if (posScanTicker) {
@@ -5045,6 +5176,20 @@ def _render_positions_page() -> str:
       const arr = Array.from(setObj || []);
       localStorage.setItem("positions_trusted_spam_keys", JSON.stringify(arr.slice(0, 1000)));
     }
+    function getManualSpamKeys() {
+      try {
+        const raw = localStorage.getItem("positions_manual_spam_keys");
+        const arr = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(arr)) return new Set();
+        return new Set(arr.map((x) => String(x)));
+      } catch (_) {
+        return new Set();
+      }
+    }
+    function setManualSpamKeys(setObj) {
+      const arr = Array.from(setObj || []);
+      localStorage.setItem("positions_manual_spam_keys", JSON.stringify(arr.slice(0, 1000)));
+    }
     function poolRowKey(r) {
       return [
         String(r.address || "").toLowerCase(),
@@ -5067,6 +5212,20 @@ def _render_positions_page() -> str:
       setTrustedSpamKeys(trusted);
       renderPools(posCache.pools || []);
       setPosStatus("Position moved back to suspected spam.", false);
+    }
+    function markSpamRow(key) {
+      const manual = getManualSpamKeys();
+      manual.add(String(key || ""));
+      setManualSpamKeys(manual);
+      renderPools(posCache.pools || []);
+      setPosStatus("Position marked as spam.", false);
+    }
+    function unmarkSpamRow(key) {
+      const manual = getManualSpamKeys();
+      manual.delete(String(key || ""));
+      setManualSpamKeys(manual);
+      renderPools(posCache.pools || []);
+      setPosStatus("Manual spam mark removed.", false);
     }
     function setSectionCollapsed(key, collapsed) {
       const bodyMap = {pools: "posPoolsBody"};
@@ -5106,72 +5265,140 @@ def _render_positions_page() -> str:
       const v = Number(document.getElementById("posHistoryDays")?.value || 30);
       return Math.max(1, Math.min(3650, Math.round(v)));
     }
-    async function showPoolSeriesByIndex(idx) {
-      const row = (posCache.pools || [])[Number(idx) || 0];
+    function savePosResults(payload) {
+      try {
+        localStorage.setItem(POS_RESULTS_STORAGE_KEY, JSON.stringify(payload || {}));
+      } catch (_) {}
+    }
+    function loadPosResults() {
+      try {
+        const raw = localStorage.getItem(POS_RESULTS_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (_) {
+        return null;
+      }
+    }
+    function renderScanMessages(data) {
+      const errWrap = document.getElementById("posErrors");
+      if (!errWrap) return;
+      const errs = data?.errors || [];
+      const infos = data?.infos || [];
+      const dbg = data?.debug || {};
+      const dbgSummary = Array.isArray(dbg.summary) ? dbg.summary : [];
+      const dbgRows = Array.isArray(dbg.pool_scan) ? dbg.pool_scan : [];
+      let dbgHtml = "";
+      if (dbgSummary.length || dbgRows.length) {
+        const sumLines = dbgSummary.slice(0, 40).map((x) =>
+          `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`
+        );
+        const zeroRows = dbgRows
+          .filter((x) => Number(x.positions_found || 0) === 0)
+          .slice(0, 30)
+          .map((x) => `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} (0)`);
+        const cmpRows = dbgRows
+          .filter((x) => {
+            const c = x.compare || {};
+            return Boolean(c.graph_checked) && (Number(c.only_onchain_count || 0) > 0 || Number(c.only_graph_count || 0) > 0);
+          })
+          .slice(0, 30)
+          .map((x) => {
+            const c = x.compare || {};
+            const o = Number(c.only_onchain_count || 0);
+            const g = Number(c.only_graph_count || 0);
+            const oid = (Array.isArray(c.only_onchain_ids) ? c.only_onchain_ids : []).slice(0, 2).join(",");
+            const gid = (Array.isArray(c.only_graph_ids) ? c.only_graph_ids : []).slice(0, 2).join(",");
+            return `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} only_onchain=${o}${oid ? ` [${esc(oid)}]` : ""}, only_graph=${g}${gid ? ` [${esc(gid)}]` : ""}`;
+          });
+        const body = []
+          .concat(sumLines.length ? ["Summary:", ...sumLines] : [])
+          .concat(zeroRows.length ? ["", "Zero-found owners:", ...zeroRows] : [])
+          .concat(cmpRows.length ? ["", "Source compare (onchain vs graph):", ...cmpRows] : [])
+          .join("\\n");
+        if (body.trim()) {
+          dbgHtml = `<div class='info-box'><details><summary>Debug scan details</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
+        }
+      }
+      const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
+      const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
+      errWrap.innerHTML = errHtml + infoHtml + dbgHtml;
+    }
+    function setHistorySelected(idx, checked) {
+      const n = Number(idx) || 0;
+      if (checked) posHistorySelected.add(n);
+      else posHistorySelected.delete(n);
+    }
+    async function showSelectedPoolSeries() {
       const chartEl = document.getElementById("posPoolChart");
-      if (!row || !chartEl) return;
-      const hasPositionIds = Array.isArray(row.position_ids) && row.position_ids.length > 0;
-      if (!hasPositionIds && (row.tvl_usd == null || !row.pool_liquidity || !row.liquidity)) {
-        chartEl.innerHTML = "<div class='hint'>Position TVL history is unavailable for this pool on current indexer schema.</div>";
+      if (!chartEl) return;
+      const selected = Array.from(posHistorySelected).sort((a, b) => a - b).slice(0, 12);
+      if (!selected.length) {
+        setPosHistoryStatus("Select at least one checkbox in Pool positions table.", true);
         return;
       }
       try {
-        setPosStatus("Loading position TVL history...", false);
-        const payload = {
-          chain: row.chain,
-          protocol: row.protocol,
-          pool_id: row.pool_id,
-          address: row.address,
-          position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
-          position_liquidity: row.liquidity,
-          pool_liquidity: row.pool_liquidity,
-          days: getHistoryDays(),
-        };
-        const res = await fetch("/api/positions/pool-value-series", {
-          method: "POST",
-          headers: {"Content-Type":"application/json"},
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.detail || "Failed to load series");
-        const items = data.items || [];
-        const historyMode = String(data.mode || "estimated");
-        if (!items.length) {
-          chartEl.innerHTML = "<div class='hint'>No historical data for this pool in selected range.</div>";
-          setPosStatus("No history data", false);
-          return;
-        }
+        setPosHistoryStatus("Loading history...", false);
         const ok = await ensurePlotly();
         if (!ok) throw new Error("Failed to load chart library");
-        const xs = items.map((x) => new Date(Number(x.ts || 0) * 1000));
-        const ys = items.map((x) => Number(x.position_tvl_usd || 0));
-        Plotly.newPlot("posPoolChart", [{
-          x: xs,
-          y: ys,
-          mode: "lines",
-          line: {color: "#1d4ed8", width: 2},
-          hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra></extra>",
-        }], {
-          title: `Position TVL history (${historyMode}) - ${row.pair || row.pool_id}`,
+        const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
+        const traces = [];
+        for (let i = 0; i < selected.length; i++) {
+          const idx = selected[i];
+          const row = (posCache.pools || [])[idx];
+          if (!row) continue;
+          const payload = {
+            chain: row.chain,
+            protocol: row.protocol,
+            pool_id: row.pool_id,
+            address: row.address,
+            position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
+            position_liquidity: row.liquidity,
+            pool_liquidity: row.pool_liquidity,
+            days: getHistoryDays(),
+          };
+          const res = await fetch("/api/positions/pool-value-series", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) continue;
+          const items = Array.isArray(data.items) ? data.items : [];
+          if (!items.length) continue;
+          traces.push({
+            x: items.map((x) => new Date(Number(x.ts || 0) * 1000)),
+            y: items.map((x) => Number(x.position_tvl_usd || 0)),
+            mode: "lines",
+            line: {color: palette[i % palette.length], width: 2},
+            name: String(row.pair || row.pool_id || `Pool ${i + 1}`),
+            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+          });
+        }
+        if (!traces.length) {
+          chartEl.innerHTML = "<div class='hint'>No historical data found for selected rows.</div>";
+          setPosHistoryStatus("No history data", false);
+          return;
+        }
+        Plotly.newPlot("posPoolChart", traces, {
+          title: "Position TVL history",
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
           xaxis: {showgrid: true, gridcolor: "#d9e2f0"},
           yaxis: {showgrid: true, gridcolor: "#d9e2f0", tickprefix: "$"},
-          showlegend: false,
+          showlegend: true,
+          legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
-        const note = data.note ? ` | ${String(data.note)}` : "";
-        setPosStatus(`History loaded (${historyMode})${note}`, false);
+        setPosHistoryStatus(`History loaded for ${traces.length} position(s).`, false);
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Failed to load chart: ${esc(e?.message || "unknown")}</div>`;
-        setPosStatus("History load failed", true);
+        setPosHistoryStatus("History load failed", true);
       }
     }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
-      const days = getHistoryDays();
       const trustedSpamKeys = getTrustedSpamKeys();
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="${days}" style="width:72px;margin-left:6px"/></th></tr>`;
+      const manualSpamKeys = getManualSpamKeys();
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const spamRows = [];
@@ -5180,7 +5407,12 @@ def _render_positions_page() -> str:
         const row = Object.assign({_src_idx: i}, r0 || {});
         row._row_key = poolRowKey(row);
         const trusted = trustedSpamKeys.has(row._row_key);
-        if (Boolean(row && row.suspected_spam) && !trusted) {
+        const manual = manualSpamKeys.has(row._row_key);
+        const suspected = Boolean(row && row.suspected_spam);
+        row._is_trusted_spam = trusted;
+        row._is_manual_spam = manual;
+        row._is_suspected_spam = suspected;
+        if (manual || (suspected && !trusted)) {
           spamRows.push(row);
           continue;
         }
@@ -5192,18 +5424,16 @@ def _render_positions_page() -> str:
         html += `<td class='mono'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(r.protocol || "")}</td>`;
-        html += `<td>${esc(r.pair || "")}</td>`;
+        const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
+        html += `<td>${esc(r.pair || "")}<button class='search-link-btn' type='button' style='margin-left:6px' onclick="markSpamRow('${rowKeyEsc}')" title='Move this position to spam section'>spam</button></td>`;
         const feeRaw = String(r.fee_tier_raw || "").trim();
         const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
         html += `<td class='mono'>${esc(r.pool_id || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
-        const canFlagBack = Boolean(r && r.suspected_spam);
-        const flagBackBtn = canFlagBack
-          ? `<button class='search-link-btn' type='button' style='margin-left:6px' onclick="untrustSpamRow('${esc(String(r._row_key || "").replace(/'/g, "\\\\'"))}')" title='Mark as suspected spam'>flag</button>`
-          : "";
-        html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${Number(r._src_idx) || 0})'>Show history</button>${flagBackBtn}</td>`;
+        const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
+        html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
         html += "</tr>";
       }
       if (!visible.length) html += "<tr><td colspan='8'>No pool positions found.</td></tr>";
@@ -5214,17 +5444,25 @@ def _render_positions_page() -> str:
           const r = spamRows[i];
           const rowKey = String(r._row_key || "");
           const tvlVal = "-";
-          spamInner += `<tr><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><button class='search-link-btn' type='button' onclick="trustSpamRow('${esc(rowKey.replace(/'/g, "\\\\'"))}')">trust</button></td></tr>`;
+          let actionBtn = `<button class='search-link-btn' type='button' onclick="trustSpamRow('${esc(rowKey.replace(/'/g, "\\\\'"))}')">trust</button>`;
+          if (Boolean(r && r._is_manual_spam)) {
+            actionBtn = `<button class='search-link-btn' type='button' onclick="unmarkSpamRow('${esc(rowKey.replace(/'/g, "\\\\'"))}')">unspam</button>`;
+          }
+          spamInner += `<tr><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'>${actionBtn}</td></tr>`;
         }
         spamInner += "</table>";
-        html += `<tr><td colspan='8'><details><summary>Suspected spam positions (${spamRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${spamInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='8'><details><summary>Spam positions (${spamRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${spamInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       if (spamRows.length > 0) {
-        setPosStatus(`Showing ${visible.length} pools (+ ${spamRows.length} suspected spam in collapsed section)`, false);
+        setPosStatus(`Showing ${visible.length} pools (+ ${spamRows.length} spam in collapsed section)`, false);
       }
     }
     async function scanPositions(targetSection = "all") {
+      if (posHasScannedOnce) {
+        const ok = window.confirm("Run scan again and replace current results?");
+        if (!ok) return;
+      }
       if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
         setPosStatus("Add at least one address first.", true);
         return;
@@ -5254,47 +5492,16 @@ def _render_positions_page() -> str:
         if (!res.ok) throw new Error(data.detail || "Scan failed");
         posCache.pools = data.pool_positions || [];
         renderPools(posCache.pools);
-        const errWrap = document.getElementById("posErrors");
-        const errs = data.errors || [];
-        const infos = data.infos || [];
-        const dbg = data.debug || {};
-        const dbgSummary = Array.isArray(dbg.summary) ? dbg.summary : [];
-        const dbgRows = Array.isArray(dbg.pool_scan) ? dbg.pool_scan : [];
-        let dbgHtml = "";
-        if (dbgSummary.length || dbgRows.length) {
-          const sumLines = dbgSummary.slice(0, 40).map((x) =>
-            `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`
-          );
-          const zeroRows = dbgRows
-            .filter((x) => Number(x.positions_found || 0) === 0)
-            .slice(0, 30)
-            .map((x) => `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} (0)`);
-          const cmpRows = dbgRows
-            .filter((x) => {
-              const c = x.compare || {};
-              return Boolean(c.graph_checked) && (Number(c.only_onchain_count || 0) > 0 || Number(c.only_graph_count || 0) > 0);
-            })
-            .slice(0, 30)
-            .map((x) => {
-              const c = x.compare || {};
-              const o = Number(c.only_onchain_count || 0);
-              const g = Number(c.only_graph_count || 0);
-              const oid = (Array.isArray(c.only_onchain_ids) ? c.only_onchain_ids : []).slice(0, 2).join(",");
-              const gid = (Array.isArray(c.only_graph_ids) ? c.only_graph_ids : []).slice(0, 2).join(",");
-              return `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} only_onchain=${o}${oid ? ` [${esc(oid)}]` : ""}, only_graph=${g}${gid ? ` [${esc(gid)}]` : ""}`;
-            });
-          const body = []
-            .concat(sumLines.length ? ["Summary:", ...sumLines] : [])
-            .concat(zeroRows.length ? ["", "Zero-found owners:", ...zeroRows] : [])
-            .concat(cmpRows.length ? ["", "Source compare (onchain vs graph):", ...cmpRows] : [])
-            .join("\\n");
-          if (body.trim()) {
-            dbgHtml = `<div class='info-box'><details><summary>Debug scan details</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
-          }
-        }
-        const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
-        const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
-        if (errWrap) errWrap.innerHTML = errHtml + infoHtml + dbgHtml;
+        renderScanMessages(data);
+        savePosResults({
+          saved_at: Date.now(),
+          pool_positions: data.pool_positions || [],
+          errors: data.errors || [],
+          infos: data.infos || [],
+          debug: data.debug || {},
+        });
+        posHasScannedOnce = true;
+        updatePosSearchButton();
         setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}`, false);
       } catch (e) {
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
@@ -5306,7 +5513,20 @@ def _render_positions_page() -> str:
     loadPosState();
     renderAllChips();
     setSectionCollapsed("pools", false);
-    setPosStatus("Ready", false);
+    const saved = loadPosResults();
+    if (saved && Array.isArray(saved.pool_positions) && saved.pool_positions.length) {
+      posCache.pools = saved.pool_positions;
+      renderPools(posCache.pools);
+      renderScanMessages(saved);
+      posHasScannedOnce = true;
+      updatePosSearchButton();
+      setPosStatus(`Restored cached results. Pools: ${saved.pool_positions.length}`, false);
+      setPosHistoryStatus("Cached results restored.", false);
+    } else {
+      updatePosSearchButton();
+      setPosStatus("Ready", false);
+      setPosHistoryStatus("Select pools and click Search", false);
+    }
     """
     return _render_placeholder_page(
         "DeFi Positions",
