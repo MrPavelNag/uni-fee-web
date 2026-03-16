@@ -173,7 +173,7 @@ _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
-POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "30")))
+POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "45")))
 POSITIONS_OWNER_MAX_SECONDS = max(2, int(os.environ.get("POSITIONS_OWNER_MAX_SECONDS", "4")))
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "4")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "3")))
@@ -1605,7 +1605,7 @@ def _is_probably_spam_symbol(symbol: str) -> bool:
     return False
 
 
-def _should_filter_spam_pair(
+def _is_suspected_spam_pair(
     chain_key: str,
     token0_obj: dict[str, Any],
     token1_obj: dict[str, Any],
@@ -1623,7 +1623,7 @@ def _should_filter_spam_pair(
         return False
     spam0 = _is_probably_spam_symbol(s0)
     spam1 = _is_probably_spam_symbol(s1)
-    # If pair tokens are not from curated list, filter clearly suspicious symbols.
+    # If pair tokens are not from curated list, mark clearly suspicious symbols.
     return bool(spam0 or spam1)
 
 
@@ -1664,8 +1664,11 @@ def _scan_v3_positions_onchain(
         return []
     limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
     out: list[dict[str, Any]] = []
+    # Scan latest NFTs first: active user positions are typically near the end.
+    start_idx = max(0, int(balance) - limit)
+    scan_indices = range(int(balance) - 1, start_idx - 1, -1)
 
-    for idx in range(limit):
+    for idx in scan_indices:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
         try:
@@ -2456,8 +2459,7 @@ def _scan_pool_positions_chain(
                         if share_external_tvl is not None and share_external_tvl > 0:
                             position_tvl_usd = share_external_tvl
                             valuation_mode = "estimated-share-external"
-                if _should_filter_spam_pair(chain_key, t0_obj, t1_obj, t0, t1, position_tvl_usd):
-                    continue
+                suspected_spam = _is_suspected_spam_pair(chain_key, t0_obj, t1_obj, t0, t1, position_tvl_usd)
                 owner_rows.append(
                     {
                         "address": owner,
@@ -2476,6 +2478,7 @@ def _scan_pool_positions_chain(
                         "pool_tvl_usd": tvl_usd,
                         "tvl_usd": position_tvl_usd,
                         "valuation_mode": valuation_mode,
+                        "suspected_spam": bool(suspected_spam),
                     }
                 )
             except Exception as e:
