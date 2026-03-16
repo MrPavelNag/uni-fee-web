@@ -8186,6 +8186,18 @@ HTML_PAGE = """
       border: 1px solid #d1d5db;
       color: #334155;
     }
+    .search-link-btn {
+      border: none;
+      background: transparent;
+      color: #1d4ed8;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      padding: 0;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .search-link-btn:hover { color: #1e40af; }
     .chips {
       display: flex;
       gap: 8px;
@@ -8584,7 +8596,7 @@ HTML_PAGE = """
         <div class="section-head">
           <h3>Pools Table</h3>
           <div class="section-actions">
-            <button class="btn run-btn" onclick="exportCsv()">Export CSV</button>
+            <button class="search-link-btn" type="button" onclick="exportCsv()">Export CSV</button>
           </div>
         </div>
         <div class="table-wrap">
