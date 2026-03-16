@@ -230,6 +230,12 @@ UNISWAP_V3_FACTORY_BY_CHAIN_ID: dict[int, str] = {
 V3_PROTOCOL_LABEL_BY_CHAIN_ID: dict[int, str] = {
     56: "pancake_v3",
 }
+PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID: dict[int, str] = {
+    56: "0x556b9306565093c855aea9ae92a594704c2cd59e",
+    1: "0x556b9306565093c855aea9ae92a594704c2cd59e",
+    42161: "0x5e09acf80c0296740ec5d6f643005a4ef8daa694",
+    8453: "0xc6a2db661d5a5690172d8eb0a7dea2d3008665a3",
+}
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
     10: ["https://optimism-rpc.publicnode.com"],
@@ -1664,6 +1670,65 @@ def _scan_v3_positions_onchain(
         return []
     limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
     out: list[dict[str, Any]] = []
+
+    def _build_position_from_token_id(token_id: int) -> dict[str, Any] | None:
+        # positions(uint256)
+        pos_data = "0x99fbab88" + _encode_uint_word(token_id)
+        pos_words = _hex_words(_eth_call_hex(int(chain_id), npm, pos_data))
+        if len(pos_words) < 8:
+            return None
+        token0 = _decode_address_from_word(pos_words[2])
+        token1 = _decode_address_from_word(pos_words[3])
+        fee = _decode_uint_from_word(pos_words[4])
+        tick_lower = _decode_int_from_word(pos_words[5])
+        tick_upper = _decode_int_from_word(pos_words[6])
+        liq = _decode_uint_from_word(pos_words[7])
+        if liq <= 0:
+            return None
+
+        # getPool(address,address,uint24)
+        pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
+        pool_words = _hex_words(_eth_call_hex(int(chain_id), factory, pool_data))
+        if not pool_words:
+            return None
+        pool_addr = _decode_address_from_word(pool_words[0])
+        if not _is_eth_address(pool_addr):
+            return None
+
+        sqrt_price_x96 = 0
+        dec0 = 18
+        dec1 = 18
+        token0_price = None
+        if include_price_details:
+            # slot0() => sqrtPriceX96 is first word
+            slot0_words = _hex_words(_eth_call_hex(int(chain_id), pool_addr, "0x3850c7bd"))
+            sqrt_price_x96 = _decode_uint_from_word(slot0_words[0]) if slot0_words else 0
+
+            # decimals()
+            dec0 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token0, "0x313ce567"))
+            dec1 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token1, "0x313ce567"))
+            if dec0 < 0 or dec0 > 36:
+                dec0 = 18
+            if dec1 < 0 or dec1 > 36:
+                dec1 = 18
+            token0_price = _pool_token0_price_from_sqrt_x96(sqrt_price_x96, int(dec0), int(dec1))
+
+        return {
+            "id": str(token_id),
+            "liquidity": str(liq),
+            "tickLower": {"tickIdx": str(tick_lower)},
+            "tickUpper": {"tickIdx": str(tick_upper)},
+            "pool": {
+                "id": str(pool_addr).lower(),
+                "feeTier": str(int(fee)),
+                "sqrtPrice": str(int(sqrt_price_x96)) if int(sqrt_price_x96) > 0 else "",
+                "token0Price": float(token0_price) if token0_price is not None else 0.0,
+                "token0": {"id": str(token0).lower(), "decimals": int(dec0)},
+                "token1": {"id": str(token1).lower(), "decimals": int(dec1)},
+            },
+            "_skip_enrich": not include_price_details,
+            "_protocol_label": str(protocol_label or "uniswap_v3"),
+        }
     # Scan latest NFTs first: active user positions are typically near the end.
     start_idx = max(0, int(balance) - limit)
     scan_indices = range(int(balance) - 1, start_idx - 1, -1)
@@ -1677,66 +1742,126 @@ def _scan_v3_positions_onchain(
             token_id = _decode_uint_eth_call(_eth_call_hex(int(chain_id), npm, token_data))
             if token_id <= 0:
                 continue
+            built = _build_position_from_token_id(int(token_id))
+            if built:
+                out.append(built)
+        except Exception:
+            continue
+    return out
 
-            # positions(uint256)
-            pos_data = "0x99fbab88" + _encode_uint_word(token_id)
-            pos_words = _hex_words(_eth_call_hex(int(chain_id), npm, pos_data))
-            if len(pos_words) < 8:
+
+def _fetch_v3_position_onchain_by_token_id(
+    chain_id: int,
+    token_id: str,
+    *,
+    include_price_details: bool = True,
+    protocol_label: str = "uniswap_v3",
+) -> dict[str, Any] | None:
+    try:
+        cid = int(chain_id)
+        tid = int(str(token_id or "").strip())
+    except Exception:
+        return None
+    if tid <= 0:
+        return None
+    npm = UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid)
+    factory = UNISWAP_V3_FACTORY_BY_CHAIN_ID.get(cid)
+    if not npm or not factory:
+        return None
+    try:
+        pos_data = "0x99fbab88" + _encode_uint_word(tid)
+        pos_words = _hex_words(_eth_call_hex(cid, npm, pos_data))
+        if len(pos_words) < 8:
+            return None
+        token0 = _decode_address_from_word(pos_words[2])
+        token1 = _decode_address_from_word(pos_words[3])
+        fee = _decode_uint_from_word(pos_words[4])
+        tick_lower = _decode_int_from_word(pos_words[5])
+        tick_upper = _decode_int_from_word(pos_words[6])
+        liq = _decode_uint_from_word(pos_words[7])
+        if liq <= 0:
+            return None
+        pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
+        pool_words = _hex_words(_eth_call_hex(cid, factory, pool_data))
+        if not pool_words:
+            return None
+        pool_addr = _decode_address_from_word(pool_words[0])
+        if not _is_eth_address(pool_addr):
+            return None
+        sqrt_price_x96 = 0
+        dec0 = 18
+        dec1 = 18
+        token0_price = None
+        if include_price_details:
+            slot0_words = _hex_words(_eth_call_hex(cid, pool_addr, "0x3850c7bd"))
+            sqrt_price_x96 = _decode_uint_from_word(slot0_words[0]) if slot0_words else 0
+            dec0 = _decode_uint_eth_call(_eth_call_hex(cid, token0, "0x313ce567"))
+            dec1 = _decode_uint_eth_call(_eth_call_hex(cid, token1, "0x313ce567"))
+            if dec0 < 0 or dec0 > 36:
+                dec0 = 18
+            if dec1 < 0 or dec1 > 36:
+                dec1 = 18
+            token0_price = _pool_token0_price_from_sqrt_x96(sqrt_price_x96, int(dec0), int(dec1))
+        return {
+            "id": str(tid),
+            "liquidity": str(liq),
+            "tickLower": {"tickIdx": str(tick_lower)},
+            "tickUpper": {"tickIdx": str(tick_upper)},
+            "pool": {
+                "id": str(pool_addr).lower(),
+                "feeTier": str(int(fee)),
+                "sqrtPrice": str(int(sqrt_price_x96)) if int(sqrt_price_x96) > 0 else "",
+                "token0Price": float(token0_price) if token0_price is not None else 0.0,
+                "token0": {"id": str(token0).lower(), "decimals": int(dec0)},
+                "token1": {"id": str(token1).lower(), "decimals": int(dec1)},
+            },
+            "_skip_enrich": not include_price_details,
+            "_protocol_label": str(protocol_label or "uniswap_v3"),
+        }
+    except Exception:
+        return None
+
+
+def _scan_pancake_staked_v3_positions_onchain(
+    owner: str,
+    chain_id: int,
+    *,
+    deadline_ts: float | None = None,
+) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    mc = PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID.get(cid)
+    if not mc:
+        return []
+    owner_addr = str(owner or "").strip().lower()
+    if not _is_eth_address(owner_addr):
+        return []
+    try:
+        bal_data = "0x70a08231" + _encode_address_word(owner_addr)
+        balance = _decode_uint_eth_call(_eth_call_hex(cid, mc, bal_data))
+    except Exception:
+        return []
+    if balance <= 0:
+        return []
+    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
+    start_idx = max(0, int(balance) - limit)
+    scan_indices = range(int(balance) - 1, start_idx - 1, -1)
+    out: list[dict[str, Any]] = []
+    for idx in scan_indices:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        try:
+            tok_data = "0x2f745c59" + _encode_address_word(owner_addr) + _encode_uint_word(idx)
+            token_id = _decode_uint_eth_call(_eth_call_hex(cid, mc, tok_data))
+            if token_id <= 0:
                 continue
-            token0 = _decode_address_from_word(pos_words[2])
-            token1 = _decode_address_from_word(pos_words[3])
-            fee = _decode_uint_from_word(pos_words[4])
-            tick_lower = _decode_int_from_word(pos_words[5])
-            tick_upper = _decode_int_from_word(pos_words[6])
-            liq = _decode_uint_from_word(pos_words[7])
-            if liq <= 0:
-                continue
-
-            # getPool(address,address,uint24)
-            pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
-            pool_words = _hex_words(_eth_call_hex(int(chain_id), factory, pool_data))
-            if not pool_words:
-                continue
-            pool_addr = _decode_address_from_word(pool_words[0])
-            if not _is_eth_address(pool_addr):
-                continue
-
-            sqrt_price_x96 = 0
-            dec0 = 18
-            dec1 = 18
-            token0_price = None
-            if include_price_details:
-                # slot0() => sqrtPriceX96 is first word
-                slot0_words = _hex_words(_eth_call_hex(int(chain_id), pool_addr, "0x3850c7bd"))
-                sqrt_price_x96 = _decode_uint_from_word(slot0_words[0]) if slot0_words else 0
-
-                # decimals()
-                dec0 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token0, "0x313ce567"))
-                dec1 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token1, "0x313ce567"))
-                if dec0 < 0 or dec0 > 36:
-                    dec0 = 18
-                if dec1 < 0 or dec1 > 36:
-                    dec1 = 18
-                token0_price = _pool_token0_price_from_sqrt_x96(sqrt_price_x96, int(dec0), int(dec1))
-
-            out.append(
-                {
-                    "id": str(token_id),
-                    "liquidity": str(liq),
-                    "tickLower": {"tickIdx": str(tick_lower)},
-                    "tickUpper": {"tickIdx": str(tick_upper)},
-                    "pool": {
-                        "id": str(pool_addr).lower(),
-                        "feeTier": str(int(fee)),
-                        "sqrtPrice": str(int(sqrt_price_x96)) if int(sqrt_price_x96) > 0 else "",
-                        "token0Price": float(token0_price) if token0_price is not None else 0.0,
-                        "token0": {"id": str(token0).lower(), "decimals": int(dec0)},
-                        "token1": {"id": str(token1).lower(), "decimals": int(dec1)},
-                    },
-                    "_skip_enrich": not include_price_details,
-                    "_protocol_label": str(protocol_label or "uniswap_v3"),
-                }
+            pos = _fetch_v3_position_onchain_by_token_id(
+                cid,
+                str(token_id),
+                include_price_details=True,
+                protocol_label="pancake_v3",
             )
+            if pos:
+                out.append(pos)
         except Exception:
             continue
     return out
@@ -2339,6 +2464,45 @@ def _scan_pool_positions_chain(
                     }
                 )
 
+        # Pancake v3 farming positions are often staked in MasterChefV3 and
+        # therefore invisible in PositionManager owner lists.
+        if version == "v3" and int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID:
+            try:
+                farm_positions = _scan_pancake_staked_v3_positions_onchain(
+                    owner,
+                    int(chain_id),
+                    deadline_ts=deadline_ts,
+                )
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_masterchef_v3",
+                        "count": len(farm_positions),
+                        "ok": True,
+                    }
+                )
+                if farm_positions:
+                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                    for p in farm_positions:
+                        pid = str((p or {}).get("id") or "")
+                        if pid and pid in seen:
+                            continue
+                        if pid:
+                            seen.add(pid)
+                        positions.append(p)
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_masterchef_v3",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                    }
+                )
+
         if not positions:
             try:
                 positions = _query_uniswap_positions_for_owner(
@@ -2450,15 +2614,36 @@ def _scan_pool_positions_chain(
                 t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
                 # Prefer exact-external, then exact-subgraph, then share-external fallback.
                 if detailed_external_tvl is None or detailed_external_tvl <= 0:
-                    detailed_subgraph_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
-                    if detailed_subgraph_tvl is not None and detailed_subgraph_tvl > 0:
-                        position_tvl_usd = detailed_subgraph_tvl
-                        valuation_mode = "exact-subgraph"
+                    if version == "v3":
+                        onchain_enriched = _fetch_v3_position_onchain_by_token_id(
+                            int(chain_id),
+                            str(p.get("id") or ""),
+                            include_price_details=True,
+                            protocol_label=str(p.get("_protocol_label") or f"uniswap_{version}"),
+                        )
+                        if onchain_enriched:
+                            p = onchain_enriched
+                            pool = p.get("pool") or {}
+                            t0_obj = pool.get("token0") or {}
+                            t1_obj = pool.get("token1") or {}
+                            t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
+                            t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
+                            detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
+                            if detailed_external_tvl is not None and detailed_external_tvl > 0:
+                                position_tvl_usd = detailed_external_tvl
+                                valuation_mode = "exact-external-onchain"
+                    if detailed_external_tvl is not None and detailed_external_tvl > 0:
+                        pass
                     else:
-                        share_external_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
-                        if share_external_tvl is not None and share_external_tvl > 0:
-                            position_tvl_usd = share_external_tvl
-                            valuation_mode = "estimated-share-external"
+                        detailed_subgraph_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
+                        if detailed_subgraph_tvl is not None and detailed_subgraph_tvl > 0:
+                            position_tvl_usd = detailed_subgraph_tvl
+                            valuation_mode = "exact-subgraph"
+                        else:
+                            share_external_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
+                            if share_external_tvl is not None and share_external_tvl > 0:
+                                position_tvl_usd = share_external_tvl
+                                valuation_mode = "estimated-share-external"
                 suspected_spam = _is_suspected_spam_pair(chain_key, t0_obj, t1_obj, t0, t1, position_tvl_usd)
                 owner_rows.append(
                     {
@@ -4614,6 +4799,14 @@ def _render_positions_page() -> str:
       if (!v) return "";
       return v.length <= 4 ? v : ("..." + v.slice(-4));
     }
+    function getHideSpamEnabled() {
+      const raw = localStorage.getItem("positions_hide_spam");
+      if (raw == null) return true;
+      return raw !== "0";
+    }
+    function setHideSpamEnabled(flag) {
+      localStorage.setItem("positions_hide_spam", flag ? "1" : "0");
+    }
     function setSectionCollapsed(key, collapsed) {
       const bodyMap = {pools: "posPoolsBody"};
       const btnMap = {pools: "togglePoolsBtn"};
@@ -4716,10 +4909,22 @@ def _render_positions_page() -> str:
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
       const days = getHistoryDays();
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Valuation mode</th><th>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="${days}" style="width:72px;margin-left:6px"/></th></tr>`;
+      const hideSpam = getHideSpamEnabled();
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Valuation mode</th><th>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="${days}" style="width:72px;margin-left:6px"/> <label style="margin-left:8px;font-weight:600;font-size:12px;white-space:nowrap"><input id="posHideSpam" type="checkbox" ${hideSpam ? "checked" : ""} /> hide suspected spam</label></th></tr>`;
       const list = rows || [];
+      const visible = [];
+      let hiddenSpam = 0;
       for (let i = 0; i < list.length; i++) {
-        const r = list[i];
+        const r0 = list[i];
+        if (hideSpam && Boolean(r0 && r0.suspected_spam)) {
+          hiddenSpam += 1;
+          continue;
+        }
+        const r = Object.assign({_src_idx: i}, r0 || {});
+        visible.push(r);
+      }
+      for (let i = 0; i < visible.length; i++) {
+        const r = visible[i];
         html += "<tr>";
         html += `<td class='mono'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
@@ -4732,11 +4937,21 @@ def _render_positions_page() -> str:
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
         html += `<td>${esc(r.valuation_mode || "unknown")}</td>`;
-        html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${i})'>Show history</button></td>`;
+        html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${Number(r._src_idx) || 0})'>Show history</button></td>`;
         html += "</tr>";
       }
-      if (!list.length) html += "<tr><td colspan='9'>No pool positions found.</td></tr>";
+      if (!visible.length) html += "<tr><td colspan='9'>No pool positions found.</td></tr>";
       table.innerHTML = html;
+      const hideCb = document.getElementById("posHideSpam");
+      if (hideCb) {
+        hideCb.onchange = (e) => {
+          setHideSpamEnabled(Boolean(e?.target?.checked));
+          renderPools(posCache.pools || []);
+        };
+      }
+      if (hiddenSpam > 0) {
+        setPosStatus(`Showing ${visible.length} pools (hidden suspected spam: ${hiddenSpam})`, false);
+      }
     }
     async function scanPositions(targetSection = "all") {
       if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
