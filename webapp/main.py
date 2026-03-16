@@ -1285,7 +1285,7 @@ def _query_uniswap_positions_for_owner(
           token1 {{ symbol id }}
         }}
     """
-    def _build_queries(owner_type: str) -> tuple[str, str, str, str]:
+    def _build_queries(owner_type: str) -> tuple[str, str, str, str, str, str, str, str]:
         q_positions = f"""
     query UserPositions($owner: {owner_type}!, $skip: Int!) {{
       positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
@@ -1299,6 +1299,29 @@ def _query_uniswap_positions_for_owner(
         positions(first: 200, skip: $skip) {{
           {detailed_fields}
         }}
+      }}
+    }}
+    """
+        q_accounts = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+      accounts(first: 1, where: {{ id: $owner }}) {{
+        positions(first: 200, skip: $skip) {{
+          {detailed_fields}
+        }}
+      }}
+    }}
+    """
+        q_positions_owner_in = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+      positions(first: 200, skip: $skip, where: {{ owner_in: [$owner] }}) {{
+        {detailed_fields}
+      }}
+    }}
+    """
+        q_positions_owner_rel = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+      positions(first: 200, skip: $skip, where: {{ owner_: {{ id: $owner }} }}) {{
+        {detailed_fields}
       }}
     }}
     """
@@ -1318,7 +1341,25 @@ def _query_uniswap_positions_for_owner(
       }}
     }}
     """
-        return q_positions, q_account, q_positions_basic, q_account_basic
+        q_accounts_basic = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+      accounts(first: 1, where: {{ id: $owner }}) {{
+        positions(first: 200, skip: $skip) {{
+          {basic_fields}
+        }}
+      }}
+    }}
+    """
+        return (
+            q_positions,
+            q_account,
+            q_accounts,
+            q_positions_owner_in,
+            q_positions_owner_rel,
+            q_positions_basic,
+            q_account_basic,
+            q_accounts_basic,
+        )
     result: list[dict[str, Any]] = []
     owner_raw = str(owner or "").strip()
     owner_lc = owner_raw.lower()
@@ -1335,8 +1376,12 @@ def _query_uniswap_positions_for_owner(
             payload = data.get("data", {}) or {}
             if mode == "positions":
                 batch = payload.get("positions", []) or []
-            else:
+            elif mode == "account":
                 batch = ((payload.get("account") or {}).get("positions") or [])
+            else:
+                accounts = payload.get("accounts", []) or []
+                first = accounts[0] if accounts else {}
+                batch = (first or {}).get("positions") or []
             out.extend(batch)
             if len(batch) < 200:
                 break
@@ -1346,12 +1391,25 @@ def _query_uniswap_positions_for_owner(
 
     query_sets = [_build_queries("String"), _build_queries("Bytes"), _build_queries("ID")]
     for owner_value in owner_candidates:
-        for q_positions, q_account, q_positions_basic, q_account_basic in query_sets:
+        for (
+            q_positions,
+            q_account,
+            q_accounts,
+            q_positions_owner_in,
+            q_positions_owner_rel,
+            q_positions_basic,
+            q_account_basic,
+            q_accounts_basic,
+        ) in query_sets:
             for q, mode in (
                 (q_positions, "positions"),
                 (q_account, "account"),
+                (q_accounts, "accounts"),
+                (q_positions_owner_in, "positions"),
+                (q_positions_owner_rel, "positions"),
                 (q_positions_basic, "positions"),
                 (q_account_basic, "account"),
+                (q_accounts_basic, "accounts"),
             ):
                 if result:
                     break
@@ -1466,17 +1524,25 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                         include_pool_liquidity=has_pool_liquidity,
                         include_position_liquidity=has_position_liquidity,
                     )
+                    # Introspection can be blocked on some indexers, producing a false
+                    # negative for liquidity support. Retry once with liquidity enabled.
+                    if not positions and not has_position_liquidity:
+                        positions = _query_uniswap_positions_for_owner(
+                            endpoint,
+                            owner,
+                            include_pool_liquidity=has_pool_liquidity,
+                            include_position_liquidity=True,
+                        )
                 except Exception as e:
                     errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
                     continue
                 for p in positions:
-                    if has_position_liquidity and _safe_float(p.get("liquidity")) <= 0:
+                    liq_raw = p.get("liquidity")
+                    if has_position_liquidity and liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
                         # Hide closed/zero-liquidity historical NFTs; keep only active positions.
                         continue
                     pool = p.get("pool") or {}
                     tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
-                    if tvl_usd <= 0:
-                        continue
                     pos_liq = _safe_float(p.get("liquidity"))
                     pool_liq = _safe_float(pool.get("liquidity"))
                     position_tvl_usd: float | None = None
@@ -3616,25 +3682,21 @@ def _render_stables_page() -> str:
       </section>
       <section class="result-card">
         <div class="section-head">
-          <h3>Lending positions</h3>
+          <h3>Lending positions and unclaimed rewards</h3>
           <div class="section-actions">
             <div id="stableProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="stableStatus">Ready</span>
-            <button class="search-link-btn" type="button" onclick="scanStable('lending')">Search</button>
-            <button class="collapse-btn" id="toggleStableLendingBtn" type="button" onclick="toggleStableSection('lending')" title="Collapse/expand">▾</button>
+            <button class="search-link-btn" type="button" onclick="scanStable()">Search</button>
+            <button class="collapse-btn" id="toggleStableCombinedBtn" type="button" onclick="toggleStableSection()" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <div id="stableLendingBody" class="section-body"><div class="table-wrap"><table id="stableLendingTable"></table></div></div>
-      </section>
-      <section class="result-card">
-        <div class="section-head">
-          <h3>Unclaimed lending rewards</h3>
-          <div class="section-actions">
-            <button class="search-link-btn" type="button" onclick="scanStable('rewards')">Search</button>
-            <button class="collapse-btn" id="toggleStableRewardsBtn" type="button" onclick="toggleStableSection('rewards')" title="Collapse/expand">▾</button>
-          </div>
+        <div id="stableCombinedBody" class="section-body">
+          <div style="margin-bottom:8px;font-weight:700;color:#1e3a8a">Lending positions</div>
+          <div class="table-wrap"><table id="stableLendingTable"></table></div>
+          <div style="margin:12px 0 8px;font-weight:700;color:#1e3a8a">Unclaimed lending rewards</div>
+          <div class="table-wrap"><table id="stableRewardsTable"></table></div>
+          <div id="stableErrors"></div>
         </div>
-        <div id="stableRewardsBody" class="section-body"><div class="table-wrap"><table id="stableRewardsTable"></table></div><div id="stableErrors"></div></div>
       </section>
     </div>
     """
@@ -3698,7 +3760,7 @@ def _render_stables_page() -> str:
       saveStableState();
       renderChips(kind);
     }
-    const stableSectionState = {lending: false, rewards: false};
+    const stableSectionState = {combined: false};
     const stableCache = {lending: [], rewards: []};
     function setStableStatus(text, isErr) {
       const el = document.getElementById("stableStatus");
@@ -3711,22 +3773,20 @@ def _render_stables_page() -> str:
       if (!el) return;
       el.style.display = flag ? "block" : "none";
     }
-    function setStableSectionCollapsed(key, collapsed) {
-      const bodyMap = {lending: "stableLendingBody", rewards: "stableRewardsBody"};
-      const btnMap = {lending: "toggleStableLendingBtn", rewards: "toggleStableRewardsBtn"};
-      const body = document.getElementById(bodyMap[key]);
-      const btn = document.getElementById(btnMap[key]);
+    function setStableSectionCollapsed(collapsed) {
+      const body = document.getElementById("stableCombinedBody");
+      const btn = document.getElementById("toggleStableCombinedBtn");
       if (!body || !btn) return;
-      stableSectionState[key] = !!collapsed;
+      stableSectionState.combined = !!collapsed;
       body.classList.toggle("collapsed", !!collapsed);
       btn.textContent = collapsed ? "▸" : "▾";
     }
-    function toggleStableSection(key) {
-      const next = !stableSectionState[key];
-      setStableSectionCollapsed(key, next);
+    function toggleStableSection() {
+      const next = !stableSectionState.combined;
+      setStableSectionCollapsed(next);
       if (!next) {
-        if (key === "lending") renderLending(stableCache.lending || []);
-        if (key === "rewards") renderRewards(stableCache.rewards || []);
+        renderLending(stableCache.lending || []);
+        renderRewards(stableCache.rewards || []);
       }
     }
     function renderLending(rows) {
@@ -3765,17 +3825,12 @@ def _render_stables_page() -> str:
       if (!(rows || []).length) html += "<tr><td colspan='6'>No unclaimed rewards found.</td></tr>";
       table.innerHTML = html;
     }
-    async function scanStable(targetSection = "all") {
+    async function scanStable() {
       if (!stableState.evm.length && !stableState.solana.length && !stableState.tron.length) {
         setStableStatus("Add at least one address first.", true);
         return;
       }
-      if (targetSection === "lending" || targetSection === "rewards") {
-        setStableSectionCollapsed(targetSection, false);
-      } else {
-        setStableSectionCollapsed("lending", false);
-        setStableSectionCollapsed("rewards", false);
-      }
+      setStableSectionCollapsed(false);
       try {
         setStableBusy(true);
         setStableStatus("Scanning latest lending and rewards...", false);
@@ -3795,8 +3850,8 @@ def _render_stables_page() -> str:
         if (!res.ok) throw new Error(data.detail || "Scan failed");
         stableCache.lending = data.lending_positions || [];
         stableCache.rewards = data.reward_positions || [];
-        if (targetSection === "all" || targetSection === "lending") renderLending(stableCache.lending);
-        if (targetSection === "all" || targetSection === "rewards") renderRewards(stableCache.rewards);
+        renderLending(stableCache.lending);
+        renderRewards(stableCache.rewards);
         const errWrap = document.getElementById("stableErrors");
         const errs = data.errors || [];
         const infos = data.infos || [];
@@ -3812,8 +3867,7 @@ def _render_stables_page() -> str:
     }
     loadStableState();
     renderAllChips();
-    setStableSectionCollapsed("lending", false);
-    setStableSectionCollapsed("rewards", false);
+    setStableSectionCollapsed(false);
     setStableStatus("Ready", false);
     """
     return _render_placeholder_page(
