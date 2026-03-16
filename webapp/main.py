@@ -187,6 +187,8 @@ POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "0").strip
 POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIMEOUT_SEC", "4")))
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
 POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "800")))
+POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS = max(20000, int(os.environ.get("POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS", "2500000")))
+POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "150000")))
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
     "1",
     "true",
@@ -1495,6 +1497,90 @@ def _eth_call_hex(chain_id: int, to: str, data_hex: str) -> str:
     return out
 
 
+def _eth_block_number(chain_id: int) -> int:
+    out = str(_json_rpc_call(int(chain_id), "eth_blockNumber", []) or "0x0").strip().lower()
+    if out.startswith("0x"):
+        return int(out, 16)
+    return int(out or "0")
+
+
+def _eth_get_logs(chain_id: int, params: dict[str, Any]) -> list[dict[str, Any]]:
+    out = _json_rpc_call(int(chain_id), "eth_getLogs", [params])
+    if isinstance(out, list):
+        return [x for x in out if isinstance(x, dict)]
+    return []
+
+
+def _scan_erc721_token_ids_by_incoming_logs(
+    chain_id: int,
+    contract: str,
+    owner: str,
+    *,
+    deadline_ts: float | None = None,
+    max_ids: int = 120,
+) -> list[int]:
+    cid = int(chain_id)
+    c = str(contract or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(c) or not _is_eth_address(o):
+        return []
+    try:
+        latest = _eth_block_number(cid)
+    except Exception:
+        return []
+    if latest <= 0:
+        return []
+    min_block = max(0, int(latest) - int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS))
+    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
+    topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    topic_to_owner = "0x" + ("0" * 24) + o[2:]
+    end_block = int(latest)
+    out: list[int] = []
+    seen: set[int] = set()
+    while end_block >= min_block:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        start_block = max(min_block, end_block - step + 1)
+        params = {
+            "address": c,
+            "fromBlock": hex(int(start_block)),
+            "toBlock": hex(int(end_block)),
+            "topics": [topic_transfer, None, topic_to_owner],
+        }
+        try:
+            logs = _eth_get_logs(cid, params)
+        except Exception:
+            # Reduce chunk size on provider "too many results" style failures.
+            if step > 5000:
+                step = max(5000, step // 2)
+                continue
+            logs = []
+        logs_sorted = sorted(
+            logs,
+            key=lambda x: (
+                int(str(x.get("blockNumber") or "0x0"), 16),
+                int(str(x.get("logIndex") or "0x0"), 16),
+            ),
+            reverse=True,
+        )
+        for lg in logs_sorted:
+            topics = lg.get("topics") or []
+            if not isinstance(topics, list) or len(topics) < 4:
+                continue
+            try:
+                tid = int(str(topics[3]), 16)
+            except Exception:
+                continue
+            if tid <= 0 or tid in seen:
+                continue
+            seen.add(tid)
+            out.append(int(tid))
+            if len(out) >= int(max_ids):
+                return out
+        end_block = int(start_block) - 1
+    return out
+
+
 def _encode_address_word(addr: str) -> str:
     raw = str(addr or "").strip().lower()
     if not raw.startswith("0x"):
@@ -1945,6 +2031,7 @@ def _scan_infinity_position_ids_for_owner(
         return []
     limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
     token_ids: list[int] = []
+    seen_ids: set[int] = set()
     enumerable_ok = True
     for idx in range(int(balance) - 1, max(-1, int(balance) - limit - 1), -1):
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
@@ -1952,11 +2039,46 @@ def _scan_infinity_position_ids_for_owner(
         try:
             tok_data = "0x2f745c59" + _encode_address_word(owner) + _encode_uint_word(idx)
             tid = _decode_uint_eth_call(_eth_call_hex(cid, pm, tok_data))
-            if tid > 0:
+            if tid > 0 and int(tid) not in seen_ids:
+                seen_ids.add(int(tid))
                 token_ids.append(int(tid))
         except Exception:
             enumerable_ok = False
             break
+    if len(token_ids) < limit:
+        # Wallets often discover Infinity NFTs by Transfer logs; use same approach
+        # when ERC721Enumerable path is unavailable or incomplete.
+        log_deadline = time.monotonic() + 2.0
+        if deadline_ts is not None:
+            log_deadline = min(log_deadline, deadline_ts)
+        owner_word = _encode_address_word(owner)[-40:]
+        log_ids = _scan_erc721_token_ids_by_incoming_logs(
+            cid,
+            pm,
+            owner,
+            deadline_ts=log_deadline,
+            max_ids=max(limit * 3, limit),
+        )
+        for tid in log_ids:
+            if len(token_ids) >= limit:
+                break
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            if int(tid) in seen_ids:
+                continue
+            try:
+                owner_data = "0x6352211e" + _encode_uint_word(tid)
+                owner_hex = _eth_call_hex(cid, pm, owner_data)
+                owner_words = _hex_words(owner_hex)
+                if not owner_words:
+                    continue
+                current_owner = owner_words[0][-40:].lower()
+                if current_owner != owner_word:
+                    continue
+            except Exception:
+                continue
+            seen_ids.add(int(tid))
+            token_ids.append(int(tid))
     if token_ids or enumerable_ok:
         return token_ids
     # Fallback for contracts without ERC721Enumerable: scan recent IDs by ownerOf.
@@ -7271,7 +7393,7 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
     # By default scan all supported EVM chains; if chain_ids provided, preserve user order.
     # Prioritize chains where users most often track active LPs, and keep heavy
     # ethereum scan later so partial results include L2 pools under timeout.
-    preferred_order = [42161, 8453, 130, 56, 1, 10, 137]
+    preferred_order = [56, 42161, 8453, 130, 1, 10, 137]
     preferred_rank = {cid: idx for idx, cid in enumerate(preferred_order)}
     all_chain_ids = sorted(
         (
