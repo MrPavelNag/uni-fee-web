@@ -192,6 +192,7 @@ POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1
     "yes",
     "on",
 )
+POSITIONS_SPAM_MAX_TVL_USD = max(0.0, float(os.environ.get("POSITIONS_SPAM_MAX_TVL_USD", "50")))
 POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
     int(x.strip())
     for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161,8453,130,56").split(",")
@@ -1533,18 +1534,28 @@ def _is_probably_spam_symbol(symbol: str) -> bool:
     return False
 
 
-def _should_filter_spam_pair(chain_key: str, token0_obj: dict[str, Any], token1_obj: dict[str, Any], s0: str, s1: str) -> bool:
+def _should_filter_spam_pair(
+    chain_key: str,
+    token0_obj: dict[str, Any],
+    token1_obj: dict[str, Any],
+    s0: str,
+    s1: str,
+    position_tvl_usd: float | None,
+) -> bool:
     if not POSITIONS_FILTER_SPAM_TOKENS:
         return False
     chain_addr_map = _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}
     a0 = str((token0_obj or {}).get("id") or "").strip().lower()
     a1 = str((token1_obj or {}).get("id") or "").strip().lower()
-    if a0 in chain_addr_map or a1 in chain_addr_map:
+    both_curated = (a0 in chain_addr_map) and (a1 in chain_addr_map)
+    if both_curated:
         return False
     spam0 = _is_probably_spam_symbol(s0)
     spam1 = _is_probably_spam_symbol(s1)
-    # If pair tokens are not from curated list, hide pool when any side looks spammy.
-    return bool(spam0 or spam1)
+    # If pair tokens are not from curated list, filter only clearly suspicious low-value rows.
+    tvl = None if position_tvl_usd is None else float(position_tvl_usd)
+    low_value = (tvl is None) or (tvl <= float(POSITIONS_SPAM_MAX_TVL_USD))
+    return bool((spam0 or spam1) and low_value)
 
 
 def _pool_token0_price_from_sqrt_x96(sqrt_price_x96: int, dec0: int, dec1: int) -> float | None:
@@ -2365,7 +2376,18 @@ def _scan_pool_positions_chain(
                 t1_obj = pool.get("token1") or {}
                 t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
                 t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
-                if _should_filter_spam_pair(chain_key, t0_obj, t1_obj, t0, t1):
+                # Prefer exact-external, then exact-subgraph, then share-external fallback.
+                if detailed_external_tvl is None or detailed_external_tvl <= 0:
+                    detailed_subgraph_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
+                    if detailed_subgraph_tvl is not None and detailed_subgraph_tvl > 0:
+                        position_tvl_usd = detailed_subgraph_tvl
+                        valuation_mode = "exact-subgraph"
+                    else:
+                        share_external_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
+                        if share_external_tvl is not None and share_external_tvl > 0:
+                            position_tvl_usd = share_external_tvl
+                            valuation_mode = "estimated-share-external"
+                if _should_filter_spam_pair(chain_key, t0_obj, t1_obj, t0, t1, position_tvl_usd):
                     continue
                 owner_rows.append(
                     {
