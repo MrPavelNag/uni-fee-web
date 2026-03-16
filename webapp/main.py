@@ -1176,6 +1176,7 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             "fee_tier": fee_disp,
                             "fee_tier_raw": fee_raw,
                             "liquidity": str(p.get("liquidity") or "0"),
+                            "pool_liquidity": str(pool.get("liquidity") or "0"),
                             "pool_tvl_usd": tvl_usd,
                             "tvl_usd": position_tvl_usd,
                         }
@@ -1188,6 +1189,63 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             uniq[key] = row
     dedup_errors = list(dict.fromkeys(errors))
     return list(uniq.values()), dedup_errors
+
+
+def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
+    endpoint = get_graph_endpoint(chain_key, version=version)
+    if not endpoint:
+        return []
+    now_ts = int(time.time())
+    since_ts = now_ts - max(1, int(days)) * 86400
+    vars_base = {"pool": str(pool_id or "").strip().lower(), "since": int(since_ts)}
+    attempts = [
+        """
+        query PoolDays($pool: String!, $since: Int!) {
+          poolDayDatas(
+            first: 400
+            orderBy: date
+            orderDirection: asc
+            where: { pool: $pool, date_gte: $since }
+          ) {
+            date
+            tvlUSD
+          }
+        }
+        """,
+        """
+        query PoolDays($pool: String!, $since: Int!) {
+          poolDayDatas(
+            first: 400
+            orderBy: date
+            orderDirection: asc
+            where: { pool: $pool, date_gte: $since }
+          ) {
+            date
+            totalValueLockedUSD
+          }
+        }
+        """,
+    ]
+    for q in attempts:
+        try:
+            data = graphql_query(endpoint, q, vars_base, retries=1)
+            rows = (data.get("data") or {}).get("poolDayDatas") or []
+            out: list[tuple[int, float]] = []
+            for r in rows:
+                ts = int(r.get("date") or 0)
+                if ts <= 0:
+                    continue
+                tvl = _safe_float(r.get("tvlUSD"))
+                if tvl <= 0:
+                    tvl = _safe_float(r.get("totalValueLockedUSD"))
+                if tvl <= 0:
+                    continue
+                out.append((ts, tvl))
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
 
 
 def _aave_markets_for_chains(chain_ids: list[int]) -> list[dict[str, Any]]:
@@ -2149,6 +2207,16 @@ class PositionsScanRequest(BaseModel):
     chain_ids: list[int] = Field(default_factory=list)
 
 
+class PositionPoolSeriesRequest(BaseModel):
+    chain: str
+    protocol: str
+    pool_id: str
+    address: str
+    position_liquidity: str = "0"
+    pool_liquidity: str = "0"
+    days: int = 30
+
+
 INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/", "Find the best fee on Uniswap"),
     ("/pancake", "Find the best pool on PancakeSwap"),
@@ -2800,7 +2868,10 @@ def _render_positions_page() -> str:
       <section class="positions-form">
         <div class="section-head">
           <h3>My Crypto Portfolio</h3>
-          <span class="pos-status" id="posStatus">Ready</span>
+          <div class="section-actions">
+            <label class="hint" style="margin:0">History days <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:90px;margin-left:6px"/></label>
+            <span class="pos-status" id="posStatus">Ready</span>
+          </div>
         </div>
         <div class="address-columns">
           <div class="addr-box">
@@ -2834,7 +2905,7 @@ def _render_positions_page() -> str:
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <div id="posPoolsBody" class="section-body"><div class="table-wrap"><table id="posPoolsTable"></table></div></div>
+        <div id="posPoolsBody" class="section-body"><div class="table-wrap"><table id="posPoolsTable"></table></div><div id="posPoolChart" style="height:320px;margin-top:10px"></div></div>
       </section>
       <section class="result-card">
         <div class="section-head">
@@ -2964,10 +3035,90 @@ def _render_positions_page() -> str:
         if (key === "rewards") renderRewards(posCache.rewards || []);
       }
     }
+    async function ensurePlotly() {
+      if (window.Plotly && typeof window.Plotly.newPlot === "function") return true;
+      return new Promise((resolve) => {
+        const existing = document.getElementById("plotlyLoader");
+        if (existing) {
+          existing.addEventListener("load", () => resolve(!!window.Plotly), {once: true});
+          existing.addEventListener("error", () => resolve(false), {once: true});
+          return;
+        }
+        const s = document.createElement("script");
+        s.id = "plotlyLoader";
+        s.src = "https://cdn.plot.ly/plotly-2.35.2.min.js";
+        s.onload = () => resolve(true);
+        s.onerror = () => resolve(false);
+        document.head.appendChild(s);
+      });
+    }
+    function getHistoryDays() {
+      const v = Number(document.getElementById("posHistoryDays")?.value || 30);
+      return Math.max(1, Math.min(3650, Math.round(v)));
+    }
+    async function showPoolSeriesByIndex(idx) {
+      const row = (posCache.pools || [])[Number(idx) || 0];
+      const chartEl = document.getElementById("posPoolChart");
+      if (!row || !chartEl) return;
+      if (row.tvl_usd == null || !row.pool_liquidity || !row.liquidity) {
+        chartEl.innerHTML = "<div class='hint'>Position TVL history is unavailable for this pool on current indexer schema.</div>";
+        return;
+      }
+      try {
+        setPosStatus("Loading position TVL history...", false);
+        const payload = {
+          chain: row.chain,
+          protocol: row.protocol,
+          pool_id: row.pool_id,
+          address: row.address,
+          position_liquidity: row.liquidity,
+          pool_liquidity: row.pool_liquidity,
+          days: getHistoryDays(),
+        };
+        const res = await fetch("/api/positions/pool-value-series", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || "Failed to load series");
+        const items = data.items || [];
+        if (!items.length) {
+          chartEl.innerHTML = "<div class='hint'>No historical data for this pool in selected range.</div>";
+          setPosStatus("No history data", false);
+          return;
+        }
+        const ok = await ensurePlotly();
+        if (!ok) throw new Error("Failed to load chart library");
+        const xs = items.map((x) => new Date(Number(x.ts || 0) * 1000));
+        const ys = items.map((x) => Number(x.position_tvl_usd || 0));
+        Plotly.newPlot("posPoolChart", [{
+          x: xs,
+          y: ys,
+          mode: "lines",
+          line: {color: "#1d4ed8", width: 2},
+          hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra></extra>",
+        }], {
+          title: `Position TVL history - ${row.pair || row.pool_id}`,
+          paper_bgcolor: "#ffffff",
+          plot_bgcolor: "#f8fbff",
+          margin: {t: 34, b: 42, l: 54, r: 12},
+          xaxis: {showgrid: true, gridcolor: "#d9e2f0"},
+          yaxis: {showgrid: true, gridcolor: "#d9e2f0", tickprefix: "$"},
+          showlegend: false,
+        }, {displaylogo: false, responsive: true});
+        setPosStatus("History loaded", false);
+      } catch (e) {
+        chartEl.innerHTML = `<div class='hint'>Failed to load chart: ${esc(e?.message || "unknown")}</div>`;
+        setPosStatus("History load failed", true);
+      }
+    }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
-      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th></tr>";
-      for (const r of (rows || [])) {
+      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Chart</th></tr>";
+      const list = rows || [];
+      for (let i = 0; i < list.length; i++) {
+        const r = list[i];
         html += "<tr>";
         html += `<td class='mono'>${esc(r.address || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
@@ -2979,9 +3130,10 @@ def _render_positions_page() -> str:
         html += `<td class='mono'>${esc(r.pool_id || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
+        html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${i})'>View</button></td>`;
         html += "</tr>";
       }
-      if (!(rows || []).length) html += "<tr><td colspan='7'>No pool positions found.</td></tr>";
+      if (!list.length) html += "<tr><td colspan='8'>No pool positions found.</td></tr>";
       table.innerHTML = html;
     }
     function renderLending(rows) {
@@ -4491,6 +4643,31 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
             "reward_count": len(reward_rows),
         },
     }
+
+
+@app.post("/api/positions/pool-value-series")
+def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
+    chain_key = str(req.chain or "").strip().lower()
+    protocol = str(req.protocol or "").strip().lower()
+    pool_id = str(req.pool_id or "").strip().lower()
+    if not chain_key or not pool_id:
+        raise HTTPException(status_code=400, detail="chain and pool_id are required.")
+    if protocol not in {"uniswap_v3", "uniswap_v4"}:
+        raise HTTPException(status_code=400, detail="protocol must be uniswap_v3 or uniswap_v4.")
+    version = "v4" if protocol.endswith("_v4") else "v3"
+    days = max(1, min(3650, int(req.days or 30)))
+    position_liq = _safe_float(req.position_liquidity)
+    pool_liq = _safe_float(req.pool_liquidity)
+    if position_liq <= 0 or pool_liq <= 0:
+        raise HTTPException(status_code=400, detail="Position or pool liquidity is unavailable for this pool.")
+    share = position_liq / pool_liq if pool_liq > 0 else 0.0
+    if share <= 0:
+        raise HTTPException(status_code=400, detail="Liquidity share is zero.")
+    series_raw = _fetch_pool_tvl_series(chain_key, version, pool_id, days)
+    if not series_raw:
+        return {"items": [], "count": 0, "share": share}
+    items = [{"ts": int(ts), "pool_tvl_usd": float(tvl), "position_tvl_usd": float(max(0.0, tvl * share))} for ts, tvl in series_raw]
+    return {"items": items, "count": len(items), "share": share}
 
 
 @app.post("/api/help/tickets")
