@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -171,9 +172,11 @@ _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
-POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "96")))
+POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "30")))
-POSITIONS_OWNER_MAX_SECONDS = max(2, int(os.environ.get("POSITIONS_OWNER_MAX_SECONDS", "6")))
+POSITIONS_OWNER_MAX_SECONDS = max(2, int(os.environ.get("POSITIONS_OWNER_MAX_SECONDS", "4")))
+POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "3")))
+POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "2")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "0").strip().lower() in (
     "1",
     "true",
@@ -181,8 +184,13 @@ POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FAL
     "on",
 )
 POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "0").strip().lower() in ("1", "true", "yes", "on")
-POSITIONS_ONCHAIN_TIMEOUT_SEC = max(3, int(os.environ.get("POSITIONS_ONCHAIN_TIMEOUT_SEC", "8")))
+POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIMEOUT_SEC", "4")))
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
+POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
+    int(x.strip())
+    for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161").split(",")
+    if x.strip().isdigit()
+}
 PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
 TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
@@ -1410,7 +1418,12 @@ def _pool_token0_price_from_sqrt_x96(sqrt_price_x96: int, dec0: int, dec1: int) 
         return None
 
 
-def _scan_v3_positions_onchain(owner: str, chain_id: int, deadline_ts: float | None = None) -> list[dict[str, Any]]:
+def _scan_v3_positions_onchain(
+    owner: str,
+    chain_id: int,
+    deadline_ts: float | None = None,
+    include_price_details: bool = True,
+) -> list[dict[str, Any]]:
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
         return []
@@ -1462,18 +1475,23 @@ def _scan_v3_positions_onchain(owner: str, chain_id: int, deadline_ts: float | N
             if not _is_eth_address(pool_addr):
                 continue
 
-            # slot0() => sqrtPriceX96 is first word
-            slot0_words = _hex_words(_eth_call_hex(int(chain_id), pool_addr, "0x3850c7bd"))
-            sqrt_price_x96 = _decode_uint_from_word(slot0_words[0]) if slot0_words else 0
+            sqrt_price_x96 = 0
+            dec0 = 18
+            dec1 = 18
+            token0_price = None
+            if include_price_details:
+                # slot0() => sqrtPriceX96 is first word
+                slot0_words = _hex_words(_eth_call_hex(int(chain_id), pool_addr, "0x3850c7bd"))
+                sqrt_price_x96 = _decode_uint_from_word(slot0_words[0]) if slot0_words else 0
 
-            # decimals()
-            dec0 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token0, "0x313ce567"))
-            dec1 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token1, "0x313ce567"))
-            if dec0 < 0 or dec0 > 36:
-                dec0 = 18
-            if dec1 < 0 or dec1 > 36:
-                dec1 = 18
-            token0_price = _pool_token0_price_from_sqrt_x96(sqrt_price_x96, int(dec0), int(dec1))
+                # decimals()
+                dec0 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token0, "0x313ce567"))
+                dec1 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token1, "0x313ce567"))
+                if dec0 < 0 or dec0 > 36:
+                    dec0 = 18
+                if dec1 < 0 or dec1 > 36:
+                    dec1 = 18
+                token0_price = _pool_token0_price_from_sqrt_x96(sqrt_price_x96, int(dec0), int(dec1))
 
             out.append(
                 {
@@ -1489,6 +1507,7 @@ def _scan_v3_positions_onchain(owner: str, chain_id: int, deadline_ts: float | N
                         "token0": {"id": str(token0).lower(), "decimals": int(dec0)},
                         "token1": {"id": str(token1).lower(), "decimals": int(dec1)},
                     },
+                    "_skip_enrich": not include_price_details,
                 }
             )
         except Exception:
@@ -1719,6 +1738,7 @@ def _query_uniswap_positions_for_owner(
                                     found_ids.append(pid)
                             return True
                     except Exception as e:
+                        err_text = str(e).lower()
                         if debug_steps is not None:
                             debug_steps.append(
                                 {
@@ -1730,6 +1750,9 @@ def _query_uniswap_positions_for_owner(
                                     "error": str(e)[:220],
                                 }
                             )
+                        # Fast-fail on endpoint auth gating: extra query variants won't help.
+                        if ("api key not found" in err_text) or ("auth error" in err_text):
+                            return False
             return bool(found_ids)
 
         _run_query_sets(query_sets_primary)
@@ -1742,8 +1765,17 @@ def _query_uniswap_positions_for_owner(
     if not found_ids:
         return []
 
-    details: list[dict[str, Any]] = []
-    for pid in found_ids[:400]:
+    target_ids = found_ids[:400]
+    details = _fetch_positions_by_ids_with_detail(
+        endpoint,
+        target_ids,
+        include_pool_liquidity=include_pool_liquidity,
+        include_position_liquidity=include_position_liquidity,
+    )
+    fetched_ids = {str(x.get("id") or "").strip() for x in details if isinstance(x, dict)}
+    # Fill missing ids with per-id fetch to keep compatibility with stricter indexers.
+    missing_ids = [pid for pid in target_ids if pid not in fetched_ids]
+    for pid in missing_ids:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
         item = _fetch_position_by_id_with_detail(
@@ -1839,6 +1871,100 @@ def _fetch_position_by_id_with_detail(
     return None
 
 
+def _fetch_positions_by_ids_with_detail(
+    endpoint: str,
+    position_ids: list[str],
+    *,
+    include_pool_liquidity: bool,
+    include_position_liquidity: bool = True,
+) -> list[dict[str, Any]]:
+    ids = [str(x).strip() for x in (position_ids or []) if str(x).strip()]
+    if not ids:
+        return []
+    pool_liq_field = "liquidity" if include_pool_liquidity else ""
+    pos_liq_field = "liquidity" if include_position_liquidity else ""
+    detailed_fields = f"""
+      id
+      {pos_liq_field}
+      tickLower {{ tickIdx }}
+      tickUpper {{ tickIdx }}
+      pool {{
+        id
+        feeTier
+        {pool_liq_field}
+        sqrtPrice
+        token0Price
+        totalValueLockedUSD
+        totalValueLockedToken0
+        totalValueLockedToken1
+        token0 {{ symbol id decimals }}
+        token1 {{ symbol id decimals }}
+      }}
+    """
+    basic_fields = f"""
+      id
+      {pos_liq_field}
+      pool {{
+        id
+        feeTier
+        {pool_liq_field}
+        totalValueLockedUSD
+        token0Price
+        token0 {{ symbol id decimals }}
+        token1 {{ symbol id decimals }}
+      }}
+    """
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    chunks = [ids[i : i + 80] for i in range(0, len(ids), 80)]
+    for chunk in chunks:
+        for list_type in ("ID", "String"):
+            q_detailed = f"""
+            query PositionsByIds($ids: [{list_type}!]!) {{
+              positions(first: 200, where: {{ id_in: $ids }}) {{
+                {detailed_fields}
+              }}
+            }}
+            """
+            try:
+                data = graphql_query(endpoint, q_detailed, {"ids": chunk}, retries=1)
+                rows = ((data.get("data") or {}).get("positions") or [])
+                if rows:
+                    for r in rows:
+                        if not isinstance(r, dict):
+                            continue
+                        pid = str(r.get("id") or "").strip()
+                        if pid and pid not in seen:
+                            seen.add(pid)
+                            out.append(r)
+                    break
+            except Exception:
+                pass
+            q_basic = f"""
+            query PositionsByIds($ids: [{list_type}!]!) {{
+              positions(first: 200, where: {{ id_in: $ids }}) {{
+                {basic_fields}
+              }}
+            }}
+            """
+            try:
+                data = graphql_query(endpoint, q_basic, {"ids": chunk}, retries=1)
+                rows = ((data.get("data") or {}).get("positions") or [])
+                if rows:
+                    for r in rows:
+                        if not isinstance(r, dict):
+                            continue
+                        pid = str(r.get("id") or "").strip()
+                        if pid and pid not in seen:
+                            seen.add(pid)
+                            out.append(r)
+                    break
+            except Exception:
+                pass
+    return out
+
+
 def _endpoint_supports_uniswap_positions(endpoint: str) -> bool:
     cached = _POSITION_SCHEMA_SUPPORT_CACHE.get(endpoint)
     if cached is not None:
@@ -1914,177 +2040,318 @@ def _endpoint_supports_pool_liquidity(endpoint: str) -> bool:
     return ok
 
 
+def _scan_pool_positions_chain(
+    chain_id: int,
+    addresses: list[str],
+    deadline_ts: float,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    debug_rows: list[dict[str, Any]] = []
+    timed_out = False
+    chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
+    if not chain_key:
+        return rows, errors, debug_rows, timed_out
+
+    def _scan_pool_positions_owner(
+        owner: str,
+        *,
+        version: str,
+        endpoint: str,
+        has_pool_liquidity: bool,
+        has_position_liquidity: bool,
+    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], bool]:
+        owner_rows: list[dict[str, Any]] = []
+        owner_errors: list[str] = []
+        owner_attempts: list[dict[str, Any]] = []
+        positions: list[dict[str, Any]] = []
+        graph_failed = False
+        owner_timed_out = time.monotonic() >= deadline_ts
+        if owner_timed_out:
+            return owner_rows, owner_errors, {
+                "chain": chain_key,
+                "version": version,
+                "owner": owner,
+                "positions_found": 0,
+                "failed": False,
+                "attempts": owner_attempts,
+            }, True
+
+        if (
+            version == "v3"
+            and int(chain_id) in UNISWAP_V3_NPM_BY_CHAIN_ID
+            and int(chain_id) in POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS
+        ):
+            try:
+                onchain_prefetch = _scan_v3_positions_onchain(owner, int(chain_id), deadline_ts=deadline_ts)
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_v3_prefetch",
+                        "count": len(onchain_prefetch),
+                        "ok": True,
+                    }
+                )
+                if onchain_prefetch:
+                    positions = onchain_prefetch
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_v3_prefetch",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                    }
+                )
+
+        if not positions:
+            try:
+                positions = _query_uniswap_positions_for_owner(
+                    endpoint,
+                    owner,
+                    include_pool_liquidity=has_pool_liquidity,
+                    include_position_liquidity=has_position_liquidity,
+                    debug_steps=owner_attempts,
+                    deadline_ts=deadline_ts,
+                )
+                if not positions and not has_position_liquidity:
+                    positions = _query_uniswap_positions_for_owner(
+                        endpoint,
+                        owner,
+                        include_pool_liquidity=has_pool_liquidity,
+                        include_position_liquidity=True,
+                        debug_steps=owner_attempts,
+                        deadline_ts=deadline_ts,
+                    )
+            except Exception as e:
+                graph_failed = True
+                owner_errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "fallback",
+                        "query_mode": "graph_exception",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                    }
+                )
+        if version == "v3" and (graph_failed or not positions):
+            if time.monotonic() < deadline_ts:
+                try:
+                    onchain_positions = _scan_v3_positions_onchain(
+                        owner,
+                        int(chain_id),
+                        deadline_ts=deadline_ts,
+                        include_price_details=(int(chain_id) in POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS),
+                    )
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "onchain",
+                            "query_mode": "onchain_v3_npm",
+                            "count": len(onchain_positions),
+                            "ok": True,
+                        }
+                    )
+                    if onchain_positions:
+                        positions = onchain_positions
+                except Exception as e:
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "onchain",
+                            "query_mode": "onchain_v3_npm",
+                            "count": 0,
+                            "ok": False,
+                            "error": str(e)[:220],
+                        }
+                    )
+        owner_debug = {
+            "chain": chain_key,
+            "version": version,
+            "owner": owner,
+            "positions_found": len(positions),
+            "failed": False,
+            "attempts": owner_attempts,
+        }
+
+        for p in positions:
+            try:
+                if not isinstance(p, dict):
+                    continue
+                if not _position_has_full_detail(p) and not bool(p.get("_skip_enrich")):
+                    enriched = _fetch_position_by_id_with_detail(
+                        endpoint,
+                        str(p.get("id") or ""),
+                        include_pool_liquidity=has_pool_liquidity,
+                    )
+                    if enriched:
+                        p = enriched
+                liq_raw = p.get("liquidity")
+                if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
+                    continue
+                pool = p.get("pool") or {}
+                tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
+                valuation_mode = "exact-external"
+                detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
+                if detailed_external_tvl is None or detailed_external_tvl <= 0:
+                    position_tvl_usd = None
+                    valuation_mode = "no-exact-external"
+                else:
+                    position_tvl_usd = detailed_external_tvl
+                fee_raw = str(pool.get("feeTier") or "").strip()
+                fee_disp = fee_raw
+                try:
+                    fee_int = int(fee_raw)
+                    if fee_int > 0:
+                        fee_disp = f"{fee_int / 10000.0:.2f}%"
+                except Exception:
+                    fee_disp = fee_raw or "-"
+                t0_obj = pool.get("token0") or {}
+                t1_obj = pool.get("token1") or {}
+                t0 = t0_obj.get("symbol") or str(t0_obj.get("id") or "")[:8] or "?"
+                t1 = t1_obj.get("symbol") or str(t1_obj.get("id") or "")[:8] or "?"
+                owner_rows.append(
+                    {
+                        "address": owner,
+                        "protocol": f"uniswap_{version}",
+                        "chain": chain_key,
+                        "chain_id": int(chain_id),
+                        "kind": "pool",
+                        "pool_id": str(pool.get("id") or ""),
+                        "pair": f"{t0}/{t1}",
+                        "fee_tier": fee_disp,
+                        "fee_tier_raw": fee_raw,
+                        "liquidity": str(p.get("liquidity") or "0"),
+                        "pool_liquidity": str(pool.get("liquidity") or "0"),
+                        "pool_tvl_usd": tvl_usd,
+                        "tvl_usd": position_tvl_usd,
+                        "valuation_mode": valuation_mode,
+                    }
+                )
+            except Exception as e:
+                if POSITIONS_DEBUG_ERRORS:
+                    owner_errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
+                continue
+            if time.monotonic() >= deadline_ts:
+                owner_timed_out = True
+                break
+        return owner_rows, owner_errors, owner_debug, owner_timed_out
+
+    for version in ("v3", "v4"):
+        if time.monotonic() >= deadline_ts:
+            timed_out = True
+            break
+        endpoint = get_graph_endpoint(chain_key, version=version)
+        if not endpoint:
+            continue
+        if not _endpoint_supports_uniswap_positions(endpoint):
+            # Keep v3 flow alive via on-chain fallback even if endpoint introspection says unsupported.
+            if version != "v3":
+                continue
+        has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint)
+        has_position_liquidity = _endpoint_supports_position_liquidity(endpoint)
+        owner_workers = max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(addresses)))
+        if owner_workers <= 1 or len(addresses) <= 1:
+            for owner in addresses:
+                if time.monotonic() >= deadline_ts:
+                    timed_out = True
+                    break
+                owner_rows, owner_errors, owner_debug, owner_timed_out = _scan_pool_positions_owner(
+                    owner,
+                    version=version,
+                    endpoint=endpoint,
+                    has_pool_liquidity=has_pool_liquidity,
+                    has_position_liquidity=has_position_liquidity,
+                )
+                rows.extend(owner_rows)
+                errors.extend(owner_errors)
+                debug_rows.append(owner_debug)
+                if owner_timed_out:
+                    timed_out = True
+                    break
+        else:
+            with ThreadPoolExecutor(max_workers=owner_workers) as owner_executor:
+                owner_futures = [
+                    owner_executor.submit(
+                        _scan_pool_positions_owner,
+                        owner,
+                        version=version,
+                        endpoint=endpoint,
+                        has_pool_liquidity=has_pool_liquidity,
+                        has_position_liquidity=has_position_liquidity,
+                    )
+                    for owner in addresses
+                ]
+                for owner_fut in as_completed(owner_futures):
+                    try:
+                        owner_rows, owner_errors, owner_debug, owner_timed_out = owner_fut.result()
+                    except Exception as e:
+                        errors.append(f"Pool owner worker failed [{chain_key}/{version}]: {e}")
+                        continue
+                    rows.extend(owner_rows)
+                    errors.extend(owner_errors)
+                    debug_rows.append(owner_debug)
+                    if owner_timed_out:
+                        timed_out = True
+                    if time.monotonic() >= deadline_ts:
+                        timed_out = True
+                        break
+        if timed_out:
+            break
+    return rows, errors, debug_rows, timed_out
+
+
 def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
     deadline_ts = time.monotonic() + float(POSITIONS_SCAN_MAX_SECONDS)
     timed_out = False
-    for chain_id in chain_ids:
-        if time.monotonic() >= deadline_ts:
-            timed_out = True
-            break
-        chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
-        if not chain_key:
-            continue
-        for version in ("v3", "v4"):
+
+    valid_chain_ids = [int(cid) for cid in chain_ids if CHAIN_ID_TO_KEY.get(int(cid), "")]
+    max_workers = max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(valid_chain_ids)))
+
+    if max_workers <= 1 or len(valid_chain_ids) <= 1:
+        for chain_id in valid_chain_ids:
             if time.monotonic() >= deadline_ts:
                 timed_out = True
                 break
-            endpoint = get_graph_endpoint(chain_key, version=version)
-            if not endpoint:
-                continue
-            if not _endpoint_supports_uniswap_positions(endpoint):
-                # Keep v3 flow alive via on-chain fallback even if endpoint introspection says unsupported.
-                if version != "v3":
+            chain_rows, chain_errors, chain_debug, chain_timed_out = _scan_pool_positions_chain(
+                chain_id,
+                addresses,
+                deadline_ts,
+            )
+            rows.extend(chain_rows)
+            errors.extend(chain_errors)
+            debug_rows.extend(chain_debug)
+            if chain_timed_out:
+                timed_out = True
+                break
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_scan_pool_positions_chain, chain_id, addresses, deadline_ts)
+                for chain_id in valid_chain_ids
+            ]
+            for fut in as_completed(futures):
+                try:
+                    chain_rows, chain_errors, chain_debug, chain_timed_out = fut.result()
+                except Exception as e:
+                    errors.append(f"Pool scan worker failed: {e}")
                     continue
-            has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint)
-            has_position_liquidity = _endpoint_supports_position_liquidity(endpoint)
-            for owner in addresses:
+                rows.extend(chain_rows)
+                errors.extend(chain_errors)
+                debug_rows.extend(chain_debug)
+                if chain_timed_out:
+                    timed_out = True
                 if time.monotonic() >= deadline_ts:
                     timed_out = True
-                    break
-                owner_attempts: list[dict[str, Any]] = []
-                positions: list[dict[str, Any]] = []
-                graph_failed = False
-                try:
-                    positions = _query_uniswap_positions_for_owner(
-                        endpoint,
-                        owner,
-                        include_pool_liquidity=has_pool_liquidity,
-                        include_position_liquidity=has_position_liquidity,
-                        debug_steps=owner_attempts,
-                        deadline_ts=deadline_ts,
-                    )
-                    # Introspection can be blocked on some indexers, producing a false
-                    # negative for liquidity support. Retry once with liquidity enabled.
-                    if not positions and not has_position_liquidity:
-                        positions = _query_uniswap_positions_for_owner(
-                            endpoint,
-                            owner,
-                            include_pool_liquidity=has_pool_liquidity,
-                            include_position_liquidity=True,
-                            debug_steps=owner_attempts,
-                            deadline_ts=deadline_ts,
-                        )
-                except Exception as e:
-                    graph_failed = True
-                    errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
-                    owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "fallback",
-                            "query_mode": "graph_exception",
-                            "count": 0,
-                            "ok": False,
-                            "error": str(e)[:220],
-                        }
-                    )
-                if version == "v3" and (graph_failed or not positions):
-                    if deadline_ts is None or time.monotonic() < deadline_ts:
-                        try:
-                            onchain_positions = _scan_v3_positions_onchain(owner, int(chain_id), deadline_ts=deadline_ts)
-                            owner_attempts.append(
-                                {
-                                    "owner_value": owner,
-                                    "owner_type": "onchain",
-                                    "query_mode": "onchain_v3_npm",
-                                    "count": len(onchain_positions),
-                                    "ok": True,
-                                }
-                            )
-                            if onchain_positions:
-                                positions = onchain_positions
-                        except Exception as e:
-                            owner_attempts.append(
-                                {
-                                    "owner_value": owner,
-                                    "owner_type": "onchain",
-                                    "query_mode": "onchain_v3_npm",
-                                    "count": 0,
-                                    "ok": False,
-                                    "error": str(e)[:220],
-                                }
-                            )
-                debug_rows.append(
-                    {
-                        "chain": chain_key,
-                        "version": version,
-                        "owner": owner,
-                        "positions_found": len(positions),
-                        "failed": False,
-                        "attempts": owner_attempts,
-                    }
-                )
-                for p in positions:
-                    if time.monotonic() >= deadline_ts:
-                        timed_out = True
-                        break
-                    try:
-                        if not isinstance(p, dict):
-                            continue
-                        if not _position_has_full_detail(p):
-                            enriched = _fetch_position_by_id_with_detail(
-                                endpoint,
-                                str(p.get("id") or ""),
-                                include_pool_liquidity=has_pool_liquidity,
-                            )
-                            if enriched:
-                                p = enriched
-                        liq_raw = p.get("liquidity")
-                        if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
-                            # Hide closed/zero-liquidity historical NFTs; keep only active positions.
-                            continue
-                        pool = p.get("pool") or {}
-                        tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
-                        valuation_mode = "exact-external"
-                        detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
-                        # Prefer exact-external value; if unavailable, keep row visible.
-                        if detailed_external_tvl is None or detailed_external_tvl <= 0:
-                            position_tvl_usd = None
-                            valuation_mode = "no-exact-external"
-                        else:
-                            position_tvl_usd = detailed_external_tvl
-                        fee_raw = str(pool.get("feeTier") or "").strip()
-                        fee_disp = fee_raw
-                        try:
-                            fee_int = int(fee_raw)
-                            if fee_int > 0:
-                                fee_disp = f"{fee_int / 10000.0:.2f}%"
-                        except Exception:
-                            fee_disp = fee_raw or "-"
-                        t0_obj = pool.get("token0") or {}
-                        t1_obj = pool.get("token1") or {}
-                        t0 = t0_obj.get("symbol") or str(t0_obj.get("id") or "")[:8] or "?"
-                        t1 = t1_obj.get("symbol") or str(t1_obj.get("id") or "")[:8] or "?"
-                        rows.append(
-                            {
-                                "address": owner,
-                                "protocol": f"uniswap_{version}",
-                                "chain": chain_key,
-                                "chain_id": int(chain_id),
-                                "kind": "pool",
-                                "pool_id": str(pool.get("id") or ""),
-                                "pair": f"{t0}/{t1}",
-                                "fee_tier": fee_disp,
-                                "fee_tier_raw": fee_raw,
-                                "liquidity": str(p.get("liquidity") or "0"),
-                                "pool_liquidity": str(pool.get("liquidity") or "0"),
-                                "pool_tvl_usd": tvl_usd,
-                                "tvl_usd": position_tvl_usd,
-                                "valuation_mode": valuation_mode,
-                            }
-                        )
-                    except Exception as e:
-                        if POSITIONS_DEBUG_ERRORS:
-                            errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
-                        continue
-                if timed_out:
-                    break
-            if timed_out:
-                break
-        if timed_out:
-            break
+
     # Aggregate by owner/protocol/pool id (wallet can hold multiple NFT positions in one pool).
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
@@ -3935,6 +4202,11 @@ def _render_positions_page() -> str:
       if (!text) return;
       navigator.clipboard.writeText(text).then(() => setPosStatus("Copied to clipboard", false)).catch(() => {});
     }
+    function shortAddr4(value) {
+      const v = String(value || "").trim();
+      if (!v) return "";
+      return v.length <= 4 ? v : ("..." + v.slice(-4));
+    }
     function setSectionCollapsed(key, collapsed) {
       const bodyMap = {pools: "posPoolsBody"};
       const btnMap = {pools: "togglePoolsBtn"};
@@ -4038,7 +4310,7 @@ def _render_positions_page() -> str:
       for (let i = 0; i < list.length; i++) {
         const r = list[i];
         html += "<tr>";
-        html += `<td class='mono'>${esc(r.address || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(r.protocol || "")}</td>`;
         html += `<td>${esc(r.pair || "")}</td>`;
@@ -5798,7 +6070,9 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
         raise HTTPException(status_code=400, detail="Too many addresses. Max 20.")
 
     # By default scan all supported EVM chains; if chain_ids provided, preserve user order.
-    preferred_order = [1, 42161, 10, 8453, 137, 56]
+    # Prioritize chains where users most often track active LPs, and keep heavy
+    # ethereum scan later so partial results include L2 pools under timeout.
+    preferred_order = [42161, 8453, 1, 10, 137, 56]
     preferred_rank = {cid: idx for idx, cid in enumerate(preferred_order)}
     all_chain_ids = sorted(
         {
