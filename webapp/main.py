@@ -8300,6 +8300,24 @@ HTML_PAGE = """
       margin-left: auto;
       justify-content: flex-end;
     }
+    .scan-progress {
+      width: 140px;
+      height: 6px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      overflow: hidden;
+      display: none;
+    }
+    .scan-progress .bar {
+      width: 40%;
+      height: 100%;
+      background: linear-gradient(90deg, #93c5fd, #2563eb);
+      animation: scanLoad 1s linear infinite;
+    }
+    @keyframes scanLoad {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(280%); }
+    }
     .btn {
       border: 0;
       border-radius: 10px;
@@ -8704,8 +8722,9 @@ HTML_PAGE = """
         <div class="section-head">
           <h3>Fee Performance History</h3>
           <div class="section-actions">
-            <button class="search-link-btn" type="button" id="scanBtn" onclick="runJob()">Scan</button>
+            <div id="scanProgress" class="scan-progress"><div class="bar"></div></div>
             <span id="status" class="status">Ready</span>
+            <button class="search-link-btn" type="button" id="scanBtn" onclick="runJob()">Scan</button>
           </div>
         </div>
         <div class="charts-grid">
@@ -8766,6 +8785,9 @@ HTML_PAGE = """
     let pairRowsVisible = 1;
     let authState = {authenticated: false};
     let hasScanRun = false;
+    let scanTicker = null;
+    let scanStartedAt = 0;
+    let scanStageLabel = "waiting";
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
 
     const WALLET_LABELS = {
@@ -9147,21 +9169,50 @@ HTML_PAGE = """
       el.className = "status " + (cssClass || "");
     }
 
+    function setScanProgressVisible(flag) {
+      const el = document.getElementById("scanProgress");
+      if (!el) return;
+      el.style.display = flag ? "block" : "none";
+    }
+
+    function stopScanTicker() {
+      if (scanTicker) {
+        clearInterval(scanTicker);
+        scanTicker = null;
+      }
+      scanStartedAt = 0;
+      scanStageLabel = "waiting";
+    }
+
+    function startScanTicker() {
+      stopScanTicker();
+      scanStartedAt = Date.now();
+      const selected = getSelectedChains();
+      const chainHints = selected.length ? selected : (availableChains.length ? availableChains : ["all chains"]);
+      const tick = () => {
+        const elapsed = Math.max(0, Math.floor((Date.now() - scanStartedAt) / 1000));
+        const chainHint = chainHints[Math.floor(elapsed / 4) % chainHints.length];
+        setStatus(`Scanning positions... ${elapsed}s | ${scanStageLabel} (${chainHint})`, "running");
+      };
+      tick();
+      scanTicker = setInterval(tick, 900);
+    }
+
     function setBusy(flag) {
       const btn = document.getElementById("scanBtn");
       if (!btn) return;
       btn.disabled = flag;
       btn.style.opacity = flag ? "0.7" : "1";
+      setScanProgressVisible(flag);
       if (flag) {
-        btn.textContent = "Scanning...";
+        btn.textContent = "Scan again";
       } else {
         btn.textContent = hasScanRun ? "Scan again" : "Scan";
       }
     }
 
     function updateProgress(progress, stageLabel) {
-      const p = Math.max(0, Math.min(100, Number(progress || 0)));
-      setStatus(`${stageLabel || "Running"} (${p}%)`, "running");
+      scanStageLabel = String(stageLabel || "running");
     }
 
     function saveFormState() {
@@ -9637,8 +9688,8 @@ HTML_PAGE = """
 
         saveFormState();
         setBusy(true);
-        setStatus("Starting...", "running");
-        updateProgress(2, "Submitting job");
+        scanStageLabel = "Submitting job";
+        startScanTicker();
         const r = await fetch("/api/pools/run", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
@@ -9646,12 +9697,14 @@ HTML_PAGE = """
         });
         const data = await r.json();
         if (!r.ok) {
+          stopScanTicker();
           setBusy(false);
           setStatus("Error: " + (data.detail || "request failed"), "fail");
           return;
         }
         pollJob(data.job_id);
       } catch (e) {
+        stopScanTicker();
         setBusy(false);
         setStatus("Frontend error: " + (e?.message || "unknown"), "fail");
       }
@@ -9664,17 +9717,19 @@ HTML_PAGE = """
         updateProgress(job.progress, job.stage_label || job.stage);
         if (job.status === "done") {
           clearInterval(timer);
+          stopScanTicker();
           hasScanRun = true;
           setBusy(false);
           setStatus("Completed", "ok");
           renderResult(job.result);
         } else if (job.status === "failed") {
           clearInterval(timer);
+          stopScanTicker();
           hasScanRun = true;
           setBusy(false);
           setStatus("Failed: " + (job.error || "unknown"), "fail");
         } else {
-          setStatus(job.stage_label || job.status, "running");
+          scanStageLabel = String(job.stage_label || job.status || "running");
         }
       }, 2000);
     }
