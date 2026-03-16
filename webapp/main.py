@@ -1020,7 +1020,7 @@ def _tick_to_sqrt_price_x96(tick: int) -> Decimal:
     return sqrt_v * (Decimal(2) ** 96)
 
 
-def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[str, Any]) -> float | None:
+def _position_amounts_from_detail(position: dict[str, Any], pool: dict[str, Any]) -> tuple[Decimal, Decimal] | None:
     try:
         liq = Decimal(str(position.get("liquidity") or "0"))
         if liq <= 0:
@@ -1059,6 +1059,19 @@ def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[
             amount1_raw = (liq * (sqrt_b - sqrt_a)) / q96
         amount0 = amount0_raw / (Decimal(10) ** dec0)
         amount1 = amount1_raw / (Decimal(10) ** dec1)
+        if amount0 < 0 or amount1 < 0:
+            return None
+        return amount0, amount1
+    except Exception:
+        return None
+
+
+def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[str, Any]) -> float | None:
+    try:
+        amounts = _position_amounts_from_detail(position, pool)
+        if not amounts:
+            return None
+        amount0, amount1 = amounts
         token0_price_in_token1 = Decimal(str(pool.get("token0Price") or "0"))
         tvl_usd = Decimal(str(pool.get("totalValueLockedUSD") or "0"))
         tvl0 = Decimal(str(pool.get("totalValueLockedToken0") or "0"))
@@ -1072,6 +1085,40 @@ def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[
         price0_usd = token0_price_in_token1 * price1_usd
         value = amount0 * price0_usd + amount1 * price1_usd
         if value < 0:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _estimate_position_tvl_usd_from_detail_external(
+    position: dict[str, Any], pool: dict[str, Any], chain_id: int
+) -> float | None:
+    try:
+        amounts = _position_amounts_from_detail(position, pool)
+        if not amounts:
+            return None
+        amount0, amount1 = amounts
+        t0 = pool.get("token0") or {}
+        t1 = pool.get("token1") or {}
+        token0 = str(t0.get("id") or "").strip().lower()
+        token1 = str(t1.get("id") or "").strip().lower()
+        prices = _get_token_prices_usd(int(chain_id), [token0, token1])
+        p0 = prices.get(token0)
+        p1 = prices.get(token1)
+        token0_price_in_token1 = _safe_float(pool.get("token0Price"))
+        if p0 is None and p1 is not None and token0_price_in_token1 > 0:
+            p0 = p1 * token0_price_in_token1
+        if p1 is None and p0 is not None and token0_price_in_token1 > 0:
+            p1 = p0 / token0_price_in_token1
+        if p0 is None and p1 is None:
+            return None
+        value = Decimal(0)
+        if p0 is not None:
+            value += amount0 * Decimal(str(p0))
+        if p1 is not None:
+            value += amount1 * Decimal(str(p1))
+        if value <= 0:
             return None
         return float(value)
     except Exception:
@@ -1330,14 +1377,20 @@ def _endpoint_supports_uniswap_positions(endpoint: str) -> bool:
       }
     }
     """
-    ok = False
+    ok = True
     try:
         data = graphql_query(endpoint, query, {}, retries=1)
         fields = ((data.get("data") or {}).get("__type") or {}).get("fields") or []
-        names = {str(x.get("name") or "") for x in fields}
-        ok = ("pool" in names)
+        if fields:
+            names = {str(x.get("name") or "") for x in fields}
+            ok = ("pool" in names)
+        else:
+            # Some providers restrict introspection. Treat as unknown/supportive
+            # and try real position queries instead of skipping silently.
+            ok = True
     except Exception:
-        ok = False
+        # Introspection failure is not enough to conclude unsupported schema.
+        ok = True
     _POSITION_SCHEMA_SUPPORT_CACHE[endpoint] = ok
     return ok
 
@@ -1426,27 +1479,19 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                         continue
                     pos_liq = _safe_float(p.get("liquidity"))
                     pool_liq = _safe_float(pool.get("liquidity"))
-                    # Estimate position TVL by liquidity share.
-                    # If pool liquidity is unavailable, keep it unknown (None).
                     position_tvl_usd: float | None = None
-                    external_share_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
+                    detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
                     detailed_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
                     share_tvl: float | None = None
                     if pool_liq > 0 and pos_liq > 0:
                         share_tvl = max(0.0, tvl_usd * (pos_liq / pool_liq))
-                    if external_share_tvl is not None and external_share_tvl >= 0:
-                        position_tvl_usd = external_share_tvl
+                    if detailed_external_tvl is not None and detailed_external_tvl >= 0:
+                        position_tvl_usd = detailed_external_tvl
                     if detailed_tvl is not None and detailed_tvl >= 0:
                         if position_tvl_usd is None:
                             position_tvl_usd = detailed_tvl
                     if position_tvl_usd is None and share_tvl is not None:
                         position_tvl_usd = share_tvl
-                    # Sanity guard: if detailed formula diverges too much from
-                    # share-based estimate, prefer share-based value.
-                    if position_tvl_usd is not None and share_tvl is not None and share_tvl > 0:
-                        ratio = position_tvl_usd / share_tvl
-                        if ratio < 0.2 or ratio > 5.0:
-                            position_tvl_usd = share_tvl
                     fee_raw = str(pool.get("feeTier") or "").strip()
                     fee_disp = fee_raw
                     try:
@@ -2516,8 +2561,8 @@ class PositionPoolSeriesRequest(BaseModel):
 INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/", "Find the best fee on Uniswap"),
     ("/pancake", "Find the best pool on PancakeSwap"),
-    ("/stables", "Find the best stablecoin yield"),
-    ("/positions", "Analyze my DeFi positions"),
+    ("/stables", "Optimize my lending positions"),
+    ("/positions", "Optimize my pool positions"),
     ("/help", "Send wishes or report issues"),
 ]
 
@@ -3266,8 +3311,9 @@ def _render_positions_page() -> str:
         setPosStatus(`Invalid ${kind.toUpperCase()} address format.`, true);
         return;
       }
-      const addr = kind === "evm" ? addrRaw.toLowerCase() : addrRaw;
-      if ((posState[kind] || []).includes(addr)) {
+      const addr = addrRaw;
+      const dup = (posState[kind] || []).some((x) => kind === "evm" ? String(x).toLowerCase() === addr.toLowerCase() : String(x) === addr);
+      if (dup) {
         setPosStatus("Address already added.", true);
         return;
       }
@@ -3637,8 +3683,9 @@ def _render_stables_page() -> str:
       const el = document.getElementById(inputId(kind));
       const addrRaw = String(el?.value || "").trim();
       if (!validAddress(kind, addrRaw)) { setStableStatus(`Invalid ${kind.toUpperCase()} address format.`, true); return; }
-      const addr = kind === "evm" ? addrRaw.toLowerCase() : addrRaw;
-      if ((stableState[kind] || []).includes(addr)) { setStableStatus("Address already added.", true); return; }
+      const addr = addrRaw;
+      const dup = (stableState[kind] || []).some((x) => kind === "evm" ? String(x).toLowerCase() === addr.toLowerCase() : String(x) === addr);
+      if (dup) { setStableStatus("Address already added.", true); return; }
       stableState[kind].push(addr);
       if (el) el.value = "";
       saveStableState();
@@ -4540,6 +4587,10 @@ def _render_help_page() -> str:
     textarea {{ min-height: 140px; resize: vertical; }}
     .compose-row {{ display:grid; grid-template-columns: 1fr auto; gap:10px; align-items:start; }}
     .compose-row .btn {{ min-width: 140px; }}
+    .auth-note {{ margin-top: 6px; font-size: 12px; color: #64748b; }}
+    .auth-note-accent {{ font-weight: 700; }}
+    .auth-note-accent.disconnected {{ color: #b91c1c; }}
+    .auth-note-accent.connected {{ color: #15803d; }}
     .ticket-meta-wrap {{ max-width: 760px; }}
     .btn {{ border: 1px solid #bfdbfe; border-radius: 10px; padding: 9px 14px; font-size: 14px; font-weight: 700; color: #1d4ed8; background: #eff6ff; cursor: pointer; }}
     .status {{ font-size: 13px; color: #475569; margin-left: 8px; }}
@@ -4589,7 +4640,8 @@ def _render_help_page() -> str:
       <section class="card feedback-form-card">
         <h3>Feedback</h3>
         <p class="hint">Share product ideas or report problems. These messages go to admin review.</p>
-        <div class="compose-row"><textarea id="fMessage" placeholder="Tell us what to improve or what is broken. Only wallet-authorized sessions can send tickets and feedback."></textarea><button class="btn" onclick="sendFeedback()">Send message</button></div>
+        <div class="compose-row"><textarea id="fMessage" placeholder="Tell us what to improve or what is broken."></textarea><button class="btn" onclick="sendFeedback()">Send message</button></div>
+        <div class="auth-note" id="feedbackAuthNote">Only wallet-authorized sessions can send tickets and feedback.</div>
         <span class="status" id="feedbackFormStatus"></span>
       </section>
       <section class="card">
@@ -4600,7 +4652,8 @@ def _render_help_page() -> str:
           <div class="row"><label>Email</label><input id="tEmail" type="email" placeholder="Optional"/></div>
           <div class="row"><label>Subject</label><input id="tSubject" type="text" placeholder="Required"/></div>
         </div>
-        <div class="compose-row"><textarea id="tMessage" placeholder="Describe the issue or request. Only wallet-authorized sessions can send tickets and feedback."></textarea><button class="btn" onclick="sendTicket()">Send ticket</button></div>
+        <div class="compose-row"><textarea id="tMessage" placeholder="Describe the issue or request."></textarea><button class="btn" onclick="sendTicket()">Send ticket</button></div>
+        <div class="auth-note" id="ticketAuthNote">Only wallet-authorized sessions can send tickets and feedback.</div>
         <span class="status" id="ticketStatus"></span>
       </section>
       <section class="card">
@@ -4630,7 +4683,18 @@ def _render_help_page() -> str:
     function closeWalletModal(event) {{ if(event&&event.target&&event.target.id!=="walletModalBackdrop") return; document.getElementById("walletModalBackdrop").style.display="none"; }}
     async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
     function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} refreshIntentMenu(); }}
-    function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; btn.textContent = authState?.authenticated ? (authState.address_short || "Wallet connected") : "Connect Wallet"; syncAdminIntentOption(); }}
+    function updateHelpAuthNotes() {{
+      const connected = !!authState?.authenticated;
+      const html = connected
+        ? 'Only <span class="auth-note-accent connected">wallet-authorized sessions</span> can send tickets and feedback.'
+        : 'Only <span class="auth-note-accent disconnected">wallet-authorized sessions</span> can send tickets and feedback.';
+      const ids = ["feedbackAuthNote", "ticketAuthNote"];
+      for (const id of ids) {{
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = html;
+      }}
+    }}
+    function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; btn.textContent = authState?.authenticated ? (authState.address_short || "Wallet connected") : "Connect Wallet"; syncAdminIntentOption(); updateHelpAuthNotes(); }}
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
@@ -6222,8 +6286,8 @@ HTML_PAGE = """
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
           <option value="/" selected>Find the best fee on Uniswap</option>
           <option value="/pancake">Find the best pool on PancakeSwap</option>
-          <option value="/stables">Find the best stablecoin yield</option>
-          <option value="/positions">Analyze my DeFi positions</option>
+          <option value="/stables">Optimize my lending positions</option>
+          <option value="/positions">Optimize my pool positions</option>
           <option value="/help">Send wishes or report issues</option>
         </select>
         <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
