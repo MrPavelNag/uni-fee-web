@@ -1469,6 +1469,55 @@ def _query_uniswap_positions_for_owner(
     return result
 
 
+def _position_has_full_detail(position: dict[str, Any]) -> bool:
+    pool = position.get("pool") or {}
+    has_ticks = bool((position.get("tickLower") or {}).get("tickIdx") is not None and (position.get("tickUpper") or {}).get("tickIdx") is not None)
+    has_pool_price = bool(str(pool.get("sqrtPrice") or "").strip())
+    has_decimals = bool((pool.get("token0") or {}).get("decimals") is not None and (pool.get("token1") or {}).get("decimals") is not None)
+    return has_ticks and has_pool_price and has_decimals
+
+
+def _fetch_position_by_id_with_detail(endpoint: str, position_id: str, include_pool_liquidity: bool) -> dict[str, Any] | None:
+    pid = str(position_id or "").strip()
+    if not pid:
+        return None
+    pool_liq_field = "liquidity" if include_pool_liquidity else ""
+    fields = f"""
+      id
+      liquidity
+      tickLower {{ tickIdx }}
+      tickUpper {{ tickIdx }}
+      pool {{
+        id
+        feeTier
+        {pool_liq_field}
+        sqrtPrice
+        token0Price
+        totalValueLockedUSD
+        totalValueLockedToken0
+        totalValueLockedToken1
+        token0 {{ symbol id decimals }}
+        token1 {{ symbol id decimals }}
+      }}
+    """
+    for id_type in ("ID", "String"):
+        q = f"""
+        query PositionById($id: {id_type}!) {{
+          position(id: $id) {{
+            {fields}
+          }}
+        }}
+        """
+        try:
+            data = graphql_query(endpoint, q, {"id": pid}, retries=1)
+            pos = ((data.get("data") or {}).get("position") or {})
+            if pos:
+                return pos
+        except Exception:
+            continue
+    return None
+
+
 def _endpoint_supports_uniswap_positions(endpoint: str) -> bool:
     cached = _POSITION_SCHEMA_SUPPORT_CACHE.get(endpoint)
     if cached is not None:
@@ -1582,8 +1631,16 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
                     continue
                 for p in positions:
+                    if not _position_has_full_detail(p):
+                        enriched = _fetch_position_by_id_with_detail(
+                            endpoint,
+                            str(p.get("id") or ""),
+                            include_pool_liquidity=has_pool_liquidity,
+                        )
+                        if enriched:
+                            p = enriched
                     liq_raw = p.get("liquidity")
-                    if has_position_liquidity and liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
+                    if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
                         # Hide closed/zero-liquidity historical NFTs; keep only active positions.
                         continue
                     pool = p.get("pool") or {}
@@ -3744,7 +3801,7 @@ def _render_stables_page() -> str:
       </section>
       <section class="result-card">
         <div class="section-head">
-          <h3>Lending positions and unclaimed rewards</h3>
+          <h3 id="stableCombinedTitle">Lending positions and unclaimed rewards</h3>
           <div class="section-actions">
             <div id="stableProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="stableStatus">Ready</span>
@@ -3753,8 +3810,9 @@ def _render_stables_page() -> str:
           </div>
         </div>
         <div id="stableCombinedBody" class="section-body">
+          <div id="stableLendingHeading" style="margin-bottom:8px;font-weight:700;color:#1e3a8a;display:none">Lending positions</div>
           <div class="table-wrap"><table id="stableLendingTable"></table></div>
-          <div style="height:10px"></div>
+          <div id="stableRewardsHeading" style="margin:12px 0 8px;font-weight:700;color:#1e3a8a;display:none">Unclaimed lending rewards</div>
           <div class="table-wrap"><table id="stableRewardsTable"></table></div>
           <div id="stableErrors"></div>
         </div>
@@ -3837,10 +3895,16 @@ def _render_stables_page() -> str:
     function setStableSectionCollapsed(collapsed) {
       const body = document.getElementById("stableCombinedBody");
       const btn = document.getElementById("toggleStableCombinedBtn");
+      const title = document.getElementById("stableCombinedTitle");
+      const hL = document.getElementById("stableLendingHeading");
+      const hR = document.getElementById("stableRewardsHeading");
       if (!body || !btn) return;
       stableSectionState.combined = !!collapsed;
       body.classList.toggle("collapsed", !!collapsed);
       btn.textContent = collapsed ? "▸" : "▾";
+      if (title) title.style.display = collapsed ? "block" : "none";
+      if (hL) hL.style.display = collapsed ? "none" : "block";
+      if (hR) hR.style.display = collapsed ? "none" : "block";
     }
     function toggleStableSection() {
       const next = !stableSectionState.combined;
