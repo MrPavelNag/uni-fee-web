@@ -186,7 +186,7 @@ POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FAL
 POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIMEOUT_SEC", "4")))
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
-POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "5000")))
+POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "800")))
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
     "1",
     "true",
@@ -1960,6 +1960,13 @@ def _scan_infinity_position_ids_for_owner(
     if token_ids or enumerable_ok:
         return token_ids
     # Fallback for contracts without ERC721Enumerable: scan recent IDs by ownerOf.
+    # Keep this path lightweight to avoid starving other chain scans.
+    now_ts = time.monotonic()
+    ownerof_deadline = now_ts + 1.5
+    if deadline_ts is not None:
+        ownerof_deadline = min(ownerof_deadline, deadline_ts)
+    if ownerof_deadline <= time.monotonic():
+        return token_ids
     try:
         next_token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x75794a3c"))
     except Exception:
@@ -1970,7 +1977,7 @@ def _scan_infinity_position_ids_for_owner(
     start_tid = max(1, int(next_token_id) - int(lookback))
     owner_word = _encode_address_word(owner)[-40:]
     for tid in range(int(next_token_id) - 1, start_tid - 1, -1):
-        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+        if time.monotonic() >= ownerof_deadline:
             break
         if len(token_ids) >= limit:
             break
@@ -5474,7 +5481,7 @@ def _render_positions_page() -> str:
       for (let i = 0; i < visible.length; i++) {
         const r = visible[i];
         html += "<tr>";
-        html += `<td class='mono'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
+        html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(r.protocol || "")}</td>`;
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
@@ -5500,7 +5507,7 @@ def _render_positions_page() -> str:
           const tvlVal = "-";
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
