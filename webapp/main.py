@@ -167,6 +167,7 @@ AAVE_CHAIN_ID_TO_NAME: dict[int, str] = {
 _POSITION_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
+POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
 TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
@@ -1423,8 +1424,10 @@ def _query_uniswap_positions_for_owner(
                     pos = (s or {}).get("position") or {}
                     if pos:
                         batch.append(pos)
-            out.extend(batch)
-            if len(batch) < 200:
+            # Defensive normalization: some endpoints can return unexpected scalar items.
+            clean_batch = [x for x in (batch or []) if isinstance(x, dict)]
+            out.extend(clean_batch)
+            if len(clean_batch) < 200:
                 break
             skip += 200
             time.sleep(0.15)
@@ -1632,6 +1635,8 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     continue
                 for p in positions:
                     try:
+                        if not isinstance(p, dict):
+                            continue
                         if not _position_has_full_detail(p):
                             enriched = _fetch_position_by_id_with_detail(
                                 endpoint,
@@ -1649,6 +1654,10 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                         pos_liq = _safe_float(p.get("liquidity"))
                         pool_liq = _safe_float(pool.get("liquidity"))
                         position_tvl_usd: float | None = None
+                        valuation_mode = "unknown"
+                        # Fallback path based on current liquidity share in pool balances.
+                        # This approximates "withdraw now" valuation when detailed fields are incomplete.
+                        external_share_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
                         detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
                         detailed_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
                         share_tvl: float | None = None
@@ -1656,13 +1665,19 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             share_tvl = max(0.0, tvl_usd * (pos_liq / pool_liq))
                         if detailed_external_tvl is not None and detailed_external_tvl >= 0:
                             position_tvl_usd = detailed_external_tvl
+                            valuation_mode = "exact-external"
                         if detailed_tvl is not None and detailed_tvl >= 0:
                             if position_tvl_usd is None:
                                 position_tvl_usd = detailed_tvl
+                                valuation_mode = "exact-subgraph"
+                        if position_tvl_usd is None and external_share_tvl is not None and external_share_tvl >= 0:
+                            position_tvl_usd = external_share_tvl
+                            valuation_mode = "liquidity-share-external"
                         if position_tvl_usd is None and share_tvl is not None:
                             position_tvl_usd = share_tvl
+                            valuation_mode = "pool-share-fallback"
                         # Keep only meaningful active positions to avoid zero-value spam rows.
-                        if position_tvl_usd is None or position_tvl_usd <= 0:
+                        if position_tvl_usd is not None and position_tvl_usd <= 0:
                             continue
                         fee_raw = str(pool.get("feeTier") or "").strip()
                         fee_disp = fee_raw
@@ -1691,10 +1706,12 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                                 "pool_liquidity": str(pool.get("liquidity") or "0"),
                                 "pool_tvl_usd": tvl_usd,
                                 "tvl_usd": position_tvl_usd,
+                                "valuation_mode": valuation_mode,
                             }
                         )
                     except Exception as e:
-                        errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
+                        if POSITIONS_DEBUG_ERRORS:
+                            errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
                         continue
     # Aggregate by owner/protocol/pool id (wallet can hold multiple NFT positions in one pool).
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -1713,6 +1730,12 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             acc["tvl_usd"] = row_tvl
         elif row_tvl is not None:
             acc["tvl_usd"] = _safe_float(cur_tvl) + _safe_float(row_tvl)
+        m1 = str(acc.get("valuation_mode") or "")
+        m2 = str(row.get("valuation_mode") or "")
+        if m1 and m2 and m1 != m2:
+            acc["valuation_mode"] = "mixed"
+        elif not m1 and m2:
+            acc["valuation_mode"] = m2
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     dedup_errors = list(dict.fromkeys(errors))
     return list(uniq.values()), dedup_errors
@@ -3359,6 +3382,7 @@ def _render_positions_page() -> str:
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
     .section-actions { display:flex; align-items:center; gap:10px; }
+    .section-head .section-actions { margin-left: auto; justify-content: flex-end; }
     .section-body { display:block; }
     .section-body.collapsed { display:none; }
     .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:12px; padding:0 0 0 4px; }
@@ -3633,7 +3657,7 @@ def _render_positions_page() -> str:
     }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
-      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Show history</th></tr>";
+      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Valuation mode</th><th>Show history</th></tr>";
       const list = rows || [];
       for (let i = 0; i < list.length; i++) {
         const r = list[i];
@@ -3648,10 +3672,11 @@ def _render_positions_page() -> str:
         html += `<td class='mono'>${esc(r.pool_id || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
+        html += `<td>${esc(r.valuation_mode || "unknown")}</td>`;
         html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${i})'>Show history</button></td>`;
         html += "</tr>";
       }
-      if (!list.length) html += "<tr><td colspan='8'>No pool positions found.</td></tr>";
+      if (!list.length) html += "<tr><td colspan='9'>No pool positions found.</td></tr>";
       table.innerHTML = html;
     }
     async function scanPositions(targetSection = "all") {
@@ -3906,7 +3931,7 @@ def _render_stables_page() -> str:
       stableSectionState.combined = !!collapsed;
       body.classList.toggle("collapsed", !!collapsed);
       btn.textContent = collapsed ? "▸" : "▾";
-      if (title) title.style.display = collapsed ? "block" : "none";
+      if (title) title.style.visibility = collapsed ? "visible" : "hidden";
       if (hL) hL.style.display = collapsed ? "none" : "block";
       if (hR) hR.style.display = collapsed ? "none" : "block";
     }
