@@ -193,6 +193,9 @@ POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1
     "on",
 )
 POSITIONS_SPAM_MAX_TVL_USD = max(0.0, float(os.environ.get("POSITIONS_SPAM_MAX_TVL_USD", "50")))
+POSITIONS_MAX_TOKEN_PRICE_USD = max(100.0, float(os.environ.get("POSITIONS_MAX_TOKEN_PRICE_USD", "1000000")))
+POSITIONS_MIN_TOKEN_PRICE_USD = max(0.0, float(os.environ.get("POSITIONS_MIN_TOKEN_PRICE_USD", "0.000000000001")))
+POSITIONS_MAX_TOKEN_PRICE_RATIO = max(10.0, float(os.environ.get("POSITIONS_MAX_TOKEN_PRICE_RATIO", "10000000000")))
 POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
     int(x.strip())
     for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161,8453,130,56").split(",")
@@ -1169,7 +1172,9 @@ def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[
         tvl_usd = Decimal(str(pool.get("totalValueLockedUSD") or "0"))
         tvl0 = Decimal(str(pool.get("totalValueLockedToken0") or "0"))
         tvl1 = Decimal(str(pool.get("totalValueLockedToken1") or "0"))
-        if token0_price_in_token1 <= 0 or tvl_usd <= 0:
+        max_ratio = Decimal(str(POSITIONS_MAX_TOKEN_PRICE_RATIO))
+        min_ratio = Decimal(1) / max_ratio
+        if token0_price_in_token1 <= 0 or token0_price_in_token1 < min_ratio or token0_price_in_token1 > max_ratio or tvl_usd <= 0:
             return None
         denom = tvl0 * token0_price_in_token1 + tvl1
         if denom <= 0:
@@ -1200,9 +1205,14 @@ def _estimate_position_tvl_usd_from_detail_external(
         p0 = prices.get(token0)
         p1 = prices.get(token1)
         token0_price_in_token1 = _safe_float(pool.get("token0Price"))
-        if p0 is None and p1 is not None and token0_price_in_token1 > 0:
+        ratio_ok = (
+            token0_price_in_token1 > 0
+            and token0_price_in_token1 >= (1.0 / POSITIONS_MAX_TOKEN_PRICE_RATIO)
+            and token0_price_in_token1 <= POSITIONS_MAX_TOKEN_PRICE_RATIO
+        )
+        if p0 is None and p1 is not None and ratio_ok:
             p0 = p1 * token0_price_in_token1
-        if p1 is None and p0 is not None and token0_price_in_token1 > 0:
+        if p1 is None and p0 is not None and ratio_ok:
             p1 = p0 / token0_price_in_token1
         if p0 is None and p1 is None:
             return None
@@ -1403,20 +1413,25 @@ def _get_token_prices_usd(chain_id: int, token_addresses: list[str]) -> dict[str
     for addr in requested:
         sym = _symbol_for_addr(addr)
         px = result.get(addr)
+        major_id = _major_coingecko_id(sym)
         if _is_stable_symbol(sym):
             if px is None or px <= 0 or px < 0.7 or px > 1.3:
                 result[addr] = 1.0
                 with TOKEN_PRICE_CACHE_LOCK:
                     TOKEN_PRICE_CACHE[(int(chain_id), addr)] = (now, 1.0)
             continue
+        if px is not None and px > 0 and (px < POSITIONS_MIN_TOKEN_PRICE_USD or px > POSITIONS_MAX_TOKEN_PRICE_USD) and not major_id:
+            # Drop clearly abnormal non-major prices (common for illiquid/spam quotes).
+            result.pop(addr, None)
+            px = None
         if px is None or px <= 0:
-            cgid = _major_coingecko_id(sym)
-            if cgid:
-                fallback_px = _fetch_major_price_usd(cgid)
+            if major_id:
+                fallback_px = _fetch_major_price_usd(major_id)
                 if fallback_px is not None and fallback_px > 0:
                     result[addr] = float(fallback_px)
                     with TOKEN_PRICE_CACHE_LOCK:
                         TOKEN_PRICE_CACHE[(int(chain_id), addr)] = (now, float(fallback_px))
+            continue
     return {a: result[a] for a in requested if a in result}
 
 
@@ -1896,9 +1911,14 @@ def _estimate_position_tvl_usd_from_share_external(
         p1 = prices.get(token1)
         # If only one token price is available, infer the second from pool token0Price.
         token0_price_in_token1 = _safe_float(pool.get("token0Price"))
-        if p0 is None and p1 is not None and token0_price_in_token1 > 0:
+        ratio_ok = (
+            token0_price_in_token1 > 0
+            and token0_price_in_token1 >= (1.0 / POSITIONS_MAX_TOKEN_PRICE_RATIO)
+            and token0_price_in_token1 <= POSITIONS_MAX_TOKEN_PRICE_RATIO
+        )
+        if p0 is None and p1 is not None and ratio_ok:
             p0 = p1 * token0_price_in_token1
-        if p1 is None and p0 is not None and token0_price_in_token1 > 0:
+        if p1 is None and p0 is not None and ratio_ok:
             p1 = p0 / token0_price_in_token1
         if p0 is None and p1 is None:
             return None
@@ -2682,7 +2702,22 @@ def _scan_pool_positions_chain(
                             if share_external_tvl is not None and share_external_tvl > 0:
                                 position_tvl_usd = share_external_tvl
                                 valuation_mode = "estimated-share-external"
+                if position_tvl_usd is not None and position_tvl_usd > 0 and tvl_usd > 0:
+                    # A single position cannot reasonably exceed the whole pool TVL by large margin.
+                    pool_cap = float(tvl_usd) * 1.25
+                    if position_tvl_usd > pool_cap:
+                        share_sanity_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
+                        if share_sanity_tvl is not None and share_sanity_tvl > 0 and share_sanity_tvl <= pool_cap:
+                            position_tvl_usd = share_sanity_tvl
+                            valuation_mode = "sanity-share"
+                        else:
+                            position_tvl_usd = pool_cap
+                            valuation_mode = "sanity-cap"
                 suspected_spam = _is_suspected_spam_pair(chain_key, t0_obj, t1_obj, t0, t1, position_tvl_usd)
+                if suspected_spam and position_tvl_usd is not None and position_tvl_usd > POSITIONS_SPAM_MAX_TVL_USD:
+                    # Prevent clearly manipulated valuations from dominating output for suspicious pairs.
+                    position_tvl_usd = float(POSITIONS_SPAM_MAX_TVL_USD)
+                    valuation_mode = "spam-capped"
                 owner_rows.append(
                     {
                         "address": owner,
@@ -4837,6 +4872,43 @@ def _render_positions_page() -> str:
       if (!v) return "";
       return v.length <= 4 ? v : ("..." + v.slice(-4));
     }
+    function getTrustedSpamKeys() {
+      try {
+        const raw = localStorage.getItem("positions_trusted_spam_keys");
+        const arr = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(arr)) return new Set();
+        return new Set(arr.map((x) => String(x)));
+      } catch (_) {
+        return new Set();
+      }
+    }
+    function setTrustedSpamKeys(setObj) {
+      const arr = Array.from(setObj || []);
+      localStorage.setItem("positions_trusted_spam_keys", JSON.stringify(arr.slice(0, 1000)));
+    }
+    function poolRowKey(r) {
+      return [
+        String(r.address || "").toLowerCase(),
+        String(r.chain || "").toLowerCase(),
+        String(r.protocol || "").toLowerCase(),
+        String(r.position_id || ""),
+        String(r.pool_id || "").toLowerCase(),
+      ].join("|");
+    }
+    function trustSpamRow(key) {
+      const trusted = getTrustedSpamKeys();
+      trusted.add(String(key || ""));
+      setTrustedSpamKeys(trusted);
+      renderPools(posCache.pools || []);
+      setPosStatus("Spam mark removed for this position.", false);
+    }
+    function untrustSpamRow(key) {
+      const trusted = getTrustedSpamKeys();
+      trusted.delete(String(key || ""));
+      setTrustedSpamKeys(trusted);
+      renderPools(posCache.pools || []);
+      setPosStatus("Position moved back to suspected spam.", false);
+    }
     function setSectionCollapsed(key, collapsed) {
       const bodyMap = {pools: "posPoolsBody"};
       const btnMap = {pools: "togglePoolsBtn"};
@@ -4939,18 +5011,21 @@ def _render_positions_page() -> str:
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
       const days = getHistoryDays();
+      const trustedSpamKeys = getTrustedSpamKeys();
       let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="${days}" style="width:72px;margin-left:6px"/></th></tr>`;
       const list = rows || [];
       const visible = [];
       const spamRows = [];
       for (let i = 0; i < list.length; i++) {
         const r0 = list[i];
-        if (Boolean(r0 && r0.suspected_spam)) {
-          spamRows.push(Object.assign({_src_idx: i}, r0 || {}));
+        const row = Object.assign({_src_idx: i}, r0 || {});
+        row._row_key = poolRowKey(row);
+        const trusted = trustedSpamKeys.has(row._row_key);
+        if (Boolean(row && row.suspected_spam) && !trusted) {
+          spamRows.push(row);
           continue;
         }
-        const r = Object.assign({_src_idx: i}, r0 || {});
-        visible.push(r);
+        visible.push(row);
       }
       for (let i = 0; i < visible.length; i++) {
         const r = visible[i];
@@ -4965,17 +5040,22 @@ def _render_positions_page() -> str:
         html += `<td class='mono'>${esc(r.pool_id || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
-        html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${Number(r._src_idx) || 0})'>Show history</button></td>`;
+        const canFlagBack = Boolean(r && r.suspected_spam);
+        const flagBackBtn = canFlagBack
+          ? `<button class='search-link-btn' type='button' style='margin-left:6px' onclick="untrustSpamRow('${esc(String(r._row_key || "").replace(/'/g, "\\\\'"))}')" title='Mark as suspected spam'>flag</button>`
+          : "";
+        html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${Number(r._src_idx) || 0})'>Show history</button>${flagBackBtn}</td>`;
         html += "</tr>";
       }
       if (!visible.length) html += "<tr><td colspan='8'>No pool positions found.</td></tr>";
       if (spamRows.length) {
         let spamInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
-        spamInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position TVL</th></tr>";
+        spamInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position TVL</th><th style='text-align:left;padding:4px 6px'></th></tr>";
         for (let i = 0; i < spamRows.length; i++) {
           const r = spamRows[i];
-          const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
-          spamInner += `<tr><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td></tr>`;
+          const rowKey = String(r._row_key || "");
+          const tvlVal = "-";
+          spamInner += `<tr><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><button class='search-link-btn' type='button' onclick="trustSpamRow('${esc(rowKey.replace(/'/g, "\\\\'"))}')">trust</button></td></tr>`;
         }
         spamInner += "</table>";
         html += `<tr><td colspan='8'><details><summary>Suspected spam positions (${spamRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${spamInner}</div></details></td></tr>`;
