@@ -186,6 +186,7 @@ POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FAL
 POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIMEOUT_SEC", "4")))
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
+POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "5000")))
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
     "1",
     "true",
@@ -1921,6 +1922,72 @@ def _normalize_infinity_currency(chain_id: int, token: str) -> tuple[str, str, i
     return "0x0000000000000000000000000000000000000000", native_sym, 18
 
 
+def _scan_infinity_position_ids_for_owner(
+    position_manager: str,
+    owner_addr: str,
+    chain_id: int,
+    *,
+    deadline_ts: float | None = None,
+) -> list[int]:
+    cid = int(chain_id)
+    owner = str(owner_addr or "").strip().lower()
+    if not _is_eth_address(owner):
+        return []
+    pm = str(position_manager or "").strip().lower()
+    if not _is_eth_address(pm):
+        return []
+    try:
+        bal_data = "0x70a08231" + _encode_address_word(owner)
+        balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
+    except Exception:
+        return []
+    if balance <= 0:
+        return []
+    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
+    token_ids: list[int] = []
+    enumerable_ok = True
+    for idx in range(int(balance) - 1, max(-1, int(balance) - limit - 1), -1):
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        try:
+            tok_data = "0x2f745c59" + _encode_address_word(owner) + _encode_uint_word(idx)
+            tid = _decode_uint_eth_call(_eth_call_hex(cid, pm, tok_data))
+            if tid > 0:
+                token_ids.append(int(tid))
+        except Exception:
+            enumerable_ok = False
+            break
+    if token_ids or enumerable_ok:
+        return token_ids
+    # Fallback for contracts without ERC721Enumerable: scan recent IDs by ownerOf.
+    try:
+        next_token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x75794a3c"))
+    except Exception:
+        return token_ids
+    if next_token_id <= 0:
+        return token_ids
+    lookback = max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 40)
+    start_tid = max(1, int(next_token_id) - int(lookback))
+    owner_word = _encode_address_word(owner)[-40:]
+    for tid in range(int(next_token_id) - 1, start_tid - 1, -1):
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        if len(token_ids) >= limit:
+            break
+        try:
+            owner_data = "0x6352211e" + _encode_uint_word(tid)
+            owner_hex = _eth_call_hex(cid, pm, owner_data)
+            owner_words = _hex_words(owner_hex)
+            if not owner_words:
+                continue
+            current_owner = owner_words[0][-40:].lower()
+            if current_owner == owner_word:
+                token_ids.append(int(tid))
+        except Exception:
+            continue
+    return token_ids
+
+
 def _scan_pancake_infinity_cl_positions_onchain(
     owner: str,
     chain_id: int,
@@ -1934,23 +2001,14 @@ def _scan_pancake_infinity_cl_positions_onchain(
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
         return []
-    try:
-        bal_data = "0x70a08231" + _encode_address_word(owner_addr)
-        balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
-    except Exception:
+    token_ids = _scan_infinity_position_ids_for_owner(pm, owner_addr, cid, deadline_ts=deadline_ts)
+    if not token_ids:
         return []
-    if balance <= 0:
-        return []
-    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
     out: list[dict[str, Any]] = []
-    for idx in range(int(balance) - 1, max(-1, int(balance) - limit - 1), -1):
+    for token_id in token_ids:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
         try:
-            tok_data = "0x2f745c59" + _encode_address_word(owner_addr) + _encode_uint_word(idx)
-            token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, tok_data))
-            if token_id <= 0:
-                continue
             pos_data = "0x99fbab88" + _encode_uint_word(token_id)
             pos_words = _hex_words(_eth_call_hex(cid, pm, pos_data))
             if len(pos_words) < 12:
@@ -2022,23 +2080,14 @@ def _scan_pancake_infinity_bin_positions_onchain(
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
         return []
-    try:
-        bal_data = "0x70a08231" + _encode_address_word(owner_addr)
-        balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
-    except Exception:
+    token_ids = _scan_infinity_position_ids_for_owner(pm, owner_addr, cid, deadline_ts=deadline_ts)
+    if not token_ids:
         return []
-    if balance <= 0:
-        return []
-    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
     out: list[dict[str, Any]] = []
-    for idx in range(int(balance) - 1, max(-1, int(balance) - limit - 1), -1):
+    for token_id in token_ids:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
         try:
-            tok_data = "0x2f745c59" + _encode_address_word(owner_addr) + _encode_uint_word(idx)
-            token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, tok_data))
-            if token_id <= 0:
-                continue
             pos_data = "0x99fbab88" + _encode_uint_word(token_id)
             pos_words = _hex_words(_eth_call_hex(cid, pm, pos_data))
             if len(pos_words) < 7:
@@ -5097,6 +5146,7 @@ def _render_positions_page() -> str:
     const posCache = {pools: []};
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
+    const POS_HIDDEN_EXPANDED_KEY = "positions_hidden_expanded_v1";
     let posHasScannedOnce = false;
     let posScanTicker = null;
     let posScanStartedAt = 0;
@@ -5176,9 +5226,9 @@ def _render_positions_page() -> str:
       const arr = Array.from(setObj || []);
       localStorage.setItem("positions_trusted_spam_keys", JSON.stringify(arr.slice(0, 1000)));
     }
-    function getManualSpamKeys() {
+    function getManualHiddenKeys() {
       try {
-        const raw = localStorage.getItem("positions_manual_spam_keys");
+        const raw = localStorage.getItem("positions_manual_hidden_keys");
         const arr = raw ? JSON.parse(raw) : [];
         if (!Array.isArray(arr)) return new Set();
         return new Set(arr.map((x) => String(x)));
@@ -5186,9 +5236,9 @@ def _render_positions_page() -> str:
         return new Set();
       }
     }
-    function setManualSpamKeys(setObj) {
+    function setManualHiddenKeys(setObj) {
       const arr = Array.from(setObj || []);
-      localStorage.setItem("positions_manual_spam_keys", JSON.stringify(arr.slice(0, 1000)));
+      localStorage.setItem("positions_manual_hidden_keys", JSON.stringify(arr.slice(0, 1000)));
     }
     function poolRowKey(r) {
       return [
@@ -5213,19 +5263,21 @@ def _render_positions_page() -> str:
       renderPools(posCache.pools || []);
       setPosStatus("Position moved back to suspected spam.", false);
     }
-    function markSpamRow(key) {
-      const manual = getManualSpamKeys();
-      manual.add(String(key || ""));
-      setManualSpamKeys(manual);
+    function setHideRow(key, hidden, suspected) {
+      const rowKey = String(key || "");
+      const manual = getManualHiddenKeys();
+      const trusted = getTrustedSpamKeys();
+      if (hidden) {
+        manual.add(rowKey);
+        if (suspected) trusted.delete(rowKey);
+      } else {
+        manual.delete(rowKey);
+        if (suspected) trusted.add(rowKey);
+      }
+      setManualHiddenKeys(manual);
+      setTrustedSpamKeys(trusted);
       renderPools(posCache.pools || []);
-      setPosStatus("Position marked as spam.", false);
-    }
-    function unmarkSpamRow(key) {
-      const manual = getManualSpamKeys();
-      manual.delete(String(key || ""));
-      setManualSpamKeys(manual);
-      renderPools(posCache.pools || []);
-      setPosStatus("Manual spam mark removed.", false);
+      setPosStatus(hidden ? "Position hidden." : "Position shown.", false);
     }
     function setSectionCollapsed(key, collapsed) {
       const bodyMap = {pools: "posPoolsBody"};
@@ -5397,23 +5449,24 @@ def _render_positions_page() -> str:
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
       const trustedSpamKeys = getTrustedSpamKeys();
-      const manualSpamKeys = getManualSpamKeys();
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>History</th></tr>`;
+      const manualHiddenKeys = getManualHiddenKeys();
+      const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
-      const spamRows = [];
+      const hiddenRows = [];
       for (let i = 0; i < list.length; i++) {
         const r0 = list[i];
         const row = Object.assign({_src_idx: i}, r0 || {});
         row._row_key = poolRowKey(row);
         const trusted = trustedSpamKeys.has(row._row_key);
-        const manual = manualSpamKeys.has(row._row_key);
+        const manual = manualHiddenKeys.has(row._row_key);
         const suspected = Boolean(row && row.suspected_spam);
         row._is_trusted_spam = trusted;
-        row._is_manual_spam = manual;
+        row._is_manual_hidden = manual;
         row._is_suspected_spam = suspected;
         if (manual || (suspected && !trusted)) {
-          spamRows.push(row);
+          hiddenRows.push(row);
           continue;
         }
         visible.push(row);
@@ -5425,37 +5478,43 @@ def _render_positions_page() -> str:
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(r.protocol || "")}</td>`;
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        html += `<td>${esc(r.pair || "")}<button class='search-link-btn' type='button' style='margin-left:6px' onclick="markSpamRow('${rowKeyEsc}')" title='Move this position to spam section'>spam</button></td>`;
+        html += `<td>${esc(r.pair || "")}</td>`;
         const feeRaw = String(r.fee_tier_raw || "").trim();
         const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
         html += `<td class='mono'>${esc(r.pool_id || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
+        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
         const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
         html += "</tr>";
       }
-      if (!visible.length) html += "<tr><td colspan='8'>No pool positions found.</td></tr>";
-      if (spamRows.length) {
-        let spamInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
-        spamInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position TVL</th><th style='text-align:left;padding:4px 6px'></th></tr>";
-        for (let i = 0; i < spamRows.length; i++) {
-          const r = spamRows[i];
+      if (!visible.length) html += "<tr><td colspan='9'>No pool positions found.</td></tr>";
+      if (hiddenRows.length) {
+        let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
+        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position TVL</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
+        for (let i = 0; i < hiddenRows.length; i++) {
+          const r = hiddenRows[i];
           const rowKey = String(r._row_key || "");
           const tvlVal = "-";
-          let actionBtn = `<button class='search-link-btn' type='button' onclick="trustSpamRow('${esc(rowKey.replace(/'/g, "\\\\'"))}')">trust</button>`;
-          if (Boolean(r && r._is_manual_spam)) {
-            actionBtn = `<button class='search-link-btn' type='button' onclick="unmarkSpamRow('${esc(rowKey.replace(/'/g, "\\\\'"))}')">unspam</button>`;
-          }
-          spamInner += `<tr><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'>${actionBtn}</td></tr>`;
+          const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
+          const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
-        spamInner += "</table>";
-        html += `<tr><td colspan='8'><details><summary>Spam positions (${spamRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${spamInner}</div></details></td></tr>`;
+        hiddenInner += "</table>";
+        const openAttr = hiddenExpanded ? " open" : "";
+        html += `<tr><td colspan='9'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
-      if (spamRows.length > 0) {
-        setPosStatus(`Showing ${visible.length} pools (+ ${spamRows.length} spam in collapsed section)`, false);
+      const detailsEl = document.getElementById("posHiddenDetails");
+      if (detailsEl) {
+        detailsEl.addEventListener("toggle", () => {
+          localStorage.setItem(POS_HIDDEN_EXPANDED_KEY, detailsEl.open ? "1" : "0");
+        });
+      }
+      if (hiddenRows.length > 0) {
+        setPosStatus(`Showing ${visible.length} pools (+ ${hiddenRows.length} hidden)`, false);
       }
     }
     async function scanPositions(targetSection = "all") {
