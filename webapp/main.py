@@ -187,8 +187,8 @@ POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "0").strip
 POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIMEOUT_SEC", "4")))
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
 POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "800")))
-POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS = max(20000, int(os.environ.get("POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS", "12000000")))
-POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "500000")))
+POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS = max(20000, int(os.environ.get("POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS", "2500000")))
+POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "150000")))
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
     "1",
     "true",
@@ -1537,41 +1537,6 @@ def _scan_erc721_token_ids_by_incoming_logs(
     end_block = int(latest)
     out: list[int] = []
     seen: set[int] = set()
-    # Fast path: ask for the whole range at once. Some providers can serve this quickly.
-    try:
-        all_params = {
-            "address": c,
-            "fromBlock": hex(int(min_block)),
-            "toBlock": hex(int(latest)),
-            "topics": [topic_transfer, None, topic_to_owner],
-        }
-        logs = _eth_get_logs(cid, all_params)
-        logs_sorted = sorted(
-            logs,
-            key=lambda x: (
-                int(str(x.get("blockNumber") or "0x0"), 16),
-                int(str(x.get("logIndex") or "0x0"), 16),
-            ),
-            reverse=True,
-        )
-        for lg in logs_sorted:
-            topics = lg.get("topics") or []
-            if not isinstance(topics, list) or len(topics) < 4:
-                continue
-            try:
-                tid = int(str(topics[3]), 16)
-            except Exception:
-                continue
-            if tid <= 0 or tid in seen:
-                continue
-            seen.add(tid)
-            out.append(int(tid))
-            if len(out) >= int(max_ids):
-                return out
-        if out:
-            return out
-    except Exception:
-        pass
     while end_block >= min_block:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
@@ -2063,7 +2028,11 @@ def _scan_infinity_position_ids_for_owner(
         balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
     except Exception:
         balance = 0
-    limit = min(max(int(balance), 1), POSITIONS_ONCHAIN_MAX_NFTS)
+    if int(balance) <= 0:
+        # Avoid expensive log scans when contract reports no owned NFTs.
+        # This keeps overall pool scan responsive and prevents global timeouts.
+        return []
+    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
     token_ids: list[int] = []
     seen_ids: set[int] = set()
     enumerable_ok = True
@@ -2085,7 +2054,7 @@ def _scan_infinity_position_ids_for_owner(
     if len(token_ids) < limit:
         # Wallets often discover Infinity NFTs by Transfer logs; use same approach
         # when ERC721Enumerable path is unavailable or incomplete.
-        log_deadline = time.monotonic() + 6.0
+        log_deadline = time.monotonic() + 2.0
         if deadline_ts is not None:
             log_deadline = min(log_deadline, deadline_ts)
         owner_word = _encode_address_word(owner)[-40:]
@@ -2094,7 +2063,7 @@ def _scan_infinity_position_ids_for_owner(
             pm,
             owner,
             deadline_ts=log_deadline,
-            max_ids=max(limit * 3, limit, POSITIONS_ONCHAIN_MAX_NFTS if balance <= 0 else 0),
+            max_ids=max(limit * 3, limit),
         )
         for tid in log_ids:
             if len(token_ids) >= limit:
@@ -8382,6 +8351,19 @@ HTML_PAGE = """
       text-underline-offset: 2px;
     }
     .search-link-btn:hover { color: #1e40af; }
+    .collapse-btn {
+      border: none;
+      background: transparent;
+      color: #334155;
+      font-size: 14px;
+      font-weight: 800;
+      cursor: pointer;
+      padding: 0 2px;
+      min-width: 16px;
+      text-align: center;
+    }
+    .section-body { display: block; }
+    .section-body.collapsed { display: none; }
     .chips {
       display: flex;
       gap: 8px;
@@ -8399,7 +8381,7 @@ HTML_PAGE = """
     }
     .status {
       font-size: 13px;
-      color: #cbd5e1;
+      color: #111111;
       display: inline-block;
       width: 280px;
       text-align: right;
@@ -8407,9 +8389,6 @@ HTML_PAGE = """
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .status.running { color: var(--warn); }
-    .status.ok { color: var(--ok); }
-    .status.fail { color: var(--danger); }
     .progress-wrap { width: 100%; margin-top: 10px; }
     .control-card .progress-wrap {
       margin-top: 8px;
@@ -8762,11 +8741,14 @@ HTML_PAGE = """
             <div id="scanProgress" class="scan-progress"><div class="bar"></div></div>
             <span id="status" class="status">Ready</span>
             <button class="search-link-btn" type="button" id="scanBtn" onclick="runJob()">Scan</button>
+            <button class="collapse-btn" id="toggleFeeHistoryBtn" type="button" onclick="toggleHomeSection('feeHistory')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <div class="charts-grid">
-          <div id="feesChart" class="plot"></div>
-          <div id="tvlChart" class="plot"></div>
+        <div id="feeHistoryBody" class="section-body">
+          <div class="charts-grid">
+            <div id="feesChart" class="plot"></div>
+            <div id="tvlChart" class="plot"></div>
+          </div>
         </div>
       </section>
 
@@ -8775,10 +8757,13 @@ HTML_PAGE = """
           <h3>Pools Table</h3>
           <div class="section-actions">
             <button class="search-link-btn" type="button" onclick="exportCsv()">Export CSV</button>
+            <button class="collapse-btn" id="togglePoolsTableBtn" type="button" onclick="toggleHomeSection('poolsTable')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <div class="table-wrap">
-          <table id="resultTable"></table>
+        <div id="poolsTableBody" class="section-body">
+          <div class="table-wrap">
+            <table id="resultTable"></table>
+          </div>
         </div>
       </section>
     </div>
@@ -8825,6 +8810,7 @@ HTML_PAGE = """
     let scanTicker = null;
     let scanStartedAt = 0;
     let scanStageLabel = "waiting";
+    const homeSectionState = { feeHistory: false, poolsTable: false };
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
 
     const WALLET_LABELS = {
@@ -9204,6 +9190,21 @@ HTML_PAGE = """
       const el = document.getElementById("status");
       el.textContent = text;
       el.className = "status " + (cssClass || "");
+    }
+
+    function setHomeSectionCollapsed(key, collapsed) {
+      const bodyMap = {feeHistory: "feeHistoryBody", poolsTable: "poolsTableBody"};
+      const btnMap = {feeHistory: "toggleFeeHistoryBtn", poolsTable: "togglePoolsTableBtn"};
+      const body = document.getElementById(bodyMap[key]);
+      const btn = document.getElementById(btnMap[key]);
+      if (!body || !btn) return;
+      homeSectionState[key] = !!collapsed;
+      body.classList.toggle("collapsed", !!collapsed);
+      btn.textContent = collapsed ? "▸" : "▾";
+    }
+
+    function toggleHomeSection(key) {
+      setHomeSectionCollapsed(key, !homeSectionState[key]);
     }
 
     function setScanProgressVisible(flag) {
@@ -9832,6 +9833,8 @@ HTML_PAGE = """
 
     attachAutosave();
     updatePairRows();
+    setHomeSectionCollapsed("feeHistory", false);
+    setHomeSectionCollapsed("poolsTable", false);
     renderEmptyCharts();
     loadAuthState();
     refreshIntentMenu();
