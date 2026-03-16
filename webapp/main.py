@@ -1141,6 +1141,19 @@ def _coingecko_platform_for_chain_id(chain_id: int) -> str:
     return mapping.get(int(chain_id), "")
 
 
+def _dexscreener_chain_for_chain_id(chain_id: int) -> str:
+    mapping: dict[int, str] = {
+        1: "ethereum",
+        10: "optimism",
+        56: "bsc",
+        137: "polygon",
+        8453: "base",
+        42161: "arbitrum",
+        43114: "avalanche",
+    }
+    return mapping.get(int(chain_id), "")
+
+
 def _fetch_token_prices_usd_coingecko(chain_id: int, token_addresses: list[str]) -> dict[str, float]:
     platform = _coingecko_platform_for_chain_id(int(chain_id))
     addrs: list[str] = []
@@ -1177,6 +1190,37 @@ def _fetch_token_prices_usd_coingecko(chain_id: int, token_addresses: list[str])
     return out
 
 
+def _fetch_token_price_usd_dexscreener(chain_id: int, token_address: str) -> float | None:
+    chain_slug = _dexscreener_chain_for_chain_id(int(chain_id))
+    addr = str(token_address or "").strip().lower()
+    if not chain_slug or not _is_eth_address(addr):
+        return None
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{addr}"
+        req = Request(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+        with urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        pairs = payload.get("pairs") or []
+        best_price: float | None = None
+        best_liq = -1.0
+        for p in pairs:
+            if str((p or {}).get("chainId") or "").strip().lower() != chain_slug:
+                continue
+            try:
+                price = float((p or {}).get("priceUsd") or 0)
+            except Exception:
+                price = 0.0
+            if price <= 0:
+                continue
+            liq_usd = _safe_float(((p or {}).get("liquidity") or {}).get("usd"))
+            if liq_usd > best_liq:
+                best_liq = liq_usd
+                best_price = price
+        return best_price
+    except Exception:
+        return None
+
+
 def _get_token_prices_usd(chain_id: int, token_addresses: list[str]) -> dict[str, float]:
     now = time.time()
     requested: list[str] = []
@@ -1200,6 +1244,18 @@ def _get_token_prices_usd(chain_id: int, token_addresses: list[str]) -> dict[str
             for addr, price in fetched.items():
                 TOKEN_PRICE_CACHE[(int(chain_id), addr)] = (now, float(price))
                 result[addr] = float(price)
+    still_missing = [a for a in requested if a not in result]
+    if still_missing:
+        updates: dict[str, float] = {}
+        for addr in still_missing:
+            price = _fetch_token_price_usd_dexscreener(chain_id, addr)
+            if price is not None and price > 0:
+                updates[addr] = float(price)
+        if updates:
+            with TOKEN_PRICE_CACHE_LOCK:
+                for addr, price in updates.items():
+                    TOKEN_PRICE_CACHE[(int(chain_id), addr)] = (now, float(price))
+                    result[addr] = float(price)
     return {a: result[a] for a in requested if a in result}
 
 
@@ -1253,6 +1309,7 @@ def _query_uniswap_positions_for_owner(
     *,
     include_pool_liquidity: bool = False,
     include_position_liquidity: bool = True,
+    debug_steps: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     pool_liq_field = "liquidity" if include_pool_liquidity else ""
     pos_liq_field = "liquidity" if include_position_liquidity else ""
@@ -1447,6 +1504,11 @@ def _query_uniswap_positions_for_owner(
             q_accounts_basic,
             q_snapshots_basic,
         ) in query_sets:
+            owner_type = "String"
+            if "$owner: Bytes!" in q_positions:
+                owner_type = "Bytes"
+            elif "$owner: ID!" in q_positions:
+                owner_type = "ID"
             for q, mode in (
                 (q_positions, "positions"),
                 (q_account, "account"),
@@ -1463,7 +1525,27 @@ def _query_uniswap_positions_for_owner(
                     break
                 try:
                     result = _run(q, mode, owner_value)
+                    if debug_steps is not None:
+                        debug_steps.append(
+                            {
+                                "owner_value": owner_value,
+                                "owner_type": owner_type,
+                                "query_mode": mode,
+                                "count": len(result),
+                                "ok": True,
+                            }
+                        )
                 except Exception:
+                    if debug_steps is not None:
+                        debug_steps.append(
+                            {
+                                "owner_value": owner_value,
+                                "owner_type": owner_type,
+                                "query_mode": mode,
+                                "count": 0,
+                                "ok": False,
+                            }
+                        )
                     result = []
             if result:
                 break
@@ -1596,9 +1678,10 @@ def _endpoint_supports_pool_liquidity(endpoint: str) -> bool:
     return ok
 
 
-def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[list[dict[str, Any]], list[str]]:
+def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
+    debug_rows: list[dict[str, Any]] = []
     for chain_id in chain_ids:
         chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
         if not chain_key:
@@ -1614,12 +1697,14 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint)
             has_position_liquidity = _endpoint_supports_position_liquidity(endpoint)
             for owner in addresses:
+                owner_attempts: list[dict[str, Any]] = []
                 try:
                     positions = _query_uniswap_positions_for_owner(
                         endpoint,
                         owner,
                         include_pool_liquidity=has_pool_liquidity,
                         include_position_liquidity=has_position_liquidity,
+                        debug_steps=owner_attempts,
                     )
                     # Introspection can be blocked on some indexers, producing a false
                     # negative for liquidity support. Retry once with liquidity enabled.
@@ -1629,10 +1714,31 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             owner,
                             include_pool_liquidity=has_pool_liquidity,
                             include_position_liquidity=True,
+                            debug_steps=owner_attempts,
                         )
                 except Exception as e:
                     errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
+                    debug_rows.append(
+                        {
+                            "chain": chain_key,
+                            "version": version,
+                            "owner": owner,
+                            "positions_found": 0,
+                            "failed": True,
+                            "attempts": owner_attempts,
+                        }
+                    )
                     continue
+                debug_rows.append(
+                    {
+                        "chain": chain_key,
+                        "version": version,
+                        "owner": owner,
+                        "positions_found": len(positions),
+                        "failed": False,
+                        "attempts": owner_attempts,
+                    }
+                )
                 for p in positions:
                     try:
                         if not isinstance(p, dict):
@@ -1651,34 +1757,12 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             continue
                         pool = p.get("pool") or {}
                         tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
-                        pos_liq = _safe_float(p.get("liquidity"))
-                        pool_liq = _safe_float(pool.get("liquidity"))
-                        position_tvl_usd: float | None = None
-                        valuation_mode = "unknown"
-                        # Fallback path based on current liquidity share in pool balances.
-                        # This approximates "withdraw now" valuation when detailed fields are incomplete.
-                        external_share_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
+                        valuation_mode = "exact-external"
                         detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
-                        detailed_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
-                        share_tvl: float | None = None
-                        if pool_liq > 0 and pos_liq > 0:
-                            share_tvl = max(0.0, tvl_usd * (pos_liq / pool_liq))
-                        if detailed_external_tvl is not None and detailed_external_tvl >= 0:
-                            position_tvl_usd = detailed_external_tvl
-                            valuation_mode = "exact-external"
-                        if detailed_tvl is not None and detailed_tvl >= 0:
-                            if position_tvl_usd is None:
-                                position_tvl_usd = detailed_tvl
-                                valuation_mode = "exact-subgraph"
-                        if position_tvl_usd is None and external_share_tvl is not None and external_share_tvl >= 0:
-                            position_tvl_usd = external_share_tvl
-                            valuation_mode = "liquidity-share-external"
-                        if position_tvl_usd is None and share_tvl is not None:
-                            position_tvl_usd = share_tvl
-                            valuation_mode = "pool-share-fallback"
-                        # Keep only meaningful active positions to avoid zero-value spam rows.
-                        if position_tvl_usd is not None and position_tvl_usd <= 0:
+                        # Strict mode: keep only exact-external valuation.
+                        if detailed_external_tvl is None or detailed_external_tvl <= 0:
                             continue
+                        position_tvl_usd = detailed_external_tvl
                         fee_raw = str(pool.get("feeTier") or "").strip()
                         fee_disp = fee_raw
                         try:
@@ -1687,10 +1771,10 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                                 fee_disp = f"{fee_int / 10000.0:.2f}%"
                         except Exception:
                             fee_disp = fee_raw or "-"
-                        t0 = (pool.get("token0") or {}).get("symbol") or "?"
-                        t1 = (pool.get("token1") or {}).get("symbol") or "?"
-                        if t0 == "?" and t1 == "?":
-                            continue
+                        t0_obj = pool.get("token0") or {}
+                        t1_obj = pool.get("token1") or {}
+                        t0 = t0_obj.get("symbol") or str(t0_obj.get("id") or "")[:8] or "?"
+                        t1 = t1_obj.get("symbol") or str(t1_obj.get("id") or "")[:8] or "?"
                         rows.append(
                             {
                                 "address": owner,
@@ -1738,7 +1822,7 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             acc["valuation_mode"] = m2
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     dedup_errors = list(dict.fromkeys(errors))
-    return list(uniq.values()), dedup_errors
+    return list(uniq.values()), dedup_errors, debug_rows
 
 
 def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
@@ -3452,7 +3536,6 @@ def _render_positions_page() -> str:
         <div class="section-head">
           <h3>Pool positions</h3>
           <div class="section-actions">
-            <label class="hint" style="margin:0">History days <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:90px;margin-left:6px"/></label>
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
             <button class="search-link-btn" type="button" onclick="scanPositions('pools')">Search</button>
@@ -3657,7 +3740,8 @@ def _render_positions_page() -> str:
     }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
-      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Valuation mode</th><th>Show history</th></tr>";
+      const days = getHistoryDays();
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Valuation mode</th><th>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="${days}" style="width:72px;margin-left:6px"/></th></tr>`;
       const list = rows || [];
       for (let i = 0; i < list.length; i++) {
         const r = list[i];
@@ -5412,14 +5496,19 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
     scan_pools = bool(req.include_pools)
     scan_lending = bool(req.include_lending)
     scan_rewards = bool(req.include_rewards)
+    pool_debug_rows: list[dict[str, Any]] = []
     if evm_addresses:
-        pool_rows, pool_errs = (_scan_pool_positions(evm_addresses, selected_chain_ids) if scan_pools else ([], []))
+        if scan_pools:
+            pool_rows, pool_errs, pool_debug_rows = _scan_pool_positions(evm_addresses, selected_chain_ids)
+        else:
+            pool_rows, pool_errs, pool_debug_rows = [], [], []
         lending_rows, lending_errs = (_scan_aave_positions(evm_addresses, selected_chain_ids) if scan_lending else ([], []))
         reward_rows, reward_errs = (_scan_aave_merit_rewards(evm_addresses, selected_chain_ids) if scan_rewards else ([], []))
     else:
         pool_rows, pool_errs = [], []
         lending_rows, lending_errs = [], []
         reward_rows, reward_errs = [], []
+        pool_debug_rows = []
 
     info_notes: list[str] = []
     if solana_addresses:
@@ -5455,12 +5544,37 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
         path="/api/positions/scan",
         payload=f"evm={len(evm_addresses)} sol={len(solana_addresses)} tron={len(tron_addresses)} chains={len(selected_chain_ids)}",
     )
+    debug_summary: dict[tuple[str, str, str, str], int] = {}
+    for d in pool_debug_rows:
+        chain = str(d.get("chain") or "")
+        version = str(d.get("version") or "")
+        attempts = d.get("attempts") or []
+        for a in attempts:
+            if not isinstance(a, dict):
+                continue
+            mode = f"{a.get('query_mode') or ''}:{a.get('owner_type') or ''}"
+            key = (chain, version, mode, "ok" if a.get("ok") else "fail")
+            debug_summary[key] = int(debug_summary.get(key, 0)) + int(a.get("count") or 0)
+    debug_summary_rows = [
+        {
+            "chain": chain,
+            "version": version,
+            "query_mode": mode,
+            "status": status,
+            "count": count,
+        }
+        for (chain, version, mode, status), count in sorted(debug_summary.items())
+    ]
     return {
         "pool_positions": pool_rows,
         "lending_positions": lending_rows,
         "reward_positions": reward_rows,
         "errors": (pool_errs + lending_errs + reward_errs)[:40],
         "infos": info_notes[:20],
+        "debug": {
+            "pool_scan": pool_debug_rows[:500],
+            "summary": debug_summary_rows[:500],
+        },
         "summary": {
             "evm_addresses": len(evm_addresses),
             "solana_addresses": len(solana_addresses),
