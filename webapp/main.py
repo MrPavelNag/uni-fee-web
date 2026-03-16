@@ -175,8 +175,8 @@ POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_P
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "30")))
 POSITIONS_OWNER_MAX_SECONDS = max(2, int(os.environ.get("POSITIONS_OWNER_MAX_SECONDS", "4")))
-POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "3")))
-POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "2")))
+POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "4")))
+POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "3")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "0").strip().lower() in (
     "1",
     "true",
@@ -188,7 +188,7 @@ POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIM
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
 POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
     int(x.strip())
-    for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161").split(",")
+    for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161,8453,130,56").split(",")
     if x.strip().isdigit()
 }
 PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
@@ -199,6 +199,9 @@ getcontext().prec = 48
 UNISWAP_V3_NPM_BY_CHAIN_ID: dict[int, str] = {
     1: "0xc36442b4a4522e871399cd717abdd847ab11fe88",
     10: "0xc36442b4a4522e871399cd717abdd847ab11fe88",
+    56: "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364",
+    130: "0x943e6e07a7e8e791dafc44083e54041d743c46e9",
+    1301: "0xb7f724d6dddfd008eff5cc2834edde5f9ef0d075",
     137: "0xc36442b4a4522e871399cd717abdd847ab11fe88",
     8453: "0x03a520b32c04bf3beef7beb72e919cf822ed34f1",
     42161: "0xc36442b4a4522e871399cd717abdd847ab11fe88",
@@ -206,14 +209,22 @@ UNISWAP_V3_NPM_BY_CHAIN_ID: dict[int, str] = {
 UNISWAP_V3_FACTORY_BY_CHAIN_ID: dict[int, str] = {
     1: "0x1f98431c8ad98523631ae4a59f267346ea31f984",
     10: "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    56: "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865",
+    130: "0x1f98400000000000000000000000000000000003",
+    1301: "0x1f98431c8ad98523631ae4a59f267346ea31f984",
     137: "0x1f98431c8ad98523631ae4a59f267346ea31f984",
     8453: "0x33128a8fc17869897dce68ed026d694621f6fdfd",
     42161: "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+}
+V3_PROTOCOL_LABEL_BY_CHAIN_ID: dict[int, str] = {
+    56: "pancake_v3",
 }
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
     10: ["https://optimism-rpc.publicnode.com"],
     56: ["https://bsc-rpc.publicnode.com"],
+    130: ["https://unichain-rpc.publicnode.com", "https://mainnet.unichain.org"],
+    1301: ["https://sepolia.unichain.org"],
     137: ["https://polygon-bor-rpc.publicnode.com"],
     8453: ["https://base-rpc.publicnode.com"],
     42161: ["https://arbitrum-one-rpc.publicnode.com"],
@@ -1423,6 +1434,7 @@ def _scan_v3_positions_onchain(
     chain_id: int,
     deadline_ts: float | None = None,
     include_price_details: bool = True,
+    protocol_label: str = "uniswap_v3",
 ) -> list[dict[str, Any]]:
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
@@ -1508,6 +1520,7 @@ def _scan_v3_positions_onchain(
                         "token1": {"id": str(token1).lower(), "decimals": int(dec1)},
                     },
                     "_skip_enrich": not include_price_details,
+                    "_protocol_label": str(protocol_label or "uniswap_v3"),
                 }
             )
         except Exception:
@@ -2083,7 +2096,12 @@ def _scan_pool_positions_chain(
             and int(chain_id) in POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS
         ):
             try:
-                onchain_prefetch = _scan_v3_positions_onchain(owner, int(chain_id), deadline_ts=deadline_ts)
+                onchain_prefetch = _scan_v3_positions_onchain(
+                    owner,
+                    int(chain_id),
+                    deadline_ts=deadline_ts,
+                    protocol_label=V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"),
+                )
                 owner_attempts.append(
                     {
                         "owner_value": owner,
@@ -2147,6 +2165,7 @@ def _scan_pool_positions_chain(
                         int(chain_id),
                         deadline_ts=deadline_ts,
                         include_price_details=(int(chain_id) in POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS),
+                            protocol_label=V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"),
                     )
                     owner_attempts.append(
                         {
@@ -2218,7 +2237,7 @@ def _scan_pool_positions_chain(
                 owner_rows.append(
                     {
                         "address": owner,
-                        "protocol": f"uniswap_{version}",
+                        "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
                         "chain": chain_key,
                         "chain_id": int(chain_id),
                         "kind": "pool",
