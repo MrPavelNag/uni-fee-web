@@ -239,10 +239,18 @@ PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID: dict[int, str] = {
     42161: "0x5e09acf80c0296740ec5d6f643005a4ef8daa694",
     8453: "0xc6a2db661d5a5690172d8eb0a7dea2d3008665a3",
 }
+PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID: dict[int, str] = {
+    56: "0x55f4c8aba71a1e923edc303eb4feff14608cc226",
+    8453: "0x55f4c8aba71a1e923edc303eb4feff14608cc226",
+}
+PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID: dict[int, str] = {
+    56: "0x3d311d6283dd8ab90bb0031835c8e606349e2850",
+    8453: "0x3d311d6283dd8ab90bb0031835c8e606349e2850",
+}
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
     10: ["https://optimism-rpc.publicnode.com"],
-    56: ["https://bsc-rpc.publicnode.com"],
+    56: ["https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com"],
     130: ["https://unichain-rpc.publicnode.com", "https://mainnet.unichain.org"],
     1301: ["https://sepolia.unichain.org"],
     137: ["https://polygon-bor-rpc.publicnode.com"],
@@ -1887,6 +1895,118 @@ def _scan_pancake_staked_v3_positions_onchain(
     return out
 
 
+def _keccak256_hex(data: bytes) -> str | None:
+    try:
+        from eth_hash.auto import keccak as _keccak
+
+        return "0x" + _keccak(data).hex()
+    except Exception:
+        return None
+
+
+def _normalize_infinity_currency(chain_id: int, token: str) -> tuple[str, str, int]:
+    t = str(token or "").strip().lower()
+    if _is_eth_address(t) and t != "0x0000000000000000000000000000000000000000":
+        return t, (_fetch_erc20_symbol_onchain(int(chain_id), t) or t[:8]).upper(), _fetch_erc20_decimals_onchain(int(chain_id), t)
+    chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
+    wrapped = ((_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(chain_key, {}) or {}).items())
+    # Prefer wrapped native aliases from config when Infinity uses native currency address(0).
+    for addr, sym in wrapped:
+        us = str(sym or "").upper()
+        if us in {"WBNB", "WETH", "WMATIC", "WPOL"} and _is_eth_address(addr):
+            return str(addr).lower(), us, _fetch_erc20_decimals_onchain(int(chain_id), str(addr))
+    native_sym = "BNB" if int(chain_id) == 56 else "NATIVE"
+    return "0x0000000000000000000000000000000000000000", native_sym, 18
+
+
+def _scan_pancake_infinity_cl_positions_onchain(
+    owner: str,
+    chain_id: int,
+    *,
+    deadline_ts: float | None = None,
+) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    pm = PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid)
+    if not pm:
+        return []
+    owner_addr = str(owner or "").strip().lower()
+    if not _is_eth_address(owner_addr):
+        return []
+    try:
+        bal_data = "0x70a08231" + _encode_address_word(owner_addr)
+        balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
+    except Exception:
+        return []
+    if balance <= 0:
+        return []
+    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
+    out: list[dict[str, Any]] = []
+    for idx in range(int(balance) - 1, max(-1, int(balance) - limit - 1), -1):
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        try:
+            tok_data = "0x2f745c59" + _encode_address_word(owner_addr) + _encode_uint_word(idx)
+            token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, tok_data))
+            if token_id <= 0:
+                continue
+            pos_data = "0x99fbab88" + _encode_uint_word(token_id)
+            pos_words = _hex_words(_eth_call_hex(cid, pm, pos_data))
+            if len(pos_words) < 12:
+                continue
+            raw0 = _decode_address_from_word(pos_words[0])
+            raw1 = _decode_address_from_word(pos_words[1])
+            pool_manager = _decode_address_from_word(pos_words[3])
+            fee = _decode_uint_from_word(pos_words[4])
+            tick_lower = _decode_int_from_word(pos_words[6])
+            tick_upper = _decode_int_from_word(pos_words[7])
+            liq = _decode_uint_from_word(pos_words[8])
+            if liq <= 0:
+                continue
+            token0_addr, token0_sym, dec0 = _normalize_infinity_currency(cid, raw0)
+            token1_addr, token1_sym, dec1 = _normalize_infinity_currency(cid, raw1)
+            poolkey_blob = bytes.fromhex("".join(pos_words[:6]))
+            pool_id_hex = _keccak256_hex(poolkey_blob) or ("0x" + _encode_uint_word(token_id))
+            sqrt_price_x96 = 0
+            pool_liquidity = 0
+            try:
+                slot_words = _hex_words(_eth_call_hex(cid, pool_manager, "0xc815641c" + pool_id_hex[2:]))
+                if slot_words:
+                    sqrt_price_x96 = _decode_uint_from_word(slot_words[0])
+            except Exception:
+                pass
+            try:
+                pool_liquidity = _decode_uint_eth_call(_eth_call_hex(cid, pool_manager, "0xfa6793d5" + pool_id_hex[2:]))
+            except Exception:
+                pool_liquidity = 0
+            token0_price = _token0_price_from_sqrt_price_x96(int(sqrt_price_x96), dec0, dec1)
+            out.append(
+                {
+                    "id": f"inf-cl:{token_id}",
+                    "liquidity": str(liq),
+                    "tickLower": {"tickIdx": str(tick_lower)},
+                    "tickUpper": {"tickIdx": str(tick_upper)},
+                    "pool": {
+                        "id": pool_id_hex,
+                        "feeTier": str(fee),
+                        "liquidity": str(pool_liquidity),
+                        "sqrtPrice": str(sqrt_price_x96),
+                        "token0Price": str(token0_price) if token0_price else "0",
+                        "totalValueLockedUSD": "0",
+                        "totalValueLockedToken0": "0",
+                        "totalValueLockedToken1": "0",
+                        "token0": {"id": token0_addr, "decimals": str(dec0), "symbol": token0_sym},
+                        "token1": {"id": token1_addr, "decimals": str(dec1), "symbol": token1_sym},
+                    },
+                    "_protocol_label": "pancake_infinity_cl",
+                    "_source": "onchain_pancake_infinity_cl",
+                    "_skip_enrich": True,
+                }
+            )
+        except Exception:
+            continue
+    return out
+
+
 def _estimate_position_tvl_usd_from_share_external(
     position: dict[str, Any], pool: dict[str, Any], chain_id: int
 ) -> float | None:
@@ -2523,6 +2643,45 @@ def _scan_pool_positions_chain(
                         "owner_value": owner,
                         "owner_type": "onchain",
                         "query_mode": "onchain_pancake_masterchef_v3",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                    }
+                )
+
+        # Pancake Infinity CL positions live in a dedicated position manager and are
+        # not visible through Uniswap-v3/v4 subgraph queries.
+        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
+            try:
+                infinity_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
+                    owner,
+                    int(chain_id),
+                    deadline_ts=deadline_ts,
+                )
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_cl",
+                        "count": len(infinity_cl_positions),
+                        "ok": True,
+                    }
+                )
+                if infinity_cl_positions:
+                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                    for p in infinity_cl_positions:
+                        pid = str((p or {}).get("id") or "")
+                        if pid and pid in seen:
+                            continue
+                        if pid:
+                            seen.add(pid)
+                        positions.append(p)
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_cl",
                         "count": 0,
                         "ok": False,
                         "error": str(e)[:220],
