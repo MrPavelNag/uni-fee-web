@@ -50,7 +50,16 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
         except ValueError:
             retries = 4
     retries = max(1, retries)
-    connect_timeout, read_timeout = 15, 60
+    try:
+        connect_timeout = float(os.environ.get("GRAPHQL_CONNECT_TIMEOUT_SEC", "8"))
+    except Exception:
+        connect_timeout = 8.0
+    try:
+        read_timeout = float(os.environ.get("GRAPHQL_READ_TIMEOUT_SEC", "15"))
+    except Exception:
+        read_timeout = 15.0
+    connect_timeout = max(2.0, connect_timeout)
+    read_timeout = max(5.0, read_timeout)
     for attempt in range(retries):
         try:
             resp = requests.post(endpoint, json=payload, timeout=(connect_timeout, read_timeout))

@@ -7,6 +7,8 @@ Cloud-ready web MVP for pool analysis.
 - Show results on-screen (no PDF required)
 """
 
+from __future__ import annotations
+
 import os
 import base64
 import hashlib
@@ -168,6 +170,9 @@ _POSITION_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
+POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "96")))
+POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "30")))
 PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
 TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
@@ -1310,147 +1315,76 @@ def _query_uniswap_positions_for_owner(
     include_pool_liquidity: bool = False,
     include_position_liquidity: bool = True,
     debug_steps: list[dict[str, Any]] | None = None,
+    deadline_ts: float | None = None,
 ) -> list[dict[str, Any]]:
-    pool_liq_field = "liquidity" if include_pool_liquidity else ""
-    pos_liq_field = "liquidity" if include_position_liquidity else ""
-    detailed_fields = f"""
-        id
-        {pos_liq_field}
-        tickLower {{ tickIdx }}
-        tickUpper {{ tickIdx }}
-        pool {{
-          id
-          feeTier
-          {pool_liq_field}
-          sqrtPrice
-          token0Price
-          totalValueLockedUSD
-          totalValueLockedToken0
-          totalValueLockedToken1
-          token0 {{ symbol id decimals }}
-          token1 {{ symbol id decimals }}
-        }}
-    """
-    basic_fields = f"""
-        id
-        {pos_liq_field}
-        pool {{
-          id
-          feeTier
-          {pool_liq_field}
-          totalValueLockedUSD
-          token0 {{ symbol id }}
-          token1 {{ symbol id }}
-        }}
-    """
-    def _build_queries(owner_type: str) -> tuple[str, str, str, str, str, str, str, str, str, str]:
-        q_positions = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
-        {detailed_fields}
-      }}
-    }}
-    """
-        q_account = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      account(id: $owner) {{
-        positions(first: 200, skip: $skip) {{
-          {detailed_fields}
-        }}
-      }}
-    }}
-    """
-        q_accounts = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      accounts(first: 1, where: {{ id: $owner }}) {{
-        positions(first: 200, skip: $skip) {{
-          {detailed_fields}
-        }}
-      }}
-    }}
-    """
-        q_positions_owner_in = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      positions(first: 200, skip: $skip, where: {{ owner_in: [$owner] }}) {{
-        {detailed_fields}
-      }}
-    }}
-    """
-        q_positions_owner_rel = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      positions(first: 200, skip: $skip, where: {{ owner_: {{ id: $owner }} }}) {{
-        {detailed_fields}
-      }}
-    }}
-    """
-        q_snapshots = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      positionSnapshots(
-        first: 200,
-        skip: $skip,
-        orderBy: timestamp,
-        orderDirection: desc,
-        where: {{ owner: $owner }}
-      ) {{
-        position {{
-          {detailed_fields}
-        }}
-      }}
-    }}
-    """
-        q_positions_basic = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
-        {basic_fields}
-      }}
-    }}
-    """
-        q_account_basic = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      account(id: $owner) {{
-        positions(first: 200, skip: $skip) {{
-          {basic_fields}
-        }}
-      }}
-    }}
-    """
-        q_accounts_basic = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      accounts(first: 1, where: {{ id: $owner }}) {{
-        positions(first: 200, skip: $skip) {{
-          {basic_fields}
-        }}
-      }}
-    }}
-    """
-        q_snapshots_basic = f"""
-    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-      positionSnapshots(
-        first: 200,
-        skip: $skip,
-        orderBy: timestamp,
-        orderDirection: desc,
-        where: {{ owner: $owner }}
-      ) {{
-        position {{
-          {basic_fields}
-        }}
-      }}
-    }}
-    """
-        return (
-            q_positions,
-            q_account,
-            q_accounts,
-            q_positions_owner_in,
-            q_positions_owner_rel,
-            q_snapshots,
-            q_positions_basic,
-            q_account_basic,
-            q_accounts_basic,
-            q_snapshots_basic,
-        )
-    result: list[dict[str, Any]] = []
+    def _build_id_queries(owner_type: str) -> list[tuple[str, str]]:
+        return [
+            (
+                "positions",
+                f"""
+                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                  positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{ id }}
+                }}
+                """,
+            ),
+            (
+                "positions_in",
+                f"""
+                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                  positions(first: 200, skip: $skip, where: {{ owner_in: [$owner] }}) {{ id }}
+                }}
+                """,
+            ),
+            (
+                "positions_rel",
+                f"""
+                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                  positions(first: 200, skip: $skip, where: {{ owner_: {{ id: $owner }} }}) {{ id }}
+                }}
+                """,
+            ),
+            (
+                "account",
+                f"""
+                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                  account(id: $owner) {{ positions(first: 200, skip: $skip) {{ id }} }}
+                }}
+                """,
+            ),
+            (
+                "accounts",
+                f"""
+                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                  accounts(first: 1, where: {{ id: $owner }}) {{ positions(first: 200, skip: $skip) {{ id }} }}
+                }}
+                """,
+            ),
+            (
+                "snapshots",
+                f"""
+                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                  positionSnapshots(first: 200, skip: $skip, where: {{ owner: $owner }}) {{ position {{ id }} }}
+                }}
+                """,
+            ),
+            (
+                "snapshots_in",
+                f"""
+                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                  positionSnapshots(first: 200, skip: $skip, where: {{ owner_in: [$owner] }}) {{ position {{ id }} }}
+                }}
+                """,
+            ),
+            (
+                "snapshots_rel",
+                f"""
+                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                  positionSnapshots(first: 200, skip: $skip, where: {{ owner_: {{ id: $owner }} }}) {{ position {{ id }} }}
+                }}
+                """,
+            ),
+        ]
+
     owner_raw = str(owner or "").strip()
     owner_lc = owner_raw.lower()
     owner_candidates: list[str] = []
@@ -1460,82 +1394,82 @@ def _query_uniswap_positions_for_owner(
         if candidate and candidate not in owner_candidates:
             owner_candidates.append(candidate)
 
-    def _run(q: str, mode: str, owner_value: str) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
+    def _run_ids(q: str, mode: str, owner_value: str) -> list[str]:
+        out: list[str] = []
         skip = 0
+        pages = 0
         while True:
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
             data = graphql_query(endpoint, q, {"owner": owner_value, "skip": skip}, retries=1)
             payload = data.get("data", {}) or {}
-            if mode == "positions":
-                batch = payload.get("positions", []) or []
+            batch_ids: list[str] = []
+            if mode.startswith("positions"):
+                for x in (payload.get("positions", []) or []):
+                    if isinstance(x, dict) and x.get("id"):
+                        batch_ids.append(str(x.get("id")))
             elif mode == "account":
-                batch = ((payload.get("account") or {}).get("positions") or [])
+                for x in (((payload.get("account") or {}).get("positions") or [])):
+                    if isinstance(x, dict) and x.get("id"):
+                        batch_ids.append(str(x.get("id")))
             elif mode == "accounts":
                 accounts = payload.get("accounts", []) or []
                 first = accounts[0] if accounts else {}
-                batch = (first or {}).get("positions") or []
+                for x in ((first or {}).get("positions") or []):
+                    if isinstance(x, dict) and x.get("id"):
+                        batch_ids.append(str(x.get("id")))
             else:
-                snapshots = payload.get("positionSnapshots", []) or []
-                batch = []
-                for s in snapshots:
+                for s in (payload.get("positionSnapshots", []) or []):
                     pos = (s or {}).get("position") or {}
-                    if pos:
-                        batch.append(pos)
-            # Defensive normalization: some endpoints can return unexpected scalar items.
-            clean_batch = [x for x in (batch or []) if isinstance(x, dict)]
-            out.extend(clean_batch)
-            if len(clean_batch) < 200:
+                    if isinstance(pos, dict) and pos.get("id"):
+                        batch_ids.append(str(pos.get("id")))
+            out.extend(batch_ids)
+            if len(batch_ids) < 200:
+                break
+            pages += 1
+            if pages >= POSITIONS_MAX_PAGES_PER_QUERY:
                 break
             skip += 200
             time.sleep(0.15)
         return out
 
-    query_sets = [_build_queries("String"), _build_queries("Bytes"), _build_queries("ID")]
+    # Try ID first: many subgraphs model owner/id filters as ID.
+    query_sets = [("ID", _build_id_queries("ID")), ("String", _build_id_queries("String")), ("Bytes", _build_id_queries("Bytes"))]
+    attempts_count = 0
+    found_ids: list[str] = []
     for owner_value in owner_candidates:
-        for (
-            q_positions,
-            q_account,
-            q_accounts,
-            q_positions_owner_in,
-            q_positions_owner_rel,
-            q_snapshots,
-            q_positions_basic,
-            q_account_basic,
-            q_accounts_basic,
-            q_snapshots_basic,
-        ) in query_sets:
-            owner_type = "String"
-            if "$owner: Bytes!" in q_positions:
-                owner_type = "Bytes"
-            elif "$owner: ID!" in q_positions:
-                owner_type = "ID"
-            for q, mode in (
-                (q_positions, "positions"),
-                (q_account, "account"),
-                (q_accounts, "accounts"),
-                (q_positions_owner_in, "positions"),
-                (q_positions_owner_rel, "positions"),
-                (q_snapshots, "snapshots"),
-                (q_positions_basic, "positions"),
-                (q_account_basic, "account"),
-                (q_accounts_basic, "accounts"),
-                (q_snapshots_basic, "snapshots"),
-            ):
-                if result:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        for owner_type, queries in query_sets:
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            for mode, q in queries:
+                if found_ids:
+                    break
+                if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                    break
+                if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
                     break
                 try:
-                    result = _run(q, mode, owner_value)
+                    attempts_count += 1
+                    ids = _run_ids(q, mode, owner_value)
                     if debug_steps is not None:
                         debug_steps.append(
                             {
                                 "owner_value": owner_value,
                                 "owner_type": owner_type,
                                 "query_mode": mode,
-                                "count": len(result),
+                                "count": len(ids),
                                 "ok": True,
                             }
                         )
-                except Exception:
+                    if ids:
+                        seen = set(found_ids)
+                        for pid in ids:
+                            if pid not in seen:
+                                seen.add(pid)
+                                found_ids.append(pid)
+                except Exception as e:
                     if debug_steps is not None:
                         debug_steps.append(
                             {
@@ -1544,14 +1478,33 @@ def _query_uniswap_positions_for_owner(
                                 "query_mode": mode,
                                 "count": 0,
                                 "ok": False,
+                                "error": str(e)[:220],
                             }
                         )
-                    result = []
-            if result:
+            if found_ids:
                 break
-        if result:
+            if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
+                break
+        if found_ids:
             break
-    return result
+        if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
+            break
+    if not found_ids:
+        return []
+
+    details: list[dict[str, Any]] = []
+    for pid in found_ids[:400]:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        item = _fetch_position_by_id_with_detail(
+            endpoint,
+            pid,
+            include_pool_liquidity=include_pool_liquidity,
+            include_position_liquidity=include_position_liquidity,
+        )
+        if item:
+            details.append(item)
+    return details
 
 
 def _position_has_full_detail(position: dict[str, Any]) -> bool:
@@ -1562,14 +1515,20 @@ def _position_has_full_detail(position: dict[str, Any]) -> bool:
     return has_ticks and has_pool_price and has_decimals
 
 
-def _fetch_position_by_id_with_detail(endpoint: str, position_id: str, include_pool_liquidity: bool) -> dict[str, Any] | None:
+def _fetch_position_by_id_with_detail(
+    endpoint: str,
+    position_id: str,
+    include_pool_liquidity: bool,
+    include_position_liquidity: bool = True,
+) -> dict[str, Any] | None:
     pid = str(position_id or "").strip()
     if not pid:
         return None
     pool_liq_field = "liquidity" if include_pool_liquidity else ""
-    fields = f"""
+    pos_liq_field = "liquidity" if include_position_liquidity else ""
+    detailed_fields = f"""
       id
-      liquidity
+      {pos_liq_field}
       tickLower {{ tickIdx }}
       tickUpper {{ tickIdx }}
       pool {{
@@ -1585,21 +1544,48 @@ def _fetch_position_by_id_with_detail(endpoint: str, position_id: str, include_p
         token1 {{ symbol id decimals }}
       }}
     """
+    basic_fields = f"""
+      id
+      {pos_liq_field}
+      pool {{
+        id
+        feeTier
+        {pool_liq_field}
+        totalValueLockedUSD
+        token0Price
+        token0 {{ symbol id decimals }}
+        token1 {{ symbol id decimals }}
+      }}
+    """
     for id_type in ("ID", "String"):
-        q = f"""
+        q_detailed = f"""
         query PositionById($id: {id_type}!) {{
           position(id: $id) {{
-            {fields}
+            {detailed_fields}
           }}
         }}
         """
         try:
-            data = graphql_query(endpoint, q, {"id": pid}, retries=1)
+            data = graphql_query(endpoint, q_detailed, {"id": pid}, retries=1)
             pos = ((data.get("data") or {}).get("position") or {})
             if pos:
                 return pos
         except Exception:
-            continue
+            pass
+        q_basic = f"""
+        query PositionById($id: {id_type}!) {{
+          position(id: $id) {{
+            {basic_fields}
+          }}
+        }}
+        """
+        try:
+            data = graphql_query(endpoint, q_basic, {"id": pid}, retries=1)
+            pos = ((data.get("data") or {}).get("position") or {})
+            if pos:
+                return pos
+        except Exception:
+            pass
     return None
 
 
@@ -1682,11 +1668,19 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
+    deadline_ts = time.monotonic() + float(POSITIONS_SCAN_MAX_SECONDS)
+    timed_out = False
     for chain_id in chain_ids:
+        if time.monotonic() >= deadline_ts:
+            timed_out = True
+            break
         chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
         if not chain_key:
             continue
         for version in ("v3", "v4"):
+            if time.monotonic() >= deadline_ts:
+                timed_out = True
+                break
             endpoint = get_graph_endpoint(chain_key, version=version)
             if not endpoint:
                 continue
@@ -1697,6 +1691,9 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint)
             has_position_liquidity = _endpoint_supports_position_liquidity(endpoint)
             for owner in addresses:
+                if time.monotonic() >= deadline_ts:
+                    timed_out = True
+                    break
                 owner_attempts: list[dict[str, Any]] = []
                 try:
                     positions = _query_uniswap_positions_for_owner(
@@ -1705,6 +1702,7 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                         include_pool_liquidity=has_pool_liquidity,
                         include_position_liquidity=has_position_liquidity,
                         debug_steps=owner_attempts,
+                        deadline_ts=deadline_ts,
                     )
                     # Introspection can be blocked on some indexers, producing a false
                     # negative for liquidity support. Retry once with liquidity enabled.
@@ -1715,6 +1713,7 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             include_pool_liquidity=has_pool_liquidity,
                             include_position_liquidity=True,
                             debug_steps=owner_attempts,
+                            deadline_ts=deadline_ts,
                         )
                 except Exception as e:
                     errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
@@ -1740,6 +1739,9 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     }
                 )
                 for p in positions:
+                    if time.monotonic() >= deadline_ts:
+                        timed_out = True
+                        break
                     try:
                         if not isinstance(p, dict):
                             continue
@@ -1759,10 +1761,12 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                         tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
                         valuation_mode = "exact-external"
                         detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
-                        # Strict mode: keep only exact-external valuation.
+                        # Prefer exact-external value; if unavailable, keep row visible.
                         if detailed_external_tvl is None or detailed_external_tvl <= 0:
-                            continue
-                        position_tvl_usd = detailed_external_tvl
+                            position_tvl_usd = None
+                            valuation_mode = "no-exact-external"
+                        else:
+                            position_tvl_usd = detailed_external_tvl
                         fee_raw = str(pool.get("feeTier") or "").strip()
                         fee_disp = fee_raw
                         try:
@@ -1797,6 +1801,12 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                         if POSITIONS_DEBUG_ERRORS:
                             errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
                         continue
+                if timed_out:
+                    break
+            if timed_out:
+                break
+        if timed_out:
+            break
     # Aggregate by owner/protocol/pool id (wallet can hold multiple NFT positions in one pool).
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
@@ -1822,6 +1832,10 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             acc["valuation_mode"] = m2
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     dedup_errors = list(dict.fromkeys(errors))
+    if timed_out:
+        dedup_errors.append(
+            f"Pool scan timed out after {POSITIONS_SCAN_MAX_SECONDS}s. Showing partial results."
+        )
     return list(uniq.values()), dedup_errors, debug_rows
 
 
@@ -3796,9 +3810,29 @@ def _render_positions_page() -> str:
         const errWrap = document.getElementById("posErrors");
         const errs = data.errors || [];
         const infos = data.infos || [];
+        const dbg = data.debug || {};
+        const dbgSummary = Array.isArray(dbg.summary) ? dbg.summary : [];
+        const dbgRows = Array.isArray(dbg.pool_scan) ? dbg.pool_scan : [];
+        let dbgHtml = "";
+        if (dbgSummary.length || dbgRows.length) {
+          const sumLines = dbgSummary.slice(0, 40).map((x) =>
+            `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`
+          );
+          const zeroRows = dbgRows
+            .filter((x) => Number(x.positions_found || 0) === 0)
+            .slice(0, 30)
+            .map((x) => `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} (0)`);
+          const body = []
+            .concat(sumLines.length ? ["Summary:", ...sumLines] : [])
+            .concat(zeroRows.length ? ["", "Zero-found owners:", ...zeroRows] : [])
+            .join("\\n");
+          if (body.trim()) {
+            dbgHtml = `<div class='info-box'><details><summary>Debug scan details</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
+          }
+        }
         const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
         const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
-        if (errWrap) errWrap.innerHTML = errHtml + infoHtml;
+        if (errWrap) errWrap.innerHTML = errHtml + infoHtml + dbgHtml;
         setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}`, false);
       } catch (e) {
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
@@ -5485,14 +5519,22 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
     if len(evm_addresses) > 20:
         raise HTTPException(status_code=400, detail="Too many addresses. Max 20.")
 
-    # Always scan all supported EVM chains when an EVM address is provided.
-    selected_chain_ids = sorted(
+    # By default scan all supported EVM chains; if chain_ids provided, use them.
+    all_chain_ids = sorted(
         {
             int(x.get("chain_id") or 0)
             for x in _positions_chain_catalog()
             if int(x.get("chain_id") or 0) > 0
         }
     )[:64]
+    requested_chain_ids = sorted({int(x) for x in (req.chain_ids or []) if int(x) > 0})
+    if requested_chain_ids:
+        allowed = set(all_chain_ids)
+        selected_chain_ids = [c for c in requested_chain_ids if c in allowed]
+        if not selected_chain_ids:
+            selected_chain_ids = all_chain_ids
+    else:
+        selected_chain_ids = all_chain_ids
     scan_pools = bool(req.include_pools)
     scan_lending = bool(req.include_lending)
     scan_rewards = bool(req.include_rewards)
