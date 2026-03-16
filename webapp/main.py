@@ -173,6 +173,14 @@ POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().l
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "96")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "30")))
+POSITIONS_OWNER_MAX_SECONDS = max(2, int(os.environ.get("POSITIONS_OWNER_MAX_SECONDS", "6")))
+POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "0").strip().lower() in ("1", "true", "yes", "on")
 PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
 TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
@@ -1317,8 +1325,8 @@ def _query_uniswap_positions_for_owner(
     debug_steps: list[dict[str, Any]] | None = None,
     deadline_ts: float | None = None,
 ) -> list[dict[str, Any]]:
-    def _build_id_queries(owner_type: str) -> list[tuple[str, str]]:
-        return [
+    def _build_id_queries(owner_type: str, *, extended: bool = False) -> list[tuple[str, str]]:
+        queries: list[tuple[str, str]] = [
             (
                 "positions",
                 f"""
@@ -1332,30 +1340,6 @@ def _query_uniswap_positions_for_owner(
                 f"""
                 query UserPositions($owner: {owner_type}!, $skip: Int!) {{
                   positions(first: 200, skip: $skip, where: {{ owner_in: [$owner] }}) {{ id }}
-                }}
-                """,
-            ),
-            (
-                "positions_rel",
-                f"""
-                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-                  positions(first: 200, skip: $skip, where: {{ owner_: {{ id: $owner }} }}) {{ id }}
-                }}
-                """,
-            ),
-            (
-                "account",
-                f"""
-                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-                  account(id: $owner) {{ positions(first: 200, skip: $skip) {{ id }} }}
-                }}
-                """,
-            ),
-            (
-                "accounts",
-                f"""
-                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-                  accounts(first: 1, where: {{ id: $owner }}) {{ positions(first: 200, skip: $skip) {{ id }} }}
                 }}
                 """,
             ),
@@ -1375,15 +1359,45 @@ def _query_uniswap_positions_for_owner(
                 }}
                 """,
             ),
-            (
-                "snapshots_rel",
-                f"""
-                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-                  positionSnapshots(first: 200, skip: $skip, where: {{ owner_: {{ id: $owner }} }}) {{ position {{ id }} }}
-                }}
-                """,
-            ),
         ]
+        if extended:
+            queries.extend(
+                [
+                    (
+                        "positions_rel",
+                        f"""
+                        query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                          positions(first: 200, skip: $skip, where: {{ owner_: {{ id: $owner }} }}) {{ id }}
+                        }}
+                        """,
+                    ),
+                    (
+                        "account",
+                        f"""
+                        query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                          account(id: $owner) {{ positions(first: 200, skip: $skip) {{ id }} }}
+                        }}
+                        """,
+                    ),
+                    (
+                        "accounts",
+                        f"""
+                        query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                          accounts(first: 1, where: {{ id: $owner }}) {{ positions(first: 200, skip: $skip) {{ id }} }}
+                        }}
+                        """,
+                    ),
+                    (
+                        "snapshots_rel",
+                        f"""
+                        query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                          positionSnapshots(first: 200, skip: $skip, where: {{ owner_: {{ id: $owner }} }}) {{ position {{ id }} }}
+                        }}
+                        """,
+                    ),
+                ]
+            )
+        return queries
 
     owner_raw = str(owner or "").strip()
     owner_lc = owner_raw.lower()
@@ -1433,58 +1447,70 @@ def _query_uniswap_positions_for_owner(
             time.sleep(0.15)
         return out
 
-    # Try ID first: many subgraphs model owner/id filters as ID.
-    query_sets = [("ID", _build_id_queries("ID")), ("String", _build_id_queries("String")), ("Bytes", _build_id_queries("Bytes"))]
+    # Fast profile by default: prefer filters that work across most indexers.
+    owner_types_primary = ["ID", "String"]
+    if POSITIONS_TRY_BYTES_TYPE:
+        owner_types_primary.append("Bytes")
+    query_sets_primary = [(x, _build_id_queries(x, extended=False)) for x in owner_types_primary]
+    query_sets_extended = [(x, _build_id_queries(x, extended=True)) for x in ["ID", "String", "Bytes"]]
     attempts_count = 0
     found_ids: list[str] = []
     for owner_value in owner_candidates:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
-        for owner_type, queries in query_sets:
-            if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                break
-            for mode, q in queries:
-                if found_ids:
-                    break
-                if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                    break
-                if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
-                    break
-                try:
-                    attempts_count += 1
-                    ids = _run_ids(q, mode, owner_value)
-                    if debug_steps is not None:
-                        debug_steps.append(
-                            {
-                                "owner_value": owner_value,
-                                "owner_type": owner_type,
-                                "query_mode": mode,
-                                "count": len(ids),
-                                "ok": True,
-                            }
-                        )
-                    if ids:
-                        seen = set(found_ids)
-                        for pid in ids:
-                            if pid not in seen:
-                                seen.add(pid)
-                                found_ids.append(pid)
-                except Exception as e:
-                    if debug_steps is not None:
-                        debug_steps.append(
-                            {
-                                "owner_value": owner_value,
-                                "owner_type": owner_type,
-                                "query_mode": mode,
-                                "count": 0,
-                                "ok": False,
-                                "error": str(e)[:220],
-                            }
-                        )
-            if found_ids:
-                break
-            if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
-                break
+        owner_deadline = time.monotonic() + float(POSITIONS_OWNER_MAX_SECONDS)
+        if deadline_ts is not None:
+            owner_deadline = min(owner_deadline, deadline_ts)
+
+        def _run_query_sets(query_sets: list[tuple[str, list[tuple[str, str]]]]) -> bool:
+            nonlocal attempts_count, found_ids
+            for owner_type, queries in query_sets:
+                if time.monotonic() >= owner_deadline:
+                    return False
+                for mode, q in queries:
+                    if found_ids:
+                        return True
+                    if time.monotonic() >= owner_deadline:
+                        return False
+                    if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
+                        return False
+                    try:
+                        attempts_count += 1
+                        ids = _run_ids(q, mode, owner_value)
+                        if debug_steps is not None:
+                            debug_steps.append(
+                                {
+                                    "owner_value": owner_value,
+                                    "owner_type": owner_type,
+                                    "query_mode": mode,
+                                    "count": len(ids),
+                                    "ok": True,
+                                }
+                            )
+                        if ids:
+                            seen = set(found_ids)
+                            for pid in ids:
+                                if pid not in seen:
+                                    seen.add(pid)
+                                    found_ids.append(pid)
+                            return True
+                    except Exception as e:
+                        if debug_steps is not None:
+                            debug_steps.append(
+                                {
+                                    "owner_value": owner_value,
+                                    "owner_type": owner_type,
+                                    "query_mode": mode,
+                                    "count": 0,
+                                    "ok": False,
+                                    "error": str(e)[:220],
+                                }
+                            )
+            return bool(found_ids)
+
+        _run_query_sets(query_sets_primary)
+        if not found_ids and POSITIONS_EXTENDED_QUERY_FALLBACK and time.monotonic() < owner_deadline:
+            _run_query_sets(query_sets_extended)
         if found_ids:
             break
         if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
@@ -5519,15 +5545,22 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
     if len(evm_addresses) > 20:
         raise HTTPException(status_code=400, detail="Too many addresses. Max 20.")
 
-    # By default scan all supported EVM chains; if chain_ids provided, use them.
+    # By default scan all supported EVM chains; if chain_ids provided, preserve user order.
+    preferred_order = [1, 42161, 10, 8453, 137, 56]
+    preferred_rank = {cid: idx for idx, cid in enumerate(preferred_order)}
     all_chain_ids = sorted(
         {
             int(x.get("chain_id") or 0)
             for x in _positions_chain_catalog()
             if int(x.get("chain_id") or 0) > 0
-        }
+        },
+        key=lambda cid: (preferred_rank.get(int(cid), 999), int(cid)),
     )[:64]
-    requested_chain_ids = sorted({int(x) for x in (req.chain_ids or []) if int(x) > 0})
+    requested_chain_ids: list[int] = []
+    for x in (req.chain_ids or []):
+        cid = int(x)
+        if cid > 0 and cid not in requested_chain_ids:
+            requested_chain_ids.append(cid)
     if requested_chain_ids:
         allowed = set(all_chain_ids)
         selected_chain_ids = [c for c in requested_chain_ids if c in allowed]
