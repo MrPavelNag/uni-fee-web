@@ -186,6 +186,12 @@ POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FAL
 POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIMEOUT_SEC", "4")))
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
+POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
     int(x.strip())
     for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161,8453,130,56").split(",")
@@ -194,6 +200,8 @@ POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
 PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
 TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
+TOKEN_SYMBOL_CACHE: dict[tuple[int, str], str] = {}
+TOKEN_SYMBOL_CACHE_LOCK = threading.Lock()
 getcontext().prec = 48
 
 UNISWAP_V3_NPM_BY_CHAIN_ID: dict[int, str] = {
@@ -229,6 +237,24 @@ DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     8453: ["https://base-rpc.publicnode.com"],
     42161: ["https://arbitrum-one-rpc.publicnode.com"],
 }
+
+_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN: dict[str, dict[str, str]] = {}
+for _ck, _per_chain in TOKEN_ADDRESSES.items():
+    addr_map: dict[str, str] = {}
+    if isinstance(_per_chain, dict):
+        for _sym, _addr in _per_chain.items():
+            a = str(_addr or "").strip().lower()
+            s = str(_sym or "").strip().upper()
+            if not a or not s or not (a.startswith("0x") and len(a) == 42):
+                continue
+            # Prefer human-readable aliases for common addresses.
+            if a in addr_map:
+                prev = addr_map[a]
+                if prev in {"WETH", "WMATIC"} and s in {"ETH", "MATIC", "POL"}:
+                    addr_map[a] = s
+                continue
+            addr_map[a] = s
+    _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN[str(_ck).strip().lower()] = addr_map
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -1416,6 +1442,111 @@ def _decode_uint_eth_call(data_hex: str) -> int:
     return _decode_uint_from_word(words[0])
 
 
+def _decode_abi_string(data_hex: str) -> str | None:
+    h = str(data_hex or "").strip().lower()
+    if h.startswith("0x"):
+        h = h[2:]
+    if not h:
+        return None
+    try:
+        # Dynamic ABI string encoding.
+        if len(h) >= 128:
+            offset_bytes = int(h[0:64], 16)
+            offset = offset_bytes * 2
+            if offset + 64 <= len(h):
+                strlen = int(h[offset : offset + 64], 16)
+                start = offset + 64
+                end = min(len(h), start + max(0, int(strlen)) * 2)
+                if end > start:
+                    raw = bytes.fromhex(h[start:end])
+                    s = raw.decode("utf-8", errors="ignore").strip("\x00").strip()
+                    if s:
+                        return s
+        # bytes32-like fallback.
+        first = h[:64]
+        if first:
+            raw = bytes.fromhex(first)
+            s = raw.split(b"\x00")[0].decode("utf-8", errors="ignore").strip()
+            if s:
+                return s
+    except Exception:
+        return None
+    return None
+
+
+def _fetch_erc20_symbol_onchain(chain_id: int, token_address: str) -> str | None:
+    addr = str(token_address or "").strip().lower()
+    if not _is_eth_address(addr):
+        return None
+    key = (int(chain_id), addr)
+    with TOKEN_SYMBOL_CACHE_LOCK:
+        cached = TOKEN_SYMBOL_CACHE.get(key)
+    if cached is not None:
+        return cached or None
+    try:
+        out = _eth_call_hex(int(chain_id), addr, "0x95d89b41")
+        sym = _decode_abi_string(out)
+        if sym:
+            sym = sym.strip()
+        if not sym:
+            sym = ""
+    except Exception:
+        sym = ""
+    with TOKEN_SYMBOL_CACHE_LOCK:
+        TOKEN_SYMBOL_CACHE[key] = sym
+    return sym or None
+
+
+def _token_display_symbol(chain_id: int, chain_key: str, token_obj: dict[str, Any]) -> str:
+    sym = str((token_obj or {}).get("symbol") or "").strip()
+    if sym:
+        return sym
+    addr = str((token_obj or {}).get("id") or "").strip().lower()
+    if not addr:
+        return "?"
+    cfg_sym = (_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}).get(addr)
+    if cfg_sym:
+        return cfg_sym
+    onchain = _fetch_erc20_symbol_onchain(int(chain_id), addr)
+    if onchain:
+        return onchain
+    return (addr[:8] if len(addr) >= 8 else addr) or "?"
+
+
+def _is_probably_spam_symbol(symbol: str) -> bool:
+    s = str(symbol or "").strip()
+    if not s or s == "?":
+        return True
+    low = s.lower()
+    if len(s) > 16:
+        return True
+    if any(x in low for x in ("http", "www", ".com", ".io", ".org", "t.me", "telegram", "twitter", "x.com")):
+        return True
+    if any(ch in s for ch in (":", "/", "\\", "|", "@")):
+        return True
+    if " " in s:
+        return True
+    if any(x in low for x in ("swap", " dao", "dao", " org", "org", "airdrop", "claim")):
+        return True
+    if re.fullmatch(r"0x[0-9a-f]{6,12}", low):
+        return True
+    return False
+
+
+def _should_filter_spam_pair(chain_key: str, token0_obj: dict[str, Any], token1_obj: dict[str, Any], s0: str, s1: str) -> bool:
+    if not POSITIONS_FILTER_SPAM_TOKENS:
+        return False
+    chain_addr_map = _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}
+    a0 = str((token0_obj or {}).get("id") or "").strip().lower()
+    a1 = str((token1_obj or {}).get("id") or "").strip().lower()
+    if a0 in chain_addr_map or a1 in chain_addr_map:
+        return False
+    spam0 = _is_probably_spam_symbol(s0)
+    spam1 = _is_probably_spam_symbol(s1)
+    # If pair tokens are not from curated list, hide pool when any side looks spammy.
+    return bool(spam0 or spam1)
+
+
 def _pool_token0_price_from_sqrt_x96(sqrt_price_x96: int, dec0: int, dec1: int) -> float | None:
     try:
         if sqrt_price_x96 <= 0:
@@ -2232,8 +2363,10 @@ def _scan_pool_positions_chain(
                     fee_disp = fee_raw or "-"
                 t0_obj = pool.get("token0") or {}
                 t1_obj = pool.get("token1") or {}
-                t0 = t0_obj.get("symbol") or str(t0_obj.get("id") or "")[:8] or "?"
-                t1 = t1_obj.get("symbol") or str(t1_obj.get("id") or "")[:8] or "?"
+                t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
+                t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
+                if _should_filter_spam_pair(chain_key, t0_obj, t1_obj, t0, t1):
+                    continue
                 owner_rows.append(
                     {
                         "address": owner,
@@ -2243,6 +2376,8 @@ def _scan_pool_positions_chain(
                         "kind": "pool",
                         "pool_id": str(pool.get("id") or ""),
                         "pair": f"{t0}/{t1}",
+                        "position_id": str(p.get("id") or ""),
+                        "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
                         "fee_tier": fee_disp,
                         "fee_tier_raw": fee_raw,
                         "liquidity": str(p.get("liquidity") or "0"),
@@ -2382,6 +2517,15 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             continue
         acc = uniq[key]
         acc["position_count"] = int(acc.get("position_count") or 1) + 1
+        acc_ids = [str(x) for x in (acc.get("position_ids") or []) if str(x).strip()]
+        row_ids = [str(x) for x in (row.get("position_ids") or []) if str(x).strip()]
+        if row_ids:
+            seen_ids = set(acc_ids)
+            for pid in row_ids:
+                if pid not in seen_ids:
+                    seen_ids.add(pid)
+                    acc_ids.append(pid)
+            acc["position_ids"] = acc_ids
         cur_tvl = acc.get("tvl_usd")
         row_tvl = row.get("tvl_usd")
         if cur_tvl is None:
@@ -2458,6 +2602,123 @@ def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int
         except Exception:
             continue
     return []
+
+
+def _chain_id_by_chain_key(chain_key: str) -> int:
+    key = str(chain_key or "").strip().lower()
+    for cid, ck in CHAIN_ID_TO_KEY.items():
+        if str(ck).strip().lower() == key:
+            return int(cid)
+    return 0
+
+
+def _fetch_position_snapshot_series_exact(
+    endpoint: str,
+    position_id: str,
+    *,
+    since_ts: int,
+    chain_id: int,
+) -> list[tuple[int, float]]:
+    pid = str(position_id or "").strip()
+    if not pid:
+        return []
+    queries = [
+        (
+            "ID",
+            """
+            query Snapshots($pid: ID!, $since: Int!) {
+              positionSnapshots(
+                first: 500,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { position: $pid, timestamp_gte: $since }
+              ) {
+                timestamp
+                liquidity
+                position { tickLower { tickIdx } tickUpper { tickIdx } }
+                pool { sqrtPrice token0Price token0 { id decimals } token1 { id decimals } }
+              }
+            }
+            """,
+        ),
+        (
+            "String",
+            """
+            query Snapshots($pid: String!, $since: Int!) {
+              positionSnapshots(
+                first: 500,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { position: $pid, timestamp_gte: $since }
+              ) {
+                timestamp
+                liquidity
+                position { tickLower { tickIdx } tickUpper { tickIdx } }
+                pool { sqrtPrice token0Price token0 { id decimals } token1 { id decimals } }
+              }
+            }
+            """,
+        ),
+        (
+            "ID",
+            """
+            query Snapshots($pid: ID!, $since: Int!) {
+              positionSnapshots(
+                first: 500,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { position_: { id: $pid }, timestamp_gte: $since }
+              ) {
+                timestamp
+                liquidity
+                position { tickLower { tickIdx } tickUpper { tickIdx } }
+                pool { sqrtPrice token0Price token0 { id decimals } token1 { id decimals } }
+              }
+            }
+            """,
+        ),
+    ]
+    rows: list[dict[str, Any]] = []
+    for _typ, q in queries:
+        try:
+            data = graphql_query(endpoint, q, {"pid": pid, "since": int(since_ts)}, retries=1)
+            rows = ((data.get("data") or {}).get("positionSnapshots") or [])
+            if rows:
+                break
+        except Exception:
+            continue
+    if not rows:
+        return []
+
+    # Keep only the last snapshot per day for this position.
+    by_day: dict[int, tuple[int, float]] = {}
+    for s in rows:
+        try:
+            ts = int((s or {}).get("timestamp") or 0)
+            if ts <= 0:
+                continue
+            liq = str((s or {}).get("liquidity") or "").strip()
+            pos = (s or {}).get("position") or {}
+            pool = (s or {}).get("pool") or {}
+            if not liq:
+                continue
+            p = {
+                "liquidity": liq,
+                "tickLower": (pos.get("tickLower") or {}),
+                "tickUpper": (pos.get("tickUpper") or {}),
+            }
+            val = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
+            if val is None or val <= 0:
+                continue
+            day_ts = (ts // 86400) * 86400
+            prev = by_day.get(day_ts)
+            if prev is None or ts > prev[0]:
+                by_day[day_ts] = (ts, float(val))
+        except Exception:
+            continue
+    out = [(day_ts, val) for day_ts, (_real_ts, val) in by_day.items()]
+    out.sort(key=lambda x: x[0])
+    return out
 
 
 def _aave_markets_for_chains(chain_ids: list[int]) -> list[dict[str, Any]]:
@@ -3427,6 +3688,7 @@ class PositionPoolSeriesRequest(BaseModel):
     protocol: str
     pool_id: str
     address: str
+    position_ids: list[str] = Field(default_factory=list)
     position_liquidity: str = "0"
     pool_liquidity: str = "0"
     days: int = 30
@@ -4205,6 +4467,8 @@ def _render_positions_page() -> str:
     }
     const posSectionState = {pools: false};
     const posCache = {pools: []};
+    let posScanTicker = null;
+    let posScanStartedAt = 0;
     function setPosStatus(text, isErr) {
       const el = document.getElementById("posStatus");
       if (!el) return;
@@ -4215,6 +4479,36 @@ def _render_positions_page() -> str:
       const el = document.getElementById("posProgress");
       if (!el) return;
       el.style.display = flag ? "block" : "none";
+    }
+    function stopPosScanProgressTicker() {
+      if (posScanTicker) {
+        clearInterval(posScanTicker);
+        posScanTicker = null;
+      }
+      posScanStartedAt = 0;
+    }
+    function startPosScanProgressTicker() {
+      stopPosScanProgressTicker();
+      posScanStartedAt = Date.now();
+      const plannedChains = ["Arbitrum", "Base", "Ethereum", "Optimism", "Polygon", "BSC", "Unichain"];
+      const steps = [
+        "Validate addresses",
+        "Start chain workers",
+        "On-chain position discovery",
+        "Subgraph fallback queries",
+        "Price lookup and valuation",
+        "Merge and finalize table",
+      ];
+      const tick = () => {
+        const elapsed = Math.max(0, Math.floor((Date.now() - posScanStartedAt) / 1000));
+        let phase = steps[Math.min(steps.length - 1, Math.floor(elapsed / 5))];
+        const chainHint = plannedChains[Math.floor(elapsed / 4) % plannedChains.length];
+        if (elapsed >= 20) phase = "Heavy indexer/rpc responses";
+        if (elapsed >= 28) phase = "Final merge and response";
+        setPosStatus(`Scanning positions... ${elapsed}s | ${phase} (${chainHint})`, false);
+      };
+      tick();
+      posScanTicker = setInterval(tick, 900);
     }
     function copyText(value) {
       const text = String(value || "").trim();
@@ -4268,7 +4562,8 @@ def _render_positions_page() -> str:
       const row = (posCache.pools || [])[Number(idx) || 0];
       const chartEl = document.getElementById("posPoolChart");
       if (!row || !chartEl) return;
-      if (row.tvl_usd == null || !row.pool_liquidity || !row.liquidity) {
+      const hasPositionIds = Array.isArray(row.position_ids) && row.position_ids.length > 0;
+      if (!hasPositionIds && (row.tvl_usd == null || !row.pool_liquidity || !row.liquidity)) {
         chartEl.innerHTML = "<div class='hint'>Position TVL history is unavailable for this pool on current indexer schema.</div>";
         return;
       }
@@ -4279,6 +4574,7 @@ def _render_positions_page() -> str:
           protocol: row.protocol,
           pool_id: row.pool_id,
           address: row.address,
+          position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
           position_liquidity: row.liquidity,
           pool_liquidity: row.pool_liquidity,
           days: getHistoryDays(),
@@ -4291,6 +4587,7 @@ def _render_positions_page() -> str:
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || "Failed to load series");
         const items = data.items || [];
+        const historyMode = String(data.mode || "estimated");
         if (!items.length) {
           chartEl.innerHTML = "<div class='hint'>No historical data for this pool in selected range.</div>";
           setPosStatus("No history data", false);
@@ -4307,7 +4604,7 @@ def _render_positions_page() -> str:
           line: {color: "#1d4ed8", width: 2},
           hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra></extra>",
         }], {
-          title: `Position TVL history - ${row.pair || row.pool_id}`,
+          title: `Position TVL history (${historyMode}) - ${row.pair || row.pool_id}`,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
@@ -4315,7 +4612,8 @@ def _render_positions_page() -> str:
           yaxis: {showgrid: true, gridcolor: "#d9e2f0", tickprefix: "$"},
           showlegend: false,
         }, {displaylogo: false, responsive: true});
-        setPosStatus("History loaded", false);
+        const note = data.note ? ` | ${String(data.note)}` : "";
+        setPosStatus(`History loaded (${historyMode})${note}`, false);
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Failed to load chart: ${esc(e?.message || "unknown")}</div>`;
         setPosStatus("History load failed", true);
@@ -4359,7 +4657,7 @@ def _render_positions_page() -> str:
       }
       try {
         setPosBusy(true);
-        setPosStatus("Scanning latest positions...", false);
+        startPosScanProgressTicker();
         const res = await fetch("/api/positions/scan", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
@@ -4406,6 +4704,7 @@ def _render_positions_page() -> str:
       } catch (e) {
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
       } finally {
+        stopPosScanProgressTicker();
         setPosBusy(false);
       }
     }
@@ -6214,22 +6513,65 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
     pool_id = str(req.pool_id or "").strip().lower()
     if not chain_key or not pool_id:
         raise HTTPException(status_code=400, detail="chain and pool_id are required.")
-    if protocol not in {"uniswap_v3", "uniswap_v4"}:
-        raise HTTPException(status_code=400, detail="protocol must be uniswap_v3 or uniswap_v4.")
+    if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3"}:
+        raise HTTPException(status_code=400, detail="protocol must be uniswap_v3, uniswap_v4 or pancake_v3.")
     version = "v4" if protocol.endswith("_v4") else "v3"
     days = max(1, min(3650, int(req.days or 30)))
+    now_ts = int(time.time())
+    since_ts = now_ts - int(days) * 86400
+
+    chain_id = _chain_id_by_chain_key(chain_key)
+    endpoint = get_graph_endpoint(chain_key, version=version)
+    position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
+
+    # 1) Try exact snapshots history first (best effort).
+    if endpoint and chain_id > 0 and position_ids:
+        exact_by_day: dict[int, float] = {}
+        for pid in position_ids[:20]:
+            series = _fetch_position_snapshot_series_exact(
+                endpoint,
+                pid,
+                since_ts=since_ts,
+                chain_id=chain_id,
+            )
+            for ts, value in series:
+                exact_by_day[int(ts)] = float(exact_by_day.get(int(ts), 0.0) + float(value))
+        if exact_by_day:
+            items = [
+                {"ts": int(ts), "position_tvl_usd": float(v), "pool_tvl_usd": None}
+                for ts, v in sorted(exact_by_day.items(), key=lambda x: x[0])
+            ]
+            return {
+                "items": items,
+                "count": len(items),
+                "mode": "exact-snapshots",
+                "note": "built from position snapshots",
+            }
+
+    # 2) Fallback to estimated share-based history.
     position_liq = _safe_float(req.position_liquidity)
     pool_liq = _safe_float(req.pool_liquidity)
     if position_liq <= 0 or pool_liq <= 0:
-        raise HTTPException(status_code=400, detail="Position or pool liquidity is unavailable for this pool.")
+        return {
+            "items": [],
+            "count": 0,
+            "mode": "unavailable",
+            "note": "snapshots missing and liquidity share unavailable",
+        }
     share = position_liq / pool_liq if pool_liq > 0 else 0.0
     if share <= 0:
         raise HTTPException(status_code=400, detail="Liquidity share is zero.")
     series_raw = _fetch_pool_tvl_series(chain_key, version, pool_id, days)
     if not series_raw:
-        return {"items": [], "count": 0, "share": share}
+        return {"items": [], "count": 0, "share": share, "mode": "estimated-share", "note": "no pool day data"}
     items = [{"ts": int(ts), "pool_tvl_usd": float(tvl), "position_tvl_usd": float(max(0.0, tvl * share))} for ts, tvl in series_raw]
-    return {"items": items, "count": len(items), "share": share}
+    return {
+        "items": items,
+        "count": len(items),
+        "share": share,
+        "mode": "estimated-share",
+        "note": "fallback: snapshots missing/incomplete",
+    }
 
 
 @app.post("/api/help/tickets")
