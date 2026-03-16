@@ -8093,6 +8093,25 @@ HTML_PAGE = """
       border-top: 1px solid #d7e1ef;
     }
     .actions .run-btn { order: 99; }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .section-head h3 {
+      margin: 0;
+      font-size: 17px;
+      color: #1f3a8a;
+    }
+    .section-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-left: auto;
+      justify-content: flex-end;
+    }
     .btn {
       border: 0;
       border-radius: 10px;
@@ -8124,10 +8143,10 @@ HTML_PAGE = """
       cursor: pointer;
     }
     .status {
-      font-size: 14px;
+      font-size: 13px;
       color: #cbd5e1;
       display: inline-block;
-      width: 260px;
+      width: 280px;
       text-align: right;
       white-space: nowrap;
       overflow: hidden;
@@ -8479,30 +8498,23 @@ HTML_PAGE = """
           </div>
         </div>
 
-        <div class="actions" style="margin-top:14px">
-          <div class="actions-left">
-            <button class="btn secondary" onclick="toggleLogs()">Latest run logs</button>
-            <button class="btn secondary" onclick="resetLogs()">Reset logs</button>
-            <button class="btn secondary" onclick="exportCsv()">Export CSV</button>
-          </div>
-          <div class="actions-right">
-            <button class="btn run-btn" id="runBtn" onclick="runJob()">Run analysis</button>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h3>Fee Performance History</h3>
+          <div class="section-actions">
+            <button class="btn run-btn" id="scanBtn" onclick="runJob()">Scan</button>
             <span id="status" class="status">Ready</span>
           </div>
         </div>
-        <div class="progress-wrap">
+        <div class="progress-wrap" style="margin-top:0">
           <div class="progress-meta">
             <span id="stageText">Stage: waiting</span>
             <span id="progressText">0%</span>
           </div>
           <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
         </div>
-        <div id="logsWrap" style="display:none; margin-top:10px">
-          <pre id="logs">No logs yet.</pre>
-        </div>
-      </section>
-
-      <section class="card">
         <div class="charts-grid">
           <div id="feesChart" class="plot"></div>
           <div id="tvlChart" class="plot"></div>
@@ -8510,7 +8522,12 @@ HTML_PAGE = """
       </section>
 
       <section class="card">
-        <h3>Pools Table</h3>
+        <div class="section-head">
+          <h3>Pools Table</h3>
+          <div class="section-actions">
+            <button class="btn run-btn" onclick="exportCsv()">Export CSV</button>
+          </div>
+        </div>
         <div class="table-wrap">
           <table id="resultTable"></table>
         </div>
@@ -8555,6 +8572,7 @@ HTML_PAGE = """
     let currentRequest = {};
     let pairRowsVisible = 1;
     let authState = {authenticated: false};
+    let hasScanRun = false;
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
 
     const WALLET_LABELS = {
@@ -8937,9 +8955,15 @@ HTML_PAGE = """
     }
 
     function setBusy(flag) {
-      document.getElementById("runBtn").disabled = flag;
-      document.getElementById("runBtn").style.opacity = flag ? "0.7" : "1";
-      document.getElementById("runBtn").textContent = flag ? "Running..." : "Run analysis";
+      const btn = document.getElementById("scanBtn");
+      if (!btn) return;
+      btn.disabled = flag;
+      btn.style.opacity = flag ? "0.7" : "1";
+      if (flag) {
+        btn.textContent = "Scanning...";
+      } else {
+        btn.textContent = hasScanRun ? "Scan again" : "Scan";
+      }
     }
 
     function updateProgress(progress, stageLabel) {
@@ -9159,57 +9183,6 @@ HTML_PAGE = """
       if (!allEl) return;
       allEl.checked = checkedCount === availableChains.length && availableChains.length > 0;
       saveFormState();
-    }
-
-    function toggleLogs() {
-      const wrap = document.getElementById("logsWrap");
-      wrap.style.display = wrap.style.display === "none" ? "block" : "none";
-      if (wrap.style.display !== "none") {
-        loadRecentLogs();
-      }
-    }
-
-    async function loadRecentLogs() {
-      const logsEl = document.getElementById("logs");
-      if (!logsEl) return;
-      try {
-        const r = await fetch("/api/runs/recent");
-        const data = await r.json();
-        const items = Array.isArray(data.items) ? data.items : [];
-        if (!items.length) {
-          logsEl.textContent = "No logs yet.";
-          return;
-        }
-        const chunks = [];
-        for (const it of items.slice(0, 10)) {
-          const req = it.request || {};
-          const minTvlTxt = req.min_tvl != null ? formatUsdShort(req.min_tvl) : "-";
-          const head = `[${it.ts || "-"}] ${String(it.status || "").toUpperCase()} | pairs=${req.pairs || "-"} | days=${req.days ?? "-"} | min_tvl=${minTvlTxt} | chains=${(req.include_chains || []).join(",") || "all"}`;
-          const speed = String(req.speed_mode || "normal");
-          const headWithSpeed = `${head} | speed=${speed}`;
-          const err = it.error ? `ERROR: ${it.error}` : "";
-          const body = (it.logs || []).join("\\n\\n");
-          chunks.push([headWithSpeed, err, body].filter(Boolean).join("\\n"));
-        }
-        logsEl.textContent = chunks.join("\\n\\n----------------------------------------\\n\\n");
-      } catch (e) {
-        logsEl.textContent = "Failed to load recent logs.";
-      }
-    }
-
-    async function resetLogs() {
-      try {
-        const r = await fetch("/api/runs/reset", {method: "POST"});
-        if (!r.ok) {
-          setStatus("Failed to reset logs", "fail");
-          return;
-        }
-        const logsEl = document.getElementById("logs");
-        if (logsEl) logsEl.textContent = "No logs yet.";
-        setStatus("Logs reset", "ok");
-      } catch (e) {
-        setStatus("Failed to reset logs", "fail");
-      }
     }
 
     function togglePoolVisibility(el) {
@@ -9500,16 +9473,15 @@ HTML_PAGE = """
         updateProgress(job.progress, job.stage_label || job.stage);
         if (job.status === "done") {
           clearInterval(timer);
+          hasScanRun = true;
           setBusy(false);
           setStatus("Completed", "ok");
           renderResult(job.result);
         } else if (job.status === "failed") {
           clearInterval(timer);
+          hasScanRun = true;
           setBusy(false);
           setStatus("Failed: " + (job.error || "unknown"), "fail");
-          if (job.result && job.result.logs) {
-            document.getElementById("logs").textContent = job.result.logs.join("\\n\\n");
-          }
         } else {
           setStatus(job.stage_label || job.status, "running");
         }
@@ -9525,7 +9497,6 @@ HTML_PAGE = """
       if (mTotal) mTotal.textContent = result.total;
       if (mChart) mChart.textContent = result.chart_pools;
       if (mErr) mErr.textContent = result.error_pools;
-      loadRecentLogs();
 
       currentRequest = result?.request || {};
       colorMap = {};
@@ -9570,7 +9541,7 @@ HTML_PAGE = """
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", range: [start, now], automargin: true},
         yaxis: {title: "Value", showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, range: [0, 1]},
-        annotations: [{text: "Run analysis to load data", x: 0.5, y: 0.5, xref: "paper", yref: "paper", showarrow: false, font: {color: "#64748b"}}],
+        annotations: [{text: "Scan to load data", x: 0.5, y: 0.5, xref: "paper", yref: "paper", showarrow: false, font: {color: "#64748b"}}],
       };
       Plotly.newPlot("feesChart", baseline, {title: "Cumulative Fees", ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "Cumulative fee (USD)"}}, {displaylogo: false, responsive: true});
       Plotly.newPlot("tvlChart", baseline, {title: "TVL dynamics (thousands USD)", ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "TVL (k USD)"}}, {displaylogo: false, responsive: true});
@@ -9584,6 +9555,8 @@ HTML_PAGE = """
     loadMeta().then(() => {
       const cached = loadResultState();
       if (cached) {
+        hasScanRun = true;
+        setBusy(false);
         renderResult(cached);
         setStatus("Restored last result", "ok");
       }
