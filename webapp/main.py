@@ -8582,16 +8582,9 @@ HTML_PAGE = """
         <div class="section-head">
           <h3>Fee Performance History</h3>
           <div class="section-actions">
-            <button class="btn run-btn" id="scanBtn" onclick="runJob()">Scan</button>
+            <button class="search-link-btn" type="button" id="scanBtn" onclick="runJob()">Scan</button>
             <span id="status" class="status">Ready</span>
           </div>
-        </div>
-        <div class="progress-wrap" style="margin-top:0">
-          <div class="progress-meta">
-            <span id="stageText">Stage: waiting</span>
-            <span id="progressText">0%</span>
-          </div>
-          <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
         </div>
         <div class="charts-grid">
           <div id="feesChart" class="plot"></div>
@@ -9046,9 +9039,7 @@ HTML_PAGE = """
 
     function updateProgress(progress, stageLabel) {
       const p = Math.max(0, Math.min(100, Number(progress || 0)));
-      document.getElementById("progressFill").style.width = p + "%";
-      document.getElementById("progressText").textContent = p + "%";
-      document.getElementById("stageText").textContent = "Stage: " + (stageLabel || "running");
+      setStatus(`${stageLabel || "Running"} (${p}%)`, "running");
     }
 
     function saveFormState() {
