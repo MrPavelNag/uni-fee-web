@@ -1285,7 +1285,7 @@ def _query_uniswap_positions_for_owner(
           token1 {{ symbol id }}
         }}
     """
-    def _build_queries(owner_type: str) -> tuple[str, str, str, str, str, str, str, str]:
+    def _build_queries(owner_type: str) -> tuple[str, str, str, str, str, str, str, str, str, str]:
         q_positions = f"""
     query UserPositions($owner: {owner_type}!, $skip: Int!) {{
       positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
@@ -1325,6 +1325,21 @@ def _query_uniswap_positions_for_owner(
       }}
     }}
     """
+        q_snapshots = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+      positionSnapshots(
+        first: 200,
+        skip: $skip,
+        orderBy: timestamp,
+        orderDirection: desc,
+        where: {{ owner: $owner }}
+      ) {{
+        position {{
+          {detailed_fields}
+        }}
+      }}
+    }}
+    """
         q_positions_basic = f"""
     query UserPositions($owner: {owner_type}!, $skip: Int!) {{
       positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
@@ -1350,21 +1365,40 @@ def _query_uniswap_positions_for_owner(
       }}
     }}
     """
+        q_snapshots_basic = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+      positionSnapshots(
+        first: 200,
+        skip: $skip,
+        orderBy: timestamp,
+        orderDirection: desc,
+        where: {{ owner: $owner }}
+      ) {{
+        position {{
+          {basic_fields}
+        }}
+      }}
+    }}
+    """
         return (
             q_positions,
             q_account,
             q_accounts,
             q_positions_owner_in,
             q_positions_owner_rel,
+            q_snapshots,
             q_positions_basic,
             q_account_basic,
             q_accounts_basic,
+            q_snapshots_basic,
         )
     result: list[dict[str, Any]] = []
     owner_raw = str(owner or "").strip()
     owner_lc = owner_raw.lower()
     owner_candidates: list[str] = []
-    for candidate in (owner_raw, owner_lc):
+    owner_no_prefix = owner_raw[2:] if owner_raw.startswith("0x") else owner_raw
+    owner_no_prefix_lc = owner_no_prefix.lower()
+    for candidate in (owner_raw, owner_lc, owner_no_prefix, owner_no_prefix_lc):
         if candidate and candidate not in owner_candidates:
             owner_candidates.append(candidate)
 
@@ -1378,10 +1412,17 @@ def _query_uniswap_positions_for_owner(
                 batch = payload.get("positions", []) or []
             elif mode == "account":
                 batch = ((payload.get("account") or {}).get("positions") or [])
-            else:
+            elif mode == "accounts":
                 accounts = payload.get("accounts", []) or []
                 first = accounts[0] if accounts else {}
                 batch = (first or {}).get("positions") or []
+            else:
+                snapshots = payload.get("positionSnapshots", []) or []
+                batch = []
+                for s in snapshots:
+                    pos = (s or {}).get("position") or {}
+                    if pos:
+                        batch.append(pos)
             out.extend(batch)
             if len(batch) < 200:
                 break
@@ -1397,9 +1438,11 @@ def _query_uniswap_positions_for_owner(
             q_accounts,
             q_positions_owner_in,
             q_positions_owner_rel,
+            q_snapshots,
             q_positions_basic,
             q_account_basic,
             q_accounts_basic,
+            q_snapshots_basic,
         ) in query_sets:
             for q, mode in (
                 (q_positions, "positions"),
@@ -1407,9 +1450,11 @@ def _query_uniswap_positions_for_owner(
                 (q_accounts, "accounts"),
                 (q_positions_owner_in, "positions"),
                 (q_positions_owner_rel, "positions"),
+                (q_snapshots, "snapshots"),
                 (q_positions_basic, "positions"),
                 (q_account_basic, "account"),
                 (q_accounts_basic, "accounts"),
+                (q_snapshots_basic, "snapshots"),
             ):
                 if result:
                     break
@@ -1558,6 +1603,9 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             position_tvl_usd = detailed_tvl
                     if position_tvl_usd is None and share_tvl is not None:
                         position_tvl_usd = share_tvl
+                    # Keep only meaningful active positions to avoid zero-value spam rows.
+                    if position_tvl_usd is None or position_tvl_usd <= 0:
+                        continue
                     fee_raw = str(pool.get("feeTier") or "").strip()
                     fee_disp = fee_raw
                     try:
@@ -1568,6 +1616,8 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                         fee_disp = fee_raw or "-"
                     t0 = (pool.get("token0") or {}).get("symbol") or "?"
                     t1 = (pool.get("token1") or {}).get("symbol") or "?"
+                    if t0 == "?" and t1 == "?":
+                        continue
                     rows.append(
                         {
                             "address": owner,
@@ -1585,12 +1635,24 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             "tvl_usd": position_tvl_usd,
                         }
                     )
-    # Deduplicate by owner/protocol/pool id.
+    # Aggregate by owner/protocol/pool id (wallet can hold multiple NFT positions in one pool).
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
         key = (str(row.get("address")), str(row.get("protocol")), str(row.get("pool_id")))
         if key not in uniq:
-            uniq[key] = row
+            base = dict(row)
+            base["position_count"] = 1
+            uniq[key] = base
+            continue
+        acc = uniq[key]
+        acc["position_count"] = int(acc.get("position_count") or 1) + 1
+        cur_tvl = acc.get("tvl_usd")
+        row_tvl = row.get("tvl_usd")
+        if cur_tvl is None:
+            acc["tvl_usd"] = row_tvl
+        elif row_tvl is not None:
+            acc["tvl_usd"] = _safe_float(cur_tvl) + _safe_float(row_tvl)
+        # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     dedup_errors = list(dict.fromkeys(errors))
     return list(uniq.values()), dedup_errors
 
@@ -3691,9 +3753,8 @@ def _render_stables_page() -> str:
           </div>
         </div>
         <div id="stableCombinedBody" class="section-body">
-          <div style="margin-bottom:8px;font-weight:700;color:#1e3a8a">Lending positions</div>
           <div class="table-wrap"><table id="stableLendingTable"></table></div>
-          <div style="margin:12px 0 8px;font-weight:700;color:#1e3a8a">Unclaimed lending rewards</div>
+          <div style="height:10px"></div>
           <div class="table-wrap"><table id="stableRewardsTable"></table></div>
           <div id="stableErrors"></div>
         </div>
