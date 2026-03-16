@@ -2978,6 +2978,9 @@ def _render_positions_page() -> str:
     .section-body { display:block; }
     .section-body.collapsed { display:none; }
     .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:12px; padding:0 0 0 4px; }
+    .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
+    .pos-progress .bar { width: 40%; height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); animation: posLoad 1s linear infinite; }
+    @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
     .pos-status { color:#475569; font-size:13px; }
     .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
@@ -3016,6 +3019,7 @@ def _render_positions_page() -> str:
           <h3>My Crypto Portfolio</h3>
           <div class="section-actions">
             <label class="hint" style="margin:0">History days <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:90px;margin-left:6px"/></label>
+            <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
           </div>
         </div>
@@ -3157,6 +3161,11 @@ def _render_positions_page() -> str:
       el.textContent = text || "";
       el.style.color = isErr ? "#b91c1c" : "#475569";
     }
+    function setPosBusy(flag) {
+      const el = document.getElementById("posProgress");
+      if (!el) return;
+      el.style.display = flag ? "block" : "none";
+    }
     function copyText(value) {
       const text = String(value || "").trim();
       if (!text) return;
@@ -3261,7 +3270,7 @@ def _render_positions_page() -> str:
     }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
-      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Chart</th></tr>";
+      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Show history</th></tr>";
       const list = rows || [];
       for (let i = 0; i < list.length; i++) {
         const r = list[i];
@@ -3276,7 +3285,7 @@ def _render_positions_page() -> str:
         html += `<td class='mono'>${esc(r.pool_id || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
-        html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${i})'>View</button></td>`;
+        html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${i})'>Show history</button></td>`;
         html += "</tr>";
       }
       if (!list.length) html += "<tr><td colspan='8'>No pool positions found.</td></tr>";
@@ -3323,7 +3332,16 @@ def _render_positions_page() -> str:
         setPosStatus("Add at least one address first.", true);
         return;
       }
+      // Search should also reveal the requested section when cache is empty/collapsed.
+      if (targetSection === "pools" || targetSection === "lending" || targetSection === "rewards") {
+        setSectionCollapsed(targetSection, false);
+      } else {
+        setSectionCollapsed("pools", false);
+        setSectionCollapsed("lending", false);
+        setSectionCollapsed("rewards", false);
+      }
       try {
+        setPosBusy(true);
         setPosStatus("Scanning latest positions...", false);
         const res = await fetch("/api/positions/scan", {
           method: "POST",
@@ -3353,6 +3371,8 @@ def _render_positions_page() -> str:
         setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}, Lending: ${(data.lending_positions || []).length}`, false);
       } catch (e) {
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
+      } finally {
+        setPosBusy(false);
       }
     }
     loadPosState();
