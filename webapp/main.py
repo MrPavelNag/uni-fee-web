@@ -26,7 +26,7 @@ from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.request import Request, urlopen
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -181,10 +181,35 @@ POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FAL
     "on",
 )
 POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "0").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_ONCHAIN_TIMEOUT_SEC = max(3, int(os.environ.get("POSITIONS_ONCHAIN_TIMEOUT_SEC", "8")))
+POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
 PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
 TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
 getcontext().prec = 48
+
+UNISWAP_V3_NPM_BY_CHAIN_ID: dict[int, str] = {
+    1: "0xc36442b4a4522e871399cd717abdd847ab11fe88",
+    10: "0xc36442b4a4522e871399cd717abdd847ab11fe88",
+    137: "0xc36442b4a4522e871399cd717abdd847ab11fe88",
+    8453: "0x03a520b32c04bf3beef7beb72e919cf822ed34f1",
+    42161: "0xc36442b4a4522e871399cd717abdd847ab11fe88",
+}
+UNISWAP_V3_FACTORY_BY_CHAIN_ID: dict[int, str] = {
+    1: "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    10: "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    137: "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    8453: "0x33128a8fc17869897dce68ed026d694621f6fdfd",
+    42161: "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+}
+DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
+    1: ["https://ethereum-rpc.publicnode.com"],
+    10: ["https://optimism-rpc.publicnode.com"],
+    56: ["https://bsc-rpc.publicnode.com"],
+    137: ["https://polygon-bor-rpc.publicnode.com"],
+    8453: ["https://base-rpc.publicnode.com"],
+    42161: ["https://arbitrum-one-rpc.publicnode.com"],
+}
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -1185,7 +1210,7 @@ def _fetch_token_prices_usd_coingecko(chain_id: int, token_addresses: list[str])
                 f"https://api.coingecko.com/api/v3/simple/token_price/{platform}"
                 f"?contract_addresses={','.join(chunk)}&vs_currencies=usd"
             )
-            req = Request(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
             with urlopen(req, timeout=12) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             if not isinstance(payload, dict):
@@ -1210,7 +1235,7 @@ def _fetch_token_price_usd_dexscreener(chain_id: int, token_address: str) -> flo
         return None
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{addr}"
-        req = Request(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+        req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
         with urlopen(req, timeout=10) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         pairs = payload.get("pairs") or []
@@ -1270,6 +1295,205 @@ def _get_token_prices_usd(chain_id: int, token_addresses: list[str]) -> dict[str
                     TOKEN_PRICE_CACHE[(int(chain_id), addr)] = (now, float(price))
                     result[addr] = float(price)
     return {a: result[a] for a in requested if a in result}
+
+
+def _rpc_urls_for_chain(chain_id: int) -> list[str]:
+    env_key = f"POSITIONS_RPC_URLS_{int(chain_id)}"
+    custom = os.environ.get(env_key, "").strip()
+    if custom:
+        out = [x.strip() for x in custom.split(",") if x.strip()]
+        if out:
+            return out
+    return list(DEFAULT_RPC_URLS_BY_CHAIN_ID.get(int(chain_id), []))
+
+
+def _json_rpc_call(chain_id: int, method: str, params: list[Any]) -> Any:
+    rpc_urls = _rpc_urls_for_chain(chain_id)
+    if not rpc_urls:
+        raise RuntimeError(f"No RPC configured for chain_id={chain_id}")
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    body = json.dumps(payload).encode("utf-8")
+    last_err = "unknown rpc error"
+    for rpc_url in rpc_urls:
+        try:
+            req = UrlRequest(
+                rpc_url,
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": "uni-fee-web/0.0.2"},
+            )
+            with urlopen(req, timeout=POSITIONS_ONCHAIN_TIMEOUT_SEC) as resp:
+                parsed = json.loads(resp.read().decode("utf-8"))
+            if isinstance(parsed, dict) and parsed.get("error"):
+                last_err = str((parsed.get("error") or {}).get("message") or parsed.get("error"))
+                continue
+            if isinstance(parsed, dict) and "result" in parsed:
+                return parsed.get("result")
+            last_err = "malformed rpc response"
+        except Exception as e:
+            last_err = str(e)
+    raise RuntimeError(last_err)
+
+
+def _eth_call_hex(chain_id: int, to: str, data_hex: str) -> str:
+    result = _json_rpc_call(
+        chain_id,
+        "eth_call",
+        [{"to": str(to).strip(), "data": str(data_hex).strip()}, "latest"],
+    )
+    out = str(result or "").strip().lower()
+    if not out.startswith("0x"):
+        raise RuntimeError("Invalid eth_call result")
+    return out
+
+
+def _encode_address_word(addr: str) -> str:
+    raw = str(addr or "").strip().lower()
+    if not raw.startswith("0x"):
+        raise ValueError("Address must be 0x-prefixed")
+    h = raw[2:]
+    if len(h) != 40:
+        raise ValueError("Address length mismatch")
+    return ("0" * 24) + h
+
+
+def _encode_uint_word(value: int) -> str:
+    v = int(value)
+    if v < 0:
+        raise ValueError("uint must be >= 0")
+    return f"{v:064x}"
+
+
+def _hex_words(data_hex: str) -> list[str]:
+    h = str(data_hex or "").strip().lower()
+    if h.startswith("0x"):
+        h = h[2:]
+    if not h:
+        return []
+    if len(h) % 64 != 0:
+        h = h[: len(h) - (len(h) % 64)]
+    return [h[i : i + 64] for i in range(0, len(h), 64)]
+
+
+def _decode_uint_from_word(word: str) -> int:
+    return int(str(word or "0"), 16)
+
+
+def _decode_int_from_word(word: str) -> int:
+    v = int(str(word or "0"), 16)
+    if v >= (1 << 255):
+        v -= (1 << 256)
+    return v
+
+
+def _decode_address_from_word(word: str) -> str:
+    w = str(word or "").strip().lower().rjust(64, "0")
+    return "0x" + w[-40:]
+
+
+def _decode_uint_eth_call(data_hex: str) -> int:
+    words = _hex_words(data_hex)
+    if not words:
+        return 0
+    return _decode_uint_from_word(words[0])
+
+
+def _pool_token0_price_from_sqrt_x96(sqrt_price_x96: int, dec0: int, dec1: int) -> float | None:
+    try:
+        if sqrt_price_x96 <= 0:
+            return None
+        p = (Decimal(int(sqrt_price_x96)) ** 2) / (Decimal(2) ** 192)
+        p *= Decimal(10) ** Decimal(int(dec0) - int(dec1))
+        if p <= 0:
+            return None
+        return float(p)
+    except Exception:
+        return None
+
+
+def _scan_v3_positions_onchain(owner: str, chain_id: int, deadline_ts: float | None = None) -> list[dict[str, Any]]:
+    owner_addr = str(owner or "").strip().lower()
+    if not _is_eth_address(owner_addr):
+        return []
+    npm = UNISWAP_V3_NPM_BY_CHAIN_ID.get(int(chain_id))
+    factory = UNISWAP_V3_FACTORY_BY_CHAIN_ID.get(int(chain_id))
+    if not npm or not factory:
+        return []
+    if deadline_ts is not None and time.monotonic() >= deadline_ts:
+        return []
+
+    # balanceOf(address)
+    bal_data = "0x70a08231" + _encode_address_word(owner_addr)
+    balance = _decode_uint_eth_call(_eth_call_hex(int(chain_id), npm, bal_data))
+    if balance <= 0:
+        return []
+    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
+    out: list[dict[str, Any]] = []
+
+    for idx in range(limit):
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        try:
+            # tokenOfOwnerByIndex(address,uint256)
+            token_data = "0x2f745c59" + _encode_address_word(owner_addr) + _encode_uint_word(idx)
+            token_id = _decode_uint_eth_call(_eth_call_hex(int(chain_id), npm, token_data))
+            if token_id <= 0:
+                continue
+
+            # positions(uint256)
+            pos_data = "0x99fbab88" + _encode_uint_word(token_id)
+            pos_words = _hex_words(_eth_call_hex(int(chain_id), npm, pos_data))
+            if len(pos_words) < 8:
+                continue
+            token0 = _decode_address_from_word(pos_words[2])
+            token1 = _decode_address_from_word(pos_words[3])
+            fee = _decode_uint_from_word(pos_words[4])
+            tick_lower = _decode_int_from_word(pos_words[5])
+            tick_upper = _decode_int_from_word(pos_words[6])
+            liq = _decode_uint_from_word(pos_words[7])
+            if liq <= 0:
+                continue
+
+            # getPool(address,address,uint24)
+            pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
+            pool_words = _hex_words(_eth_call_hex(int(chain_id), factory, pool_data))
+            if not pool_words:
+                continue
+            pool_addr = _decode_address_from_word(pool_words[0])
+            if not _is_eth_address(pool_addr):
+                continue
+
+            # slot0() => sqrtPriceX96 is first word
+            slot0_words = _hex_words(_eth_call_hex(int(chain_id), pool_addr, "0x3850c7bd"))
+            sqrt_price_x96 = _decode_uint_from_word(slot0_words[0]) if slot0_words else 0
+
+            # decimals()
+            dec0 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token0, "0x313ce567"))
+            dec1 = _decode_uint_eth_call(_eth_call_hex(int(chain_id), token1, "0x313ce567"))
+            if dec0 < 0 or dec0 > 36:
+                dec0 = 18
+            if dec1 < 0 or dec1 > 36:
+                dec1 = 18
+            token0_price = _pool_token0_price_from_sqrt_x96(sqrt_price_x96, int(dec0), int(dec1))
+
+            out.append(
+                {
+                    "id": str(token_id),
+                    "liquidity": str(liq),
+                    "tickLower": {"tickIdx": str(tick_lower)},
+                    "tickUpper": {"tickIdx": str(tick_upper)},
+                    "pool": {
+                        "id": str(pool_addr).lower(),
+                        "feeTier": str(int(fee)),
+                        "sqrtPrice": str(int(sqrt_price_x96)) if int(sqrt_price_x96) > 0 else "",
+                        "token0Price": float(token0_price) if token0_price is not None else 0.0,
+                        "token0": {"id": str(token0).lower(), "decimals": int(dec0)},
+                        "token1": {"id": str(token1).lower(), "decimals": int(dec1)},
+                    },
+                }
+            )
+        except Exception:
+            continue
+    return out
 
 
 def _estimate_position_tvl_usd_from_share_external(
@@ -1711,9 +1935,9 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             if not endpoint:
                 continue
             if not _endpoint_supports_uniswap_positions(endpoint):
-                # Not a user-facing failure: some endpoints simply do not expose Position fields.
-                # Skip silently to avoid noisy red warnings in the UI.
-                continue
+                # Keep v3 flow alive via on-chain fallback even if endpoint introspection says unsupported.
+                if version != "v3":
+                    continue
             has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint)
             has_position_liquidity = _endpoint_supports_position_liquidity(endpoint)
             for owner in addresses:
@@ -1721,6 +1945,8 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     timed_out = True
                     break
                 owner_attempts: list[dict[str, Any]] = []
+                positions: list[dict[str, Any]] = []
+                graph_failed = False
                 try:
                     positions = _query_uniswap_positions_for_owner(
                         endpoint,
@@ -1742,18 +1968,44 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                             deadline_ts=deadline_ts,
                         )
                 except Exception as e:
+                    graph_failed = True
                     errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
-                    debug_rows.append(
+                    owner_attempts.append(
                         {
-                            "chain": chain_key,
-                            "version": version,
-                            "owner": owner,
-                            "positions_found": 0,
-                            "failed": True,
-                            "attempts": owner_attempts,
+                            "owner_value": owner,
+                            "owner_type": "fallback",
+                            "query_mode": "graph_exception",
+                            "count": 0,
+                            "ok": False,
+                            "error": str(e)[:220],
                         }
                     )
-                    continue
+                if version == "v3" and (graph_failed or not positions):
+                    if deadline_ts is None or time.monotonic() < deadline_ts:
+                        try:
+                            onchain_positions = _scan_v3_positions_onchain(owner, int(chain_id), deadline_ts=deadline_ts)
+                            owner_attempts.append(
+                                {
+                                    "owner_value": owner,
+                                    "owner_type": "onchain",
+                                    "query_mode": "onchain_v3_npm",
+                                    "count": len(onchain_positions),
+                                    "ok": True,
+                                }
+                            )
+                            if onchain_positions:
+                                positions = onchain_positions
+                        except Exception as e:
+                            owner_attempts.append(
+                                {
+                                    "owner_value": owner,
+                                    "owner_type": "onchain",
+                                    "query_mode": "onchain_v3_npm",
+                                    "count": 0,
+                                    "ok": False,
+                                    "error": str(e)[:220],
+                                }
+                            )
                 debug_rows.append(
                     {
                         "chain": chain_key,
