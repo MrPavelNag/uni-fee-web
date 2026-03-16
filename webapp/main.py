@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 import shutil
+from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -165,6 +166,7 @@ AAVE_CHAIN_ID_TO_NAME: dict[int, str] = {
 _POSITION_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
+getcontext().prec = 48
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -1003,6 +1005,72 @@ def _parse_tron_addresses(raw_items: list[str]) -> list[str]:
     return out
 
 
+def _tick_to_sqrt_price_x96(tick: int) -> Decimal:
+    # sqrt(1.0001^tick) * 2^96
+    base = Decimal("1.0001")
+    v = base ** Decimal(int(tick))
+    sqrt_v = v.sqrt()
+    return sqrt_v * (Decimal(2) ** 96)
+
+
+def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[str, Any]) -> float | None:
+    try:
+        liq = Decimal(str(position.get("liquidity") or "0"))
+        if liq <= 0:
+            return None
+        t0 = pool.get("token0") or {}
+        t1 = pool.get("token1") or {}
+        dec0 = int(t0.get("decimals") or 18)
+        dec1 = int(t1.get("decimals") or 18)
+        if dec0 < 0 or dec0 > 36 or dec1 < 0 or dec1 > 36:
+            return None
+        sqrt_current_raw = str(pool.get("sqrtPrice") or "").strip()
+        if not sqrt_current_raw:
+            return None
+        sqrt_current = Decimal(sqrt_current_raw)
+        if sqrt_current <= 0:
+            return None
+        lower = position.get("tickLower") or {}
+        upper = position.get("tickUpper") or {}
+        tick_lower = int(lower.get("tickIdx"))
+        tick_upper = int(upper.get("tickIdx"))
+        if tick_lower >= tick_upper:
+            return None
+        sqrt_a = _tick_to_sqrt_price_x96(tick_lower)
+        sqrt_b = _tick_to_sqrt_price_x96(tick_upper)
+        if sqrt_a <= 0 or sqrt_b <= 0:
+            return None
+        q96 = Decimal(2) ** 96
+        if sqrt_current <= sqrt_a:
+            amount0_raw = (liq * q96 * (sqrt_b - sqrt_a)) / (sqrt_b * sqrt_a)
+            amount1_raw = Decimal(0)
+        elif sqrt_current < sqrt_b:
+            amount0_raw = (liq * q96 * (sqrt_b - sqrt_current)) / (sqrt_b * sqrt_current)
+            amount1_raw = (liq * (sqrt_current - sqrt_a)) / q96
+        else:
+            amount0_raw = Decimal(0)
+            amount1_raw = (liq * (sqrt_b - sqrt_a)) / q96
+        amount0 = amount0_raw / (Decimal(10) ** dec0)
+        amount1 = amount1_raw / (Decimal(10) ** dec1)
+        token0_price_in_token1 = Decimal(str(pool.get("token0Price") or "0"))
+        tvl_usd = Decimal(str(pool.get("totalValueLockedUSD") or "0"))
+        tvl0 = Decimal(str(pool.get("totalValueLockedToken0") or "0"))
+        tvl1 = Decimal(str(pool.get("totalValueLockedToken1") or "0"))
+        if token0_price_in_token1 <= 0 or tvl_usd <= 0:
+            return None
+        denom = tvl0 * token0_price_in_token1 + tvl1
+        if denom <= 0:
+            return None
+        price1_usd = tvl_usd / denom
+        price0_usd = token0_price_in_token1 * price1_usd
+        value = amount0 * price0_usd + amount1 * price1_usd
+        if value < 0:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
 def _query_uniswap_positions_for_owner(
     endpoint: str,
     owner: str,
@@ -1012,9 +1080,25 @@ def _query_uniswap_positions_for_owner(
 ) -> list[dict[str, Any]]:
     pool_liq_field = "liquidity" if include_pool_liquidity else ""
     pos_liq_field = "liquidity" if include_position_liquidity else ""
-    query = f"""
-    query UserPositions($owner: String!, $skip: Int!) {{
-      positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
+    detailed_fields = f"""
+        id
+        {pos_liq_field}
+        tickLower {{ tickIdx }}
+        tickUpper {{ tickIdx }}
+        pool {{
+          id
+          feeTier
+          {pool_liq_field}
+          sqrtPrice
+          token0Price
+          totalValueLockedUSD
+          totalValueLockedToken0
+          totalValueLockedToken1
+          token0 {{ symbol id decimals }}
+          token1 {{ symbol id decimals }}
+        }}
+    """
+    basic_fields = f"""
         id
         {pos_liq_field}
         pool {{
@@ -1025,20 +1109,78 @@ def _query_uniswap_positions_for_owner(
           token0 {{ symbol id }}
           token1 {{ symbol id }}
         }}
+    """
+    query_positions = f"""
+    query UserPositions($owner: String!, $skip: Int!) {{
+      positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
+        {detailed_fields}
+      }}
+    }}
+    """
+    query_account = f"""
+    query UserPositions($owner: String!, $skip: Int!) {{
+      account(id: $owner) {{
+        positions(first: 200, skip: $skip) {{
+          {detailed_fields}
+        }}
+      }}
+    }}
+    """
+    query_positions_basic = f"""
+    query UserPositions($owner: String!, $skip: Int!) {{
+      positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
+        {basic_fields}
+      }}
+    }}
+    """
+    query_account_basic = f"""
+    query UserPositions($owner: String!, $skip: Int!) {{
+      account(id: $owner) {{
+        positions(first: 200, skip: $skip) {{
+          {basic_fields}
+        }}
       }}
     }}
     """
     result: list[dict[str, Any]] = []
-    skip = 0
     owner_lc = str(owner or "").strip().lower()
-    while True:
-        data = graphql_query(endpoint, query, {"owner": owner_lc, "skip": skip}, retries=1)
-        batch = data.get("data", {}).get("positions", []) or []
-        result.extend(batch)
-        if len(batch) < 200:
-            break
-        skip += 200
-        time.sleep(0.15)
+
+    def _run(q: str, mode: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        skip = 0
+        while True:
+            data = graphql_query(endpoint, q, {"owner": owner_lc, "skip": skip}, retries=1)
+            payload = data.get("data", {}) or {}
+            if mode == "positions":
+                batch = payload.get("positions", []) or []
+            else:
+                batch = ((payload.get("account") or {}).get("positions") or [])
+            out.extend(batch)
+            if len(batch) < 200:
+                break
+            skip += 200
+            time.sleep(0.15)
+        return out
+
+    try:
+        result = _run(query_positions, "positions")
+    except Exception:
+        result = []
+    if not result:
+        try:
+            result = _run(query_account, "account")
+        except Exception:
+            result = []
+    if not result:
+        try:
+            result = _run(query_positions_basic, "positions")
+        except Exception:
+            result = []
+    if not result:
+        try:
+            result = _run(query_account_basic, "account")
+        except Exception:
+            result = []
     return result
 
 
@@ -1152,8 +1294,12 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     # Estimate position TVL by liquidity share.
                     # If pool liquidity is unavailable, keep it unknown (None).
                     position_tvl_usd: float | None = None
+                    detailed_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
+                    if detailed_tvl is not None and detailed_tvl >= 0:
+                        position_tvl_usd = detailed_tvl
                     if pool_liq > 0 and pos_liq > 0:
-                        position_tvl_usd = max(0.0, tvl_usd * (pos_liq / pool_liq))
+                        if position_tvl_usd is None:
+                            position_tvl_usd = max(0.0, tvl_usd * (pos_liq / pool_liq))
                     fee_raw = str(pool.get("feeTier") or "").strip()
                     fee_disp = fee_raw
                     try:
