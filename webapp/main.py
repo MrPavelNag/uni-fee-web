@@ -10,6 +10,7 @@ Cloud-ready web MVP for pool analysis.
 import os
 import base64
 import hashlib
+import json
 import re
 import secrets
 import sqlite3
@@ -23,7 +24,7 @@ from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -166,6 +167,9 @@ AAVE_CHAIN_ID_TO_NAME: dict[int, str] = {
 _POSITION_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
+PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
+TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
+TOKEN_PRICE_CACHE_LOCK = threading.Lock()
 getcontext().prec = 48
 
 
@@ -965,13 +969,16 @@ def _parse_positions_addresses(raw_items: list[str]) -> list[str]:
     seen: set[str] = set()
     for raw in raw_items or []:
         for token in re.split(r"[,\s;]+", str(raw or "").strip()):
-            addr = token.strip().lower()
-            if not _is_eth_address(addr):
+            addr_raw = token.strip()
+            addr_lc = addr_raw.lower()
+            if not _is_eth_address(addr_raw):
                 continue
-            if addr in seen:
+            if addr_lc in seen:
                 continue
-            seen.add(addr)
-            out.append(addr)
+            seen.add(addr_lc)
+            # Keep original checksum/case to improve compatibility with indexers
+            # that store owner/account ids case-sensitively.
+            out.append(addr_raw)
     return out
 
 
@@ -1071,6 +1078,127 @@ def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[
         return None
 
 
+def _coingecko_platform_for_chain_id(chain_id: int) -> str:
+    mapping: dict[int, str] = {
+        1: "ethereum",
+        10: "optimism",
+        56: "binance-smart-chain",
+        137: "polygon-pos",
+        324: "zksync",
+        8453: "base",
+        42161: "arbitrum-one",
+        43114: "avalanche",
+        81457: "blast",
+    }
+    return mapping.get(int(chain_id), "")
+
+
+def _fetch_token_prices_usd_coingecko(chain_id: int, token_addresses: list[str]) -> dict[str, float]:
+    platform = _coingecko_platform_for_chain_id(int(chain_id))
+    addrs: list[str] = []
+    for a in token_addresses or []:
+        s = str(a or "").strip().lower()
+        if _is_eth_address(s) and s not in addrs:
+            addrs.append(s)
+    if not platform or not addrs:
+        return {}
+    # Keep batch size conservative for URL length and API stability.
+    chunks = [addrs[i : i + 40] for i in range(0, len(addrs), 40)]
+    out: dict[str, float] = {}
+    for chunk in chunks:
+        try:
+            url = (
+                f"https://api.coingecko.com/api/v3/simple/token_price/{platform}"
+                f"?contract_addresses={','.join(chunk)}&vs_currencies=usd"
+            )
+            req = Request(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            with urlopen(req, timeout=12) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            for addr, item in payload.items():
+                try:
+                    price = float((item or {}).get("usd"))
+                except Exception:
+                    continue
+                if price > 0:
+                    out[str(addr).strip().lower()] = price
+        except Exception:
+            # Silent fallback to subgraph-derived valuation.
+            continue
+    return out
+
+
+def _get_token_prices_usd(chain_id: int, token_addresses: list[str]) -> dict[str, float]:
+    now = time.time()
+    requested: list[str] = []
+    result: dict[str, float] = {}
+    missing: list[str] = []
+    with TOKEN_PRICE_CACHE_LOCK:
+        for token in token_addresses or []:
+            addr = str(token or "").strip().lower()
+            if not _is_eth_address(addr):
+                continue
+            if addr not in requested:
+                requested.append(addr)
+            cached = TOKEN_PRICE_CACHE.get((int(chain_id), addr))
+            if cached and (now - cached[0]) <= PRICE_CACHE_TTL_SEC and cached[1] > 0:
+                result[addr] = cached[1]
+            else:
+                missing.append(addr)
+    if missing:
+        fetched = _fetch_token_prices_usd_coingecko(chain_id, missing)
+        with TOKEN_PRICE_CACHE_LOCK:
+            for addr, price in fetched.items():
+                TOKEN_PRICE_CACHE[(int(chain_id), addr)] = (now, float(price))
+                result[addr] = float(price)
+    return {a: result[a] for a in requested if a in result}
+
+
+def _estimate_position_tvl_usd_from_share_external(
+    position: dict[str, Any], pool: dict[str, Any], chain_id: int
+) -> float | None:
+    try:
+        pos_liq = _safe_float(position.get("liquidity"))
+        pool_liq = _safe_float(pool.get("liquidity"))
+        if pos_liq <= 0 or pool_liq <= 0:
+            return None
+        share = pos_liq / pool_liq
+        if share <= 0:
+            return None
+        tvl0 = _safe_float(pool.get("totalValueLockedToken0"))
+        tvl1 = _safe_float(pool.get("totalValueLockedToken1"))
+        if tvl0 <= 0 and tvl1 <= 0:
+            return None
+        t0 = pool.get("token0") or {}
+        t1 = pool.get("token1") or {}
+        token0 = str(t0.get("id") or "").strip().lower()
+        token1 = str(t1.get("id") or "").strip().lower()
+        prices = _get_token_prices_usd(int(chain_id), [token0, token1])
+        p0 = prices.get(token0)
+        p1 = prices.get(token1)
+        # If only one token price is available, infer the second from pool token0Price.
+        token0_price_in_token1 = _safe_float(pool.get("token0Price"))
+        if p0 is None and p1 is not None and token0_price_in_token1 > 0:
+            p0 = p1 * token0_price_in_token1
+        if p1 is None and p0 is not None and token0_price_in_token1 > 0:
+            p1 = p0 / token0_price_in_token1
+        if p0 is None and p1 is None:
+            return None
+        amount0 = max(0.0, tvl0 * share)
+        amount1 = max(0.0, tvl1 * share)
+        value = 0.0
+        if p0 is not None:
+            value += amount0 * float(p0)
+        if p1 is not None:
+            value += amount1 * float(p1)
+        if value <= 0:
+            return None
+        return value
+    except Exception:
+        return None
+
+
 def _query_uniswap_positions_for_owner(
     endpoint: str,
     owner: str,
@@ -1110,15 +1238,16 @@ def _query_uniswap_positions_for_owner(
           token1 {{ symbol id }}
         }}
     """
-    query_positions = f"""
-    query UserPositions($owner: String!, $skip: Int!) {{
+    def _build_queries(owner_type: str) -> tuple[str, str, str, str]:
+        q_positions = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
       positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
         {detailed_fields}
       }}
     }}
     """
-    query_account = f"""
-    query UserPositions($owner: String!, $skip: Int!) {{
+        q_account = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
       account(id: $owner) {{
         positions(first: 200, skip: $skip) {{
           {detailed_fields}
@@ -1126,15 +1255,15 @@ def _query_uniswap_positions_for_owner(
       }}
     }}
     """
-    query_positions_basic = f"""
-    query UserPositions($owner: String!, $skip: Int!) {{
+        q_positions_basic = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
       positions(first: 200, skip: $skip, where: {{ owner: $owner }}) {{
         {basic_fields}
       }}
     }}
     """
-    query_account_basic = f"""
-    query UserPositions($owner: String!, $skip: Int!) {{
+        q_account_basic = f"""
+    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
       account(id: $owner) {{
         positions(first: 200, skip: $skip) {{
           {basic_fields}
@@ -1142,14 +1271,20 @@ def _query_uniswap_positions_for_owner(
       }}
     }}
     """
+        return q_positions, q_account, q_positions_basic, q_account_basic
     result: list[dict[str, Any]] = []
-    owner_lc = str(owner or "").strip().lower()
+    owner_raw = str(owner or "").strip()
+    owner_lc = owner_raw.lower()
+    owner_candidates: list[str] = []
+    for candidate in (owner_raw, owner_lc):
+        if candidate and candidate not in owner_candidates:
+            owner_candidates.append(candidate)
 
-    def _run(q: str, mode: str) -> list[dict[str, Any]]:
+    def _run(q: str, mode: str, owner_value: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         skip = 0
         while True:
-            data = graphql_query(endpoint, q, {"owner": owner_lc, "skip": skip}, retries=1)
+            data = graphql_query(endpoint, q, {"owner": owner_value, "skip": skip}, retries=1)
             payload = data.get("data", {}) or {}
             if mode == "positions":
                 batch = payload.get("positions", []) or []
@@ -1162,25 +1297,25 @@ def _query_uniswap_positions_for_owner(
             time.sleep(0.15)
         return out
 
-    try:
-        result = _run(query_positions, "positions")
-    except Exception:
-        result = []
-    if not result:
-        try:
-            result = _run(query_account, "account")
-        except Exception:
-            result = []
-    if not result:
-        try:
-            result = _run(query_positions_basic, "positions")
-        except Exception:
-            result = []
-    if not result:
-        try:
-            result = _run(query_account_basic, "account")
-        except Exception:
-            result = []
+    query_sets = [_build_queries("String"), _build_queries("Bytes"), _build_queries("ID")]
+    for owner_value in owner_candidates:
+        for q_positions, q_account, q_positions_basic, q_account_basic in query_sets:
+            for q, mode in (
+                (q_positions, "positions"),
+                (q_account, "account"),
+                (q_positions_basic, "positions"),
+                (q_account_basic, "account"),
+            ):
+                if result:
+                    break
+                try:
+                    result = _run(q, mode, owner_value)
+                except Exception:
+                    result = []
+            if result:
+                break
+        if result:
+            break
     return result
 
 
@@ -1294,12 +1429,24 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     # Estimate position TVL by liquidity share.
                     # If pool liquidity is unavailable, keep it unknown (None).
                     position_tvl_usd: float | None = None
+                    external_share_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
                     detailed_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
-                    if detailed_tvl is not None and detailed_tvl >= 0:
-                        position_tvl_usd = detailed_tvl
+                    share_tvl: float | None = None
                     if pool_liq > 0 and pos_liq > 0:
+                        share_tvl = max(0.0, tvl_usd * (pos_liq / pool_liq))
+                    if external_share_tvl is not None and external_share_tvl >= 0:
+                        position_tvl_usd = external_share_tvl
+                    if detailed_tvl is not None and detailed_tvl >= 0:
                         if position_tvl_usd is None:
-                            position_tvl_usd = max(0.0, tvl_usd * (pos_liq / pool_liq))
+                            position_tvl_usd = detailed_tvl
+                    if position_tvl_usd is None and share_tvl is not None:
+                        position_tvl_usd = share_tvl
+                    # Sanity guard: if detailed formula diverges too much from
+                    # share-based estimate, prefer share-based value.
+                    if position_tvl_usd is not None and share_tvl is not None and share_tvl > 0:
+                        ratio = position_tvl_usd / share_tvl
+                        if ratio < 0.2 or ratio > 5.0:
+                            position_tvl_usd = share_tvl
                     fee_raw = str(pool.get("feeTier") or "").strip()
                     fee_disp = fee_raw
                     try:
@@ -2348,6 +2495,9 @@ class PositionsScanRequest(BaseModel):
     evm_addresses: list[str] = Field(default_factory=list)
     solana_addresses: list[str] = Field(default_factory=list)
     tron_addresses: list[str] = Field(default_factory=list)
+    include_pools: bool = True
+    include_lending: bool = True
+    include_rewards: bool = True
     # Backward-compatible fields from the previous UI version.
     addresses: list[str] = Field(default_factory=list)
     chain_ids: list[int] = Field(default_factory=list)
@@ -3012,17 +3162,10 @@ def _render_positions_page() -> str:
       .errors-box, .info-box { font-size: 11px; padding: 7px; }
     }
     """
-    extra_html = f"""
+    extra_html = """
     <div class="positions-grid">
       <section class="positions-form">
-        <div class="section-head">
-          <h3>My Crypto Portfolio</h3>
-          <div class="section-actions">
-            <label class="hint" style="margin:0">History days <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:90px;margin-left:6px"/></label>
-            <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
-            <span class="pos-status" id="posStatus">Ready</span>
-          </div>
-        </div>
+        <div class="section-head"><h3>My Crypto Portfolio</h3></div>
         <div class="address-columns">
           <div class="addr-box">
             <div class="addr-input-row">
@@ -3051,31 +3194,18 @@ def _render_positions_page() -> str:
         <div class="section-head">
           <h3>Pool positions</h3>
           <div class="section-actions">
+            <label class="hint" style="margin:0">History days <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:90px;margin-left:6px"/></label>
+            <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
+            <span class="pos-status" id="posStatus">Ready</span>
             <button class="search-link-btn" type="button" onclick="scanPositions('pools')">Search</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <div id="posPoolsBody" class="section-body"><div class="table-wrap"><table id="posPoolsTable"></table></div><div id="posPoolChart" style="height:320px;margin-top:10px"></div></div>
-      </section>
-      <section class="result-card">
-        <div class="section-head">
-          <h3>Lending positions</h3>
-          <div class="section-actions">
-            <button class="search-link-btn" type="button" onclick="scanPositions('lending')">Search</button>
-            <button class="collapse-btn" id="toggleLendingBtn" type="button" onclick="togglePosSection('lending')" title="Collapse/expand">▾</button>
-          </div>
+        <div id="posPoolsBody" class="section-body">
+          <div class="table-wrap"><table id="posPoolsTable"></table></div>
+          <div id="posPoolChart" style="height:320px;margin-top:10px"></div>
+          <div id="posErrors"></div>
         </div>
-        <div id="posLendingBody" class="section-body"><div class="table-wrap"><table id="posLendingTable"></table></div></div>
-      </section>
-      <section class="result-card">
-        <div class="section-head">
-          <h3>Unclaimed lending rewards</h3>
-          <div class="section-actions">
-            <button class="search-link-btn" type="button" onclick="scanPositions('rewards')">Search</button>
-            <button class="collapse-btn" id="toggleRewardsBtn" type="button" onclick="togglePosSection('rewards')" title="Collapse/expand">▾</button>
-          </div>
-        </div>
-        <div id="posRewardsBody" class="section-body"><div class="table-wrap"><table id="posRewardsTable"></table></div><div id="posErrors"></div></div>
       </section>
     </div>
     """
@@ -3153,8 +3283,8 @@ def _render_positions_page() -> str:
       savePosState();
       renderChips(kind);
     }
-    const posSectionState = {pools: false, lending: false, rewards: false};
-    const posCache = {pools: [], lending: [], rewards: []};
+    const posSectionState = {pools: false};
+    const posCache = {pools: []};
     function setPosStatus(text, isErr) {
       const el = document.getElementById("posStatus");
       if (!el) return;
@@ -3172,8 +3302,8 @@ def _render_positions_page() -> str:
       navigator.clipboard.writeText(text).then(() => setPosStatus("Copied to clipboard", false)).catch(() => {});
     }
     function setSectionCollapsed(key, collapsed) {
-      const bodyMap = {pools: "posPoolsBody", lending: "posLendingBody", rewards: "posRewardsBody"};
-      const btnMap = {pools: "togglePoolsBtn", lending: "toggleLendingBtn", rewards: "toggleRewardsBtn"};
+      const bodyMap = {pools: "posPoolsBody"};
+      const btnMap = {pools: "togglePoolsBtn"};
       const body = document.getElementById(bodyMap[key]);
       const btn = document.getElementById(btnMap[key]);
       if (!body || !btn) return;
@@ -3186,8 +3316,6 @@ def _render_positions_page() -> str:
       setSectionCollapsed(key, next);
       if (!next) {
         if (key === "pools") renderPools(posCache.pools || []);
-        if (key === "lending") renderLending(posCache.lending || []);
-        if (key === "rewards") renderRewards(posCache.rewards || []);
       }
     }
     async function ensurePlotly() {
@@ -3291,8 +3419,271 @@ def _render_positions_page() -> str:
       if (!list.length) html += "<tr><td colspan='8'>No pool positions found.</td></tr>";
       table.innerHTML = html;
     }
+    async function scanPositions(targetSection = "all") {
+      if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
+        setPosStatus("Add at least one address first.", true);
+        return;
+      }
+      // Search should also reveal the requested section when cache is empty/collapsed.
+      if (targetSection === "pools") {
+        setSectionCollapsed(targetSection, false);
+      } else {
+        setSectionCollapsed("pools", false);
+      }
+      try {
+        setPosBusy(true);
+        setPosStatus("Scanning latest positions...", false);
+        const res = await fetch("/api/positions/scan", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({
+            evm_addresses: posState.evm,
+            solana_addresses: posState.solana,
+            tron_addresses: posState.tron,
+            include_pools: true,
+            include_lending: false,
+            include_rewards: false,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || "Scan failed");
+        posCache.pools = data.pool_positions || [];
+        renderPools(posCache.pools);
+        const errWrap = document.getElementById("posErrors");
+        const errs = data.errors || [];
+        const infos = data.infos || [];
+        const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
+        const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
+        if (errWrap) errWrap.innerHTML = errHtml + infoHtml;
+        setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}`, false);
+      } catch (e) {
+        setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
+      } finally {
+        setPosBusy(false);
+      }
+    }
+    loadPosState();
+    renderAllChips();
+    setSectionCollapsed("pools", false);
+    setPosStatus("Ready", false);
+    """
+    return _render_placeholder_page(
+        "DeFi Positions",
+        "Find where wallet funds are in pools and lending protocols.",
+        "/positions",
+        extra_css=extra_css,
+        extra_html=extra_html,
+        extra_script=extra_script,
+        show_intro=False,
+    )
+
+
+def _render_stables_page() -> str:
+    extra_css = """
+    .positions-grid { display:grid; gap:14px; margin-top:4px; }
+    .positions-form, .result-card {
+      background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%);
+      border: 1px solid #d4deee;
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 6px 20px rgba(15,23,42,0.06);
+    }
+    .positions-form h3, .result-card h3 { margin:0; font-size:17px; color:#1f3a8a; }
+    .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }
+    .address-columns { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+    .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
+    .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
+    .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; }
+    .btn-plus { width:26px; min-width:26px; height:26px; border:none; border-radius:0; padding:0; font-size:22px; line-height:1; display:inline-flex; align-items:center; justify-content:center; background:transparent; color:#2563eb; font-weight:800; box-shadow:none; }
+    .btn-plus:hover { color:#1d4ed8; background:transparent; }
+    .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; min-height:26px; }
+    .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
+    .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; }
+    .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
+    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:13px; font-weight:700; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
+    .search-link-btn:hover { color:#1e40af; }
+    .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
+    .section-actions { display:flex; align-items:center; gap:10px; }
+    .section-body { display:block; }
+    .section-body.collapsed { display:none; }
+    .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
+    .pos-progress .bar { width: 40%; height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); animation: posLoad 1s linear infinite; }
+    @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
+    .pos-status { color:#475569; font-size:13px; }
+    .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
+    table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
+    th, td { border-bottom:1px solid #e2e8f0; padding:7px; text-align:left; vertical-align:top; }
+    th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
+    .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
+    .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
+    @media (max-width: 1100px) {
+      .address-columns { grid-template-columns:1fr; }
+      .positions-form, .result-card { padding: 12px; }
+      .section-head { flex-wrap: wrap; align-items: center; }
+      .section-head h3 { font-size: 16px; }
+      .search-link-btn { font-size: 12px; }
+    }
+    @media (max-width: 720px) {
+      .positions-grid { gap: 10px; }
+      .positions-form, .result-card { padding: 10px; border-radius: 12px; }
+      .addr-box { padding: 8px; }
+      .addr-input-row { gap: 6px; }
+      .addr-input-row input { font-size: 12px; padding: 7px; }
+      .btn-plus { width: 24px; min-width: 24px; height: 24px; font-size: 20px; }
+      .chip { font-size: 11px; padding: 3px 7px; }
+      .pos-status { font-size: 12px; }
+      .table-wrap { border-radius: 8px; }
+      table { min-width: 740px; font-size: 11px; }
+      th, td { padding: 6px; }
+      .mono { font-size: 10px; }
+      .errors-box, .info-box { font-size: 11px; padding: 7px; }
+    }
+    """
+    extra_html = """
+    <div class="positions-grid">
+      <section class="positions-form">
+        <div class="section-head"><h3>Lending Stablecoin</h3></div>
+        <div class="address-columns">
+          <div class="addr-box">
+            <div class="addr-input-row">
+              <input id="evmInput" placeholder="0x..." />
+              <button class="btn btn-plus" type="button" onclick="addAddress('evm')" aria-label="Add EVM address">+</button>
+            </div>
+            <div class="chips" id="evmChips"></div>
+          </div>
+          <div class="addr-box">
+            <div class="addr-input-row">
+              <input id="solanaInput" placeholder="Solana address" />
+              <button class="btn btn-plus" type="button" onclick="addAddress('solana')" aria-label="Add Solana address">+</button>
+            </div>
+            <div class="chips" id="solanaChips"></div>
+          </div>
+          <div class="addr-box">
+            <div class="addr-input-row">
+              <input id="tronInput" placeholder="TRON address" />
+              <button class="btn btn-plus" type="button" onclick="addAddress('tron')" aria-label="Add TRON address">+</button>
+            </div>
+            <div class="chips" id="tronChips"></div>
+          </div>
+        </div>
+      </section>
+      <section class="result-card">
+        <div class="section-head">
+          <h3>Lending positions</h3>
+          <div class="section-actions">
+            <div id="stableProgress" class="pos-progress"><div class="bar"></div></div>
+            <span class="pos-status" id="stableStatus">Ready</span>
+            <button class="search-link-btn" type="button" onclick="scanStable('lending')">Search</button>
+            <button class="collapse-btn" id="toggleStableLendingBtn" type="button" onclick="toggleStableSection('lending')" title="Collapse/expand">▾</button>
+          </div>
+        </div>
+        <div id="stableLendingBody" class="section-body"><div class="table-wrap"><table id="stableLendingTable"></table></div></div>
+      </section>
+      <section class="result-card">
+        <div class="section-head">
+          <h3>Unclaimed lending rewards</h3>
+          <div class="section-actions">
+            <button class="search-link-btn" type="button" onclick="scanStable('rewards')">Search</button>
+            <button class="collapse-btn" id="toggleStableRewardsBtn" type="button" onclick="toggleStableSection('rewards')" title="Collapse/expand">▾</button>
+          </div>
+        </div>
+        <div id="stableRewardsBody" class="section-body"><div class="table-wrap"><table id="stableRewardsTable"></table></div><div id="stableErrors"></div></div>
+      </section>
+    </div>
+    """
+    extra_script = """
+    function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+    const stableState = { evm: [], solana: [], tron: [] };
+    const STABLE_STORAGE_KEY = "stables_form_v1";
+    function validAddress(kind, value) {
+      const v = String(value || "").trim();
+      if (!v) return false;
+      if (kind === "evm") return /^0x[a-fA-F0-9]{40}$/.test(v);
+      if (kind === "solana") return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
+      if (kind === "tron") return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(v);
+      return false;
+    }
+    function inputId(kind) {
+      if (kind === "evm") return "evmInput";
+      if (kind === "solana") return "solanaInput";
+      return "tronInput";
+    }
+    function chipsId(kind) {
+      if (kind === "evm") return "evmChips";
+      if (kind === "solana") return "solanaChips";
+      return "tronChips";
+    }
+    function saveStableState() { localStorage.setItem(STABLE_STORAGE_KEY, JSON.stringify(stableState)); }
+    function loadStableState() {
+      try {
+        const raw = localStorage.getItem(STABLE_STORAGE_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        for (const k of ["evm", "solana", "tron"]) {
+          if (Array.isArray(parsed[k])) stableState[k] = parsed[k].map((x) => String(x || "").trim()).filter(Boolean);
+        }
+      } catch (_) {}
+    }
+    function renderChips(kind) {
+      const wrap = document.getElementById(chipsId(kind));
+      if (!wrap) return;
+      const rows = stableState[kind] || [];
+      if (!rows.length) { wrap.innerHTML = "<span class='chip muted'>No addresses</span>"; return; }
+      wrap.innerHTML = rows.map((addr, i) => `<span class='chip'><span class='mono'>${esc(addr)}</span><button class='x' type='button' onclick=\"removeAddress('${kind}', ${i})\">×</button></span>`).join("");
+    }
+    function renderAllChips() { renderChips("evm"); renderChips("solana"); renderChips("tron"); }
+    function addAddress(kind) {
+      const el = document.getElementById(inputId(kind));
+      const addrRaw = String(el?.value || "").trim();
+      if (!validAddress(kind, addrRaw)) { setStableStatus(`Invalid ${kind.toUpperCase()} address format.`, true); return; }
+      const addr = kind === "evm" ? addrRaw.toLowerCase() : addrRaw;
+      if ((stableState[kind] || []).includes(addr)) { setStableStatus("Address already added.", true); return; }
+      stableState[kind].push(addr);
+      if (el) el.value = "";
+      saveStableState();
+      renderChips(kind);
+      setStableStatus("Address added.", false);
+    }
+    function removeAddress(kind, idx) {
+      if (!Array.isArray(stableState[kind])) return;
+      stableState[kind].splice(Number(idx) || 0, 1);
+      saveStableState();
+      renderChips(kind);
+    }
+    const stableSectionState = {lending: false, rewards: false};
+    const stableCache = {lending: [], rewards: []};
+    function setStableStatus(text, isErr) {
+      const el = document.getElementById("stableStatus");
+      if (!el) return;
+      el.textContent = text || "";
+      el.style.color = isErr ? "#b91c1c" : "#475569";
+    }
+    function setStableBusy(flag) {
+      const el = document.getElementById("stableProgress");
+      if (!el) return;
+      el.style.display = flag ? "block" : "none";
+    }
+    function setStableSectionCollapsed(key, collapsed) {
+      const bodyMap = {lending: "stableLendingBody", rewards: "stableRewardsBody"};
+      const btnMap = {lending: "toggleStableLendingBtn", rewards: "toggleStableRewardsBtn"};
+      const body = document.getElementById(bodyMap[key]);
+      const btn = document.getElementById(btnMap[key]);
+      if (!body || !btn) return;
+      stableSectionState[key] = !!collapsed;
+      body.classList.toggle("collapsed", !!collapsed);
+      btn.textContent = collapsed ? "▸" : "▾";
+    }
+    function toggleStableSection(key) {
+      const next = !stableSectionState[key];
+      setStableSectionCollapsed(key, next);
+      if (!next) {
+        if (key === "lending") renderLending(stableCache.lending || []);
+        if (key === "rewards") renderRewards(stableCache.rewards || []);
+      }
+    }
     function renderLending(rows) {
-      const table = document.getElementById("posLendingTable");
+      const table = document.getElementById("stableLendingTable");
       let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Type</th><th>Market</th><th>Asset</th><th>Amount</th><th>USD</th><th>APY</th><th>Collateral</th></tr>";
       for (const r of (rows || [])) {
         html += "<tr>";
@@ -3312,7 +3703,7 @@ def _render_positions_page() -> str:
       table.innerHTML = html;
     }
     function renderRewards(rows) {
-      const table = document.getElementById("posRewardsTable");
+      const table = document.getElementById("stableRewardsTable");
       let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Asset</th><th>Amount</th><th>USD</th></tr>";
       for (const r of (rows || [])) {
         html += "<tr>";
@@ -3327,65 +3718,61 @@ def _render_positions_page() -> str:
       if (!(rows || []).length) html += "<tr><td colspan='6'>No unclaimed rewards found.</td></tr>";
       table.innerHTML = html;
     }
-    async function scanPositions(targetSection = "all") {
-      if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
-        setPosStatus("Add at least one address first.", true);
+    async function scanStable(targetSection = "all") {
+      if (!stableState.evm.length && !stableState.solana.length && !stableState.tron.length) {
+        setStableStatus("Add at least one address first.", true);
         return;
       }
-      // Search should also reveal the requested section when cache is empty/collapsed.
-      if (targetSection === "pools" || targetSection === "lending" || targetSection === "rewards") {
-        setSectionCollapsed(targetSection, false);
+      if (targetSection === "lending" || targetSection === "rewards") {
+        setStableSectionCollapsed(targetSection, false);
       } else {
-        setSectionCollapsed("pools", false);
-        setSectionCollapsed("lending", false);
-        setSectionCollapsed("rewards", false);
+        setStableSectionCollapsed("lending", false);
+        setStableSectionCollapsed("rewards", false);
       }
       try {
-        setPosBusy(true);
-        setPosStatus("Scanning latest positions...", false);
+        setStableBusy(true);
+        setStableStatus("Scanning latest lending and rewards...", false);
         const res = await fetch("/api/positions/scan", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
           body: JSON.stringify({
-            evm_addresses: posState.evm,
-            solana_addresses: posState.solana,
-            tron_addresses: posState.tron,
+            evm_addresses: stableState.evm,
+            solana_addresses: stableState.solana,
+            tron_addresses: stableState.tron,
+            include_pools: false,
+            include_lending: true,
+            include_rewards: true,
           }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || "Scan failed");
-        posCache.pools = data.pool_positions || [];
-        posCache.lending = data.lending_positions || [];
-        posCache.rewards = data.reward_positions || [];
-        if (targetSection === "all" || targetSection === "pools") renderPools(posCache.pools);
-        if (targetSection === "all" || targetSection === "lending") renderLending(posCache.lending);
-        if (targetSection === "all" || targetSection === "rewards") renderRewards(posCache.rewards);
-        const errWrap = document.getElementById("posErrors");
+        stableCache.lending = data.lending_positions || [];
+        stableCache.rewards = data.reward_positions || [];
+        if (targetSection === "all" || targetSection === "lending") renderLending(stableCache.lending);
+        if (targetSection === "all" || targetSection === "rewards") renderRewards(stableCache.rewards);
+        const errWrap = document.getElementById("stableErrors");
         const errs = data.errors || [];
         const infos = data.infos || [];
         const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
         const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
-        if (targetSection === "all" || targetSection === "rewards") {
-          errWrap.innerHTML = errHtml + infoHtml;
-        }
-        setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}, Lending: ${(data.lending_positions || []).length}`, false);
+        if (errWrap) errWrap.innerHTML = errHtml + infoHtml;
+        setStableStatus(`Done. Lending: ${(data.lending_positions || []).length}, Rewards: ${(data.reward_positions || []).length}`, false);
       } catch (e) {
-        setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
+        setStableStatus("Scan failed: " + (e?.message || "unknown"), true);
       } finally {
-        setPosBusy(false);
+        setStableBusy(false);
       }
     }
-    loadPosState();
+    loadStableState();
     renderAllChips();
-    setSectionCollapsed("pools", false);
-    setSectionCollapsed("lending", false);
-    setSectionCollapsed("rewards", false);
-    setPosStatus("Ready", false);
+    setStableSectionCollapsed("lending", false);
+    setStableSectionCollapsed("rewards", false);
+    setStableStatus("Ready", false);
     """
     return _render_placeholder_page(
-        "DeFi Positions",
-        "Find where wallet funds are in pools and lending protocols.",
-        "/positions",
+        "Lending Stablecoin",
+        "Scan lending positions and unclaimed rewards.",
+        "/stables",
         extra_css=extra_css,
         extra_html=extra_html,
         extra_script=extra_script,
@@ -4441,7 +4828,7 @@ def home(request: Request) -> HTMLResponse:
 
 @app.get("/stables", response_class=HTMLResponse)
 def stables_page(request: Request) -> HTMLResponse:
-    html = _render_placeholder_page("Lending Stablecoin", "This page is a placeholder for the future stablecoin workflow.", "/stables")
+    html = _render_stables_page()
     html = html.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
     resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
@@ -4750,10 +5137,13 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
             if int(x.get("chain_id") or 0) > 0
         }
     )[:64]
+    scan_pools = bool(req.include_pools)
+    scan_lending = bool(req.include_lending)
+    scan_rewards = bool(req.include_rewards)
     if evm_addresses:
-        pool_rows, pool_errs = _scan_pool_positions(evm_addresses, selected_chain_ids)
-        lending_rows, lending_errs = _scan_aave_positions(evm_addresses, selected_chain_ids)
-        reward_rows, reward_errs = _scan_aave_merit_rewards(evm_addresses, selected_chain_ids)
+        pool_rows, pool_errs = (_scan_pool_positions(evm_addresses, selected_chain_ids) if scan_pools else ([], []))
+        lending_rows, lending_errs = (_scan_aave_positions(evm_addresses, selected_chain_ids) if scan_lending else ([], []))
+        reward_rows, reward_errs = (_scan_aave_merit_rewards(evm_addresses, selected_chain_ids) if scan_rewards else ([], []))
     else:
         pool_rows, pool_errs = [], []
         lending_rows, lending_errs = [], []
