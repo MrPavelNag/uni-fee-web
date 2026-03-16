@@ -1652,6 +1652,7 @@ def _scan_v3_positions_onchain(
     deadline_ts: float | None = None,
     include_price_details: bool = True,
     protocol_label: str = "uniswap_v3",
+    source_tag: str = "onchain_npm",
 ) -> list[dict[str, Any]]:
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
@@ -1728,6 +1729,7 @@ def _scan_v3_positions_onchain(
             },
             "_skip_enrich": not include_price_details,
             "_protocol_label": str(protocol_label or "uniswap_v3"),
+            "_source": str(source_tag or "onchain_npm"),
         }
     # Scan latest NFTs first: active user positions are typically near the end.
     start_idx = max(0, int(balance) - limit)
@@ -1756,6 +1758,7 @@ def _fetch_v3_position_onchain_by_token_id(
     *,
     include_price_details: bool = True,
     protocol_label: str = "uniswap_v3",
+    source_tag: str = "onchain_tokenid",
 ) -> dict[str, Any] | None:
     try:
         cid = int(chain_id)
@@ -1817,6 +1820,7 @@ def _fetch_v3_position_onchain_by_token_id(
             },
             "_skip_enrich": not include_price_details,
             "_protocol_label": str(protocol_label or "uniswap_v3"),
+            "_source": str(source_tag or "onchain_tokenid"),
         }
     except Exception:
         return None
@@ -1859,6 +1863,7 @@ def _scan_pancake_staked_v3_positions_onchain(
                 str(token_id),
                 include_price_details=True,
                 protocol_label="pancake_v3",
+                source_tag="onchain_pancake_masterchef",
             )
             if pos:
                 out.append(pos)
@@ -2440,6 +2445,7 @@ def _scan_pool_positions_chain(
                     int(chain_id),
                     deadline_ts=deadline_ts,
                     protocol_label=V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"),
+                    source_tag="onchain_prefetch",
                 )
                 owner_attempts.append(
                     {
@@ -2513,6 +2519,9 @@ def _scan_pool_positions_chain(
                     debug_steps=owner_attempts,
                     deadline_ts=deadline_ts,
                 )
+                for _p in positions:
+                    if isinstance(_p, dict) and not str(_p.get("_source") or "").strip():
+                        _p["_source"] = "graph_query"
                 if not positions and not has_position_liquidity:
                     positions = _query_uniswap_positions_for_owner(
                         endpoint,
@@ -2522,6 +2531,9 @@ def _scan_pool_positions_chain(
                         debug_steps=owner_attempts,
                         deadline_ts=deadline_ts,
                     )
+                    for _p in positions:
+                        if isinstance(_p, dict) and not str(_p.get("_source") or "").strip():
+                            _p["_source"] = "graph_query"
             except Exception as e:
                 graph_failed = True
                 owner_errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
@@ -2544,6 +2556,7 @@ def _scan_pool_positions_chain(
                         deadline_ts=deadline_ts,
                         include_price_details=(int(chain_id) in POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS),
                             protocol_label=V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"),
+                        source_tag="onchain_fallback",
                     )
                     owner_attempts.append(
                         {
@@ -2574,6 +2587,31 @@ def _scan_pool_positions_chain(
             "positions_found": len(positions),
             "failed": False,
             "attempts": owner_attempts,
+        }
+        onchain_ids = {
+            str((x or {}).get("id") or "")
+            for x in positions
+            if isinstance(x, dict) and str((x or {}).get("_source") or "").startswith("onchain")
+        }
+        graph_ids = {
+            str((x or {}).get("id") or "")
+            for x in positions
+            if isinstance(x, dict) and str((x or {}).get("_source") or "").startswith("graph")
+        }
+        graph_checked = any(
+            str((a or {}).get("owner_type") or "").upper() in {"ID", "STRING", "BYTES"}
+            and str((a or {}).get("query_mode") or "").startswith(("positions", "snapshots", "account", "accounts"))
+            for a in owner_attempts
+            if isinstance(a, dict)
+        )
+        owner_debug["compare"] = {
+            "graph_checked": bool(graph_checked),
+            "onchain_count": len(onchain_ids),
+            "graph_count": len(graph_ids),
+            "only_onchain_count": len(onchain_ids - graph_ids) if graph_checked else 0,
+            "only_graph_count": len(graph_ids - onchain_ids) if graph_checked else 0,
+            "only_onchain_ids": sorted([x for x in (onchain_ids - graph_ids) if x][:5]) if graph_checked else [],
+            "only_graph_ids": sorted([x for x in (graph_ids - onchain_ids) if x][:5]) if graph_checked else [],
         }
 
         for p in positions:
@@ -4799,14 +4837,6 @@ def _render_positions_page() -> str:
       if (!v) return "";
       return v.length <= 4 ? v : ("..." + v.slice(-4));
     }
-    function getHideSpamEnabled() {
-      const raw = localStorage.getItem("positions_hide_spam");
-      if (raw == null) return true;
-      return raw !== "0";
-    }
-    function setHideSpamEnabled(flag) {
-      localStorage.setItem("positions_hide_spam", flag ? "1" : "0");
-    }
     function setSectionCollapsed(key, collapsed) {
       const bodyMap = {pools: "posPoolsBody"};
       const btnMap = {pools: "togglePoolsBtn"};
@@ -4909,15 +4939,14 @@ def _render_positions_page() -> str:
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
       const days = getHistoryDays();
-      const hideSpam = getHideSpamEnabled();
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Valuation mode</th><th>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="${days}" style="width:72px;margin-left:6px"/> <label style="margin-left:8px;font-weight:600;font-size:12px;white-space:nowrap"><input id="posHideSpam" type="checkbox" ${hideSpam ? "checked" : ""} /> hide suspected spam</label></th></tr>`;
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="${days}" style="width:72px;margin-left:6px"/></th></tr>`;
       const list = rows || [];
       const visible = [];
-      let hiddenSpam = 0;
+      const spamRows = [];
       for (let i = 0; i < list.length; i++) {
         const r0 = list[i];
-        if (hideSpam && Boolean(r0 && r0.suspected_spam)) {
-          hiddenSpam += 1;
+        if (Boolean(r0 && r0.suspected_spam)) {
+          spamRows.push(Object.assign({_src_idx: i}, r0 || {}));
           continue;
         }
         const r = Object.assign({_src_idx: i}, r0 || {});
@@ -4936,21 +4965,24 @@ def _render_positions_page() -> str:
         html += `<td class='mono'>${esc(r.pool_id || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
-        html += `<td>${esc(r.valuation_mode || "unknown")}</td>`;
         html += `<td><button class='search-link-btn' type='button' onclick='showPoolSeriesByIndex(${Number(r._src_idx) || 0})'>Show history</button></td>`;
         html += "</tr>";
       }
-      if (!visible.length) html += "<tr><td colspan='9'>No pool positions found.</td></tr>";
-      table.innerHTML = html;
-      const hideCb = document.getElementById("posHideSpam");
-      if (hideCb) {
-        hideCb.onchange = (e) => {
-          setHideSpamEnabled(Boolean(e?.target?.checked));
-          renderPools(posCache.pools || []);
-        };
+      if (!visible.length) html += "<tr><td colspan='8'>No pool positions found.</td></tr>";
+      if (spamRows.length) {
+        let spamInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
+        spamInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position TVL</th></tr>";
+        for (let i = 0; i < spamRows.length; i++) {
+          const r = spamRows[i];
+          const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
+          spamInner += `<tr><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td></tr>`;
+        }
+        spamInner += "</table>";
+        html += `<tr><td colspan='8'><details><summary>Suspected spam positions (${spamRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${spamInner}</div></details></td></tr>`;
       }
-      if (hiddenSpam > 0) {
-        setPosStatus(`Showing ${visible.length} pools (hidden suspected spam: ${hiddenSpam})`, false);
+      table.innerHTML = html;
+      if (spamRows.length > 0) {
+        setPosStatus(`Showing ${visible.length} pools (+ ${spamRows.length} suspected spam in collapsed section)`, false);
       }
     }
     async function scanPositions(targetSection = "all") {
@@ -4998,9 +5030,24 @@ def _render_positions_page() -> str:
             .filter((x) => Number(x.positions_found || 0) === 0)
             .slice(0, 30)
             .map((x) => `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} (0)`);
+          const cmpRows = dbgRows
+            .filter((x) => {
+              const c = x.compare || {};
+              return Boolean(c.graph_checked) && (Number(c.only_onchain_count || 0) > 0 || Number(c.only_graph_count || 0) > 0);
+            })
+            .slice(0, 30)
+            .map((x) => {
+              const c = x.compare || {};
+              const o = Number(c.only_onchain_count || 0);
+              const g = Number(c.only_graph_count || 0);
+              const oid = (Array.isArray(c.only_onchain_ids) ? c.only_onchain_ids : []).slice(0, 2).join(",");
+              const gid = (Array.isArray(c.only_graph_ids) ? c.only_graph_ids : []).slice(0, 2).join(",");
+              return `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} only_onchain=${o}${oid ? ` [${esc(oid)}]` : ""}, only_graph=${g}${gid ? ` [${esc(gid)}]` : ""}`;
+            });
           const body = []
             .concat(sumLines.length ? ["Summary:", ...sumLines] : [])
             .concat(zeroRows.length ? ["", "Zero-found owners:", ...zeroRows] : [])
+            .concat(cmpRows.length ? ["", "Source compare (onchain vs graph):", ...cmpRows] : [])
             .join("\\n");
           if (body.trim()) {
             dbgHtml = `<div class='info-box'><details><summary>Debug scan details</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
@@ -6699,14 +6746,17 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
     # By default scan all supported EVM chains; if chain_ids provided, preserve user order.
     # Prioritize chains where users most often track active LPs, and keep heavy
     # ethereum scan later so partial results include L2 pools under timeout.
-    preferred_order = [42161, 8453, 1, 10, 137, 56]
+    preferred_order = [42161, 8453, 130, 56, 1, 10, 137]
     preferred_rank = {cid: idx for idx, cid in enumerate(preferred_order)}
     all_chain_ids = sorted(
-        {
-            int(x.get("chain_id") or 0)
-            for x in _positions_chain_catalog()
-            if int(x.get("chain_id") or 0) > 0
-        },
+        (
+            {
+                int(x.get("chain_id") or 0)
+                for x in _positions_chain_catalog()
+                if int(x.get("chain_id") or 0) > 0
+            }
+            | {int(cid) for cid in CHAIN_ID_TO_KEY.keys() if int(cid) > 0}
+        ),
         key=lambda cid: (preferred_rank.get(int(cid), 999), int(cid)),
     )[:64]
     requested_chain_ids: list[int] = []
