@@ -1631,67 +1631,71 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
                     continue
                 for p in positions:
-                    if not _position_has_full_detail(p):
-                        enriched = _fetch_position_by_id_with_detail(
-                            endpoint,
-                            str(p.get("id") or ""),
-                            include_pool_liquidity=has_pool_liquidity,
-                        )
-                        if enriched:
-                            p = enriched
-                    liq_raw = p.get("liquidity")
-                    if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
-                        # Hide closed/zero-liquidity historical NFTs; keep only active positions.
-                        continue
-                    pool = p.get("pool") or {}
-                    tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
-                    pos_liq = _safe_float(p.get("liquidity"))
-                    pool_liq = _safe_float(pool.get("liquidity"))
-                    position_tvl_usd: float | None = None
-                    detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
-                    detailed_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
-                    share_tvl: float | None = None
-                    if pool_liq > 0 and pos_liq > 0:
-                        share_tvl = max(0.0, tvl_usd * (pos_liq / pool_liq))
-                    if detailed_external_tvl is not None and detailed_external_tvl >= 0:
-                        position_tvl_usd = detailed_external_tvl
-                    if detailed_tvl is not None and detailed_tvl >= 0:
-                        if position_tvl_usd is None:
-                            position_tvl_usd = detailed_tvl
-                    if position_tvl_usd is None and share_tvl is not None:
-                        position_tvl_usd = share_tvl
-                    # Keep only meaningful active positions to avoid zero-value spam rows.
-                    if position_tvl_usd is None or position_tvl_usd <= 0:
-                        continue
-                    fee_raw = str(pool.get("feeTier") or "").strip()
-                    fee_disp = fee_raw
                     try:
-                        fee_int = int(fee_raw)
-                        if fee_int > 0:
-                            fee_disp = f"{fee_int / 10000.0:.2f}%"
-                    except Exception:
-                        fee_disp = fee_raw or "-"
-                    t0 = (pool.get("token0") or {}).get("symbol") or "?"
-                    t1 = (pool.get("token1") or {}).get("symbol") or "?"
-                    if t0 == "?" and t1 == "?":
+                        if not _position_has_full_detail(p):
+                            enriched = _fetch_position_by_id_with_detail(
+                                endpoint,
+                                str(p.get("id") or ""),
+                                include_pool_liquidity=has_pool_liquidity,
+                            )
+                            if enriched:
+                                p = enriched
+                        liq_raw = p.get("liquidity")
+                        if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
+                            # Hide closed/zero-liquidity historical NFTs; keep only active positions.
+                            continue
+                        pool = p.get("pool") or {}
+                        tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
+                        pos_liq = _safe_float(p.get("liquidity"))
+                        pool_liq = _safe_float(pool.get("liquidity"))
+                        position_tvl_usd: float | None = None
+                        detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
+                        detailed_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
+                        share_tvl: float | None = None
+                        if pool_liq > 0 and pos_liq > 0:
+                            share_tvl = max(0.0, tvl_usd * (pos_liq / pool_liq))
+                        if detailed_external_tvl is not None and detailed_external_tvl >= 0:
+                            position_tvl_usd = detailed_external_tvl
+                        if detailed_tvl is not None and detailed_tvl >= 0:
+                            if position_tvl_usd is None:
+                                position_tvl_usd = detailed_tvl
+                        if position_tvl_usd is None and share_tvl is not None:
+                            position_tvl_usd = share_tvl
+                        # Keep only meaningful active positions to avoid zero-value spam rows.
+                        if position_tvl_usd is None or position_tvl_usd <= 0:
+                            continue
+                        fee_raw = str(pool.get("feeTier") or "").strip()
+                        fee_disp = fee_raw
+                        try:
+                            fee_int = int(fee_raw)
+                            if fee_int > 0:
+                                fee_disp = f"{fee_int / 10000.0:.2f}%"
+                        except Exception:
+                            fee_disp = fee_raw or "-"
+                        t0 = (pool.get("token0") or {}).get("symbol") or "?"
+                        t1 = (pool.get("token1") or {}).get("symbol") or "?"
+                        if t0 == "?" and t1 == "?":
+                            continue
+                        rows.append(
+                            {
+                                "address": owner,
+                                "protocol": f"uniswap_{version}",
+                                "chain": chain_key,
+                                "chain_id": int(chain_id),
+                                "kind": "pool",
+                                "pool_id": str(pool.get("id") or ""),
+                                "pair": f"{t0}/{t1}",
+                                "fee_tier": fee_disp,
+                                "fee_tier_raw": fee_raw,
+                                "liquidity": str(p.get("liquidity") or "0"),
+                                "pool_liquidity": str(pool.get("liquidity") or "0"),
+                                "pool_tvl_usd": tvl_usd,
+                                "tvl_usd": position_tvl_usd,
+                            }
+                        )
+                    except Exception as e:
+                        errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
                         continue
-                    rows.append(
-                        {
-                            "address": owner,
-                            "protocol": f"uniswap_{version}",
-                            "chain": chain_key,
-                            "chain_id": int(chain_id),
-                            "kind": "pool",
-                            "pool_id": str(pool.get("id") or ""),
-                            "pair": f"{t0}/{t1}",
-                            "fee_tier": fee_disp,
-                            "fee_tier_raw": fee_raw,
-                            "liquidity": str(p.get("liquidity") or "0"),
-                            "pool_liquidity": str(pool.get("liquidity") or "0"),
-                            "pool_tvl_usd": tvl_usd,
-                            "tvl_usd": position_tvl_usd,
-                        }
-                    )
     # Aggregate by owner/protocol/pool id (wallet can hold multiple NFT positions in one pool).
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
