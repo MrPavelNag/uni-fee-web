@@ -199,6 +199,8 @@ POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_I
 POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_CREATION_DATE_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_CREATION_DATE_WORKERS", "6"))))
+POSITIONS_CREATION_DATE_MAX_SECONDS = max(1, int(os.environ.get("POSITIONS_CREATION_DATE_MAX_SECONDS", "8")))
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
     "1",
     "true",
@@ -1614,7 +1616,75 @@ def _contract_creation_date_cached(chain_id: int, contract_address: str) -> str:
     key = (int(chain_id), addr)
     with CONTRACT_CREATION_DATE_CACHE_LOCK:
         cached = CONTRACT_CREATION_DATE_CACHE.get(key)
+    if cached is not None:
+        return str(cached or "")
+    # Lazy compute on first access so Created column is populated.
+    return _contract_creation_date_ymd(int(chain_id), addr)
+
+
+def _contract_creation_date_peek(chain_id: int, contract_address: str) -> str:
+    addr = str(contract_address or "").strip().lower()
+    if not _is_eth_address(addr):
+        return ""
+    key = (int(chain_id), addr)
+    with CONTRACT_CREATION_DATE_CACHE_LOCK:
+        cached = CONTRACT_CREATION_DATE_CACHE.get(key)
     return str(cached or "")
+
+
+def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    keys: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for r in rows:
+        try:
+            cid = int(r.get("chain_id") or 0)
+        except Exception:
+            cid = 0
+        pool_id = str(r.get("pool_id") or "").strip().lower()
+        if cid <= 0 or not _is_eth_address(pool_id):
+            continue
+        k = (cid, pool_id)
+        if k in seen:
+            continue
+        seen.add(k)
+        keys.append(k)
+    if not keys:
+        return
+    deadline = time.monotonic() + float(POSITIONS_CREATION_DATE_MAX_SECONDS)
+    workers = max(1, min(int(POSITIONS_CREATION_DATE_WORKERS), len(keys)))
+    if workers <= 1:
+        for cid, pool_id in keys:
+            if time.monotonic() >= deadline:
+                break
+            _contract_creation_date_ymd(cid, pool_id)
+    else:
+        ex = ThreadPoolExecutor(max_workers=workers)
+        futures = [ex.submit(_contract_creation_date_ymd, cid, pool_id) for cid, pool_id in keys]
+        aborted = False
+        try:
+            for fut in as_completed(futures):
+                if time.monotonic() >= deadline:
+                    aborted = True
+                    break
+                try:
+                    fut.result(timeout=0)
+                except Exception:
+                    continue
+        finally:
+            ex.shutdown(wait=not aborted, cancel_futures=aborted)
+    for r in rows:
+        try:
+            cid = int(r.get("chain_id") or 0)
+        except Exception:
+            cid = 0
+        pool_id = str(r.get("pool_id") or "").strip().lower()
+        if cid <= 0 or not pool_id:
+            continue
+        d = _contract_creation_date_peek(cid, pool_id)
+        if d:
+            r["contract_created_date"] = d
 
 
 def _scan_erc721_token_ids_by_incoming_logs(
@@ -2165,10 +2235,13 @@ def _scan_erc721_token_ids_by_ownerof_batch(
                     return out, checked, errors
         return out, checked, errors
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(_scan_chunk, tids) for tids in ranges]
+    ex = ThreadPoolExecutor(max_workers=workers)
+    futures = [ex.submit(_scan_chunk, tids) for tids in ranges]
+    aborted = False
+    try:
         for fut in as_completed(futures):
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                aborted = True
                 break
             try:
                 found, errs = fut.result()
@@ -2183,7 +2256,10 @@ def _scan_erc721_token_ids_by_ownerof_batch(
                 seen.add(tid)
                 out.append(tid)
                 if len(out) >= int(max_ids):
+                    aborted = True
                     return out, checked, errors
+    finally:
+        ex.shutdown(wait=not aborted, cancel_futures=aborted)
     return out, checked, errors
 
 
@@ -4181,7 +4257,7 @@ def _scan_pool_positions_chain(
                         "pool_liquidity": str(pool.get("liquidity") or "0"),
                         "pool_tvl_usd": tvl_usd,
                         "tvl_usd": position_tvl_usd,
-                        "contract_created_date": _contract_creation_date_cached(int(chain_id), str(pool.get("id") or "")),
+                        "contract_created_date": _contract_creation_date_peek(int(chain_id), str(pool.get("id") or "")),
                         "valuation_mode": valuation_mode,
                         "suspected_spam": bool(suspected_spam),
                     }
@@ -4228,18 +4304,20 @@ def _scan_pool_positions_chain(
                     timed_out = True
                     break
         else:
-            with ThreadPoolExecutor(max_workers=owner_workers) as owner_executor:
-                owner_futures = [
-                    owner_executor.submit(
-                        _scan_pool_positions_owner,
-                        owner,
-                        version=version,
-                        endpoint=endpoint,
-                        has_pool_liquidity=has_pool_liquidity,
-                        has_position_liquidity=has_position_liquidity,
-                    )
-                    for owner in addresses
-                ]
+            owner_executor = ThreadPoolExecutor(max_workers=owner_workers)
+            owner_futures = [
+                owner_executor.submit(
+                    _scan_pool_positions_owner,
+                    owner,
+                    version=version,
+                    endpoint=endpoint,
+                    has_pool_liquidity=has_pool_liquidity,
+                    has_position_liquidity=has_position_liquidity,
+                )
+                for owner in addresses
+            ]
+            aborted = False
+            try:
                 for owner_fut in as_completed(owner_futures):
                     try:
                         owner_rows, owner_errors, owner_debug, owner_timed_out = owner_fut.result()
@@ -4253,7 +4331,10 @@ def _scan_pool_positions_chain(
                         timed_out = True
                     if time.monotonic() >= deadline_ts:
                         timed_out = True
+                        aborted = True
                         break
+            finally:
+                owner_executor.shutdown(wait=not aborted, cancel_futures=aborted)
         if timed_out:
             break
     return rows, errors, debug_rows, timed_out
@@ -4324,11 +4405,13 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                 timed_out = True
                 break
     elif not timed_out:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(_scan_pool_positions_chain, chain_id, addresses, deadline_ts)
-                for chain_id in remaining_chain_ids
-            ]
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = [
+            executor.submit(_scan_pool_positions_chain, chain_id, addresses, deadline_ts)
+            for chain_id in remaining_chain_ids
+        ]
+        aborted = False
+        try:
             for fut in as_completed(futures):
                 try:
                     chain_rows, chain_errors, chain_debug, chain_timed_out = fut.result()
@@ -4342,6 +4425,10 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                     timed_out = True
                 if time.monotonic() >= deadline_ts:
                     timed_out = True
+                    aborted = True
+                    break
+        finally:
+            executor.shutdown(wait=not aborted, cancel_futures=aborted)
 
     # Aggregate by owner/protocol/pool id (wallet can hold multiple NFT positions in one pool).
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -4376,6 +4463,7 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
         elif not m1 and m2:
             acc["valuation_mode"] = m2
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
+    _populate_creation_dates_parallel(list(uniq.values()))
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
         dedup_errors.append(
