@@ -197,6 +197,7 @@ POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
 POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
     "1",
     "true",
@@ -3234,6 +3235,7 @@ def _query_uniswap_positions_for_owner(
     include_position_liquidity: bool = True,
     debug_steps: list[dict[str, Any]] | None = None,
     deadline_ts: float | None = None,
+    light_mode: bool = False,
 ) -> list[dict[str, Any]]:
     def _build_id_queries(owner_type: str, *, extended: bool = False) -> list[tuple[str, str]]:
         queries: list[tuple[str, str]] = [
@@ -3253,23 +3255,28 @@ def _query_uniswap_positions_for_owner(
                 }}
                 """,
             ),
-            (
-                "snapshots",
-                f"""
-                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-                  positionSnapshots(first: 200, skip: $skip, where: {{ owner: $owner }}) {{ position {{ id }} }}
-                }}
-                """,
-            ),
-            (
-                "snapshots_in",
-                f"""
-                query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-                  positionSnapshots(first: 200, skip: $skip, where: {{ owner_in: [$owner] }}) {{ position {{ id }} }}
-                }}
-                """,
-            ),
         ]
+        if not light_mode:
+            queries.extend(
+                [
+                    (
+                        "snapshots",
+                        f"""
+                        query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                          positionSnapshots(first: 200, skip: $skip, where: {{ owner: $owner }}) {{ position {{ id }} }}
+                        }}
+                        """,
+                    ),
+                    (
+                        "snapshots_in",
+                        f"""
+                        query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                          positionSnapshots(first: 200, skip: $skip, where: {{ owner_in: [$owner] }}) {{ position {{ id }} }}
+                        }}
+                        """,
+                    ),
+                ]
+            )
         if extended:
             queries.extend(
                 [
@@ -3314,7 +3321,8 @@ def _query_uniswap_positions_for_owner(
     owner_candidates: list[str] = []
     owner_no_prefix = owner_raw[2:] if owner_raw.startswith("0x") else owner_raw
     owner_no_prefix_lc = owner_no_prefix.lower()
-    for candidate in (owner_raw, owner_lc, owner_no_prefix, owner_no_prefix_lc):
+    candidates = (owner_raw, owner_lc) if light_mode else (owner_raw, owner_lc, owner_no_prefix, owner_no_prefix_lc)
+    for candidate in candidates:
         if candidate and candidate not in owner_candidates:
             owner_candidates.append(candidate)
 
@@ -3952,6 +3960,7 @@ def _scan_pool_positions_chain(
                         include_position_liquidity=has_position_liquidity,
                         debug_steps=owner_attempts,
                         deadline_ts=deadline_ts,
+                        light_mode=POSITIONS_LIGHT_GRAPH_QUERIES,
                     )
                     for _p in positions:
                         if isinstance(_p, dict) and not str(_p.get("_source") or "").strip():
@@ -3964,6 +3973,7 @@ def _scan_pool_positions_chain(
                             include_position_liquidity=True,
                             debug_steps=owner_attempts,
                             deadline_ts=deadline_ts,
+                            light_mode=POSITIONS_LIGHT_GRAPH_QUERIES,
                         )
                         for _p in positions:
                             if isinstance(_p, dict) and not str(_p.get("_source") or "").strip():
@@ -6332,7 +6342,7 @@ def _render_positions_page() -> str:
         const elapsed = Math.max(0, Math.floor((Date.now() - posScanStartedAt) / 1000));
         let phase = steps[Math.min(steps.length - 1, Math.floor(elapsed / 5))];
         const chainHint = plannedChains[Math.floor(elapsed / 4) % plannedChains.length];
-        if (elapsed >= 20) phase = "Heavy indexer/rpc responses";
+        if (elapsed >= 20) phase = "Indexer/rpc responses";
         if (elapsed >= 28) phase = "Final merge and response";
         setPosStatus(`Scanning positions... ${elapsed}s | ${phase} (${chainHint})`, false);
       };
