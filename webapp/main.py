@@ -1721,6 +1721,93 @@ def _scan_erc721_token_ids_by_recent_transfers_ownerof(
     return out
 
 
+def _scan_cl_mintposition_token_ids_by_owner(
+    chain_id: int,
+    contract: str,
+    owner: str,
+    *,
+    deadline_ts: float | None = None,
+    max_ids: int = 120,
+    lookback_blocks: int | None = None,
+) -> list[int]:
+    cid = int(chain_id)
+    c = str(contract or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(c) or not _is_eth_address(o):
+        return []
+    try:
+        latest = _eth_block_number(cid)
+    except Exception:
+        return []
+    if latest <= 0:
+        return []
+    lb = int(lookback_blocks) if lookback_blocks is not None else int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS)
+    min_block = max(0, int(latest) - max(1, lb))
+    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
+    # event MintPosition(uint256 indexed tokenId)
+    topic_mint = "0x591c0e8a7de1f037c433d7f8f0f5cae4460ed28e9ca9f6f778dfec51dff7d8f7"
+    owner_word = _encode_address_word(o)[-40:]
+    end_block = int(latest)
+    out: list[int] = []
+    seen: set[int] = set()
+    while end_block >= min_block:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        start_block = max(min_block, end_block - step + 1)
+        params = {
+            "address": c,
+            "fromBlock": hex(int(start_block)),
+            "toBlock": hex(int(end_block)),
+            "topics": [topic_mint],
+        }
+        try:
+            logs = _eth_get_logs(cid, params)
+        except Exception:
+            if step > 5000:
+                step = max(5000, step // 2)
+                continue
+            logs = []
+        logs_sorted = sorted(
+            logs,
+            key=lambda x: (
+                int(str(x.get("blockNumber") or "0x0"), 16),
+                int(str(x.get("logIndex") or "0x0"), 16),
+            ),
+            reverse=True,
+        )
+        for lg in logs_sorted:
+            topics = lg.get("topics") or []
+            tid = 0
+            try:
+                if isinstance(topics, list) and len(topics) >= 2:
+                    tid = int(str(topics[1]), 16)
+                elif str(lg.get("data") or "").startswith("0x"):
+                    words = _hex_words(str(lg.get("data") or "0x"))
+                    if words:
+                        tid = int(words[0], 16)
+            except Exception:
+                tid = 0
+            if tid <= 0 or tid in seen:
+                continue
+            seen.add(tid)
+            try:
+                owner_data = "0x6352211e" + _encode_uint_word(tid)
+                owner_hex = _eth_call_hex(cid, c, owner_data)
+                owner_words = _hex_words(owner_hex)
+                if not owner_words:
+                    continue
+                current_owner = owner_words[0][-40:].lower()
+                if current_owner != owner_word:
+                    continue
+            except Exception:
+                continue
+            out.append(int(tid))
+            if len(out) >= int(max_ids):
+                return out
+        end_block = int(start_block) - 1
+    return out
+
+
 def _scan_erc721_token_ids_by_explorer_api(
     chain_id: int,
     contract: str,
@@ -2241,6 +2328,9 @@ def _scan_infinity_position_ids_for_owner(
                 "explorer_token_ids": 0,
                 "explorer_ownerof_checked": 0,
                 "explorer_ownerof_matched": 0,
+                "mint_log_ids": 0,
+                "mint_log_ownerof_checked": 0,
+                "mint_log_ownerof_matched": 0,
                 "total_supply": 0,
                 "tokenbyindex_checked": 0,
                 "tokenbyindex_matched": 0,
@@ -2434,6 +2524,30 @@ def _scan_infinity_position_ids_for_owner(
             token_ids.append(int(tid))
             if dbg is not None:
                 dbg["explorer_ownerof_matched"] = int(dbg.get("explorer_ownerof_matched") or 0) + 1
+    if len(token_ids) < limit and balance > 0:
+        # CL-specific event fallback: MintPosition(tokenId) + ownerOf verification.
+        mint_ids = _scan_cl_mintposition_token_ids_by_owner(
+            cid,
+            pm,
+            owner,
+            deadline_ts=deadline_ts,
+            max_ids=max(limit * 8, limit),
+            lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 30_000_000),
+        )
+        if dbg is not None:
+            dbg["mint_log_ids"] = len(mint_ids)
+            dbg["mint_log_ownerof_checked"] = len(mint_ids)
+        for tid in mint_ids:
+            if len(token_ids) >= limit:
+                break
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            if int(tid) in seen_ids:
+                continue
+            seen_ids.add(int(tid))
+            token_ids.append(int(tid))
+            if dbg is not None:
+                dbg["mint_log_ownerof_matched"] = int(dbg.get("mint_log_ownerof_matched") or 0) + 1
     if token_ids or enumerable_ok:
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
@@ -5930,6 +6044,9 @@ def _render_positions_page() -> str:
               + `explorer_ids=${Number(d.explorer_token_ids || 0)} `
               + `explorer_checked=${Number(d.explorer_ownerof_checked || 0)} `
               + `explorer_match=${Number(d.explorer_ownerof_matched || 0)} `
+              + `mint_ids=${Number(d.mint_log_ids || 0)} `
+              + `mint_checked=${Number(d.mint_log_ownerof_checked || 0)} `
+              + `mint_match=${Number(d.mint_log_ownerof_matched || 0)} `
               + `supply=${Number(d.total_supply || 0)} `
               + `tbi_checked=${Number(d.tokenbyindex_checked || 0)} `
               + `tbi_match=${Number(d.tokenbyindex_matched || 0)} `
