@@ -190,7 +190,7 @@ POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS = max(20000, int(os.environ.get("POSITIONS_
 POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "150000")))
 POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS = max(20, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS", "120")))
 POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS = max(10, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS", "60")))
-POSITIONS_ENABLE_INFINITY = os.environ.get("POSITIONS_ENABLE_INFINITY", "0").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_ENABLE_INFINITY = os.environ.get("POSITIONS_ENABLE_INFINITY", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_HEAVY_METHODS = os.environ.get("POSITIONS_INFINITY_HEAVY_METHODS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
@@ -3256,27 +3256,7 @@ def _query_uniswap_positions_for_owner(
                 """,
             ),
         ]
-        if not light_mode:
-            queries.extend(
-                [
-                    (
-                        "snapshots",
-                        f"""
-                        query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-                          positionSnapshots(first: 200, skip: $skip, where: {{ owner: $owner }}) {{ position {{ id }} }}
-                        }}
-                        """,
-                    ),
-                    (
-                        "snapshots_in",
-                        f"""
-                        query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-                          positionSnapshots(first: 200, skip: $skip, where: {{ owner_in: [$owner] }}) {{ position {{ id }} }}
-                        }}
-                        """,
-                    ),
-                ]
-            )
+        # snapshots* queries are intentionally disabled: they are expensive and noisy.
         if extended:
             queries.extend(
                 [
@@ -3305,13 +3285,13 @@ def _query_uniswap_positions_for_owner(
                         """,
                     ),
                     (
-                        "snapshots_rel",
+                        "positions_rel_in",
                         f"""
                         query UserPositions($owner: {owner_type}!, $skip: Int!) {{
-                          positionSnapshots(first: 200, skip: $skip, where: {{ owner_: {{ id: $owner }} }}) {{ position {{ id }} }}
+                          positions(first: 200, skip: $skip, where: {{ owner_: {{ id_in: [$owner] }} }}) {{ id }}
                         }}
                         """,
-                    ),
+                    )
                 ]
             )
         return queries
@@ -3369,7 +3349,7 @@ def _query_uniswap_positions_for_owner(
     if POSITIONS_TRY_BYTES_TYPE:
         owner_types_primary.append("Bytes")
     query_sets_primary = [(x, _build_id_queries(x, extended=False)) for x in owner_types_primary]
-    query_sets_extended = [(x, _build_id_queries(x, extended=True)) for x in ["ID", "String", "Bytes"]]
+    query_sets_extended = [] if light_mode else [(x, _build_id_queries(x, extended=True)) for x in ["ID", "String", "Bytes"]]
     attempts_count = 0
     found_ids: list[str] = []
     for owner_value in owner_candidates:
@@ -3427,7 +3407,7 @@ def _query_uniswap_positions_for_owner(
             return bool(found_ids)
 
         _run_query_sets(query_sets_primary)
-        if not found_ids and POSITIONS_EXTENDED_QUERY_FALLBACK and (deadline_ts is None or time.monotonic() < deadline_ts):
+        if query_sets_extended and not found_ids and POSITIONS_EXTENDED_QUERY_FALLBACK and (deadline_ts is None or time.monotonic() < deadline_ts):
             _run_query_sets(query_sets_extended)
         if found_ids:
             break
@@ -3858,7 +3838,7 @@ def _scan_pool_positions_chain(
 
         # Pancake Infinity CL positions live in a dedicated position manager and are
         # not visible through Uniswap-v3/v4 subgraph queries.
-        if POSITIONS_ENABLE_INFINITY and version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
+        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
             try:
                 infinity_cl_debug: dict[str, Any] = {}
                 infinity_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
@@ -3899,7 +3879,7 @@ def _scan_pool_positions_chain(
                     }
                 )
 
-        if POSITIONS_ENABLE_INFINITY and version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
+        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
             try:
                 infinity_bin_debug: dict[str, Any] = {}
                 infinity_bin_positions = _scan_pancake_infinity_bin_positions_onchain(
