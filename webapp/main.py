@@ -1547,7 +1547,7 @@ def _scan_pancake_infinity_cl_positions_graph(
         return []
     # Basic Infinity CL positions query by owner; schema is similar to v3 positions.
     query = """
-    query InfinityPositions($owner: String!, $skip: Int!) {
+    query InfinityPositions($owner: Bytes!, $skip: Int!) {
       positions(first: 200, skip: $skip, where: { owner: $owner }) {
         id
         liquidity
@@ -2463,6 +2463,11 @@ def _owner_has_any_position_nft_balance(chain_id: int, owner: str) -> bool:
     o = str(owner or "").strip().lower()
     if not _is_eth_address(o):
         return False
+    # Only apply strict precheck on chains where we know it helps
+    # with Infinity/Pancake load (BSC/Base). For other chains rely
+    # on graph/on-chain discovery.
+    if int(chain_id) not in (56, 8453):
+        return True
     managers = _position_manager_contracts_for_chain(int(chain_id))
     if not managers:
         return True
@@ -3916,8 +3921,14 @@ def _scan_pool_positions_chain(
     if not chain_key:
         return rows, errors, debug_rows, timed_out
     owner_has_nft_balance: dict[str, bool] = {}
-    for owner in addresses:
-        owner_has_nft_balance[str(owner).strip().lower()] = _owner_has_any_position_nft_balance(int(chain_id), owner)
+    # Owner-level NFT balance precheck имеет смысл только там, где он реально нужен
+    # для Infinity/нагрузки — на BSC и Base. Для остальных v3-сетей не режем скан.
+    if int(chain_id) in (56, 8453):
+        for owner in addresses:
+            owner_has_nft_balance[str(owner).strip().lower()] = _owner_has_any_position_nft_balance(int(chain_id), owner)
+    else:
+        for owner in addresses:
+            owner_has_nft_balance[str(owner).strip().lower()] = True
 
     def _scan_pool_positions_owner(
         owner: str,
@@ -4163,46 +4174,6 @@ def _scan_pool_positions_chain(
                     if pid:
                         seen.add(pid)
                     positions.append(p)
-            # Only fall back to on-chain discovery if graph returned nothing and we still have time.
-            elif time.monotonic() < deadline_ts:
-                try:
-                    infinity_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
-                        owner,
-                        int(chain_id),
-                        deadline_ts=deadline_ts,
-                        debug_out=infinity_cl_debug,
-                    )
-                    owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "onchain",
-                            "query_mode": "onchain_pancake_infinity_cl",
-                            "count": len(infinity_cl_positions),
-                            "ok": True,
-                            "infinity_debug": infinity_cl_debug,
-                        }
-                    )
-                    if infinity_cl_positions:
-                        seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
-                        for p in infinity_cl_positions:
-                            pid = str((p or {}).get("id") or "")
-                            if pid and pid in seen:
-                                continue
-                            if pid:
-                                seen.add(pid)
-                            positions.append(p)
-                except Exception as e:
-                    owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "onchain",
-                            "query_mode": "onchain_pancake_infinity_cl",
-                            "count": 0,
-                            "ok": False,
-                            "error": str(e)[:220],
-                            "infinity_debug": infinity_cl_debug,
-                        }
-                    )
 
         if version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
             try:
