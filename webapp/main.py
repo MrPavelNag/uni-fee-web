@@ -266,6 +266,12 @@ POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
     for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161,8453,130,56").split(",")
     if x.strip().isdigit()
 }
+POSITIONS_DISABLE_V3_PREFETCH = os.environ.get("POSITIONS_DISABLE_V3_PREFETCH", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
 TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
@@ -2447,6 +2453,29 @@ def _enrich_tvl_background(rows: list[dict[str, Any]], max_seconds: int = 25) ->
             touched += 1
         except Exception:
             continue
+
+
+def _enrich_missing_creation_dates(rows: list[dict[str, Any]], max_seconds: int = 40, max_rows: int = 400) -> None:
+    if not rows:
+        return
+    deadline = time.monotonic() + max(5, int(max_seconds))
+    checked = 0
+    for r in rows:
+        if checked >= int(max_rows) or time.monotonic() >= deadline:
+            break
+        if str(r.get("contract_created_date") or "").strip() not in {"", "-"}:
+            continue
+        try:
+            cid = int(r.get("chain_id") or 0)
+        except Exception:
+            cid = 0
+        pool_id = str(r.get("pool_id") or "").strip().lower()
+        if cid <= 0 or not _is_eth_address(pool_id):
+            continue
+        d = _contract_creation_date_ymd(cid, pool_id)
+        if d:
+            r["contract_created_date"] = d
+        checked += 1
 
 
 def _scan_erc721_token_ids_by_incoming_logs(
@@ -4631,15 +4660,16 @@ def _scan_pool_positions_chain(
             }, True
         owner_key = str(owner).strip().lower()
         owner_has_nft = bool(owner_has_nft_balance.get(owner_key, True))
-        owner_attempts.append(
-            {
-                "owner_value": owner,
-                "owner_type": "onchain",
-                "query_mode": "owner_nft_balance_precheck",
-                "count": 1 if owner_has_nft else 0,
-                "ok": True,
-            }
-        )
+        if int(chain_id) in (56, 8453):
+            owner_attempts.append(
+                {
+                    "owner_value": owner,
+                    "owner_type": "onchain",
+                    "query_mode": "owner_nft_balance_precheck",
+                    "count": 1 if owner_has_nft else 0,
+                    "ok": True,
+                }
+            )
         if version == "v3" and not owner_has_nft:
             owner_debug = {
                 "chain": chain_key,
@@ -4664,6 +4694,7 @@ def _scan_pool_positions_chain(
             version == "v3"
             and int(chain_id) in UNISWAP_V3_NPM_BY_CHAIN_ID
             and int(chain_id) in POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS
+            and not POSITIONS_DISABLE_V3_PREFETCH
         ):
             try:
                 onchain_prefetch = _scan_v3_positions_onchain(
@@ -7733,9 +7764,6 @@ def _render_positions_page() -> str:
           localStorage.setItem(POS_HIDDEN_EXPANDED_KEY, detailsEl.open ? "1" : "0");
         });
       }
-      if (hiddenRows.length > 0) {
-        setPosStatus(`Showing ${visible.length} pools (+ ${hiddenRows.length} hidden)`, false);
-      }
     }
     const POS_ACTIVE_JOB_KEY = "positions_active_job_v1";
     function saveActivePosJob(jobId) {
@@ -7747,7 +7775,7 @@ def _render_positions_page() -> str:
     function loadActivePosJob() {
       try { return String(localStorage.getItem(POS_ACTIVE_JOB_KEY) || "").trim(); } catch (_) { return ""; }
     }
-    async function pollPosJob(jobId) {
+    async function pollPosJob(jobId, allowPartialReturn = false) {
       const jid = String(jobId || "").trim();
       if (!jid) throw new Error("Missing job id");
       let partialRendered = false;
@@ -7767,6 +7795,9 @@ def _render_positions_page() -> str:
         }
         if (st === "done") return data.result || {};
         if (st === "failed") throw new Error(data.error || "Scan failed");
+        if (allowPartialReturn && partialRendered && String(data.stage || "").startsWith("enrich_")) {
+          return Object.assign({__partial: true}, partial);
+        }
         if (partialRendered) {
           setPosStatus(`${stageLabel || "Background scan"}... ${progress}% (table updates live)`, false);
         } else {
@@ -7776,6 +7807,7 @@ def _render_positions_page() -> str:
       }
     }
     async function scanPositions(targetSection = "all") {
+      let handoffToBackground = false;
       if (posHasScannedOnce) {
         const ok = window.confirm("Run scan again and replace current results?");
         if (!ok) return;
@@ -7810,7 +7842,13 @@ def _render_positions_page() -> str:
         const jobId = String(startData.job_id || "").trim();
         if (!jobId) throw new Error("Invalid job id");
         saveActivePosJob(jobId);
-        const data = await pollPosJob(jobId);
+        const data = await pollPosJob(jobId, true);
+        if (data && data.__partial) {
+          handoffToBackground = true;
+          setPosStatus("Base results loaded. Background enrichment continues...", false);
+          setTimeout(() => { resumePosJobIfAny(); }, 900);
+          return;
+        }
         saveActivePosJob("");
         posCache.pools = data.pool_positions || [];
         renderPools(posCache.pools);
@@ -7830,8 +7868,10 @@ def _render_positions_page() -> str:
         saveActivePosJob("");
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
       } finally {
-        stopPosScanProgressTicker();
-        setPosBusy(false);
+        if (!handoffToBackground) {
+          stopPosScanProgressTicker();
+          setPosBusy(false);
+        }
       }
     }
     async function resumePosJobIfAny() {
@@ -8344,11 +8384,16 @@ def _render_admin_page() -> str:
           <div><b>Total records:</b> <span id="idxRecordsTotal">-</span></div>
           <div><b>Total owners:</b> <span id="idxOwnersTotal">-</span></div>
           <div><b>Running now:</b> <span id="idxRunningNow">-</span></div>
+          <div><b>Elapsed:</b> <span id="idxElapsedNow">-</span></div>
           <div><b>Progress:</b> <span id="idxProgressNow">-</span></div>
           <div><b>Current owner:</b> <span id="idxCurrentOwner">-</span></div>
           <div><b>Last run:</b> <span id="idxLastRun">-</span></div>
           <div><b>Last status:</b> <span id="idxLastStatus">-</span></div>
           <div><b>Last details:</b> <span id="idxLastDetails">-</span></div>
+        </div>
+        <div style="margin-top:8px">
+          <div style="font-weight:700;font-size:13px;color:#334155;margin-bottom:4px">Indexer debug log (recent)</div>
+          <pre id="idxDebugLog" style="max-height:160px;overflow:auto;margin:0">-</pre>
         </div>
         <span id="idxStatus" class="status">Ready</span>
       </section>
@@ -8518,12 +8563,36 @@ def _render_admin_page() -> str:
       const targets = Number(a.targets || 0);
       const updated = Number(a.updated || 0);
       const errors = Number(a.errors || 0);
+      const startedAt = Number(a.started_at || 0);
+      const elapsedSec = running && startedAt > 0 ? Math.max(0, Math.floor((Date.now()/1000) - startedAt)) : 0;
+      document.getElementById("idxElapsedNow").textContent = running ? `${{elapsedSec}}s` : "-";
       document.getElementById("idxProgressNow").textContent = running ? `${{processed}}/${{targets}} | updated=${{updated}} errors=${{errors}}` : "-";
       document.getElementById("idxCurrentOwner").textContent = running ? (a.current_owner || "-") : "-";
       document.getElementById("idxLastRun").textContent = d.last_run_at || "-";
       document.getElementById("idxLastStatus").textContent = d.last_run_status || "-";
       document.getElementById("idxLastDetails").textContent = d.last_run_details || "-";
       if (running) setIndexerStatus(`Indexer running: ${{processed}}/${{targets}}`, false);
+    }}
+    function renderIndexerRuns(items) {{
+      const el = document.getElementById("idxDebugLog");
+      if (!el) return;
+      const rows = (items || []).slice(0, 12).map((r) => {{
+        const ts = String(r.ts || "-");
+        const st = String(r.status || "-");
+        const d = String(r.details || "");
+        return `[${{ts}}] ${{st}}  ${{d}}`;
+      }});
+      el.textContent = rows.length ? rows.join("\\n") : "-";
+    }}
+    async function loadIndexerRuns() {{
+      try {{
+        const r = await fetch("/api/admin/indexers/runs?name=infinity_bsc&limit=20");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Failed to load indexer runs");
+        renderIndexerRuns(data.items || []);
+      }} catch (_) {{
+        renderIndexerRuns([]);
+      }}
     }}
     async function loadIndexers() {{
       try {{
@@ -8538,6 +8607,7 @@ def _render_admin_page() -> str:
         }} else {{
           setIndexerStatus("Loaded", false);
         }}
+        await loadIndexerRuns();
       }} catch (e) {{
         setIndexerStatus("Load failed: " + (e?.message || "unknown"), true);
       }}
@@ -8569,7 +8639,11 @@ def _render_admin_page() -> str:
         const data = await postJson("/api/admin/indexers/run", {{ name: "infinity_bsc", owner, chain_id: chainId }});
         if (data?.item) renderIndexerCard(data.item);
         const run = data?.run || {{}};
-        setIndexerStatus(`Done: merged=${{Number(run.merged_ids || 0)}}, checked=${{Number(run.receipt_checked || 0)}}`, false);
+        if (data?.started) {{
+          setIndexerStatus("Started in background. You can switch pages.", false);
+        }} else {{
+          setIndexerStatus(`Done: merged=${{Number(run.merged_ids || 0)}}, checked=${{Number(run.receipt_checked || 0)}}`, false);
+        }}
       }} catch (e) {{
         setIndexerStatus("Run failed: " + (e?.message || "unknown"), true);
       }}
@@ -9654,6 +9728,24 @@ def admin_indexers(request: Request, response: Response) -> dict[str, Any]:
     return {"ok": True, "items": [_indexer_summary("infinity_bsc")]}
 
 
+@app.get("/api/admin/indexers/runs")
+def admin_indexer_runs(
+    request: Request,
+    response: Response,
+    name: str = "infinity_bsc",
+    limit: int = 20,
+) -> dict[str, Any]:
+    _require_admin(request, response)
+    lim = max(1, min(200, int(limit)))
+    with _analytics_conn() as conn:
+        rows = conn.execute(
+            "SELECT ts, status, details FROM indexer_runs WHERE name = ? ORDER BY id DESC LIMIT ?",
+            (str(name or "infinity_bsc"), lim),
+        ).fetchall()
+    items = [{"ts": str(r[0] or ""), "status": str(r[1] or ""), "details": str(r[2] or "")} for r in rows]
+    return {"ok": True, "items": items, "count": len(items)}
+
+
 @app.post("/api/admin/indexers/config")
 def admin_indexers_config(req: AdminIndexerUpdate, request: Request, response: Response) -> dict[str, Any]:
     _require_admin(request, response)
@@ -9673,6 +9765,27 @@ def admin_indexers_config(req: AdminIndexerUpdate, request: Request, response: R
     return {"ok": True, "item": _indexer_summary("infinity_bsc")}
 
 
+def _run_indexer_owner_task(chain_id: int, owner: str, max_receipts: int) -> None:
+    if not INDEXER_LOCK.acquire(blocking=False):
+        _indexer_log_run("infinity_bsc", "skip", "manual run skipped: busy")
+        return
+    try:
+        _indexer_activity_start("infinity_bsc", 1)
+        run_stats = _update_infinity_index_for_owner(int(chain_id), owner, max_receipts=int(max_receipts))
+        _indexer_activity_tick(int(chain_id), owner, updated_inc=int(run_stats.get("merged_ids") or 0), error_inc=0)
+        _indexer_log_run(
+            "infinity_bsc",
+            "ok",
+            f"manual owner={owner} chain={chain_id} merged={run_stats.get('merged_ids', 0)} checked={run_stats.get('receipt_checked', 0)}",
+        )
+    except Exception as e:
+        _indexer_activity_tick(int(chain_id), owner, updated_inc=0, error_inc=1)
+        _indexer_log_run("infinity_bsc", "error", f"manual owner={owner} chain={chain_id} error={str(e)[:220]}")
+    finally:
+        _indexer_activity_stop()
+        INDEXER_LOCK.release()
+
+
 @app.post("/api/admin/indexers/run")
 def admin_indexers_run(req: AdminIndexerRunRequest, request: Request, response: Response) -> dict[str, Any]:
     _require_admin(request, response)
@@ -9685,29 +9798,16 @@ def admin_indexers_run(req: AdminIndexerRunRequest, request: Request, response: 
     if max_receipts is None:
         cfg = _indexer_get("infinity_bsc")
         max_receipts = int(cfg.get("max_receipts") or INFINITY_INDEXER_MAX_RECEIPTS)
-    if not INDEXER_LOCK.acquire(blocking=False):
+    if _indexer_activity_snapshot().get("running"):
         raise HTTPException(status_code=409, detail="Indexer is already running. Please wait until it finishes.")
-    try:
-        _indexer_activity_start("infinity_bsc", 1)
-        run_stats = _update_infinity_index_for_owner(int(req.chain_id), owner, max_receipts=int(max_receipts))
-        _indexer_activity_tick(int(req.chain_id), owner, updated_inc=int(run_stats.get("merged_ids") or 0), error_inc=0)
-        _indexer_log_run(
-            "infinity_bsc",
-            "ok",
-            f"manual owner={owner} chain={req.chain_id} merged={run_stats.get('merged_ids', 0)} checked={run_stats.get('receipt_checked', 0)}",
-        )
-        return {"ok": True, "run": run_stats, "item": _indexer_summary("infinity_bsc")}
-    except HTTPException as e:
-        _indexer_activity_tick(int(req.chain_id), owner, updated_inc=0, error_inc=1)
-        _indexer_log_run("infinity_bsc", "error", f"manual owner={owner} chain={req.chain_id} error={e.detail}")
-        raise
-    except Exception as e:
-        _indexer_activity_tick(int(req.chain_id), owner, updated_inc=0, error_inc=1)
-        _indexer_log_run("infinity_bsc", "error", f"manual owner={owner} chain={req.chain_id} error={str(e)[:220]}")
-        raise HTTPException(status_code=500, detail=f"Indexer run failed: {e}") from e
-    finally:
-        _indexer_activity_stop()
-        INDEXER_LOCK.release()
+    t = threading.Thread(
+        target=_run_indexer_owner_task,
+        args=(int(req.chain_id), owner, int(max_receipts)),
+        daemon=True,
+        name="indexer-manual-owner-run",
+    )
+    t.start()
+    return {"ok": True, "started": True, "item": _indexer_summary("infinity_bsc")}
 
 
 @app.get("/api/positions/chains")
@@ -9882,6 +9982,7 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
         pool_rows = result.get("pool_positions") or []
         if isinstance(pool_rows, list) and pool_rows:
             _populate_creation_dates_parallel(pool_rows)
+            _enrich_missing_creation_dates(pool_rows, max_seconds=45, max_rows=500)
             with POS_JOB_LOCK:
                 job = POS_JOBS.get(job_id)
                 if job:
