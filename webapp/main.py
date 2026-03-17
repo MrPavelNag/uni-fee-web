@@ -250,6 +250,9 @@ UNISWAP_V3_FACTORY_BY_CHAIN_ID: dict[int, str] = {
 V3_PROTOCOL_LABEL_BY_CHAIN_ID: dict[int, str] = {
     56: "pancake_v3",
 }
+INFINITY_CL_SUBGRAPH_BY_CHAIN_ID: dict[int, str] = {
+    56: "https://api.thegraph.com/subgraphs/id/8jFYxwKP8tNGSDisucpHRK1ojUchZd7ELd8zh2ugHGDN",
+}
 PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID: dict[int, str] = {
     56: "0x556b9306565093c855aea9ae92a594704c2cd59e",
     1: "0x556b9306565093c855aea9ae92a594704c2cd59e",
@@ -1527,6 +1530,96 @@ def _json_rpc_batch_call(chain_id: int, payloads: list[dict[str, Any]]) -> list[
         except Exception as e:
             last_err = str(e)
     raise RuntimeError(last_err)
+
+
+def _scan_pancake_infinity_cl_positions_graph(
+    owner: str,
+    chain_id: int,
+    *,
+    deadline_ts: float | None = None,
+) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    ep = INFINITY_CL_SUBGRAPH_BY_CHAIN_ID.get(cid)
+    owner_raw = str(owner or "").strip()
+    if not ep or not _is_eth_address(owner_raw):
+        return []
+    if deadline_ts is not None and time.monotonic() >= deadline_ts:
+        return []
+    # Basic Infinity CL positions query by owner; schema is similar to v3 positions.
+    query = """
+    query InfinityPositions($owner: String!, $skip: Int!) {
+      positions(first: 200, skip: $skip, where: { owner: $owner }) {
+        id
+        liquidity
+        tickLower
+        tickUpper
+        pool {
+          id
+          feeTier
+          liquidity
+          sqrtPrice
+          token0Price
+          totalValueLockedUSD
+          token0 { id decimals symbol }
+          token1 { id decimals symbol }
+        }
+      }
+    }
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    skip = 0
+    while True:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        data = graphql_query(ep, query, {"owner": owner_raw.lower(), "skip": skip}, retries=1)
+        rows = ((data.get("data") or {}).get("positions") or []) or []
+        if not rows:
+            break
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            pid = str(r.get("id") or "").strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            pool = r.get("pool") or {}
+            t0 = pool.get("token0") or {}
+            t1 = pool.get("token1") or {}
+            pos_liq = str(r.get("liquidity") or "0")
+            out.append(
+                {
+                    "id": f"inf-cl:{pid}",
+                    "liquidity": pos_liq,
+                    "tickLower": {"tickIdx": str(r.get("tickLower") or "0")},
+                    "tickUpper": {"tickIdx": str(r.get("tickUpper") or "0")},
+                    "pool": {
+                        "id": str(pool.get("id") or "").strip().lower(),
+                        "feeTier": str(pool.get("feeTier") or "0"),
+                        "liquidity": str(pool.get("liquidity") or "0"),
+                        "sqrtPrice": str(pool.get("sqrtPrice") or "0"),
+                        "token0Price": str(pool.get("token0Price") or "0"),
+                        "totalValueLockedUSD": str(pool.get("totalValueLockedUSD") or "0"),
+                        "token0": {
+                            "id": str(t0.get("id") or "").strip().lower(),
+                            "decimals": str(t0.get("decimals") or "18"),
+                            "symbol": str(t0.get("symbol") or "") or None,
+                        },
+                        "token1": {
+                            "id": str(t1.get("id") or "").strip().lower(),
+                            "decimals": str(t1.get("decimals") or "18"),
+                            "symbol": str(t1.get("symbol") or "") or None,
+                        },
+                    },
+                    "_protocol_label": "pancake_infinity_cl",
+                    "_source": "graph_pancake_infinity_cl",
+                    "_skip_enrich": True,
+                }
+            )
+        if len(rows) < 200:
+            break
+        skip += 200
+    return out
 
 
 def _eth_call_hex(chain_id: int, to: str, data_hex: str) -> str:
@@ -4039,48 +4132,77 @@ def _scan_pool_positions_chain(
                             "error": str(e)[:220],
                         }
                     )
-        # Run Pancake Infinity at the very end so it cannot starve
-        # normal v3/v4 discovery paths.
+        # Run Pancake Infinity at the very end so it cannot starve normal v3/v4 discovery.
         if version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
+            infinity_cl_debug: dict[str, Any] = {}
+            graph_positions: list[dict[str, Any]] = []
             try:
-                infinity_cl_debug: dict[str, Any] = {}
-                infinity_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
+                graph_positions = _scan_pancake_infinity_cl_positions_graph(
                     owner,
                     int(chain_id),
                     deadline_ts=deadline_ts,
-                    debug_out=infinity_cl_debug,
                 )
+            except Exception as e:
+                infinity_cl_debug["graph_error"] = str(e)[:220]
+            if graph_positions:
                 owner_attempts.append(
                     {
                         "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_infinity_cl",
-                        "count": len(infinity_cl_positions),
+                        "owner_type": "graph",
+                        "query_mode": "graph_pancake_infinity_cl",
+                        "count": len(graph_positions),
                         "ok": True,
                         "infinity_debug": infinity_cl_debug,
                     }
                 )
-                if infinity_cl_positions:
-                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
-                    for p in infinity_cl_positions:
-                        pid = str((p or {}).get("id") or "")
-                        if pid and pid in seen:
-                            continue
-                        if pid:
-                            seen.add(pid)
-                        positions.append(p)
-            except Exception as e:
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_infinity_cl",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                        "infinity_debug": infinity_cl_debug,
-                    }
-                )
+                seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                for p in graph_positions:
+                    pid = str((p or {}).get("id") or "")
+                    if pid and pid in seen:
+                        continue
+                    if pid:
+                        seen.add(pid)
+                    positions.append(p)
+            # Only fall back to on-chain discovery if graph returned nothing and we still have time.
+            elif time.monotonic() < deadline_ts:
+                try:
+                    infinity_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
+                        owner,
+                        int(chain_id),
+                        deadline_ts=deadline_ts,
+                        debug_out=infinity_cl_debug,
+                    )
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "onchain",
+                            "query_mode": "onchain_pancake_infinity_cl",
+                            "count": len(infinity_cl_positions),
+                            "ok": True,
+                            "infinity_debug": infinity_cl_debug,
+                        }
+                    )
+                    if infinity_cl_positions:
+                        seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                        for p in infinity_cl_positions:
+                            pid = str((p or {}).get("id") or "")
+                            if pid and pid in seen:
+                                continue
+                            if pid:
+                                seen.add(pid)
+                            positions.append(p)
+                except Exception as e:
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "onchain",
+                            "query_mode": "onchain_pancake_infinity_cl",
+                            "count": 0,
+                            "ok": False,
+                            "error": str(e)[:220],
+                            "infinity_debug": infinity_cl_debug,
+                        }
+                    )
 
         if version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
             try:
