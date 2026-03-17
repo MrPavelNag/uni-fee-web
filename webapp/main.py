@@ -1639,6 +1639,88 @@ def _scan_erc721_token_ids_by_incoming_logs(
     return out
 
 
+def _scan_erc721_token_ids_by_recent_transfers_ownerof(
+    chain_id: int,
+    contract: str,
+    owner: str,
+    *,
+    deadline_ts: float | None = None,
+    max_ids: int = 120,
+    lookback_blocks: int | None = None,
+) -> list[int]:
+    cid = int(chain_id)
+    c = str(contract or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(c) or not _is_eth_address(o):
+        return []
+    try:
+        latest = _eth_block_number(cid)
+    except Exception:
+        return []
+    if latest <= 0:
+        return []
+    lb = int(lookback_blocks) if lookback_blocks is not None else int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS)
+    min_block = max(0, int(latest) - max(1, lb))
+    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
+    topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    owner_word = _encode_address_word(o)[-40:]
+    end_block = int(latest)
+    out: list[int] = []
+    seen_candidates: set[int] = set()
+    while end_block >= min_block:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        start_block = max(min_block, end_block - step + 1)
+        params = {
+            "address": c,
+            "fromBlock": hex(int(start_block)),
+            "toBlock": hex(int(end_block)),
+            "topics": [topic_transfer],
+        }
+        try:
+            logs = _eth_get_logs(cid, params)
+        except Exception:
+            if step > 5000:
+                step = max(5000, step // 2)
+                continue
+            logs = []
+        logs_sorted = sorted(
+            logs,
+            key=lambda x: (
+                int(str(x.get("blockNumber") or "0x0"), 16),
+                int(str(x.get("logIndex") or "0x0"), 16),
+            ),
+            reverse=True,
+        )
+        for lg in logs_sorted:
+            topics = lg.get("topics") or []
+            if not isinstance(topics, list) or len(topics) < 4:
+                continue
+            try:
+                tid = int(str(topics[3]), 16)
+            except Exception:
+                continue
+            if tid <= 0 or tid in seen_candidates:
+                continue
+            seen_candidates.add(tid)
+            try:
+                owner_data = "0x6352211e" + _encode_uint_word(tid)
+                owner_hex = _eth_call_hex(cid, c, owner_data)
+                owner_words = _hex_words(owner_hex)
+                if not owner_words:
+                    continue
+                current_owner = owner_words[0][-40:].lower()
+                if current_owner != owner_word:
+                    continue
+            except Exception:
+                continue
+            out.append(int(tid))
+            if len(out) >= int(max_ids):
+                return out
+        end_block = int(start_block) - 1
+    return out
+
+
 def _encode_address_word(addr: str) -> str:
     raw = str(addr or "").strip().lower()
     if not raw.startswith("0x"):
@@ -2097,6 +2179,9 @@ def _scan_infinity_position_ids_for_owner(
                 "ownerof_mismatched_from_logs": 0,
                 "ownerof_errors_from_logs": 0,
                 "deep_log_token_ids": 0,
+                "recent_transfer_token_ids": 0,
+                "recent_transfer_ownerof_checked": 0,
+                "recent_transfer_ownerof_matched": 0,
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -2226,6 +2311,31 @@ def _scan_infinity_position_ids_for_owner(
                 dbg["ownerof_matched_from_logs"] = int(dbg.get("ownerof_matched_from_logs") or 0) + 1
             seen_ids.add(int(tid))
             token_ids.append(int(tid))
+    if len(token_ids) < limit and balance > 0:
+        # Independent fallback: walk recent Transfer logs for this NFT contract
+        # and validate candidates via ownerOf, without filtering logs by owner.
+        recent_ids = _scan_erc721_token_ids_by_recent_transfers_ownerof(
+            cid,
+            pm,
+            owner,
+            deadline_ts=deadline_ts,
+            max_ids=max(limit * 8, limit),
+            lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 30_000_000),
+        )
+        if dbg is not None:
+            dbg["recent_transfer_token_ids"] = len(recent_ids)
+            dbg["recent_transfer_ownerof_checked"] = len(recent_ids)
+        for tid in recent_ids:
+            if len(token_ids) >= limit:
+                break
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            if int(tid) in seen_ids:
+                continue
+            seen_ids.add(int(tid))
+            token_ids.append(int(tid))
+            if dbg is not None:
+                dbg["recent_transfer_ownerof_matched"] = int(dbg.get("recent_transfer_ownerof_matched") or 0) + 1
     if token_ids or enumerable_ok:
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
@@ -5673,6 +5783,9 @@ def _render_positions_page() -> str:
               + `ownerOf_mismatch=${Number(d.ownerof_mismatched_from_logs || 0)} `
               + `ownerOf_err=${Number(d.ownerof_errors_from_logs || 0)} `
               + `deep_log_ids=${Number(d.deep_log_token_ids || 0)} `
+              + `recent_ids=${Number(d.recent_transfer_token_ids || 0)} `
+              + `recent_checked=${Number(d.recent_transfer_ownerof_checked || 0)} `
+              + `recent_match=${Number(d.recent_transfer_ownerof_matched || 0)} `
               + `scan_checked=${Number(d.owner_scan_checked || 0)} `
               + `scan_match=${Number(d.owner_scan_matched || 0)} `
               + `scan_err=${Number(d.owner_scan_errors || 0)} `
