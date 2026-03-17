@@ -1231,8 +1231,23 @@ def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: in
         max_ids=240,
         max_receipts=max(20, min(2000, int(max_receipts))),
     )
-    merged_ids = sorted({int(x) for x in explorer_ids + receipt_ids if _parse_int_like(x) > 0}, reverse=True)
-    upserted = _infinity_index_upsert(cid, owner_addr, merged_ids, "receipt")
+    log_ids: list[int] = []
+    if not explorer_ids and not receipt_ids:
+        # Explorer APIs can miss historical NFT transfers; use direct chain logs as fallback.
+        try:
+            log_ids = _scan_erc721_token_ids_by_incoming_logs(
+                cid,
+                pm,
+                owner_addr,
+                deadline_ts=time.monotonic() + 8.0,
+                max_ids=240,
+                lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 8_000_000),
+            )
+        except Exception:
+            log_ids = []
+    merged_ids = sorted({int(x) for x in explorer_ids + receipt_ids + log_ids if _parse_int_like(x) > 0}, reverse=True)
+    source_tag = "logs" if log_ids else "receipt"
+    upserted = _infinity_index_upsert(cid, owner_addr, merged_ids, source_tag)
     indexed_now = _infinity_index_get_token_ids(cid, owner_addr, limit=400)
     return {
         "chain_id": cid,
@@ -1241,6 +1256,7 @@ def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: in
         "receipt_checked": int(receipt_checked),
         "explorer_ids": len(explorer_ids),
         "receipt_ids": len(receipt_ids),
+        "log_ids": len(log_ids),
         "merged_ids": len(merged_ids),
         "upserted": int(upserted),
         "indexed_total_for_owner": len(indexed_now),
