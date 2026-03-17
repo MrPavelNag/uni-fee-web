@@ -188,6 +188,8 @@ POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NF
 POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "800")))
 POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS = max(20000, int(os.environ.get("POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS", "2500000")))
 POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "150000")))
+POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS = max(20, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS", "120")))
+POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS = max(10, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS", "60")))
 POSITIONS_DEBANK_FALLBACK = os.environ.get("POSITIONS_DEBANK_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
 DEBANK_ACCESS_KEY = os.environ.get("DEBANK_ACCESS_KEY", "").strip()
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
@@ -2629,48 +2631,6 @@ def _scan_infinity_position_ids_for_owner(
     if dbg is not None:
         dbg["enumerable_ok"] = bool(enumerable_ok)
         dbg["enumerable_token_ids"] = len(token_ids)
-    if len(token_ids) < limit:
-        # Priority path: when nextTokenId exists, ownerOf scan near the latest ids
-        # is usually the fastest way to recover ids for non-enumerable managers.
-        next_token_id_fast = 0
-        try:
-            next_token_id_fast = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x75794a3c"))
-        except Exception:
-            next_token_id_fast = 0
-        if next_token_id_fast > 0:
-            owner_word_fast = _encode_address_word(owner)[-40:]
-            lookback_fast = max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 200, 20000)
-            start_tid_fast = max(1, int(next_token_id_fast) - int(lookback_fast))
-            for tid in range(int(next_token_id_fast) - 1, start_tid_fast - 1, -1):
-                if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                    break
-                if len(token_ids) >= limit:
-                    break
-                if dbg is not None:
-                    dbg["owner_scan_checked"] = int(dbg.get("owner_scan_checked") or 0) + 1
-                try:
-                    owner_data = "0x6352211e" + _encode_uint_word(tid)
-                    owner_hex = _eth_call_hex(cid, pm, owner_data)
-                    owner_words = _hex_words(owner_hex)
-                    if not owner_words:
-                        if dbg is not None:
-                            dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
-                        continue
-                    current_owner = owner_words[0][-40:].lower()
-                    if current_owner == owner_word_fast:
-                        if int(tid) not in seen_ids:
-                            seen_ids.add(int(tid))
-                            token_ids.append(int(tid))
-                        if dbg is not None:
-                            dbg["owner_scan_matched"] = int(dbg.get("owner_scan_matched") or 0) + 1
-                except Exception:
-                    if dbg is not None:
-                        dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
-                    continue
-            if len(token_ids) >= limit:
-                if dbg is not None:
-                    dbg["final_token_ids"] = len(token_ids)
-                return token_ids
     if len(token_ids) < limit and balance > 0:
         # Rabby-like fallback: centralized DeFi indexer can surface Infinity NFTs
         # when RPC logs/enumeration are unreliable.
@@ -2709,8 +2669,7 @@ def _scan_infinity_position_ids_for_owner(
             if dbg is not None:
                 dbg["debank_ownerof_matched"] = int(dbg.get("debank_ownerof_matched") or 0) + 1
     if len(token_ids) < limit:
-        # Wallets often discover Infinity NFTs by Transfer logs; use same approach
-        # when ERC721Enumerable path is unavailable or incomplete.
+        # Wallets often discover Infinity NFTs by Transfer logs.
         owner_word = _encode_address_word(owner)[-40:]
         log_ids = _scan_erc721_token_ids_by_incoming_logs(
             cid,
@@ -2905,8 +2864,8 @@ def _scan_infinity_position_ids_for_owner(
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
         return token_ids
-    # Fallback for contracts without ERC721Enumerable: scan recent IDs by ownerOf.
-    # Keep this path lightweight to avoid starving other chain scans.
+    # Last resort: scan recent IDs by ownerOf.
+    # This path is bounded by attempt/error counters, not local timers.
     if deadline_ts is not None and deadline_ts <= time.monotonic():
         return token_ids
     already_owner_scanned = int((dbg or {}).get("owner_scan_checked") or 0) > 0
@@ -2920,11 +2879,18 @@ def _scan_infinity_position_ids_for_owner(
         lookback = max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 40, 5000)
         start_tid = max(1, int(next_token_id) - int(lookback))
         owner_word = _encode_address_word(owner)[-40:]
+        max_checks = int(POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS)
+        max_errors = int(POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS)
+        local_checked = 0
+        local_errors = 0
         for tid in range(int(next_token_id) - 1, start_tid - 1, -1):
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
                 break
             if len(token_ids) >= limit:
                 break
+            if local_checked >= max_checks or local_errors >= max_errors:
+                break
+            local_checked += 1
             if dbg is not None:
                 dbg["owner_scan_checked"] = int(dbg.get("owner_scan_checked") or 0) + 1
             try:
@@ -2932,6 +2898,7 @@ def _scan_infinity_position_ids_for_owner(
                 owner_hex = _eth_call_hex(cid, pm, owner_data)
                 owner_words = _hex_words(owner_hex)
                 if not owner_words:
+                    local_errors += 1
                     if dbg is not None:
                         dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
                     continue
@@ -2941,6 +2908,7 @@ def _scan_infinity_position_ids_for_owner(
                     if dbg is not None:
                         dbg["owner_scan_matched"] = int(dbg.get("owner_scan_matched") or 0) + 1
             except Exception:
+                local_errors += 1
                 if dbg is not None:
                     dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
                 continue
