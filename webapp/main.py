@@ -174,7 +174,6 @@ POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().l
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "90")))
-POSITIONS_OWNER_MAX_SECONDS = max(2, int(os.environ.get("POSITIONS_OWNER_MAX_SECONDS", "4")))
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "4")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "3")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "0").strip().lower() in (
@@ -189,6 +188,8 @@ POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NF
 POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "800")))
 POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS = max(20000, int(os.environ.get("POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS", "2500000")))
 POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "150000")))
+POSITIONS_DEBANK_FALLBACK = os.environ.get("POSITIONS_DEBANK_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
+DEBANK_ACCESS_KEY = os.environ.get("DEBANK_ACCESS_KEY", "").strip()
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
     "1",
     "true",
@@ -1884,6 +1885,106 @@ def _scan_erc721_token_ids_by_explorer_api(
     return out
 
 
+def _parse_positive_int_like(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return int(value) if int(value) > 0 else 0
+    if isinstance(value, float):
+        iv = int(value)
+        return iv if iv > 0 else 0
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    try:
+        if raw.lower().startswith("0x"):
+            v = int(raw, 16)
+        elif re.fullmatch(r"\d+", raw):
+            v = int(raw, 10)
+        else:
+            return 0
+    except Exception:
+        return 0
+    return int(v) if int(v) > 0 else 0
+
+
+def _scan_erc721_token_ids_by_debank_api(
+    chain_id: int,
+    position_manager: str,
+    owner: str,
+    *,
+    max_ids: int = 120,
+) -> tuple[list[int], str]:
+    if not POSITIONS_DEBANK_FALLBACK:
+        return [], "disabled"
+    if not DEBANK_ACCESS_KEY:
+        return [], "no_access_key"
+    cid = int(chain_id)
+    pm = str(position_manager or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(pm) or not _is_eth_address(o):
+        return [], "bad_input"
+    chain_key = {56: "bsc", 8453: "base"}.get(cid, "")
+    if not chain_key:
+        return [], "unsupported_chain"
+    headers = {
+        "accept": "application/json",
+        "AccessKey": DEBANK_ACCESS_KEY,
+        "User-Agent": "uni-fee-web/0.0.2",
+    }
+    urls = [
+        f"https://pro-openapi.debank.com/v1/user/complex_protocol_list?id={o}&chain_id={chain_key}",
+        f"https://pro-openapi.debank.com/v1/user/all_complex_protocol_list?id={o}&chain_ids={chain_key}",
+    ]
+    rows: list[dict[str, Any]] = []
+    source = "none"
+    for idx, url in enumerate(urls):
+        try:
+            req = UrlRequest(url, headers=headers)
+            with urlopen(req, timeout=12) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if isinstance(payload, list):
+                rows = [x for x in payload if isinstance(x, dict)]
+            elif isinstance(payload, dict):
+                items = payload.get("data") or payload.get("result")
+                if isinstance(items, list):
+                    rows = [x for x in items if isinstance(x, dict)]
+            if rows:
+                source = "complex" if idx == 0 else "all_complex"
+                break
+        except Exception:
+            continue
+    if not rows:
+        return [], source
+    max_candidates = max(int(max_ids), 1) * 30
+    owner_hits: set[int] = set()
+    stack: list[Any] = list(rows)
+    while stack and len(owner_hits) < max_candidates:
+        node = stack.pop()
+        if isinstance(node, dict):
+            pm_seen = False
+            for v in node.values():
+                if isinstance(v, str) and v.strip().lower() == pm:
+                    pm_seen = True
+                    break
+            if pm_seen:
+                for key in ("token_id", "tokenId", "nft_id", "nftId", "id"):
+                    tid = _parse_positive_int_like(node.get(key))
+                    if tid > 0:
+                        owner_hits.add(int(tid))
+                        if len(owner_hits) >= max_candidates:
+                            break
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+    out = sorted(owner_hits, reverse=True)[: max(1, int(max_ids))]
+    return out, source
+
+
 def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int = 400) -> list[str]:
     cid = int(chain_id)
     o = str(owner or "").strip().lower()
@@ -2482,6 +2583,10 @@ def _scan_infinity_position_ids_for_owner(
                 "tokenbyindex_checked": 0,
                 "tokenbyindex_matched": 0,
                 "tokenbyindex_errors": 0,
+                "debank_token_ids": 0,
+                "debank_ownerof_checked": 0,
+                "debank_ownerof_matched": 0,
+                "debank_source": "",
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -2566,6 +2671,43 @@ def _scan_infinity_position_ids_for_owner(
                 if dbg is not None:
                     dbg["final_token_ids"] = len(token_ids)
                 return token_ids
+    if len(token_ids) < limit and balance > 0:
+        # Rabby-like fallback: centralized DeFi indexer can surface Infinity NFTs
+        # when RPC logs/enumeration are unreliable.
+        owner_word = _encode_address_word(owner)[-40:]
+        debank_ids, debank_source = _scan_erc721_token_ids_by_debank_api(
+            cid,
+            pm,
+            owner,
+            max_ids=max(limit * 8, limit),
+        )
+        if dbg is not None:
+            dbg["debank_token_ids"] = len(debank_ids)
+            dbg["debank_source"] = str(debank_source or "")
+        for tid in debank_ids:
+            if len(token_ids) >= limit:
+                break
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            if int(tid) in seen_ids:
+                continue
+            if dbg is not None:
+                dbg["debank_ownerof_checked"] = int(dbg.get("debank_ownerof_checked") or 0) + 1
+            try:
+                owner_data = "0x6352211e" + _encode_uint_word(tid)
+                owner_hex = _eth_call_hex(cid, pm, owner_data)
+                owner_words = _hex_words(owner_hex)
+                if not owner_words:
+                    continue
+                current_owner = owner_words[0][-40:].lower()
+                if current_owner != owner_word:
+                    continue
+            except Exception:
+                continue
+            seen_ids.add(int(tid))
+            token_ids.append(int(tid))
+            if dbg is not None:
+                dbg["debank_ownerof_matched"] = int(dbg.get("debank_ownerof_matched") or 0) + 1
     if len(token_ids) < limit:
         # Wallets often discover Infinity NFTs by Transfer logs; use same approach
         # when ERC721Enumerable path is unavailable or incomplete.
@@ -3168,7 +3310,6 @@ def _query_uniswap_positions_for_owner(
             if pages >= POSITIONS_MAX_PAGES_PER_QUERY:
                 break
             skip += 200
-            time.sleep(0.15)
         return out
 
     # Fast profile by default: prefer filters that work across most indexers.
@@ -3182,19 +3323,16 @@ def _query_uniswap_positions_for_owner(
     for owner_value in owner_candidates:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
-        owner_deadline = time.monotonic() + float(POSITIONS_OWNER_MAX_SECONDS)
-        if deadline_ts is not None:
-            owner_deadline = min(owner_deadline, deadline_ts)
 
         def _run_query_sets(query_sets: list[tuple[str, list[tuple[str, str]]]]) -> bool:
             nonlocal attempts_count, found_ids
             for owner_type, queries in query_sets:
-                if time.monotonic() >= owner_deadline:
+                if deadline_ts is not None and time.monotonic() >= deadline_ts:
                     return False
                 for mode, q in queries:
                     if found_ids:
                         return True
-                    if time.monotonic() >= owner_deadline:
+                    if deadline_ts is not None and time.monotonic() >= deadline_ts:
                         return False
                     if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
                         return False
@@ -3237,7 +3375,7 @@ def _query_uniswap_positions_for_owner(
             return bool(found_ids)
 
         _run_query_sets(query_sets_primary)
-        if not found_ids and POSITIONS_EXTENDED_QUERY_FALLBACK and time.monotonic() < owner_deadline:
+        if not found_ids and POSITIONS_EXTENDED_QUERY_FALLBACK and (deadline_ts is None or time.monotonic() < deadline_ts):
             _run_query_sets(query_sets_extended)
         if found_ids:
             break
