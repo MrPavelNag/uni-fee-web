@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -112,6 +112,21 @@ JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()  # prevent collisions in shared data/*.json files
 INDEXER_LOCK = threading.Lock()
+INDEXER_ACTIVITY_LOCK = threading.Lock()
+INDEXER_ACTIVITY: dict[str, Any] = {
+    "running": False,
+    "name": "infinity_bsc",
+    "started_at": 0.0,
+    "processed": 0,
+    "targets": 0,
+    "updated": 0,
+    "errors": 0,
+    "current_owner": "",
+    "current_chain_id": 0,
+}
+POS_JOBS: dict[str, dict[str, Any]] = {}
+POS_JOB_LOCK = threading.Lock()
+POS_JOB_TTL_SEC = 60 * 60
 RUN_HISTORY: dict[str, list[dict[str, Any]]] = {}
 RUN_HISTORY_LIMIT = 10
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -192,10 +207,10 @@ _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
-POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
+POSITIONS_MAX_QUERY_ATTEMPTS = max(8, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "20")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "90")))
-POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "4")))
-POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "3")))
+POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
+POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "4")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "0").strip().lower() in (
     "1",
     "true",
@@ -220,7 +235,19 @@ POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHO
 POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_CREATION_DATE_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_CREATION_DATE_WORKERS", "6"))))
-POSITIONS_CREATION_DATE_MAX_SECONDS = max(1, int(os.environ.get("POSITIONS_CREATION_DATE_MAX_SECONDS", "8")))
+POSITIONS_CREATION_DATE_MAX_SECONDS = max(1, int(os.environ.get("POSITIONS_CREATION_DATE_MAX_SECONDS", "20")))
+POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK = os.environ.get("POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_SKIP_PER_ID_DETAIL_FETCH = os.environ.get("POSITIONS_SKIP_PER_ID_DETAIL_FETCH", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 INFINITY_INDEXER_ENABLED_DEFAULT = os.environ.get("INFINITY_INDEXER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 INFINITY_INDEXER_MODE_DEFAULT = os.environ.get("INFINITY_INDEXER_MODE", "auto").strip().lower() or "auto"
 INFINITY_INDEXER_MAX_RECEIPTS = max(20, int(os.environ.get("INFINITY_INDEXER_MAX_RECEIPTS", "220")))
@@ -598,6 +625,45 @@ def _indexer_log_run(name: str, status: str, details: str = "") -> None:
         conn.commit()
 
 
+def _indexer_activity_snapshot() -> dict[str, Any]:
+    with INDEXER_ACTIVITY_LOCK:
+        return dict(INDEXER_ACTIVITY)
+
+
+def _indexer_activity_start(name: str, targets: int) -> None:
+    with INDEXER_ACTIVITY_LOCK:
+        INDEXER_ACTIVITY.clear()
+        INDEXER_ACTIVITY.update(
+            {
+                "running": True,
+                "name": str(name or "infinity_bsc"),
+                "started_at": time.time(),
+                "processed": 0,
+                "targets": max(0, int(targets)),
+                "updated": 0,
+                "errors": 0,
+                "current_owner": "",
+                "current_chain_id": 0,
+            }
+        )
+
+
+def _indexer_activity_tick(chain_id: int, owner: str, *, updated_inc: int = 0, error_inc: int = 0) -> None:
+    with INDEXER_ACTIVITY_LOCK:
+        INDEXER_ACTIVITY["processed"] = int(INDEXER_ACTIVITY.get("processed") or 0) + 1
+        INDEXER_ACTIVITY["updated"] = int(INDEXER_ACTIVITY.get("updated") or 0) + max(0, int(updated_inc))
+        INDEXER_ACTIVITY["errors"] = int(INDEXER_ACTIVITY.get("errors") or 0) + max(0, int(error_inc))
+        INDEXER_ACTIVITY["current_chain_id"] = int(chain_id)
+        INDEXER_ACTIVITY["current_owner"] = str(owner or "").strip().lower()
+
+
+def _indexer_activity_stop() -> None:
+    with INDEXER_ACTIVITY_LOCK:
+        INDEXER_ACTIVITY["running"] = False
+        INDEXER_ACTIVITY["current_owner"] = ""
+        INDEXER_ACTIVITY["current_chain_id"] = 0
+
+
 def _infinity_index_upsert(chain_id: int, owner: str, token_ids: list[int], source: str) -> int:
     if not token_ids:
         return 0
@@ -714,6 +780,7 @@ def _indexer_summary(name: str = "infinity_bsc") -> dict[str, Any]:
         "last_run_at": str(runs[0]) if runs else "",
         "last_run_status": str(runs[1]) if runs else "",
         "last_run_details": str(runs[2]) if runs else "",
+        "activity": _indexer_activity_snapshot(),
     }
 
 
@@ -789,6 +856,7 @@ def _run_infinity_indexer_daily_once(max_targets: int | None = None) -> dict[str
         )
         if not targets:
             return {"status": "skipped", "reason": "no_targets", "processed": 0, "updated": 0, "errors": 0}
+        _indexer_activity_start("infinity_bsc", len(targets))
 
         deadline_ts = time.monotonic() + float(INFINITY_INDEXER_DAILY_MAX_SECONDS)
         updated_total = 0
@@ -802,9 +870,12 @@ def _run_infinity_indexer_daily_once(max_targets: int | None = None) -> dict[str
             processed += 1
             try:
                 stats = _update_infinity_index_for_owner(chain_id, owner, max_receipts=receipts_cap)
-                updated_total += int(stats.get("merged_ids") or 0)
+                merged_now = int(stats.get("merged_ids") or 0)
+                updated_total += merged_now
+                _indexer_activity_tick(chain_id, owner, updated_inc=merged_now, error_inc=0)
             except Exception as e:
                 errors += 1
+                _indexer_activity_tick(chain_id, owner, updated_inc=0, error_inc=1)
                 if not first_error:
                     first_error = str(e)[:220]
 
@@ -830,6 +901,7 @@ def _run_infinity_indexer_daily_once(max_targets: int | None = None) -> dict[str
             "timed_out": timed_out,
         }
     finally:
+        _indexer_activity_stop()
         INDEXER_LOCK.release()
 
 
@@ -2116,6 +2188,50 @@ def _eth_get_block_timestamp(chain_id: int, block_number: int) -> int:
         return 0
 
 
+def _explorer_contract_creation_block(chain_id: int, contract_address: str) -> int:
+    cid = int(chain_id)
+    addr = str(contract_address or "").strip().lower()
+    if not _is_eth_address(addr):
+        return 0
+    # Prefer Etherscan V2 when key exists (supports multiple chains via chainid).
+    eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
+    chainid_for_v2 = {1: "1", 10: "10", 56: "56", 137: "137", 8453: "8453", 42161: "42161"}.get(cid, "")
+    urls: list[str] = []
+    if chainid_for_v2 and eth_key:
+        urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=contract&action=getcontractcreation"
+            f"&contractaddresses={addr}&apikey={eth_key}"
+        )
+    if cid == 56 and bsc_key:
+        urls.append(
+            f"https://api.bscscan.com/api?module=contract&action=getcontractcreation"
+            f"&contractaddresses={addr}&apikey={bsc_key}"
+        )
+    elif cid == 8453 and base_key:
+        urls.append(
+            f"https://api.basescan.org/api?module=contract&action=getcontractcreation"
+            f"&contractaddresses={addr}&apikey={base_key}"
+        )
+    for url in urls:
+        try:
+            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            with urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            rows = (payload or {}).get("result")
+            if not isinstance(rows, list) or not rows:
+                continue
+            first = rows[0] if isinstance(rows[0], dict) else {}
+            blk = _parse_int_like(first.get("blockNumber") or 0)
+            if blk > 0:
+                return int(blk)
+        except Exception:
+            continue
+    return 0
+
+
 def _contract_creation_date_ymd(chain_id: int, contract_address: str) -> str:
     addr = str(contract_address or "").strip().lower()
     if not _is_eth_address(addr):
@@ -2126,6 +2242,14 @@ def _contract_creation_date_ymd(chain_id: int, contract_address: str) -> str:
     if cached is not None:
         return cached
     try:
+        explorer_block = _explorer_contract_creation_block(int(chain_id), addr)
+        if explorer_block > 0:
+            ts = _eth_get_block_timestamp(int(chain_id), int(explorer_block))
+            if ts > 0:
+                ymd = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                with CONTRACT_CREATION_DATE_CACHE_LOCK:
+                    CONTRACT_CREATION_DATE_CACHE[key] = ymd
+                return ymd
         latest = _eth_block_number(int(chain_id))
         if latest <= 0:
             with CONTRACT_CREATION_DATE_CACHE_LOCK:
@@ -2209,14 +2333,18 @@ def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
         futures = [ex.submit(_contract_creation_date_ymd, cid, pool_id) for cid, pool_id in keys]
         aborted = False
         try:
-            for fut in as_completed(futures):
+            pending = set(futures)
+            while pending:
                 if time.monotonic() >= deadline:
                     aborted = True
                     break
-                try:
-                    fut.result(timeout=0)
-                except Exception:
-                    continue
+                timeout_left = max(0.05, min(0.8, deadline - time.monotonic()))
+                done, pending = wait(pending, timeout=timeout_left, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    try:
+                        fut.result(timeout=0)
+                    except Exception:
+                        continue
         finally:
             ex.shutdown(wait=not aborted, cancel_futures=aborted)
     for r in rows:
@@ -2230,6 +2358,95 @@ def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
         d = _contract_creation_date_peek(cid, pool_id)
         if d:
             r["contract_created_date"] = d
+
+
+def _enrich_pair_symbols_background(rows: list[dict[str, Any]], max_seconds: int = 20) -> None:
+    if not rows:
+        return
+    deadline = time.monotonic() + max(2, int(max_seconds))
+    for r in rows:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            cid = int(r.get("chain_id") or 0)
+        except Exception:
+            cid = 0
+        if cid <= 0:
+            continue
+        pair = str(r.get("pair") or "").strip()
+        token0 = str(r.get("token0_id") or "").strip().lower()
+        token1 = str(r.get("token1_id") or "").strip().lower()
+        if not token0 or not token1:
+            continue
+        needs_refresh = ("0x" in pair.lower()) or ("?" in pair) or (not pair)
+        if not needs_refresh:
+            continue
+        chain_key = str(r.get("chain") or CHAIN_ID_TO_KEY.get(cid, "")).strip().lower()
+        sym0 = (_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(chain_key, {}) or {}).get(token0) or _fetch_erc20_symbol_onchain(cid, token0) or token0[:8]
+        sym1 = (_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(chain_key, {}) or {}).get(token1) or _fetch_erc20_symbol_onchain(cid, token1) or token1[:8]
+        r["pair"] = f"{str(sym0).upper()}/{str(sym1).upper()}"
+
+
+def _enrich_tvl_background(rows: list[dict[str, Any]], max_seconds: int = 25) -> None:
+    if not rows:
+        return
+    deadline = time.monotonic() + max(3, int(max_seconds))
+    touched = 0
+    for r in rows:
+        if time.monotonic() >= deadline or touched >= 120:
+            break
+        if not isinstance(r, dict):
+            continue
+        protocol = str(r.get("protocol") or "").strip().lower()
+        if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3"}:
+            continue
+        current_tvl = _safe_float(r.get("tvl_usd"))
+        mode = str(r.get("valuation_mode") or "").strip().lower()
+        needs_recalc = (current_tvl <= 0) or (mode in {"no-exact-external", "sanity-cap"})
+        if not needs_recalc:
+            continue
+        chain_key = str(r.get("chain") or "").strip().lower()
+        version = "v4" if protocol.endswith("_v4") else "v3"
+        endpoint = get_graph_endpoint(chain_key, version=version)
+        if not endpoint:
+            continue
+        pos_ids = [str(x).strip() for x in (r.get("position_ids") or []) if str(x).strip()]
+        if not pos_ids:
+            continue
+        chain_id = int(r.get("chain_id") or 0)
+        if chain_id <= 0:
+            continue
+        try:
+            pos = _fetch_position_by_id_with_detail(
+                endpoint,
+                pos_ids[0],
+                include_pool_liquidity=True,
+                include_position_liquidity=True,
+            )
+            if not pos:
+                continue
+            pool = pos.get("pool") or {}
+            pool_tvl_usd = _safe_float(pool.get("totalValueLockedUSD")) or _safe_float(r.get("pool_tvl_usd"))
+            new_tvl: float | None = _estimate_position_tvl_usd_from_detail_external(pos, pool, chain_id)
+            new_mode = "exact-external-bg"
+            if new_tvl is None or new_tvl <= 0:
+                new_tvl = _estimate_position_tvl_usd_from_detail(pos, pool)
+                new_mode = "exact-subgraph-bg"
+            if (new_tvl is None or new_tvl <= 0) and pool_tvl_usd > 0:
+                pos_liq = _safe_float(pos.get("liquidity") or r.get("liquidity"))
+                pool_liq = _safe_float(pool.get("liquidity") or r.get("pool_liquidity"))
+                if pos_liq > 0 and pool_liq > 0:
+                    new_tvl = max(0.0, float(pool_tvl_usd) * float(pos_liq) / float(pool_liq))
+                    new_mode = "estimated-share-bg"
+            if new_tvl is None or new_tvl <= 0:
+                continue
+            r["tvl_usd"] = float(new_tvl)
+            if pool_tvl_usd > 0:
+                r["pool_tvl_usd"] = float(pool_tvl_usd)
+            r["valuation_mode"] = new_mode
+            touched += 1
+        except Exception:
+            continue
 
 
 def _scan_erc721_token_ids_by_incoming_logs(
@@ -4096,20 +4313,23 @@ def _query_uniswap_positions_for_owner(
         include_pool_liquidity=include_pool_liquidity,
         include_position_liquidity=include_position_liquidity,
     )
+    if POSITIONS_SKIP_PER_ID_DETAIL_FETCH:
+        return details
     fetched_ids = {str(x.get("id") or "").strip() for x in details if isinstance(x, dict)}
-    # Fill missing ids with per-id fetch to keep compatibility with stricter indexers.
-    missing_ids = [pid for pid in target_ids if pid not in fetched_ids]
-    for pid in missing_ids:
-        if deadline_ts is not None and time.monotonic() >= deadline_ts:
-            break
-        item = _fetch_position_by_id_with_detail(
-            endpoint,
-            pid,
-            include_pool_liquidity=include_pool_liquidity,
-            include_position_liquidity=include_position_liquidity,
-        )
-        if item:
-            details.append(item)
+    # Optional per-id fallback is expensive; keep it disabled by default for speed.
+    if not POSITIONS_SKIP_PER_ID_DETAIL_FETCH:
+        missing_ids = [pid for pid in target_ids if pid not in fetched_ids]
+        for pid in missing_ids:
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            item = _fetch_position_by_id_with_detail(
+                endpoint,
+                pid,
+                include_pool_liquidity=include_pool_liquidity,
+                include_position_liquidity=include_position_liquidity,
+            )
+            if item:
+                details.append(item)
     return details
 
 
@@ -4566,7 +4786,7 @@ def _scan_pool_positions_chain(
                             "error": str(e)[:220],
                         }
                     )
-        if version == "v3" and (graph_failed or not positions):
+        if version == "v3" and (graph_failed or not positions) and not POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK:
             if time.monotonic() < deadline_ts:
                 try:
                     onchain_positions = _scan_v3_positions_onchain(
@@ -4853,6 +5073,8 @@ def _scan_pool_positions_chain(
                         "kind": "pool",
                         "pool_id": str(pool.get("id") or ""),
                         "pair": f"{t0}/{t1}",
+                        "token0_id": str((pool.get("token0") or {}).get("id") or ""),
+                        "token1_id": str((pool.get("token1") or {}).get("id") or ""),
                         "position_id": str(p.get("id") or ""),
                         "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
                         "fee_tier": fee_disp,
@@ -4944,7 +5166,12 @@ def _scan_pool_positions_chain(
     return rows, errors, debug_rows, timed_out
 
 
-def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+def _scan_pool_positions(
+    addresses: list[str],
+    chain_ids: list[int],
+    *,
+    include_creation_dates: bool = True,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
@@ -5067,7 +5294,12 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
         elif not m1 and m2:
             acc["valuation_mode"] = m2
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
-    _populate_creation_dates_parallel(list(uniq.values()))
+    if include_creation_dates:
+        _populate_creation_dates_parallel(list(uniq.values()))
+    else:
+        for _row in uniq.values():
+            if "contract_created_date" not in _row:
+                _row["contract_created_date"] = "-"
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
         dedup_errors.append(
@@ -6058,16 +6290,34 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 env["TOKEN_PAIRS"] = pair_str
 
                 base_progress = int(10 + (idx - 1) * (65 / total_pairs))
-                if run_v3:
-                    _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
-                    _run_subprocess("agent_v3.py", env, req.min_tvl, logs)
-                    v3_path = DATA_DIR / f"pools_v3_{pair_suffix}.json"
-                    merged_raw.update(load_chart_data_json(str(v3_path)))
-                if run_v4:
-                    _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
-                    _run_subprocess("agent_v4.py", env, req.min_tvl, logs)
-                    v4_path = DATA_DIR / f"pools_v4_{pair_suffix}.json"
-                    merged_raw.update(load_chart_data_json(str(v4_path)))
+                if run_v3 and run_v4:
+                    _set_stage("v3v4", f"Running v3+v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 18))
+
+                    def _run_agent(script_name: str) -> dict[str, dict]:
+                        env_local = dict(env)
+                        _run_subprocess(script_name, env_local, req.min_tvl, logs)
+                        if script_name == "agent_v3.py":
+                            p = DATA_DIR / f"pools_v3_{pair_suffix}.json"
+                        else:
+                            p = DATA_DIR / f"pools_v4_{pair_suffix}.json"
+                        return load_chart_data_json(str(p))
+
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        f_v3 = ex.submit(_run_agent, "agent_v3.py")
+                        f_v4 = ex.submit(_run_agent, "agent_v4.py")
+                        merged_raw.update(f_v3.result())
+                        merged_raw.update(f_v4.result())
+                else:
+                    if run_v3:
+                        _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
+                        _run_subprocess("agent_v3.py", env, req.min_tvl, logs)
+                        v3_path = DATA_DIR / f"pools_v3_{pair_suffix}.json"
+                        merged_raw.update(load_chart_data_json(str(v3_path)))
+                    if run_v4:
+                        _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
+                        _run_subprocess("agent_v4.py", env, req.min_tvl, logs)
+                        v4_path = DATA_DIR / f"pools_v4_{pair_suffix}.json"
+                        merged_raw.update(load_chart_data_json(str(v4_path)))
 
         # Keep only pools that really match requested pairs.
         # Protects against occasional cross-token resolution artifacts (e.g. POL instead of ETH).
@@ -7487,6 +7737,44 @@ def _render_positions_page() -> str:
         setPosStatus(`Showing ${visible.length} pools (+ ${hiddenRows.length} hidden)`, false);
       }
     }
+    const POS_ACTIVE_JOB_KEY = "positions_active_job_v1";
+    function saveActivePosJob(jobId) {
+      try {
+        if (jobId) localStorage.setItem(POS_ACTIVE_JOB_KEY, String(jobId));
+        else localStorage.removeItem(POS_ACTIVE_JOB_KEY);
+      } catch (_) {}
+    }
+    function loadActivePosJob() {
+      try { return String(localStorage.getItem(POS_ACTIVE_JOB_KEY) || "").trim(); } catch (_) { return ""; }
+    }
+    async function pollPosJob(jobId) {
+      const jid = String(jobId || "").trim();
+      if (!jid) throw new Error("Missing job id");
+      let partialRendered = false;
+      while (true) {
+        const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || "Job polling failed");
+        const st = String(data.status || "");
+        const stageLabel = String(data.stage_label || data.stage || "");
+        const progress = Number(data.progress || 0);
+        const partial = data.result || {};
+        if (partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length) {
+          posCache.pools = partial.pool_positions || [];
+          renderPools(posCache.pools);
+          renderScanMessages(partial);
+          partialRendered = true;
+        }
+        if (st === "done") return data.result || {};
+        if (st === "failed") throw new Error(data.error || "Scan failed");
+        if (partialRendered) {
+          setPosStatus(`${stageLabel || "Background scan"}... ${progress}% (table updates live)`, false);
+        } else {
+          setPosStatus(`${stageLabel || "Scanning in background"}... ${progress}%`, false);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+      }
+    }
     async function scanPositions(targetSection = "all") {
       if (posHasScannedOnce) {
         const ok = window.confirm("Run scan again and replace current results?");
@@ -7505,7 +7793,7 @@ def _render_positions_page() -> str:
       try {
         setPosBusy(true);
         startPosScanProgressTicker();
-        const res = await fetch("/api/positions/scan", {
+        const startRes = await fetch("/api/positions/scan/start", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
           body: JSON.stringify({
@@ -7517,8 +7805,13 @@ def _render_positions_page() -> str:
             include_rewards: false,
           }),
         });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.detail || "Scan failed");
+        const startData = await startRes.json().catch(() => ({}));
+        if (!startRes.ok) throw new Error(startData.detail || "Failed to start scan");
+        const jobId = String(startData.job_id || "").trim();
+        if (!jobId) throw new Error("Invalid job id");
+        saveActivePosJob(jobId);
+        const data = await pollPosJob(jobId);
+        saveActivePosJob("");
         posCache.pools = data.pool_positions || [];
         renderPools(posCache.pools);
         renderScanMessages(data);
@@ -7534,7 +7827,37 @@ def _render_positions_page() -> str:
         updatePosSearchButton();
         setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}${finishedChecks ? ` | Owner-chain checks: ${finishedChecks}` : ""}`, false);
       } catch (e) {
+        saveActivePosJob("");
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
+      } finally {
+        stopPosScanProgressTicker();
+        setPosBusy(false);
+      }
+    }
+    async function resumePosJobIfAny() {
+      const jobId = loadActivePosJob();
+      if (!jobId) return;
+      try {
+        setPosBusy(true);
+        startPosScanProgressTicker();
+        const data = await pollPosJob(jobId);
+        saveActivePosJob("");
+        posCache.pools = data.pool_positions || [];
+        renderPools(posCache.pools);
+        renderScanMessages(data);
+        savePosResults({
+          saved_at: Date.now(),
+          pool_positions: data.pool_positions || [],
+          errors: data.errors || [],
+          infos: data.infos || [],
+          debug: data.debug || {},
+        });
+        posHasScannedOnce = true;
+        updatePosSearchButton();
+        setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}`, false);
+      } catch (e) {
+        saveActivePosJob("");
+        setPosStatus("Background scan failed: " + (e?.message || "unknown"), true);
       } finally {
         stopPosScanProgressTicker();
         setPosBusy(false);
@@ -7557,6 +7880,7 @@ def _render_positions_page() -> str:
       setPosStatus("Ready", false);
       setPosHistoryStatus("Select pools and click Search", false);
     }
+    resumePosJobIfAny();
     """
     return _render_placeholder_page(
         "DeFi Positions",
@@ -8019,6 +8343,9 @@ def _render_admin_page() -> str:
         <div style="margin-top:10px;font-size:13px;color:#334155">
           <div><b>Total records:</b> <span id="idxRecordsTotal">-</span></div>
           <div><b>Total owners:</b> <span id="idxOwnersTotal">-</span></div>
+          <div><b>Running now:</b> <span id="idxRunningNow">-</span></div>
+          <div><b>Progress:</b> <span id="idxProgressNow">-</span></div>
+          <div><b>Current owner:</b> <span id="idxCurrentOwner">-</span></div>
           <div><b>Last run:</b> <span id="idxLastRun">-</span></div>
           <div><b>Last status:</b> <span id="idxLastStatus">-</span></div>
           <div><b>Last details:</b> <span id="idxLastDetails">-</span></div>
@@ -8184,9 +8511,19 @@ def _render_admin_page() -> str:
       document.getElementById("idxMaxReceipts").value = String(Number(d.max_receipts || 220));
       document.getElementById("idxRecordsTotal").textContent = String(Number(d.records_total || 0));
       document.getElementById("idxOwnersTotal").textContent = String(Number(d.owners_total || 0));
+      const a = d.activity || {{}};
+      const running = !!a.running;
+      document.getElementById("idxRunningNow").textContent = running ? "yes" : "no";
+      const processed = Number(a.processed || 0);
+      const targets = Number(a.targets || 0);
+      const updated = Number(a.updated || 0);
+      const errors = Number(a.errors || 0);
+      document.getElementById("idxProgressNow").textContent = running ? `${{processed}}/${{targets}} | updated=${{updated}} errors=${{errors}}` : "-";
+      document.getElementById("idxCurrentOwner").textContent = running ? (a.current_owner || "-") : "-";
       document.getElementById("idxLastRun").textContent = d.last_run_at || "-";
       document.getElementById("idxLastStatus").textContent = d.last_run_status || "-";
       document.getElementById("idxLastDetails").textContent = d.last_run_details || "-";
+      if (running) setIndexerStatus(`Indexer running: ${{processed}}/${{targets}}`, false);
     }}
     async function loadIndexers() {{
       try {{
@@ -8194,8 +8531,13 @@ def _render_admin_page() -> str:
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || "Failed to load indexers");
         const item = ((data.items || [])[0] || null);
-        if (item) renderIndexerCard(item);
-        setIndexerStatus("Loaded", false);
+        if (item) {{
+          renderIndexerCard(item);
+          const running = !!(item.activity && item.activity.running);
+          if (!running) setIndexerStatus("Loaded", false);
+        }} else {{
+          setIndexerStatus("Loaded", false);
+        }}
       }} catch (e) {{
         setIndexerStatus("Load failed: " + (e?.message || "unknown"), true);
       }}
@@ -8231,6 +8573,15 @@ def _render_admin_page() -> str:
       }} catch (e) {{
         setIndexerStatus("Run failed: " + (e?.message || "unknown"), true);
       }}
+    }}
+    function startIndexerLiveRefresh() {{
+      if (window._idxLiveRefreshStarted) return;
+      window._idxLiveRefreshStarted = true;
+      setInterval(() => {{
+        const tab = document.getElementById("tabSettings");
+        if (!tab || tab.style.display === "none") return;
+        loadIndexers();
+      }}, 3000);
     }}
     function normStatus(v) {{ return String(v || "").trim().toLowerCase().replace(/[\\s-]+/g, "_"); }}
     function getTicketsFilter() {{
@@ -8666,6 +9017,7 @@ def _render_admin_page() -> str:
     }}
     loadAuthState();
     loadAdmin();
+    startIndexerLiveRefresh();
     setupTicketFiltersAutoApply();
     startTicketsAutoRefresh();
     startFeedbackAutoRefresh();
@@ -9333,8 +9685,12 @@ def admin_indexers_run(req: AdminIndexerRunRequest, request: Request, response: 
     if max_receipts is None:
         cfg = _indexer_get("infinity_bsc")
         max_receipts = int(cfg.get("max_receipts") or INFINITY_INDEXER_MAX_RECEIPTS)
+    if not INDEXER_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Indexer is already running. Please wait until it finishes.")
     try:
+        _indexer_activity_start("infinity_bsc", 1)
         run_stats = _update_infinity_index_for_owner(int(req.chain_id), owner, max_receipts=int(max_receipts))
+        _indexer_activity_tick(int(req.chain_id), owner, updated_inc=int(run_stats.get("merged_ids") or 0), error_inc=0)
         _indexer_log_run(
             "infinity_bsc",
             "ok",
@@ -9342,11 +9698,16 @@ def admin_indexers_run(req: AdminIndexerRunRequest, request: Request, response: 
         )
         return {"ok": True, "run": run_stats, "item": _indexer_summary("infinity_bsc")}
     except HTTPException as e:
+        _indexer_activity_tick(int(req.chain_id), owner, updated_inc=0, error_inc=1)
         _indexer_log_run("infinity_bsc", "error", f"manual owner={owner} chain={req.chain_id} error={e.detail}")
         raise
     except Exception as e:
+        _indexer_activity_tick(int(req.chain_id), owner, updated_inc=0, error_inc=1)
         _indexer_log_run("infinity_bsc", "error", f"manual owner={owner} chain={req.chain_id} error={str(e)[:220]}")
         raise HTTPException(status_code=500, detail=f"Indexer run failed: {e}") from e
+    finally:
+        _indexer_activity_stop()
+        INDEXER_LOCK.release()
 
 
 @app.get("/api/positions/chains")
@@ -9355,9 +9716,12 @@ def positions_chains() -> dict[str, Any]:
     return {"items": items, "count": len(items)}
 
 
-@app.post("/api/positions/scan")
-def scan_positions(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
-    sid = _ensure_session_cookie(request, response)
+def _scan_positions_core(
+    req: PositionsScanRequest,
+    sid: str = "unknown",
+    *,
+    include_creation_dates: bool = True,
+) -> dict[str, Any]:
     evm_raw = list(req.evm_addresses or []) + list(req.addresses or [])
     evm_addresses = _parse_positions_addresses(evm_raw)
     solana_addresses = _parse_solana_addresses(req.solana_addresses or [])
@@ -9402,7 +9766,11 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
     pool_debug_rows: list[dict[str, Any]] = []
     if evm_addresses:
         if scan_pools:
-            pool_rows, pool_errs, pool_debug_rows = _scan_pool_positions(evm_addresses, selected_chain_ids)
+            pool_rows, pool_errs, pool_debug_rows = _scan_pool_positions(
+                evm_addresses,
+                selected_chain_ids,
+                include_creation_dates=include_creation_dates,
+            )
         else:
             pool_rows, pool_errs, pool_debug_rows = [], [], []
         lending_rows, lending_errs = (_scan_aave_positions(evm_addresses, selected_chain_ids) if scan_lending else ([], []))
@@ -9488,6 +9856,118 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
             "reward_count": len(reward_rows),
         },
     }
+
+
+def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: str) -> None:
+    with POS_JOB_LOCK:
+        job = POS_JOBS.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+        job["stage"] = "scan"
+        job["stage_label"] = "Scanning positions"
+        job["progress"] = 15
+        job["started_at"] = time.time()
+    try:
+        result = _scan_positions_core(req, sid=session_id, include_creation_dates=False)
+        with POS_JOB_LOCK:
+            job = POS_JOBS.get(job_id)
+            if not job:
+                return
+            job["result"] = result
+            job["stage"] = "enrich_dates"
+            job["stage_label"] = "Enriching dates"
+            job["progress"] = 65
+        # Phase 2: enrich heavier fields in background and update result.
+        pool_rows = result.get("pool_positions") or []
+        if isinstance(pool_rows, list) and pool_rows:
+            _populate_creation_dates_parallel(pool_rows)
+            with POS_JOB_LOCK:
+                job = POS_JOBS.get(job_id)
+                if job:
+                    job["result"] = result
+                    job["stage"] = "enrich_pairs"
+                    job["stage_label"] = "Resolving pair symbols"
+                    job["progress"] = 85
+            _enrich_pair_symbols_background(pool_rows, max_seconds=20)
+            with POS_JOB_LOCK:
+                job = POS_JOBS.get(job_id)
+                if job:
+                    job["result"] = result
+                    job["stage"] = "enrich_tvl"
+                    job["stage_label"] = "Refining TVL estimates"
+                    job["progress"] = 92
+            _enrich_tvl_background(pool_rows, max_seconds=25)
+            for r in pool_rows:
+                if not str(r.get("contract_created_date") or "").strip():
+                    r["contract_created_date"] = "-"
+            with POS_JOB_LOCK:
+                job = POS_JOBS.get(job_id)
+                if job:
+                    job["result"] = result
+                    job["progress"] = 95
+        with POS_JOB_LOCK:
+            job = POS_JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "done"
+            job["stage"] = "done"
+            job["stage_label"] = "Completed"
+            job["progress"] = 100
+            job["finished_at"] = time.time()
+            job["result"] = result
+    except Exception as e:
+        with POS_JOB_LOCK:
+            job = POS_JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "failed"
+            job["stage"] = "failed"
+            job["stage_label"] = "Failed"
+            job["progress"] = 100
+            job["finished_at"] = time.time()
+            job["error"] = str(e)[:400]
+
+
+@app.post("/api/positions/scan/start")
+def scan_positions_start(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    job_id = str(uuid.uuid4())
+    with POS_JOB_LOCK:
+        now = time.time()
+        stale = [jid for jid, j in POS_JOBS.items() if (now - float(j.get("created_at") or now)) > float(POS_JOB_TTL_SEC)]
+        for jid in stale:
+            POS_JOBS.pop(jid, None)
+        POS_JOBS[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "stage": "queued",
+            "stage_label": "Queued",
+            "progress": 0,
+            "created_at": now,
+            "started_at": None,
+            "finished_at": None,
+            "error": "",
+            "result": None,
+        }
+    t = threading.Thread(target=_run_positions_scan_job, args=(job_id, req, sid), daemon=True)
+    t.start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/positions/scan/job/{job_id}")
+def scan_positions_job(job_id: str) -> dict[str, Any]:
+    with POS_JOB_LOCK:
+        job = POS_JOBS.get(str(job_id))
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return dict(job)
+
+
+@app.post("/api/positions/scan")
+def scan_positions(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    return _scan_positions_core(req, sid=sid, include_creation_dates=True)
 
 
 @app.post("/api/positions/pool-value-series")
