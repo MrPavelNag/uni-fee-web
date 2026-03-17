@@ -123,6 +123,9 @@ INDEXER_ACTIVITY: dict[str, Any] = {
     "errors": 0,
     "current_owner": "",
     "current_chain_id": 0,
+    "last_event": "",
+    "last_error": "",
+    "updated_at": 0.0,
 }
 POS_JOBS: dict[str, dict[str, Any]] = {}
 POS_JOB_LOCK = threading.Lock()
@@ -207,7 +210,7 @@ _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
-POSITIONS_MAX_QUERY_ATTEMPTS = max(8, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "20")))
+POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "90")))
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "4")))
@@ -236,13 +239,13 @@ POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BAL
 POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_CREATION_DATE_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_CREATION_DATE_WORKERS", "6"))))
 POSITIONS_CREATION_DATE_MAX_SECONDS = max(1, int(os.environ.get("POSITIONS_CREATION_DATE_MAX_SECONDS", "20")))
-POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK = os.environ.get("POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK", "1").strip().lower() in (
+POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK = os.environ.get("POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK", "0").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-POSITIONS_SKIP_PER_ID_DETAIL_FETCH = os.environ.get("POSITIONS_SKIP_PER_ID_DETAIL_FETCH", "1").strip().lower() in (
+POSITIONS_SKIP_PER_ID_DETAIL_FETCH = os.environ.get("POSITIONS_SKIP_PER_ID_DETAIL_FETCH", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -266,7 +269,7 @@ POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
     for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161,8453,130,56").split(",")
     if x.strip().isdigit()
 }
-POSITIONS_DISABLE_V3_PREFETCH = os.environ.get("POSITIONS_DISABLE_V3_PREFETCH", "1").strip().lower() in (
+POSITIONS_DISABLE_V3_PREFETCH = os.environ.get("POSITIONS_DISABLE_V3_PREFETCH", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -650,6 +653,9 @@ def _indexer_activity_start(name: str, targets: int) -> None:
                 "errors": 0,
                 "current_owner": "",
                 "current_chain_id": 0,
+                "last_event": "started",
+                "last_error": "",
+                "updated_at": time.time(),
             }
         )
 
@@ -661,13 +667,21 @@ def _indexer_activity_tick(chain_id: int, owner: str, *, updated_inc: int = 0, e
         INDEXER_ACTIVITY["errors"] = int(INDEXER_ACTIVITY.get("errors") or 0) + max(0, int(error_inc))
         INDEXER_ACTIVITY["current_chain_id"] = int(chain_id)
         INDEXER_ACTIVITY["current_owner"] = str(owner or "").strip().lower()
+        INDEXER_ACTIVITY["last_event"] = "tick"
+        if int(error_inc) > 0:
+            INDEXER_ACTIVITY["last_error"] = "owner update failed"
+        INDEXER_ACTIVITY["updated_at"] = time.time()
 
 
-def _indexer_activity_stop() -> None:
+def _indexer_activity_stop(event: str = "stopped", error: str = "") -> None:
     with INDEXER_ACTIVITY_LOCK:
         INDEXER_ACTIVITY["running"] = False
         INDEXER_ACTIVITY["current_owner"] = ""
         INDEXER_ACTIVITY["current_chain_id"] = 0
+        INDEXER_ACTIVITY["last_event"] = str(event or "stopped")
+        if error:
+            INDEXER_ACTIVITY["last_error"] = str(error)[:220]
+        INDEXER_ACTIVITY["updated_at"] = time.time()
 
 
 def _infinity_index_upsert(chain_id: int, owner: str, token_ids: list[int], source: str) -> int:
@@ -907,7 +921,7 @@ def _run_infinity_indexer_daily_once(max_targets: int | None = None) -> dict[str
             "timed_out": timed_out,
         }
     finally:
-        _indexer_activity_stop()
+        _indexer_activity_stop("daily-finished")
         INDEXER_LOCK.release()
 
 
@@ -7566,6 +7580,7 @@ def _render_positions_page() -> str:
             const gid = (Array.isArray(c.only_graph_ids) ? c.only_graph_ids : []).slice(0, 2).join(",");
             return `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} only_onchain=${o}${oid ? ` [${esc(oid)}]` : ""}, only_graph=${g}${gid ? ` [${esc(gid)}]` : ""}`;
           });
+        const cmpRowsDedup = Array.from(new Set(cmpRows));
         const infinityRows = [];
         for (const row of dbgRows.slice(0, 200)) {
           const attempts = Array.isArray(row?.attempts) ? row.attempts : [];
@@ -7613,7 +7628,7 @@ def _render_positions_page() -> str:
         const body = []
           .concat(sumLines.length ? ["Summary:", ...sumLines] : [])
           .concat(zeroRows.length ? ["", "Zero-found owners:", ...zeroRows] : [])
-          .concat(cmpRows.length ? ["", "Source compare (onchain vs graph):", ...cmpRows] : [])
+          .concat(cmpRowsDedup.length ? ["", "Source compare (onchain vs graph):", ...cmpRowsDedup] : [])
           .concat(infinityRows.length ? ["", "Infinity debug:", ...infinityRows.slice(0, 40)] : [])
           .join("\\n");
         if (body.trim()) {
@@ -7824,7 +7839,6 @@ def _render_positions_page() -> str:
       }
       try {
         setPosBusy(true);
-        startPosScanProgressTicker();
         const startRes = await fetch("/api/positions/scan/start", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
@@ -7869,7 +7883,6 @@ def _render_positions_page() -> str:
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
       } finally {
         if (!handoffToBackground) {
-          stopPosScanProgressTicker();
           setPosBusy(false);
         }
       }
@@ -7879,7 +7892,6 @@ def _render_positions_page() -> str:
       if (!jobId) return;
       try {
         setPosBusy(true);
-        startPosScanProgressTicker();
         const data = await pollPosJob(jobId);
         saveActivePosJob("");
         posCache.pools = data.pool_positions || [];
@@ -7899,7 +7911,6 @@ def _render_positions_page() -> str:
         saveActivePosJob("");
         setPosStatus("Background scan failed: " + (e?.message || "unknown"), true);
       } finally {
-        stopPosScanProgressTicker();
         setPosBusy(false);
       }
     }
@@ -8566,7 +8577,11 @@ def _render_admin_page() -> str:
       const startedAt = Number(a.started_at || 0);
       const elapsedSec = running && startedAt > 0 ? Math.max(0, Math.floor((Date.now()/1000) - startedAt)) : 0;
       document.getElementById("idxElapsedNow").textContent = running ? `${{elapsedSec}}s` : "-";
-      document.getElementById("idxProgressNow").textContent = running ? `${{processed}}/${{targets}} | updated=${{updated}} errors=${{errors}}` : "-";
+      const ev = String(a.last_event || "-");
+      const err = String(a.last_error || "");
+      document.getElementById("idxProgressNow").textContent = running
+        ? `${{processed}}/${{targets}} | updated=${{updated}} errors=${{errors}} | event=${{ev}}${{err ? ` | err=${{err}}` : ""}}`
+        : (ev !== "-" ? `${{ev}}${{err ? ` | err=${{err}}` : ""}}` : "-");
       document.getElementById("idxCurrentOwner").textContent = running ? (a.current_owner || "-") : "-";
       document.getElementById("idxLastRun").textContent = d.last_run_at || "-";
       document.getElementById("idxLastStatus").textContent = d.last_run_status || "-";
@@ -9782,7 +9797,7 @@ def _run_indexer_owner_task(chain_id: int, owner: str, max_receipts: int) -> Non
         _indexer_activity_tick(int(chain_id), owner, updated_inc=0, error_inc=1)
         _indexer_log_run("infinity_bsc", "error", f"manual owner={owner} chain={chain_id} error={str(e)[:220]}")
     finally:
-        _indexer_activity_stop()
+        _indexer_activity_stop("manual-finished")
         INDEXER_LOCK.release()
 
 
