@@ -1884,6 +1884,131 @@ def _scan_erc721_token_ids_by_explorer_api(
     return out
 
 
+def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int = 400) -> list[str]:
+    cid = int(chain_id)
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(o):
+        return []
+    chainid_for_v2 = {56: "56", 8453: "8453"}.get(cid, "")
+    api_base_v1 = {56: "https://api.bscscan.com/api", 8453: "https://api.basescan.org/api"}.get(cid, "")
+    if not chainid_for_v2 and not api_base_v1:
+        return []
+    api_key = os.environ.get("ETHERSCAN_API_KEY", "").strip() or os.environ.get("BSCSCAN_API_KEY", "").strip() or "YourApiKeyToken"
+    urls: list[str] = []
+    if chainid_for_v2:
+        urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=txlist"
+            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={api_key}"
+        )
+    if api_base_v1:
+        urls.append(
+            f"{api_base_v1}?module=account&action=txlist"
+            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={api_key}"
+        )
+    for url in urls:
+        try:
+            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            with urlopen(req, timeout=12) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            rows = (payload or {}).get("result")
+            if not isinstance(rows, list):
+                continue
+            out: list[str] = []
+            seen: set[str] = set()
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                txh = str(r.get("hash") or "").strip().lower()
+                if not (txh.startswith("0x") and len(txh) == 66):
+                    continue
+                if txh in seen:
+                    continue
+                seen.add(txh)
+                out.append(txh)
+                if len(out) >= int(max_items):
+                    break
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
+
+
+def _scan_cl_token_ids_from_owner_receipts(
+    chain_id: int,
+    position_manager: str,
+    owner: str,
+    *,
+    deadline_ts: float | None = None,
+    max_ids: int = 120,
+    max_receipts: int = 220,
+) -> tuple[list[int], int]:
+    cid = int(chain_id)
+    pm = str(position_manager or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(pm) or not _is_eth_address(o):
+        return [], 0
+    tx_hashes = _explorer_txlist_hashes_for_owner(cid, o, max_items=max_receipts)
+    if not tx_hashes:
+        return [], 0
+    topic_mint = "0x2c0223eed283e194c1112e080d31bdec9e2760ba1454153666cd9d7d6a877964"
+    owner_word = _encode_address_word(o)[-40:]
+    out: list[int] = []
+    seen: set[int] = set()
+    checked = 0
+    for txh in tx_hashes:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        checked += 1
+        try:
+            rcpt = _json_rpc_call(cid, "eth_getTransactionReceipt", [txh])
+        except Exception:
+            continue
+        if not isinstance(rcpt, dict):
+            continue
+        logs = rcpt.get("logs") or []
+        if not isinstance(logs, list):
+            continue
+        for lg in logs:
+            if not isinstance(lg, dict):
+                continue
+            if str(lg.get("address") or "").strip().lower() != pm:
+                continue
+            topics = lg.get("topics") or []
+            if not isinstance(topics, list) or not topics:
+                continue
+            if str(topics[0]).strip().lower() != topic_mint:
+                continue
+            tid = 0
+            try:
+                if len(topics) >= 2:
+                    tid = int(str(topics[1]), 16)
+                elif str(lg.get("data") or "").startswith("0x"):
+                    ws = _hex_words(str(lg.get("data") or "0x"))
+                    if ws:
+                        tid = int(ws[0], 16)
+            except Exception:
+                tid = 0
+            if tid <= 0 or tid in seen:
+                continue
+            try:
+                owner_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(tid))
+                owner_words = _hex_words(owner_hex)
+                if not owner_words:
+                    continue
+                current_owner = owner_words[0][-40:].lower()
+                if current_owner != owner_word:
+                    continue
+            except Exception:
+                continue
+            seen.add(tid)
+            out.append(int(tid))
+            if len(out) >= int(max_ids):
+                return out, checked
+    return out, checked
+
+
 def _encode_address_word(addr: str) -> str:
     raw = str(addr or "").strip().lower()
     if not raw.startswith("0x"):
@@ -2351,6 +2476,8 @@ def _scan_infinity_position_ids_for_owner(
                 "mint_log_ids": 0,
                 "mint_log_ownerof_checked": 0,
                 "mint_log_ownerof_matched": 0,
+                "receipt_mint_ids": 0,
+                "receipt_checked": 0,
                 "total_supply": 0,
                 "tokenbyindex_checked": 0,
                 "tokenbyindex_matched": 0,
@@ -2610,6 +2737,28 @@ def _scan_infinity_position_ids_for_owner(
             token_ids.append(int(tid))
             if dbg is not None:
                 dbg["mint_log_ownerof_matched"] = int(dbg.get("mint_log_ownerof_matched") or 0) + 1
+    if len(token_ids) < limit and balance > 0:
+        # Explorer txlist + receipt logs fallback for providers that heavily limit eth_getLogs.
+        receipt_ids, receipt_checked = _scan_cl_token_ids_from_owner_receipts(
+            cid,
+            pm,
+            owner,
+            deadline_ts=deadline_ts,
+            max_ids=max(limit * 8, limit),
+            max_receipts=220,
+        )
+        if dbg is not None:
+            dbg["receipt_mint_ids"] = len(receipt_ids)
+            dbg["receipt_checked"] = int(receipt_checked)
+        for tid in receipt_ids:
+            if len(token_ids) >= limit:
+                break
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            if int(tid) in seen_ids:
+                continue
+            seen_ids.add(int(tid))
+            token_ids.append(int(tid))
     if token_ids or enumerable_ok:
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
@@ -6111,6 +6260,8 @@ def _render_positions_page() -> str:
               + `mint_ids=${Number(d.mint_log_ids || 0)} `
               + `mint_checked=${Number(d.mint_log_ownerof_checked || 0)} `
               + `mint_match=${Number(d.mint_log_ownerof_matched || 0)} `
+              + `receipt_ids=${Number(d.receipt_mint_ids || 0)} `
+              + `receipt_checked=${Number(d.receipt_checked || 0)} `
               + `supply=${Number(d.total_supply || 0)} `
               + `tbi_checked=${Number(d.tokenbyindex_checked || 0)} `
               + `tbi_match=${Number(d.tokenbyindex_matched || 0)} `
