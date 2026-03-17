@@ -190,6 +190,9 @@ POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS = max(20000, int(os.environ.get("POSITIONS_
 POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "150000")))
 POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS = max(20, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS", "120")))
 POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS = max(10, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS", "60")))
+POSITIONS_ENABLE_INFINITY = os.environ.get("POSITIONS_ENABLE_INFINITY", "0").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_INFINITY_HEAVY_METHODS = os.environ.get("POSITIONS_INFINITY_HEAVY_METHODS", "0").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_DEBANK_FALLBACK = os.environ.get("POSITIONS_DEBANK_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
 DEBANK_ACCESS_KEY = os.environ.get("DEBANK_ACCESS_KEY", "").strip()
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
@@ -2163,6 +2166,73 @@ def _decode_uint_eth_call(data_hex: str) -> int:
     return _decode_uint_from_word(words[0])
 
 
+def _position_manager_contracts_for_chain(chain_id: int) -> list[str]:
+    cid = int(chain_id)
+    out: list[str] = []
+    contracts = [
+        UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid, ""),
+        PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID.get(cid, ""),
+    ]
+    if POSITIONS_ENABLE_INFINITY:
+        contracts.extend(
+            [
+                PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid, ""),
+                PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid, ""),
+            ]
+        )
+    for c in contracts:
+        cc = str(c or "").strip().lower()
+        if _is_eth_address(cc) and cc not in out:
+            out.append(cc)
+    return out
+
+
+def _erc721_balance_of(chain_id: int, contract: str, owner: str) -> int | None:
+    try:
+        data = "0x70a08231" + _encode_address_word(owner)
+        return int(_decode_uint_eth_call(_eth_call_hex(int(chain_id), str(contract).strip(), data)))
+    except Exception:
+        return None
+
+
+def _chain_has_any_position_nft_balance(chain_id: int, addresses: list[str]) -> bool:
+    managers = _position_manager_contracts_for_chain(int(chain_id))
+    if not managers:
+        return True
+    had_unknown = False
+    for owner in addresses:
+        o = str(owner or "").strip().lower()
+        if not _is_eth_address(o):
+            continue
+        for pm in managers:
+            bal = _erc721_balance_of(int(chain_id), pm, o)
+            if bal is None:
+                had_unknown = True
+                continue
+            if int(bal) > 0:
+                return True
+    # If RPC precheck is inconclusive, do not skip the chain.
+    return had_unknown
+
+
+def _owner_has_any_position_nft_balance(chain_id: int, owner: str) -> bool:
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(o):
+        return False
+    managers = _position_manager_contracts_for_chain(int(chain_id))
+    if not managers:
+        return True
+    had_unknown = False
+    for pm in managers:
+        bal = _erc721_balance_of(int(chain_id), pm, o)
+        if bal is None:
+            had_unknown = True
+            continue
+        if int(bal) > 0:
+            return True
+    return had_unknown
+
+
 def _decode_abi_string(data_hex: str) -> str | None:
     h = str(data_hex or "").strip().lower()
     if h.startswith("0x"):
@@ -2631,6 +2701,10 @@ def _scan_infinity_position_ids_for_owner(
     if dbg is not None:
         dbg["enumerable_ok"] = bool(enumerable_ok)
         dbg["enumerable_token_ids"] = len(token_ids)
+    if not POSITIONS_INFINITY_HEAVY_METHODS:
+        if dbg is not None:
+            dbg["final_token_ids"] = len(token_ids)
+        return token_ids
     if len(token_ids) < limit and balance > 0:
         # Rabby-like fallback: centralized DeFi indexer can surface Infinity NFTs
         # when RPC logs/enumeration are unreliable.
@@ -3639,6 +3713,9 @@ def _scan_pool_positions_chain(
     chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
     if not chain_key:
         return rows, errors, debug_rows, timed_out
+    owner_has_nft_balance: dict[str, bool] = {}
+    for owner in addresses:
+        owner_has_nft_balance[str(owner).strip().lower()] = _owner_has_any_position_nft_balance(int(chain_id), owner)
 
     def _scan_pool_positions_owner(
         owner: str,
@@ -3741,7 +3818,7 @@ def _scan_pool_positions_chain(
 
         # Pancake Infinity CL positions live in a dedicated position manager and are
         # not visible through Uniswap-v3/v4 subgraph queries.
-        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
+        if POSITIONS_ENABLE_INFINITY and version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
             try:
                 infinity_cl_debug: dict[str, Any] = {}
                 infinity_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
@@ -3782,7 +3859,7 @@ def _scan_pool_positions_chain(
                     }
                 )
 
-        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
+        if POSITIONS_ENABLE_INFINITY and version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
             try:
                 infinity_bin_debug: dict[str, Any] = {}
                 infinity_bin_positions = _scan_pancake_infinity_bin_positions_onchain(
@@ -3823,44 +3900,56 @@ def _scan_pool_positions_chain(
                     }
                 )
 
+        owner_key = str(owner).strip().lower()
         if endpoint and not positions:
-            try:
-                positions = _query_uniswap_positions_for_owner(
-                    endpoint,
-                    owner,
-                    include_pool_liquidity=has_pool_liquidity,
-                    include_position_liquidity=has_position_liquidity,
-                    debug_steps=owner_attempts,
-                    deadline_ts=deadline_ts,
+            if version == "v3" and not bool(owner_has_nft_balance.get(owner_key, True)):
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "graph_skipped_no_nft_balance",
+                        "count": 0,
+                        "ok": True,
+                    }
                 )
-                for _p in positions:
-                    if isinstance(_p, dict) and not str(_p.get("_source") or "").strip():
-                        _p["_source"] = "graph_query"
-                if not positions and not has_position_liquidity:
+            else:
+                try:
                     positions = _query_uniswap_positions_for_owner(
                         endpoint,
                         owner,
                         include_pool_liquidity=has_pool_liquidity,
-                        include_position_liquidity=True,
+                        include_position_liquidity=has_position_liquidity,
                         debug_steps=owner_attempts,
                         deadline_ts=deadline_ts,
                     )
                     for _p in positions:
                         if isinstance(_p, dict) and not str(_p.get("_source") or "").strip():
                             _p["_source"] = "graph_query"
-            except Exception as e:
-                graph_failed = True
-                owner_errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "fallback",
-                        "query_mode": "graph_exception",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                    }
-                )
+                    if not positions and not has_position_liquidity:
+                        positions = _query_uniswap_positions_for_owner(
+                            endpoint,
+                            owner,
+                            include_pool_liquidity=has_pool_liquidity,
+                            include_position_liquidity=True,
+                            debug_steps=owner_attempts,
+                            deadline_ts=deadline_ts,
+                        )
+                        for _p in positions:
+                            if isinstance(_p, dict) and not str(_p.get("_source") or "").strip():
+                                _p["_source"] = "graph_query"
+                except Exception as e:
+                    graph_failed = True
+                    owner_errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "fallback",
+                            "query_mode": "graph_exception",
+                            "count": 0,
+                            "ok": False,
+                            "error": str(e)[:220],
+                        }
+                    )
         if version == "v3" and (graph_failed or not positions):
             if time.monotonic() < deadline_ts:
                 try:
@@ -4117,6 +4206,17 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
     valid_chain_ids = [int(cid) for cid in chain_ids if CHAIN_ID_TO_KEY.get(int(cid), "")]
     if not valid_chain_ids:
         return [], [], []
+    if POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
+        filtered_chain_ids: list[int] = []
+        for cid in valid_chain_ids:
+            if _chain_has_any_position_nft_balance(int(cid), addresses):
+                filtered_chain_ids.append(int(cid))
+            else:
+                ck = CHAIN_ID_TO_KEY.get(int(cid), str(cid))
+                errors.append(f"Pool scan skipped [{ck}]: no position NFTs for selected addresses.")
+        valid_chain_ids = filtered_chain_ids
+        if not valid_chain_ids:
+            return [], list(dict.fromkeys(errors)), []
     priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
     ordered_chain_ids: list[int] = []
     seen_chain_ids: set[int] = set()
