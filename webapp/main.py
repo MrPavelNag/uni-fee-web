@@ -192,6 +192,9 @@ POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS = max(20, int(os.environ.get("POSITIONS
 POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS = max(10, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS", "60")))
 POSITIONS_ENABLE_INFINITY = os.environ.get("POSITIONS_ENABLE_INFINITY", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_HEAVY_METHODS = os.environ.get("POSITIONS_INFINITY_HEAVY_METHODS", "0").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
+POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
 POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_DEBANK_FALLBACK = os.environ.get("POSITIONS_DEBANK_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -1494,6 +1497,30 @@ def _json_rpc_call(chain_id: int, method: str, params: list[Any]) -> Any:
     raise RuntimeError(last_err)
 
 
+def _json_rpc_batch_call(chain_id: int, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rpc_urls = _rpc_urls_for_chain(chain_id)
+    if not rpc_urls:
+        raise RuntimeError(f"No RPC configured for chain_id={chain_id}")
+    body = json.dumps(payloads).encode("utf-8")
+    last_err = "unknown batch rpc error"
+    for rpc_url in rpc_urls:
+        try:
+            req = UrlRequest(
+                rpc_url,
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": "uni-fee-web/0.0.2"},
+            )
+            with urlopen(req, timeout=max(8, POSITIONS_ONCHAIN_TIMEOUT_SEC * 3)) as resp:
+                parsed = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(parsed, list):
+                last_err = "batch rpc did not return list"
+                continue
+            return [x for x in parsed if isinstance(x, dict)]
+        except Exception as e:
+            last_err = str(e)
+    raise RuntimeError(last_err)
+
+
 def _eth_call_hex(chain_id: int, to: str, data_hex: str) -> str:
     result = _json_rpc_call(
         chain_id,
@@ -2116,6 +2143,90 @@ def _scan_cl_token_ids_from_owner_receipts(
     return out, checked
 
 
+def _scan_erc721_token_ids_by_ownerof_batch(
+    chain_id: int,
+    contract: str,
+    owner: str,
+    *,
+    max_ids: int = 120,
+    max_checks: int = 800000,
+    batch_size: int = 1000,
+    deadline_ts: float | None = None,
+    start_from_token_id: int = 0,
+) -> tuple[list[int], int, int]:
+    cid = int(chain_id)
+    c = str(contract or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(c) or not _is_eth_address(o):
+        return [], 0, 0
+    try:
+        next_token_id = _decode_uint_eth_call(_eth_call_hex(cid, c, "0x75794a3c"))
+    except Exception:
+        return [], 0, 1
+    if next_token_id <= 1:
+        return [], 0, 0
+    owner_word = _encode_address_word(o)[-40:]
+    hi = int(next_token_id) - 1
+    if int(start_from_token_id) > 0:
+        hi = min(hi, int(start_from_token_id))
+    lo = 1
+    bsz = max(50, min(1000, int(batch_size)))
+    to_check = min(max(1, int(max_checks)), max(0, hi - lo + 1))
+    checked = 0
+    errors = 0
+    out: list[int] = []
+    seen: set[int] = set()
+    cur = hi
+    while cur >= lo and checked < to_check:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        chunk_start = max(lo, cur - bsz + 1)
+        tids = list(range(cur, chunk_start - 1, -1))
+        if checked + len(tids) > to_check:
+            tids = tids[: max(0, to_check - checked)]
+        if not tids:
+            break
+        payloads = [
+            {
+                "jsonrpc": "2.0",
+                "id": idx,
+                "method": "eth_call",
+                "params": [{"to": c, "data": "0x6352211e" + _encode_uint_word(int(tid))}, "latest"],
+            }
+            for idx, tid in enumerate(tids)
+        ]
+        try:
+            resp = _json_rpc_batch_call(cid, payloads)
+            by_id: dict[int, dict[str, Any]] = {}
+            for row in resp:
+                try:
+                    rid = int(row.get("id"))
+                except Exception:
+                    continue
+                by_id[rid] = row
+            for idx, tid in enumerate(tids):
+                row = by_id.get(idx) or {}
+                raw = str(row.get("result") or "").strip().lower()
+                if not raw.startswith("0x") or len(raw) < 42:
+                    if row.get("error") is not None:
+                        errors += 1
+                    continue
+                current_owner = raw[-40:]
+                if current_owner != owner_word:
+                    continue
+                if int(tid) in seen:
+                    continue
+                seen.add(int(tid))
+                out.append(int(tid))
+                if len(out) >= int(max_ids):
+                    return out, checked + len(tids), errors
+        except Exception:
+            errors += len(tids)
+        checked += len(tids)
+        cur = chunk_start - 1
+    return out, checked, errors
+
+
 def _encode_address_word(addr: str) -> str:
     raw = str(addr or "").strip().lower()
     if not raw.startswith("0x"):
@@ -2661,6 +2772,9 @@ def _scan_infinity_position_ids_for_owner(
                 "tokenbyindex_checked": 0,
                 "tokenbyindex_matched": 0,
                 "tokenbyindex_errors": 0,
+                "batch_ownerof_checked": 0,
+                "batch_ownerof_matched": 0,
+                "batch_ownerof_errors": 0,
                 "debank_token_ids": 0,
                 "debank_ownerof_checked": 0,
                 "debank_ownerof_matched": 0,
@@ -2688,25 +2802,32 @@ def _scan_infinity_position_ids_for_owner(
     limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
     token_ids: list[int] = []
     seen_ids: set[int] = set()
-    enumerable_ok = True
-    if balance > 0:
-        for idx in range(int(balance) - 1, max(-1, int(balance) - limit - 1), -1):
-            if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                break
-            try:
-                tok_data = "0x2f745c59" + _encode_address_word(owner) + _encode_uint_word(idx)
-                tid = _decode_uint_eth_call(_eth_call_hex(cid, pm, tok_data))
-                if tid > 0 and int(tid) not in seen_ids:
-                    seen_ids.add(int(tid))
-                    token_ids.append(int(tid))
-            except Exception:
-                enumerable_ok = False
-                break
-    else:
-        enumerable_ok = False
+    # Infinity position managers use Solmate ERC721 (non-enumerable), so tokenOfOwnerByIndex is not available.
+    enumerable_ok = False
     if dbg is not None:
         dbg["enumerable_ok"] = bool(enumerable_ok)
         dbg["enumerable_token_ids"] = len(token_ids)
+    if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN:
+        batch_ids, batch_checked, batch_errors = _scan_erc721_token_ids_by_ownerof_batch(
+            cid,
+            pm,
+            owner,
+            max_ids=max(limit * 2, limit),
+            max_checks=int(POSITIONS_INFINITY_BATCH_MAX_CHECKS),
+            batch_size=int(POSITIONS_INFINITY_BATCH_SIZE),
+            deadline_ts=deadline_ts,
+        )
+        if dbg is not None:
+            dbg["batch_ownerof_checked"] = int(batch_checked)
+            dbg["batch_ownerof_errors"] = int(batch_errors)
+            dbg["batch_ownerof_matched"] = int(len(batch_ids))
+        for tid in batch_ids:
+            if len(token_ids) >= limit:
+                break
+            if int(tid) in seen_ids:
+                continue
+            seen_ids.add(int(tid))
+            token_ids.append(int(tid))
     if not POSITIONS_INFINITY_HEAVY_METHODS:
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
