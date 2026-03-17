@@ -98,17 +98,20 @@ app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 def _on_startup() -> None:
     _start_catalog_auto_refresh()
     _start_analytics()
+    _start_infinity_indexer_daily()
 
 
 @app.on_event("shutdown")
 def _on_shutdown() -> None:
     _stop_catalog_auto_refresh()
+    _stop_infinity_indexer_daily()
     _stop_analytics()
 
 # Simple in-memory job storage (MVP)
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()  # prevent collisions in shared data/*.json files
+INDEXER_LOCK = threading.Lock()
 RUN_HISTORY: dict[str, list[dict[str, Any]]] = {}
 RUN_HISTORY_LIMIT = 10
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -117,6 +120,23 @@ CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTER
 CATALOG_REFRESH_ON_STARTUP = os.environ.get("CATALOG_REFRESH_ON_STARTUP", "0").strip().lower() in ("1", "true", "yes", "on")
 CATALOG_REFRESH_STOP = threading.Event()
 CATALOG_REFRESH_THREAD: threading.Thread | None = None
+INFINITY_INDEXER_DAILY_ENABLED = os.environ.get("INFINITY_INDEXER_DAILY_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+INFINITY_INDEXER_DAILY_INTERVAL_SEC = max(3600, int(os.environ.get("INFINITY_INDEXER_DAILY_INTERVAL_SEC", str(24 * 60 * 60))))
+INFINITY_INDEXER_DAILY_ON_STARTUP = os.environ.get("INFINITY_INDEXER_DAILY_ON_STARTUP", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+INFINITY_INDEXER_DAILY_MAX_TARGETS = max(1, min(2000, int(os.environ.get("INFINITY_INDEXER_DAILY_MAX_TARGETS", "400"))))
+INFINITY_INDEXER_DAILY_MAX_SECONDS = max(30, int(os.environ.get("INFINITY_INDEXER_DAILY_MAX_SECONDS", "900")))
+INFINITY_INDEXER_DAILY_STOP = threading.Event()
+INFINITY_INDEXER_DAILY_THREAD: threading.Thread | None = None
 AUTH_NONCE_TTL_SEC = int(os.environ.get("AUTH_NONCE_TTL_SEC", "300"))
 AUTH_NONCES: dict[str, dict[str, Any]] = {}
 AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
@@ -201,6 +221,9 @@ POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BAL
 POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_CREATION_DATE_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_CREATION_DATE_WORKERS", "6"))))
 POSITIONS_CREATION_DATE_MAX_SECONDS = max(1, int(os.environ.get("POSITIONS_CREATION_DATE_MAX_SECONDS", "8")))
+INFINITY_INDEXER_ENABLED_DEFAULT = os.environ.get("INFINITY_INDEXER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+INFINITY_INDEXER_MODE_DEFAULT = os.environ.get("INFINITY_INDEXER_MODE", "auto").strip().lower() or "auto"
+INFINITY_INDEXER_MAX_RECEIPTS = max(20, int(os.environ.get("INFINITY_INDEXER_MAX_RECEIPTS", "220")))
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
     "1",
     "true",
@@ -431,6 +454,59 @@ def _init_analytics_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_items_pub ON faq_items(is_published)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_items_feat ON faq_items(is_featured)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_items_sort ON faq_items(sort_order, id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS indexers (
+              name TEXT PRIMARY KEY,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              mode TEXT NOT NULL DEFAULT 'auto',
+              max_receipts INTEGER NOT NULL DEFAULT 220,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS indexer_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              ts TEXT NOT NULL,
+              status TEXT NOT NULL,
+              details TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_indexer_runs_name_ts ON indexer_runs(name, ts)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS infinity_positions_index (
+              chain_id INTEGER NOT NULL,
+              owner TEXT NOT NULL,
+              token_id TEXT NOT NULL,
+              source TEXT NOT NULL DEFAULT 'receipt',
+              first_seen_ts TEXT NOT NULL,
+              last_seen_ts TEXT NOT NULL,
+              PRIMARY KEY(chain_id, owner, token_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inf_pos_owner_chain ON infinity_positions_index(owner, chain_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inf_pos_ts ON infinity_positions_index(last_seen_ts)")
+        # Ensure default infinity indexer config exists.
+        conn.execute(
+            """
+            INSERT INTO indexers(name, enabled, mode, max_receipts, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO NOTHING
+            """,
+            (
+                "infinity_bsc",
+                1 if INFINITY_INDEXER_ENABLED_DEFAULT else 0,
+                INFINITY_INDEXER_MODE_DEFAULT if INFINITY_INDEXER_MODE_DEFAULT in {"auto", "manual", "off"} else "auto",
+                int(INFINITY_INDEXER_MAX_RECEIPTS),
+                _iso_now(),
+            ),
+        )
         conn.commit()
 
 
@@ -451,6 +527,310 @@ def _analytics_get_state(key: str) -> str:
     with _analytics_conn() as conn:
         row = conn.execute("SELECT value FROM analytics_state WHERE key = ?", (key,)).fetchone()
     return str(row[0]) if row else ""
+
+
+def _parse_int_like(value: Any) -> int:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw, 10)
+    except Exception:
+        pass
+    try:
+        return int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+    except Exception:
+        return 0
+
+
+def _indexer_get(name: str) -> dict[str, Any]:
+    safe_name = str(name or "").strip()
+    if not safe_name:
+        return {}
+    with _analytics_conn() as conn:
+        row = conn.execute(
+            "SELECT name, enabled, mode, max_receipts, updated_at FROM indexers WHERE name = ?",
+            (safe_name,),
+        ).fetchone()
+    if not row:
+        return {}
+    return {
+        "name": str(row[0]),
+        "enabled": bool(int(row[1] or 0)),
+        "mode": str(row[2] or "auto"),
+        "max_receipts": int(row[3] or 220),
+        "updated_at": str(row[4] or ""),
+    }
+
+
+def _indexer_upsert(name: str, *, enabled: bool, mode: str, max_receipts: int) -> dict[str, Any]:
+    safe_name = str(name or "").strip()
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Indexer name is required.")
+    safe_mode = str(mode or "auto").strip().lower()
+    if safe_mode not in {"auto", "manual", "off"}:
+        raise HTTPException(status_code=400, detail="mode must be auto, manual, or off.")
+    safe_max_receipts = max(20, min(2000, int(max_receipts)))
+    now = _iso_now()
+    with _analytics_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO indexers(name, enabled, mode, max_receipts, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+              enabled = excluded.enabled,
+              mode = excluded.mode,
+              max_receipts = excluded.max_receipts,
+              updated_at = excluded.updated_at
+            """,
+            (safe_name, 1 if enabled else 0, safe_mode, safe_max_receipts, now),
+        )
+        conn.commit()
+    return _indexer_get(safe_name)
+
+
+def _indexer_log_run(name: str, status: str, details: str = "") -> None:
+    with _analytics_conn() as conn:
+        conn.execute(
+            "INSERT INTO indexer_runs(name, ts, status, details) VALUES(?, ?, ?, ?)",
+            (str(name or "").strip(), _iso_now(), str(status or "ok")[:32], str(details or "")[:5000]),
+        )
+        conn.commit()
+
+
+def _infinity_index_upsert(chain_id: int, owner: str, token_ids: list[int], source: str) -> int:
+    if not token_ids:
+        return 0
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    if not _is_eth_address(owner_addr):
+        return 0
+    now = _iso_now()
+    rows: list[tuple[Any, ...]] = []
+    for tid in token_ids:
+        token_id = _parse_int_like(tid)
+        if token_id <= 0:
+            continue
+        rows.append((cid, owner_addr, str(token_id), str(source or "receipt")[:24], now, now))
+    if not rows:
+        return 0
+    with _analytics_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO infinity_positions_index(chain_id, owner, token_id, source, first_seen_ts, last_seen_ts)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chain_id, owner, token_id) DO UPDATE SET
+              source = excluded.source,
+              last_seen_ts = excluded.last_seen_ts
+            """,
+            rows,
+        )
+        conn.commit()
+    return len(rows)
+
+
+def _infinity_index_get_token_ids(chain_id: int, owner: str, limit: int = 180) -> list[int]:
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    if not _is_eth_address(owner_addr):
+        return []
+    lim = max(1, min(500, int(limit)))
+    with _analytics_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT token_id FROM infinity_positions_index
+            WHERE chain_id = ? AND owner = ?
+            ORDER BY last_seen_ts DESC
+            LIMIT ?
+            """,
+            (cid, owner_addr, lim),
+        ).fetchall()
+    out: list[int] = []
+    seen: set[int] = set()
+    for r in rows:
+        tid = _parse_int_like(r[0] if r else 0)
+        if tid <= 0 or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(tid)
+    return out
+
+
+def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: int = 220) -> dict[str, Any]:
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    if not _is_eth_address(owner_addr):
+        raise HTTPException(status_code=400, detail="Invalid owner address.")
+    pm = PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid)
+    if not pm:
+        raise HTTPException(status_code=400, detail=f"Infinity CL position manager is not configured for chain {cid}.")
+
+    deadline_ts = time.monotonic() + 25.0
+    explorer_ids = _scan_erc721_token_ids_by_explorer_api(cid, pm, owner_addr, max_ids=240)
+    receipt_ids, receipt_checked = _scan_cl_token_ids_from_owner_receipts(
+        cid,
+        pm,
+        owner_addr,
+        deadline_ts=deadline_ts,
+        max_ids=240,
+        max_receipts=max(20, min(2000, int(max_receipts))),
+    )
+    merged_ids = sorted({int(x) for x in explorer_ids + receipt_ids if _parse_int_like(x) > 0}, reverse=True)
+    upserted = _infinity_index_upsert(cid, owner_addr, merged_ids, "receipt")
+    indexed_now = _infinity_index_get_token_ids(cid, owner_addr, limit=400)
+    return {
+        "chain_id": cid,
+        "owner": owner_addr,
+        "position_manager": pm,
+        "receipt_checked": int(receipt_checked),
+        "explorer_ids": len(explorer_ids),
+        "receipt_ids": len(receipt_ids),
+        "merged_ids": len(merged_ids),
+        "upserted": int(upserted),
+        "indexed_total_for_owner": len(indexed_now),
+        "sample_token_ids": indexed_now[:10],
+    }
+
+
+def _indexer_summary(name: str = "infinity_bsc") -> dict[str, Any]:
+    cfg = _indexer_get(name) or {
+        "name": name,
+        "enabled": False,
+        "mode": "off",
+        "max_receipts": int(INFINITY_INDEXER_MAX_RECEIPTS),
+        "updated_at": "",
+    }
+    with _analytics_conn() as conn:
+        total_rows = int(conn.execute("SELECT COUNT(*) FROM infinity_positions_index").fetchone()[0] or 0)
+        owners = int(conn.execute("SELECT COUNT(DISTINCT owner) FROM infinity_positions_index").fetchone()[0] or 0)
+        runs = conn.execute(
+            "SELECT ts, status, details FROM indexer_runs WHERE name = ? ORDER BY id DESC LIMIT 1",
+            (str(name),),
+        ).fetchone()
+    return {
+        **cfg,
+        "records_total": total_rows,
+        "owners_total": owners,
+        "last_run_at": str(runs[0]) if runs else "",
+        "last_run_status": str(runs[1]) if runs else "",
+        "last_run_details": str(runs[2]) if runs else "",
+    }
+
+
+def _parse_owner_chain_from_run_details(details: str) -> tuple[int, str] | None:
+    text = str(details or "")
+    m_owner = re.search(r"owner=(0x[a-fA-F0-9]{40})", text)
+    m_chain = re.search(r"chain=(\d+)", text)
+    if not m_owner or not m_chain:
+        return None
+    owner = str(m_owner.group(1) or "").strip().lower()
+    chain_id = _parse_int_like(m_chain.group(1))
+    if chain_id <= 0 or not _is_eth_address(owner):
+        return None
+    return int(chain_id), owner
+
+
+def _collect_infinity_indexer_targets(limit: int = 400) -> list[tuple[int, str]]:
+    lim = max(1, min(2000, int(limit)))
+    out: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    with _analytics_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT chain_id, owner, MAX(last_seen_ts) AS last_seen
+            FROM infinity_positions_index
+            GROUP BY chain_id, owner
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+        for r in rows:
+            try:
+                cid = int(r[0] or 0)
+            except Exception:
+                cid = 0
+            owner = str(r[1] or "").strip().lower()
+            key = (cid, owner)
+            if cid <= 0 or not _is_eth_address(owner) or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        run_rows = conn.execute(
+            "SELECT details FROM indexer_runs WHERE name = ? ORDER BY id DESC LIMIT 1200",
+            ("infinity_bsc",),
+        ).fetchall()
+        for rr in run_rows:
+            parsed = _parse_owner_chain_from_run_details(rr[0] if rr else "")
+            if not parsed:
+                continue
+            if parsed in seen:
+                continue
+            seen.add(parsed)
+            out.append(parsed)
+            if len(out) >= lim:
+                break
+    return out[:lim]
+
+
+def _run_infinity_indexer_daily_once(max_targets: int | None = None) -> dict[str, Any]:
+    cfg = _indexer_get("infinity_bsc")
+    if not cfg:
+        return {"status": "skipped", "reason": "missing_config", "processed": 0, "updated": 0, "errors": 0}
+    if not bool(cfg.get("enabled")) or str(cfg.get("mode") or "").strip().lower() == "off":
+        return {"status": "skipped", "reason": "disabled", "processed": 0, "updated": 0, "errors": 0}
+
+    if not INDEXER_LOCK.acquire(blocking=False):
+        return {"status": "skipped", "reason": "busy", "processed": 0, "updated": 0, "errors": 0}
+
+    try:
+        targets = _collect_infinity_indexer_targets(
+            limit=max_targets if max_targets is not None else INFINITY_INDEXER_DAILY_MAX_TARGETS
+        )
+        if not targets:
+            return {"status": "skipped", "reason": "no_targets", "processed": 0, "updated": 0, "errors": 0}
+
+        deadline_ts = time.monotonic() + float(INFINITY_INDEXER_DAILY_MAX_SECONDS)
+        updated_total = 0
+        processed = 0
+        errors = 0
+        first_error = ""
+        receipts_cap = int(cfg.get("max_receipts") or INFINITY_INDEXER_MAX_RECEIPTS)
+        for chain_id, owner in targets:
+            if time.monotonic() >= deadline_ts:
+                break
+            processed += 1
+            try:
+                stats = _update_infinity_index_for_owner(chain_id, owner, max_receipts=receipts_cap)
+                updated_total += int(stats.get("merged_ids") or 0)
+            except Exception as e:
+                errors += 1
+                if not first_error:
+                    first_error = str(e)[:220]
+
+        timed_out = processed < len(targets)
+        if errors == 0 and not timed_out:
+            status = "ok"
+        elif processed == 0 and errors > 0:
+            status = "error"
+        else:
+            status = "partial"
+        details = (
+            f"daily processed={processed}/{len(targets)} updated={updated_total} errors={errors}"
+            + (f" first_error={first_error}" if first_error else "")
+            + (" timed_out=1" if timed_out else "")
+        )
+        _indexer_log_run("infinity_bsc", status, details)
+        return {
+            "status": status,
+            "processed": processed,
+            "targets": len(targets),
+            "updated": updated_total,
+            "errors": errors,
+            "timed_out": timed_out,
+        }
+    finally:
+        INDEXER_LOCK.release()
 
 
 def _analytics_log_event(session_id: str, event_type: str, path: str = "", payload: str = "") -> None:
@@ -3332,6 +3712,7 @@ def _scan_pancake_infinity_cl_positions_onchain(
     *,
     deadline_ts: float | None = None,
     debug_out: dict[str, Any] | None = None,
+    token_ids_override: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
     pm = PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid)
@@ -3340,7 +3721,10 @@ def _scan_pancake_infinity_cl_positions_onchain(
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
         return []
-    token_ids = _scan_infinity_position_ids_for_owner(pm, owner_addr, cid, deadline_ts=deadline_ts, debug_out=debug_out)
+    if token_ids_override:
+        token_ids = [int(x) for x in token_ids_override if _parse_int_like(x) > 0]
+    else:
+        token_ids = _scan_infinity_position_ids_for_owner(pm, owner_addr, cid, deadline_ts=deadline_ts, debug_out=debug_out)
     if not token_ids:
         return []
     out: list[dict[str, Any]] = []
@@ -4218,6 +4602,61 @@ def _scan_pool_positions_chain(
         # Run Pancake Infinity at the very end so it cannot starve normal v3/v4 discovery.
         if version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
             infinity_cl_debug: dict[str, Any] = {}
+            index_positions: list[dict[str, Any]] = []
+            try:
+                idx_cfg = _indexer_get("infinity_bsc")
+                idx_enabled = bool(idx_cfg.get("enabled")) and str(idx_cfg.get("mode") or "off") != "off"
+                if idx_enabled and int(chain_id) in {56, 8453} and time.monotonic() < deadline_ts:
+                    if str(idx_cfg.get("mode") or "auto") == "auto":
+                        try:
+                            run_stats = _update_infinity_index_for_owner(
+                                int(chain_id),
+                                owner,
+                                max_receipts=int(idx_cfg.get("max_receipts") or INFINITY_INDEXER_MAX_RECEIPTS),
+                            )
+                            _indexer_log_run(
+                                "infinity_bsc",
+                                "ok",
+                                f"auto owner={owner} chain={chain_id} merged={run_stats.get('merged_ids', 0)} checked={run_stats.get('receipt_checked', 0)}",
+                            )
+                        except Exception as e:
+                            infinity_cl_debug["indexer_auto_error"] = str(e)[:220]
+                            _indexer_log_run(
+                                "infinity_bsc",
+                                "error",
+                                f"auto owner={owner} chain={chain_id} error={str(e)[:220]}",
+                            )
+                    indexed_token_ids = _infinity_index_get_token_ids(int(chain_id), owner, limit=POSITIONS_ONCHAIN_MAX_NFTS)
+                    infinity_cl_debug["indexer_token_ids"] = len(indexed_token_ids)
+                    if indexed_token_ids:
+                        index_positions = _scan_pancake_infinity_cl_positions_onchain(
+                            owner,
+                            int(chain_id),
+                            deadline_ts=deadline_ts,
+                            debug_out=infinity_cl_debug,
+                            token_ids_override=indexed_token_ids,
+                        )
+            except Exception as e:
+                infinity_cl_debug["indexer_error"] = str(e)[:220]
+            if index_positions:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "indexer",
+                        "query_mode": "indexer_pancake_infinity_cl",
+                        "count": len(index_positions),
+                        "ok": True,
+                        "infinity_debug": infinity_cl_debug,
+                    }
+                )
+                seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                for p in index_positions:
+                    pid = str((p or {}).get("id") or "")
+                    if pid and pid in seen:
+                        continue
+                    if pid:
+                        seen.add(pid)
+                    positions.append(p)
             graph_positions: list[dict[str, Any]] = []
             try:
                 graph_positions = _scan_pancake_infinity_cl_positions_graph(
@@ -5247,6 +5686,23 @@ def _catalog_refresh_loop(interval_sec: int, run_on_startup: bool) -> None:
         _refresh_catalogs_once()
 
 
+def _infinity_indexer_daily_loop(interval_sec: int, run_on_startup: bool) -> None:
+    if run_on_startup:
+        try:
+            result = _run_infinity_indexer_daily_once()
+            if str(result.get("status") or "") == "skipped":
+                _indexer_log_run("infinity_bsc", "skip", f"daily_startup reason={result.get('reason') or 'unknown'}")
+        except Exception as e:
+            _indexer_log_run("infinity_bsc", "error", f"daily_startup error={str(e)[:220]}")
+    while not INFINITY_INDEXER_DAILY_STOP.wait(interval_sec):
+        try:
+            result = _run_infinity_indexer_daily_once()
+            if str(result.get("status") or "") == "skipped":
+                _indexer_log_run("infinity_bsc", "skip", f"daily reason={result.get('reason') or 'unknown'}")
+        except Exception as e:
+            _indexer_log_run("infinity_bsc", "error", f"daily_loop error={str(e)[:220]}")
+
+
 def _start_catalog_auto_refresh() -> None:
     global CATALOG_REFRESH_THREAD
     if CATALOG_REFRESH_THREAD and CATALOG_REFRESH_THREAD.is_alive():
@@ -5261,8 +5717,28 @@ def _start_catalog_auto_refresh() -> None:
     CATALOG_REFRESH_THREAD.start()
 
 
+def _start_infinity_indexer_daily() -> None:
+    global INFINITY_INDEXER_DAILY_THREAD
+    if not INFINITY_INDEXER_DAILY_ENABLED:
+        return
+    if INFINITY_INDEXER_DAILY_THREAD and INFINITY_INDEXER_DAILY_THREAD.is_alive():
+        return
+    INFINITY_INDEXER_DAILY_STOP.clear()
+    INFINITY_INDEXER_DAILY_THREAD = threading.Thread(
+        target=_infinity_indexer_daily_loop,
+        args=(INFINITY_INDEXER_DAILY_INTERVAL_SEC, INFINITY_INDEXER_DAILY_ON_STARTUP),
+        daemon=True,
+        name="infinity-indexer-daily",
+    )
+    INFINITY_INDEXER_DAILY_THREAD.start()
+
+
 def _stop_catalog_auto_refresh() -> None:
     CATALOG_REFRESH_STOP.set()
+
+
+def _stop_infinity_indexer_daily() -> None:
+    INFINITY_INDEXER_DAILY_STOP.set()
 
 
 def _final_income(data: dict) -> float:
@@ -5703,6 +6179,20 @@ class AuthVerifyRequest(BaseModel):
 class AdminWalletUpdate(BaseModel):
     action: str
     address: str
+
+
+class AdminIndexerUpdate(BaseModel):
+    name: str = "infinity_bsc"
+    enabled: bool
+    mode: str = "auto"
+    max_receipts: int = INFINITY_INDEXER_MAX_RECEIPTS
+
+
+class AdminIndexerRunRequest(BaseModel):
+    name: str = "infinity_bsc"
+    chain_id: int = 56
+    owner: str
+    max_receipts: int | None = None
 
 
 class HelpTicketCreate(BaseModel):
@@ -6800,9 +7290,9 @@ def _render_positions_page() -> str:
           const attempts = Array.isArray(row?.attempts) ? row.attempts : [];
           for (const a of attempts) {
             const qm = String(a?.query_mode || "");
-            if (!(qm === "onchain_pancake_infinity_cl" || qm === "onchain_pancake_infinity_bin")) continue;
+            if (!(qm === "onchain_pancake_infinity_cl" || qm === "onchain_pancake_infinity_bin" || qm === "indexer_pancake_infinity_cl")) continue;
             const d = a?.infinity_debug || {};
-            const line = `${esc(row.owner || "?")} -> ${esc(row.chain || "?")}/${esc(qm.replace("onchain_", ""))} `
+            const line = `${esc(row.owner || "?")} -> ${esc(row.chain || "?")}/${esc(qm.replace("onchain_", "").replace("indexer_", ""))} `
               + `count=${Number(a?.count || 0)} `
               + `balance=${Number(d.balance || 0)} `
               + `enum_ok=${d.enumerable_ok ? "1" : "0"} enum_ids=${Number(d.enumerable_token_ids || 0)} `
@@ -7511,6 +8001,30 @@ def _render_admin_page() -> str:
         <div class="row"><label>Token catalog</label><div id="tokenCatalogInfo">-</div></div>
         <span id="adminStatus" class="status">Ready</span>
       </section>
+      <section class="card">
+        <h3>Indexers</h3>
+        <p class="hint">Configure and run transaction-history indexers.</p>
+        <div class="row"><label>Infinity indexer</label><div id="idxName">infinity_bsc</div></div>
+        <div class="row"><label>Enabled</label><select id="idxEnabled"><option value="true">yes</option><option value="false">no</option></select></div>
+        <div class="row"><label>Mode</label><select id="idxMode"><option value="auto">auto</option><option value="manual">manual</option><option value="off">off</option></select></div>
+        <div class="row"><label>Max receipts</label><input id="idxMaxReceipts" type="number" min="20" max="2000" step="1" value="220"/></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" onclick="saveIndexerConfig()">Save config</button>
+          <button class="btn" onclick="loadIndexers()">Refresh indexer</button>
+        </div>
+        <hr style="margin:12px 0;border:none;border-top:1px solid #dbe3ef" />
+        <div class="row"><label>Run for owner</label><input id="idxRunOwner" type="text" placeholder="0x..."/></div>
+        <div class="row"><label>Chain id</label><input id="idxRunChainId" type="number" min="1" step="1" value="56"/></div>
+        <button class="btn" onclick="runIndexerForOwner()">Run index now</button>
+        <div style="margin-top:10px;font-size:13px;color:#334155">
+          <div><b>Total records:</b> <span id="idxRecordsTotal">-</span></div>
+          <div><b>Total owners:</b> <span id="idxOwnersTotal">-</span></div>
+          <div><b>Last run:</b> <span id="idxLastRun">-</span></div>
+          <div><b>Last status:</b> <span id="idxLastStatus">-</span></div>
+          <div><b>Last details:</b> <span id="idxLastDetails">-</span></div>
+        </div>
+        <span id="idxStatus" class="status">Ready</span>
+      </section>
     </div>
     <div class="grid" id="tabStats" style="display:none">
       <section class="card">
@@ -7662,6 +8176,62 @@ def _render_admin_page() -> str:
     function setTicketsStatus(text, isErr) {{ const el=document.getElementById("ticketsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFeedbackStatus(text, isErr) {{ const el=document.getElementById("feedbackStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFaqStatus(text, isErr) {{ const el=document.getElementById("faqStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function setIndexerStatus(text, isErr) {{ const el=document.getElementById("idxStatus"); if(!el) return; el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function renderIndexerCard(item) {{
+      const d = item || {{}};
+      document.getElementById("idxEnabled").value = d.enabled ? "true" : "false";
+      document.getElementById("idxMode").value = (d.mode || "auto");
+      document.getElementById("idxMaxReceipts").value = String(Number(d.max_receipts || 220));
+      document.getElementById("idxRecordsTotal").textContent = String(Number(d.records_total || 0));
+      document.getElementById("idxOwnersTotal").textContent = String(Number(d.owners_total || 0));
+      document.getElementById("idxLastRun").textContent = d.last_run_at || "-";
+      document.getElementById("idxLastStatus").textContent = d.last_run_status || "-";
+      document.getElementById("idxLastDetails").textContent = d.last_run_details || "-";
+    }}
+    async function loadIndexers() {{
+      try {{
+        const r = await fetch("/api/admin/indexers");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Failed to load indexers");
+        const item = ((data.items || [])[0] || null);
+        if (item) renderIndexerCard(item);
+        setIndexerStatus("Loaded", false);
+      }} catch (e) {{
+        setIndexerStatus("Load failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function saveIndexerConfig() {{
+      try {{
+        const payload = {{
+          name: "infinity_bsc",
+          enabled: document.getElementById("idxEnabled").value === "true",
+          mode: document.getElementById("idxMode").value || "auto",
+          max_receipts: Number(document.getElementById("idxMaxReceipts").value || 220),
+        }};
+        const data = await postJson("/api/admin/indexers/config", payload);
+        if (data?.item) renderIndexerCard(data.item);
+        setIndexerStatus("Indexer config saved", false);
+      }} catch (e) {{
+        setIndexerStatus("Save failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function runIndexerForOwner() {{
+      const owner = (document.getElementById("idxRunOwner").value || "").trim();
+      const chainId = Number(document.getElementById("idxRunChainId").value || 56);
+      if (!owner) {{
+        setIndexerStatus("Enter owner address", true);
+        return;
+      }}
+      try {{
+        setIndexerStatus("Running indexer...", false);
+        const data = await postJson("/api/admin/indexers/run", {{ name: "infinity_bsc", owner, chain_id: chainId }});
+        if (data?.item) renderIndexerCard(data.item);
+        const run = data?.run || {{}};
+        setIndexerStatus(`Done: merged=${{Number(run.merged_ids || 0)}}, checked=${{Number(run.receipt_checked || 0)}}`, false);
+      }} catch (e) {{
+        setIndexerStatus("Run failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
     function normStatus(v) {{ return String(v || "").trim().toLowerCase().replace(/[\\s-]+/g, "_"); }}
     function getTicketsFilter() {{
       const statusEl = document.getElementById("ticketFilterStatus");
@@ -8059,6 +8629,7 @@ def _render_admin_page() -> str:
         document.getElementById("eventsCount").textContent = String(data.events_count || 0);
         document.getElementById("tokenCatalogInfo").textContent = `updated: ${{data.token_catalog_updated_at || "-"}}, count: ${{data.token_catalog_count || 0}}`;
         renderAdminWallets(data.admin_wallets || []);
+        await loadIndexers();
       }} catch (e) {{
         setAdminStatus("Load failed: " + (e?.message || "unknown"), true);
       }}
@@ -8633,6 +9204,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "events_count": events_count,
             "token_catalog_updated_at": token_catalog.get("updated_at"),
             "token_catalog_count": token_catalog.get("count", 0),
+            "indexer": _indexer_summary("infinity_bsc"),
         }
     except Exception as e:
         return {
@@ -8642,6 +9214,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "events_count": 0,
             "token_catalog_updated_at": None,
             "token_catalog_count": 0,
+            "indexer": _indexer_summary("infinity_bsc"),
             "info": f"Admin settings fallback mode. Error: {e}",
         }
 
@@ -8721,6 +9294,59 @@ def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Res
     wallets = [w for w in wallets if w != address]
     _set_admin_wallets(wallets)
     return {"ok": True, "info": "Admin wallet removed.", "items": _admin_wallets_value()}
+
+
+@app.get("/api/admin/indexers")
+def admin_indexers(request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    return {"ok": True, "items": [_indexer_summary("infinity_bsc")]}
+
+
+@app.post("/api/admin/indexers/config")
+def admin_indexers_config(req: AdminIndexerUpdate, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    if str(req.name or "").strip() != "infinity_bsc":
+        raise HTTPException(status_code=400, detail="Unknown indexer name.")
+    item = _indexer_upsert(
+        "infinity_bsc",
+        enabled=bool(req.enabled),
+        mode=str(req.mode or "auto"),
+        max_receipts=int(req.max_receipts),
+    )
+    _indexer_log_run(
+        "infinity_bsc",
+        "config",
+        f"enabled={1 if item.get('enabled') else 0} mode={item.get('mode')} max_receipts={item.get('max_receipts')}",
+    )
+    return {"ok": True, "item": _indexer_summary("infinity_bsc")}
+
+
+@app.post("/api/admin/indexers/run")
+def admin_indexers_run(req: AdminIndexerRunRequest, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    if str(req.name or "").strip() != "infinity_bsc":
+        raise HTTPException(status_code=400, detail="Unknown indexer name.")
+    owner = str(req.owner or "").strip().lower()
+    if not _is_eth_address(owner):
+        raise HTTPException(status_code=400, detail="Invalid owner address.")
+    max_receipts = req.max_receipts
+    if max_receipts is None:
+        cfg = _indexer_get("infinity_bsc")
+        max_receipts = int(cfg.get("max_receipts") or INFINITY_INDEXER_MAX_RECEIPTS)
+    try:
+        run_stats = _update_infinity_index_for_owner(int(req.chain_id), owner, max_receipts=int(max_receipts))
+        _indexer_log_run(
+            "infinity_bsc",
+            "ok",
+            f"manual owner={owner} chain={req.chain_id} merged={run_stats.get('merged_ids', 0)} checked={run_stats.get('receipt_checked', 0)}",
+        )
+        return {"ok": True, "run": run_stats, "item": _indexer_summary("infinity_bsc")}
+    except HTTPException as e:
+        _indexer_log_run("infinity_bsc", "error", f"manual owner={owner} chain={req.chain_id} error={e.detail}")
+        raise
+    except Exception as e:
+        _indexer_log_run("infinity_bsc", "error", f"manual owner={owner} chain={req.chain_id} error={str(e)[:220]}")
+        raise HTTPException(status_code=500, detail=f"Indexer run failed: {e}") from e
 
 
 @app.get("/api/positions/chains")
