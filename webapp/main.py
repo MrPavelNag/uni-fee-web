@@ -2014,6 +2014,7 @@ def _scan_infinity_position_ids_for_owner(
     chain_id: int,
     *,
     deadline_ts: float | None = None,
+    debug_out: dict[str, Any] | None = None,
 ) -> list[int]:
     cid = int(chain_id)
     owner = str(owner_addr or "").strip().lower()
@@ -2023,14 +2024,39 @@ def _scan_infinity_position_ids_for_owner(
     if not _is_eth_address(pm):
         return []
     balance = 0
+    dbg = debug_out if isinstance(debug_out, dict) else None
+    if dbg is not None:
+        dbg.clear()
+        dbg.update(
+            {
+                "pm": pm,
+                "balance": 0,
+                "enumerable_ok": False,
+                "enumerable_token_ids": 0,
+                "log_token_ids": 0,
+                "ownerof_checked_from_logs": 0,
+                "ownerof_matched_from_logs": 0,
+                "ownerof_mismatched_from_logs": 0,
+                "ownerof_errors_from_logs": 0,
+                "owner_scan_checked": 0,
+                "owner_scan_matched": 0,
+                "owner_scan_errors": 0,
+                "final_token_ids": 0,
+                "early_exit_no_balance": False,
+            }
+        )
     try:
         bal_data = "0x70a08231" + _encode_address_word(owner)
         balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
     except Exception:
         balance = 0
+    if dbg is not None:
+        dbg["balance"] = int(balance)
     if int(balance) <= 0:
         # Avoid expensive log scans when contract reports no owned NFTs.
         # This keeps overall pool scan responsive and prevents global timeouts.
+        if dbg is not None:
+            dbg["early_exit_no_balance"] = True
         return []
     limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
     token_ids: list[int] = []
@@ -2051,6 +2077,9 @@ def _scan_infinity_position_ids_for_owner(
                 break
     else:
         enumerable_ok = False
+    if dbg is not None:
+        dbg["enumerable_ok"] = bool(enumerable_ok)
+        dbg["enumerable_token_ids"] = len(token_ids)
     if len(token_ids) < limit:
         # Wallets often discover Infinity NFTs by Transfer logs; use same approach
         # when ERC721Enumerable path is unavailable or incomplete.
@@ -2065,6 +2094,8 @@ def _scan_infinity_position_ids_for_owner(
             deadline_ts=log_deadline,
             max_ids=max(limit * 3, limit),
         )
+        if dbg is not None:
+            dbg["log_token_ids"] = len(log_ids)
         for tid in log_ids:
             if len(token_ids) >= limit:
                 break
@@ -2072,20 +2103,32 @@ def _scan_infinity_position_ids_for_owner(
                 break
             if int(tid) in seen_ids:
                 continue
+            if dbg is not None:
+                dbg["ownerof_checked_from_logs"] = int(dbg.get("ownerof_checked_from_logs") or 0) + 1
             try:
                 owner_data = "0x6352211e" + _encode_uint_word(tid)
                 owner_hex = _eth_call_hex(cid, pm, owner_data)
                 owner_words = _hex_words(owner_hex)
                 if not owner_words:
+                    if dbg is not None:
+                        dbg["ownerof_errors_from_logs"] = int(dbg.get("ownerof_errors_from_logs") or 0) + 1
                     continue
                 current_owner = owner_words[0][-40:].lower()
                 if current_owner != owner_word:
+                    if dbg is not None:
+                        dbg["ownerof_mismatched_from_logs"] = int(dbg.get("ownerof_mismatched_from_logs") or 0) + 1
                     continue
             except Exception:
+                if dbg is not None:
+                    dbg["ownerof_errors_from_logs"] = int(dbg.get("ownerof_errors_from_logs") or 0) + 1
                 continue
+            if dbg is not None:
+                dbg["ownerof_matched_from_logs"] = int(dbg.get("ownerof_matched_from_logs") or 0) + 1
             seen_ids.add(int(tid))
             token_ids.append(int(tid))
     if token_ids or enumerable_ok:
+        if dbg is not None:
+            dbg["final_token_ids"] = len(token_ids)
         return token_ids
     # Fallback for contracts without ERC721Enumerable: scan recent IDs by ownerOf.
     # Keep this path lightweight to avoid starving other chain scans.
@@ -2109,17 +2152,27 @@ def _scan_infinity_position_ids_for_owner(
             break
         if len(token_ids) >= limit:
             break
+        if dbg is not None:
+            dbg["owner_scan_checked"] = int(dbg.get("owner_scan_checked") or 0) + 1
         try:
             owner_data = "0x6352211e" + _encode_uint_word(tid)
             owner_hex = _eth_call_hex(cid, pm, owner_data)
             owner_words = _hex_words(owner_hex)
             if not owner_words:
+                if dbg is not None:
+                    dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
                 continue
             current_owner = owner_words[0][-40:].lower()
             if current_owner == owner_word:
                 token_ids.append(int(tid))
+                if dbg is not None:
+                    dbg["owner_scan_matched"] = int(dbg.get("owner_scan_matched") or 0) + 1
         except Exception:
+            if dbg is not None:
+                dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
             continue
+    if dbg is not None:
+        dbg["final_token_ids"] = len(token_ids)
     return token_ids
 
 
@@ -2128,6 +2181,7 @@ def _scan_pancake_infinity_cl_positions_onchain(
     chain_id: int,
     *,
     deadline_ts: float | None = None,
+    debug_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
     pm = PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid)
@@ -2136,7 +2190,7 @@ def _scan_pancake_infinity_cl_positions_onchain(
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
         return []
-    token_ids = _scan_infinity_position_ids_for_owner(pm, owner_addr, cid, deadline_ts=deadline_ts)
+    token_ids = _scan_infinity_position_ids_for_owner(pm, owner_addr, cid, deadline_ts=deadline_ts, debug_out=debug_out)
     if not token_ids:
         return []
     out: list[dict[str, Any]] = []
@@ -2207,6 +2261,7 @@ def _scan_pancake_infinity_bin_positions_onchain(
     chain_id: int,
     *,
     deadline_ts: float | None = None,
+    debug_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
     pm = PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid)
@@ -2215,7 +2270,7 @@ def _scan_pancake_infinity_bin_positions_onchain(
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
         return []
-    token_ids = _scan_infinity_position_ids_for_owner(pm, owner_addr, cid, deadline_ts=deadline_ts)
+    token_ids = _scan_infinity_position_ids_for_owner(pm, owner_addr, cid, deadline_ts=deadline_ts, debug_out=debug_out)
     if not token_ids:
         return []
     out: list[dict[str, Any]] = []
@@ -2908,10 +2963,12 @@ def _scan_pool_positions_chain(
         # not visible through Uniswap-v3/v4 subgraph queries.
         if version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
             try:
+                infinity_cl_debug: dict[str, Any] = {}
                 infinity_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
                     owner,
                     int(chain_id),
                     deadline_ts=deadline_ts,
+                    debug_out=infinity_cl_debug,
                 )
                 owner_attempts.append(
                     {
@@ -2920,6 +2977,7 @@ def _scan_pool_positions_chain(
                         "query_mode": "onchain_pancake_infinity_cl",
                         "count": len(infinity_cl_positions),
                         "ok": True,
+                        "infinity_debug": infinity_cl_debug,
                     }
                 )
                 if infinity_cl_positions:
@@ -2940,15 +2998,18 @@ def _scan_pool_positions_chain(
                         "count": 0,
                         "ok": False,
                         "error": str(e)[:220],
+                        "infinity_debug": infinity_cl_debug,
                     }
                 )
 
         if version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
             try:
+                infinity_bin_debug: dict[str, Any] = {}
                 infinity_bin_positions = _scan_pancake_infinity_bin_positions_onchain(
                     owner,
                     int(chain_id),
                     deadline_ts=deadline_ts,
+                    debug_out=infinity_bin_debug,
                 )
                 owner_attempts.append(
                     {
@@ -2957,6 +3018,7 @@ def _scan_pool_positions_chain(
                         "query_mode": "onchain_pancake_infinity_bin",
                         "count": len(infinity_bin_positions),
                         "ok": True,
+                        "infinity_debug": infinity_bin_debug,
                     }
                 )
                 if infinity_bin_positions:
@@ -2977,6 +3039,7 @@ def _scan_pool_positions_chain(
                         "count": 0,
                         "ok": False,
                         "error": str(e)[:220],
+                        "infinity_debug": infinity_bin_debug,
                     }
                 )
 
@@ -5496,10 +5559,36 @@ def _render_positions_page() -> str:
             const gid = (Array.isArray(c.only_graph_ids) ? c.only_graph_ids : []).slice(0, 2).join(",");
             return `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} only_onchain=${o}${oid ? ` [${esc(oid)}]` : ""}, only_graph=${g}${gid ? ` [${esc(gid)}]` : ""}`;
           });
+        const infinityRows = [];
+        for (const row of dbgRows.slice(0, 200)) {
+          const attempts = Array.isArray(row?.attempts) ? row.attempts : [];
+          for (const a of attempts) {
+            const qm = String(a?.query_mode || "");
+            if (!(qm === "onchain_pancake_infinity_cl" || qm === "onchain_pancake_infinity_bin")) continue;
+            const d = a?.infinity_debug || {};
+            const line = `${esc(row.owner || "?")} -> ${esc(row.chain || "?")}/${esc(qm.replace("onchain_", ""))} `
+              + `count=${Number(a?.count || 0)} `
+              + `balance=${Number(d.balance || 0)} `
+              + `enum_ok=${d.enumerable_ok ? "1" : "0"} enum_ids=${Number(d.enumerable_token_ids || 0)} `
+              + `log_ids=${Number(d.log_token_ids || 0)} `
+              + `ownerOf_checked=${Number(d.ownerof_checked_from_logs || 0)} `
+              + `ownerOf_match=${Number(d.ownerof_matched_from_logs || 0)} `
+              + `ownerOf_mismatch=${Number(d.ownerof_mismatched_from_logs || 0)} `
+              + `ownerOf_err=${Number(d.ownerof_errors_from_logs || 0)} `
+              + `scan_checked=${Number(d.owner_scan_checked || 0)} `
+              + `scan_match=${Number(d.owner_scan_matched || 0)} `
+              + `scan_err=${Number(d.owner_scan_errors || 0)} `
+              + `final_ids=${Number(d.final_token_ids || 0)} `
+              + `no_balance_exit=${d.early_exit_no_balance ? "1" : "0"}`
+              + `${d.pm ? ` pm=${esc(d.pm)}` : ""}`;
+            infinityRows.push(line);
+          }
+        }
         const body = []
           .concat(sumLines.length ? ["Summary:", ...sumLines] : [])
           .concat(zeroRows.length ? ["", "Zero-found owners:", ...zeroRows] : [])
           .concat(cmpRows.length ? ["", "Source compare (onchain vs graph):", ...cmpRows] : [])
+          .concat(infinityRows.length ? ["", "Infinity debug:", ...infinityRows.slice(0, 40)] : [])
           .join("\\n");
         if (body.trim()) {
           dbgHtml = `<div class='info-box'><details><summary>Debug scan details</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
