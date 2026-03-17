@@ -1567,6 +1567,16 @@ def _contract_creation_date_ymd(chain_id: int, contract_address: str) -> str:
     return date_str
 
 
+def _contract_creation_date_cached(chain_id: int, contract_address: str) -> str:
+    addr = str(contract_address or "").strip().lower()
+    if not _is_eth_address(addr):
+        return ""
+    key = (int(chain_id), addr)
+    with CONTRACT_CREATION_DATE_CACHE_LOCK:
+        cached = CONTRACT_CREATION_DATE_CACHE.get(key)
+    return str(cached or "")
+
+
 def _scan_erc721_token_ids_by_incoming_logs(
     chain_id: int,
     contract: str,
@@ -1745,7 +1755,7 @@ def _scan_cl_mintposition_token_ids_by_owner(
     min_block = max(0, int(latest) - max(1, lb))
     step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
     # event MintPosition(uint256 indexed tokenId)
-    topic_mint = "0x591c0e8a7de1f037c433d7f8f0f5cae4460ed28e9ca9f6f778dfec51dff7d8f7"
+    topic_mint = "0x2c0223eed283e194c1112e080d31bdec9e2760ba1454153666cd9d7d6a877964"
     owner_word = _encode_address_word(o)[-40:]
     end_block = int(latest)
     out: list[int] = []
@@ -1820,31 +1830,41 @@ def _scan_erc721_token_ids_by_explorer_api(
     o = str(owner or "").strip().lower()
     if not _is_eth_address(c) or not _is_eth_address(o):
         return []
-    api_base = {
-        56: "https://api.bscscan.com/api",
-        8453: "https://api.basescan.org/api",
-    }.get(cid, "")
-    if not api_base:
+    chainid_for_v2 = {56: "56", 8453: "8453"}.get(cid, "")
+    api_base_v1 = {56: "https://api.bscscan.com/api", 8453: "https://api.basescan.org/api"}.get(cid, "")
+    if not chainid_for_v2 and not api_base_v1:
         return []
     api_key = os.environ.get("ETHERSCAN_API_KEY", "").strip() or os.environ.get("BSCSCAN_API_KEY", "").strip() or "YourApiKeyToken"
-    url = (
-        f"{api_base}?module=account&action=tokennfttx"
-        f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={api_key}"
-    )
-    try:
-        req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
-        with urlopen(req, timeout=12) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return []
-    rows = (payload or {}).get("result")
-    if not isinstance(rows, list):
+    urls: list[str] = []
+    if chainid_for_v2:
+        urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={api_key}"
+        )
+    if api_base_v1:
+        urls.append(
+            f"{api_base_v1}?module=account&action=tokennfttx"
+            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={api_key}"
+        )
+    rows: list[dict[str, Any]] = []
+    for url in urls:
+        try:
+            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            with urlopen(req, timeout=12) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            result_rows = (payload or {}).get("result")
+            if isinstance(result_rows, list):
+                rows = [x for x in result_rows if isinstance(x, dict)]
+                if rows:
+                    break
+        except Exception:
+            continue
+    if not rows:
         return []
     out: list[int] = []
     seen: set[int] = set()
     for r in rows:
-        if not isinstance(r, dict):
-            continue
         tid_raw = str(r.get("tokenID") or "").strip()
         if not tid_raw:
             continue
@@ -2378,6 +2398,48 @@ def _scan_infinity_position_ids_for_owner(
         dbg["enumerable_ok"] = bool(enumerable_ok)
         dbg["enumerable_token_ids"] = len(token_ids)
     if len(token_ids) < limit:
+        # Priority path: when nextTokenId exists, ownerOf scan near the latest ids
+        # is usually the fastest way to recover ids for non-enumerable managers.
+        next_token_id_fast = 0
+        try:
+            next_token_id_fast = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x75794a3c"))
+        except Exception:
+            next_token_id_fast = 0
+        if next_token_id_fast > 0:
+            owner_word_fast = _encode_address_word(owner)[-40:]
+            lookback_fast = max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 200, 20000)
+            start_tid_fast = max(1, int(next_token_id_fast) - int(lookback_fast))
+            for tid in range(int(next_token_id_fast) - 1, start_tid_fast - 1, -1):
+                if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                    break
+                if len(token_ids) >= limit:
+                    break
+                if dbg is not None:
+                    dbg["owner_scan_checked"] = int(dbg.get("owner_scan_checked") or 0) + 1
+                try:
+                    owner_data = "0x6352211e" + _encode_uint_word(tid)
+                    owner_hex = _eth_call_hex(cid, pm, owner_data)
+                    owner_words = _hex_words(owner_hex)
+                    if not owner_words:
+                        if dbg is not None:
+                            dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
+                        continue
+                    current_owner = owner_words[0][-40:].lower()
+                    if current_owner == owner_word_fast:
+                        if int(tid) not in seen_ids:
+                            seen_ids.add(int(tid))
+                            token_ids.append(int(tid))
+                        if dbg is not None:
+                            dbg["owner_scan_matched"] = int(dbg.get("owner_scan_matched") or 0) + 1
+                except Exception:
+                    if dbg is not None:
+                        dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
+                    continue
+            if len(token_ids) >= limit:
+                if dbg is not None:
+                    dbg["final_token_ids"] = len(token_ids)
+                return token_ids
+    if len(token_ids) < limit:
         # Wallets often discover Infinity NFTs by Transfer logs; use same approach
         # when ERC721Enumerable path is unavailable or incomplete.
         owner_word = _encode_address_word(owner)[-40:]
@@ -2556,12 +2618,14 @@ def _scan_infinity_position_ids_for_owner(
     # Keep this path lightweight to avoid starving other chain scans.
     if deadline_ts is not None and deadline_ts <= time.monotonic():
         return token_ids
+    already_owner_scanned = int((dbg or {}).get("owner_scan_checked") or 0) > 0
     next_token_id = 0
-    try:
-        next_token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x75794a3c"))
-    except Exception:
-        next_token_id = 0
-    if next_token_id > 0:
+    if not already_owner_scanned:
+        try:
+            next_token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x75794a3c"))
+        except Exception:
+            next_token_id = 0
+    if next_token_id > 0 and not already_owner_scanned:
         lookback = max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 40, 5000)
         start_tid = max(1, int(next_token_id) - int(lookback))
         owner_word = _encode_address_word(owner)[-40:]
@@ -3710,7 +3774,7 @@ def _scan_pool_positions_chain(
                         "pool_liquidity": str(pool.get("liquidity") or "0"),
                         "pool_tvl_usd": tvl_usd,
                         "tvl_usd": position_tvl_usd,
-                        "contract_created_date": _contract_creation_date_ymd(int(chain_id), str(pool.get("id") or "")),
+                        "contract_created_date": _contract_creation_date_cached(int(chain_id), str(pool.get("id") or "")),
                         "valuation_mode": valuation_mode,
                         "suspected_spam": bool(suspected_spam),
                     }
