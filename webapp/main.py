@@ -193,6 +193,7 @@ POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS = max(10, int(os.environ.get("POSITIONS
 POSITIONS_ENABLE_INFINITY = os.environ.get("POSITIONS_ENABLE_INFINITY", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_HEAVY_METHODS = os.environ.get("POSITIONS_INFINITY_HEAVY_METHODS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_DEBANK_FALLBACK = os.environ.get("POSITIONS_DEBANK_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
 DEBANK_ACCESS_KEY = os.environ.get("DEBANK_ACCESS_KEY", "").strip()
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
@@ -2211,7 +2212,10 @@ def _chain_has_any_position_nft_balance(chain_id: int, addresses: list[str]) -> 
                 continue
             if int(bal) > 0:
                 return True
-    # If RPC precheck is inconclusive, do not skip the chain.
+    # Strict mode: treat inconclusive RPC as zero to aggressively skip old-empty chains.
+    if POSITIONS_STRICT_ZERO_BALANCE_FILTER:
+        return False
+    # Relaxed mode: inconclusive precheck should not drop a chain.
     return had_unknown
 
 
@@ -2230,6 +2234,8 @@ def _owner_has_any_position_nft_balance(chain_id: int, owner: str) -> bool:
             continue
         if int(bal) > 0:
             return True
+    if POSITIONS_STRICT_ZERO_BALANCE_FILTER:
+        return False
     return had_unknown
 
 
