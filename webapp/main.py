@@ -1721,6 +1721,62 @@ def _scan_erc721_token_ids_by_recent_transfers_ownerof(
     return out
 
 
+def _scan_erc721_token_ids_by_explorer_api(
+    chain_id: int,
+    contract: str,
+    owner: str,
+    *,
+    max_ids: int = 120,
+) -> list[int]:
+    cid = int(chain_id)
+    c = str(contract or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(c) or not _is_eth_address(o):
+        return []
+    api_base = {
+        56: "https://api.bscscan.com/api",
+        8453: "https://api.basescan.org/api",
+    }.get(cid, "")
+    if not api_base:
+        return []
+    api_key = os.environ.get("ETHERSCAN_API_KEY", "").strip() or os.environ.get("BSCSCAN_API_KEY", "").strip() or "YourApiKeyToken"
+    url = (
+        f"{api_base}?module=account&action=tokennfttx"
+        f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={api_key}"
+    )
+    try:
+        req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+        with urlopen(req, timeout=12) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+    rows = (payload or {}).get("result")
+    if not isinstance(rows, list):
+        return []
+    out: list[int] = []
+    seen: set[int] = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        tid_raw = str(r.get("tokenID") or "").strip()
+        if not tid_raw:
+            continue
+        try:
+            tid = int(tid_raw, 10)
+        except Exception:
+            try:
+                tid = int(tid_raw, 16) if tid_raw.lower().startswith("0x") else int(tid_raw)
+            except Exception:
+                continue
+        if tid <= 0 or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(int(tid))
+        if len(out) >= int(max_ids):
+            break
+    return out
+
+
 def _encode_address_word(addr: str) -> str:
     raw = str(addr or "").strip().lower()
     if not raw.startswith("0x"):
@@ -2182,6 +2238,9 @@ def _scan_infinity_position_ids_for_owner(
                 "recent_transfer_token_ids": 0,
                 "recent_transfer_ownerof_checked": 0,
                 "recent_transfer_ownerof_matched": 0,
+                "explorer_token_ids": 0,
+                "explorer_ownerof_checked": 0,
+                "explorer_ownerof_matched": 0,
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -2336,6 +2395,41 @@ def _scan_infinity_position_ids_for_owner(
             token_ids.append(int(tid))
             if dbg is not None:
                 dbg["recent_transfer_ownerof_matched"] = int(dbg.get("recent_transfer_ownerof_matched") or 0) + 1
+    if len(token_ids) < limit and balance > 0:
+        # Final fallback: explorer NFT tx index (BscScan/BaseScan style APIs).
+        owner_word = _encode_address_word(owner)[-40:]
+        explorer_ids = _scan_erc721_token_ids_by_explorer_api(
+            cid,
+            pm,
+            owner,
+            max_ids=max(limit * 8, limit),
+        )
+        if dbg is not None:
+            dbg["explorer_token_ids"] = len(explorer_ids)
+        for tid in explorer_ids:
+            if len(token_ids) >= limit:
+                break
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            if int(tid) in seen_ids:
+                continue
+            if dbg is not None:
+                dbg["explorer_ownerof_checked"] = int(dbg.get("explorer_ownerof_checked") or 0) + 1
+            try:
+                owner_data = "0x6352211e" + _encode_uint_word(tid)
+                owner_hex = _eth_call_hex(cid, pm, owner_data)
+                owner_words = _hex_words(owner_hex)
+                if not owner_words:
+                    continue
+                current_owner = owner_words[0][-40:].lower()
+                if current_owner != owner_word:
+                    continue
+            except Exception:
+                continue
+            seen_ids.add(int(tid))
+            token_ids.append(int(tid))
+            if dbg is not None:
+                dbg["explorer_ownerof_matched"] = int(dbg.get("explorer_ownerof_matched") or 0) + 1
     if token_ids or enumerable_ok:
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
@@ -5786,6 +5880,9 @@ def _render_positions_page() -> str:
               + `recent_ids=${Number(d.recent_transfer_token_ids || 0)} `
               + `recent_checked=${Number(d.recent_transfer_ownerof_checked || 0)} `
               + `recent_match=${Number(d.recent_transfer_ownerof_matched || 0)} `
+              + `explorer_ids=${Number(d.explorer_token_ids || 0)} `
+              + `explorer_checked=${Number(d.explorer_ownerof_checked || 0)} `
+              + `explorer_match=${Number(d.explorer_ownerof_matched || 0)} `
               + `scan_checked=${Number(d.owner_scan_checked || 0)} `
               + `scan_match=${Number(d.owner_scan_matched || 0)} `
               + `scan_err=${Number(d.owner_scan_errors || 0)} `
