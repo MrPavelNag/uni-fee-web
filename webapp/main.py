@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 import shutil
+from queue import Empty, Queue
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
@@ -98,12 +99,14 @@ app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 def _on_startup() -> None:
     _start_catalog_auto_refresh()
     _start_analytics()
+    _start_positions_index_workers()
     _start_infinity_indexer_daily()
 
 
 @app.on_event("shutdown")
 def _on_shutdown() -> None:
     _stop_catalog_auto_refresh()
+    _stop_positions_index_workers()
     _stop_infinity_indexer_daily()
     _stop_analytics()
 
@@ -130,6 +133,11 @@ INDEXER_ACTIVITY: dict[str, Any] = {
 POS_JOBS: dict[str, dict[str, Any]] = {}
 POS_JOB_LOCK = threading.Lock()
 POS_JOB_TTL_SEC = 60 * 60
+POSITIONS_INDEX_QUEUE: Queue[tuple[int, str]] = Queue()
+POSITIONS_INDEX_INFLIGHT: set[tuple[int, str]] = set()
+POSITIONS_INDEX_INFLIGHT_LOCK = threading.Lock()
+POSITIONS_INDEX_STOP = threading.Event()
+POSITIONS_INDEX_WORKERS: list[threading.Thread] = []
 RUN_HISTORY: dict[str, list[dict[str, Any]]] = {}
 RUN_HISTORY_LIMIT = 10
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -270,6 +278,43 @@ POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
     if x.strip().isdigit()
 }
 POSITIONS_DISABLE_V3_PREFETCH = os.environ.get("POSITIONS_DISABLE_V3_PREFETCH", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_OWNERSHIP_INDEX_ENABLED = os.environ.get("POSITIONS_OWNERSHIP_INDEX_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_OWNERSHIP_INDEX_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_OWNERSHIP_INDEX_WORKERS", "2"))))
+POSITIONS_OWNERSHIP_INDEX_MAX_NFTS = max(20, min(600, int(os.environ.get("POSITIONS_OWNERSHIP_INDEX_MAX_NFTS", "240"))))
+POSITIONS_INDEX_FIRST_STRICT = os.environ.get("POSITIONS_INDEX_FIRST_STRICT", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_DIRECT_INCLUDE_CREATION_DATES = os.environ.get("POSITIONS_DIRECT_INCLUDE_CREATION_DATES", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_INDEX_SYNC_WARMUP_ENABLED = os.environ.get("POSITIONS_INDEX_SYNC_WARMUP_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_INDEX_SYNC_WARMUP_MAX_RECEIPTS = max(20, int(os.environ.get("POSITIONS_INDEX_SYNC_WARMUP_MAX_RECEIPTS", "80")))
+POSITIONS_INDEX_SYNC_WARMUP_V4_DEADLINE_SEC = max(
+    2,
+    int(os.environ.get("POSITIONS_INDEX_SYNC_WARMUP_V4_DEADLINE_SEC", "6")),
+)
+POSITIONS_LEGACY_DISCOVERY_ENABLED = os.environ.get("POSITIONS_LEGACY_DISCOVERY_ENABLED", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -528,6 +573,36 @@ def _init_analytics_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_inf_pos_owner_chain ON infinity_positions_index(owner, chain_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_inf_pos_ts ON infinity_positions_index(last_seen_ts)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS position_ownership_index (
+              chain_id INTEGER NOT NULL,
+              owner TEXT NOT NULL,
+              protocol TEXT NOT NULL,
+              manager TEXT NOT NULL DEFAULT '',
+              token_id TEXT NOT NULL,
+              source TEXT NOT NULL DEFAULT '',
+              first_seen_ts TEXT NOT NULL,
+              last_seen_ts TEXT NOT NULL,
+              PRIMARY KEY(chain_id, owner, protocol, token_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS position_details_cache (
+              chain_id INTEGER NOT NULL,
+              protocol TEXT NOT NULL,
+              token_id TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(chain_id, protocol, token_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pos_own_owner_chain ON position_ownership_index(owner, chain_id, protocol)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pos_own_seen ON position_ownership_index(last_seen_ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pos_details_updated ON position_details_cache(updated_at)")
         # Ensure default infinity indexer config exists.
         conn.execute(
             """
@@ -742,6 +817,305 @@ def _infinity_index_get_token_ids(chain_id: int, owner: str, limit: int = 180) -
     return out
 
 
+def _position_ownership_upsert(
+    chain_id: int,
+    owner: str,
+    protocol: str,
+    manager: str,
+    token_ids: list[int | str],
+    *,
+    source: str = "onchain",
+) -> int:
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(owner_addr):
+        return 0
+    proto = str(protocol or "").strip().lower()[:40]
+    if not proto:
+        return 0
+    mgr = str(manager or "").strip().lower()
+    now = _iso_now()
+    rows: list[tuple[Any, ...]] = []
+    for raw_tid in token_ids:
+        tid = _parse_int_like(raw_tid)
+        if tid <= 0:
+            continue
+        rows.append((cid, owner_addr, proto, mgr, str(tid), str(source or "onchain")[:24], now, now))
+    if not rows:
+        return 0
+    with _analytics_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO position_ownership_index(chain_id, owner, protocol, manager, token_id, source, first_seen_ts, last_seen_ts)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chain_id, owner, protocol, token_id) DO UPDATE SET
+              manager = excluded.manager,
+              source = excluded.source,
+              last_seen_ts = excluded.last_seen_ts
+            """,
+            rows,
+        )
+        conn.commit()
+    return len(rows)
+
+
+def _position_details_cache_upsert(chain_id: int, protocol: str, position: dict[str, Any]) -> None:
+    try:
+        cid = int(chain_id)
+    except Exception:
+        return
+    proto = str(protocol or "").strip().lower()[:40]
+    tid = str((position or {}).get("id") or "").strip()
+    if cid <= 0 or not proto or not tid:
+        return
+    payload = dict(position or {})
+    # Runtime-only fields should not be persisted in cache.
+    for k in ("created", "current_tvl_usd", "valuation_mode", "token0_symbol", "token1_symbol"):
+        if k in payload:
+            payload.pop(k, None)
+    now = _iso_now()
+    with _analytics_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO position_details_cache(chain_id, protocol, token_id, payload_json, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(chain_id, protocol, token_id) DO UPDATE SET
+              payload_json = excluded.payload_json,
+              updated_at = excluded.updated_at
+            """,
+            (cid, proto, tid, json.dumps(payload, ensure_ascii=True), now),
+        )
+        conn.commit()
+
+
+def _position_cached_rows_for_owner(
+    chain_id: int,
+    owner: str,
+    protocol: str,
+    *,
+    limit: int = 240,
+) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    proto = str(protocol or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(owner_addr) or not proto:
+        return []
+    lim = max(1, min(800, int(limit)))
+    with _analytics_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT o.token_id, d.payload_json, o.last_seen_ts
+            FROM position_ownership_index o
+            LEFT JOIN position_details_cache d
+              ON d.chain_id = o.chain_id AND d.protocol = o.protocol AND d.token_id = o.token_id
+            WHERE o.chain_id = ? AND o.owner = ? AND o.protocol = ?
+            ORDER BY o.last_seen_ts DESC
+            LIMIT ?
+            """,
+            (cid, owner_addr, proto, lim),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            token_id = str(r[0] or "").strip()
+            payload = str(r[1] or "").strip()
+            if not token_id or not payload:
+                continue
+            obj = json.loads(payload)
+            if not isinstance(obj, dict):
+                continue
+            obj["id"] = token_id
+            obj["_source"] = "ownership_cache"
+            obj["_protocol_label"] = str(obj.get("_protocol_label") or proto)
+            out.append(obj)
+        except Exception:
+            continue
+    return out
+
+
+def _position_enqueue_ownership_refresh(chain_id: int, owner: str) -> bool:
+    if not POSITIONS_OWNERSHIP_INDEX_ENABLED:
+        return False
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(owner_addr):
+        return False
+    key = (cid, owner_addr)
+    with POSITIONS_INDEX_INFLIGHT_LOCK:
+        if key in POSITIONS_INDEX_INFLIGHT:
+            return False
+        POSITIONS_INDEX_INFLIGHT.add(key)
+    POSITIONS_INDEX_QUEUE.put(key)
+    return True
+
+
+def _position_index_refresh_owner_chain(
+    chain_id: int,
+    owner: str,
+    *,
+    target_version: str = "all",
+    warmup_mode: bool = False,
+) -> dict[str, int]:
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    summary = {"cached": 0, "ownership_upserted": 0}
+    if cid <= 0 or not _is_eth_address(owner_addr):
+        return summary
+    mode = str(target_version or "all").strip().lower()
+    if mode not in {"all", "v3", "v4"}:
+        mode = "all"
+    run_v3 = mode in {"all", "v3"}
+    run_v4 = mode in {"all", "v4"}
+    chain_key = CHAIN_ID_TO_KEY.get(cid, "")
+    try:
+        protocol_label = str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(cid, "uniswap_v3"))
+        npm = UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid, "")
+        if run_v3 and npm:
+            rows = _scan_v3_positions_onchain(
+                owner_addr,
+                cid,
+                include_price_details=False,
+                protocol_label=protocol_label,
+                source_tag="ownership_index",
+            )
+            token_ids: list[int] = []
+            for pos in rows:
+                tid = _parse_int_like((pos or {}).get("id"))
+                if tid <= 0:
+                    continue
+                token_ids.append(tid)
+                _position_details_cache_upsert(cid, protocol_label, pos)
+                summary["cached"] += 1
+            summary["ownership_upserted"] += _position_ownership_upsert(
+                cid,
+                owner_addr,
+                protocol_label,
+                npm,
+                token_ids,
+                source="onchain_npm",
+            )
+        mc = PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID.get(cid, "")
+        if run_v3 and mc:
+            staked = _scan_pancake_staked_v3_positions_onchain(owner_addr, cid)
+            staked_ids: list[int] = []
+            for pos in staked:
+                tid = _parse_int_like((pos or {}).get("id"))
+                if tid <= 0:
+                    continue
+                staked_ids.append(tid)
+                _position_details_cache_upsert(cid, "pancake_v3_staked", pos)
+                summary["cached"] += 1
+            summary["ownership_upserted"] += _position_ownership_upsert(
+                cid,
+                owner_addr,
+                "pancake_v3_staked",
+                mc,
+                staked_ids,
+                source="onchain_masterchef",
+            )
+        # Infinity CL ids are maintained by the dedicated indexer. Mirror them into the unified ownership index.
+        inf_mgr = PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid, "")
+        if run_v3 and inf_mgr:
+            idx_cfg = _indexer_get("infinity_bsc")
+            idx_enabled = bool(idx_cfg.get("enabled")) and str(idx_cfg.get("mode") or "off") != "off"
+            if idx_enabled and str(idx_cfg.get("mode") or "auto") == "auto":
+                try:
+                    max_receipts = int(idx_cfg.get("max_receipts") or INFINITY_INDEXER_MAX_RECEIPTS)
+                    if warmup_mode:
+                        max_receipts = min(max_receipts, int(POSITIONS_INDEX_SYNC_WARMUP_MAX_RECEIPTS))
+                    run_stats = _update_infinity_index_for_owner(
+                        cid,
+                        owner_addr,
+                        max_receipts=max_receipts,
+                    )
+                    summary["cached"] += int(run_stats.get("merged_ids") or 0)
+                except Exception:
+                    pass
+            inf_ids = _infinity_index_get_token_ids(cid, owner_addr, limit=POSITIONS_OWNERSHIP_INDEX_MAX_NFTS)
+            summary["ownership_upserted"] += _position_ownership_upsert(
+                cid,
+                owner_addr,
+                "pancake_infinity_cl",
+                inf_mgr,
+                inf_ids,
+                source="infinity_index",
+            )
+        # V4 ownership/cache refresh runs from graph in light mode.
+        if run_v4 and chain_key:
+            ep_v4 = get_graph_endpoint(chain_key, version="v4")
+            if ep_v4 and _endpoint_supports_uniswap_positions(ep_v4):
+                v4_deadline = time.monotonic() + (
+                    float(POSITIONS_INDEX_SYNC_WARMUP_V4_DEADLINE_SEC) if warmup_mode else 14.0
+                )
+                v4_rows = _query_uniswap_positions_for_owner(
+                    ep_v4,
+                    owner_addr,
+                    include_pool_liquidity=False,
+                    include_position_liquidity=True,
+                    debug_steps=None,
+                    deadline_ts=v4_deadline,
+                    light_mode=True,
+                )
+                v4_ids: list[int] = []
+                for pos in v4_rows:
+                    tid = _parse_int_like((pos or {}).get("id"))
+                    if tid <= 0:
+                        continue
+                    v4_ids.append(tid)
+                    if isinstance(pos, dict):
+                        pos["_protocol_label"] = "uniswap_v4"
+                        pos["_source"] = str(pos.get("_source") or "ownership_index_graph")
+                    _position_details_cache_upsert(cid, "uniswap_v4", pos)
+                    summary["cached"] += 1
+                if v4_ids:
+                    summary["ownership_upserted"] += _position_ownership_upsert(
+                        cid,
+                        owner_addr,
+                        "uniswap_v4",
+                        "",
+                        v4_ids,
+                        source="graph_v4",
+                    )
+    except Exception:
+        pass
+    return summary
+
+
+def _positions_index_worker_loop() -> None:
+    while not POSITIONS_INDEX_STOP.is_set():
+        try:
+            cid, owner = POSITIONS_INDEX_QUEUE.get(timeout=1.0)
+        except Empty:
+            continue
+        try:
+            _position_index_refresh_owner_chain(int(cid), str(owner))
+        except Exception:
+            pass
+        finally:
+            with POSITIONS_INDEX_INFLIGHT_LOCK:
+                POSITIONS_INDEX_INFLIGHT.discard((int(cid), str(owner).strip().lower()))
+            POSITIONS_INDEX_QUEUE.task_done()
+
+
+def _start_positions_index_workers() -> None:
+    if not POSITIONS_OWNERSHIP_INDEX_ENABLED:
+        return
+    if POSITIONS_INDEX_WORKERS:
+        return
+    POSITIONS_INDEX_STOP.clear()
+    for idx in range(int(POSITIONS_OWNERSHIP_INDEX_WORKERS)):
+        t = threading.Thread(target=_positions_index_worker_loop, name=f"positions-index-{idx+1}", daemon=True)
+        t.start()
+        POSITIONS_INDEX_WORKERS.append(t)
+
+
+def _stop_positions_index_workers() -> None:
+    POSITIONS_INDEX_STOP.set()
+    for _ in POSITIONS_INDEX_WORKERS:
+        POSITIONS_INDEX_QUEUE.put((0, ""))
+    POSITIONS_INDEX_WORKERS.clear()
+
+
 def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: int = 220) -> dict[str, Any]:
     cid = int(chain_id)
     owner_addr = str(owner or "").strip().lower()
@@ -789,6 +1163,18 @@ def _indexer_summary(name: str = "infinity_bsc") -> dict[str, Any]:
     with _analytics_conn() as conn:
         total_rows = int(conn.execute("SELECT COUNT(*) FROM infinity_positions_index").fetchone()[0] or 0)
         owners = int(conn.execute("SELECT COUNT(DISTINCT owner) FROM infinity_positions_index").fetchone()[0] or 0)
+        ownership_rows = int(conn.execute("SELECT COUNT(*) FROM position_ownership_index").fetchone()[0] or 0)
+        ownership_owners = int(conn.execute("SELECT COUNT(DISTINCT owner) FROM position_ownership_index").fetchone()[0] or 0)
+        details_rows = int(conn.execute("SELECT COUNT(*) FROM position_details_cache").fetchone()[0] or 0)
+        protocol_rows = conn.execute(
+            """
+            SELECT protocol, COUNT(*) AS cnt
+            FROM position_ownership_index
+            GROUP BY protocol
+            ORDER BY cnt DESC
+            LIMIT 6
+            """
+        ).fetchall()
         runs = conn.execute(
             "SELECT ts, status, details FROM indexer_runs WHERE name = ? ORDER BY id DESC LIMIT 1",
             (str(name),),
@@ -801,6 +1187,23 @@ def _indexer_summary(name: str = "infinity_bsc") -> dict[str, Any]:
         "last_run_status": str(runs[1]) if runs else "",
         "last_run_details": str(runs[2]) if runs else "",
         "activity": _indexer_activity_snapshot(),
+        "ownership_index": {
+            "records_total": ownership_rows,
+            "owners_total": ownership_owners,
+            "details_cached_total": details_rows,
+            "protocol_breakdown": [
+                {"protocol": str(r[0] or ""), "count": int(r[1] or 0)}
+                for r in (protocol_rows or [])
+            ],
+        },
+        "ownership_index_queue": {
+            "enabled": bool(POSITIONS_OWNERSHIP_INDEX_ENABLED),
+            "index_first_strict": bool(POSITIONS_INDEX_FIRST_STRICT),
+            "legacy_discovery_enabled": bool(POSITIONS_LEGACY_DISCOVERY_ENABLED),
+            "workers": int(POSITIONS_OWNERSHIP_INDEX_WORKERS),
+            "queued": int(POSITIONS_INDEX_QUEUE.qsize()),
+            "inflight": len(POSITIONS_INDEX_INFLIGHT),
+        },
     }
 
 
@@ -4634,6 +5037,7 @@ def _scan_pool_positions_chain(
     chain_id: int,
     addresses: list[str],
     deadline_ts: float,
+    pre_enqueued_ownership_refresh: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -4651,67 +5055,163 @@ def _scan_pool_positions_chain(
     else:
         for owner in addresses:
             owner_has_nft_balance[str(owner).strip().lower()] = True
+    # Guard sync warmup from running repeatedly for the same owner/version
+    # when owner scans are processed in parallel workers.
+    sync_warmup_seen: set[tuple[str, str]] = set()
+    sync_warmup_lock = threading.Lock()
 
-    def _scan_pool_positions_owner(
+    def _claim_sync_warmup(owner: str, version: str) -> bool:
+        key = (str(owner).strip().lower(), str(version).strip().lower())
+        with sync_warmup_lock:
+            if key in sync_warmup_seen:
+                return False
+            sync_warmup_seen.add(key)
+            return True
+
+    def _run_owner_legacy_infinity_discovery(
+        owner: str,
+        *,
+        version: str,
+        positions: list[dict[str, Any]],
+        owner_attempts: list[dict[str, Any]],
+        deadline_ts: float,
+    ) -> list[dict[str, Any]]:
+        if version != "v3":
+            return positions
+        # Run Pancake Infinity at the very end so it cannot starve normal v3/v4 discovery.
+        if int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
+            infinity_cl_debug: dict[str, Any] = {}
+            index_positions: list[dict[str, Any]] = []
+            try:
+                idx_cfg = _indexer_get("infinity_bsc")
+                idx_enabled = bool(idx_cfg.get("enabled")) and str(idx_cfg.get("mode") or "off") != "off"
+                if idx_enabled and int(chain_id) in {56, 8453} and time.monotonic() < deadline_ts:
+                    # Request thread does read-only from index. Heavy index updates are handled by background worker.
+                    if not pre_enqueued_ownership_refresh:
+                        _position_enqueue_ownership_refresh(int(chain_id), owner)
+                    indexed_token_ids = _infinity_index_get_token_ids(int(chain_id), owner, limit=POSITIONS_ONCHAIN_MAX_NFTS)
+                    infinity_cl_debug["indexer_token_ids"] = len(indexed_token_ids)
+                    if indexed_token_ids:
+                        index_positions = _scan_pancake_infinity_cl_positions_onchain(
+                            owner,
+                            int(chain_id),
+                            deadline_ts=deadline_ts,
+                            debug_out=infinity_cl_debug,
+                            token_ids_override=indexed_token_ids,
+                        )
+            except Exception as e:
+                infinity_cl_debug["indexer_error"] = str(e)[:220]
+            if index_positions:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "indexer",
+                        "query_mode": "indexer_pancake_infinity_cl",
+                        "count": len(index_positions),
+                        "ok": True,
+                        "infinity_debug": infinity_cl_debug,
+                    }
+                )
+                seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                for p in index_positions:
+                    pid = str((p or {}).get("id") or "")
+                    if pid and pid in seen:
+                        continue
+                    if pid:
+                        seen.add(pid)
+                    positions.append(p)
+            graph_positions: list[dict[str, Any]] = []
+            try:
+                if not index_positions:
+                    graph_positions = _scan_pancake_infinity_cl_positions_graph(
+                        owner,
+                        int(chain_id),
+                        deadline_ts=deadline_ts,
+                    )
+            except Exception as e:
+                infinity_cl_debug["graph_error"] = str(e)[:220]
+            if graph_positions:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "graph",
+                        "query_mode": "graph_pancake_infinity_cl",
+                        "count": len(graph_positions),
+                        "ok": True,
+                        "infinity_debug": infinity_cl_debug,
+                    }
+                )
+                seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                for p in graph_positions:
+                    pid = str((p or {}).get("id") or "")
+                    if pid and pid in seen:
+                        continue
+                    if pid:
+                        seen.add(pid)
+                    positions.append(p)
+
+        if int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
+            try:
+                infinity_bin_debug: dict[str, Any] = {}
+                infinity_bin_positions = _scan_pancake_infinity_bin_positions_onchain(
+                    owner,
+                    int(chain_id),
+                    deadline_ts=deadline_ts,
+                    debug_out=infinity_bin_debug,
+                )
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_bin",
+                        "count": len(infinity_bin_positions),
+                        "ok": True,
+                        "infinity_debug": infinity_bin_debug,
+                    }
+                )
+                if infinity_bin_positions:
+                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                    for p in infinity_bin_positions:
+                        pid = str((p or {}).get("id") or "")
+                        if pid and pid in seen:
+                            continue
+                        if pid:
+                            seen.add(pid)
+                        positions.append(p)
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_bin",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                    }
+                )
+        return positions
+
+    def _run_owner_legacy_core_discovery(
         owner: str,
         *,
         version: str,
         endpoint: str,
         has_pool_liquidity: bool,
         has_position_liquidity: bool,
-    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], bool]:
-        owner_rows: list[dict[str, Any]] = []
-        owner_errors: list[str] = []
-        owner_attempts: list[dict[str, Any]] = []
-        positions: list[dict[str, Any]] = []
+        owner_has_nft: bool,
+        positions: list[dict[str, Any]],
+        index_cache_hit: bool,
+        owner_attempts: list[dict[str, Any]],
+        owner_errors: list[str],
+        deadline_ts: float,
+    ) -> list[dict[str, Any]]:
         graph_failed = False
-        owner_timed_out = time.monotonic() >= deadline_ts
-        if owner_timed_out:
-            return owner_rows, owner_errors, {
-                "chain": chain_key,
-                "version": version,
-                "owner": owner,
-                "positions_found": 0,
-                "failed": False,
-                "attempts": owner_attempts,
-            }, True
-        owner_key = str(owner).strip().lower()
-        owner_has_nft = bool(owner_has_nft_balance.get(owner_key, True))
-        if int(chain_id) in (56, 8453):
-            owner_attempts.append(
-                {
-                    "owner_value": owner,
-                    "owner_type": "onchain",
-                    "query_mode": "owner_nft_balance_precheck",
-                    "count": 1 if owner_has_nft else 0,
-                    "ok": True,
-                }
-            )
-        if version == "v3" and not owner_has_nft:
-            owner_debug = {
-                "chain": chain_key,
-                "version": version,
-                "owner": owner,
-                "positions_found": 0,
-                "failed": False,
-                "attempts": owner_attempts,
-                "compare": {
-                    "graph_checked": False,
-                    "onchain_count": 0,
-                    "graph_count": 0,
-                    "only_onchain_count": 0,
-                    "only_graph_count": 0,
-                    "only_onchain_ids": [],
-                    "only_graph_ids": [],
-                },
-            }
-            return owner_rows, owner_errors, owner_debug, False
-
         if (
             version == "v3"
             and int(chain_id) in UNISWAP_V3_NPM_BY_CHAIN_ID
             and int(chain_id) in POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS
             and not POSITIONS_DISABLE_V3_PREFETCH
+            and not index_cache_hit
         ):
             try:
                 onchain_prefetch = _scan_v3_positions_onchain(
@@ -4746,7 +5246,7 @@ def _scan_pool_positions_chain(
 
         # Pancake v3 farming positions are often staked in MasterChefV3 and
         # therefore invisible in PositionManager owner lists.
-        if version == "v3" and int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID:
+        if version == "v3" and int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID and not index_cache_hit:
             try:
                 farm_positions = _scan_pancake_staked_v3_positions_onchain(
                     owner,
@@ -4784,7 +5284,7 @@ def _scan_pool_positions_chain(
                 )
 
         if endpoint and not positions:
-            if version == "v3" and not bool(owner_has_nft_balance.get(owner_key, True)):
+            if version == "v3" and not owner_has_nft:
                 owner_attempts.append(
                     {
                         "owner_value": owner,
@@ -4842,7 +5342,7 @@ def _scan_pool_positions_chain(
                         int(chain_id),
                         deadline_ts=deadline_ts,
                         include_price_details=(int(chain_id) in POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS),
-                            protocol_label=V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"),
+                        protocol_label=V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"),
                         source_tag="onchain_fallback",
                     )
                     owner_attempts.append(
@@ -4867,141 +5367,54 @@ def _scan_pool_positions_chain(
                             "error": str(e)[:220],
                         }
                     )
-        # Run Pancake Infinity at the very end so it cannot starve normal v3/v4 discovery.
-        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
-            infinity_cl_debug: dict[str, Any] = {}
-            index_positions: list[dict[str, Any]] = []
-            try:
-                idx_cfg = _indexer_get("infinity_bsc")
-                idx_enabled = bool(idx_cfg.get("enabled")) and str(idx_cfg.get("mode") or "off") != "off"
-                if idx_enabled and int(chain_id) in {56, 8453} and time.monotonic() < deadline_ts:
-                    if str(idx_cfg.get("mode") or "auto") == "auto":
-                        try:
-                            run_stats = _update_infinity_index_for_owner(
-                                int(chain_id),
-                                owner,
-                                max_receipts=int(idx_cfg.get("max_receipts") or INFINITY_INDEXER_MAX_RECEIPTS),
-                            )
-                            _indexer_log_run(
-                                "infinity_bsc",
-                                "ok",
-                                f"auto owner={owner} chain={chain_id} merged={run_stats.get('merged_ids', 0)} checked={run_stats.get('receipt_checked', 0)}",
-                            )
-                        except Exception as e:
-                            infinity_cl_debug["indexer_auto_error"] = str(e)[:220]
-                            _indexer_log_run(
-                                "infinity_bsc",
-                                "error",
-                                f"auto owner={owner} chain={chain_id} error={str(e)[:220]}",
-                            )
-                    indexed_token_ids = _infinity_index_get_token_ids(int(chain_id), owner, limit=POSITIONS_ONCHAIN_MAX_NFTS)
-                    infinity_cl_debug["indexer_token_ids"] = len(indexed_token_ids)
-                    if indexed_token_ids:
-                        index_positions = _scan_pancake_infinity_cl_positions_onchain(
-                            owner,
-                            int(chain_id),
-                            deadline_ts=deadline_ts,
-                            debug_out=infinity_cl_debug,
-                            token_ids_override=indexed_token_ids,
-                        )
-            except Exception as e:
-                infinity_cl_debug["indexer_error"] = str(e)[:220]
-            if index_positions:
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "indexer",
-                        "query_mode": "indexer_pancake_infinity_cl",
-                        "count": len(index_positions),
-                        "ok": True,
-                        "infinity_debug": infinity_cl_debug,
-                    }
-                )
-                seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
-                for p in index_positions:
-                    pid = str((p or {}).get("id") or "")
-                    if pid and pid in seen:
-                        continue
-                    if pid:
-                        seen.add(pid)
-                    positions.append(p)
-            graph_positions: list[dict[str, Any]] = []
-            try:
-                graph_positions = _scan_pancake_infinity_cl_positions_graph(
-                    owner,
-                    int(chain_id),
-                    deadline_ts=deadline_ts,
-                )
-            except Exception as e:
-                infinity_cl_debug["graph_error"] = str(e)[:220]
-            if graph_positions:
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "graph",
-                        "query_mode": "graph_pancake_infinity_cl",
-                        "count": len(graph_positions),
-                        "ok": True,
-                        "infinity_debug": infinity_cl_debug,
-                    }
-                )
-                seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
-                for p in graph_positions:
-                    pid = str((p or {}).get("id") or "")
-                    if pid and pid in seen:
-                        continue
-                    if pid:
-                        seen.add(pid)
-                    positions.append(p)
+        return positions
 
-        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
-            try:
-                infinity_bin_debug: dict[str, Any] = {}
-                infinity_bin_positions = _scan_pancake_infinity_bin_positions_onchain(
-                    owner,
-                    int(chain_id),
-                    deadline_ts=deadline_ts,
-                    debug_out=infinity_bin_debug,
-                )
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_infinity_bin",
-                        "count": len(infinity_bin_positions),
-                        "ok": True,
-                        "infinity_debug": infinity_bin_debug,
-                    }
-                )
-                if infinity_bin_positions:
-                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
-                    for p in infinity_bin_positions:
-                        pid = str((p or {}).get("id") or "")
-                        if pid and pid in seen:
-                            continue
-                        if pid:
-                            seen.add(pid)
-                        positions.append(p)
-            except Exception as e:
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_infinity_bin",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                        "infinity_debug": infinity_bin_debug,
-                    }
-                )
-        owner_debug = {
-            "chain": chain_key,
-            "version": version,
-            "owner": owner,
-            "positions_found": len(positions),
-            "failed": False,
-            "attempts": owner_attempts,
-        }
+    def _persist_positions_to_ownership_index(
+        owner: str,
+        *,
+        version: str,
+        positions: list[dict[str, Any]],
+    ) -> None:
+        if version not in {"v3", "v4"} or not POSITIONS_OWNERSHIP_INDEX_ENABLED or not positions:
+            return
+        by_protocol: dict[str, list[int]] = {}
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            pid = _parse_int_like(p.get("id"))
+            if pid <= 0:
+                continue
+            default_proto = "uniswap_v4" if version == "v4" else V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3")
+            proto = str(p.get("_protocol_label") or default_proto).strip().lower()
+            if not proto:
+                proto = "uniswap_v4" if version == "v4" else "uniswap_v3"
+            by_protocol.setdefault(proto, []).append(pid)
+            _position_details_cache_upsert(int(chain_id), proto, p)
+        for proto, token_ids in by_protocol.items():
+            manager = ""
+            if proto == "pancake_v3_staked":
+                manager = str(PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID.get(int(chain_id), "") or "")
+            elif proto == "pancake_infinity_cl":
+                manager = str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "")
+            elif proto == "pancake_infinity_bin":
+                manager = str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "")
+            elif proto == "uniswap_v4":
+                manager = ""
+            else:
+                manager = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(int(chain_id), "") or "")
+            _position_ownership_upsert(
+                int(chain_id),
+                owner,
+                proto,
+                manager,
+                token_ids,
+                source="scan_passive",
+            )
+
+    def _build_owner_compare_debug(
+        positions: list[dict[str, Any]],
+        owner_attempts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         onchain_ids = {
             str((x or {}).get("id") or "")
             for x in positions
@@ -5018,7 +5431,7 @@ def _scan_pool_positions_chain(
             for a in owner_attempts
             if isinstance(a, dict)
         )
-        owner_debug["compare"] = {
+        return {
             "graph_checked": bool(graph_checked),
             "onchain_count": len(onchain_ids),
             "graph_count": len(graph_ids),
@@ -5028,123 +5441,423 @@ def _scan_pool_positions_chain(
             "only_graph_ids": sorted([x for x in (graph_ids - onchain_ids) if x][:5]) if graph_checked else [],
         }
 
-        for p in positions:
+    def _make_owner_debug(
+        owner: str,
+        version: str,
+        positions: list[dict[str, Any]],
+        owner_attempts: list[dict[str, Any]],
+        *,
+        compare: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "chain": chain_key,
+            "version": version,
+            "owner": owner,
+            "positions_found": len(positions),
+            "failed": False,
+            "attempts": owner_attempts,
+            "compare": compare if isinstance(compare, dict) else _build_owner_compare_debug(positions, owner_attempts),
+        }
+
+    def _make_no_nft_owner_debug(owner: str, version: str, owner_attempts: list[dict[str, Any]]) -> dict[str, Any]:
+        return _make_owner_debug(
+            owner,
+            version,
+            [],
+            owner_attempts,
+            compare={
+                "graph_checked": False,
+                "onchain_count": 0,
+                "graph_count": 0,
+                "only_onchain_count": 0,
+                "only_graph_count": 0,
+                "only_onchain_ids": [],
+                "only_graph_ids": [],
+            },
+        )
+
+    def _resolve_live_discovery_flag(
+        *,
+        owner: str,
+        skip_live_discovery: bool,
+        positions: list[dict[str, Any]],
+        owner_attempts: list[dict[str, Any]],
+    ) -> bool:
+        can_use_live_discovery = bool(POSITIONS_LEGACY_DISCOVERY_ENABLED and not skip_live_discovery)
+        if not can_use_live_discovery and not positions:
+            owner_attempts.append(
+                {
+                    "owner_value": owner,
+                    "owner_type": "legacy",
+                    "query_mode": "legacy_discovery_disabled",
+                    "count": 0,
+                    "ok": True,
+                }
+            )
+        return can_use_live_discovery
+
+    def _load_cached_positions_for_owner(owner: str, version: str) -> list[dict[str, Any]]:
+        protocol_label = (
+            str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"))
+            if version == "v3"
+            else "uniswap_v4"
+        )
+        cached_positions = _position_cached_rows_for_owner(
+            int(chain_id),
+            owner,
+            protocol_label,
+            limit=POSITIONS_OWNERSHIP_INDEX_MAX_NFTS,
+        )
+        if version == "v3" and int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID:
+            cached_positions.extend(
+                _position_cached_rows_for_owner(
+                    int(chain_id),
+                    owner,
+                    "pancake_v3_staked",
+                    limit=max(40, POSITIONS_OWNERSHIP_INDEX_MAX_NFTS // 2),
+                )
+            )
+        if version == "v3":
+            cached_positions.extend(
+                _position_cached_rows_for_owner(
+                    int(chain_id),
+                    owner,
+                    "pancake_infinity_cl",
+                    limit=max(20, POSITIONS_OWNERSHIP_INDEX_MAX_NFTS // 3),
+                )
+            )
+            cached_positions.extend(
+                _position_cached_rows_for_owner(
+                    int(chain_id),
+                    owner,
+                    "pancake_infinity_bin",
+                    limit=max(20, POSITIONS_OWNERSHIP_INDEX_MAX_NFTS // 3),
+                )
+            )
+        uniq: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for cp in cached_positions:
+            if not isinstance(cp, dict):
+                continue
+            key = "|".join(
+                [
+                    str(cp.get("_protocol_label") or "").lower(),
+                    str(cp.get("id") or ""),
+                    str(((cp.get("pool") or {}).get("id") or "")).lower(),
+                ]
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            uniq.append(cp)
+        return uniq
+
+    def _apply_ownership_cache(
+        owner: str,
+        *,
+        version: str,
+        owner_attempts: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool, bool]:
+        cached_positions: list[dict[str, Any]] = []
+        index_cache_hit = False
+        skip_live_discovery = False
+        if version in {"v3", "v4"} and POSITIONS_OWNERSHIP_INDEX_ENABLED:
             try:
-                if not isinstance(p, dict):
-                    continue
-                if not _position_has_full_detail(p) and not bool(p.get("_skip_enrich")):
-                    enriched = _fetch_position_by_id_with_detail(
-                        endpoint,
-                        str(p.get("id") or ""),
-                        include_pool_liquidity=has_pool_liquidity,
-                    )
-                    if enriched:
-                        p = enriched
-                liq_raw = p.get("liquidity")
-                if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
-                    continue
-                pool = p.get("pool") or {}
-                tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
-                valuation_mode = "exact-external"
-                detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
-                if detailed_external_tvl is None or detailed_external_tvl <= 0:
-                    position_tvl_usd = None
-                    valuation_mode = "no-exact-external"
-                else:
-                    position_tvl_usd = detailed_external_tvl
-                fee_raw = str(pool.get("feeTier") or "").strip()
-                fee_disp = fee_raw
-                try:
-                    fee_int = int(fee_raw)
-                    if fee_int > 0:
-                        fee_disp = f"{fee_int / 10000.0:.2f}%"
-                except Exception:
-                    fee_disp = fee_raw or "-"
-                t0_obj = pool.get("token0") or {}
-                t1_obj = pool.get("token1") or {}
-                t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
-                t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
-                # Prefer exact-external, then exact-subgraph, then share-external fallback.
-                if detailed_external_tvl is None or detailed_external_tvl <= 0:
-                    if version == "v3":
-                        onchain_enriched = _fetch_v3_position_onchain_by_token_id(
-                            int(chain_id),
-                            str(p.get("id") or ""),
-                            include_price_details=True,
-                            protocol_label=str(p.get("_protocol_label") or f"uniswap_{version}"),
-                        )
-                        if onchain_enriched:
-                            p = onchain_enriched
-                            pool = p.get("pool") or {}
-                            t0_obj = pool.get("token0") or {}
-                            t1_obj = pool.get("token1") or {}
-                            t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
-                            t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
-                            detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
-                            if detailed_external_tvl is not None and detailed_external_tvl > 0:
-                                position_tvl_usd = detailed_external_tvl
-                                valuation_mode = "exact-external-onchain"
-                    if detailed_external_tvl is not None and detailed_external_tvl > 0:
-                        pass
-                    else:
-                        detailed_subgraph_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
-                        if detailed_subgraph_tvl is not None and detailed_subgraph_tvl > 0:
-                            position_tvl_usd = detailed_subgraph_tvl
-                            valuation_mode = "exact-subgraph"
-                        else:
-                            share_external_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
-                            if share_external_tvl is not None and share_external_tvl > 0:
-                                position_tvl_usd = share_external_tvl
-                                valuation_mode = "estimated-share-external"
-                if (position_tvl_usd is None or position_tvl_usd <= 0) and tvl_usd > 0:
-                    try:
-                        pos_liq_simple = _safe_float(p.get("liquidity") or 0)
-                        pool_liq_simple = _safe_float(pool.get("liquidity") or 0)
-                        if pos_liq_simple > 0 and pool_liq_simple > 0:
-                            position_tvl_usd = max(0.0, float(tvl_usd) * float(pos_liq_simple) / float(pool_liq_simple))
-                            valuation_mode = "estimated-share-simple"
-                    except Exception:
-                        pass
-                if position_tvl_usd is not None and position_tvl_usd > 0 and tvl_usd > 0:
-                    # A single position cannot reasonably exceed the whole pool TVL by large margin.
-                    pool_cap = float(tvl_usd) * 1.25
-                    if position_tvl_usd > pool_cap:
-                        share_sanity_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
-                        if share_sanity_tvl is not None and share_sanity_tvl > 0 and share_sanity_tvl <= pool_cap:
-                            position_tvl_usd = share_sanity_tvl
-                            valuation_mode = "sanity-share"
-                        else:
-                            position_tvl_usd = pool_cap
-                            valuation_mode = "sanity-cap"
-                suspected_spam = _is_suspected_spam_pair(chain_key, t0_obj, t1_obj, t0, t1, position_tvl_usd)
-                if suspected_spam and position_tvl_usd is not None and position_tvl_usd > POSITIONS_SPAM_MAX_TVL_USD:
-                    # Prevent clearly manipulated valuations from dominating output for suspicious pairs.
-                    position_tvl_usd = float(POSITIONS_SPAM_MAX_TVL_USD)
-                    valuation_mode = "spam-capped"
-                owner_rows.append(
+                if not pre_enqueued_ownership_refresh:
+                    _position_enqueue_ownership_refresh(int(chain_id), owner)
+                cached_positions = _load_cached_positions_for_owner(owner, version)
+                if cached_positions:
+                    index_cache_hit = True
+                owner_attempts.append(
                     {
-                        "address": owner,
-                        "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
-                        "chain": chain_key,
-                        "chain_id": int(chain_id),
-                        "kind": "pool",
-                        "pool_id": str(pool.get("id") or ""),
-                        "pair": f"{t0}/{t1}",
-                        "token0_id": str((pool.get("token0") or {}).get("id") or ""),
-                        "token1_id": str((pool.get("token1") or {}).get("id") or ""),
-                        "position_id": str(p.get("id") or ""),
-                        "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
-                        "fee_tier": fee_disp,
-                        "fee_tier_raw": fee_raw,
-                        "liquidity": str(p.get("liquidity") or "0"),
-                        "pool_liquidity": str(pool.get("liquidity") or "0"),
-                        "pool_tvl_usd": tvl_usd,
-                        "tvl_usd": position_tvl_usd,
-                        "contract_created_date": _contract_creation_date_peek(int(chain_id), str(pool.get("id") or "")),
-                        "valuation_mode": valuation_mode,
-                        "suspected_spam": bool(suspected_spam),
+                        "owner_value": owner,
+                        "owner_type": "index",
+                        "query_mode": "ownership_cache",
+                        "count": len(cached_positions),
+                        "ok": True,
                     }
                 )
+                if POSITIONS_INDEX_FIRST_STRICT and index_cache_hit:
+                    skip_live_discovery = True
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "index",
+                            "query_mode": "index_first_skip_live",
+                            "count": len(cached_positions),
+                            "ok": True,
+                        }
+                    )
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "index",
+                        "query_mode": "ownership_cache",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                    }
+                )
+        return cached_positions, index_cache_hit, skip_live_discovery
+
+    def _discover_owner_positions(
+        owner: str,
+        *,
+        version: str,
+        endpoint: str,
+        has_pool_liquidity: bool,
+        has_position_liquidity: bool,
+        owner_has_nft: bool,
+        owner_attempts: list[dict[str, Any]],
+        owner_errors: list[str],
+        deadline_ts: float,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        cached_positions, index_cache_hit, skip_live_discovery = _apply_ownership_cache(
+            owner,
+            version=version,
+            owner_attempts=owner_attempts,
+        )
+        positions: list[dict[str, Any]] = list(cached_positions) if cached_positions else []
+        can_use_live_discovery = _resolve_live_discovery_flag(
+            owner=owner,
+            skip_live_discovery=skip_live_discovery,
+            positions=positions,
+            owner_attempts=owner_attempts,
+        )
+        # Cold-cache safety: when strict index-first disables live discovery and cache is empty,
+        # do one bounded synchronous warmup for this owner/chain to avoid empty first response.
+        if (
+            version == "v3"
+            and not positions
+            and not can_use_live_discovery
+            and POSITIONS_OWNERSHIP_INDEX_ENABLED
+            and POSITIONS_INDEX_SYNC_WARMUP_ENABLED
+            and int(chain_id) in (56, 8453)
+            and _claim_sync_warmup(owner, version)
+            and time.monotonic() < (deadline_ts - 1.0)
+        ):
+            try:
+                warm_stats = _position_index_refresh_owner_chain(
+                    int(chain_id),
+                    owner,
+                    target_version=version,
+                    warmup_mode=True,
+                )
+                cached_positions = _load_cached_positions_for_owner(owner, version)
+                if cached_positions:
+                    positions = cached_positions
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "index",
+                        "query_mode": "index_sync_warmup",
+                        "count": len(cached_positions),
+                        "ok": True,
+                        "cached": int(warm_stats.get("cached") or 0),
+                        "ownership_upserted": int(warm_stats.get("ownership_upserted") or 0),
+                    }
+                )
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "index",
+                        "query_mode": "index_sync_warmup",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                    }
+                )
+        if version == "v4" and not str(endpoint or "").strip():
+            owner_attempts.append(
+                {
+                    "owner_value": owner,
+                    "owner_type": "index",
+                    "query_mode": "v4_no_endpoint_cache_only",
+                    "count": len(positions),
+                    "ok": True,
+                }
+            )
+        if positions and not can_use_live_discovery:
+            owner_attempts.append(
+                {
+                    "owner_value": owner,
+                    "owner_type": "index",
+                    "query_mode": "row_live_enrich_disabled",
+                    "count": len(positions),
+                    "ok": True,
+                }
+            )
+        if can_use_live_discovery:
+            positions = _run_owner_legacy_core_discovery(
+                owner,
+                version=version,
+                endpoint=endpoint,
+                has_pool_liquidity=has_pool_liquidity,
+                has_position_liquidity=has_position_liquidity,
+                owner_has_nft=owner_has_nft,
+                positions=positions,
+                index_cache_hit=index_cache_hit,
+                owner_attempts=owner_attempts,
+                owner_errors=owner_errors,
+                deadline_ts=deadline_ts,
+            )
+            positions = _run_owner_legacy_infinity_discovery(
+                owner,
+                version=version,
+                positions=positions,
+                owner_attempts=owner_attempts,
+                deadline_ts=deadline_ts,
+            )
+        return positions, can_use_live_discovery
+
+    def _build_owner_pool_row(
+        p: dict[str, Any],
+        *,
+        owner: str,
+        version: str,
+        endpoint: str,
+        has_pool_liquidity: bool,
+        allow_live_enrich: bool,
+    ) -> dict[str, Any] | None:
+        if not isinstance(p, dict):
+            return None
+        if allow_live_enrich and not _position_has_full_detail(p) and not bool(p.get("_skip_enrich")):
+            enriched = _fetch_position_by_id_with_detail(
+                endpoint,
+                str(p.get("id") or ""),
+                include_pool_liquidity=has_pool_liquidity,
+            )
+            if enriched:
+                p = enriched
+        liq_raw = p.get("liquidity")
+        if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
+            return None
+        pool = p.get("pool") or {}
+        tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
+        valuation_mode = "exact-external"
+        detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
+        if detailed_external_tvl is None or detailed_external_tvl <= 0:
+            position_tvl_usd = None
+            valuation_mode = "no-exact-external"
+        else:
+            position_tvl_usd = detailed_external_tvl
+        fee_raw = str(pool.get("feeTier") or "").strip()
+        fee_disp = fee_raw
+        try:
+            fee_int = int(fee_raw)
+            if fee_int > 0:
+                fee_disp = f"{fee_int / 10000.0:.2f}%"
+        except Exception:
+            fee_disp = fee_raw or "-"
+        t0_obj = pool.get("token0") or {}
+        t1_obj = pool.get("token1") or {}
+        t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
+        t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
+        # Prefer exact-external, then exact-subgraph, then share-external fallback.
+        if detailed_external_tvl is None or detailed_external_tvl <= 0:
+            if allow_live_enrich and version == "v3":
+                onchain_enriched = _fetch_v3_position_onchain_by_token_id(
+                    int(chain_id),
+                    str(p.get("id") or ""),
+                    include_price_details=True,
+                    protocol_label=str(p.get("_protocol_label") or f"uniswap_{version}"),
+                )
+                if onchain_enriched:
+                    p = onchain_enriched
+                    pool = p.get("pool") or {}
+                    t0_obj = pool.get("token0") or {}
+                    t1_obj = pool.get("token1") or {}
+                    t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
+                    t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
+                    detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
+                    if detailed_external_tvl is not None and detailed_external_tvl > 0:
+                        position_tvl_usd = detailed_external_tvl
+                        valuation_mode = "exact-external-onchain"
+            if detailed_external_tvl is None or detailed_external_tvl <= 0:
+                detailed_subgraph_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
+                if detailed_subgraph_tvl is not None and detailed_subgraph_tvl > 0:
+                    position_tvl_usd = detailed_subgraph_tvl
+                    valuation_mode = "exact-subgraph"
+                else:
+                    share_external_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
+                    if share_external_tvl is not None and share_external_tvl > 0:
+                        position_tvl_usd = share_external_tvl
+                        valuation_mode = "estimated-share-external"
+        if (position_tvl_usd is None or position_tvl_usd <= 0) and tvl_usd > 0:
+            try:
+                pos_liq_simple = _safe_float(p.get("liquidity") or 0)
+                pool_liq_simple = _safe_float(pool.get("liquidity") or 0)
+                if pos_liq_simple > 0 and pool_liq_simple > 0:
+                    position_tvl_usd = max(0.0, float(tvl_usd) * float(pos_liq_simple) / float(pool_liq_simple))
+                    valuation_mode = "estimated-share-simple"
+            except Exception:
+                pass
+        if position_tvl_usd is not None and position_tvl_usd > 0 and tvl_usd > 0:
+            # A single position cannot reasonably exceed the whole pool TVL by large margin.
+            pool_cap = float(tvl_usd) * 1.25
+            if position_tvl_usd > pool_cap:
+                share_sanity_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
+                if share_sanity_tvl is not None and share_sanity_tvl > 0 and share_sanity_tvl <= pool_cap:
+                    position_tvl_usd = share_sanity_tvl
+                    valuation_mode = "sanity-share"
+                else:
+                    position_tvl_usd = pool_cap
+                    valuation_mode = "sanity-cap"
+        suspected_spam = _is_suspected_spam_pair(chain_key, t0_obj, t1_obj, t0, t1, position_tvl_usd)
+        if suspected_spam and position_tvl_usd is not None and position_tvl_usd > POSITIONS_SPAM_MAX_TVL_USD:
+            # Prevent clearly manipulated valuations from dominating output for suspicious pairs.
+            position_tvl_usd = float(POSITIONS_SPAM_MAX_TVL_USD)
+            valuation_mode = "spam-capped"
+        return {
+            "address": owner,
+            "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
+            "chain": chain_key,
+            "chain_id": int(chain_id),
+            "kind": "pool",
+            "pool_id": str(pool.get("id") or ""),
+            "pair": f"{t0}/{t1}",
+            "token0_id": str((pool.get("token0") or {}).get("id") or ""),
+            "token1_id": str((pool.get("token1") or {}).get("id") or ""),
+            "position_id": str(p.get("id") or ""),
+            "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
+            "fee_tier": fee_disp,
+            "fee_tier_raw": fee_raw,
+            "liquidity": str(p.get("liquidity") or "0"),
+            "pool_liquidity": str(pool.get("liquidity") or "0"),
+            "pool_tvl_usd": tvl_usd,
+            "tvl_usd": position_tvl_usd,
+            "contract_created_date": _contract_creation_date_peek(int(chain_id), str(pool.get("id") or "")),
+            "valuation_mode": valuation_mode,
+            "suspected_spam": bool(suspected_spam),
+        }
+
+    def _build_owner_rows_from_positions(
+        positions: list[dict[str, Any]],
+        *,
+        owner: str,
+        version: str,
+        endpoint: str,
+        has_pool_liquidity: bool,
+        allow_live_enrich: bool,
+        owner_errors: list[str],
+        deadline_ts: float,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        out_rows: list[dict[str, Any]] = []
+        owner_timed_out = False
+        for p in positions:
+            try:
+                row = _build_owner_pool_row(
+                    p,
+                    owner=owner,
+                    version=version,
+                    endpoint=endpoint,
+                    has_pool_liquidity=has_pool_liquidity,
+                    allow_live_enrich=allow_live_enrich,
+                )
+                if row:
+                    out_rows.append(row)
             except Exception as e:
                 if POSITIONS_DEBUG_ERRORS:
                     owner_errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
@@ -5152,26 +5865,86 @@ def _scan_pool_positions_chain(
             if time.monotonic() >= deadline_ts:
                 owner_timed_out = True
                 break
+        return out_rows, owner_timed_out
+
+    def _scan_pool_positions_owner(
+        owner: str,
+        *,
+        version: str,
+        endpoint: str,
+        has_pool_liquidity: bool,
+        has_position_liquidity: bool,
+    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], bool]:
+        owner_rows: list[dict[str, Any]] = []
+        owner_errors: list[str] = []
+        owner_attempts: list[dict[str, Any]] = []
+        positions: list[dict[str, Any]] = []
+        owner_timed_out = time.monotonic() >= deadline_ts
+        if owner_timed_out:
+            return owner_rows, owner_errors, _make_owner_debug(owner, version, [], owner_attempts), True
+        owner_key = str(owner).strip().lower()
+        owner_has_nft = bool(owner_has_nft_balance.get(owner_key, True))
+        if int(chain_id) in (56, 8453):
+            owner_attempts.append(
+                {
+                    "owner_value": owner,
+                    "owner_type": "onchain",
+                    "query_mode": "owner_nft_balance_precheck",
+                    "count": 1 if owner_has_nft else 0,
+                    "ok": True,
+                }
+            )
+        if version == "v3" and not owner_has_nft:
+            owner_debug = _make_no_nft_owner_debug(owner, version, owner_attempts)
+            return owner_rows, owner_errors, owner_debug, False
+        positions, allow_live_enrich = _discover_owner_positions(
+            owner,
+            version=version,
+            endpoint=endpoint,
+            has_pool_liquidity=has_pool_liquidity,
+            has_position_liquidity=has_position_liquidity,
+            owner_has_nft=owner_has_nft,
+            owner_attempts=owner_attempts,
+            owner_errors=owner_errors,
+            deadline_ts=deadline_ts,
+        )
+        try:
+            _persist_positions_to_ownership_index(
+                owner,
+                version=version,
+                positions=positions,
+            )
+        except Exception:
+            pass
+        owner_debug = _make_owner_debug(owner, version, positions, owner_attempts)
+        owner_rows, owner_timed_out = _build_owner_rows_from_positions(
+            positions,
+            owner=owner,
+            version=version,
+            endpoint=endpoint,
+            has_pool_liquidity=has_pool_liquidity,
+            allow_live_enrich=allow_live_enrich,
+            owner_errors=owner_errors,
+            deadline_ts=deadline_ts,
+        )
         return owner_rows, owner_errors, owner_debug, owner_timed_out
 
-    for version in ("v3", "v4"):
-        if time.monotonic() >= deadline_ts:
-            timed_out = True
-            break
-        endpoint = get_graph_endpoint(chain_key, version=version)
-        if not endpoint and version != "v3":
-            continue
-        if endpoint and not _endpoint_supports_uniswap_positions(endpoint):
-            # Keep v3 flow alive via on-chain fallback even if endpoint introspection says unsupported.
-            if version != "v3":
-                continue
-        has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint) if endpoint else False
-        has_position_liquidity = _endpoint_supports_position_liquidity(endpoint) if endpoint else True
+    def _scan_version_owners(
+        *,
+        version: str,
+        endpoint: str,
+        has_pool_liquidity: bool,
+        has_position_liquidity: bool,
+    ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
+        v_rows: list[dict[str, Any]] = []
+        v_errors: list[str] = []
+        v_debug: list[dict[str, Any]] = []
+        v_timed_out = False
         owner_workers = max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(addresses)))
         if owner_workers <= 1 or len(addresses) <= 1:
             for owner in addresses:
                 if time.monotonic() >= deadline_ts:
-                    timed_out = True
+                    v_timed_out = True
                     break
                 owner_rows, owner_errors, owner_debug, owner_timed_out = _scan_pool_positions_owner(
                     owner,
@@ -5180,11 +5953,11 @@ def _scan_pool_positions_chain(
                     has_pool_liquidity=has_pool_liquidity,
                     has_position_liquidity=has_position_liquidity,
                 )
-                rows.extend(owner_rows)
-                errors.extend(owner_errors)
-                debug_rows.append(owner_debug)
+                v_rows.extend(owner_rows)
+                v_errors.extend(owner_errors)
+                v_debug.append(owner_debug)
                 if owner_timed_out:
-                    timed_out = True
+                    v_timed_out = True
                     break
         else:
             owner_executor = ThreadPoolExecutor(max_workers=owner_workers)
@@ -5205,120 +5978,61 @@ def _scan_pool_positions_chain(
                     try:
                         owner_rows, owner_errors, owner_debug, owner_timed_out = owner_fut.result()
                     except Exception as e:
-                        errors.append(f"Pool owner worker failed [{chain_key}/{version}]: {e}")
+                        v_errors.append(f"Pool owner worker failed [{chain_key}/{version}]: {e}")
                         continue
-                    rows.extend(owner_rows)
-                    errors.extend(owner_errors)
-                    debug_rows.append(owner_debug)
+                    v_rows.extend(owner_rows)
+                    v_errors.extend(owner_errors)
+                    v_debug.append(owner_debug)
                     if owner_timed_out:
-                        timed_out = True
+                        v_timed_out = True
                     if time.monotonic() >= deadline_ts:
-                        timed_out = True
+                        v_timed_out = True
                         aborted = True
                         break
             finally:
                 owner_executor.shutdown(wait=not aborted, cancel_futures=aborted)
+        return v_rows, v_errors, v_debug, v_timed_out
+
+    def _prepare_version_scan_context(version: str) -> tuple[str, bool, bool] | None:
+        endpoint = get_graph_endpoint(chain_key, version=version)
+        if not endpoint and version != "v3":
+            # In index-first mode we can still serve cached v4 positions even without live graph endpoint.
+            if not POSITIONS_OWNERSHIP_INDEX_ENABLED:
+                return None
+        if endpoint and not _endpoint_supports_uniswap_positions(endpoint):
+            # Keep v3 flow alive via on-chain fallback even if endpoint introspection says unsupported.
+            if version != "v3":
+                if not POSITIONS_OWNERSHIP_INDEX_ENABLED:
+                    return None
+        has_pool_liquidity = _endpoint_supports_pool_liquidity(endpoint) if endpoint else False
+        has_position_liquidity = _endpoint_supports_position_liquidity(endpoint) if endpoint else True
+        return endpoint, has_pool_liquidity, has_position_liquidity
+
+    for version in ("v3", "v4"):
+        if time.monotonic() >= deadline_ts:
+            timed_out = True
+            break
+        v_ctx = _prepare_version_scan_context(version)
+        if v_ctx is None:
+            continue
+        endpoint, has_pool_liquidity, has_position_liquidity = v_ctx
+        v_rows, v_errors, v_debug, v_timed_out = _scan_version_owners(
+            version=version,
+            endpoint=endpoint,
+            has_pool_liquidity=has_pool_liquidity,
+            has_position_liquidity=has_position_liquidity,
+        )
+        rows.extend(v_rows)
+        errors.extend(v_errors)
+        debug_rows.extend(v_debug)
+        if v_timed_out:
+            timed_out = True
         if timed_out:
             break
     return rows, errors, debug_rows, timed_out
 
 
-def _scan_pool_positions(
-    addresses: list[str],
-    chain_ids: list[int],
-    *,
-    include_creation_dates: bool = True,
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
-    rows: list[dict[str, Any]] = []
-    errors: list[str] = []
-    debug_rows: list[dict[str, Any]] = []
-    deadline_ts = time.monotonic() + float(POSITIONS_SCAN_MAX_SECONDS)
-    timed_out = False
-
-    valid_chain_ids = [int(cid) for cid in chain_ids if CHAIN_ID_TO_KEY.get(int(cid), "")]
-    if not valid_chain_ids:
-        return [], [], []
-    if POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
-        filtered_chain_ids: list[int] = []
-        for cid in valid_chain_ids:
-            if _chain_has_any_position_nft_balance(int(cid), addresses):
-                filtered_chain_ids.append(int(cid))
-        valid_chain_ids = filtered_chain_ids
-        if not valid_chain_ids:
-            return [], [], []
-    priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
-    ordered_chain_ids: list[int] = []
-    seen_chain_ids: set[int] = set()
-    for cid in priority_chain_ids + valid_chain_ids:
-        cc = int(cid)
-        if cc in seen_chain_ids:
-            continue
-        seen_chain_ids.add(cc)
-        ordered_chain_ids.append(cc)
-    max_workers = max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
-
-    # Run priority chains first in sequence to avoid deadline starvation.
-    for chain_id in [c for c in ordered_chain_ids if c in priority_chain_ids]:
-        if time.monotonic() >= deadline_ts:
-            timed_out = True
-            break
-        chain_rows, chain_errors, chain_debug, chain_timed_out = _scan_pool_positions_chain(
-            chain_id,
-            addresses,
-            deadline_ts,
-        )
-        rows.extend(chain_rows)
-        errors.extend(chain_errors)
-        debug_rows.extend(chain_debug)
-        if chain_timed_out:
-            timed_out = True
-            break
-
-    remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
-
-    if not timed_out and (max_workers <= 1 or len(remaining_chain_ids) <= 1):
-        for chain_id in remaining_chain_ids:
-            if time.monotonic() >= deadline_ts:
-                timed_out = True
-                break
-            chain_rows, chain_errors, chain_debug, chain_timed_out = _scan_pool_positions_chain(
-                chain_id,
-                addresses,
-                deadline_ts,
-            )
-            rows.extend(chain_rows)
-            errors.extend(chain_errors)
-            debug_rows.extend(chain_debug)
-            if chain_timed_out:
-                timed_out = True
-                break
-    elif not timed_out:
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        futures = [
-            executor.submit(_scan_pool_positions_chain, chain_id, addresses, deadline_ts)
-            for chain_id in remaining_chain_ids
-        ]
-        aborted = False
-        try:
-            for fut in as_completed(futures):
-                try:
-                    chain_rows, chain_errors, chain_debug, chain_timed_out = fut.result()
-                except Exception as e:
-                    errors.append(f"Pool scan worker failed: {e}")
-                    continue
-                rows.extend(chain_rows)
-                errors.extend(chain_errors)
-                debug_rows.extend(chain_debug)
-                if chain_timed_out:
-                    timed_out = True
-                if time.monotonic() >= deadline_ts:
-                    timed_out = True
-                    aborted = True
-                    break
-        finally:
-            executor.shutdown(wait=not aborted, cancel_futures=aborted)
-
-    # Aggregate by owner/protocol/pool id (wallet can hold multiple NFT positions in one pool).
+def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
         key = (str(row.get("address")), str(row.get("protocol")), str(row.get("pool_id")))
@@ -5351,18 +6065,198 @@ def _scan_pool_positions(
         elif not m1 and m2:
             acc["valuation_mode"] = m2
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
+    return list(uniq.values())
+
+
+def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_dates: bool) -> None:
     if include_creation_dates:
-        _populate_creation_dates_parallel(list(uniq.values()))
-    else:
-        for _row in uniq.values():
-            if "contract_created_date" not in _row:
-                _row["contract_created_date"] = "-"
+        _populate_creation_dates_parallel(rows)
+        return
+    for row in rows:
+        if "contract_created_date" not in row:
+            row["contract_created_date"] = "-"
+
+
+def _run_pool_chain_scan(
+    chain_id: int,
+    addresses: list[str],
+    deadline_ts: float,
+    pre_enqueued_ownership_refresh: bool = False,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
+    return _scan_pool_positions_chain(
+        chain_id,
+        addresses,
+        deadline_ts,
+        pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+    )
+
+
+def _run_pool_chain_batch_serial(
+    chain_ids: list[int],
+    addresses: list[str],
+    deadline_ts: float,
+    pre_enqueued_ownership_refresh: bool = False,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    debug_rows: list[dict[str, Any]] = []
+    timed_out = False
+    for chain_id in chain_ids:
+        if time.monotonic() >= deadline_ts:
+            timed_out = True
+            break
+        chain_rows, chain_errors, chain_debug, chain_timed_out = _run_pool_chain_scan(
+            int(chain_id),
+            addresses,
+            deadline_ts,
+            pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+        )
+        rows.extend(chain_rows)
+        errors.extend(chain_errors)
+        debug_rows.extend(chain_debug)
+        if chain_timed_out:
+            timed_out = True
+            break
+    return rows, errors, debug_rows, timed_out
+
+
+def _run_pool_chain_batch_parallel(
+    chain_ids: list[int],
+    addresses: list[str],
+    deadline_ts: float,
+    max_workers: int,
+    pre_enqueued_ownership_refresh: bool = False,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    debug_rows: list[dict[str, Any]] = []
+    timed_out = False
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = [
+        executor.submit(
+            _run_pool_chain_scan,
+            int(chain_id),
+            addresses,
+            deadline_ts,
+            pre_enqueued_ownership_refresh,
+        )
+        for chain_id in chain_ids
+    ]
+    aborted = False
+    try:
+        for fut in as_completed(futures):
+            try:
+                chain_rows, chain_errors, chain_debug, chain_timed_out = fut.result()
+            except Exception as e:
+                errors.append(f"Pool scan worker failed: {e}")
+                continue
+            rows.extend(chain_rows)
+            errors.extend(chain_errors)
+            debug_rows.extend(chain_debug)
+            if chain_timed_out:
+                timed_out = True
+            if time.monotonic() >= deadline_ts:
+                timed_out = True
+                aborted = True
+                break
+    finally:
+        executor.shutdown(wait=not aborted, cancel_futures=aborted)
+    return rows, errors, debug_rows, timed_out
+
+
+def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str]) -> list[int]:
+    valid_chain_ids = [int(cid) for cid in chain_ids if CHAIN_ID_TO_KEY.get(int(cid), "")]
+    if not valid_chain_ids:
+        return []
+    if not POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
+        return valid_chain_ids
+    filtered_chain_ids: list[int] = []
+    for cid in valid_chain_ids:
+        if _chain_has_any_position_nft_balance(int(cid), addresses):
+            filtered_chain_ids.append(int(cid))
+    return filtered_chain_ids
+
+
+def _order_chain_ids_for_pool_scan(valid_chain_ids: list[int], priority_chain_ids: list[int]) -> list[int]:
+    ordered_chain_ids: list[int] = []
+    seen_chain_ids: set[int] = set()
+    for cid in list(priority_chain_ids) + list(valid_chain_ids):
+        cc = int(cid)
+        if cc in seen_chain_ids:
+            continue
+        seen_chain_ids.add(cc)
+        ordered_chain_ids.append(cc)
+    return ordered_chain_ids
+
+
+def _scan_pool_positions(
+    addresses: list[str],
+    chain_ids: list[int],
+    *,
+    include_creation_dates: bool = True,
+    pre_enqueued_ownership_refresh: bool = False,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    debug_rows: list[dict[str, Any]] = []
+    deadline_ts = time.monotonic() + float(POSITIONS_SCAN_MAX_SECONDS)
+    timed_out = False
+
+    valid_chain_ids = _filter_chain_ids_for_pool_scan(chain_ids, addresses)
+    if not valid_chain_ids:
+        return [], [], []
+    priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
+    ordered_chain_ids = _order_chain_ids_for_pool_scan(valid_chain_ids, priority_chain_ids)
+    max_workers = max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
+
+    # Run priority chains first in sequence to avoid deadline starvation.
+    priority_ids = [c for c in ordered_chain_ids if c in priority_chain_ids]
+    p_rows, p_errors, p_debug, p_timed_out = _run_pool_chain_batch_serial(
+        priority_ids,
+        addresses,
+        deadline_ts,
+        pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+    )
+    rows.extend(p_rows)
+    errors.extend(p_errors)
+    debug_rows.extend(p_debug)
+    timed_out = bool(p_timed_out)
+
+    remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
+
+    if not timed_out and (max_workers <= 1 or len(remaining_chain_ids) <= 1):
+        r_rows, r_errors, r_debug, r_timed_out = _run_pool_chain_batch_serial(
+            remaining_chain_ids,
+            addresses,
+            deadline_ts,
+            pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+        )
+        rows.extend(r_rows)
+        errors.extend(r_errors)
+        debug_rows.extend(r_debug)
+        timed_out = bool(r_timed_out)
+    elif not timed_out:
+        r_rows, r_errors, r_debug, r_timed_out = _run_pool_chain_batch_parallel(
+            remaining_chain_ids,
+            addresses,
+            deadline_ts,
+            max_workers=max_workers,
+            pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+        )
+        rows.extend(r_rows)
+        errors.extend(r_errors)
+        debug_rows.extend(r_debug)
+        timed_out = bool(r_timed_out)
+
+    # Aggregate by owner/protocol/pool id (wallet can hold multiple NFT positions in one pool).
+    uniq_rows = _aggregate_pool_rows_by_owner_protocol_pool(rows)
+    _apply_creation_dates_phase(uniq_rows, include_creation_dates=include_creation_dates)
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
         dedup_errors.append(
             f"Pool scan timed out after {POSITIONS_SCAN_MAX_SECONDS}s. Showing partial results."
         )
-    return list(uniq.values()), dedup_errors, debug_rows
+    return uniq_rows, dedup_errors, debug_rows
 
 
 def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
@@ -8454,6 +9348,10 @@ def _render_admin_page() -> str:
         <div style="margin-top:10px;font-size:13px;color:#334155">
           <div><b>Total records:</b> <span id="idxRecordsTotal">-</span></div>
           <div><b>Total owners:</b> <span id="idxOwnersTotal">-</span></div>
+          <div><b>Ownership index records:</b> <span id="idxOwnershipRecordsTotal">-</span></div>
+          <div><b>Ownership index owners:</b> <span id="idxOwnershipOwnersTotal">-</span></div>
+          <div><b>Details cache rows:</b> <span id="idxDetailsCacheTotal">-</span></div>
+          <div><b>Ownership by protocol:</b> <span id="idxOwnershipBreakdown">-</span></div>
           <div><b>Running now:</b> <span id="idxRunningNow">-</span></div>
           <div><b>Elapsed:</b> <span id="idxElapsedNow">-</span></div>
           <div><b>Progress:</b> <span id="idxProgressNow">-</span></div>
@@ -8627,7 +9525,16 @@ def _render_admin_page() -> str:
       document.getElementById("idxMaxReceipts").value = String(Number(d.max_receipts || 220));
       document.getElementById("idxRecordsTotal").textContent = String(Number(d.records_total || 0));
       document.getElementById("idxOwnersTotal").textContent = String(Number(d.owners_total || 0));
+      const own = d.ownership_index || {{}};
+      document.getElementById("idxOwnershipRecordsTotal").textContent = String(Number(own.records_total || 0));
+      document.getElementById("idxOwnershipOwnersTotal").textContent = String(Number(own.owners_total || 0));
+      document.getElementById("idxDetailsCacheTotal").textContent = String(Number(own.details_cached_total || 0));
+      const ownBreakdown = Array.isArray(own.protocol_breakdown) ? own.protocol_breakdown : [];
+      document.getElementById("idxOwnershipBreakdown").textContent = ownBreakdown.length
+        ? ownBreakdown.map((x) => `${{String(x.protocol || "-")}}:${{Number(x.count || 0)}}`).join(", ")
+        : "-";
       const a = d.activity || {{}};
+      const q = d.ownership_index_queue || {{}};
       const running = !!a.running;
       document.getElementById("idxRunningNow").textContent = running ? "yes" : "no";
       const processed = Number(a.processed || 0);
@@ -8639,9 +9546,12 @@ def _render_admin_page() -> str:
       document.getElementById("idxElapsedNow").textContent = running ? `${{elapsedSec}}s` : "-";
       const ev = String(a.last_event || "-");
       const err = String(a.last_error || "");
+      const qInfo = q.enabled
+        ? ` | strict=${{q.index_first_strict ? "on" : "off"}} legacy=${{q.legacy_discovery_enabled ? "on" : "off"}} queue=${{Number(q.queued||0)}} inflight=${{Number(q.inflight||0)}} workers=${{Number(q.workers||0)}}`
+        : "";
       document.getElementById("idxProgressNow").textContent = running
-        ? `${{processed}}/${{targets}} | updated=${{updated}} errors=${{errors}} | event=${{ev}}${{err ? ` | err=${{err}}` : ""}}`
-        : (ev !== "-" ? `${{ev}}${{err ? ` | err=${{err}}` : ""}}` : "-");
+        ? `${{processed}}/${{targets}} | updated=${{updated}} errors=${{errors}} | event=${{ev}}${{err ? ` | err=${{err}}` : ""}}${{qInfo}}`
+        : (ev !== "-" ? `${{ev}}${{err ? ` | err=${{err}}` : ""}}${{qInfo}}` : (`-${{qInfo}}`));
       document.getElementById("idxCurrentOwner").textContent = running ? (a.current_owner || "-") : "-";
       document.getElementById("idxLastRun").textContent = d.last_run_at || "-";
       document.getElementById("idxLastStatus").textContent = d.last_run_status || "-";
@@ -8810,7 +9720,7 @@ def _render_admin_page() -> str:
     }}
     function renderStats(rows) {{
       const table = document.getElementById("statsTable");
-      let html = "<tr><th>Period</th><th>Unique sessions</th><th>Page views</th><th>Run start</th><th>Run done</th><th>Run failed</th><th>Wallet auth</th><th>Help tickets</th><th>Total events</th></tr>";
+      let html = "<tr><th>Period</th><th>Unique sessions</th><th>Page views</th><th>Run start</th><th>Run done</th><th>Run failed</th><th>Wallet auth</th><th>Help tickets</th><th>Position scans</th><th>Pool scans</th><th>Scan light mode</th><th>Index cache hits</th><th>Index cache misses</th><th>Index skip live</th><th>Legacy disabled</th><th>Row enrich off</th><th>Total events</th></tr>";
       for (const r of (rows || [])) {{
         html += "<tr>";
         html += `<td class="mono">${{esc(r.bucket)}}</td>`;
@@ -8821,10 +9731,18 @@ def _render_admin_page() -> str:
         html += `<td>${{Number(r.runs_failed || 0)}}</td>`;
         html += `<td>${{Number(r.wallet_auth || 0)}}</td>`;
         html += `<td>${{Number(r.help_tickets || 0)}}</td>`;
+        html += `<td>${{Number(r.positions_scans || 0)}}</td>`;
+        html += `<td>${{Number(r.positions_pool_scans || 0)}}</td>`;
+        html += `<td>${{Number(r.positions_scan_light_mode || 0)}}</td>`;
+        html += `<td>${{Number(r.index_cache_hits || 0)}}</td>`;
+        html += `<td>${{Number(r.index_cache_misses || 0)}}</td>`;
+        html += `<td>${{Number(r.index_skip_live || 0)}}</td>`;
+        html += `<td>${{Number(r.index_legacy_disabled || 0)}}</td>`;
+        html += `<td>${{Number(r.index_row_live_enrich_disabled || 0)}}</td>`;
         html += `<td>${{Number(r.total_events || 0)}}</td>`;
         html += "</tr>";
       }}
-      if (!(rows || []).length) html += '<tr><td colspan="9">No stats yet.</td></tr>';
+      if (!(rows || []).length) html += '<tr><td colspan="17">No stats yet.</td></tr>';
       table.innerHTML = html;
     }}
     async function loadStats() {{
@@ -9741,7 +10659,8 @@ def admin_stats(request: Request, response: Response, period: str = "day", limit
           SUM(CASE WHEN event_type = 'run_done' THEN 1 ELSE 0 END) AS runs_done,
           SUM(CASE WHEN event_type = 'run_failed' THEN 1 ELSE 0 END) AS runs_failed,
           SUM(CASE WHEN event_type = 'wallet_auth' THEN 1 ELSE 0 END) AS wallet_auth,
-          SUM(CASE WHEN event_type = 'help_ticket' THEN 1 ELSE 0 END) AS help_tickets
+          SUM(CASE WHEN event_type = 'help_ticket' THEN 1 ELSE 0 END) AS help_tickets,
+          SUM(CASE WHEN event_type = 'positions_scan' THEN 1 ELSE 0 END) AS positions_scans
         FROM (
           SELECT {bucket_expr} AS bucket, session_id, event_type
           FROM analytics_events
@@ -9766,8 +10685,51 @@ def admin_stats(request: Request, response: Response, period: str = "day", limit
                 "runs_failed": int(r[6] or 0),
                 "wallet_auth": int(r[7] or 0),
                 "help_tickets": int(r[8] or 0),
+                "positions_scans": int(r[9] or 0),
+                "positions_pool_scans": 0,
+                "index_cache_hits": 0,
+                "index_cache_misses": 0,
+                "index_skip_live": 0,
+                "index_legacy_disabled": 0,
+                "index_row_live_enrich_disabled": 0,
+                "positions_scan_light_mode": 0,
             }
         )
+    bucket_map: dict[str, dict[str, Any]] = {str(it.get("bucket") or ""): it for it in items}
+    payload_query = f"""
+        SELECT bucket, payload
+        FROM (
+          SELECT {bucket_expr} AS bucket, event_type, payload
+          FROM analytics_events
+        ) x
+        WHERE bucket IS NOT NULL AND bucket != '' AND event_type = 'positions_scan'
+    """
+    with _analytics_conn() as conn:
+        payload_rows = conn.execute(payload_query).fetchall()
+    for r in payload_rows:
+        bucket = str(r[0] or "")
+        raw_payload = str(r[1] or "").strip()
+        if not bucket or not raw_payload:
+            continue
+        item = bucket_map.get(bucket)
+        if not item:
+            continue
+        try:
+            obj = json.loads(raw_payload)
+            if not isinstance(obj, dict):
+                continue
+            item["index_cache_hits"] = int(item.get("index_cache_hits") or 0) + int(obj.get("index_cache_hits") or 0)
+            item["index_cache_misses"] = int(item.get("index_cache_misses") or 0) + int(obj.get("index_cache_misses") or 0)
+            item["index_skip_live"] = int(item.get("index_skip_live") or 0) + int(obj.get("index_skip_live") or 0)
+            item["index_legacy_disabled"] = int(item.get("index_legacy_disabled") or 0) + int(obj.get("legacy_disabled") or 0)
+            item["index_row_live_enrich_disabled"] = int(item.get("index_row_live_enrich_disabled") or 0) + int(obj.get("row_live_enrich_disabled") or 0)
+            is_pool_scan = bool(obj.get("scan_pools"))
+            if is_pool_scan:
+                item["positions_pool_scans"] = int(item.get("positions_pool_scans") or 0) + 1
+            if is_pool_scan and not bool(obj.get("include_creation_dates")):
+                item["positions_scan_light_mode"] = int(item.get("positions_scan_light_mode") or 0) + 1
+        except Exception:
+            continue
     return {"period": p, "limit": lim, "items": items, "count": len(items)}
 
 
@@ -9891,77 +10853,113 @@ def positions_chains() -> dict[str, Any]:
     return {"items": items, "count": len(items)}
 
 
-def _scan_positions_core(
-    req: PositionsScanRequest,
-    sid: str = "unknown",
+def _extract_index_scan_counters(pool_debug_rows: list[dict[str, Any]]) -> tuple[int, int, int, int, int]:
+    cache_hits = 0
+    cache_misses = 0
+    skip_live = 0
+    legacy_disabled = 0
+    row_live_enrich_disabled = 0
+    for row in pool_debug_rows:
+        attempts = row.get("attempts") or []
+        if not isinstance(attempts, list):
+            continue
+        has_cache_hit = False
+        has_cache_miss = False
+        has_skip_live = False
+        has_legacy_disabled = False
+        has_row_live_enrich_disabled = False
+        for a in attempts:
+            if not isinstance(a, dict):
+                continue
+            qmode = str(a.get("query_mode") or "")
+            if qmode == "ownership_cache":
+                if int(a.get("count") or 0) > 0:
+                    has_cache_hit = True
+                else:
+                    has_cache_miss = True
+            elif qmode == "index_first_skip_live":
+                has_skip_live = True
+            elif qmode == "legacy_discovery_disabled":
+                has_legacy_disabled = True
+            elif qmode == "row_live_enrich_disabled":
+                has_row_live_enrich_disabled = True
+        if has_cache_hit:
+            cache_hits += 1
+        elif has_cache_miss:
+            cache_misses += 1
+        if has_skip_live:
+            skip_live += 1
+        if has_legacy_disabled:
+            legacy_disabled += 1
+        if has_row_live_enrich_disabled:
+            row_live_enrich_disabled += 1
+    return cache_hits, cache_misses, skip_live, legacy_disabled, row_live_enrich_disabled
+
+
+def _build_pool_debug_summary_rows(pool_debug_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    debug_summary: dict[tuple[str, str, str, str], int] = {}
+    for d in pool_debug_rows:
+        chain = str(d.get("chain") or "")
+        version = str(d.get("version") or "")
+        attempts = d.get("attempts") or []
+        for a in attempts:
+            if not isinstance(a, dict):
+                continue
+            mode = f"{a.get('query_mode') or ''}:{a.get('owner_type') or ''}"
+            key = (chain, version, mode, "ok" if a.get("ok") else "fail")
+            debug_summary[key] = int(debug_summary.get(key, 0)) + int(a.get("count") or 0)
+    return [
+        {
+            "chain": chain,
+            "version": version,
+            "query_mode": mode,
+            "status": status,
+            "count": count,
+        }
+        for (chain, version, mode, status), count in sorted(debug_summary.items())
+    ]
+
+
+def _build_positions_scan_analytics_payload(
     *,
-    include_creation_dates: bool = True,
-) -> dict[str, Any]:
-    evm_raw = list(req.evm_addresses or []) + list(req.addresses or [])
-    evm_addresses = _parse_positions_addresses(evm_raw)
-    solana_addresses = _parse_solana_addresses(req.solana_addresses or [])
-    tron_addresses = _parse_tron_addresses(req.tron_addresses or [])
+    evm_count: int,
+    sol_count: int,
+    tron_count: int,
+    chains_count: int,
+    scan_pools: bool,
+    include_creation_dates: bool,
+    cache_hits: int,
+    cache_misses: int,
+    skip_live: int,
+    legacy_disabled: int,
+    row_live_enrich_disabled: int,
+) -> str:
+    return json.dumps(
+        {
+            "evm": int(evm_count),
+            "sol": int(sol_count),
+            "tron": int(tron_count),
+            "chains": int(chains_count),
+            "scan_pools": bool(scan_pools),
+            "include_creation_dates": bool(include_creation_dates),
+            "index_cache_hits": int(cache_hits),
+            "index_cache_misses": int(cache_misses),
+            "index_skip_live": int(skip_live),
+            "legacy_disabled": int(legacy_disabled),
+            "row_live_enrich_disabled": int(row_live_enrich_disabled),
+            "legacy_enabled": bool(POSITIONS_LEGACY_DISCOVERY_ENABLED),
+            "index_first_strict": bool(POSITIONS_INDEX_FIRST_STRICT),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
-    if not evm_addresses and not solana_addresses and not tron_addresses:
-        raise HTTPException(status_code=400, detail="Provide at least one valid address.")
-    if len(evm_addresses) > 20:
-        raise HTTPException(status_code=400, detail="Too many addresses. Max 20.")
 
-    # By default scan all supported EVM chains; if chain_ids provided, preserve user order.
-    # Prioritize chains where users most often track active LPs, and keep heavy
-    # ethereum scan later so partial results include L2 pools under timeout.
-    preferred_order = [56, 42161, 8453, 130, 1, 10, 137]
-    preferred_rank = {cid: idx for idx, cid in enumerate(preferred_order)}
-    all_chain_ids = sorted(
-        (
-            {
-                int(x.get("chain_id") or 0)
-                for x in _positions_chain_catalog()
-                if int(x.get("chain_id") or 0) > 0
-            }
-            | {int(cid) for cid in CHAIN_ID_TO_KEY.keys() if int(cid) > 0}
-        ),
-        key=lambda cid: (preferred_rank.get(int(cid), 999), int(cid)),
-    )[:64]
-    requested_chain_ids: list[int] = []
-    for x in (req.chain_ids or []):
-        cid = int(x)
-        if cid > 0 and cid not in requested_chain_ids:
-            requested_chain_ids.append(cid)
-    if requested_chain_ids:
-        allowed = set(all_chain_ids)
-        selected_chain_ids = [c for c in requested_chain_ids if c in allowed]
-        if not selected_chain_ids:
-            selected_chain_ids = all_chain_ids
-    else:
-        selected_chain_ids = all_chain_ids
-    scan_pools = bool(req.include_pools)
-    scan_lending = bool(req.include_lending)
-    scan_rewards = bool(req.include_rewards)
-    pool_debug_rows: list[dict[str, Any]] = []
-    if evm_addresses:
-        if scan_pools:
-            pool_rows, pool_errs, pool_debug_rows = _scan_pool_positions(
-                evm_addresses,
-                selected_chain_ids,
-                include_creation_dates=include_creation_dates,
-            )
-        else:
-            pool_rows, pool_errs, pool_debug_rows = [], [], []
-        lending_rows, lending_errs = (_scan_aave_positions(evm_addresses, selected_chain_ids) if scan_lending else ([], []))
-        reward_rows, reward_errs = (_scan_aave_merit_rewards(evm_addresses, selected_chain_ids) if scan_rewards else ([], []))
-    else:
-        pool_rows, pool_errs = [], []
-        lending_rows, lending_errs = [], []
-        reward_rows, reward_errs = [], []
-        pool_debug_rows = []
-
-    info_notes: list[str] = []
-    if solana_addresses:
-        info_notes.append("Solana scanning is not available yet in this build.")
-    if tron_addresses:
-        info_notes.append("TRON scanning is not available yet in this build.")
-
+def _sort_positions_scan_rows(
+    pool_rows: list[dict[str, Any]],
+    lending_rows: list[dict[str, Any]],
+    reward_rows: list[dict[str, Any]],
+) -> None:
     pool_rows.sort(
         key=lambda x: (
             str(x.get("address") or ""),
@@ -9984,33 +10982,158 @@ def _scan_positions_core(
         )
     )
 
-    _analytics_log_event(
-        session_id=sid,
-        event_type="positions_scan",
-        path="/api/positions/scan",
-        payload=f"evm={len(evm_addresses)} sol={len(solana_addresses)} tron={len(tron_addresses)} chains={len(selected_chain_ids)}",
+
+def _append_index_mode_info_note(
+    info_notes: list[str],
+    *,
+    cache_hits: int,
+    cache_misses: int,
+    skip_live: int,
+    row_live_enrich_disabled: int,
+) -> None:
+    if not POSITIONS_OWNERSHIP_INDEX_ENABLED:
+        return
+    mode_text = "strict" if POSITIONS_INDEX_FIRST_STRICT else "hybrid"
+    legacy_text = "enabled" if POSITIONS_LEGACY_DISCOVERY_ENABLED else "disabled"
+    info_notes.append(
+        f"Ownership index mode: {mode_text}; legacy discovery: {legacy_text}; "
+        f"cache hits={cache_hits}, misses={cache_misses}, skip_live={skip_live}, row_live_enrich_off={row_live_enrich_disabled}."
     )
-    debug_summary: dict[tuple[str, str, str, str], int] = {}
-    for d in pool_debug_rows:
-        chain = str(d.get("chain") or "")
-        version = str(d.get("version") or "")
-        attempts = d.get("attempts") or []
-        for a in attempts:
-            if not isinstance(a, dict):
-                continue
-            mode = f"{a.get('query_mode') or ''}:{a.get('owner_type') or ''}"
-            key = (chain, version, mode, "ok" if a.get("ok") else "fail")
-            debug_summary[key] = int(debug_summary.get(key, 0)) + int(a.get("count") or 0)
-    debug_summary_rows = [
-        {
-            "chain": chain,
-            "version": version,
-            "query_mode": mode,
-            "status": status,
-            "count": count,
-        }
-        for (chain, version, mode, status), count in sorted(debug_summary.items())
-    ]
+
+
+def _enqueue_positions_ownership_refresh_for_addresses(
+    chain_ids: list[int],
+    evm_addresses: list[str],
+) -> None:
+    if not POSITIONS_OWNERSHIP_INDEX_ENABLED:
+        return
+    for cid in chain_ids:
+        for owner in evm_addresses:
+            _position_enqueue_ownership_refresh(int(cid), owner)
+
+
+def _select_positions_chain_ids(requested_chain_ids_raw: list[int]) -> list[int]:
+    # By default scan all supported EVM chains; if chain_ids provided, preserve user order.
+    # Prioritize chains where users most often track active LPs, and keep heavy
+    # ethereum scan later so partial results include L2 pools under timeout.
+    preferred_order = [56, 42161, 8453, 130, 1, 10, 137]
+    preferred_rank = {cid: idx for idx, cid in enumerate(preferred_order)}
+    all_chain_ids = sorted(
+        (
+            {
+                int(x.get("chain_id") or 0)
+                for x in _positions_chain_catalog()
+                if int(x.get("chain_id") or 0) > 0
+            }
+            | {int(cid) for cid in CHAIN_ID_TO_KEY.keys() if int(cid) > 0}
+        ),
+        key=lambda cid: (preferred_rank.get(int(cid), 999), int(cid)),
+    )[:64]
+    requested_chain_ids: list[int] = []
+    for x in (requested_chain_ids_raw or []):
+        cid = int(x)
+        if cid > 0 and cid not in requested_chain_ids:
+            requested_chain_ids.append(cid)
+    if requested_chain_ids:
+        allowed = set(all_chain_ids)
+        selected_chain_ids = [c for c in requested_chain_ids if c in allowed]
+        return selected_chain_ids if selected_chain_ids else all_chain_ids
+    return all_chain_ids
+
+
+def _scan_positions_evm_components(
+    evm_addresses: list[str],
+    selected_chain_ids: list[int],
+    *,
+    scan_pools: bool,
+    scan_lending: bool,
+    scan_rewards: bool,
+    include_creation_dates: bool,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], list[str]]:
+    if scan_pools:
+        _enqueue_positions_ownership_refresh_for_addresses(selected_chain_ids, evm_addresses)
+    if scan_pools:
+        pool_rows, pool_errs, pool_debug_rows = _scan_pool_positions(
+            evm_addresses,
+            selected_chain_ids,
+            include_creation_dates=include_creation_dates,
+            pre_enqueued_ownership_refresh=bool(POSITIONS_OWNERSHIP_INDEX_ENABLED),
+        )
+    else:
+        pool_rows, pool_errs, pool_debug_rows = [], [], []
+    lending_rows, lending_errs = (_scan_aave_positions(evm_addresses, selected_chain_ids) if scan_lending else ([], []))
+    reward_rows, reward_errs = (_scan_aave_merit_rewards(evm_addresses, selected_chain_ids) if scan_rewards else ([], []))
+    return (
+        pool_rows,
+        pool_errs,
+        pool_debug_rows,
+        lending_rows,
+        lending_errs,
+        reward_rows,
+        reward_errs,
+    )
+
+
+def _prepare_positions_scan_request(
+    req: PositionsScanRequest,
+) -> tuple[list[str], list[str], list[str], list[int], bool, bool, bool]:
+    evm_raw = list(req.evm_addresses or []) + list(req.addresses or [])
+    evm_addresses = _parse_positions_addresses(evm_raw)
+    solana_addresses = _parse_solana_addresses(req.solana_addresses or [])
+    tron_addresses = _parse_tron_addresses(req.tron_addresses or [])
+    if not evm_addresses and not solana_addresses and not tron_addresses:
+        raise HTTPException(status_code=400, detail="Provide at least one valid address.")
+    if len(evm_addresses) > 20:
+        raise HTTPException(status_code=400, detail="Too many addresses. Max 20.")
+    scan_pools = bool(req.include_pools)
+    scan_lending = bool(req.include_lending)
+    scan_rewards = bool(req.include_rewards)
+    need_evm_chain_context = bool(evm_addresses) and bool(scan_pools or scan_lending or scan_rewards)
+    selected_chain_ids = _select_positions_chain_ids(list(req.chain_ids or [])) if need_evm_chain_context else []
+    return (
+        evm_addresses,
+        solana_addresses,
+        tron_addresses,
+        selected_chain_ids,
+        scan_pools,
+        scan_lending,
+        scan_rewards,
+    )
+
+
+def _build_positions_info_notes(
+    solana_addresses: list[str],
+    tron_addresses: list[str],
+    *,
+    scan_pools: bool,
+    include_creation_dates: bool,
+) -> list[str]:
+    info_notes: list[str] = []
+    if solana_addresses:
+        info_notes.append("Solana scanning is not available yet in this build.")
+    if tron_addresses:
+        info_notes.append("TRON scanning is not available yet in this build.")
+    if scan_pools and not include_creation_dates:
+        info_notes.append("Creation dates are in fast mode (deferred/background).")
+    return info_notes
+
+
+def _build_positions_scan_response(
+    *,
+    pool_rows: list[dict[str, Any]],
+    lending_rows: list[dict[str, Any]],
+    reward_rows: list[dict[str, Any]],
+    pool_errs: list[str],
+    lending_errs: list[str],
+    reward_errs: list[str],
+    info_notes: list[str],
+    pool_debug_rows: list[dict[str, Any]],
+    debug_summary_rows: list[dict[str, Any]],
+    evm_count: int,
+    sol_count: int,
+    tron_count: int,
+    chains_count: int,
+) -> dict[str, Any]:
     return {
         "pool_positions": pool_rows,
         "lending_positions": lending_rows,
@@ -10022,10 +11145,10 @@ def _scan_positions_core(
             "summary": debug_summary_rows[:500],
         },
         "summary": {
-            "evm_addresses": len(evm_addresses),
-            "solana_addresses": len(solana_addresses),
-            "tron_addresses": len(tron_addresses),
-            "chains": len(selected_chain_ids),
+            "evm_addresses": int(evm_count),
+            "solana_addresses": int(sol_count),
+            "tron_addresses": int(tron_count),
+            "chains": int(chains_count),
             "pool_count": len(pool_rows),
             "lending_count": len(lending_rows),
             "reward_count": len(reward_rows),
@@ -10033,81 +11156,217 @@ def _scan_positions_core(
     }
 
 
-def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: str) -> None:
+def _record_positions_scan_analytics(
+    *,
+    sid: str,
+    evm_addresses: list[str],
+    solana_addresses: list[str],
+    tron_addresses: list[str],
+    selected_chain_ids: list[int],
+    scan_pools: bool,
+    include_creation_dates: bool,
+    cache_hits: int,
+    cache_misses: int,
+    skip_live: int,
+    legacy_disabled: int,
+    row_live_enrich_disabled: int,
+    info_notes: list[str],
+) -> None:
+    _analytics_log_event(
+        session_id=sid,
+        event_type="positions_scan",
+        path="/api/positions/scan",
+        payload=_build_positions_scan_analytics_payload(
+            evm_count=len(evm_addresses),
+            sol_count=len(solana_addresses),
+            tron_count=len(tron_addresses),
+            chains_count=len(selected_chain_ids),
+            scan_pools=bool(scan_pools),
+            include_creation_dates=bool(include_creation_dates),
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            skip_live=skip_live,
+            legacy_disabled=legacy_disabled,
+            row_live_enrich_disabled=row_live_enrich_disabled,
+        ),
+    )
+    if scan_pools:
+        _append_index_mode_info_note(
+            info_notes,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            skip_live=skip_live,
+            row_live_enrich_disabled=row_live_enrich_disabled,
+        )
+
+
+def _update_pos_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
     with POS_JOB_LOCK:
         job = POS_JOBS.get(job_id)
         if not job:
-            return
-        job["status"] = "running"
-        job["stage"] = "scan"
-        job["stage_label"] = "Scanning positions"
-        job["progress"] = 15
-        job["started_at"] = time.time()
+            return None
+        job.update(updates)
+        return job
+
+
+def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any]) -> None:
+    pool_rows = result.get("pool_positions") or []
+    if not isinstance(pool_rows, list) or not pool_rows:
+        return
+    _populate_creation_dates_parallel(pool_rows)
+    _enrich_missing_creation_dates(pool_rows, max_seconds=45, max_rows=500)
+    if _update_pos_job(
+        job_id,
+        result=result,
+        stage="enrich_pairs",
+        stage_label="Resolving pair symbols",
+        progress=85,
+    ) is None:
+        return
+    _enrich_pair_symbols_background(pool_rows, max_seconds=20)
+    if _update_pos_job(
+        job_id,
+        result=result,
+        stage="enrich_tvl",
+        stage_label="Refining TVL estimates",
+        progress=92,
+    ) is None:
+        return
+    _enrich_tvl_background(pool_rows, max_seconds=25)
+    for r in pool_rows:
+        if not str(r.get("contract_created_date") or "").strip():
+            r["contract_created_date"] = "-"
+    _update_pos_job(job_id, result=result, progress=95)
+
+
+def _scan_positions_core(
+    req: PositionsScanRequest,
+    sid: str = "unknown",
+    *,
+    include_creation_dates: bool = True,
+) -> dict[str, Any]:
+    (
+        evm_addresses,
+        solana_addresses,
+        tron_addresses,
+        selected_chain_ids,
+        scan_pools,
+        scan_lending,
+        scan_rewards,
+    ) = _prepare_positions_scan_request(req)
+    scan_pools_effective = bool(scan_pools and evm_addresses)
+    pool_debug_rows: list[dict[str, Any]] = []
+    if evm_addresses:
+        (
+            pool_rows,
+            pool_errs,
+            pool_debug_rows,
+            lending_rows,
+            lending_errs,
+            reward_rows,
+            reward_errs,
+        ) = _scan_positions_evm_components(
+            evm_addresses,
+            selected_chain_ids,
+            scan_pools=scan_pools,
+            scan_lending=scan_lending,
+            scan_rewards=scan_rewards,
+            include_creation_dates=include_creation_dates,
+        )
+    else:
+        pool_rows, pool_errs = [], []
+        lending_rows, lending_errs = [], []
+        reward_rows, reward_errs = [], []
+        pool_debug_rows = []
+
+    info_notes = _build_positions_info_notes(
+        solana_addresses,
+        tron_addresses,
+        scan_pools=scan_pools_effective,
+        include_creation_dates=include_creation_dates,
+    )
+
+    _sort_positions_scan_rows(pool_rows, lending_rows, reward_rows)
+
+    debug_summary_rows = _build_pool_debug_summary_rows(pool_debug_rows)
+    cache_hits, cache_misses, skip_live, legacy_disabled, row_live_enrich_disabled = _extract_index_scan_counters(
+        pool_debug_rows
+    )
+    _record_positions_scan_analytics(
+        sid=sid,
+        evm_addresses=evm_addresses,
+        solana_addresses=solana_addresses,
+        tron_addresses=tron_addresses,
+        selected_chain_ids=selected_chain_ids,
+        scan_pools=scan_pools_effective,
+        include_creation_dates=include_creation_dates,
+        cache_hits=cache_hits,
+        cache_misses=cache_misses,
+        skip_live=skip_live,
+        legacy_disabled=legacy_disabled,
+        row_live_enrich_disabled=row_live_enrich_disabled,
+        info_notes=info_notes,
+    )
+    return _build_positions_scan_response(
+        pool_rows=pool_rows,
+        lending_rows=lending_rows,
+        reward_rows=reward_rows,
+        pool_errs=pool_errs,
+        lending_errs=lending_errs,
+        reward_errs=reward_errs,
+        info_notes=info_notes,
+        pool_debug_rows=pool_debug_rows,
+        debug_summary_rows=debug_summary_rows,
+        evm_count=len(evm_addresses),
+        sol_count=len(solana_addresses),
+        tron_count=len(tron_addresses),
+        chains_count=len(selected_chain_ids),
+    )
+
+
+def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: str) -> None:
+    if _update_pos_job(
+        job_id,
+        status="running",
+        stage="scan",
+        stage_label="Scanning positions",
+        progress=15,
+        started_at=time.time(),
+    ) is None:
+        return
     try:
         result = _scan_positions_core(req, sid=session_id, include_creation_dates=False)
-        with POS_JOB_LOCK:
-            job = POS_JOBS.get(job_id)
-            if not job:
-                return
-            job["result"] = result
-            job["stage"] = "enrich_dates"
-            job["stage_label"] = "Enriching dates"
-            job["progress"] = 65
-        # Phase 2: enrich heavier fields in background and update result.
-        pool_rows = result.get("pool_positions") or []
-        if isinstance(pool_rows, list) and pool_rows:
-            _populate_creation_dates_parallel(pool_rows)
-            _enrich_missing_creation_dates(pool_rows, max_seconds=45, max_rows=500)
-            with POS_JOB_LOCK:
-                job = POS_JOBS.get(job_id)
-                if job:
-                    job["result"] = result
-                    job["stage"] = "enrich_pairs"
-                    job["stage_label"] = "Resolving pair symbols"
-                    job["progress"] = 85
-            _enrich_pair_symbols_background(pool_rows, max_seconds=20)
-            with POS_JOB_LOCK:
-                job = POS_JOBS.get(job_id)
-                if job:
-                    job["result"] = result
-                    job["stage"] = "enrich_tvl"
-                    job["stage_label"] = "Refining TVL estimates"
-                    job["progress"] = 92
-            _enrich_tvl_background(pool_rows, max_seconds=25)
-            for r in pool_rows:
-                if not str(r.get("contract_created_date") or "").strip():
-                    r["contract_created_date"] = "-"
-            with POS_JOB_LOCK:
-                job = POS_JOBS.get(job_id)
-                if job:
-                    job["result"] = result
-                    job["progress"] = 95
-        with POS_JOB_LOCK:
-            job = POS_JOBS.get(job_id)
-            if not job:
-                return
-            job["status"] = "done"
-            job["stage"] = "done"
-            job["stage_label"] = "Completed"
-            job["progress"] = 100
-            job["finished_at"] = time.time()
-            job["result"] = result
+        if _update_pos_job(
+            job_id,
+            result=result,
+            stage="enrich_dates",
+            stage_label="Enriching dates",
+            progress=65,
+        ) is None:
+            return
+        _run_positions_scan_enrich_phases(job_id, result)
+        _update_pos_job(
+            job_id,
+            status="done",
+            stage="done",
+            stage_label="Completed",
+            progress=100,
+            finished_at=time.time(),
+            result=result,
+        )
     except Exception as e:
-        with POS_JOB_LOCK:
-            job = POS_JOBS.get(job_id)
-            if not job:
-                return
-            job["status"] = "failed"
-            job["stage"] = "failed"
-            job["stage_label"] = "Failed"
-            job["progress"] = 100
-            job["finished_at"] = time.time()
-            job["error"] = str(e)[:400]
+        _update_pos_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            stage_label="Failed",
+            progress=100,
+            finished_at=time.time(),
+            error=str(e)[:400],
+        )
 
 
-@app.post("/api/positions/scan/start")
-def scan_positions_start(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
-    sid = _ensure_session_cookie(request, response)
+def _create_positions_job() -> str:
     job_id = str(uuid.uuid4())
     with POS_JOB_LOCK:
         now = time.time()
@@ -10126,6 +11385,13 @@ def scan_positions_start(req: PositionsScanRequest, request: Request, response: 
             "error": "",
             "result": None,
         }
+    return job_id
+
+
+@app.post("/api/positions/scan/start")
+def scan_positions_start(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    job_id = _create_positions_job()
     t = threading.Thread(target=_run_positions_scan_job, args=(job_id, req, sid), daemon=True)
     t.start()
     return {"job_id": job_id}
@@ -10143,7 +11409,11 @@ def scan_positions_job(job_id: str) -> dict[str, Any]:
 @app.post("/api/positions/scan")
 def scan_positions(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
     sid = _ensure_session_cookie(request, response)
-    return _scan_positions_core(req, sid=sid, include_creation_dates=True)
+    return _scan_positions_core(
+        req,
+        sid=sid,
+        include_creation_dates=bool(POSITIONS_DIRECT_INCLUDE_CREATION_DATES),
+    )
 
 
 @app.post("/api/positions/pool-value-series")
