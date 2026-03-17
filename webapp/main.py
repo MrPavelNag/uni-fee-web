@@ -1061,6 +1061,81 @@ def _position_index_refresh_owner_chain(
                 inf_ids,
                 source="infinity_index",
             )
+            if inf_ids:
+                try:
+                    inf_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
+                        owner_addr,
+                        cid,
+                        deadline_ts=time.monotonic() + (8.0 if warmup_mode else 20.0),
+                        debug_out={},
+                        token_ids_override=inf_ids,
+                    )
+                except Exception:
+                    inf_cl_positions = []
+                inf_cl_ids: list[int] = []
+                for pos in inf_cl_positions:
+                    tid = _parse_int_like((pos or {}).get("id"))
+                    if tid <= 0:
+                        continue
+                    inf_cl_ids.append(tid)
+                    _position_details_cache_upsert(cid, "pancake_infinity_cl", pos)
+                    summary["cached"] += 1
+                if inf_cl_ids:
+                    summary["ownership_upserted"] += _position_ownership_upsert(
+                        cid,
+                        owner_addr,
+                        "pancake_infinity_cl",
+                        inf_mgr,
+                        inf_cl_ids,
+                        source="onchain_infinity_cl",
+                    )
+        inf_bin_mgr = PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid, "")
+        if run_v3 and inf_bin_mgr:
+            try:
+                bin_ids = _scan_erc721_token_ids_by_explorer_api(
+                    cid,
+                    inf_bin_mgr,
+                    owner_addr,
+                    max_ids=max(40, POSITIONS_OWNERSHIP_INDEX_MAX_NFTS // 2),
+                )
+            except Exception:
+                bin_ids = []
+            if bin_ids:
+                summary["ownership_upserted"] += _position_ownership_upsert(
+                    cid,
+                    owner_addr,
+                    "pancake_infinity_bin",
+                    inf_bin_mgr,
+                    bin_ids,
+                    source="explorer_infinity_bin",
+                )
+                try:
+                    inf_bin_positions = _scan_pancake_infinity_bin_positions_onchain(
+                        owner_addr,
+                        cid,
+                        deadline_ts=time.monotonic() + (8.0 if warmup_mode else 20.0),
+                        debug_out={},
+                        token_ids_override=bin_ids,
+                    )
+                except Exception:
+                    inf_bin_positions = []
+                inf_bin_ids: list[int] = []
+                for pos in inf_bin_positions:
+                    tid = _parse_int_like((pos or {}).get("id"))
+                    if tid <= 0:
+                        continue
+                    inf_bin_ids.append(tid)
+                    _position_details_cache_upsert(cid, "pancake_infinity_bin", pos)
+                    summary["cached"] += 1
+                if inf_bin_ids:
+                    summary["ownership_upserted"] += _position_ownership_upsert(
+                        cid,
+                        owner_addr,
+                        "pancake_infinity_bin",
+                        inf_bin_mgr,
+                        inf_bin_ids,
+                        source="onchain_infinity_bin",
+                    )
         # V4 ownership/cache refresh runs from graph in light mode.
         if run_v4 and chain_key:
             ep_v4 = get_graph_endpoint(chain_key, version="v4")
