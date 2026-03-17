@@ -1545,80 +1545,152 @@ def _scan_pancake_infinity_cl_positions_graph(
         return []
     if deadline_ts is not None and time.monotonic() >= deadline_ts:
         return []
-    # Basic Infinity CL positions query by owner; schema is similar to v3 positions.
-    query = """
-    query InfinityPositions($owner: Bytes!, $skip: Int!) {
-      positions(first: 200, skip: $skip, where: { owner: $owner }) {
-        id
-        liquidity
-        tickLower
-        tickUpper
-        pool {
-          id
-          feeTier
-          liquidity
-          sqrtPrice
-          token0Price
-          totalValueLockedUSD
-          token0 { id decimals symbol }
-          token1 { id decimals symbol }
-        }
-      }
-    }
-    """
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     skip = 0
-    while True:
-        if deadline_ts is not None and time.monotonic() >= deadline_ts:
-            break
-        data = graphql_query(ep, query, {"owner": owner_raw.lower(), "skip": skip}, retries=1)
-        rows = ((data.get("data") or {}).get("positions") or []) or []
-        if not rows:
-            break
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            pid = str(r.get("id") or "").strip()
-            if not pid or pid in seen:
-                continue
-            seen.add(pid)
-            pool = r.get("pool") or {}
-            t0 = pool.get("token0") or {}
-            t1 = pool.get("token1") or {}
-            pos_liq = str(r.get("liquidity") or "0")
-            out.append(
-                {
-                    "id": f"inf-cl:{pid}",
-                    "liquidity": pos_liq,
-                    "tickLower": {"tickIdx": str(r.get("tickLower") or "0")},
-                    "tickUpper": {"tickIdx": str(r.get("tickUpper") or "0")},
-                    "pool": {
-                        "id": str(pool.get("id") or "").strip().lower(),
-                        "feeTier": str(pool.get("feeTier") or "0"),
-                        "liquidity": str(pool.get("liquidity") or "0"),
-                        "sqrtPrice": str(pool.get("sqrtPrice") or "0"),
-                        "token0Price": str(pool.get("token0Price") or "0"),
-                        "totalValueLockedUSD": str(pool.get("totalValueLockedUSD") or "0"),
-                        "token0": {
-                            "id": str(t0.get("id") or "").strip().lower(),
-                            "decimals": str(t0.get("decimals") or "18"),
-                            "symbol": str(t0.get("symbol") or "") or None,
-                        },
-                        "token1": {
-                            "id": str(t1.get("id") or "").strip().lower(),
-                            "decimals": str(t1.get("decimals") or "18"),
-                            "symbol": str(t1.get("symbol") or "") or None,
-                        },
-                    },
-                    "_protocol_label": "pancake_infinity_cl",
-                    "_source": "graph_pancake_infinity_cl",
-                    "_skip_enrich": True,
+    owner_bytes = owner_raw.lower()
+
+    def _rows_from_payload(payload: dict[str, Any], mode: str) -> list[dict[str, Any]]:
+        data = payload.get("data") or {}
+        if mode in ("positions", "positions_in"):
+            return (data.get("positions") or []) or []
+        if mode == "account":
+            acc = data.get("account") or {}
+            return (acc.get("positions") or []) or []
+        if mode == "accounts":
+            accs = (data.get("accounts") or []) or []
+            first = accs[0] if accs else {}
+            return (first.get("positions") or []) or []
+        return []
+
+    queries: list[tuple[str, str]] = [
+        (
+            "positions",
+            """
+            query InfinityPositions($owner: Bytes!, $skip: Int!) {
+              positions(first: 200, skip: $skip, where: { owner: $owner }) {
+                id
+                liquidity
+                tickLower
+                tickUpper
+                pool {
+                  id
+                  feeTier
+                  liquidity
+                  sqrtPrice
+                  token0Price
+                  totalValueLockedUSD
+                  token0 { id decimals symbol }
+                  token1 { id decimals symbol }
                 }
-            )
-        if len(rows) < 200:
+              }
+            }
+            """,
+        ),
+        (
+            "positions_in",
+            """
+            query InfinityPositions($owner: Bytes!, $skip: Int!) {
+              positions(first: 200, skip: $skip, where: { owner_in: [$owner] }) {
+                id
+                liquidity
+                tickLower
+                tickUpper
+                pool {
+                  id
+                  feeTier
+                  liquidity
+                  sqrtPrice
+                  token0Price
+                  totalValueLockedUSD
+                  token0 { id decimals symbol }
+                  token1 { id decimals symbol }
+                }
+              }
+            }
+            """,
+        ),
+        (
+            "account",
+            """
+            query InfinityPositions($owner: Bytes!, $skip: Int!) {
+              account(id: $owner) {
+                positions(first: 200, skip: $skip) {
+                  id
+                  liquidity
+                  tickLower
+                  tickUpper
+                  pool {
+                    id
+                    feeTier
+                    liquidity
+                    sqrtPrice
+                    token0Price
+                    totalValueLockedUSD
+                    token0 { id decimals symbol }
+                    token1 { id decimals symbol }
+                  }
+                }
+              }
+            }
+            """,
+        ),
+    ]
+
+    for mode, query in queries:
+        skip = 0
+        while True:
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            payload = graphql_query(ep, query, {"owner": owner_bytes, "skip": skip}, retries=1)
+            rows = _rows_from_payload(payload, mode)
+            if not rows:
+                break
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                pid = str(r.get("id") or "").strip()
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                pool = r.get("pool") or {}
+                t0 = pool.get("token0") or {}
+                t1 = pool.get("token1") or {}
+                pos_liq = str(r.get("liquidity") or "0")
+                out.append(
+                    {
+                        "id": f"inf-cl:{pid}",
+                        "liquidity": pos_liq,
+                        "tickLower": {"tickIdx": str(r.get("tickLower") or "0")},
+                        "tickUpper": {"tickIdx": str(r.get("tickUpper") or "0")},
+                        "pool": {
+                            "id": str(pool.get("id") or "").strip().lower(),
+                            "feeTier": str(pool.get("feeTier") or "0"),
+                            "liquidity": str(pool.get("liquidity") or "0"),
+                            "sqrtPrice": str(pool.get("sqrtPrice") or "0"),
+                            "token0Price": str(pool.get("token0Price") or "0"),
+                            "totalValueLockedUSD": str(pool.get("totalValueLockedUSD") or "0"),
+                            "token0": {
+                                "id": str(t0.get("id") or "").strip().lower(),
+                                "decimals": str(t0.get("decimals") or "18"),
+                                "symbol": str(t0.get("symbol") or "") or None,
+                            },
+                            "token1": {
+                                "id": str(t1.get("id") or "").strip().lower(),
+                                "decimals": str(t1.get("decimals") or "18"),
+                                "symbol": str(t1.get("symbol") or "") or None,
+                            },
+                        },
+                        "_protocol_label": "pancake_infinity_cl",
+                        "_source": "graph_pancake_infinity_cl",
+                        "_skip_enrich": True,
+                    }
+                )
+            if len(rows) < 200:
+                break
+            skip += 200
+        if out:
             break
-        skip += 200
     return out
 
 
