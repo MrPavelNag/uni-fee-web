@@ -5640,6 +5640,17 @@ def _scan_pool_positions_chain(
             owner_attempts=owner_attempts,
         )
         positions: list[dict[str, Any]] = list(cached_positions) if cached_positions else []
+        has_cached_infinity = any(
+            str((cp or {}).get("_protocol_label") or "").strip().lower().startswith("pancake_infinity_")
+            for cp in positions
+            if isinstance(cp, dict)
+        )
+        needs_infinity_gap_warmup = bool(
+            version == "v3"
+            and int(chain_id) in POSITIONS_INDEX_SYNC_WARMUP_CHAIN_IDS
+            and index_cache_hit
+            and not has_cached_infinity
+        )
         can_use_live_discovery = _resolve_live_discovery_flag(
             owner=owner,
             skip_live_discovery=skip_live_discovery,
@@ -5648,9 +5659,10 @@ def _scan_pool_positions_chain(
         )
         # Cold-cache safety: when strict index-first disables live discovery and cache is empty,
         # do one bounded synchronous warmup for this owner/chain to avoid empty first response.
+        # Also warm up once when cache hit has v3 rows but is missing Infinity rows.
         if (
             version == "v3"
-            and not positions
+            and ((not positions) or needs_infinity_gap_warmup)
             and not can_use_live_discovery
             and POSITIONS_OWNERSHIP_INDEX_ENABLED
             and POSITIONS_INDEX_SYNC_WARMUP_ENABLED
@@ -5675,6 +5687,7 @@ def _scan_pool_positions_chain(
                         "query_mode": "index_sync_warmup",
                         "count": len(cached_positions),
                         "ok": True,
+                        "reason": "infinity_gap" if needs_infinity_gap_warmup else "cold_cache",
                         "cached": int(warm_stats.get("cached") or 0),
                         "ownership_upserted": int(warm_stats.get("ownership_upserted") or 0),
                     }
