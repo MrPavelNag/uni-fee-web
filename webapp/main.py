@@ -195,10 +195,8 @@ POSITIONS_INFINITY_HEAVY_METHODS = os.environ.get("POSITIONS_INFINITY_HEAVY_METH
 POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
-POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
-POSITIONS_DEBANK_FALLBACK = os.environ.get("POSITIONS_DEBANK_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
-DEBANK_ACCESS_KEY = os.environ.get("DEBANK_ACCESS_KEY", "").strip()
 POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
     "1",
     "true",
@@ -1868,19 +1866,28 @@ def _scan_erc721_token_ids_by_explorer_api(
     api_base_v1 = {56: "https://api.bscscan.com/api", 8453: "https://api.basescan.org/api"}.get(cid, "")
     if not chainid_for_v2 and not api_base_v1:
         return []
-    api_key = os.environ.get("ETHERSCAN_API_KEY", "").strip() or os.environ.get("BSCSCAN_API_KEY", "").strip() or "YourApiKeyToken"
+    eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
     urls: list[str] = []
-    if chainid_for_v2:
+    if chainid_for_v2 and eth_key:
         urls.append(
             "https://api.etherscan.io/v2/api"
             f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={api_key}"
+            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={eth_key}"
         )
-    if api_base_v1:
+    if cid == 56 and bsc_key:
         urls.append(
             f"{api_base_v1}?module=account&action=tokennfttx"
-            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={api_key}"
+            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={bsc_key}"
         )
+    elif cid == 8453 and base_key:
+        urls.append(
+            f"{api_base_v1}?module=account&action=tokennfttx"
+            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={base_key}"
+        )
+    if not urls:
+        return []
     rows: list[dict[str, Any]] = []
     for url in urls:
         try:
@@ -1918,106 +1925,6 @@ def _scan_erc721_token_ids_by_explorer_api(
     return out
 
 
-def _parse_positive_int_like(value: Any) -> int:
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        return int(value) if int(value) > 0 else 0
-    if isinstance(value, float):
-        iv = int(value)
-        return iv if iv > 0 else 0
-    raw = str(value or "").strip()
-    if not raw:
-        return 0
-    try:
-        if raw.lower().startswith("0x"):
-            v = int(raw, 16)
-        elif re.fullmatch(r"\d+", raw):
-            v = int(raw, 10)
-        else:
-            return 0
-    except Exception:
-        return 0
-    return int(v) if int(v) > 0 else 0
-
-
-def _scan_erc721_token_ids_by_debank_api(
-    chain_id: int,
-    position_manager: str,
-    owner: str,
-    *,
-    max_ids: int = 120,
-) -> tuple[list[int], str]:
-    if not POSITIONS_DEBANK_FALLBACK:
-        return [], "disabled"
-    if not DEBANK_ACCESS_KEY:
-        return [], "no_access_key"
-    cid = int(chain_id)
-    pm = str(position_manager or "").strip().lower()
-    o = str(owner or "").strip().lower()
-    if not _is_eth_address(pm) or not _is_eth_address(o):
-        return [], "bad_input"
-    chain_key = {56: "bsc", 8453: "base"}.get(cid, "")
-    if not chain_key:
-        return [], "unsupported_chain"
-    headers = {
-        "accept": "application/json",
-        "AccessKey": DEBANK_ACCESS_KEY,
-        "User-Agent": "uni-fee-web/0.0.2",
-    }
-    urls = [
-        f"https://pro-openapi.debank.com/v1/user/complex_protocol_list?id={o}&chain_id={chain_key}",
-        f"https://pro-openapi.debank.com/v1/user/all_complex_protocol_list?id={o}&chain_ids={chain_key}",
-    ]
-    rows: list[dict[str, Any]] = []
-    source = "none"
-    for idx, url in enumerate(urls):
-        try:
-            req = UrlRequest(url, headers=headers)
-            with urlopen(req, timeout=12) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            if isinstance(payload, list):
-                rows = [x for x in payload if isinstance(x, dict)]
-            elif isinstance(payload, dict):
-                items = payload.get("data") or payload.get("result")
-                if isinstance(items, list):
-                    rows = [x for x in items if isinstance(x, dict)]
-            if rows:
-                source = "complex" if idx == 0 else "all_complex"
-                break
-        except Exception:
-            continue
-    if not rows:
-        return [], source
-    max_candidates = max(int(max_ids), 1) * 30
-    owner_hits: set[int] = set()
-    stack: list[Any] = list(rows)
-    while stack and len(owner_hits) < max_candidates:
-        node = stack.pop()
-        if isinstance(node, dict):
-            pm_seen = False
-            for v in node.values():
-                if isinstance(v, str) and v.strip().lower() == pm:
-                    pm_seen = True
-                    break
-            if pm_seen:
-                for key in ("token_id", "tokenId", "nft_id", "nftId", "id"):
-                    tid = _parse_positive_int_like(node.get(key))
-                    if tid > 0:
-                        owner_hits.add(int(tid))
-                        if len(owner_hits) >= max_candidates:
-                            break
-            for v in node.values():
-                if isinstance(v, (dict, list)):
-                    stack.append(v)
-        elif isinstance(node, list):
-            for item in node:
-                if isinstance(item, (dict, list)):
-                    stack.append(item)
-    out = sorted(owner_hits, reverse=True)[: max(1, int(max_ids))]
-    return out, source
-
-
 def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int = 400) -> list[str]:
     cid = int(chain_id)
     o = str(owner or "").strip().lower()
@@ -2027,19 +1934,28 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     api_base_v1 = {56: "https://api.bscscan.com/api", 8453: "https://api.basescan.org/api"}.get(cid, "")
     if not chainid_for_v2 and not api_base_v1:
         return []
-    api_key = os.environ.get("ETHERSCAN_API_KEY", "").strip() or os.environ.get("BSCSCAN_API_KEY", "").strip() or "YourApiKeyToken"
+    eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
     urls: list[str] = []
-    if chainid_for_v2:
+    if chainid_for_v2 and eth_key:
         urls.append(
             "https://api.etherscan.io/v2/api"
             f"?chainid={chainid_for_v2}&module=account&action=txlist"
-            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={api_key}"
+            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={eth_key}"
         )
-    if api_base_v1:
+    if cid == 56 and bsc_key:
         urls.append(
             f"{api_base_v1}?module=account&action=txlist"
-            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={api_key}"
+            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={bsc_key}"
         )
+    elif cid == 8453 and base_key:
+        urls.append(
+            f"{api_base_v1}?module=account&action=txlist"
+            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={base_key}"
+        )
+    if not urls:
+        return []
     for url in urls:
         try:
             req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
@@ -2775,10 +2691,6 @@ def _scan_infinity_position_ids_for_owner(
                 "batch_ownerof_checked": 0,
                 "batch_ownerof_matched": 0,
                 "batch_ownerof_errors": 0,
-                "debank_token_ids": 0,
-                "debank_ownerof_checked": 0,
-                "debank_ownerof_matched": 0,
-                "debank_source": "",
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -2832,43 +2744,6 @@ def _scan_infinity_position_ids_for_owner(
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
         return token_ids
-    if len(token_ids) < limit and balance > 0:
-        # Rabby-like fallback: centralized DeFi indexer can surface Infinity NFTs
-        # when RPC logs/enumeration are unreliable.
-        owner_word = _encode_address_word(owner)[-40:]
-        debank_ids, debank_source = _scan_erc721_token_ids_by_debank_api(
-            cid,
-            pm,
-            owner,
-            max_ids=max(limit * 8, limit),
-        )
-        if dbg is not None:
-            dbg["debank_token_ids"] = len(debank_ids)
-            dbg["debank_source"] = str(debank_source or "")
-        for tid in debank_ids:
-            if len(token_ids) >= limit:
-                break
-            if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                break
-            if int(tid) in seen_ids:
-                continue
-            if dbg is not None:
-                dbg["debank_ownerof_checked"] = int(dbg.get("debank_ownerof_checked") or 0) + 1
-            try:
-                owner_data = "0x6352211e" + _encode_uint_word(tid)
-                owner_hex = _eth_call_hex(cid, pm, owner_data)
-                owner_words = _hex_words(owner_hex)
-                if not owner_words:
-                    continue
-                current_owner = owner_words[0][-40:].lower()
-                if current_owner != owner_word:
-                    continue
-            except Exception:
-                continue
-            seen_ids.add(int(tid))
-            token_ids.append(int(tid))
-            if dbg is not None:
-                dbg["debank_ownerof_matched"] = int(dbg.get("debank_ownerof_matched") or 0) + 1
     if len(token_ids) < limit:
         # Wallets often discover Infinity NFTs by Transfer logs.
         owner_word = _encode_address_word(owner)[-40:]
@@ -3867,6 +3742,36 @@ def _scan_pool_positions_chain(
                 "failed": False,
                 "attempts": owner_attempts,
             }, True
+        owner_key = str(owner).strip().lower()
+        owner_has_nft = bool(owner_has_nft_balance.get(owner_key, True))
+        owner_attempts.append(
+            {
+                "owner_value": owner,
+                "owner_type": "onchain",
+                "query_mode": "owner_nft_balance_precheck",
+                "count": 1 if owner_has_nft else 0,
+                "ok": True,
+            }
+        )
+        if version == "v3" and not owner_has_nft:
+            owner_debug = {
+                "chain": chain_key,
+                "version": version,
+                "owner": owner,
+                "positions_found": 0,
+                "failed": False,
+                "attempts": owner_attempts,
+                "compare": {
+                    "graph_checked": False,
+                    "onchain_count": 0,
+                    "graph_count": 0,
+                    "only_onchain_count": 0,
+                    "only_graph_count": 0,
+                    "only_onchain_ids": [],
+                    "only_graph_ids": [],
+                },
+            }
+            return owner_rows, owner_errors, owner_debug, False
 
         if (
             version == "v3"
@@ -4027,7 +3932,6 @@ def _scan_pool_positions_chain(
                     }
                 )
 
-        owner_key = str(owner).strip().lower()
         if endpoint and not positions:
             if version == "v3" and not bool(owner_has_nft_balance.get(owner_key, True)):
                 owner_attempts.append(
@@ -4338,12 +4242,9 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
         for cid in valid_chain_ids:
             if _chain_has_any_position_nft_balance(int(cid), addresses):
                 filtered_chain_ids.append(int(cid))
-            else:
-                ck = CHAIN_ID_TO_KEY.get(int(cid), str(cid))
-                errors.append(f"Pool scan skipped [{ck}]: no position NFTs for selected addresses.")
         valid_chain_ids = filtered_chain_ids
         if not valid_chain_ids:
-            return [], list(dict.fromkeys(errors)), []
+            return [], [], []
     priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
     ordered_chain_ids: list[int] = []
     seen_chain_ids: set[int] = set()
