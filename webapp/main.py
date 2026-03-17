@@ -173,7 +173,7 @@ _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
-POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "45")))
+POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "90")))
 POSITIONS_OWNER_MAX_SECONDS = max(2, int(os.environ.get("POSITIONS_OWNER_MAX_SECONDS", "4")))
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "4")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "3")))
@@ -4009,10 +4009,40 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
     timed_out = False
 
     valid_chain_ids = [int(cid) for cid in chain_ids if CHAIN_ID_TO_KEY.get(int(cid), "")]
-    max_workers = max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(valid_chain_ids)))
+    if not valid_chain_ids:
+        return [], [], []
+    priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
+    ordered_chain_ids: list[int] = []
+    seen_chain_ids: set[int] = set()
+    for cid in priority_chain_ids + valid_chain_ids:
+        cc = int(cid)
+        if cc in seen_chain_ids:
+            continue
+        seen_chain_ids.add(cc)
+        ordered_chain_ids.append(cc)
+    max_workers = max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
 
-    if max_workers <= 1 or len(valid_chain_ids) <= 1:
-        for chain_id in valid_chain_ids:
+    # Run priority chains first in sequence to avoid deadline starvation.
+    for chain_id in [c for c in ordered_chain_ids if c in priority_chain_ids]:
+        if time.monotonic() >= deadline_ts:
+            timed_out = True
+            break
+        chain_rows, chain_errors, chain_debug, chain_timed_out = _scan_pool_positions_chain(
+            chain_id,
+            addresses,
+            deadline_ts,
+        )
+        rows.extend(chain_rows)
+        errors.extend(chain_errors)
+        debug_rows.extend(chain_debug)
+        if chain_timed_out:
+            timed_out = True
+            break
+
+    remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
+
+    if not timed_out and (max_workers <= 1 or len(remaining_chain_ids) <= 1):
+        for chain_id in remaining_chain_ids:
             if time.monotonic() >= deadline_ts:
                 timed_out = True
                 break
@@ -4027,11 +4057,11 @@ def _scan_pool_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
             if chain_timed_out:
                 timed_out = True
                 break
-    else:
+    elif not timed_out:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(_scan_pool_positions_chain, chain_id, addresses, deadline_ts)
-                for chain_id in valid_chain_ids
+                for chain_id in remaining_chain_ids
             ]
             for fut in as_completed(futures):
                 try:
