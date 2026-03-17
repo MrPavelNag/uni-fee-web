@@ -2241,6 +2241,10 @@ def _scan_infinity_position_ids_for_owner(
                 "explorer_token_ids": 0,
                 "explorer_ownerof_checked": 0,
                 "explorer_ownerof_matched": 0,
+                "total_supply": 0,
+                "tokenbyindex_checked": 0,
+                "tokenbyindex_matched": 0,
+                "tokenbyindex_errors": 0,
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -2438,39 +2442,82 @@ def _scan_infinity_position_ids_for_owner(
     # Keep this path lightweight to avoid starving other chain scans.
     if deadline_ts is not None and deadline_ts <= time.monotonic():
         return token_ids
+    next_token_id = 0
     try:
         next_token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x75794a3c"))
     except Exception:
-        return token_ids
-    if next_token_id <= 0:
-        return token_ids
-    lookback = max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 40, 5000)
-    start_tid = max(1, int(next_token_id) - int(lookback))
-    owner_word = _encode_address_word(owner)[-40:]
-    for tid in range(int(next_token_id) - 1, start_tid - 1, -1):
-        if deadline_ts is not None and time.monotonic() >= deadline_ts:
-            break
-        if len(token_ids) >= limit:
-            break
-        if dbg is not None:
-            dbg["owner_scan_checked"] = int(dbg.get("owner_scan_checked") or 0) + 1
-        try:
-            owner_data = "0x6352211e" + _encode_uint_word(tid)
-            owner_hex = _eth_call_hex(cid, pm, owner_data)
-            owner_words = _hex_words(owner_hex)
-            if not owner_words:
+        next_token_id = 0
+    if next_token_id > 0:
+        lookback = max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 40, 5000)
+        start_tid = max(1, int(next_token_id) - int(lookback))
+        owner_word = _encode_address_word(owner)[-40:]
+        for tid in range(int(next_token_id) - 1, start_tid - 1, -1):
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            if len(token_ids) >= limit:
+                break
+            if dbg is not None:
+                dbg["owner_scan_checked"] = int(dbg.get("owner_scan_checked") or 0) + 1
+            try:
+                owner_data = "0x6352211e" + _encode_uint_word(tid)
+                owner_hex = _eth_call_hex(cid, pm, owner_data)
+                owner_words = _hex_words(owner_hex)
+                if not owner_words:
+                    if dbg is not None:
+                        dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
+                    continue
+                current_owner = owner_words[0][-40:].lower()
+                if current_owner == owner_word:
+                    token_ids.append(int(tid))
+                    if dbg is not None:
+                        dbg["owner_scan_matched"] = int(dbg.get("owner_scan_matched") or 0) + 1
+            except Exception:
                 if dbg is not None:
                     dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
                 continue
-            current_owner = owner_words[0][-40:].lower()
-            if current_owner == owner_word:
-                token_ids.append(int(tid))
-                if dbg is not None:
-                    dbg["owner_scan_matched"] = int(dbg.get("owner_scan_matched") or 0) + 1
+    elif len(token_ids) < limit:
+        # Fallback for contracts exposing ERC721Enumerable tokenByIndex/totalSupply,
+        # even when nextTokenId/tokenOfOwnerByIndex are unavailable.
+        total_supply = 0
+        try:
+            total_supply = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x18160ddd"))
         except Exception:
-            if dbg is not None:
-                dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
-            continue
+            total_supply = 0
+        if dbg is not None:
+            dbg["total_supply"] = int(total_supply)
+        if total_supply > 0:
+            scan_cnt = min(int(total_supply), max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 200, 10000))
+            start_idx = max(0, int(total_supply) - scan_cnt)
+            owner_word = _encode_address_word(owner)[-40:]
+            for idx in range(int(total_supply) - 1, start_idx - 1, -1):
+                if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                    break
+                if len(token_ids) >= limit:
+                    break
+                if dbg is not None:
+                    dbg["tokenbyindex_checked"] = int(dbg.get("tokenbyindex_checked") or 0) + 1
+                try:
+                    tid = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x4f6ccce7" + _encode_uint_word(idx)))
+                    if tid <= 0 or int(tid) in seen_ids:
+                        continue
+                    owner_data = "0x6352211e" + _encode_uint_word(tid)
+                    owner_hex = _eth_call_hex(cid, pm, owner_data)
+                    owner_words = _hex_words(owner_hex)
+                    if not owner_words:
+                        if dbg is not None:
+                            dbg["tokenbyindex_errors"] = int(dbg.get("tokenbyindex_errors") or 0) + 1
+                        continue
+                    current_owner = owner_words[0][-40:].lower()
+                    if current_owner != owner_word:
+                        continue
+                    seen_ids.add(int(tid))
+                    token_ids.append(int(tid))
+                    if dbg is not None:
+                        dbg["tokenbyindex_matched"] = int(dbg.get("tokenbyindex_matched") or 0) + 1
+                except Exception:
+                    if dbg is not None:
+                        dbg["tokenbyindex_errors"] = int(dbg.get("tokenbyindex_errors") or 0) + 1
+                    continue
     if dbg is not None:
         dbg["final_token_ids"] = len(token_ids)
     return token_ids
@@ -5883,6 +5930,10 @@ def _render_positions_page() -> str:
               + `explorer_ids=${Number(d.explorer_token_ids || 0)} `
               + `explorer_checked=${Number(d.explorer_ownerof_checked || 0)} `
               + `explorer_match=${Number(d.explorer_ownerof_matched || 0)} `
+              + `supply=${Number(d.total_supply || 0)} `
+              + `tbi_checked=${Number(d.tokenbyindex_checked || 0)} `
+              + `tbi_match=${Number(d.tokenbyindex_matched || 0)} `
+              + `tbi_err=${Number(d.tokenbyindex_errors || 0)} `
               + `scan_checked=${Number(d.owner_scan_checked || 0)} `
               + `scan_match=${Number(d.owner_scan_matched || 0)} `
               + `scan_err=${Number(d.owner_scan_errors || 0)} `
