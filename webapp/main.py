@@ -314,6 +314,27 @@ POSITIONS_INDEX_SYNC_WARMUP_V4_DEADLINE_SEC = max(
     2,
     int(os.environ.get("POSITIONS_INDEX_SYNC_WARMUP_V4_DEADLINE_SEC", "6")),
 )
+_POSITIONS_INDEX_SYNC_WARMUP_CHAIN_IDS_RAW = os.environ.get("POSITIONS_INDEX_SYNC_WARMUP_CHAIN_IDS", "56,8453")
+POSITIONS_INDEX_SYNC_WARMUP_CHAIN_IDS: set[int] = {
+    int(x.strip())
+    for x in str(_POSITIONS_INDEX_SYNC_WARMUP_CHAIN_IDS_RAW or "").split(",")
+    if str(x).strip().isdigit()
+}
+if not POSITIONS_INDEX_SYNC_WARMUP_CHAIN_IDS:
+    POSITIONS_INDEX_SYNC_WARMUP_CHAIN_IDS = {56, 8453}
+POSITIONS_INDEX_MISS_GRAPH_FALLBACK_ENABLED = os.environ.get(
+    "POSITIONS_INDEX_MISS_GRAPH_FALLBACK_ENABLED",
+    "1",
+).strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_INDEX_MISS_GRAPH_FALLBACK_DEADLINE_SEC = max(
+    2,
+    int(os.environ.get("POSITIONS_INDEX_MISS_GRAPH_FALLBACK_DEADLINE_SEC", "5")),
+)
 POSITIONS_LEGACY_DISCOVERY_ENABLED = os.environ.get("POSITIONS_LEGACY_DISCOVERY_ENABLED", "0").strip().lower() in (
     "1",
     "true",
@@ -5633,7 +5654,7 @@ def _scan_pool_positions_chain(
             and not can_use_live_discovery
             and POSITIONS_OWNERSHIP_INDEX_ENABLED
             and POSITIONS_INDEX_SYNC_WARMUP_ENABLED
-            and int(chain_id) in (56, 8453)
+            and int(chain_id) in POSITIONS_INDEX_SYNC_WARMUP_CHAIN_IDS
             and _claim_sync_warmup(owner, version)
             and time.monotonic() < (deadline_ts - 1.0)
         ):
@@ -5664,6 +5685,53 @@ def _scan_pool_positions_chain(
                         "owner_value": owner,
                         "owner_type": "index",
                         "query_mode": "index_sync_warmup",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                    }
+                )
+        # Strict index-first fallback for non-infinity paths: allow one lightweight graph read
+        # on cache miss so broad-chain scans do not return empty while keeping legacy paths disabled.
+        if (
+            version == "v3"
+            and not positions
+            and not can_use_live_discovery
+            and POSITIONS_INDEX_MISS_GRAPH_FALLBACK_ENABLED
+            and str(endpoint or "").strip()
+            and _endpoint_supports_uniswap_positions(endpoint)
+            and time.monotonic() < (deadline_ts - 0.5)
+        ):
+            try:
+                graph_deadline = min(
+                    deadline_ts - 0.2,
+                    time.monotonic() + float(POSITIONS_INDEX_MISS_GRAPH_FALLBACK_DEADLINE_SEC),
+                )
+                graph_positions = _query_uniswap_positions_for_owner(
+                    endpoint,
+                    owner,
+                    include_pool_liquidity=False,
+                    include_position_liquidity=True,
+                    debug_steps=None,
+                    deadline_ts=graph_deadline,
+                    light_mode=True,
+                )
+                if graph_positions:
+                    positions = graph_positions
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "index",
+                        "query_mode": "index_graph_fallback",
+                        "count": len(graph_positions or []),
+                        "ok": True,
+                    }
+                )
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "index",
+                        "query_mode": "index_graph_fallback",
                         "count": 0,
                         "ok": False,
                         "error": str(e)[:220],
