@@ -209,6 +209,8 @@ TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
 TOKEN_SYMBOL_CACHE: dict[tuple[int, str], str] = {}
 TOKEN_SYMBOL_CACHE_LOCK = threading.Lock()
+CONTRACT_CREATION_DATE_CACHE: dict[tuple[int, str], str] = {}
+CONTRACT_CREATION_DATE_CACHE_LOCK = threading.Lock()
 MAJOR_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 MAJOR_ASSET_PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("MAJOR_ASSET_PRICE_CACHE_TTL_SEC", "300")))
 getcontext().prec = 48
@@ -1511,6 +1513,60 @@ def _eth_get_logs(chain_id: int, params: dict[str, Any]) -> list[dict[str, Any]]
     return []
 
 
+def _eth_get_code(chain_id: int, address: str, block_tag: str = "latest") -> str:
+    out = str(_json_rpc_call(int(chain_id), "eth_getCode", [str(address).strip(), str(block_tag)]) or "").strip().lower()
+    return out if out.startswith("0x") else "0x"
+
+
+def _eth_get_block_timestamp(chain_id: int, block_number: int) -> int:
+    out = _json_rpc_call(int(chain_id), "eth_getBlockByNumber", [hex(max(0, int(block_number))), False])
+    if not isinstance(out, dict):
+        return 0
+    ts_hex = str(out.get("timestamp") or "0x0").strip().lower()
+    try:
+        return int(ts_hex, 16) if ts_hex.startswith("0x") else int(ts_hex or "0")
+    except Exception:
+        return 0
+
+
+def _contract_creation_date_ymd(chain_id: int, contract_address: str) -> str:
+    addr = str(contract_address or "").strip().lower()
+    if not _is_eth_address(addr):
+        return ""
+    key = (int(chain_id), addr)
+    with CONTRACT_CREATION_DATE_CACHE_LOCK:
+        cached = CONTRACT_CREATION_DATE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        latest = _eth_block_number(int(chain_id))
+        if latest <= 0:
+            with CONTRACT_CREATION_DATE_CACHE_LOCK:
+                CONTRACT_CREATION_DATE_CACHE[key] = ""
+            return ""
+        if _eth_get_code(int(chain_id), addr, "latest") in {"0x", "0x0"}:
+            with CONTRACT_CREATION_DATE_CACHE_LOCK:
+                CONTRACT_CREATION_DATE_CACHE[key] = ""
+            return ""
+        lo, hi = 0, int(latest)
+        first = int(latest)
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            code = _eth_get_code(int(chain_id), addr, hex(int(mid)))
+            if code not in {"0x", "0x0"}:
+                first = mid
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        ts = _eth_get_block_timestamp(int(chain_id), int(first))
+        date_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat() if ts > 0 else ""
+    except Exception:
+        date_str = ""
+    with CONTRACT_CREATION_DATE_CACHE_LOCK:
+        CONTRACT_CREATION_DATE_CACHE[key] = date_str
+    return date_str
+
+
 def _scan_erc721_token_ids_by_incoming_logs(
     chain_id: int,
     contract: str,
@@ -1518,6 +1574,7 @@ def _scan_erc721_token_ids_by_incoming_logs(
     *,
     deadline_ts: float | None = None,
     max_ids: int = 120,
+    lookback_blocks: int | None = None,
 ) -> list[int]:
     cid = int(chain_id)
     c = str(contract or "").strip().lower()
@@ -1530,7 +1587,8 @@ def _scan_erc721_token_ids_by_incoming_logs(
         return []
     if latest <= 0:
         return []
-    min_block = max(0, int(latest) - int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS))
+    lb = int(lookback_blocks) if lookback_blocks is not None else int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS)
+    min_block = max(0, int(latest) - max(1, lb))
     step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
     topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     topic_to_owner = "0x" + ("0" * 24) + o[2:]
@@ -2038,6 +2096,7 @@ def _scan_infinity_position_ids_for_owner(
                 "ownerof_matched_from_logs": 0,
                 "ownerof_mismatched_from_logs": 0,
                 "ownerof_errors_from_logs": 0,
+                "deep_log_token_ids": 0,
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -2083,20 +2142,61 @@ def _scan_infinity_position_ids_for_owner(
     if len(token_ids) < limit:
         # Wallets often discover Infinity NFTs by Transfer logs; use same approach
         # when ERC721Enumerable path is unavailable or incomplete.
-        log_deadline = time.monotonic() + 2.0
-        if deadline_ts is not None:
-            log_deadline = min(log_deadline, deadline_ts)
         owner_word = _encode_address_word(owner)[-40:]
         log_ids = _scan_erc721_token_ids_by_incoming_logs(
             cid,
             pm,
             owner,
-            deadline_ts=log_deadline,
+            deadline_ts=deadline_ts,
             max_ids=max(limit * 3, limit),
         )
         if dbg is not None:
             dbg["log_token_ids"] = len(log_ids)
         for tid in log_ids:
+            if len(token_ids) >= limit:
+                break
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            if int(tid) in seen_ids:
+                continue
+            if dbg is not None:
+                dbg["ownerof_checked_from_logs"] = int(dbg.get("ownerof_checked_from_logs") or 0) + 1
+            try:
+                owner_data = "0x6352211e" + _encode_uint_word(tid)
+                owner_hex = _eth_call_hex(cid, pm, owner_data)
+                owner_words = _hex_words(owner_hex)
+                if not owner_words:
+                    if dbg is not None:
+                        dbg["ownerof_errors_from_logs"] = int(dbg.get("ownerof_errors_from_logs") or 0) + 1
+                    continue
+                current_owner = owner_words[0][-40:].lower()
+                if current_owner != owner_word:
+                    if dbg is not None:
+                        dbg["ownerof_mismatched_from_logs"] = int(dbg.get("ownerof_mismatched_from_logs") or 0) + 1
+                    continue
+            except Exception:
+                if dbg is not None:
+                    dbg["ownerof_errors_from_logs"] = int(dbg.get("ownerof_errors_from_logs") or 0) + 1
+                continue
+            if dbg is not None:
+                dbg["ownerof_matched_from_logs"] = int(dbg.get("ownerof_matched_from_logs") or 0) + 1
+            seen_ids.add(int(tid))
+            token_ids.append(int(tid))
+    if len(token_ids) < limit and balance > 0:
+        # If balance>0 but neither enumerable nor regular recent logs yielded ids,
+        # run a deeper log lookup over a wider history window.
+        owner_word = _encode_address_word(owner)[-40:]
+        deep_ids = _scan_erc721_token_ids_by_incoming_logs(
+            cid,
+            pm,
+            owner,
+            deadline_ts=deadline_ts,
+            max_ids=max(limit * 10, limit),
+            lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 20_000_000),
+        )
+        if dbg is not None:
+            dbg["deep_log_token_ids"] = len(deep_ids)
+        for tid in deep_ids:
             if len(token_ids) >= limit:
                 break
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
@@ -2132,11 +2232,7 @@ def _scan_infinity_position_ids_for_owner(
         return token_ids
     # Fallback for contracts without ERC721Enumerable: scan recent IDs by ownerOf.
     # Keep this path lightweight to avoid starving other chain scans.
-    now_ts = time.monotonic()
-    ownerof_deadline = now_ts + 1.5
-    if deadline_ts is not None:
-        ownerof_deadline = min(ownerof_deadline, deadline_ts)
-    if ownerof_deadline <= time.monotonic():
+    if deadline_ts is not None and deadline_ts <= time.monotonic():
         return token_ids
     try:
         next_token_id = _decode_uint_eth_call(_eth_call_hex(cid, pm, "0x75794a3c"))
@@ -2144,11 +2240,11 @@ def _scan_infinity_position_ids_for_owner(
         return token_ids
     if next_token_id <= 0:
         return token_ids
-    lookback = max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 40)
+    lookback = max(POSITIONS_INFINITY_OWNER_LOOKBACK, limit * 40, 5000)
     start_tid = max(1, int(next_token_id) - int(lookback))
     owner_word = _encode_address_word(owner)[-40:]
     for tid in range(int(next_token_id) - 1, start_tid - 1, -1):
-        if time.monotonic() >= ownerof_deadline:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
         if len(token_ids) >= limit:
             break
@@ -3249,6 +3345,7 @@ def _scan_pool_positions_chain(
                         "pool_liquidity": str(pool.get("liquidity") or "0"),
                         "pool_tvl_usd": tvl_usd,
                         "tvl_usd": position_tvl_usd,
+                        "contract_created_date": _contract_creation_date_ymd(int(chain_id), str(pool.get("id") or "")),
                         "valuation_mode": valuation_mode,
                         "suspected_spam": bool(suspected_spam),
                     }
@@ -5575,6 +5672,7 @@ def _render_positions_page() -> str:
               + `ownerOf_match=${Number(d.ownerof_matched_from_logs || 0)} `
               + `ownerOf_mismatch=${Number(d.ownerof_mismatched_from_logs || 0)} `
               + `ownerOf_err=${Number(d.ownerof_errors_from_logs || 0)} `
+              + `deep_log_ids=${Number(d.deep_log_token_ids || 0)} `
               + `scan_checked=${Number(d.owner_scan_checked || 0)} `
               + `scan_match=${Number(d.owner_scan_matched || 0)} `
               + `scan_err=${Number(d.owner_scan_errors || 0)} `
@@ -5675,7 +5773,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Created</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -5706,7 +5804,8 @@ def _render_positions_page() -> str:
         const feeRaw = String(r.fee_tier_raw || "").trim();
         const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
-        html += `<td class='mono'>${esc(r.pool_id || "")}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.pool_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
+        html += `<td>${esc(r.contract_created_date || "-")}</td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
@@ -5714,21 +5813,21 @@ def _render_positions_page() -> str:
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
         html += "</tr>";
       }
-      if (!visible.length) html += "<tr><td colspan='9'>No pool positions found.</td></tr>";
+      if (!visible.length) html += "<tr><td colspan='10'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
-        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position TVL</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
+        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Created</th><th style='text-align:left;padding:4px 6px'>Position TVL</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
         for (let i = 0; i < hiddenRows.length; i++) {
           const r = hiddenRows[i];
           const rowKey = String(r._row_key || "");
           const tvlVal = "-";
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(r.pool_id || "")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.contract_created_date || "-")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
-        html += `<tr><td colspan='9'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='10'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       const detailsEl = document.getElementById("posHiddenDetails");
