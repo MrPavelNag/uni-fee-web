@@ -214,13 +214,13 @@ POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_A
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "90")))
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "4")))
-POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "0").strip().lower() in (
+POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "0").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_TRY_BYTES_TYPE = os.environ.get("POSITIONS_TRY_BYTES_TYPE", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIMEOUT_SEC", "4")))
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
 POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "800")))
@@ -863,8 +863,10 @@ def _collect_infinity_indexer_targets(limit: int = 400) -> list[tuple[int, str]]
 def _run_infinity_indexer_daily_once(max_targets: int | None = None) -> dict[str, Any]:
     cfg = _indexer_get("infinity_bsc")
     if not cfg:
+        _indexer_activity_stop("daily-skip", "missing_config")
         return {"status": "skipped", "reason": "missing_config", "processed": 0, "updated": 0, "errors": 0}
     if not bool(cfg.get("enabled")) or str(cfg.get("mode") or "").strip().lower() == "off":
+        _indexer_activity_stop("daily-skip", "disabled")
         return {"status": "skipped", "reason": "disabled", "processed": 0, "updated": 0, "errors": 0}
 
     if not INDEXER_LOCK.acquire(blocking=False):
@@ -875,6 +877,7 @@ def _run_infinity_indexer_daily_once(max_targets: int | None = None) -> dict[str
             limit=max_targets if max_targets is not None else INFINITY_INDEXER_DAILY_MAX_TARGETS
         )
         if not targets:
+            _indexer_activity_stop("daily-skip", "no_targets")
             return {"status": "skipped", "reason": "no_targets", "processed": 0, "updated": 0, "errors": 0}
         _indexer_activity_start("infinity_bsc", len(targets))
 
@@ -5093,6 +5096,15 @@ def _scan_pool_positions_chain(
                             if share_external_tvl is not None and share_external_tvl > 0:
                                 position_tvl_usd = share_external_tvl
                                 valuation_mode = "estimated-share-external"
+                if (position_tvl_usd is None or position_tvl_usd <= 0) and tvl_usd > 0:
+                    try:
+                        pos_liq_simple = _safe_float(p.get("liquidity") or 0)
+                        pool_liq_simple = _safe_float(pool.get("liquidity") or 0)
+                        if pos_liq_simple > 0 and pool_liq_simple > 0:
+                            position_tvl_usd = max(0.0, float(tvl_usd) * float(pos_liq_simple) / float(pool_liq_simple))
+                            valuation_mode = "estimated-share-simple"
+                    except Exception:
+                        pass
                 if position_tvl_usd is not None and position_tvl_usd > 0 and tvl_usd > 0:
                     # A single position cannot reasonably exceed the whole pool TVL by large margin.
                     pool_cap = float(tvl_usd) * 1.25
@@ -7342,12 +7354,14 @@ def _render_positions_page() -> str:
       savePosState();
       renderChips(kind);
       setPosStatus("Address added.", false);
+      if (kind === "evm") scheduleBackgroundWarmup("add");
     }
     function removeAddress(kind, idx) {
       if (!Array.isArray(posState[kind])) return;
       posState[kind].splice(Number(idx) || 0, 1);
       savePosState();
       renderChips(kind);
+      if (kind === "evm" && (posState.evm || []).length) scheduleBackgroundWarmup("remove");
     }
     const posSectionState = {pools: false};
     const posCache = {pools: []};
@@ -7358,11 +7372,20 @@ def _render_positions_page() -> str:
     let posScanTicker = null;
     let posScanStartedAt = 0;
     let posScanPlannedOwnerChainTotal = 0;
+    let posLastStatusText = "";
+    let posLastStatusErr = false;
+    let posAutoWarmupTimer = null;
+    let posAutoWarmupInFlight = false;
     function setPosStatus(text, isErr) {
       const el = document.getElementById("posStatus");
       if (!el) return;
-      el.textContent = text || "";
-      el.style.color = isErr ? "#b91c1c" : "#475569";
+      const nextText = String(text || "");
+      const nextErr = !!isErr;
+      if (nextText === posLastStatusText && nextErr === posLastStatusErr) return;
+      posLastStatusText = nextText;
+      posLastStatusErr = nextErr;
+      el.textContent = nextText;
+      el.style.color = nextErr ? "#b91c1c" : "#475569";
     }
     function setPosBusy(flag) {
       const el = document.getElementById("posProgress");
@@ -7379,6 +7402,40 @@ def _render_positions_page() -> str:
       if (!el) return;
       el.textContent = text || "";
       el.style.color = isErr ? "#b91c1c" : "#475569";
+    }
+    async function startBackgroundWarmup(reason = "auto") {
+      if (posAutoWarmupInFlight) return;
+      if (!Array.isArray(posState.evm) || !posState.evm.length) return;
+      const existing = loadActivePosJob();
+      if (existing) return;
+      posAutoWarmupInFlight = true;
+      try {
+        const res = await fetch("/api/positions/scan/start", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({
+            evm_addresses: posState.evm,
+            solana_addresses: posState.solana,
+            tron_addresses: posState.tron,
+            include_pools: true,
+            include_lending: false,
+            include_rewards: false,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) return;
+        const jobId = String(data.job_id || "").trim();
+        if (!jobId) return;
+        saveActivePosJob(jobId);
+        if (reason !== "silent") setPosStatus("Background analysis started.", false);
+      } catch (_) {
+      } finally {
+        posAutoWarmupInFlight = false;
+      }
+    }
+    function scheduleBackgroundWarmup(reason = "auto") {
+      if (posAutoWarmupTimer) clearTimeout(posAutoWarmupTimer);
+      posAutoWarmupTimer = setTimeout(() => startBackgroundWarmup(reason), 700);
     }
     function stopPosScanProgressTicker() {
       if (posScanTicker) {
@@ -7932,6 +7989,9 @@ def _render_positions_page() -> str:
       setPosHistoryStatus("Select pools and click Search", false);
     }
     resumePosJobIfAny();
+    if ((posState.evm || []).length && !loadActivePosJob()) {
+      scheduleBackgroundWarmup("silent");
+    }
     """
     return _render_placeholder_page(
         "DeFi Positions",
