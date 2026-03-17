@@ -195,6 +195,7 @@ POSITIONS_INFINITY_HEAVY_METHODS = os.environ.get("POSITIONS_INFINITY_HEAVY_METH
 POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
+POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
 POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -1500,6 +1501,12 @@ def _json_rpc_batch_call(chain_id: int, payloads: list[dict[str, Any]]) -> list[
     rpc_urls = _rpc_urls_for_chain(chain_id)
     if not rpc_urls:
         raise RuntimeError(f"No RPC configured for chain_id={chain_id}")
+    # Prefer known batch-friendly public RPCs for batched ownerOf scans.
+    if int(chain_id) in (56, 8453):
+        rpc_urls = sorted(
+            rpc_urls,
+            key=lambda u: 0 if "publicnode.com" in str(u).lower() else 1,
+        )
     body = json.dumps(payloads).encode("utf-8")
     last_err = "unknown batch rpc error"
     for rpc_url in rpc_urls:
@@ -2089,20 +2096,21 @@ def _scan_erc721_token_ids_by_ownerof_batch(
     lo = 1
     bsz = max(50, min(1000, int(batch_size)))
     to_check = min(max(1, int(max_checks)), max(0, hi - lo + 1))
-    checked = 0
-    errors = 0
-    out: list[int] = []
-    seen: set[int] = set()
+    ranges: list[list[int]] = []
     cur = hi
-    while cur >= lo and checked < to_check:
-        if deadline_ts is not None and time.monotonic() >= deadline_ts:
-            break
+    remaining = int(to_check)
+    while cur >= lo and remaining > 0:
         chunk_start = max(lo, cur - bsz + 1)
         tids = list(range(cur, chunk_start - 1, -1))
-        if checked + len(tids) > to_check:
-            tids = tids[: max(0, to_check - checked)]
+        if len(tids) > remaining:
+            tids = tids[:remaining]
         if not tids:
             break
+        ranges.append(tids)
+        remaining -= len(tids)
+        cur = chunk_start - 1
+
+    def _scan_chunk(tids: list[int]) -> tuple[list[int], int]:
         payloads = [
             {
                 "jsonrpc": "2.0",
@@ -2114,33 +2122,68 @@ def _scan_erc721_token_ids_by_ownerof_batch(
         ]
         try:
             resp = _json_rpc_batch_call(cid, payloads)
-            by_id: dict[int, dict[str, Any]] = {}
-            for row in resp:
-                try:
-                    rid = int(row.get("id"))
-                except Exception:
-                    continue
-                by_id[rid] = row
-            for idx, tid in enumerate(tids):
-                row = by_id.get(idx) or {}
-                raw = str(row.get("result") or "").strip().lower()
-                if not raw.startswith("0x") or len(raw) < 42:
-                    if row.get("error") is not None:
-                        errors += 1
-                    continue
-                current_owner = raw[-40:]
-                if current_owner != owner_word:
-                    continue
-                if int(tid) in seen:
-                    continue
-                seen.add(int(tid))
-                out.append(int(tid))
-                if len(out) >= int(max_ids):
-                    return out, checked + len(tids), errors
         except Exception:
-            errors += len(tids)
-        checked += len(tids)
-        cur = chunk_start - 1
+            return [], len(tids)
+        by_id: dict[int, dict[str, Any]] = {}
+        for row in resp:
+            try:
+                rid = int(row.get("id"))
+            except Exception:
+                continue
+            by_id[rid] = row
+        found: list[int] = []
+        errs = 0
+        for idx, tid in enumerate(tids):
+            row = by_id.get(idx) or {}
+            raw = str(row.get("result") or "").strip().lower()
+            if not raw.startswith("0x") or len(raw) < 42:
+                if row.get("error") is not None:
+                    errs += 1
+                continue
+            if raw[-40:] == owner_word:
+                found.append(int(tid))
+        return found, errs
+
+    checked = 0
+    errors = 0
+    out: list[int] = []
+    seen: set[int] = set()
+    workers = max(1, min(int(POSITIONS_INFINITY_BATCH_WORKERS), len(ranges)))
+    if workers <= 1:
+        for tids in ranges:
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            found, errs = _scan_chunk(tids)
+            checked += len(tids)
+            errors += int(errs)
+            for tid in found:
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                out.append(tid)
+                if len(out) >= int(max_ids):
+                    return out, checked, errors
+        return out, checked, errors
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_scan_chunk, tids) for tids in ranges]
+        for fut in as_completed(futures):
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            try:
+                found, errs = fut.result()
+            except Exception:
+                found, errs = [], bsz
+            # checked approximation by fixed chunk size is enough for debug/progress.
+            checked += bsz
+            errors += int(errs)
+            for tid in found:
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                out.append(tid)
+                if len(out) >= int(max_ids):
+                    return out, checked, errors
     return out, checked, errors
 
 
@@ -3836,90 +3879,6 @@ def _scan_pool_positions_chain(
                     }
                 )
 
-        # Pancake Infinity CL positions live in a dedicated position manager and are
-        # not visible through Uniswap-v3/v4 subgraph queries.
-        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
-            try:
-                infinity_cl_debug: dict[str, Any] = {}
-                infinity_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
-                    owner,
-                    int(chain_id),
-                    deadline_ts=deadline_ts,
-                    debug_out=infinity_cl_debug,
-                )
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_infinity_cl",
-                        "count": len(infinity_cl_positions),
-                        "ok": True,
-                        "infinity_debug": infinity_cl_debug,
-                    }
-                )
-                if infinity_cl_positions:
-                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
-                    for p in infinity_cl_positions:
-                        pid = str((p or {}).get("id") or "")
-                        if pid and pid in seen:
-                            continue
-                        if pid:
-                            seen.add(pid)
-                        positions.append(p)
-            except Exception as e:
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_infinity_cl",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                        "infinity_debug": infinity_cl_debug,
-                    }
-                )
-
-        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
-            try:
-                infinity_bin_debug: dict[str, Any] = {}
-                infinity_bin_positions = _scan_pancake_infinity_bin_positions_onchain(
-                    owner,
-                    int(chain_id),
-                    deadline_ts=deadline_ts,
-                    debug_out=infinity_bin_debug,
-                )
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_infinity_bin",
-                        "count": len(infinity_bin_positions),
-                        "ok": True,
-                        "infinity_debug": infinity_bin_debug,
-                    }
-                )
-                if infinity_bin_positions:
-                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
-                    for p in infinity_bin_positions:
-                        pid = str((p or {}).get("id") or "")
-                        if pid and pid in seen:
-                            continue
-                        if pid:
-                            seen.add(pid)
-                        positions.append(p)
-            except Exception as e:
-                owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_infinity_bin",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                        "infinity_debug": infinity_bin_debug,
-                    }
-                )
-
         if endpoint and not positions:
             if version == "v3" and not bool(owner_has_nft_balance.get(owner_key, True)):
                 owner_attempts.append(
@@ -4004,6 +3963,89 @@ def _scan_pool_positions_chain(
                             "error": str(e)[:220],
                         }
                     )
+        # Run Pancake Infinity at the very end so it cannot starve
+        # normal v3/v4 discovery paths.
+        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID:
+            try:
+                infinity_cl_debug: dict[str, Any] = {}
+                infinity_cl_positions = _scan_pancake_infinity_cl_positions_onchain(
+                    owner,
+                    int(chain_id),
+                    deadline_ts=deadline_ts,
+                    debug_out=infinity_cl_debug,
+                )
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_cl",
+                        "count": len(infinity_cl_positions),
+                        "ok": True,
+                        "infinity_debug": infinity_cl_debug,
+                    }
+                )
+                if infinity_cl_positions:
+                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                    for p in infinity_cl_positions:
+                        pid = str((p or {}).get("id") or "")
+                        if pid and pid in seen:
+                            continue
+                        if pid:
+                            seen.add(pid)
+                        positions.append(p)
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_cl",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                        "infinity_debug": infinity_cl_debug,
+                    }
+                )
+
+        if version == "v3" and int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID:
+            try:
+                infinity_bin_debug: dict[str, Any] = {}
+                infinity_bin_positions = _scan_pancake_infinity_bin_positions_onchain(
+                    owner,
+                    int(chain_id),
+                    deadline_ts=deadline_ts,
+                    debug_out=infinity_bin_debug,
+                )
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_bin",
+                        "count": len(infinity_bin_positions),
+                        "ok": True,
+                        "infinity_debug": infinity_bin_debug,
+                    }
+                )
+                if infinity_bin_positions:
+                    seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
+                    for p in infinity_bin_positions:
+                        pid = str((p or {}).get("id") or "")
+                        if pid and pid in seen:
+                            continue
+                        if pid:
+                            seen.add(pid)
+                        positions.append(p)
+            except Exception as e:
+                owner_attempts.append(
+                    {
+                        "owner_value": owner,
+                        "owner_type": "onchain",
+                        "query_mode": "onchain_pancake_infinity_bin",
+                        "count": 0,
+                        "ok": False,
+                        "error": str(e)[:220],
+                        "infinity_debug": infinity_bin_debug,
+                    }
+                )
         owner_debug = {
             "chain": chain_key,
             "version": version,
@@ -6277,6 +6319,7 @@ def _render_positions_page() -> str:
     let posHasScannedOnce = false;
     let posScanTicker = null;
     let posScanStartedAt = 0;
+    let posScanPlannedOwnerChainTotal = 0;
     function setPosStatus(text, isErr) {
       const el = document.getElementById("posStatus");
       if (!el) return;
@@ -6305,11 +6348,14 @@ def _render_positions_page() -> str:
         posScanTicker = null;
       }
       posScanStartedAt = 0;
+      posScanPlannedOwnerChainTotal = 0;
     }
     function startPosScanProgressTicker() {
       stopPosScanProgressTicker();
       posScanStartedAt = Date.now();
       const plannedChains = ["Arbitrum", "Base", "Ethereum", "Optimism", "Polygon", "BSC", "Unichain"];
+      const evmOwners = Math.max(1, Number((posState.evm || []).length || 0));
+      posScanPlannedOwnerChainTotal = Math.max(1, evmOwners * plannedChains.length);
       const steps = [
         "Validate addresses",
         "Start chain workers",
@@ -6322,9 +6368,17 @@ def _render_positions_page() -> str:
         const elapsed = Math.max(0, Math.floor((Date.now() - posScanStartedAt) / 1000));
         let phase = steps[Math.min(steps.length - 1, Math.floor(elapsed / 5))];
         const chainHint = plannedChains[Math.floor(elapsed / 4) % plannedChains.length];
+        const totalChecks = Math.max(1, posScanPlannedOwnerChainTotal || 1);
+        const estRate = totalChecks / 35.0;
+        const estDone = Math.max(0, Math.min(totalChecks, Math.floor(elapsed * estRate)));
+        const progress = `Progress ~${estDone}/${totalChecks} owner-chain checks`;
         if (elapsed >= 20) phase = "Indexer/rpc responses";
-        if (elapsed >= 28) phase = "Final merge and response";
-        setPosStatus(`Scanning positions... ${elapsed}s | ${phase} (${chainHint})`, false);
+        if (elapsed >= 28) {
+          phase = "Final merge and response";
+          setPosStatus(`Scanning positions... ${elapsed}s | ${phase} (${progress}; Aggregating results)`, false);
+          return;
+        }
+        setPosStatus(`Scanning positions... ${elapsed}s | ${phase} (${chainHint}; ${progress})`, false);
       };
       tick();
       posScanTicker = setInterval(tick, 900);
@@ -6511,6 +6565,9 @@ def _render_positions_page() -> str:
               + `explorer_ids=${Number(d.explorer_token_ids || 0)} `
               + `explorer_checked=${Number(d.explorer_ownerof_checked || 0)} `
               + `explorer_match=${Number(d.explorer_ownerof_matched || 0)} `
+              + `batch_checked=${Number(d.batch_ownerof_checked || 0)} `
+              + `batch_match=${Number(d.batch_ownerof_matched || 0)} `
+              + `batch_err=${Number(d.batch_ownerof_errors || 0)} `
               + `mint_ids=${Number(d.mint_log_ids || 0)} `
               + `mint_checked=${Number(d.mint_log_ownerof_checked || 0)} `
               + `mint_match=${Number(d.mint_log_ownerof_matched || 0)} `
@@ -6722,6 +6779,7 @@ def _render_positions_page() -> str:
         posCache.pools = data.pool_positions || [];
         renderPools(posCache.pools);
         renderScanMessages(data);
+        const finishedChecks = Array.isArray(data?.debug?.pool_scan) ? data.debug.pool_scan.length : 0;
         savePosResults({
           saved_at: Date.now(),
           pool_positions: data.pool_positions || [],
@@ -6731,7 +6789,7 @@ def _render_positions_page() -> str:
         });
         posHasScannedOnce = true;
         updatePosSearchButton();
-        setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}`, false);
+        setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}${finishedChecks ? ` | Owner-chain checks: ${finishedChecks}` : ""}`, false);
       } catch (e) {
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
       } finally {
