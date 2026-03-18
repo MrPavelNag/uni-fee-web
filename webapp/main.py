@@ -5412,25 +5412,47 @@ def _scan_infinity_position_ids_for_owner(
         if len(token_ids) < limit and POSITIONS_INFINITY_OWNEROF_FALLBACK_ENABLED and owner_candidates:
             used_ownerof_fallback = True
             per_owner_checks = max(100, int(POSITIONS_INFINITY_OWNEROF_FALLBACK_MAX_CHECKS) // max(1, len(owner_candidates)))
+            per_owner_hi_checks = max(50, per_owner_checks // 2)
+            per_owner_lo_checks = max(50, per_owner_checks - per_owner_hi_checks)
             for cand in owner_candidates:
                 if len(token_ids) >= limit:
                     break
                 if deadline_ts is not None and time.monotonic() >= deadline_ts:
                     break
                 t_batch0 = time.perf_counter()
-                batch_ids, batch_checked, batch_errors = _scan_erc721_token_ids_by_ownerof_batch(
+                # Pass A: recent (high tokenIds) window.
+                batch_ids_hi, batch_checked_hi, batch_errors_hi = _scan_erc721_token_ids_by_ownerof_batch(
                     cid,
                     pm,
                     str(cand),
                     max_ids=max(limit * 4, limit),
-                    max_checks=int(per_owner_checks),
+                    max_checks=int(per_owner_hi_checks),
                     batch_size=min(int(POSITIONS_INFINITY_BATCH_SIZE), 200),
                     deadline_ts=deadline_ts,
                 )
+                # Pass B: legacy (low tokenIds) window.
+                # Many long-lived positions have small tokenIds and are missed by top-only scanning.
+                batch_ids_lo, batch_checked_lo, batch_errors_lo = _scan_erc721_token_ids_by_ownerof_batch(
+                    cid,
+                    pm,
+                    str(cand),
+                    max_ids=max(limit * 4, limit),
+                    max_checks=int(per_owner_lo_checks),
+                    batch_size=min(int(POSITIONS_INFINITY_BATCH_SIZE), 200),
+                    deadline_ts=deadline_ts,
+                    start_from_token_id=max(1000, int(POSITIONS_INFINITY_OWNER_LOOKBACK) * 20),
+                )
+                batch_ids = list(batch_ids_hi) + [x for x in batch_ids_lo if int(x) not in {int(y) for y in batch_ids_hi}]
+                batch_checked = int(batch_checked_hi) + int(batch_checked_lo)
+                batch_errors = int(batch_errors_hi) + int(batch_errors_lo)
                 if dbg is not None:
                     dbg["batch_ownerof_checked"] = int((dbg.get("batch_ownerof_checked") or 0) + int(batch_checked))
                     dbg["batch_ownerof_errors"] = int((dbg.get("batch_ownerof_errors") or 0) + int(batch_errors))
                     dbg["batch_ownerof_matched"] = int((dbg.get("batch_ownerof_matched") or 0) + len(batch_ids))
+                    dbg["batch_ownerof_checked_hi"] = int((dbg.get("batch_ownerof_checked_hi") or 0) + int(batch_checked_hi))
+                    dbg["batch_ownerof_checked_lo"] = int((dbg.get("batch_ownerof_checked_lo") or 0) + int(batch_checked_lo))
+                    dbg["batch_ownerof_matched_hi"] = int((dbg.get("batch_ownerof_matched_hi") or 0) + len(batch_ids_hi))
+                    dbg["batch_ownerof_matched_lo"] = int((dbg.get("batch_ownerof_matched_lo") or 0) + len(batch_ids_lo))
                     dbg["rpc_ms_batch_ownerof"] = int(
                         (dbg.get("rpc_ms_batch_ownerof") or 0) + int(max(0.0, (time.perf_counter() - t_batch0) * 1000.0))
                     )
