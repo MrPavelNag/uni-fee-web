@@ -2940,7 +2940,7 @@ def _position_manager_for_protocol(chain_id: int, protocol: str) -> str:
     cid = int(chain_id)
     proto = str(protocol or "").strip().lower()
     if proto == "uniswap_v3":
-        return str(UNISWAP_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        return str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
     if proto in {"pancake_v3", "pancake_v3_staked"}:
         return str(PANCAKE_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
     if proto == "pancake_infinity_cl":
