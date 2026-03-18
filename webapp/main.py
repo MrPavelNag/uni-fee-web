@@ -254,6 +254,16 @@ POSITIONS_INFINITY_LOG_FALLBACK_ENABLED = os.environ.get("POSITIONS_INFINITY_LOG
     "yes",
     "on",
 )
+POSITIONS_INFINITY_OWNEROF_FALLBACK_ENABLED = os.environ.get("POSITIONS_INFINITY_OWNEROF_FALLBACK_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_INFINITY_OWNEROF_FALLBACK_MAX_CHECKS = max(
+    100,
+    int(os.environ.get("POSITIONS_INFINITY_OWNEROF_FALLBACK_MAX_CHECKS", "6000")),
+)
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
 POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
@@ -5395,10 +5405,45 @@ def _scan_infinity_position_ids_for_owner(
                     dbg["explorer_ownerof_matched"] = int(dbg.get("explorer_ownerof_matched") or 0) + 1
                 seen_ids.add(int(tid))
                 token_ids.append(int(tid))
-        # Contract-only strict mode: do not run heavy log/batch fallbacks here.
-        # If explorer path returns nothing, return quickly and let debug show it.
+        # Stage 1.5 fallback: bounded ownerOf batch scan (no getLogs), including custody owners.
+        owner_candidates = sorted(_position_owner_allowlist(int(cid), proto_hint, owner))
+        used_ownerof_fallback = False
+        if len(token_ids) < limit and POSITIONS_INFINITY_OWNEROF_FALLBACK_ENABLED and owner_candidates:
+            used_ownerof_fallback = True
+            per_owner_checks = max(100, int(POSITIONS_INFINITY_OWNEROF_FALLBACK_MAX_CHECKS) // max(1, len(owner_candidates)))
+            for cand in owner_candidates:
+                if len(token_ids) >= limit:
+                    break
+                if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                    break
+                t_batch0 = time.perf_counter()
+                batch_ids, batch_checked, batch_errors = _scan_erc721_token_ids_by_ownerof_batch(
+                    cid,
+                    pm,
+                    str(cand),
+                    max_ids=max(limit * 4, limit),
+                    max_checks=int(per_owner_checks),
+                    batch_size=min(int(POSITIONS_INFINITY_BATCH_SIZE), 200),
+                    deadline_ts=deadline_ts,
+                )
+                if dbg is not None:
+                    dbg["batch_ownerof_checked"] = int((dbg.get("batch_ownerof_checked") or 0) + int(batch_checked))
+                    dbg["batch_ownerof_errors"] = int((dbg.get("batch_ownerof_errors") or 0) + int(batch_errors))
+                    dbg["batch_ownerof_matched"] = int((dbg.get("batch_ownerof_matched") or 0) + len(batch_ids))
+                    dbg["rpc_ms_batch_ownerof"] = int(
+                        (dbg.get("rpc_ms_batch_ownerof") or 0) + int(max(0.0, (time.perf_counter() - t_batch0) * 1000.0))
+                    )
+                for tid in batch_ids:
+                    if len(token_ids) >= limit:
+                        break
+                    if int(tid) in seen_ids:
+                        continue
+                    seen_ids.add(int(tid))
+                    token_ids.append(int(tid))
+        # Contract-only strict mode: do not run heavy getLogs fallbacks here.
         if dbg is not None:
-            dbg["contract_only_explorer_only"] = True
+            dbg["contract_only_explorer_only"] = not bool(used_ownerof_fallback)
+            dbg["contract_only_ownerof_fallback_used"] = bool(used_ownerof_fallback)
             if len(token_ids) < limit:
                 dbg["log_fallback_skipped"] = True
         if dbg is not None:
