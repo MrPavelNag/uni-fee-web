@@ -4637,6 +4637,7 @@ def _scan_v3_positions_onchain(
     include_price_details: bool = True,
     protocol_label: str = "uniswap_v3",
     source_tag: str = "onchain_npm",
+    debug_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
@@ -4655,6 +4656,12 @@ def _scan_v3_positions_onchain(
         return []
     limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
     out: list[dict[str, Any]] = []
+    dbg = debug_out if isinstance(debug_out, dict) else None
+    if dbg is not None:
+        dbg.setdefault("scanned_token_ids", 0)
+        dbg.setdefault("kept_positions", 0)
+        dbg.setdefault("skipped_zero_liq", 0)
+        dbg.setdefault("invalid_positions", 0)
 
     def _build_position_from_token_id(token_id: int) -> dict[str, Any] | None:
         # positions(uint256)
@@ -4670,6 +4677,10 @@ def _scan_v3_positions_onchain(
         liq = _decode_uint_from_word(pos_words[7])
         tokens_owed0 = _decode_uint_from_word(pos_words[10]) if len(pos_words) > 10 else 0
         tokens_owed1 = _decode_uint_from_word(pos_words[11]) if len(pos_words) > 11 else 0
+        if liq <= 0:
+            if dbg is not None:
+                dbg["skipped_zero_liq"] = int(dbg.get("skipped_zero_liq") or 0) + 1
+            return None
 
         # getPool(address,address,uint24)
         pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
@@ -4730,10 +4741,18 @@ def _scan_v3_positions_onchain(
             token_id = _decode_uint_eth_call(_eth_call_hex(int(chain_id), npm, token_data))
             if token_id <= 0:
                 continue
+            if dbg is not None:
+                dbg["scanned_token_ids"] = int(dbg.get("scanned_token_ids") or 0) + 1
             built = _build_position_from_token_id(int(token_id))
             if built:
                 out.append(built)
+                if dbg is not None:
+                    dbg["kept_positions"] = int(dbg.get("kept_positions") or 0) + 1
+            elif dbg is not None:
+                dbg["invalid_positions"] = int(dbg.get("invalid_positions") or 0) + 1
         except Exception:
+            if dbg is not None:
+                dbg["invalid_positions"] = int(dbg.get("invalid_positions") or 0) + 1
             continue
     return out
 
@@ -4770,6 +4789,8 @@ def _fetch_v3_position_onchain_by_token_id(
         liq = _decode_uint_from_word(pos_words[7])
         tokens_owed0 = _decode_uint_from_word(pos_words[10]) if len(pos_words) > 10 else 0
         tokens_owed1 = _decode_uint_from_word(pos_words[11]) if len(pos_words) > 11 else 0
+        if liq <= 0:
+            return None
         pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
         pool_words = _hex_words(_eth_call_hex(cid, factory, pool_data))
         if not pool_words:
@@ -4819,6 +4840,7 @@ def _scan_pancake_staked_v3_positions_onchain(
     chain_id: int,
     *,
     deadline_ts: float | None = None,
+    debug_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
     mc = PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID.get(cid)
@@ -4838,6 +4860,11 @@ def _scan_pancake_staked_v3_positions_onchain(
     start_idx = max(0, int(balance) - limit)
     scan_indices = range(int(balance) - 1, start_idx - 1, -1)
     out: list[dict[str, Any]] = []
+    dbg = debug_out if isinstance(debug_out, dict) else None
+    if dbg is not None:
+        dbg.setdefault("scanned_token_ids", 0)
+        dbg.setdefault("kept_positions", 0)
+        dbg.setdefault("invalid_positions", 0)
     for idx in scan_indices:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
@@ -4846,6 +4873,8 @@ def _scan_pancake_staked_v3_positions_onchain(
             token_id = _decode_uint_eth_call(_eth_call_hex(cid, mc, tok_data))
             if token_id <= 0:
                 continue
+            if dbg is not None:
+                dbg["scanned_token_ids"] = int(dbg.get("scanned_token_ids") or 0) + 1
             pos = _fetch_v3_position_onchain_by_token_id(
                 cid,
                 str(token_id),
@@ -4855,7 +4884,13 @@ def _scan_pancake_staked_v3_positions_onchain(
             )
             if pos:
                 out.append(pos)
+                if dbg is not None:
+                    dbg["kept_positions"] = int(dbg.get("kept_positions") or 0) + 1
+            elif dbg is not None:
+                dbg["invalid_positions"] = int(dbg.get("invalid_positions") or 0) + 1
         except Exception:
+            if dbg is not None:
+                dbg["invalid_positions"] = int(dbg.get("invalid_positions") or 0) + 1
             continue
     return out
 
@@ -6752,6 +6787,7 @@ def _scan_pool_positions_chain(
 
             if version == "v3" and time.monotonic() < deadline_ts:
                 try:
+                    v3_dbg: dict[str, Any] = {}
                     v3_rows = _scan_v3_positions_onchain(
                         owner,
                         int(chain_id),
@@ -6759,6 +6795,7 @@ def _scan_pool_positions_chain(
                         include_price_details=False,
                         protocol_label=V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"),
                         source_tag="contract_only_onchain_v3_npm",
+                        debug_out=v3_dbg,
                     )
                     owner_attempts.append(
                         {
@@ -6767,6 +6804,7 @@ def _scan_pool_positions_chain(
                             "query_mode": "contract_only_onchain_v3_npm",
                             "count": len(v3_rows),
                             "ok": True,
+                            "v3_debug": v3_dbg,
                         }
                     )
                     _merge_positions(v3_rows)
@@ -6784,10 +6822,12 @@ def _scan_pool_positions_chain(
 
                 if int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                     try:
+                        pc_dbg: dict[str, Any] = {}
                         staked_rows = _scan_pancake_staked_v3_positions_onchain(
                             owner,
                             int(chain_id),
                             deadline_ts=deadline_ts,
+                            debug_out=pc_dbg,
                         )
                         owner_attempts.append(
                             {
@@ -6796,6 +6836,7 @@ def _scan_pool_positions_chain(
                                 "query_mode": "contract_only_onchain_pancake_masterchef_v3",
                                 "count": len(staked_rows),
                                 "ok": True,
+                                "pancake_v3_debug": pc_dbg,
                             }
                         )
                         _merge_positions(staked_rows)
@@ -8346,6 +8387,12 @@ def _scan_pool_positions(
         "ms_total": 0,
         "last_error": "",
     }
+    v3_scan_ctr = {
+        "scanned": 0,
+        "kept": 0,
+        "skipped_zero_liq": 0,
+        "invalid": 0,
+    }
     for d in debug_rows:
         attempts = (d or {}).get("attempts") or []
         if not isinstance(attempts, list):
@@ -8355,16 +8402,22 @@ def _scan_pool_positions(
                 continue
             inf = a.get("infinity_debug") or {}
             if not isinstance(inf, dict):
-                continue
-            infinity_rpc["requests"] += int(inf.get("rpc_getlogs_requests") or 0)
-            infinity_rpc["attempts"] += int(inf.get("rpc_getlogs_attempts") or 0)
-            infinity_rpc["success"] += int(inf.get("rpc_getlogs_success") or 0)
-            infinity_rpc["failures"] += int(inf.get("rpc_getlogs_failures") or 0)
-            infinity_rpc["first_try_fail"] += int(inf.get("rpc_getlogs_first_try_fail") or 0)
-            infinity_rpc["retry_success"] += int(inf.get("rpc_getlogs_retry_success") or 0)
-            infinity_rpc["ms_total"] += int(inf.get("rpc_getlogs_ms") or 0)
+                inf = {}
+            infinity_rpc["requests"] += int((inf or {}).get("rpc_getlogs_requests") or 0)
+            infinity_rpc["attempts"] += int((inf or {}).get("rpc_getlogs_attempts") or 0)
+            infinity_rpc["success"] += int((inf or {}).get("rpc_getlogs_success") or 0)
+            infinity_rpc["failures"] += int((inf or {}).get("rpc_getlogs_failures") or 0)
+            infinity_rpc["first_try_fail"] += int((inf or {}).get("rpc_getlogs_first_try_fail") or 0)
+            infinity_rpc["retry_success"] += int((inf or {}).get("rpc_getlogs_retry_success") or 0)
+            infinity_rpc["ms_total"] += int((inf or {}).get("rpc_getlogs_ms") or 0)
             if not infinity_rpc["last_error"]:
-                infinity_rpc["last_error"] = str(inf.get("rpc_getlogs_last_error") or "").strip()[:180]
+                infinity_rpc["last_error"] = str((inf or {}).get("rpc_getlogs_last_error") or "").strip()[:180]
+            vd = a.get("v3_debug") or a.get("pancake_v3_debug") or {}
+            if isinstance(vd, dict):
+                v3_scan_ctr["scanned"] += int(vd.get("scanned_token_ids") or 0)
+                v3_scan_ctr["kept"] += int(vd.get("kept_positions") or 0)
+                v3_scan_ctr["skipped_zero_liq"] += int(vd.get("skipped_zero_liq") or 0)
+                v3_scan_ctr["invalid"] += int(vd.get("invalid_positions") or 0)
     if int(infinity_rpc["requests"]) > 0 or int(infinity_rpc["attempts"]) > 0:
         timings["infinity_rpc"] = {
             "getlogs_requests": int(infinity_rpc["requests"]),
@@ -8375,6 +8428,13 @@ def _scan_pool_positions(
             "getlogs_retry_success": int(infinity_rpc["retry_success"]),
             "getlogs_ms_total": int(infinity_rpc["ms_total"]),
             "getlogs_last_error": str(infinity_rpc["last_error"] or ""),
+        }
+    if int(v3_scan_ctr["scanned"]) > 0 or int(v3_scan_ctr["kept"]) > 0:
+        timings["v3_contract_scan"] = {
+            "scanned_token_ids": int(v3_scan_ctr["scanned"]),
+            "kept_positions": int(v3_scan_ctr["kept"]),
+            "skipped_zero_liq": int(v3_scan_ctr["skipped_zero_liq"]),
+            "invalid_positions": int(v3_scan_ctr["invalid"]),
         }
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
@@ -10865,6 +10925,15 @@ def _render_positions_page() -> str:
           if (String(infRpc.getlogs_last_error || "").trim()) {
             timingLines.push(`infinity_getLogs_last_error: ${String(infRpc.getlogs_last_error || "")}`);
           }
+        }
+        const v3Scan = (pool && typeof pool.v3_contract_scan === "object" && pool.v3_contract_scan) ? pool.v3_contract_scan : {};
+        if (Number(v3Scan?.scanned_token_ids || 0) > 0 || Number(v3Scan?.kept_positions || 0) > 0) {
+          timingLines.push(
+            `v3_scan: scanned=${Number(v3Scan.scanned_token_ids || 0)} `
+            + `kept=${Number(v3Scan.kept_positions || 0)} `
+            + `skipped0=${Number(v3Scan.skipped_zero_liq || 0)} `
+            + `invalid=${Number(v3Scan.invalid_positions || 0)}`
+          );
         }
         if (!infinityMode) {
           const compactLines = summaryFiltered
