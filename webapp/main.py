@@ -6567,6 +6567,8 @@ def _scan_pool_positions_chain(
             if precheck_symbols_ready
             else False
         )
+        if proto_label.startswith("pancake_"):
+            suspected_spam_pre = False
         pos_token_id = _position_token_id_from_raw(p.get("id"))
         if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
             suspected_spam_pre = False
@@ -6820,7 +6822,7 @@ def _scan_pool_positions_chain(
                 return f"{x / 1_000_000_000.0:.1f}B".rstrip("0").rstrip(".")
             return f"{x / 1_000_000_000_000.0:.1f}T".rstrip("0").rstrip(".")
 
-        liquidity_display = _fmt_liq_compact(liq_int)
+        liquidity_display = _format_usd_compact(None)
         suspected_spam = _is_suspected_spam_pair(
             chain_key,
             t0_obj if isinstance(t0_obj, dict) else {},
@@ -6829,6 +6831,8 @@ def _scan_pool_positions_chain(
             str(t1 or ""),
             None,
         )
+        if proto_label.startswith("pancake_"):
+            suspected_spam = False
         if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
             suspected_spam = False
 
@@ -7178,7 +7182,7 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
                 return f"{x / 1_000_000_000.0:.1f}B".rstrip("0").rstrip(".")
             return f"{x / 1_000_000_000_000.0:.1f}T".rstrip("0").rstrip(".")
 
-        acc["liquidity_display"] = _fmt_liq_compact(liq_raw)
+        acc["liquidity_display"] = _format_usd_compact(_opt_float(acc.get("liquidity_usd")))
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     return list(uniq.values())
 
@@ -7212,6 +7216,7 @@ def _run_pool_chain_batch_serial(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
+    per_chain_timeout_sec: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -7223,10 +7228,13 @@ def _run_pool_chain_batch_serial(
             timed_out = True
             break
         chain_started = time.monotonic()
+        chain_deadline = float(deadline_ts)
+        if per_chain_timeout_sec is not None and int(per_chain_timeout_sec) > 0:
+            chain_deadline = min(chain_deadline, chain_started + float(int(per_chain_timeout_sec)))
         chain_rows, chain_errors, chain_debug, chain_timed_out = _run_pool_chain_scan(
             int(chain_id),
             addresses,
-            deadline_ts,
+            chain_deadline,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
@@ -7250,6 +7258,7 @@ def _run_pool_chain_batch_parallel(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
+    per_chain_timeout_sec: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -7260,17 +7269,21 @@ def _run_pool_chain_batch_parallel(
     future_map: dict[Any, tuple[int, float]] = {}
     futures = []
     for chain_id in chain_ids:
+        chain_started = time.monotonic()
+        chain_deadline = float(deadline_ts)
+        if per_chain_timeout_sec is not None and int(per_chain_timeout_sec) > 0:
+            chain_deadline = min(chain_deadline, chain_started + float(int(per_chain_timeout_sec)))
         fut = executor.submit(
             _run_pool_chain_scan,
             int(chain_id),
             addresses,
-            deadline_ts,
+            chain_deadline,
             pre_enqueued_ownership_refresh,
             hard_scan,
             deep_infinity_scan,
         )
         futures.append(fut)
-        future_map[fut] = (int(chain_id), time.monotonic())
+        future_map[fut] = (int(chain_id), chain_started)
     aborted = False
     try:
         for fut in as_completed(futures):
@@ -7384,6 +7397,7 @@ def _scan_pool_positions(
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
         hard_scan=hard_scan,
         deep_infinity_scan=deep_infinity_scan,
+        per_chain_timeout_sec=None,
     )
     timings["priority_chains_sec"] = round(max(0.0, time.monotonic() - t_prio), 3)
     rows.extend(p_rows)
@@ -7400,6 +7414,7 @@ def _scan_pool_positions(
             time.monotonic() + float(POSITIONS_FAST_REMAINING_BUDGET_SEC),
         )
         timings["remaining_budget_sec"] = int(POSITIONS_FAST_REMAINING_BUDGET_SEC)
+        timings["per_chain_timeout_sec"] = int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)
 
     if not timed_out and (max_workers <= 1 or len(remaining_chain_ids) <= 1):
         t_rest = time.monotonic()
@@ -7410,6 +7425,7 @@ def _scan_pool_positions(
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
+            per_chain_timeout_sec=(None if hard_scan else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
@@ -7427,6 +7443,7 @@ def _scan_pool_positions(
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
+            per_chain_timeout_sec=(None if hard_scan else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
@@ -12873,19 +12890,26 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
         return s.rstrip("0").rstrip(".")
 
     liq_raw = max(0, int(snap.get("liquidity") or 0))
-    if liq_raw < 1000:
-        liq_disp = str(liq_raw)
-    elif liq_raw < 1_000_000:
-        liq_disp = f"{liq_raw / 1000.0:.1f}K".rstrip("0").rstrip(".")
-    elif liq_raw < 1_000_000_000:
-        liq_disp = f"{liq_raw / 1_000_000.0:.1f}M".rstrip("0").rstrip(".")
-    elif liq_raw < 1_000_000_000_000:
-        liq_disp = f"{liq_raw / 1_000_000_000.0:.1f}B".rstrip("0").rstrip(".")
-    else:
-        liq_disp = f"{liq_raw / 1_000_000_000_000.0:.1f}T".rstrip("0").rstrip(".")
     a0_now = max(0.0, float(amount0 or 0.0))
     a1_now = max(0.0, float(amount1 or 0.0))
     status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
+    token0_addr = str(snap.get("token0") or "").strip().lower()
+    token1_addr = str(snap.get("token1") or "").strip().lower()
+    liq_usd = None
+    try:
+        prices = _get_token_prices_usd(int(chain_id), [token0_addr, token1_addr])
+        p0 = _safe_float(prices.get(token0_addr))
+        p1 = _safe_float(prices.get(token1_addr))
+        usd = 0.0
+        if a0_now > 0 and p0 > 0:
+            usd += a0_now * p0
+        if a1_now > 0 and p1 > 0:
+            usd += a1_now * p1
+        if usd > 0:
+            liq_usd = float(usd)
+    except Exception:
+        liq_usd = None
+    liq_disp = _format_usd_compact(liq_usd)
     updates = {
         "position_amount0": (float(amount0) if amount0 is not None else 0.0),
         "position_amount1": (float(amount1) if amount1 is not None else 0.0),
@@ -12896,6 +12920,9 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
         "position_status": status,
         "liquidity": str(liq_raw),
         "liquidity_display": liq_disp,
+        "liquidity_usd": liq_usd,
+        "token0_id": token0_addr,
+        "token1_id": token1_addr,
         "position_symbol0": _normalize_display_symbol(str(snap.get("token0_symbol") or row.get("position_symbol0") or "")),
         "position_symbol1": _normalize_display_symbol(str(snap.get("token1_symbol") or row.get("position_symbol1") or "")),
         "pair": (
