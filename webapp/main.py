@@ -223,8 +223,8 @@ POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECON
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
-POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "18")))
-POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
+POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "10")))
+POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "1")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
     "1",
     "true",
@@ -7209,6 +7209,27 @@ def _run_pool_chain_scan(
     )
 
 
+def _run_pool_chain_scan_timed(
+    chain_id: int,
+    addresses: list[str],
+    deadline_ts: float,
+    pre_enqueued_ownership_refresh: bool = False,
+    hard_scan: bool = False,
+    deep_infinity_scan: bool = False,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, float]:
+    started = time.monotonic()
+    rows, errors, debug_rows, timed_out = _run_pool_chain_scan(
+        chain_id,
+        addresses,
+        deadline_ts,
+        pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+        hard_scan=hard_scan,
+        deep_infinity_scan=deep_infinity_scan,
+    )
+    elapsed = round(max(0.0, time.monotonic() - started), 3)
+    return rows, errors, debug_rows, timed_out, elapsed
+
+
 def _run_pool_chain_batch_serial(
     chain_ids: list[int],
     addresses: list[str],
@@ -7227,11 +7248,10 @@ def _run_pool_chain_batch_serial(
         if time.monotonic() >= deadline_ts:
             timed_out = True
             break
-        chain_started = time.monotonic()
         chain_deadline = float(deadline_ts)
         if per_chain_timeout_sec is not None and int(per_chain_timeout_sec) > 0:
-            chain_deadline = min(chain_deadline, chain_started + float(int(per_chain_timeout_sec)))
-        chain_rows, chain_errors, chain_debug, chain_timed_out = _run_pool_chain_scan(
+            chain_deadline = min(chain_deadline, time.monotonic() + float(int(per_chain_timeout_sec)))
+        chain_rows, chain_errors, chain_debug, chain_timed_out, chain_elapsed = _run_pool_chain_scan_timed(
             int(chain_id),
             addresses,
             chain_deadline,
@@ -7243,7 +7263,7 @@ def _run_pool_chain_batch_serial(
         errors.extend(chain_errors)
         debug_rows.extend(chain_debug)
         chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id), str(chain_id)) or str(chain_id))
-        chain_durations_sec[chain_key] = round(max(0.0, time.monotonic() - chain_started), 3)
+        chain_durations_sec[chain_key] = float(chain_elapsed)
         if chain_timed_out:
             timed_out = True
             break
@@ -7266,15 +7286,14 @@ def _run_pool_chain_batch_parallel(
     timed_out = False
     chain_durations_sec: dict[str, float] = {}
     executor = ThreadPoolExecutor(max_workers=max_workers)
-    future_map: dict[Any, tuple[int, float]] = {}
+    future_map: dict[Any, int] = {}
     futures = []
     for chain_id in chain_ids:
-        chain_started = time.monotonic()
         chain_deadline = float(deadline_ts)
         if per_chain_timeout_sec is not None and int(per_chain_timeout_sec) > 0:
-            chain_deadline = min(chain_deadline, chain_started + float(int(per_chain_timeout_sec)))
+            chain_deadline = min(chain_deadline, time.monotonic() + float(int(per_chain_timeout_sec)))
         fut = executor.submit(
-            _run_pool_chain_scan,
+            _run_pool_chain_scan_timed,
             int(chain_id),
             addresses,
             chain_deadline,
@@ -7283,23 +7302,35 @@ def _run_pool_chain_batch_parallel(
             deep_infinity_scan,
         )
         futures.append(fut)
-        future_map[fut] = (int(chain_id), chain_started)
+        future_map[fut] = int(chain_id)
     aborted = False
+    pending: set[Any] = set(futures)
     try:
-        for fut in as_completed(futures):
-            chain_id, started = future_map.get(fut, (0, time.monotonic()))
-            try:
-                chain_rows, chain_errors, chain_debug, chain_timed_out = fut.result()
-            except Exception as e:
-                errors.append(f"Pool scan worker failed: {e}")
-                continue
-            chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id), str(chain_id)) or str(chain_id))
-            chain_durations_sec[chain_key] = round(max(0.0, time.monotonic() - started), 3)
-            rows.extend(chain_rows)
-            errors.extend(chain_errors)
-            debug_rows.extend(chain_debug)
-            if chain_timed_out:
+        while pending:
+            now = time.monotonic()
+            if now >= deadline_ts:
                 timed_out = True
+                aborted = True
+                break
+            timeout = min(0.25, max(0.01, deadline_ts - now))
+            done, not_done = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+            for fut in done:
+                chain_id = int(future_map.get(fut, 0))
+                try:
+                    chain_rows, chain_errors, chain_debug, chain_timed_out, chain_elapsed = fut.result()
+                except Exception as e:
+                    errors.append(f"Pool scan worker failed: {e}")
+                    continue
+                chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id), str(chain_id)) or str(chain_id))
+                chain_durations_sec[chain_key] = float(chain_elapsed)
+                rows.extend(chain_rows)
+                errors.extend(chain_errors)
+                debug_rows.extend(chain_debug)
+                if chain_timed_out:
+                    timed_out = True
+            pending = set(not_done)
             if time.monotonic() >= deadline_ts:
                 timed_out = True
                 aborted = True
@@ -9315,10 +9346,10 @@ def _render_positions_page() -> str:
     @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
     .pos-status { color:#475569; font-size:13px; }
     .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
-    table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
-    th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
+    table { width:100%; border-collapse:collapse; font-size:11px; min-width:860px; }
+    th, td { border-bottom:1px solid #e2e8f0; padding:4px 5px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
-    #posPoolsTable { min-width: 1400px; table-layout: auto; }
+    #posPoolsTable { min-width: 1200px; table-layout: auto; }
     #posPoolsTable th, #posPoolsTable td { white-space: nowrap; }
     #posPoolsTable th:nth-child(1), #posPoolsTable td:nth-child(1) {
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
@@ -9336,6 +9367,16 @@ def _render_positions_page() -> str:
     }
     .table-nav-btn:hover { background:#dbeafe; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
+    .status-dot {
+      display:inline-block;
+      width:8px;
+      height:8px;
+      border-radius:999px;
+      vertical-align:middle;
+      border:1px solid transparent;
+    }
+    .status-dot.active { background:#7d9f89; border-color:#6f8e7a; }
+    .status-dot.inactive { background:#ab8787; border-color:#987676; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     @media (max-width: 1100px) {
@@ -9953,6 +9994,13 @@ def _render_positions_page() -> str:
       if (p === "pancake_infinity_cl" || p === "pancake_infinity_bin") return "PanC_INF";
       return String(v || "");
     }
+    function statusDot(status) {
+      const s = String(status || "").trim().toLowerCase();
+      const isActive = s === "active";
+      const cls = isActive ? "active" : "inactive";
+      const title = isActive ? "active" : "inactive";
+      return `<span class="status-dot ${cls}" title="${title}"></span>`;
+    }
     function escAttr(v) {
       return esc(v).replace(/"/g, "&quot;");
     }
@@ -9988,7 +10036,7 @@ def _render_positions_page() -> str:
         const mismatchTitle = mismatch ? ` title="${escAttr(mismatchHint(r))}"` : "";
         html += "<tr>";
         html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
-        html += `<td class='mono'>${esc(String(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
@@ -9996,7 +10044,7 @@ def _render_positions_page() -> str:
         const feeRaw = String(r.fee_tier_raw || "").trim();
         const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
-        html += `<td>${esc(r.position_status || "-")}</td>`;
+        html += `<td>${statusDot(r.position_status || "-")}</td>`;
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
@@ -10017,7 +10065,7 @@ def _render_positions_page() -> str:
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(String(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${esc(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
