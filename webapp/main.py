@@ -3281,7 +3281,8 @@ def _position_manager_for_protocol(chain_id: int, protocol: str) -> str:
     if proto == "uniswap_v3":
         return str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
     if proto in {"pancake_v3", "pancake_v3_staked"}:
-        return str(PANCAKE_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        # Pancake v3 NPM is stored in chain-specific v3 NPM map.
+        return str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
     if proto == "pancake_infinity_cl":
         return str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
     if proto == "pancake_infinity_bin":
@@ -4812,7 +4813,7 @@ def _scan_infinity_position_ids_for_owner(
                 continue
             seen_ids.add(int(tid))
             token_ids.append(int(tid))
-    if not POSITIONS_INFINITY_HEAVY_METHODS:
+    if POSITIONS_CONTRACT_ONLY_ENABLED or not POSITIONS_INFINITY_HEAVY_METHODS:
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
         return token_ids
@@ -6360,6 +6361,152 @@ def _scan_pool_positions_chain(
         owner_errors: list[str],
         deadline_ts: float,
     ) -> tuple[list[dict[str, Any]], bool]:
+        if POSITIONS_CONTRACT_ONLY_ENABLED:
+            positions: list[dict[str, Any]] = []
+
+            def _merge_positions(add_rows: list[dict[str, Any]]) -> None:
+                if not add_rows:
+                    return
+                seen_keys = {
+                    f"{str((x or {}).get('_protocol_label') or '').strip().lower()}|{str((x or {}).get('id') or '').strip()}"
+                    for x in positions
+                    if isinstance(x, dict)
+                }
+                for row in add_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    k = f"{str((row or {}).get('_protocol_label') or '').strip().lower()}|{str((row or {}).get('id') or '').strip()}"
+                    if k in seen_keys:
+                        continue
+                    seen_keys.add(k)
+                    positions.append(row)
+
+            if version == "v3" and time.monotonic() < deadline_ts:
+                try:
+                    v3_rows = _scan_v3_positions_onchain(
+                        owner,
+                        int(chain_id),
+                        deadline_ts=deadline_ts,
+                        include_price_details=False,
+                        protocol_label=V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"),
+                        source_tag="contract_only_onchain_v3_npm",
+                    )
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "onchain",
+                            "query_mode": "contract_only_onchain_v3_npm",
+                            "count": len(v3_rows),
+                            "ok": True,
+                        }
+                    )
+                    _merge_positions(v3_rows)
+                except Exception as e:
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "onchain",
+                            "query_mode": "contract_only_onchain_v3_npm",
+                            "count": 0,
+                            "ok": False,
+                            "error": str(e)[:220],
+                        }
+                    )
+
+                if int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID and time.monotonic() < deadline_ts:
+                    try:
+                        staked_rows = _scan_pancake_staked_v3_positions_onchain(
+                            owner,
+                            int(chain_id),
+                            deadline_ts=deadline_ts,
+                        )
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "onchain",
+                                "query_mode": "contract_only_onchain_pancake_masterchef_v3",
+                                "count": len(staked_rows),
+                                "ok": True,
+                            }
+                        )
+                        _merge_positions(staked_rows)
+                    except Exception as e:
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "onchain",
+                                "query_mode": "contract_only_onchain_pancake_masterchef_v3",
+                                "count": 0,
+                                "ok": False,
+                                "error": str(e)[:220],
+                            }
+                        )
+
+                if int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
+                    try:
+                        inf_dbg: dict[str, Any] = {}
+                        inf_cl_rows = _scan_pancake_infinity_cl_positions_onchain(
+                            owner,
+                            int(chain_id),
+                            deadline_ts=deadline_ts,
+                            debug_out=inf_dbg,
+                        )
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "onchain",
+                                "query_mode": "contract_only_onchain_pancake_infinity_cl",
+                                "count": len(inf_cl_rows),
+                                "ok": True,
+                                "infinity_debug": inf_dbg,
+                            }
+                        )
+                        _merge_positions(inf_cl_rows)
+                    except Exception as e:
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "onchain",
+                                "query_mode": "contract_only_onchain_pancake_infinity_cl",
+                                "count": 0,
+                                "ok": False,
+                                "error": str(e)[:220],
+                            }
+                        )
+
+                if int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
+                    try:
+                        inf_dbg: dict[str, Any] = {}
+                        inf_bin_rows = _scan_pancake_infinity_bin_positions_onchain(
+                            owner,
+                            int(chain_id),
+                            deadline_ts=deadline_ts,
+                            debug_out=inf_dbg,
+                        )
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "onchain",
+                                "query_mode": "contract_only_onchain_pancake_infinity_bin",
+                                "count": len(inf_bin_rows),
+                                "ok": True,
+                                "infinity_debug": inf_dbg,
+                            }
+                        )
+                        _merge_positions(inf_bin_rows)
+                    except Exception as e:
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "onchain",
+                                "query_mode": "contract_only_onchain_pancake_infinity_bin",
+                                "count": 0,
+                                "ok": False,
+                                "error": str(e)[:220],
+                            }
+                        )
+            return positions, False
+
         cached_positions, index_cache_hit, skip_live_discovery = _apply_ownership_cache(
             owner,
             version=version,
@@ -6400,7 +6547,7 @@ def _scan_pool_positions_chain(
             ):
                 try:
                     fast_deadline = min(deadline_ts, time.monotonic() + 1.6)
-                    farm_positions = _scan_pancake_staked_v3_positions_onchain(
+                    fallback_positions = _scan_pancake_staked_v3_positions_onchain(
                         owner,
                         int(chain_id),
                         deadline_ts=fast_deadline,
@@ -6410,18 +6557,18 @@ def _scan_pool_positions_chain(
                             "owner_value": owner,
                             "owner_type": "fast",
                             "query_mode": "fast_onchain_pancake_masterchef_v3",
-                            "count": len(farm_positions),
+                            "count": len(fallback_positions),
                             "ok": True,
                         }
                     )
-                    if farm_positions:
+                    if fallback_positions:
                         seen_keys: set[str] = set()
                         for pp in positions:
                             if not isinstance(pp, dict):
                                 continue
                             k = f"{str(pp.get('_protocol_label') or '').lower()}|{str(pp.get('id') or '')}"
                             seen_keys.add(k)
-                        for fp in farm_positions:
+                        for fp in fallback_positions:
                             if not isinstance(fp, dict):
                                 continue
                             fk = f"{str(fp.get('_protocol_label') or '').lower()}|{str(fp.get('id') or '')}"
