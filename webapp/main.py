@@ -3965,12 +3965,16 @@ def _explorer_nfttx_rows(
     owner: str,
     *,
     max_rows: int = 200,
+    protocol: str = "",
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
     c = str(contract or "").strip().lower()
     o = str(owner or "").strip().lower()
     if not _is_eth_address(c) or not _is_eth_address(o):
         return []
+    owner_candidates = sorted(_position_owner_allowlist(int(cid), str(protocol or ""), o))
+    if not owner_candidates:
+        owner_candidates = [o]
     chainid_for_v2 = {
         1: "1",
         10: "10",
@@ -3986,46 +3990,47 @@ def _explorer_nfttx_rows(
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
     urls: list[tuple[str, bool]] = []
     offset = max(20, min(1000, int(max_rows)))
-    if cid == 56 and bsc_key:
-        urls.append((
-            "https://api.bscscan.com/api"
-            f"?module=account&action=tokennfttx&contractaddress={c}"
-            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}",
-            True,
-        ))
-        urls.append((
-            "https://api.bscscan.com/api"
-            f"?module=account&action=tokennfttx"
-            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}",
-            False,
-        ))
-    elif cid == 8453 and base_key:
-        urls.append((
-            "https://api.basescan.org/api"
-            f"?module=account&action=tokennfttx&contractaddress={c}"
-            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}",
-            True,
-        ))
-        urls.append((
-            "https://api.basescan.org/api"
-            f"?module=account&action=tokennfttx"
-            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}",
-            False,
-        ))
-    # Secondary fallback via Etherscan V2 unified endpoint.
-    if eth_key:
-        urls.append((
-            "https://api.etherscan.io/v2/api"
-            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-            f"&contractaddress={c}&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
-            True,
-        ))
-        urls.append((
-            "https://api.etherscan.io/v2/api"
-            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
-            False,
-        ))
+    for owner_addr in owner_candidates:
+        if cid == 56 and bsc_key:
+            urls.append((
+                "https://api.bscscan.com/api"
+                f"?module=account&action=tokennfttx&contractaddress={c}"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={bsc_key}",
+                True,
+            ))
+            urls.append((
+                "https://api.bscscan.com/api"
+                f"?module=account&action=tokennfttx"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={bsc_key}",
+                False,
+            ))
+        elif cid == 8453 and base_key:
+            urls.append((
+                "https://api.basescan.org/api"
+                f"?module=account&action=tokennfttx&contractaddress={c}"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={base_key}",
+                True,
+            ))
+            urls.append((
+                "https://api.basescan.org/api"
+                f"?module=account&action=tokennfttx"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={base_key}",
+                False,
+            ))
+        # Secondary fallback via Etherscan V2 unified endpoint.
+        if eth_key:
+            urls.append((
+                "https://api.etherscan.io/v2/api"
+                f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+                f"&contractaddress={c}&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
+                True,
+            ))
+            urls.append((
+                "https://api.etherscan.io/v2/api"
+                f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
+                False,
+            ))
     if not urls:
         return []
     def _fetch_rows(url: str) -> list[dict[str, Any]]:
@@ -4098,7 +4103,7 @@ def _explorer_nfttx_rows(
             for r in batch:
                 to_addr = str(r.get("to") or "").strip().lower()
                 from_addr = str(r.get("from") or "").strip().lower()
-                if to_addr != o and from_addr != o:
+                if to_addr not in owner_candidates and from_addr not in owner_candidates:
                     continue
                 key = "|".join(
                     [
@@ -4136,6 +4141,7 @@ def _scan_erc721_token_ids_by_explorer_api(
         contract,
         owner,
         max_rows=max(200, int(max_ids) * 4),
+        protocol=protocol,
     )
     if not rows:
         rcpt_ids, _ = _scan_erc721_token_ids_by_owner_receipts(
