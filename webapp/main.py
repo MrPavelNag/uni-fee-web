@@ -3069,7 +3069,6 @@ def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
         d = _position_creation_date_peek(cid, proto, pid)
         if d:
             r["position_created_date"] = d
-            r["contract_created_date"] = d
 
 
 def _enrich_pair_symbols_background(rows: list[dict[str, Any]], max_seconds: int = 20) -> None:
@@ -3169,7 +3168,7 @@ def _enrich_missing_creation_dates(rows: list[dict[str, Any]], max_seconds: int 
     for r in rows:
         if checked >= int(max_rows) or time.monotonic() >= deadline:
             break
-        if str(r.get("position_created_date") or r.get("contract_created_date") or "").strip() not in {"", "-"}:
+        if str(r.get("position_created_date") or "").strip() not in {"", "-"}:
             continue
         try:
             cid = int(r.get("chain_id") or 0)
@@ -3182,7 +3181,6 @@ def _enrich_missing_creation_dates(rows: list[dict[str, Any]], max_seconds: int 
         d = _position_creation_date_ymd(cid, proto, pid)
         if d:
             r["position_created_date"] = d
-            r["contract_created_date"] = d
         checked += 1
 
 
@@ -6174,11 +6172,6 @@ def _scan_pool_positions_chain(
                 str(p.get("_protocol_label") or f"uniswap_{version}"),
                 str(p.get("id") or ""),
             ),
-            "contract_created_date": _position_creation_date_peek(
-                int(chain_id),
-                str(p.get("_protocol_label") or f"uniswap_{version}"),
-                str(p.get("id") or ""),
-            ),
             "valuation_mode": valuation_mode,
             "suspected_spam": bool(suspected_spam),
         }
@@ -6425,8 +6418,6 @@ def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_
     for row in rows:
         if "position_created_date" not in row:
             row["position_created_date"] = "-"
-        if "contract_created_date" not in row:
-            row["contract_created_date"] = "-"
 
 
 def _run_pool_chain_scan(
@@ -9072,7 +9063,7 @@ def _render_positions_page() -> str:
         const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
         html += `<td class='mono'>${esc(shortAddr4(r.pool_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
-        html += `<td>${esc(r.position_created_date || r.contract_created_date || "-")}</td>`;
+        html += `<td>${esc(r.position_created_date || "-")}</td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
@@ -9090,7 +9081,7 @@ def _render_positions_page() -> str:
           const tvlVal = "-";
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.position_created_date || r.contract_created_date || "-")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.position_created_date || "-")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
@@ -11608,9 +11599,7 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any]) -> No
     _enrich_tvl_background(pool_rows, max_seconds=25)
     for r in pool_rows:
         if not str(r.get("position_created_date") or "").strip():
-            r["position_created_date"] = str(r.get("contract_created_date") or "").strip() or "-"
-        if not str(r.get("contract_created_date") or "").strip():
-            r["contract_created_date"] = str(r.get("position_created_date") or "").strip() or "-"
+            r["position_created_date"] = "-"
     _update_pos_job(job_id, result=result, progress=95)
 
 
