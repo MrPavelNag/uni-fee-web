@@ -3113,7 +3113,7 @@ def _enrich_tvl_background(rows: list[dict[str, Any]], max_seconds: int = 25) ->
             continue
         current_tvl = _safe_float(r.get("tvl_usd"))
         mode = str(r.get("valuation_mode") or "").strip().lower()
-        needs_recalc = (current_tvl <= 0) or (mode in {"no-exact-external", "sanity-cap"})
+        needs_recalc = (current_tvl <= 0) or (mode in {"no-exact-external", "exact-unavailable"})
         if not needs_recalc:
             continue
         chain_key = str(r.get("chain") or "").strip().lower()
@@ -3140,15 +3140,6 @@ def _enrich_tvl_background(rows: list[dict[str, Any]], max_seconds: int = 25) ->
             pool_tvl_usd = _safe_float(pool.get("totalValueLockedUSD")) or _safe_float(r.get("pool_tvl_usd"))
             new_tvl: float | None = _estimate_position_tvl_usd_from_detail_external(pos, pool, chain_id)
             new_mode = "exact-external-bg"
-            if new_tvl is None or new_tvl <= 0:
-                new_tvl = _estimate_position_tvl_usd_from_detail(pos, pool)
-                new_mode = "exact-subgraph-bg"
-            if (new_tvl is None or new_tvl <= 0) and pool_tvl_usd > 0:
-                pos_liq = _safe_float(pos.get("liquidity") or r.get("liquidity"))
-                pool_liq = _safe_float(pool.get("liquidity") or r.get("pool_liquidity"))
-                if pos_liq > 0 and pool_liq > 0:
-                    new_tvl = max(0.0, float(pool_tvl_usd) * float(pos_liq) / float(pool_liq))
-                    new_mode = "estimated-share-bg"
             if new_tvl is None or new_tvl <= 0:
                 continue
             r["tvl_usd"] = float(new_tvl)
@@ -6094,61 +6085,29 @@ def _scan_pool_positions_chain(
                 t0 = "Infinity"
             elif str(t1).upper() == "UNK":
                 t1 = f"#{pid}" if pid else "Position"
-        # Prefer exact-external, then exact-subgraph, then share-external fallback.
+        # Exact-only mode: no share/simple/sanity estimation branches.
+        if (detailed_external_tvl is None or detailed_external_tvl <= 0) and allow_live_enrich and version == "v3":
+            onchain_enriched = _fetch_v3_position_onchain_by_token_id(
+                int(chain_id),
+                str(p.get("id") or ""),
+                include_price_details=True,
+                protocol_label=str(p.get("_protocol_label") or f"uniswap_{version}"),
+            )
+            if onchain_enriched:
+                p = onchain_enriched
+                pool = p.get("pool") or {}
+                t0_obj = pool.get("token0") or {}
+                t1_obj = pool.get("token1") or {}
+                t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
+                t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
+                detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
+                if detailed_external_tvl is not None and detailed_external_tvl > 0:
+                    position_tvl_usd = detailed_external_tvl
+                    valuation_mode = "exact-external-onchain"
         if detailed_external_tvl is None or detailed_external_tvl <= 0:
-            if allow_live_enrich and version == "v3":
-                onchain_enriched = _fetch_v3_position_onchain_by_token_id(
-                    int(chain_id),
-                    str(p.get("id") or ""),
-                    include_price_details=True,
-                    protocol_label=str(p.get("_protocol_label") or f"uniswap_{version}"),
-                )
-                if onchain_enriched:
-                    p = onchain_enriched
-                    pool = p.get("pool") or {}
-                    t0_obj = pool.get("token0") or {}
-                    t1_obj = pool.get("token1") or {}
-                    t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
-                    t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
-                    detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
-                    if detailed_external_tvl is not None and detailed_external_tvl > 0:
-                        position_tvl_usd = detailed_external_tvl
-                        valuation_mode = "exact-external-onchain"
-            if detailed_external_tvl is None or detailed_external_tvl <= 0:
-                detailed_subgraph_tvl = _estimate_position_tvl_usd_from_detail(p, pool)
-                if detailed_subgraph_tvl is not None and detailed_subgraph_tvl > 0:
-                    position_tvl_usd = detailed_subgraph_tvl
-                    valuation_mode = "exact-subgraph"
-                else:
-                    share_external_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
-                    if share_external_tvl is not None and share_external_tvl > 0:
-                        position_tvl_usd = share_external_tvl
-                        valuation_mode = "estimated-share-external"
-        if (position_tvl_usd is None or position_tvl_usd <= 0) and tvl_usd > 0:
-            try:
-                pos_liq_simple = _safe_float(p.get("liquidity") or 0)
-                pool_liq_simple = _safe_float(pool.get("liquidity") or 0)
-                if pos_liq_simple > 0 and pool_liq_simple > 0:
-                    position_tvl_usd = max(0.0, float(tvl_usd) * float(pos_liq_simple) / float(pool_liq_simple))
-                    valuation_mode = "estimated-share-simple"
-            except Exception:
-                pass
-        if position_tvl_usd is not None and position_tvl_usd > 0 and tvl_usd > 0:
-            # A single position cannot reasonably exceed the whole pool TVL by large margin.
-            pool_cap = float(tvl_usd) * 1.25
-            if position_tvl_usd > pool_cap:
-                share_sanity_tvl = _estimate_position_tvl_usd_from_share_external(p, pool, int(chain_id))
-                if share_sanity_tvl is not None and share_sanity_tvl > 0 and share_sanity_tvl <= pool_cap:
-                    position_tvl_usd = share_sanity_tvl
-                    valuation_mode = "sanity-share"
-                else:
-                    position_tvl_usd = pool_cap
-                    valuation_mode = "sanity-cap"
+            position_tvl_usd = None
+            valuation_mode = "exact-unavailable"
         suspected_spam = _is_suspected_spam_pair(chain_key, t0_obj, t1_obj, t0, t1, position_tvl_usd)
-        if suspected_spam and position_tvl_usd is not None and position_tvl_usd > POSITIONS_SPAM_MAX_TVL_USD:
-            # Prevent clearly manipulated valuations from dominating output for suspicious pairs.
-            position_tvl_usd = float(POSITIONS_SPAM_MAX_TVL_USD)
-            valuation_mode = "spam-capped"
         return {
             "address": owner,
             "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
@@ -9031,7 +8990,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact TVL only; shown as - when exact value is unavailable'>Position TVL</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
