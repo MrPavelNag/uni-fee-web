@@ -248,6 +248,12 @@ POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS = max(10, int(os.environ.get("POSITIONS
 POSITIONS_ENABLE_INFINITY = os.environ.get("POSITIONS_ENABLE_INFINITY", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_HEAVY_METHODS = os.environ.get("POSITIONS_INFINITY_HEAVY_METHODS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_INFINITY_LOG_FALLBACK_ENABLED = os.environ.get("POSITIONS_INFINITY_LOG_FALLBACK_ENABLED", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
 POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
@@ -288,6 +294,10 @@ POSITIONS_SPAM_MAX_TVL_USD = max(0.0, float(os.environ.get("POSITIONS_SPAM_MAX_T
 POSITIONS_MAX_TOKEN_PRICE_USD = max(100.0, float(os.environ.get("POSITIONS_MAX_TOKEN_PRICE_USD", "1000000")))
 POSITIONS_MIN_TOKEN_PRICE_USD = max(0.0, float(os.environ.get("POSITIONS_MIN_TOKEN_PRICE_USD", "0.000000000001")))
 POSITIONS_MAX_TOKEN_PRICE_RATIO = max(10.0, float(os.environ.get("POSITIONS_MAX_TOKEN_PRICE_RATIO", "10000000000")))
+POSITIONS_CUSTODY_OWNER_ALLOWLIST_RAW = str(os.environ.get("POSITIONS_CUSTODY_OWNER_ALLOWLIST", "")).strip()
+POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN_RAW = str(
+    os.environ.get("POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN", "")
+).strip()
 
 
 def _parse_csv_int_set(raw: str) -> set[int]:
@@ -305,7 +315,37 @@ def _parse_csv_int_set(raw: str) -> set[int]:
     return out
 
 
+def _parse_csv_address_set(raw: str) -> set[str]:
+    out: set[str] = set()
+    for part in str(raw or "").split(","):
+        s = str(part or "").strip().lower()
+        if re.fullmatch(r"0x[a-f0-9]{40}", s or ""):
+            out.add(s)
+    return out
+
+
+def _parse_chain_address_allowlist(raw: str) -> dict[int, set[str]]:
+    out: dict[int, set[str]] = {}
+    for part in str(raw or "").split(";"):
+        seg = str(part or "").strip()
+        if not seg or ":" not in seg:
+            continue
+        cid_raw, addrs_raw = seg.split(":", 1)
+        try:
+            cid = int(str(cid_raw).strip())
+        except Exception:
+            cid = 0
+        if cid <= 0:
+            continue
+        vals = _parse_csv_address_set(addrs_raw)
+        if vals:
+            out[int(cid)] = vals
+    return out
+
+
 POSITIONS_NOT_SPAM_POSITION_IDS = _parse_csv_int_set(os.environ.get("POSITIONS_NOT_SPAM_IDS", "1227707,1011627"))
+POSITIONS_CUSTODY_OWNER_ALLOWLIST = _parse_csv_address_set(POSITIONS_CUSTODY_OWNER_ALLOWLIST_RAW)
+POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN = _parse_chain_address_allowlist(POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN_RAW)
 POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
     int(x.strip())
     for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161,8453,130,56").split(",")
@@ -3413,6 +3453,34 @@ def _position_manager_for_protocol(chain_id: int, protocol: str) -> str:
     return ""
 
 
+def _position_owner_allowlist(chain_id: int, protocol: str, wallet_owner: str) -> set[str]:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    owner = str(wallet_owner or "").strip().lower()
+    allowed: set[str] = set()
+    if _is_eth_address(owner):
+        allowed.add(owner)
+    for a in POSITIONS_CUSTODY_OWNER_ALLOWLIST:
+        if _is_eth_address(str(a or "").strip().lower()):
+            allowed.add(str(a).strip().lower())
+    for a in (POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN.get(cid) or set()):
+        if _is_eth_address(str(a or "").strip().lower()):
+            allowed.add(str(a).strip().lower())
+    # Known staking custody owner for Pancake v3 positions.
+    if proto in {"pancake_v3", "pancake_v3_staked"}:
+        mc = str(PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID.get(cid, "") or "").strip().lower()
+        if _is_eth_address(mc):
+            allowed.add(mc)
+    return allowed
+
+
+def _owner_matches_wallet_or_custody(chain_id: int, protocol: str, wallet_owner: str, current_owner: str) -> bool:
+    cur = str(current_owner or "").strip().lower()
+    if not _is_eth_address(cur):
+        return False
+    return cur in _position_owner_allowlist(int(chain_id), protocol, wallet_owner)
+
+
 def _position_creation_date_ymd(chain_id: int, protocol: str, position_id: Any) -> str:
     cid = int(chain_id)
     proto = str(protocol or "").strip().lower()
@@ -3730,6 +3798,7 @@ def _scan_erc721_token_ids_by_recent_transfers_ownerof(
     deadline_ts: float | None = None,
     max_ids: int = 120,
     lookback_blocks: int | None = None,
+    protocol: str = "pancake_infinity_cl",
 ) -> list[int]:
     cid = int(chain_id)
     c = str(contract or "").strip().lower()
@@ -3746,7 +3815,6 @@ def _scan_erc721_token_ids_by_recent_transfers_ownerof(
     min_block = max(0, int(latest) - max(1, lb))
     step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
     topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-    owner_word = _encode_address_word(o)[-40:]
     end_block = int(latest)
     out: list[int] = []
     seen_candidates: set[int] = set()
@@ -3793,7 +3861,7 @@ def _scan_erc721_token_ids_by_recent_transfers_ownerof(
                 if not owner_words:
                     continue
                 current_owner = owner_words[0][-40:].lower()
-                if current_owner != owner_word:
+                if not _owner_matches_wallet_or_custody(int(cid), str(protocol or "pancake_infinity_cl"), o, current_owner):
                     continue
             except Exception:
                 continue
@@ -3812,6 +3880,7 @@ def _scan_cl_mintposition_token_ids_by_owner(
     deadline_ts: float | None = None,
     max_ids: int = 120,
     lookback_blocks: int | None = None,
+    protocol: str = "pancake_infinity_cl",
 ) -> list[int]:
     cid = int(chain_id)
     c = str(contract or "").strip().lower()
@@ -3829,7 +3898,6 @@ def _scan_cl_mintposition_token_ids_by_owner(
     step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
     # event MintPosition(uint256 indexed tokenId)
     topic_mint = "0x2c0223eed283e194c1112e080d31bdec9e2760ba1454153666cd9d7d6a877964"
-    owner_word = _encode_address_word(o)[-40:]
     end_block = int(latest)
     out: list[int] = []
     seen: set[int] = set()
@@ -3880,7 +3948,7 @@ def _scan_cl_mintposition_token_ids_by_owner(
                 if not owner_words:
                     continue
                 current_owner = owner_words[0][-40:].lower()
-                if current_owner != owner_word:
+                if not _owner_matches_wallet_or_custody(int(cid), str(protocol or "pancake_infinity_cl"), o, current_owner):
                     continue
             except Exception:
                 continue
@@ -3960,31 +4028,98 @@ def _explorer_nfttx_rows(
         ))
     if not urls:
         return []
-    rows: list[dict[str, Any]] = []
-    for url, has_contract_filter in urls:
+    def _fetch_rows(url: str) -> list[dict[str, Any]]:
         try:
             req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
             with urlopen(req, timeout=12) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             result_rows = (payload or {}).get("result")
             if isinstance(result_rows, list):
-                rows = [x for x in result_rows if isinstance(x, dict)]
-                if not has_contract_filter:
-                    rows = [
-                        x
-                        for x in rows
-                        if str(
-                            x.get("contractAddress")
-                            or x.get("contractaddress")
-                            or x.get("tokenAddress")
-                            or ""
-                        ).strip().lower() == c
-                    ]
-                if rows:
-                    break
+                return [x for x in result_rows if isinstance(x, dict)]
         except Exception:
+            return []
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for url, has_contract_filter in urls:
+        base_rows = _fetch_rows(url)
+        if not base_rows:
             continue
-    return rows
+        cur_rows = list(base_rows)
+        if not has_contract_filter:
+            cur_rows = [
+                x
+                for x in cur_rows
+                if str(
+                    x.get("contractAddress")
+                    or x.get("contractaddress")
+                    or x.get("tokenAddress")
+                    or ""
+                ).strip().lower() == c
+            ]
+        if cur_rows:
+            rows = cur_rows
+            break
+    if rows:
+        return rows
+
+    # Fallback: query tokennfttx by contract only (without owner filter),
+    # then filter rows locally by owner in from/to fields.
+    contract_urls: list[str] = []
+    if cid == 56 and bsc_key:
+        contract_urls.append(
+            "https://api.bscscan.com/api"
+            f"?module=account&action=tokennfttx&contractaddress={c}"
+            f"&page={{page}}&offset={offset}&sort=desc&apikey={bsc_key}"
+        )
+    elif cid == 8453 and base_key:
+        contract_urls.append(
+            "https://api.basescan.org/api"
+            f"?module=account&action=tokennfttx&contractaddress={c}"
+            f"&page={{page}}&offset={offset}&sort=desc&apikey={base_key}"
+        )
+    if eth_key:
+        contract_urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+            f"&contractaddress={c}&page={{page}}&offset={offset}&sort=desc&apikey={eth_key}"
+        )
+    if not contract_urls:
+        return []
+    out: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    max_pages = 8
+    for tmpl in contract_urls:
+        for page in range(1, max_pages + 1):
+            batch = _fetch_rows(str(tmpl).replace("{page}", str(page)))
+            if not batch:
+                break
+            matched = 0
+            for r in batch:
+                to_addr = str(r.get("to") or "").strip().lower()
+                from_addr = str(r.get("from") or "").strip().lower()
+                if to_addr != o and from_addr != o:
+                    continue
+                key = "|".join(
+                    [
+                        str(r.get("hash") or "").strip().lower(),
+                        str(r.get("tokenID") or "").strip().lower(),
+                        str(r.get("logIndex") or "").strip().lower(),
+                    ]
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                out.append(r)
+                matched += 1
+            # If page has no owner-related rows and we're already deep enough, stop early.
+            if matched == 0 and page >= 3:
+                break
+            if len(out) >= int(max_rows):
+                return out[: int(max_rows)]
+        if out:
+            break
+    return out[: int(max_rows)]
 
 
 def _scan_erc721_token_ids_by_explorer_api(
@@ -4188,6 +4323,7 @@ def _scan_cl_token_ids_from_owner_receipts(
     deadline_ts: float | None = None,
     max_ids: int = 120,
     max_receipts: int = 220,
+    protocol: str = "pancake_infinity_cl",
 ) -> tuple[list[int], int]:
     cid = int(chain_id)
     pm = str(position_manager or "").strip().lower()
@@ -4198,7 +4334,6 @@ def _scan_cl_token_ids_from_owner_receipts(
     if not tx_hashes:
         return [], 0
     topic_mint = "0x2c0223eed283e194c1112e080d31bdec9e2760ba1454153666cd9d7d6a877964"
-    owner_word = _encode_address_word(o)[-40:]
     out: list[int] = []
     seen: set[int] = set()
     checked = 0
@@ -4243,7 +4378,7 @@ def _scan_cl_token_ids_from_owner_receipts(
                 if not owner_words:
                     continue
                 current_owner = owner_words[0][-40:].lower()
-                if current_owner != owner_word:
+                if not _owner_matches_wallet_or_custody(int(cid), str(protocol or "pancake_infinity_cl"), o, current_owner):
                     continue
             except Exception:
                 continue
@@ -5114,6 +5249,12 @@ def _scan_infinity_position_ids_for_owner(
     pm = str(position_manager or "").strip().lower()
     if not _is_eth_address(pm):
         return []
+    proto_hint = "pancake_infinity_cl"
+    if pm == str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid, "") or "").strip().lower():
+        proto_hint = "pancake_infinity_bin"
+
+    def _owner_matches_effective_owner(current_owner_hex40: str) -> bool:
+        return _owner_matches_wallet_or_custody(int(cid), proto_hint, owner, str(current_owner_hex40 or "").strip().lower())
     balance = 0
     dbg = debug_out if isinstance(debug_out, dict) else None
     if dbg is not None:
@@ -5216,11 +5357,6 @@ def _scan_infinity_position_ids_for_owner(
     if POSITIONS_CONTRACT_ONLY_ENABLED:
         # Stage 1 (fast): explorer NFT transfers for candidate token IDs.
         # Keep final ownership strict via direct ownerOf verification.
-        proto_hint = ""
-        if pm == str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid, "") or "").strip().lower():
-            proto_hint = "pancake_infinity_cl"
-        elif pm == str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid, "") or "").strip().lower():
-            proto_hint = "pancake_infinity_bin"
         if len(token_ids) < limit:
             explorer_ids = _scan_erc721_token_ids_by_explorer_api(
                 cid,
@@ -5245,7 +5381,7 @@ def _scan_infinity_position_ids_for_owner(
                     if not owner_words:
                         continue
                     current_owner = owner_words[0][-40:].lower()
-                    if current_owner != owner_word:
+                    if not _owner_matches_effective_owner(current_owner):
                         continue
                 except Exception:
                     continue
@@ -5253,51 +5389,12 @@ def _scan_infinity_position_ids_for_owner(
                     dbg["explorer_ownerof_matched"] = int(dbg.get("explorer_ownerof_matched") or 0) + 1
                 seen_ids.add(int(tid))
                 token_ids.append(int(tid))
-        # Stage 2 fallback: direct Transfer(to=owner) logs (contract-native discovery).
-        if len(token_ids) < limit:
-            t_logs0 = time.perf_counter()
-            log_ids = _scan_erc721_token_ids_by_incoming_logs(
-                cid,
-                pm,
-                owner,
-                deadline_ts=deadline_ts,
-                max_ids=max(limit * 4, limit),
-                lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 20_000_000),
-                debug_out=dbg,
-            )
-            if dbg is not None:
-                dbg["log_token_ids"] = len(log_ids)
-                dbg["rpc_ms_logs"] = int(max(0.0, (time.perf_counter() - t_logs0) * 1000.0))
-            for tid in log_ids:
-                if len(token_ids) >= limit:
-                    break
-                if int(tid) in seen_ids:
-                    continue
-                seen_ids.add(int(tid))
-                token_ids.append(int(tid))
-        if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN:
-            t_batch0 = time.perf_counter()
-            batch_ids, batch_checked, batch_errors = _scan_erc721_token_ids_by_ownerof_batch(
-                cid,
-                pm,
-                owner,
-                max_ids=max(limit * 4, limit),
-                max_checks=int(POSITIONS_INFINITY_BATCH_MAX_CHECKS),
-                batch_size=int(POSITIONS_INFINITY_BATCH_SIZE),
-                deadline_ts=deadline_ts,
-            )
-            if dbg is not None:
-                dbg["batch_ownerof_checked"] = int((dbg.get("batch_ownerof_checked") or 0) + int(batch_checked))
-                dbg["batch_ownerof_errors"] = int((dbg.get("batch_ownerof_errors") or 0) + int(batch_errors))
-                dbg["batch_ownerof_matched"] = int((dbg.get("batch_ownerof_matched") or 0) + len(batch_ids))
-                dbg["rpc_ms_batch_ownerof"] = int((dbg.get("rpc_ms_batch_ownerof") or 0) + int(max(0.0, (time.perf_counter() - t_batch0) * 1000.0)))
-            for tid in batch_ids:
-                if len(token_ids) >= limit:
-                    break
-                if int(tid) in seen_ids:
-                    continue
-                seen_ids.add(int(tid))
-                token_ids.append(int(tid))
+        # Contract-only strict mode: do not run heavy log/batch fallbacks here.
+        # If explorer path returns nothing, return quickly and let debug show it.
+        if dbg is not None:
+            dbg["contract_only_explorer_only"] = True
+            if len(token_ids) < limit:
+                dbg["log_fallback_skipped"] = True
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
         return token_ids
@@ -5336,7 +5433,7 @@ def _scan_infinity_position_ids_for_owner(
                         dbg["ownerof_errors_from_logs"] = int(dbg.get("ownerof_errors_from_logs") or 0) + 1
                     continue
                 current_owner = owner_words[0][-40:].lower()
-                if current_owner != owner_word:
+                if not _owner_matches_effective_owner(current_owner):
                     if dbg is not None:
                         dbg["ownerof_mismatched_from_logs"] = int(dbg.get("ownerof_mismatched_from_logs") or 0) + 1
                     continue
@@ -5381,7 +5478,7 @@ def _scan_infinity_position_ids_for_owner(
                         dbg["ownerof_errors_from_logs"] = int(dbg.get("ownerof_errors_from_logs") or 0) + 1
                     continue
                 current_owner = owner_words[0][-40:].lower()
-                if current_owner != owner_word:
+                if not _owner_matches_effective_owner(current_owner):
                     if dbg is not None:
                         dbg["ownerof_mismatched_from_logs"] = int(dbg.get("ownerof_mismatched_from_logs") or 0) + 1
                     continue
@@ -5403,6 +5500,7 @@ def _scan_infinity_position_ids_for_owner(
             deadline_ts=deadline_ts,
             max_ids=max(limit * 8, limit),
             lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 30_000_000),
+            protocol=proto_hint,
         )
         if dbg is not None:
             dbg["recent_transfer_token_ids"] = len(recent_ids)
@@ -5445,7 +5543,7 @@ def _scan_infinity_position_ids_for_owner(
                 if not owner_words:
                     continue
                 current_owner = owner_words[0][-40:].lower()
-                if current_owner != owner_word:
+                if not _owner_matches_effective_owner(current_owner):
                     continue
             except Exception:
                 continue
@@ -5462,6 +5560,7 @@ def _scan_infinity_position_ids_for_owner(
             deadline_ts=deadline_ts,
             max_ids=max(limit * 8, limit),
             lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 30_000_000),
+            protocol=proto_hint,
         )
         if dbg is not None:
             dbg["mint_log_ids"] = len(mint_ids)
@@ -5486,6 +5585,7 @@ def _scan_infinity_position_ids_for_owner(
             deadline_ts=deadline_ts,
             max_ids=max(limit * 8, limit),
             max_receipts=220,
+            protocol=proto_hint,
         )
         if dbg is not None:
             dbg["receipt_mint_ids"] = len(receipt_ids)
@@ -5542,7 +5642,7 @@ def _scan_infinity_position_ids_for_owner(
                         dbg["owner_scan_errors"] = int(dbg.get("owner_scan_errors") or 0) + 1
                     continue
                 current_owner = owner_words[0][-40:].lower()
-                if current_owner == owner_word:
+                if _owner_matches_effective_owner(current_owner):
                     token_ids.append(int(tid))
                     if dbg is not None:
                         dbg["owner_scan_matched"] = int(dbg.get("owner_scan_matched") or 0) + 1
@@ -5584,7 +5684,7 @@ def _scan_infinity_position_ids_for_owner(
                             dbg["tokenbyindex_errors"] = int(dbg.get("tokenbyindex_errors") or 0) + 1
                         continue
                     current_owner = owner_words[0][-40:].lower()
-                    if current_owner != owner_word:
+                    if not _owner_matches_effective_owner(current_owner):
                         continue
                     seen_ids.add(int(tid))
                     token_ids.append(int(tid))
