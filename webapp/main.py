@@ -6542,10 +6542,15 @@ def _scan_pool_positions_chain(
         endpoint: str,
         has_pool_liquidity: bool,
         allow_live_enrich: bool,
+        deadline_ts: float,
     ) -> dict[str, Any] | None:
+        if time.monotonic() >= deadline_ts:
+            return None
         if not isinstance(p, dict):
             return None
         if hard_scan and allow_live_enrich and not _position_has_full_detail(p) and not bool(p.get("_skip_enrich")):
+            if time.monotonic() >= deadline_ts:
+                return None
             enriched = _fetch_position_by_id_with_detail(
                 endpoint,
                 str(p.get("id") or ""),
@@ -6658,6 +6663,8 @@ def _scan_pool_positions_chain(
             t0 = _normalize_display_symbol(_token_display_symbol(int(chain_id), chain_key, t0_obj))
             t1 = _normalize_display_symbol(_token_display_symbol(int(chain_id), chain_key, t1_obj))
         if version == "v3" and is_v3_npm_protocol:
+            if time.monotonic() >= deadline_ts:
+                return None
             try:
                 contract_snapshot = _fetch_v3_position_contract_snapshot(
                     int(chain_id),
@@ -6721,9 +6728,7 @@ def _scan_pool_positions_chain(
             if curated:
                 return s
             if _is_probably_spam_symbol(s):
-                if _is_eth_address(addr):
-                    return f"TKN_{addr[-4:].upper()}"
-                return "?"
+                return "UNK"
             return s
 
         t0 = _sanitize_pair_symbol(t0, t0_obj if isinstance(t0_obj, dict) else {})
@@ -6767,6 +6772,8 @@ def _scan_pool_positions_chain(
             )
         )
         if need_direct_quote:
+            if time.monotonic() >= deadline_ts:
+                return None
             try:
                 quoted0, quoted1 = _quote_v3_decrease_liquidity_amounts(
                     int(chain_id),
@@ -6817,6 +6824,8 @@ def _scan_pool_positions_chain(
             except Exception:
                 pass
         if version == "v3" and is_v3_npm_protocol and (fees0_val is None or fees1_val is None):
+            if time.monotonic() >= deadline_ts:
+                return None
             try:
                 qf0, qf1 = _quote_v3_collect_fees_amounts(
                     int(chain_id),
@@ -6945,6 +6954,7 @@ def _scan_pool_positions_chain(
                         endpoint=endpoint,
                         has_pool_liquidity=has_pool_liquidity,
                         allow_live_enrich=allow_live_enrich,
+                        deadline_ts=deadline_ts,
                     )
                     if row:
                         out_rows.append(row)
@@ -6972,21 +6982,35 @@ def _scan_pool_positions_chain(
                     endpoint=endpoint,
                     has_pool_liquidity=has_pool_liquidity,
                     allow_live_enrich=allow_live_enrich,
+                    deadline_ts=deadline_ts,
                 )
                 fut_to_idx[fut] = idx
-            for fut in as_completed(list(fut_to_idx.keys())):
-                if time.monotonic() >= deadline_ts:
+            pending: set[Any] = set(fut_to_idx.keys())
+            aborted = False
+            while pending:
+                now = time.monotonic()
+                if now >= deadline_ts:
                     owner_timed_out = True
+                    aborted = True
                     break
-                idx = int(fut_to_idx.get(fut, -1))
-                try:
-                    row = fut.result()
-                    if row and idx >= 0:
-                        indexed_rows.append((idx, row))
-                except Exception as e:
-                    if POSITIONS_DEBUG_ERRORS:
-                        owner_errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
+                timeout = min(0.25, max(0.01, deadline_ts - now))
+                done, not_done = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+                if not done:
+                    pending = set(not_done)
                     continue
+                for fut in done:
+                    idx = int(fut_to_idx.get(fut, -1))
+                    try:
+                        row = fut.result()
+                        if row and idx >= 0:
+                            indexed_rows.append((idx, row))
+                    except Exception as e:
+                        if POSITIONS_DEBUG_ERRORS:
+                            owner_errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
+                        continue
+                pending = set(not_done)
+            if aborted:
+                ex.shutdown(wait=False, cancel_futures=True)
         if indexed_rows:
             indexed_rows.sort(key=lambda x: x[0])
             out_rows.extend([r for _, r in indexed_rows])
@@ -7549,9 +7573,13 @@ def _scan_pool_positions(
     _apply_creation_dates_phase(uniq_rows, include_creation_dates=include_creation_dates)
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
-        dedup_errors.append(
-            f"Pool scan timed out after {POSITIONS_SCAN_MAX_SECONDS}s. Showing partial results."
-        )
+        elapsed_total = _safe_float(timings.get("total_sec"))
+        if (not hard_scan) and elapsed_total > 0 and elapsed_total < float(POSITIONS_SCAN_MAX_SECONDS) - 1.0:
+            dedup_errors.append("Pool scan reached fast-mode budget. Showing partial results.")
+        else:
+            dedup_errors.append(
+                f"Pool scan timed out after {POSITIONS_SCAN_MAX_SECONDS}s. Showing partial results."
+            )
     timings["rows_before_aggregate"] = int(rows_before_aggregate)
     timings["rows_after_aggregate"] = int(len(uniq_rows))
     timings["chain_durations_sec"] = chain_durations_sec
@@ -8778,6 +8806,84 @@ class PositionPoolSeriesRequest(BaseModel):
 
 class PositionsRowEnrichRequest(BaseModel):
     row: dict[str, Any] = Field(default_factory=dict)
+
+
+def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], chain_id: int) -> dict[str, Any]:
+    dec0 = _parse_int_like(snap.get("token0_decimals") or 18)
+    dec1 = _parse_int_like(snap.get("token1_decimals") or 18)
+    if dec0 <= 0 or dec0 > 36:
+        dec0 = 18
+    if dec1 <= 0 or dec1 > 36:
+        dec1 = 18
+    amount0 = snap.get("quote_amount0")
+    amount1 = snap.get("quote_amount1")
+    fee0 = snap.get("quote_fee0")
+    fee1 = snap.get("quote_fee1")
+    try:
+        if fee0 is None:
+            fee0 = float(Decimal(int(snap.get("tokens_owed0_raw") or 0)) / (Decimal(10) ** dec0))
+        if fee1 is None:
+            fee1 = float(Decimal(int(snap.get("tokens_owed1_raw") or 0)) / (Decimal(10) ** dec1))
+    except Exception:
+        pass
+
+    def _fmt_amt(v: float | None, *, zero_if_missing: bool = False) -> str:
+        if v is None:
+            return "0" if zero_if_missing else "-"
+        av = abs(float(v))
+        if av >= 1000:
+            s = f"{float(v):,.1f}"
+        elif av >= 1:
+            s = f"{float(v):,.2f}"
+        elif av >= 0.01:
+            s = f"{float(v):,.3f}"
+        else:
+            s = f"{float(v):,.4f}"
+        return s.rstrip("0").rstrip(".")
+
+    liq_raw = max(0, int(snap.get("liquidity") or 0))
+    a0_now = max(0.0, float(amount0 or 0.0))
+    a1_now = max(0.0, float(amount1 or 0.0))
+    status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
+    token0_addr = str(snap.get("token0") or row.get("token0_id") or "").strip().lower()
+    token1_addr = str(snap.get("token1") or row.get("token1_id") or "").strip().lower()
+    liq_usd = None
+    try:
+        prices = _get_token_prices_usd(int(chain_id), [token0_addr, token1_addr])
+        p0 = _safe_float(prices.get(token0_addr))
+        p1 = _safe_float(prices.get(token1_addr))
+        usd = 0.0
+        if a0_now > 0 and p0 > 0:
+            usd += a0_now * p0
+        if a1_now > 0 and p1 > 0:
+            usd += a1_now * p1
+        if usd > 0:
+            liq_usd = float(usd)
+    except Exception:
+        liq_usd = None
+    liq_disp = _format_usd_compact(liq_usd)
+    return {
+        "position_amount0": (float(amount0) if amount0 is not None else 0.0),
+        "position_amount1": (float(amount1) if amount1 is not None else 0.0),
+        "fees_owed0": (float(fee0) if fee0 is not None else 0.0),
+        "fees_owed1": (float(fee1) if fee1 is not None else 0.0),
+        "position_amounts_display": f"{_fmt_amt(amount0)} / {_fmt_amt(amount1)}",
+        "fees_owed_display": f"{_fmt_amt(fee0, zero_if_missing=True)} / {_fmt_amt(fee1, zero_if_missing=True)}",
+        "position_status": status,
+        "liquidity": str(liq_raw),
+        "liquidity_display": liq_disp,
+        "liquidity_usd": liq_usd,
+        "token0_id": token0_addr,
+        "token1_id": token1_addr,
+        "position_symbol0": _normalize_display_symbol(str(snap.get("token0_symbol") or row.get("position_symbol0") or "")),
+        "position_symbol1": _normalize_display_symbol(str(snap.get("token1_symbol") or row.get("position_symbol1") or "")),
+        "pair": (
+            f"{_normalize_display_symbol(str(snap.get('token0_symbol') or row.get('position_symbol0') or '?'))}/"
+            f"{_normalize_display_symbol(str(snap.get('token1_symbol') or row.get('position_symbol1') or '?'))}"
+        ),
+        "suspected_spam": False,
+        "spam_skipped": False,
+    }
 
 
 INTENT_OPTIONS: list[tuple[str, str]] = [
@@ -10168,7 +10274,10 @@ def _render_positions_page() -> str:
         }
         if (st === "done") return data.result || {};
         if (st === "failed") throw new Error(data.error || "Scan failed");
-        if (allowPartialReturn && partialRendered && String(data.stage || "").startsWith("enrich_")) {
+        // Handoff as soon as base table is ready; continue heavier enrich in background.
+        const stageKey = String(data.stage || "");
+        const backgroundPhase = stageKey.startsWith("enrich_") || stageKey === "finalize" || progress >= 65;
+        if (allowPartialReturn && partialRendered && backgroundPhase) {
           return Object.assign({__partial: true}, partial);
         }
         const statusTail = statusTailFromPayload(partial);
@@ -10226,8 +10335,8 @@ def _render_positions_page() -> str:
         const data = await pollPosJob(jobId, true);
         if (data && data.__partial) {
           handoffToBackground = true;
-          setPosStatus(`Base results loaded (${modeLabel}). Background enrichment continues...`, false);
-          setTimeout(() => { resumePosJobIfAny(); }, 900);
+          setPosStatus(`Base results loaded (${modeLabel}). Hard-like enrich continues in background...`, false);
+          setTimeout(() => { resumePosJobIfAny(); }, 300);
           return;
         }
         saveActivePosJob("");
@@ -12668,55 +12777,75 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
     pool_rows = result.get("pool_positions") or []
     if not isinstance(pool_rows, list) or not pool_rows:
         return
-    # Temporary mode: disable post-scan enrichment phases entirely.
-    # Keep only base scan payload so the table reflects direct scan outputs.
-    _update_pos_job(
+    if _update_pos_job(
         job_id,
         result=result,
-        stage="finalize",
-        stage_label="Post-scan enrichment is temporarily disabled",
-        progress=95,
-    )
-    return
+        stage="enrich_anomalies",
+        stage_label="Background: enriching symbol anomalies (UNK)",
+        progress=74,
+    ) is None:
+        return
+
+    def _is_symbol_anomaly(row: dict[str, Any]) -> bool:
+        s0 = str(row.get("position_symbol0") or "").strip().upper()
+        s1 = str(row.get("position_symbol1") or "").strip().upper()
+        pair = str(row.get("pair") or "").strip().upper()
+        return bool(
+            row.get("spam_skipped")
+            or s0 in {"", "?", "UNK"}
+            or s1 in {"", "?", "UNK"}
+            or "UNK" in pair
+            or "/?" in pair
+        )
+
+    start = time.monotonic()
+    max_seconds = 18
+    max_rows = 80
+    checked = 0
+    updated = 0
+    for row in pool_rows:
+        if time.monotonic() >= (start + max_seconds):
+            break
+        if checked >= max_rows:
+            break
+        if not isinstance(row, dict) or not _is_symbol_anomaly(row):
+            continue
+        proto = str(row.get("protocol") or "").strip().lower()
+        if proto not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+            continue
+        chain_id = int(row.get("chain_id") or _chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
+        token_id = _position_token_id_from_raw(row.get("position_id"))
+        owner = str(row.get("address") or "").strip().lower()
+        if chain_id <= 0 or token_id <= 0:
+            continue
+        checked += 1
+        try:
+            snap = _fetch_v3_position_contract_snapshot(chain_id, proto, token_id, owner)
+            if not isinstance(snap, dict):
+                continue
+            row_updates = _build_row_updates_from_snapshot(row, snap, chain_id)
+            if row_updates:
+                row.update(row_updates)
+                row["spam_skipped"] = False
+                row["suspected_spam"] = False
+                updated += 1
+        except Exception:
+            continue
+
+    _enrich_rows_liquidity_usd(pool_rows, max_seconds=4)
+    infos = result.get("infos") if isinstance(result.get("infos"), list) else []
+    infos = list(infos)
+    infos.append(f"Background anomaly enrich: checked={checked}, updated={updated}.")
+    result["infos"] = infos[:20]
     rows_count = int(len(pool_rows))
     if _update_pos_job(
         job_id,
         result=result,
-        stage="enrich_dates",
-        stage_label=f"Resolving position creation dates ({rows_count} rows)",
-        progress=65,
-    ) is None:
-        return
-    _populate_creation_dates_parallel(pool_rows)
-    if _update_pos_job(
-        job_id,
-        result=result,
-        stage="enrich_dates_backfill",
-        stage_label="Backfilling missing creation dates",
-        progress=74,
-    ) is None:
-        return
-    _enrich_missing_creation_dates(pool_rows, max_seconds=45, max_rows=500)
-    if _update_pos_job(
-        job_id,
-        result=result,
-        stage="enrich_pairs",
-        stage_label="Resolving pair symbols for unknown tokens",
-        progress=85,
-    ) is None:
-        return
-    _enrich_pair_symbols_background(pool_rows, max_seconds=20)
-    if _update_pos_job(
-        job_id,
-        result=result,
         stage="finalize",
-        stage_label="Finalizing table fields",
+        stage_label=f"Finalizing after anomaly enrich ({rows_count} rows)",
         progress=92,
     ) is None:
         return
-    for r in pool_rows:
-        if not str(r.get("position_created_date") or "").strip():
-            r["position_created_date"] = "-"
     _update_pos_job(job_id, result=result, progress=95)
 
 
@@ -12942,81 +13071,7 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     snap = _fetch_v3_position_contract_snapshot(int(chain_id), protocol, int(token_id), owner)
     if not isinstance(snap, dict):
         return {"ok": False, "reason": "snapshot_unavailable"}
-    dec0 = _parse_int_like(snap.get("token0_decimals") or 18)
-    dec1 = _parse_int_like(snap.get("token1_decimals") or 18)
-    if dec0 <= 0 or dec0 > 36:
-        dec0 = 18
-    if dec1 <= 0 or dec1 > 36:
-        dec1 = 18
-    amount0 = snap.get("quote_amount0")
-    amount1 = snap.get("quote_amount1")
-    fee0 = snap.get("quote_fee0")
-    fee1 = snap.get("quote_fee1")
-    try:
-        if fee0 is None:
-            fee0 = float(Decimal(int(snap.get("tokens_owed0_raw") or 0)) / (Decimal(10) ** dec0))
-        if fee1 is None:
-            fee1 = float(Decimal(int(snap.get("tokens_owed1_raw") or 0)) / (Decimal(10) ** dec1))
-    except Exception:
-        pass
-
-    def _fmt_amt(v: float | None, *, zero_if_missing: bool = False) -> str:
-        if v is None:
-            return "0" if zero_if_missing else "-"
-        av = abs(float(v))
-        if av >= 1000:
-            s = f"{float(v):,.1f}"
-        elif av >= 1:
-            s = f"{float(v):,.2f}"
-        elif av >= 0.01:
-            s = f"{float(v):,.3f}"
-        else:
-            s = f"{float(v):,.4f}"
-        return s.rstrip("0").rstrip(".")
-
-    liq_raw = max(0, int(snap.get("liquidity") or 0))
-    a0_now = max(0.0, float(amount0 or 0.0))
-    a1_now = max(0.0, float(amount1 or 0.0))
-    status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
-    token0_addr = str(snap.get("token0") or "").strip().lower()
-    token1_addr = str(snap.get("token1") or "").strip().lower()
-    liq_usd = None
-    try:
-        prices = _get_token_prices_usd(int(chain_id), [token0_addr, token1_addr])
-        p0 = _safe_float(prices.get(token0_addr))
-        p1 = _safe_float(prices.get(token1_addr))
-        usd = 0.0
-        if a0_now > 0 and p0 > 0:
-            usd += a0_now * p0
-        if a1_now > 0 and p1 > 0:
-            usd += a1_now * p1
-        if usd > 0:
-            liq_usd = float(usd)
-    except Exception:
-        liq_usd = None
-    liq_disp = _format_usd_compact(liq_usd)
-    updates = {
-        "position_amount0": (float(amount0) if amount0 is not None else 0.0),
-        "position_amount1": (float(amount1) if amount1 is not None else 0.0),
-        "fees_owed0": (float(fee0) if fee0 is not None else 0.0),
-        "fees_owed1": (float(fee1) if fee1 is not None else 0.0),
-        "position_amounts_display": f"{_fmt_amt(amount0)} / {_fmt_amt(amount1)}",
-        "fees_owed_display": f"{_fmt_amt(fee0, zero_if_missing=True)} / {_fmt_amt(fee1, zero_if_missing=True)}",
-        "position_status": status,
-        "liquidity": str(liq_raw),
-        "liquidity_display": liq_disp,
-        "liquidity_usd": liq_usd,
-        "token0_id": token0_addr,
-        "token1_id": token1_addr,
-        "position_symbol0": _normalize_display_symbol(str(snap.get("token0_symbol") or row.get("position_symbol0") or "")),
-        "position_symbol1": _normalize_display_symbol(str(snap.get("token1_symbol") or row.get("position_symbol1") or "")),
-        "pair": (
-            f"{_normalize_display_symbol(str(snap.get('token0_symbol') or row.get('position_symbol0') or '?'))}/"
-            f"{_normalize_display_symbol(str(snap.get('token1_symbol') or row.get('position_symbol1') or '?'))}"
-        ),
-        "suspected_spam": False,
-        "spam_skipped": False,
-    }
+    updates = _build_row_updates_from_snapshot(row, snap, int(chain_id))
     return {"ok": True, "row_updates": updates}
 
 
