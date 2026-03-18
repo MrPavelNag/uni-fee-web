@@ -4025,6 +4025,8 @@ def _scan_v3_positions_onchain(
         tick_lower = _decode_int_from_word(pos_words[5])
         tick_upper = _decode_int_from_word(pos_words[6])
         liq = _decode_uint_from_word(pos_words[7])
+        tokens_owed0 = _decode_uint_from_word(pos_words[10]) if len(pos_words) > 10 else 0
+        tokens_owed1 = _decode_uint_from_word(pos_words[11]) if len(pos_words) > 11 else 0
         if liq <= 0:
             return None
 
@@ -4058,6 +4060,8 @@ def _scan_v3_positions_onchain(
         return {
             "id": str(token_id),
             "liquidity": str(liq),
+            "tokensOwed0": str(max(0, int(tokens_owed0))),
+            "tokensOwed1": str(max(0, int(tokens_owed1))),
             "tickLower": {"tickIdx": str(tick_lower)},
             "tickUpper": {"tickIdx": str(tick_upper)},
             "pool": {
@@ -6054,14 +6058,6 @@ def _scan_pool_positions_chain(
         if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
             return None
         pool = p.get("pool") or {}
-        tvl_usd = _safe_float(pool.get("totalValueLockedUSD"))
-        valuation_mode = "exact-external"
-        detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
-        if detailed_external_tvl is None or detailed_external_tvl <= 0:
-            position_tvl_usd = None
-            valuation_mode = "no-exact-external"
-        else:
-            position_tvl_usd = detailed_external_tvl
         fee_raw = str(pool.get("feeTier") or "").strip()
         fee_disp = fee_raw
         try:
@@ -6085,8 +6081,8 @@ def _scan_pool_positions_chain(
                 t0 = "Infinity"
             elif str(t1).upper() == "UNK":
                 t1 = f"#{pid}" if pid else "Position"
-        # Exact-only mode: no share/simple/sanity estimation branches.
-        if (detailed_external_tvl is None or detailed_external_tvl <= 0) and allow_live_enrich and version == "v3":
+        # Exact-only output: show on-chain token amounts and owed fees.
+        if allow_live_enrich and version == "v3":
             onchain_enriched = _fetch_v3_position_onchain_by_token_id(
                 int(chain_id),
                 str(p.get("id") or ""),
@@ -6100,14 +6096,47 @@ def _scan_pool_positions_chain(
                 t1_obj = pool.get("token1") or {}
                 t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
                 t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
-                detailed_external_tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
-                if detailed_external_tvl is not None and detailed_external_tvl > 0:
-                    position_tvl_usd = detailed_external_tvl
-                    valuation_mode = "exact-external-onchain"
-        if detailed_external_tvl is None or detailed_external_tvl <= 0:
-            position_tvl_usd = None
-            valuation_mode = "exact-unavailable"
-        suspected_spam = _is_suspected_spam_pair(chain_key, t0_obj, t1_obj, t0, t1, position_tvl_usd)
+
+        amount0_val: float | None = None
+        amount1_val: float | None = None
+        amounts = _position_amounts_from_detail(p, pool)
+        if amounts:
+            try:
+                amount0_val = float(amounts[0])
+                amount1_val = float(amounts[1])
+            except Exception:
+                amount0_val = None
+                amount1_val = None
+
+        dec0 = _parse_int_like((pool.get("token0") or {}).get("decimals") or 18)
+        dec1 = _parse_int_like((pool.get("token1") or {}).get("decimals") or 18)
+        if dec0 <= 0 or dec0 > 36:
+            dec0 = 18
+        if dec1 <= 0 or dec1 > 36:
+            dec1 = 18
+        owed0_raw = max(0, _parse_int_like(p.get("tokensOwed0") or 0))
+        owed1_raw = max(0, _parse_int_like(p.get("tokensOwed1") or 0))
+        fees0_val: float | None = None
+        fees1_val: float | None = None
+        try:
+            if owed0_raw > 0:
+                fees0_val = float(Decimal(owed0_raw) / (Decimal(10) ** dec0))
+            if owed1_raw > 0:
+                fees1_val = float(Decimal(owed1_raw) / (Decimal(10) ** dec1))
+        except Exception:
+            fees0_val = None
+            fees1_val = None
+
+        def _fmt_amt(v: float | None) -> str:
+            if v is None:
+                return "-"
+            if abs(v) >= 1000:
+                return f"{v:,.4f}".rstrip("0").rstrip(".")
+            return f"{v:.8f}".rstrip("0").rstrip(".")
+
+        position_amounts_display = f"{_fmt_amt(amount0_val)} {t0} / {_fmt_amt(amount1_val)} {t1}"
+        fees_owed_display = f"{_fmt_amt(fees0_val)} {t0} / {_fmt_amt(fees1_val)} {t1}"
+
         return {
             "address": owner,
             "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
@@ -6124,15 +6153,21 @@ def _scan_pool_positions_chain(
             "fee_tier_raw": fee_raw,
             "liquidity": str(p.get("liquidity") or "0"),
             "pool_liquidity": str(pool.get("liquidity") or "0"),
-            "pool_tvl_usd": tvl_usd,
-            "tvl_usd": position_tvl_usd,
+            "pool_tvl_usd": None,
+            "tvl_usd": None,
+            "position_amount0": amount0_val,
+            "position_amount1": amount1_val,
+            "position_amounts_display": position_amounts_display,
+            "fees_owed0": fees0_val,
+            "fees_owed1": fees1_val,
+            "fees_owed_display": fees_owed_display,
             "position_created_date": _position_creation_date_peek(
                 int(chain_id),
                 str(p.get("_protocol_label") or f"uniswap_{version}"),
                 str(p.get("id") or ""),
             ),
-            "valuation_mode": valuation_mode,
-            "suspected_spam": bool(suspected_spam),
+            "valuation_mode": "exact-onchain-amounts",
+            "suspected_spam": False,
         }
 
     def _build_owner_rows_from_positions(
@@ -8990,7 +9025,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact TVL only; shown as - when exact value is unavailable'>Position TVL</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -9023,28 +9058,27 @@ def _render_positions_page() -> str:
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
         html += `<td class='mono'>${esc(shortAddr4(r.pool_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
         html += `<td>${esc(r.position_created_date || "-")}</td>`;
-        const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
-        html += `<td>${tvlVal}</td>`;
+        html += `<td>${esc(r.position_amounts_display || "-")}</td>`;
+        html += `<td>${esc(r.fees_owed_display || "-")}</td>`;
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
         const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
         html += "</tr>";
       }
-      if (!visible.length) html += "<tr><td colspan='10'>No pool positions found.</td></tr>";
+      if (!visible.length) html += "<tr><td colspan='11'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
-        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position created</th><th style='text-align:left;padding:4px 6px'>Position TVL</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
+        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position created</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
         for (let i = 0; i < hiddenRows.length; i++) {
           const r = hiddenRows[i];
           const rowKey = String(r._row_key || "");
-          const tvlVal = "-";
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.position_created_date || "-")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.position_created_date || "-")}</td><td style='padding:3px 6px'>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
-        html += `<tr><td colspan='10'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='11'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       const detailsEl = document.getElementById("posHiddenDetails");
@@ -11550,12 +11584,11 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any]) -> No
     if _update_pos_job(
         job_id,
         result=result,
-        stage="enrich_tvl",
-        stage_label="Refining TVL estimates",
+        stage="enrich_exact",
+        stage_label="Refreshing exact on-chain values",
         progress=92,
     ) is None:
         return
-    _enrich_tvl_background(pool_rows, max_seconds=25)
     for r in pool_rows:
         if not str(r.get("position_created_date") or "").strip():
             r["position_created_date"] = "-"
