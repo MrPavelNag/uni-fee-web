@@ -3903,37 +3903,65 @@ def _explorer_nfttx_rows(
     o = str(owner or "").strip().lower()
     if not _is_eth_address(c) or not _is_eth_address(o):
         return []
-    chainid_for_v2 = {56: "56", 8453: "8453"}.get(cid, "")
+    chainid_for_v2 = {
+        1: "1",
+        10: "10",
+        56: "56",
+        137: "137",
+        8453: "8453",
+        42161: "42161",
+    }.get(cid, "")
     if not chainid_for_v2:
         return []
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
-    urls: list[str] = []
+    urls: list[tuple[str, bool]] = []
     offset = max(20, min(1000, int(max_rows)))
     if cid == 56 and bsc_key:
-        urls.append(
+        urls.append((
             "https://api.bscscan.com/api"
             f"?module=account&action=tokennfttx&contractaddress={c}"
-            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}"
-        )
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}",
+            True,
+        ))
+        urls.append((
+            "https://api.bscscan.com/api"
+            f"?module=account&action=tokennfttx"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}",
+            False,
+        ))
     elif cid == 8453 and base_key:
-        urls.append(
+        urls.append((
             "https://api.basescan.org/api"
             f"?module=account&action=tokennfttx&contractaddress={c}"
-            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}"
-        )
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}",
+            True,
+        ))
+        urls.append((
+            "https://api.basescan.org/api"
+            f"?module=account&action=tokennfttx"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}",
+            False,
+        ))
     # Secondary fallback via Etherscan V2 unified endpoint.
     if eth_key:
-        urls.append(
+        urls.append((
             "https://api.etherscan.io/v2/api"
             f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-            f"&contractaddress={c}&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}"
-        )
+            f"&contractaddress={c}&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
+            True,
+        ))
+        urls.append((
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
+            False,
+        ))
     if not urls:
         return []
     rows: list[dict[str, Any]] = []
-    for url in urls:
+    for url, has_contract_filter in urls:
         try:
             req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
             with urlopen(req, timeout=12) as resp:
@@ -3941,6 +3969,17 @@ def _explorer_nfttx_rows(
             result_rows = (payload or {}).get("result")
             if isinstance(result_rows, list):
                 rows = [x for x in result_rows if isinstance(x, dict)]
+                if not has_contract_filter:
+                    rows = [
+                        x
+                        for x in rows
+                        if str(
+                            x.get("contractAddress")
+                            or x.get("contractaddress")
+                            or x.get("tokenAddress")
+                            or ""
+                        ).strip().lower() == c
+                    ]
                 if rows:
                     break
         except Exception:
@@ -4014,7 +4053,14 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     o = str(owner or "").strip().lower()
     if not _is_eth_address(o):
         return []
-    chainid_for_v2 = {56: "56", 8453: "8453"}.get(cid, "")
+    chainid_for_v2 = {
+        1: "1",
+        10: "10",
+        56: "56",
+        137: "137",
+        8453: "8453",
+        42161: "42161",
+    }.get(cid, "")
     if not chainid_for_v2:
         return []
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
@@ -4680,6 +4726,7 @@ def _scan_v3_positions_onchain(
     protocol_label: str = "uniswap_v3",
     source_tag: str = "onchain_npm",
     debug_out: dict[str, Any] | None = None,
+    token_ids_override: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
@@ -4691,12 +4738,27 @@ def _scan_v3_positions_onchain(
     if deadline_ts is not None and time.monotonic() >= deadline_ts:
         return []
 
-    # balanceOf(address)
-    bal_data = "0x70a08231" + _encode_address_word(owner_addr)
-    balance = _decode_uint_eth_call(_eth_call_hex(int(chain_id), npm, bal_data))
-    if balance <= 0:
-        return []
-    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
+    limit = int(POSITIONS_ONCHAIN_MAX_NFTS)
+    token_ids_prefetched: list[int] = []
+    if isinstance(token_ids_override, list):
+        seen_pref: set[int] = set()
+        for tid in token_ids_override:
+            t = _parse_int_like(tid)
+            if t <= 0 or t in seen_pref:
+                continue
+            seen_pref.add(int(t))
+            token_ids_prefetched.append(int(t))
+            if len(token_ids_prefetched) >= int(POSITIONS_ONCHAIN_MAX_NFTS):
+                break
+    if not token_ids_prefetched:
+        # balanceOf(address)
+        bal_data = "0x70a08231" + _encode_address_word(owner_addr)
+        balance = _decode_uint_eth_call(_eth_call_hex(int(chain_id), npm, bal_data))
+        if balance <= 0:
+            return []
+        limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
+    else:
+        limit = min(len(token_ids_prefetched), int(POSITIONS_ONCHAIN_MAX_NFTS))
     out: list[dict[str, Any]] = []
     dbg = debug_out if isinstance(debug_out, dict) else None
     if dbg is not None:
@@ -4770,19 +4832,30 @@ def _scan_v3_positions_onchain(
             "_protocol_label": str(protocol_label or "uniswap_v3"),
             "_source": str(source_tag or "onchain_npm"),
         }
-    # Scan latest NFTs first: active user positions are typically near the end.
-    start_idx = max(0, int(balance) - limit)
-    scan_indices = range(int(balance) - 1, start_idx - 1, -1)
+    if token_ids_prefetched:
+        scan_token_ids = list(token_ids_prefetched[: int(limit)])
+    else:
+        # Scan latest NFTs first: active user positions are typically near the end.
+        start_idx = max(0, int(balance) - limit)
+        scan_indices = range(int(balance) - 1, start_idx - 1, -1)
+        scan_token_ids = []
+        for idx in scan_indices:
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            try:
+                # tokenOfOwnerByIndex(address,uint256)
+                token_data = "0x2f745c59" + _encode_address_word(owner_addr) + _encode_uint_word(idx)
+                token_id = _decode_uint_eth_call(_eth_call_hex(int(chain_id), npm, token_data))
+                if token_id <= 0:
+                    continue
+                scan_token_ids.append(int(token_id))
+            except Exception:
+                continue
 
-    for idx in scan_indices:
+    for token_id in scan_token_ids:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
         try:
-            # tokenOfOwnerByIndex(address,uint256)
-            token_data = "0x2f745c59" + _encode_address_word(owner_addr) + _encode_uint_word(idx)
-            token_id = _decode_uint_eth_call(_eth_call_hex(int(chain_id), npm, token_data))
-            if token_id <= 0:
-                continue
             if dbg is not None:
                 dbg["scanned_token_ids"] = int(dbg.get("scanned_token_ids") or 0) + 1
             built = _build_position_from_token_id(int(token_id))
@@ -6872,14 +6945,37 @@ def _scan_pool_positions_chain(
                     t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_onchain_v3_npm", version=version, owner=str(owner))
                     v3_dbg: dict[str, Any] = {}
+                    v3_proto = str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3") or "uniswap_v3").strip().lower()
+                    explorer_v3_ids: list[int] = []
+                    npm = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
+                    if _is_eth_address(npm):
+                        explorer_v3_ids = _scan_erc721_token_ids_by_explorer_api(
+                            int(chain_id),
+                            npm,
+                            owner,
+                            max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
+                            protocol=v3_proto,
+                        )
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "explorer",
+                                "query_mode": "contract_only_explorer_v3_ids",
+                                "count": len(explorer_v3_ids),
+                                "ok": True,
+                                "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
+                            }
+                        )
+                    t_call = time.monotonic()
                     v3_rows = _scan_v3_positions_onchain(
                         owner,
                         int(chain_id),
                         deadline_ts=deadline_ts,
                         include_price_details=False,
-                        protocol_label=V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3"),
+                        protocol_label=v3_proto,
                         source_tag="contract_only_onchain_v3_npm",
                         debug_out=v3_dbg,
+                        token_ids_override=explorer_v3_ids,
                     )
                     owner_attempts.append(
                         {
@@ -11209,7 +11305,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Created</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -11248,6 +11344,7 @@ def _render_positions_page() -> str:
         const feeRaw = String(r.fee_tier_raw || "").trim();
         const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
+        html += `<td>${esc(r.position_created_date || "-")}</td>`;
         html += `<td>${statusDot(r.position_status || "-")}</td>`;
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
@@ -11257,7 +11354,7 @@ def _render_positions_page() -> str:
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
         html += "</tr>";
       }
-      if (!visible.length) html += "<tr><td colspan='12'>No pool positions found.</td></tr>";
+      if (!visible.length) html += "<tr><td colspan='13'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
         hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Position ID</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
@@ -11277,7 +11374,7 @@ def _render_positions_page() -> str:
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
-        html += `<tr><td colspan='12'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='13'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       const detailsEl = document.getElementById("posHiddenDetails");
