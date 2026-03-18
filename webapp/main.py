@@ -220,10 +220,6 @@ POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().l
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "45")))
-POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = max(
-    int(POSITIONS_SCAN_MAX_SECONDS),
-    int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY", "90")),
-)
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
@@ -242,7 +238,7 @@ POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIM
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
 POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "800")))
 POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS = max(20000, int(os.environ.get("POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS", "2500000")))
-POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "20000")))
+POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "150000")))
 POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS = max(20, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS", "120")))
 POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS = max(10, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS", "60")))
 POSITIONS_ENABLE_INFINITY = os.environ.get("POSITIONS_ENABLE_INFINITY", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -250,12 +246,8 @@ POSITIONS_INFINITY_HEAVY_METHODS = os.environ.get("POSITIONS_INFINITY_HEAVY_METH
 POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
-POSITIONS_INFINITY_BATCH_MAX_CHECKS_ON_PRUNED = max(
-    500,
-    int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS_ON_PRUNED", "3000")),
-)
 POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
-POSITIONS_RPC_BATCH_MAX_ITEMS = max(10, min(200, int(os.environ.get("POSITIONS_RPC_BATCH_MAX_ITEMS", "50"))))
+POSITIONS_RPC_BATCH_MAX_ITEMS = max(10, min(200, int(os.environ.get("POSITIONS_RPC_BATCH_MAX_ITEMS", "80"))))
 POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK = os.environ.get("POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK", "0").strip().lower() in (
     "1",
     "true",
@@ -2858,7 +2850,6 @@ def _json_rpc_call(
     *,
     timeout_sec: float | None = None,
     deadline_ts: float | None = None,
-    max_urls: int | None = None,
 ) -> Any:
     rpc_urls = _rpc_urls_for_chain(chain_id)
     if not rpc_urls:
@@ -2866,10 +2857,7 @@ def _json_rpc_call(
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     body = json.dumps(payload).encode("utf-8")
     last_err = "unknown rpc error"
-    urls = list(rpc_urls)
-    url_limit = 2 if max_urls is None else max(1, int(max_urls))
-    urls = urls[:url_limit]
-    for rpc_url in urls:
+    for rpc_url in rpc_urls:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             raise RuntimeError("rpc deadline exceeded")
         try:
@@ -2901,7 +2889,6 @@ def _json_rpc_batch_call(
     payloads: list[dict[str, Any]],
     *,
     deadline_ts: float | None = None,
-    max_urls: int | None = None,
 ) -> list[dict[str, Any]]:
     rpc_urls = _rpc_urls_for_chain(chain_id)
     if not rpc_urls:
@@ -2923,10 +2910,7 @@ def _json_rpc_batch_call(
         body = json.dumps(chunk).encode("utf-8")
         last_err = "unknown batch rpc error"
         chunk_ok = False
-        urls = list(rpc_urls)
-        url_limit = 2 if max_urls is None else max(1, int(max_urls))
-        urls = urls[:url_limit]
-        for rpc_url in urls:
+        for rpc_url in rpc_urls:
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
                 raise RuntimeError("batch rpc deadline exceeded")
             try:
@@ -3222,7 +3206,7 @@ def _eth_get_logs(
     debug_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     last_exc: Exception | None = None
-    attempts = min(2, max(1, int(max_attempts)))
+    attempts = max(1, int(max_attempts))
     req_started = time.perf_counter()
     first_try_failed = False
     if isinstance(debug_out, dict):
@@ -3237,7 +3221,6 @@ def _eth_get_logs(
                 [params],
                 timeout_sec=(timeout_sec if timeout_sec is not None else max(12.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 4.0)),
                 deadline_ts=deadline_ts,
-                max_urls=2,
             )
             if isinstance(out, list):
                 if isinstance(debug_out, dict):
@@ -3667,8 +3650,7 @@ def _scan_erc721_token_ids_by_incoming_logs(
         return []
     lb = int(lookback_blocks) if lookback_blocks is not None else int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS)
     min_block = max(0, int(latest) - max(1, lb))
-    # Keep log queries in small ranges; large ranges are unstable on public RPCs.
-    step = max(5000, min(30000, int(POSITIONS_ERC721_LOG_BLOCK_STEP)))
+    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
     topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     topic_to_owner = "0x" + ("0" * 24) + o[2:]
     end_block = int(latest)
@@ -3686,23 +3668,7 @@ def _scan_erc721_token_ids_by_incoming_logs(
         }
         try:
             logs = _eth_get_logs(cid, params, deadline_ts=deadline_ts, debug_out=debug_out)
-        except Exception as e:
-            err_txt = str(e or "").strip().lower()
-            # Root-cause fix: archival/pruned-history errors mean older ranges are unavailable
-            # on this RPC provider; continuing the backward loop is guaranteed waste.
-            if any(
-                s in err_txt
-                for s in (
-                    "history has been pruned",
-                    "historical state",
-                    "missing trie node",
-                    "state is not available",
-                )
-            ):
-                if isinstance(debug_out, dict):
-                    debug_out["rpc_getlogs_pruned_errors"] = int(debug_out.get("rpc_getlogs_pruned_errors") or 0) + 1
-                    debug_out["rpc_getlogs_stop_reason"] = "pruned_history"
-                break
+        except Exception:
             # Reduce chunk size on provider "too many results" style failures.
             if step > 5000:
                 step = max(5000, step // 2)
@@ -3756,8 +3722,7 @@ def _scan_erc721_token_ids_by_recent_transfers_ownerof(
         return []
     lb = int(lookback_blocks) if lookback_blocks is not None else int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS)
     min_block = max(0, int(latest) - max(1, lb))
-    # Keep log queries in small ranges; large ranges are unstable on public RPCs.
-    step = max(5000, min(30000, int(POSITIONS_ERC721_LOG_BLOCK_STEP)))
+    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
     topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     owner_word = _encode_address_word(o)[-40:]
     end_block = int(latest)
@@ -3839,8 +3804,7 @@ def _scan_cl_mintposition_token_ids_by_owner(
         return []
     lb = int(lookback_blocks) if lookback_blocks is not None else int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS)
     min_block = max(0, int(latest) - max(1, lb))
-    # Keep log queries in small ranges; large ranges are unstable on public RPCs.
-    step = max(5000, min(30000, int(POSITIONS_ERC721_LOG_BLOCK_STEP)))
+    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
     # event MintPosition(uint256 indexed tokenId)
     topic_mint = "0x2c0223eed283e194c1112e080d31bdec9e2760ba1454153666cd9d7d6a877964"
     owner_word = _encode_address_word(o)[-40:]
@@ -4123,7 +4087,7 @@ def _scan_erc721_token_ids_by_ownerof_batch(
     if int(start_from_token_id) > 0:
         hi = min(hi, int(start_from_token_id))
     lo = 1
-    bsz = max(20, min(200, int(batch_size)))
+    bsz = max(50, min(1000, int(batch_size)))
     to_check = min(max(1, int(max_checks)), max(0, hi - lo + 1))
     ranges: list[list[int]] = []
     cur = hi
@@ -4142,43 +4106,37 @@ def _scan_erc721_token_ids_by_ownerof_batch(
     def _scan_chunk(tids: list[int]) -> tuple[list[int], int]:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             return [], 0
+        payloads = [
+            {
+                "jsonrpc": "2.0",
+                "id": idx,
+                "method": "eth_call",
+                "params": [{"to": c, "data": "0x6352211e" + _encode_uint_word(int(tid))}, "latest"],
+            }
+            for idx, tid in enumerate(tids)
+        ]
+        try:
+            resp = _json_rpc_batch_call(cid, payloads, deadline_ts=deadline_ts)
+        except Exception:
+            return [], len(tids)
+        by_id: dict[int, dict[str, Any]] = {}
+        for row in resp:
+            try:
+                rid = int(row.get("id"))
+            except Exception:
+                continue
+            by_id[rid] = row
         found: list[int] = []
         errs = 0
-        rpc_batch = max(10, min(100, int(POSITIONS_RPC_BATCH_MAX_ITEMS)))
-        for i in range(0, len(tids), rpc_batch):
-            if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                break
-            sub_tids = tids[i : i + rpc_batch]
-            payloads = [
-                {
-                    "jsonrpc": "2.0",
-                    "id": idx,
-                    "method": "eth_call",
-                    "params": [{"to": c, "data": "0x6352211e" + _encode_uint_word(int(tid))}, "latest"],
-                }
-                for idx, tid in enumerate(sub_tids)
-            ]
-            try:
-                resp = _json_rpc_batch_call(cid, payloads, deadline_ts=deadline_ts)
-            except Exception:
-                errs += len(sub_tids)
+        for idx, tid in enumerate(tids):
+            row = by_id.get(idx) or {}
+            raw = str(row.get("result") or "").strip().lower()
+            if not raw.startswith("0x") or len(raw) < 42:
+                if row.get("error") is not None:
+                    errs += 1
                 continue
-            by_id: dict[int, dict[str, Any]] = {}
-            for row in resp:
-                try:
-                    rid = int(row.get("id"))
-                except Exception:
-                    continue
-                by_id[rid] = row
-            for idx, tid in enumerate(sub_tids):
-                row = by_id.get(idx) or {}
-                raw = str(row.get("result") or "").strip().lower()
-                if not raw.startswith("0x") or len(raw) < 42:
-                    if row.get("error") is not None:
-                        errs += 1
-                    continue
-                if raw[-40:] == owner_word:
-                    found.append(int(tid))
+            if raw[-40:] == owner_word:
+                found.append(int(tid))
         return found, errs
 
     checked = 0
@@ -4658,10 +4616,10 @@ def _scan_v3_positions_onchain(
     out: list[dict[str, Any]] = []
     dbg = debug_out if isinstance(debug_out, dict) else None
     if dbg is not None:
-        dbg.setdefault("scanned_token_ids", 0)
-        dbg.setdefault("kept_positions", 0)
-        dbg.setdefault("skipped_zero_liq", 0)
-        dbg.setdefault("invalid_positions", 0)
+        dbg["scanned_token_ids"] = 0
+        dbg["kept_positions"] = 0
+        dbg["skipped_zero_liq"] = 0
+        dbg["invalid_positions"] = 0
 
     def _build_position_from_token_id(token_id: int) -> dict[str, Any] | None:
         # positions(uint256)
@@ -4862,9 +4820,9 @@ def _scan_pancake_staked_v3_positions_onchain(
     out: list[dict[str, Any]] = []
     dbg = debug_out if isinstance(debug_out, dict) else None
     if dbg is not None:
-        dbg.setdefault("scanned_token_ids", 0)
-        dbg.setdefault("kept_positions", 0)
-        dbg.setdefault("invalid_positions", 0)
+        dbg["scanned_token_ids"] = 0
+        dbg["kept_positions"] = 0
+        dbg["invalid_positions"] = 0
     for idx in scan_indices:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
@@ -4979,10 +4937,6 @@ def _scan_infinity_position_ids_for_owner(
                 "rpc_getlogs_retry_success": 0,
                 "rpc_getlogs_ms": 0,
                 "rpc_getlogs_last_error": "",
-                "rpc_getlogs_pruned_errors": 0,
-                "rpc_getlogs_stop_reason": "",
-                "direct_contract_only": False,
-                "direct_contract_no_ids": False,
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -5038,8 +4992,6 @@ def _scan_infinity_position_ids_for_owner(
             seen_ids.add(int(tid))
             token_ids.append(int(tid))
     if POSITIONS_CONTRACT_ONLY_ENABLED:
-        if dbg is not None:
-            dbg["direct_contract_only"] = True
         # Root-cause fix for hangs and misses:
         # 1) use direct Transfer(to=owner) logs first (contract-native discovery),
         # 2) only then fallback to ownerOf batch scan if ids are still missing.
@@ -5064,20 +5016,14 @@ def _scan_infinity_position_ids_for_owner(
                     continue
                 seen_ids.add(int(tid))
                 token_ids.append(int(tid))
-        stop_reason = str((dbg or {}).get("rpc_getlogs_stop_reason") or "").strip().lower()
-        pruned_history = stop_reason == "pruned_history"
         if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN:
             t_batch0 = time.perf_counter()
-            max_checks = int(POSITIONS_INFINITY_BATCH_MAX_CHECKS)
-            if pruned_history:
-                # Provider cannot serve deep historical logs; use bounded recent ownerOf sweep.
-                max_checks = min(max_checks, int(POSITIONS_INFINITY_BATCH_MAX_CHECKS_ON_PRUNED))
             batch_ids, batch_checked, batch_errors = _scan_erc721_token_ids_by_ownerof_batch(
                 cid,
                 pm,
                 owner,
                 max_ids=max(limit * 4, limit),
-                max_checks=max_checks,
+                max_checks=int(POSITIONS_INFINITY_BATCH_MAX_CHECKS),
                 batch_size=int(POSITIONS_INFINITY_BATCH_SIZE),
                 deadline_ts=deadline_ts,
             )
@@ -5086,9 +5032,6 @@ def _scan_infinity_position_ids_for_owner(
                 dbg["batch_ownerof_errors"] = int((dbg.get("batch_ownerof_errors") or 0) + int(batch_errors))
                 dbg["batch_ownerof_matched"] = int((dbg.get("batch_ownerof_matched") or 0) + len(batch_ids))
                 dbg["rpc_ms_batch_ownerof"] = int((dbg.get("rpc_ms_batch_ownerof") or 0) + int(max(0.0, (time.perf_counter() - t_batch0) * 1000.0)))
-                if pruned_history:
-                    dbg["rpc_ownerof_batch_mode"] = "bounded_after_pruned_history"
-                    dbg["rpc_ownerof_batch_max_checks"] = int(max_checks)
             for tid in batch_ids:
                 if len(token_ids) >= limit:
                     break
@@ -5098,8 +5041,6 @@ def _scan_infinity_position_ids_for_owner(
                 token_ids.append(int(tid))
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
-            if int(balance) > 0 and not token_ids:
-                dbg["direct_contract_no_ids"] = True
         return token_ids
     if not POSITIONS_INFINITY_HEAVY_METHODS:
         if dbg is not None:
@@ -7189,12 +7130,7 @@ def _scan_pool_positions_chain(
             )
             if enriched:
                 p = enriched
-        # Keep zero-liquidity positions (inactive/closed) in table output.
-        # They can still have unclaimed fees and are important for full discovery.
         liq_raw = p.get("liquidity")
-        # Fast skip for empty positions by user rule:
-        # if position liquidity is zero, In position is effectively zero and
-        # this row should be hidden without extra on-chain quote calls.
         if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
             return None
         pool = p.get("pool") or {}
@@ -7578,12 +7514,6 @@ def _scan_pool_positions_chain(
         fees_owed_display = f"{_fmt_amt(fees0_val, zero_if_missing=True)} / {_fmt_amt(fees1_val, zero_if_missing=True)}"
         a0_now = max(0.0, float(amount0_val or 0.0))
         a1_now = max(0.0, float(amount1_val or 0.0))
-        f0_now = max(0.0, float(fees0_val or 0.0))
-        f1_now = max(0.0, float(fees1_val or 0.0))
-        # User rule: hide rows when In position is fully zero.
-        # This is an intentionally aggressive filter.
-        if a0_now <= 0.0 and a1_now <= 0.0:
-            return None
         # Status is derived only from "In position":
         # inactive when either side is zero; active otherwise.
         position_status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
@@ -7807,10 +7737,6 @@ def _scan_pool_positions_chain(
         v_debug: list[dict[str, Any]] = []
         v_timed_out = False
         owner_workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(addresses)))
-        if POSITIONS_CONTRACT_ONLY_ENABLED and not hard_scan:
-            # In contract-only fast mode, scan owners concurrently so one heavy owner
-            # cannot starve other addresses on the same chain.
-            owner_workers = max(2, int(owner_workers))
         if owner_workers <= 1 or len(addresses) <= 1:
             for owner in addresses:
                 if time.monotonic() >= deadline_ts:
@@ -7892,11 +7818,7 @@ def _scan_pool_positions_chain(
         has_position_liquidity = _endpoint_supports_position_liquidity(endpoint) if endpoint else True
         return endpoint, has_pool_liquidity, has_position_liquidity
 
-    version_order = ("v3", "v4")
-    if POSITIONS_CONTRACT_ONLY_ENABLED:
-        # In contract-only mode, run v4 first so Unichain v4 is not starved by long v3 scans.
-        version_order = ("v4", "v3")
-    for version in version_order:
+    for version in ("v3", "v4"):
         if time.monotonic() >= deadline_ts:
             timed_out = True
             break
@@ -8197,22 +8119,10 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], 
                     ).fetchall()
                 known_chain_ids = {int(r[0] or 0) for r in (rows or []) if int(r[0] or 0) > 0}
                 narrowed = [cid for cid in valid_chain_ids if int(cid) in known_chain_ids]
-                if POSITIONS_CONTRACT_ONLY_ENABLED and not hard_scan and POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
-                    filtered: list[int] = []
-                    for cid in narrowed:
-                        if _chain_has_any_position_nft_balance(int(cid), addresses):
-                            filtered.append(int(cid))
-                    return filtered
                 return narrowed
             except Exception:
                 return []
     if not hard_scan:
-        if POSITIONS_CONTRACT_ONLY_ENABLED and POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
-            filtered_fast: list[int] = []
-            for cid in valid_chain_ids:
-                if _chain_has_any_position_nft_balance(int(cid), addresses):
-                    filtered_fast.append(int(cid))
-            return filtered_fast
         return valid_chain_ids
     if not POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
         return valid_chain_ids
@@ -8226,11 +8136,8 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], 
 def _order_chain_ids_for_pool_scan(valid_chain_ids: list[int], priority_chain_ids: list[int]) -> list[int]:
     ordered_chain_ids: list[int] = []
     seen_chain_ids: set[int] = set()
-    allowed_chain_ids = {int(cid) for cid in (valid_chain_ids or []) if int(cid) > 0}
     for cid in list(priority_chain_ids) + list(valid_chain_ids):
         cc = int(cid)
-        if cc not in allowed_chain_ids:
-            continue
         if cc in seen_chain_ids:
             continue
         seen_chain_ids.add(cc)
@@ -8252,10 +8159,7 @@ def _scan_pool_positions(
     debug_rows: list[dict[str, Any]] = []
     timings: dict[str, Any] = {}
     scan_started = time.monotonic()
-    scan_budget_sec = int(POSITIONS_SCAN_MAX_SECONDS)
-    if POSITIONS_CONTRACT_ONLY_ENABLED:
-        scan_budget_sec = int(POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY)
-    deadline_ts = time.monotonic() + float(scan_budget_sec)
+    deadline_ts = time.monotonic() + float(POSITIONS_SCAN_MAX_SECONDS)
     timed_out = False
 
     t_filter = time.monotonic()
@@ -8264,22 +8168,15 @@ def _scan_pool_positions(
     if not valid_chain_ids:
         timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
         return [], [], [], timings
-    priority_chain_ids = [130, 56, 8453]  # Prioritize Unichain first, then BSC + Base
+    priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
     ordered_chain_ids = _order_chain_ids_for_pool_scan(valid_chain_ids, priority_chain_ids)
     max_workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
-    run_all_chains_parallel = bool(POSITIONS_CONTRACT_ONLY_ENABLED and (not hard_scan))
-    if POSITIONS_CONTRACT_ONLY_ENABLED and not hard_scan:
-        # In contract-only fast mode, avoid single-chain starvation.
-        max_workers = max(3, int(max_workers))
     timings["chains_total"] = len(ordered_chain_ids)
     timings["chain_workers"] = int(max_workers)
     chain_durations_sec: dict[str, float] = {}
 
     # Run priority chains first in sequence to avoid deadline starvation.
     priority_ids = [c for c in ordered_chain_ids if c in priority_chain_ids]
-    if run_all_chains_parallel:
-        # For contract-only fast mode, skip serial pre-pass and run all in parallel below.
-        priority_ids = []
     t_prio = time.monotonic()
     p_rows, p_errors, p_debug, p_timed_out, p_chain_durations = _run_pool_chain_batch_serial(
         priority_ids,
@@ -8297,11 +8194,7 @@ def _scan_pool_positions(
     chain_durations_sec.update(p_chain_durations or {})
     timed_out = bool(p_timed_out)
 
-    remaining_chain_ids = (
-        list(ordered_chain_ids)
-        if run_all_chains_parallel
-        else [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
-    )
+    remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
     remaining_deadline_ts = float(deadline_ts)
     use_fast_chain_caps = bool((not hard_scan) and (not POSITIONS_CONTRACT_ONLY_ENABLED))
     if use_fast_chain_caps and remaining_chain_ids:
@@ -8376,23 +8269,7 @@ def _scan_pool_positions(
     _enrich_rows_liquidity_usd(uniq_rows, max_seconds=4 if not hard_scan else 10)
     timings["liquidity_usd_enrich_sec"] = round(max(0.0, time.monotonic() - t_liq), 3)
     _apply_creation_dates_phase(uniq_rows, include_creation_dates=include_creation_dates)
-    # Aggregate low-level Infinity RPC diagnostics from per-owner attempts.
-    infinity_rpc = {
-        "requests": 0,
-        "attempts": 0,
-        "success": 0,
-        "failures": 0,
-        "first_try_fail": 0,
-        "retry_success": 0,
-        "ms_total": 0,
-        "last_error": "",
-    }
-    v3_scan_ctr = {
-        "scanned": 0,
-        "kept": 0,
-        "skipped_zero_liq": 0,
-        "invalid": 0,
-    }
+    v3_ctr = {"scanned": 0, "kept": 0, "skipped0": 0, "invalid": 0}
     for d in debug_rows:
         attempts = (d or {}).get("attempts") or []
         if not isinstance(attempts, list):
@@ -8400,41 +8277,19 @@ def _scan_pool_positions(
         for a in attempts:
             if not isinstance(a, dict):
                 continue
-            inf = a.get("infinity_debug") or {}
-            if not isinstance(inf, dict):
-                inf = {}
-            infinity_rpc["requests"] += int((inf or {}).get("rpc_getlogs_requests") or 0)
-            infinity_rpc["attempts"] += int((inf or {}).get("rpc_getlogs_attempts") or 0)
-            infinity_rpc["success"] += int((inf or {}).get("rpc_getlogs_success") or 0)
-            infinity_rpc["failures"] += int((inf or {}).get("rpc_getlogs_failures") or 0)
-            infinity_rpc["first_try_fail"] += int((inf or {}).get("rpc_getlogs_first_try_fail") or 0)
-            infinity_rpc["retry_success"] += int((inf or {}).get("rpc_getlogs_retry_success") or 0)
-            infinity_rpc["ms_total"] += int((inf or {}).get("rpc_getlogs_ms") or 0)
-            if not infinity_rpc["last_error"]:
-                infinity_rpc["last_error"] = str((inf or {}).get("rpc_getlogs_last_error") or "").strip()[:180]
             vd = a.get("v3_debug") or a.get("pancake_v3_debug") or {}
-            if isinstance(vd, dict):
-                v3_scan_ctr["scanned"] += int(vd.get("scanned_token_ids") or 0)
-                v3_scan_ctr["kept"] += int(vd.get("kept_positions") or 0)
-                v3_scan_ctr["skipped_zero_liq"] += int(vd.get("skipped_zero_liq") or 0)
-                v3_scan_ctr["invalid"] += int(vd.get("invalid_positions") or 0)
-    if int(infinity_rpc["requests"]) > 0 or int(infinity_rpc["attempts"]) > 0:
-        timings["infinity_rpc"] = {
-            "getlogs_requests": int(infinity_rpc["requests"]),
-            "getlogs_attempts": int(infinity_rpc["attempts"]),
-            "getlogs_success": int(infinity_rpc["success"]),
-            "getlogs_failures": int(infinity_rpc["failures"]),
-            "getlogs_first_try_fail": int(infinity_rpc["first_try_fail"]),
-            "getlogs_retry_success": int(infinity_rpc["retry_success"]),
-            "getlogs_ms_total": int(infinity_rpc["ms_total"]),
-            "getlogs_last_error": str(infinity_rpc["last_error"] or ""),
-        }
-    if int(v3_scan_ctr["scanned"]) > 0 or int(v3_scan_ctr["kept"]) > 0:
+            if not isinstance(vd, dict):
+                continue
+            v3_ctr["scanned"] += int(vd.get("scanned_token_ids") or 0)
+            v3_ctr["kept"] += int(vd.get("kept_positions") or 0)
+            v3_ctr["skipped0"] += int(vd.get("skipped_zero_liq") or 0)
+            v3_ctr["invalid"] += int(vd.get("invalid_positions") or 0)
+    if int(v3_ctr["scanned"]) > 0 or int(v3_ctr["kept"]) > 0:
         timings["v3_contract_scan"] = {
-            "scanned_token_ids": int(v3_scan_ctr["scanned"]),
-            "kept_positions": int(v3_scan_ctr["kept"]),
-            "skipped_zero_liq": int(v3_scan_ctr["skipped_zero_liq"]),
-            "invalid_positions": int(v3_scan_ctr["invalid"]),
+            "scanned_token_ids": int(v3_ctr["scanned"]),
+            "kept_positions": int(v3_ctr["kept"]),
+            "skipped_zero_liq": int(v3_ctr["skipped0"]),
+            "invalid_positions": int(v3_ctr["invalid"]),
         }
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
@@ -8443,7 +8298,7 @@ def _scan_pool_positions(
             dedup_errors.append("Pool scan reached fast-mode budget. Showing partial results.")
         else:
             dedup_errors.append(
-                f"Pool scan timed out after {int(scan_budget_sec)}s. Showing partial results."
+                f"Pool scan timed out after {POSITIONS_SCAN_MAX_SECONDS}s. Showing partial results."
             )
     timings["rows_before_aggregate"] = int(rows_before_aggregate)
     timings["rows_after_aggregate"] = int(len(uniq_rows))
@@ -10878,9 +10733,7 @@ def _render_positions_page() -> str:
         const v4Found = v4Rows
           .filter((x) => String(x?.status || "") === "ok")
           .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
-        const v4Errors = v4Rows
-          .filter((x) => String(x?.status || "") !== "ok")
-          .length;
+        const v4Errors = v4Rows.filter((x) => String(x?.status || "") !== "ok").length;
         const modeText = infinityMode ? "infinity" : "fast";
         const timingLines = [];
         const ts = (k) => Number(dbgTimings?.[k] || 0);
@@ -10908,24 +10761,7 @@ def _render_positions_page() -> str:
           timingLines.push(`slow_chains: ${slowChains.join(", ")}`);
         }
         const unfinished = Array.isArray(pool?.unfinished_chains) ? pool.unfinished_chains.map((x) => String(x || "")).filter(Boolean) : [];
-        if (unfinished.length) {
-          timingLines.push(`unfinished_chains: ${unfinished.join(", ")}`);
-        }
-        const infRpc = (pool && typeof pool.infinity_rpc === "object" && pool.infinity_rpc) ? pool.infinity_rpc : {};
-        if (Number(infRpc?.getlogs_requests || 0) > 0 || Number(infRpc?.getlogs_attempts || 0) > 0) {
-          timingLines.push(
-            `infinity_getLogs: req=${Number(infRpc.getlogs_requests || 0)} `
-            + `attempts=${Number(infRpc.getlogs_attempts || 0)} `
-            + `first_fail=${Number(infRpc.getlogs_first_try_fail || 0)} `
-            + `retry_ok=${Number(infRpc.getlogs_retry_success || 0)} `
-            + `ok=${Number(infRpc.getlogs_success || 0)} `
-            + `fail=${Number(infRpc.getlogs_failures || 0)} `
-            + `ms=${Number(infRpc.getlogs_ms_total || 0)}`
-          );
-          if (String(infRpc.getlogs_last_error || "").trim()) {
-            timingLines.push(`infinity_getLogs_last_error: ${String(infRpc.getlogs_last_error || "")}`);
-          }
-        }
+        if (unfinished.length) timingLines.push(`unfinished_chains: ${unfinished.join(", ")}`);
         const v3Scan = (pool && typeof pool.v3_contract_scan === "object" && pool.v3_contract_scan) ? pool.v3_contract_scan : {};
         if (Number(v3Scan?.scanned_token_ids || 0) > 0 || Number(v3Scan?.kept_positions || 0) > 0) {
           timingLines.push(
@@ -11089,7 +10925,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Pool</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -11120,7 +10956,7 @@ def _render_positions_page() -> str:
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         html += "<tr>";
         html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.pool_id || ""))}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
@@ -11140,7 +10976,7 @@ def _render_positions_page() -> str:
       if (!visible.length) html += "<tr><td colspan='12'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
-        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Pool</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
+        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Position ID</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
         for (let i = 0; i < hiddenRows.length; i++) {
           const r = hiddenRows[i];
           const mismatch = hasPairMismatch(r);
@@ -11153,7 +10989,7 @@ def _render_positions_page() -> str:
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
@@ -11243,9 +11079,8 @@ def _render_positions_page() -> str:
         const elapsedTxt = elapsedSec > 0 ? ` ${elapsedSec}s` : "";
         let uiProgress = progress;
         if (st === "running" && progress <= 15) {
-          // Backend can stay at 15% during core scan; keep UI moving smoothly.
-          // Do not pin at 64%, which looks like a frozen scan.
-          uiProgress = Math.min(94, 15 + Math.floor(elapsedSec * 2.2));
+          // Backend keeps 15% during core scan; show a smooth front-end estimate meanwhile.
+          uiProgress = Math.min(64, 15 + Math.floor(elapsedSec * 2.2));
         }
         const sLabel = statusStageLabel(stageLabel, st, partialRendered);
         const liveTag = partialRendered ? " | live" : "";
@@ -13534,7 +13369,7 @@ def _select_positions_chain_ids(requested_chain_ids_raw: list[int]) -> list[int]
     # By default scan all supported EVM chains; if chain_ids provided, preserve user order.
     # Prioritize chains where users most often track active LPs, and keep heavy
     # ethereum scan later so partial results include L2 pools under timeout.
-    preferred_order = [56, 130, 42161, 8453, 1, 10, 137]
+    preferred_order = [56, 42161, 8453, 130, 1, 10, 137]
     preferred_rank = {cid: idx for idx, cid in enumerate(preferred_order)}
     all_chain_ids = sorted(
         (
