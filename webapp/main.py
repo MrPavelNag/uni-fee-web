@@ -4246,20 +4246,25 @@ def _fetch_erc20_symbol_onchain(chain_id: int, token_address: str) -> str | None
     return sym or None
 
 
-def _token_display_symbol(chain_id: int, chain_key: str, token_obj: dict[str, Any]) -> str:
+def _token_display_symbol_with_source(chain_id: int, chain_key: str, token_obj: dict[str, Any]) -> tuple[str, str]:
     sym = str((token_obj or {}).get("symbol") or "").strip()
     if sym:
-        return sym
+        return sym, "token.symbol"
     addr = str((token_obj or {}).get("id") or "").strip().lower()
     if not addr:
-        return "?"
+        return "?", "missing"
     cfg_sym = (_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}).get(addr)
     if cfg_sym:
-        return cfg_sym
+        return cfg_sym, "curated_map"
     onchain = _fetch_erc20_symbol_onchain(int(chain_id), addr)
     if onchain:
-        return onchain
-    return (addr[:8] if len(addr) >= 8 else addr) or "?"
+        return onchain, "onchain_symbol"
+    return (addr[:8] if len(addr) >= 8 else addr) or "?", "address_fallback"
+
+
+def _token_display_symbol(chain_id: int, chain_key: str, token_obj: dict[str, Any]) -> str:
+    sym, _src = _token_display_symbol_with_source(chain_id, chain_key, token_obj)
+    return sym
 
 
 def _canonical_wrapped_native_symbol(symbol: str) -> str:
@@ -4319,6 +4324,15 @@ def _is_probably_spam_symbol(symbol: str) -> bool:
     if any(x in low for x in ("swap", " dao", "dao", " org", "org", "airdrop", "claim")):
         return True
     if re.fullmatch(r"0x[0-9a-f]{6,12}", low):
+        return True
+    # Human-like names are a common spam pattern in token symbols
+    # (e.g. JamesThomas, MariaWilliams) and should not be shown as pair tickers.
+    if re.fullmatch(r"[A-Z][a-z]+(?:[A-Z][a-z]+)+", s):
+        return True
+    if re.fullmatch(r"[A-Za-z]{8,}", s) and s != s.upper():
+        return True
+    # Very long all-caps "word" symbols are usually garbage/noise as well.
+    if re.fullmatch(r"[A-Z]{13,}", s):
         return True
     return False
 
@@ -6574,20 +6588,20 @@ def _scan_pool_positions_chain(
         t1_obj = pool.get("token1") or {}
         chain_addr_map = _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}
 
-        def _token_symbol_hint(token_obj: dict[str, Any]) -> str:
+        def _token_symbol_hint(token_obj: dict[str, Any]) -> tuple[str, str]:
             sym = str((token_obj or {}).get("symbol") or "").strip()
             if sym:
-                return _normalize_display_symbol(sym)
+                return _normalize_display_symbol(sym), "token.symbol"
             addr = str((token_obj or {}).get("id") or "").strip().lower()
             cfg = str(chain_addr_map.get(addr) or "").strip()
             if cfg:
-                return _normalize_display_symbol(cfg)
-            return "?"
+                return _normalize_display_symbol(cfg), "curated_map"
+            return "?", "missing"
 
         # Fast pre-check for suspected spam based on existing/cached symbols only.
         # Do this before expensive on-chain quote/snapshot calls.
-        t0 = _token_symbol_hint(t0_obj)
-        t1 = _token_symbol_hint(t1_obj)
+        t0, t0_src = _token_symbol_hint(t0_obj)
+        t1, t1_src = _token_symbol_hint(t1_obj)
         proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
         is_v3_npm_protocol = proto_label in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
         t0_hint_u = str(t0 or "").strip().upper()
@@ -6622,11 +6636,67 @@ def _scan_pool_positions_chain(
             if str(t0).upper() == "UNK" and str(t1).upper() == "UNK":
                 t0 = "Infinity"
                 t1 = f"#{pid}" if pid else "Position"
+                t0_src = "infinity_placeholder"
+                t1_src = "infinity_placeholder"
             elif str(t0).upper() == "UNK":
                 t0 = "Infinity"
+                t0_src = "infinity_placeholder"
             elif str(t1).upper() == "UNK":
                 t1 = f"#{pid}" if pid else "Position"
+                t1_src = "infinity_placeholder"
+        # Source of truth for v3 rows is on-chain position snapshot.
+        # If precheck flags spam, re-verify token symbols from contract first.
+        if suspected_spam_pre and version == "v3" and is_v3_npm_protocol and time.monotonic() < deadline_ts:
+            try:
+                contract_snapshot = _fetch_v3_position_contract_snapshot(
+                    int(chain_id),
+                    proto_label,
+                    _position_token_id_from_raw(p.get("id")),
+                    owner,
+                )
+            except Exception:
+                contract_snapshot = None
+            if contract_snapshot:
+                t0_snap = _normalize_display_symbol(str(contract_snapshot.get("token0_symbol") or ""))
+                t1_snap = _normalize_display_symbol(str(contract_snapshot.get("token1_symbol") or ""))
+                if t0_snap:
+                    t0 = t0_snap
+                    t0_src = "snapshot_symbol"
+                if t1_snap:
+                    t1 = t1_snap
+                    t1_src = "snapshot_symbol"
+                t0_obj = dict(t0_obj or {})
+                t1_obj = dict(t1_obj or {})
+                t0_obj["id"] = str(contract_snapshot.get("token0") or t0_obj.get("id") or "")
+                t1_obj["id"] = str(contract_snapshot.get("token1") or t1_obj.get("id") or "")
+                t0_obj["symbol"] = str(contract_snapshot.get("token0_symbol") or t0_obj.get("symbol") or "")
+                t1_obj["symbol"] = str(contract_snapshot.get("token1_symbol") or t1_obj.get("symbol") or "")
+                suspected_spam_pre = _is_suspected_spam_pair(
+                    chain_key,
+                    t0_obj if isinstance(t0_obj, dict) else {},
+                    t1_obj if isinstance(t1_obj, dict) else {},
+                    str(t0 or ""),
+                    str(t1 or ""),
+                    None,
+                )
+                if proto_label.startswith("pancake_"):
+                    suspected_spam_pre = False
+                if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
+                    suspected_spam_pre = False
         if suspected_spam_pre:
+            # Early spam path must sanitize displayed pair symbols too,
+            # otherwise hidden rows can show garbage names (e.g. ETH/JamesThomas).
+            if not proto_label.startswith("pancake_infinity_"):
+                t0_addr = str((t0_obj or {}).get("id") or "").strip().lower() if isinstance(t0_obj, dict) else ""
+                t1_addr = str((t1_obj or {}).get("id") or "").strip().lower() if isinstance(t1_obj, dict) else ""
+                t0_curated = bool(t0_addr and (t0_addr in chain_addr_map))
+                t1_curated = bool(t1_addr and (t1_addr in chain_addr_map))
+                if (not t0_curated) and _is_probably_spam_symbol(str(t0 or "")):
+                    t0 = "UNK"
+                    t0_src = f"{str(t0_src or '')}|precheck_sanitized_spam"
+                if (not t1_curated) and _is_probably_spam_symbol(str(t1 or "")):
+                    t1 = "UNK"
+                    t1_src = f"{str(t1_src or '')}|precheck_sanitized_spam"
             liq_spam = max(0, _parse_int_like(p.get("liquidity") or 0))
             return {
                 "address": owner,
@@ -6650,6 +6720,9 @@ def _scan_pool_positions_chain(
                 "position_amount1": 0.0,
                 "position_symbol0": str(t0 or ""),
                 "position_symbol1": str(t1 or ""),
+                "pair_symbol_source0": str(t0_src or ""),
+                "pair_symbol_source1": str(t1_src or ""),
+                "pair_symbol_source": f"0:{str(t0_src or '-')} | 1:{str(t1_src or '-')}",
                 "position_amounts_display": "0 / 0",
                 "fees_owed0": 0.0,
                 "fees_owed1": 0.0,
@@ -6660,8 +6733,10 @@ def _scan_pool_positions_chain(
             }
         # For non-spam rows, allow on-chain symbol fallback.
         if not proto_label.startswith("pancake_infinity_"):
-            t0 = _normalize_display_symbol(_token_display_symbol(int(chain_id), chain_key, t0_obj))
-            t1 = _normalize_display_symbol(_token_display_symbol(int(chain_id), chain_key, t1_obj))
+            t0_raw, t0_src = _token_display_symbol_with_source(int(chain_id), chain_key, t0_obj)
+            t1_raw, t1_src = _token_display_symbol_with_source(int(chain_id), chain_key, t1_obj)
+            t0 = _normalize_display_symbol(t0_raw)
+            t1 = _normalize_display_symbol(t1_raw)
         if version == "v3" and is_v3_npm_protocol:
             if time.monotonic() >= deadline_ts:
                 return None
@@ -6685,8 +6760,10 @@ def _scan_pool_positions_chain(
                 t1_snap = _normalize_display_symbol(str(contract_snapshot.get("token1_symbol") or ""))
                 if t0_snap:
                     t0 = t0_snap
+                    t0_src = "snapshot_symbol"
                 if t1_snap:
                     t1 = t1_snap
+                    t1_src = "snapshot_symbol"
                 if not isinstance(pool, dict):
                     pool = {}
                 pool = dict(pool)
@@ -6714,25 +6791,25 @@ def _scan_pool_positions_chain(
                 pool = p.get("pool") or {}
                 t0_obj = pool.get("token0") or {}
                 t1_obj = pool.get("token1") or {}
-                t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
-                t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
-                t0 = _normalize_display_symbol(t0)
-                t1 = _normalize_display_symbol(t1)
+                t0_raw, t0_src = _token_display_symbol_with_source(int(chain_id), chain_key, t0_obj)
+                t1_raw, t1_src = _token_display_symbol_with_source(int(chain_id), chain_key, t1_obj)
+                t0 = _normalize_display_symbol(t0_raw)
+                t1 = _normalize_display_symbol(t1_raw)
 
-        def _sanitize_pair_symbol(sym: str, token_obj: dict[str, Any]) -> str:
+        def _sanitize_pair_symbol(sym: str, token_obj: dict[str, Any], sym_src: str) -> tuple[str, str]:
             s = _normalize_display_symbol(str(sym or ""))
             if proto_label.startswith("pancake_infinity_"):
-                return s
+                return s, sym_src
             addr = str((token_obj or {}).get("id") or "").strip().lower()
             curated = bool(addr and (addr in chain_addr_map))
             if curated:
-                return s
+                return s, sym_src
             if _is_probably_spam_symbol(s):
-                return "UNK"
-            return s
+                return "UNK", f"{sym_src}|sanitized_spam"
+            return s, sym_src
 
-        t0 = _sanitize_pair_symbol(t0, t0_obj if isinstance(t0_obj, dict) else {})
-        t1 = _sanitize_pair_symbol(t1, t1_obj if isinstance(t1_obj, dict) else {})
+        t0, t0_src = _sanitize_pair_symbol(t0, t0_obj if isinstance(t0_obj, dict) else {}, str(t0_src or ""))
+        t1, t1_src = _sanitize_pair_symbol(t1, t1_obj if isinstance(t1_obj, dict) else {}, str(t1_src or ""))
 
         amount0_val: float | None = None
         amount1_val: float | None = None
@@ -6922,6 +6999,9 @@ def _scan_pool_positions_chain(
             "position_amount1": amount1_val,
             "position_symbol0": str(t0 or ""),
             "position_symbol1": str(t1 or ""),
+            "pair_symbol_source0": str(t0_src or ""),
+            "pair_symbol_source1": str(t1_src or ""),
+            "pair_symbol_source": f"0:{str(t0_src or '-')} | 1:{str(t1_src or '-')}",
             "position_amounts_display": position_amounts_display,
             "fees_owed0": fees0_val,
             "fees_owed1": fees1_val,
@@ -10226,7 +10306,11 @@ def _render_positions_page() -> str:
         const r = visible[i];
         const mismatch = hasPairMismatch(r);
         const mismatchCellStyle = mismatch ? " style='background:#fff7ed;color:#9a3412;font-weight:600'" : "";
-        const mismatchTitle = mismatch ? ` title="${escAttr(mismatchHint(r))}"` : "";
+        const pairTrace = String(r.pair_symbol_source || "").trim();
+        const pairTitleRaw = mismatch
+          ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`
+          : (pairTrace ? `source: ${pairTrace}` : "");
+        const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         html += "<tr>";
         html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
         html += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
@@ -10254,7 +10338,11 @@ def _render_positions_page() -> str:
           const r = hiddenRows[i];
           const mismatch = hasPairMismatch(r);
           const mismatchStyle = mismatch ? "background:#fff7ed;color:#9a3412;font-weight:600;" : "";
-          const mismatchTitle = mismatch ? ` title="${escAttr(mismatchHint(r))}"` : "";
+          const pairTrace = String(r.pair_symbol_source || "").trim();
+          const pairTitleRaw = mismatch
+            ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`
+            : (pairTrace ? `source: ${pairTrace}` : "");
+          const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
