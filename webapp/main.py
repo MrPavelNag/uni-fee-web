@@ -7151,6 +7151,11 @@ def _scan_pool_positions_chain(
         # Keep zero-liquidity positions (inactive/closed) in table output.
         # They can still have unclaimed fees and are important for full discovery.
         liq_raw = p.get("liquidity")
+        # Fast skip for empty positions by user rule:
+        # if position liquidity is zero, In position is effectively zero and
+        # this row should be hidden without extra on-chain quote calls.
+        if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
+            return None
         pool = p.get("pool") or {}
         fee_raw = str(pool.get("feeTier") or "").strip()
         fee_disp = fee_raw
@@ -7532,6 +7537,12 @@ def _scan_pool_positions_chain(
         fees_owed_display = f"{_fmt_amt(fees0_val, zero_if_missing=True)} / {_fmt_amt(fees1_val, zero_if_missing=True)}"
         a0_now = max(0.0, float(amount0_val or 0.0))
         a1_now = max(0.0, float(amount1_val or 0.0))
+        f0_now = max(0.0, float(fees0_val or 0.0))
+        f1_now = max(0.0, float(fees1_val or 0.0))
+        # User rule: hide rows when In position is fully zero.
+        # This is an intentionally aggressive filter.
+        if a0_now <= 0.0 and a1_now <= 0.0:
+            return None
         # Status is derived only from "In position":
         # inactive when either side is zero; active otherwise.
         position_status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
@@ -10802,6 +10813,14 @@ def _render_positions_page() -> str:
         const cacheHits = summaryFiltered
           .filter((x) => String(x?.query_mode || "") === "ownership_cache")
           .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
+        const v4Rows = summaryFiltered.filter((x) => String(x?.query_mode || "") === "contract_only_onchain_uniswap_v4_pm:onchain");
+        const v4Attempted = v4Rows.length;
+        const v4Found = v4Rows
+          .filter((x) => String(x?.status || "") === "ok")
+          .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
+        const v4Errors = v4Rows
+          .filter((x) => String(x?.status || "") !== "ok")
+          .length;
         const modeText = infinityMode ? "infinity" : "fast";
         const timingLines = [];
         const ts = (k) => Number(dbgTimings?.[k] || 0);
@@ -10853,6 +10872,7 @@ def _render_positions_page() -> str:
             .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")}: ${Number(x.count || 0)}`);
           const body = []
             .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
+            .concat([`v4: attempted=${v4Attempted} found=${v4Found} errors=${v4Errors}`])
             .concat(timingLines.length ? [`time: ${timingLines.join(" | ")}`] : [])
             .concat(compactLines.length ? compactLines : [])
             .join("\\n");
@@ -10865,6 +10885,7 @@ def _render_positions_page() -> str:
             .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`);
           const body = []
             .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
+            .concat([`v4: attempted=${v4Attempted} found=${v4Found} errors=${v4Errors}`])
             .concat(timingLines.length ? [`time: ${timingLines.join(" | ")}`] : [])
             .concat(detailedLines.length ? detailedLines : [])
             .join("\\n");
