@@ -356,6 +356,9 @@ CONTRACT_CREATION_DATE_CACHE: dict[tuple[int, str], str] = {}
 CONTRACT_CREATION_DATE_CACHE_LOCK = threading.Lock()
 POSITION_CREATION_DATE_CACHE: dict[tuple[int, str, int], str] = {}
 POSITION_CREATION_DATE_CACHE_LOCK = threading.Lock()
+POSITION_CONTRACT_SNAPSHOT_TTL_SEC = max(30, int(os.environ.get("POSITION_CONTRACT_SNAPSHOT_TTL_SEC", "600")))
+POSITION_CONTRACT_SNAPSHOT_CACHE: dict[tuple[int, str, int], tuple[float, dict[str, Any]]] = {}
+POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK = threading.Lock()
 MAJOR_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 MAJOR_ASSET_PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("MAJOR_ASSET_PRICE_CACHE_TTL_SEC", "300")))
 getcontext().prec = 48
@@ -2432,6 +2435,106 @@ def _quote_v3_collect_fees_amounts(
         except Exception:
             continue
     return None, None
+
+
+def _fetch_v3_position_contract_snapshot(
+    chain_id: int,
+    protocol: str,
+    token_id: int,
+    owner_hint: str,
+) -> dict[str, Any] | None:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    tid = int(token_id)
+    owner_addr = str(owner_hint or "").strip().lower()
+    if tid <= 0:
+        return None
+    cache_key = (cid, proto, tid)
+    now = time.time()
+    with POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK:
+        cached = POSITION_CONTRACT_SNAPSHOT_CACHE.get(cache_key)
+    if cached:
+        ts, payload = cached
+        if (now - float(ts or 0.0)) <= float(POSITION_CONTRACT_SNAPSHOT_TTL_SEC):
+            return dict(payload or {})
+    pm = _position_manager_for_protocol(cid, proto)
+    if not _is_eth_address(pm):
+        return None
+    factory = UNISWAP_V3_FACTORY_BY_CHAIN_ID.get(cid)
+    if not _is_eth_address(str(factory or "")):
+        return None
+    try:
+        pos_data = "0x99fbab88" + _encode_uint_word(int(tid))
+        words = _hex_words(_eth_call_hex(cid, pm, pos_data))
+        if len(words) < 12:
+            return None
+        nonce = _decode_uint_from_word(words[0])
+        operator = _decode_address_from_word(words[1])
+        token0 = _decode_address_from_word(words[2]).lower()
+        token1 = _decode_address_from_word(words[3]).lower()
+        fee = _decode_uint_from_word(words[4])
+        tick_lower = _decode_int_from_word(words[5])
+        tick_upper = _decode_int_from_word(words[6])
+        liq = max(0, _decode_uint_from_word(words[7]))
+        owed0_raw = max(0, _decode_uint_from_word(words[10]))
+        owed1_raw = max(0, _decode_uint_from_word(words[11]))
+        pool_data = (
+            "0x1698ee82"
+            + _encode_address_word(token0)
+            + _encode_address_word(token1)
+            + _encode_uint_word(int(fee))
+        )
+        pool_words = _hex_words(_eth_call_hex(cid, str(factory), pool_data))
+        pool_addr = _decode_address_from_word(pool_words[0]).lower() if pool_words else ""
+        sqrt_price_x96 = 0
+        pool_liq = 0
+        if _is_eth_address(pool_addr):
+            slot0_words = _hex_words(_eth_call_hex(cid, pool_addr, "0x3850c7bd"))
+            sqrt_price_x96 = _decode_uint_from_word(slot0_words[0]) if slot0_words else 0
+            pool_liq = max(0, _decode_uint_eth_call(_eth_call_hex(cid, pool_addr, "0x1a686502")))
+        dec0 = _fetch_erc20_decimals_onchain(cid, token0)
+        dec1 = _fetch_erc20_decimals_onchain(cid, token1)
+        sym0 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token0) or "")
+        sym1 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token1) or "")
+        q_amount0, q_amount1 = _quote_v3_decrease_liquidity_amounts(
+            cid, proto, tid, liq, owner_addr, dec0, dec1
+        )
+        q_fee0, q_fee1 = _quote_v3_collect_fees_amounts(
+            cid, proto, tid, owner_addr, dec0, dec1
+        )
+        payload: dict[str, Any] = {
+            "chain_id": cid,
+            "protocol": proto,
+            "position_manager": pm,
+            "token_id": tid,
+            "owner_hint": owner_addr,
+            "nonce": int(nonce),
+            "operator": str(operator or "").lower(),
+            "token0": str(token0),
+            "token1": str(token1),
+            "fee": int(fee),
+            "tick_lower": int(tick_lower),
+            "tick_upper": int(tick_upper),
+            "liquidity": int(liq),
+            "tokens_owed0_raw": int(owed0_raw),
+            "tokens_owed1_raw": int(owed1_raw),
+            "pool_address": str(pool_addr or ""),
+            "pool_sqrt_price_x96": int(sqrt_price_x96),
+            "pool_liquidity": int(pool_liq),
+            "token0_decimals": int(dec0),
+            "token1_decimals": int(dec1),
+            "token0_symbol": str(sym0 or ""),
+            "token1_symbol": str(sym1 or ""),
+            "quote_amount0": q_amount0,
+            "quote_amount1": q_amount1,
+            "quote_fee0": q_fee0,
+            "quote_fee1": q_fee1,
+        }
+        with POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK:
+            POSITION_CONTRACT_SNAPSHOT_CACHE[cache_key] = (now, payload)
+        return dict(payload)
+    except Exception:
+        return None
 
 
 def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[str, Any]) -> float | None:
@@ -6305,6 +6408,8 @@ def _scan_pool_positions_chain(
         t0 = _normalize_display_symbol(t0)
         t1 = _normalize_display_symbol(t1)
         proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
+        is_v3_npm_protocol = proto_label in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
+        contract_snapshot: dict[str, Any] | None = None
         if proto_label.startswith("pancake_infinity_"):
             raw_pid = str(p.get("id") or "").strip()
             pid = raw_pid.split(":", 1)[1] if ":" in raw_pid else raw_pid
@@ -6315,6 +6420,47 @@ def _scan_pool_positions_chain(
                 t0 = "Infinity"
             elif str(t1).upper() == "UNK":
                 t1 = f"#{pid}" if pid else "Position"
+        elif version == "v3" and is_v3_npm_protocol:
+            try:
+                contract_snapshot = _fetch_v3_position_contract_snapshot(
+                    int(chain_id),
+                    proto_label,
+                    _position_token_id_from_raw(p.get("id")),
+                    owner,
+                )
+            except Exception:
+                contract_snapshot = None
+            if contract_snapshot:
+                try:
+                    p["liquidity"] = str(int(contract_snapshot.get("liquidity") or 0))
+                    p["tokensOwed0"] = str(int(contract_snapshot.get("tokens_owed0_raw") or 0))
+                    p["tokensOwed1"] = str(int(contract_snapshot.get("tokens_owed1_raw") or 0))
+                    p["_contract_snapshot_source"] = "v3_npm_eth_call"
+                except Exception:
+                    pass
+                t0_snap = _normalize_display_symbol(str(contract_snapshot.get("token0_symbol") or ""))
+                t1_snap = _normalize_display_symbol(str(contract_snapshot.get("token1_symbol") or ""))
+                if t0_snap:
+                    t0 = t0_snap
+                if t1_snap:
+                    t1 = t1_snap
+                if not isinstance(pool, dict):
+                    pool = {}
+                pool = dict(pool)
+                pool["feeTier"] = str(contract_snapshot.get("fee") or pool.get("feeTier") or "")
+                pool["liquidity"] = str(contract_snapshot.get("pool_liquidity") or pool.get("liquidity") or "0")
+                pool["sqrtPrice"] = str(contract_snapshot.get("pool_sqrt_price_x96") or pool.get("sqrtPrice") or "0")
+                pool["id"] = str(contract_snapshot.get("pool_address") or pool.get("id") or "")
+                t0_obj = dict(t0_obj or {})
+                t1_obj = dict(t1_obj or {})
+                t0_obj["id"] = str(contract_snapshot.get("token0") or t0_obj.get("id") or "")
+                t1_obj["id"] = str(contract_snapshot.get("token1") or t1_obj.get("id") or "")
+                t0_obj["decimals"] = str(contract_snapshot.get("token0_decimals") or t0_obj.get("decimals") or "18")
+                t1_obj["decimals"] = str(contract_snapshot.get("token1_decimals") or t1_obj.get("decimals") or "18")
+                t0_obj["symbol"] = str(contract_snapshot.get("token0_symbol") or t0_obj.get("symbol") or "")
+                t1_obj["symbol"] = str(contract_snapshot.get("token1_symbol") or t1_obj.get("symbol") or "")
+                pool["token0"] = t0_obj
+                pool["token1"] = t1_obj
         # Exact-only output: show on-chain token amounts and owed fees.
         if hard_scan and allow_live_enrich and version == "v3":
             onchain_enriched = _fetch_v3_position_onchain_by_token_id(
@@ -6335,11 +6481,21 @@ def _scan_pool_positions_chain(
 
         amount0_val: float | None = None
         amount1_val: float | None = None
+        if contract_snapshot:
+            try:
+                q0 = contract_snapshot.get("quote_amount0")
+                q1 = contract_snapshot.get("quote_amount1")
+                if q0 is not None:
+                    amount0_val = float(q0)
+                if q1 is not None:
+                    amount1_val = float(q1)
+            except Exception:
+                pass
         raw_amount0 = _safe_float(p.get("position_amount0"))
         raw_amount1 = _safe_float(p.get("position_amount1"))
-        if raw_amount0 is not None:
+        if raw_amount0 is not None and amount0_val is None:
             amount0_val = float(raw_amount0)
-        if raw_amount1 is not None:
+        if raw_amount1 is not None and amount1_val is None:
             amount1_val = float(raw_amount1)
 
         dec0 = _parse_int_like((pool.get("token0") or {}).get("decimals") or 18)
@@ -6352,6 +6508,8 @@ def _scan_pool_positions_chain(
         # Prefer direct on-chain quote from position manager instead of local math.
         need_direct_quote = bool(
             version == "v3"
+            and is_v3_npm_protocol
+            and not contract_snapshot
             and (
                 amount0_val is None
                 or amount1_val is None
@@ -6387,7 +6545,7 @@ def _scan_pool_positions_chain(
                     amount1_val = None
         owed0_raw = max(0, _parse_int_like(p.get("tokensOwed0") or 0))
         owed1_raw = max(0, _parse_int_like(p.get("tokensOwed1") or 0))
-        if version == "v3" and owed0_raw == 0 and owed1_raw == 0 and liq_int > 0:
+        if version == "v3" and is_v3_npm_protocol and owed0_raw == 0 and owed1_raw == 0 and liq_int > 0:
             owed_direct = _fetch_v3_tokens_owed_raw(
                 int(chain_id),
                 str(p.get("_protocol_label") or f"uniswap_{version}"),
@@ -6398,7 +6556,17 @@ def _scan_pool_positions_chain(
                 owed1_raw = int(owed_direct[1] or 0)
         fees0_val: float | None = None
         fees1_val: float | None = None
-        if version == "v3":
+        if contract_snapshot:
+            try:
+                fq0 = contract_snapshot.get("quote_fee0")
+                fq1 = contract_snapshot.get("quote_fee1")
+                if fq0 is not None:
+                    fees0_val = float(fq0)
+                if fq1 is not None:
+                    fees1_val = float(fq1)
+            except Exception:
+                pass
+        if version == "v3" and is_v3_npm_protocol and (fees0_val is None or fees1_val is None):
             try:
                 qf0, qf1 = _quote_v3_collect_fees_amounts(
                     int(chain_id),
@@ -6474,6 +6642,30 @@ def _scan_pool_positions_chain(
             "fees_owed0": fees0_val,
             "fees_owed1": fees1_val,
             "fees_owed_display": fees_owed_display,
+            "contract_source": str(p.get("_contract_snapshot_source") or ""),
+            "contract_position_manager": str((contract_snapshot or {}).get("position_manager") or ""),
+            "contract_token_id": int((contract_snapshot or {}).get("token_id") or _position_token_id_from_raw(p.get("id")) or 0),
+            "contract_nonce": int((contract_snapshot or {}).get("nonce") or 0),
+            "contract_operator": str((contract_snapshot or {}).get("operator") or ""),
+            "contract_token0": str((contract_snapshot or {}).get("token0") or ""),
+            "contract_token1": str((contract_snapshot or {}).get("token1") or ""),
+            "contract_fee": int((contract_snapshot or {}).get("fee") or _parse_int_like(fee_raw) or 0),
+            "contract_tick_lower": int((contract_snapshot or {}).get("tick_lower") or 0),
+            "contract_tick_upper": int((contract_snapshot or {}).get("tick_upper") or 0),
+            "contract_liquidity": int((contract_snapshot or {}).get("liquidity") or liq_int or 0),
+            "contract_tokens_owed0_raw": int((contract_snapshot or {}).get("tokens_owed0_raw") or owed0_raw or 0),
+            "contract_tokens_owed1_raw": int((contract_snapshot or {}).get("tokens_owed1_raw") or owed1_raw or 0),
+            "contract_pool_address": str((contract_snapshot or {}).get("pool_address") or str(pool.get("id") or "")),
+            "contract_pool_sqrt_price_x96": int((contract_snapshot or {}).get("pool_sqrt_price_x96") or _parse_int_like(pool.get("sqrtPrice") or 0) or 0),
+            "contract_pool_liquidity": int((contract_snapshot or {}).get("pool_liquidity") or _parse_int_like(pool.get("liquidity") or 0) or 0),
+            "contract_token0_decimals": int((contract_snapshot or {}).get("token0_decimals") or dec0 or 18),
+            "contract_token1_decimals": int((contract_snapshot or {}).get("token1_decimals") or dec1 or 18),
+            "contract_token0_symbol": str((contract_snapshot or {}).get("token0_symbol") or t0 or ""),
+            "contract_token1_symbol": str((contract_snapshot or {}).get("token1_symbol") or t1 or ""),
+            "contract_quote_amount0": amount0_val,
+            "contract_quote_amount1": amount1_val,
+            "contract_quote_fee0": fees0_val,
+            "contract_quote_fee1": fees1_val,
             "position_created_date": _position_creation_date_peek(
                 int(chain_id),
                 str(p.get("_protocol_label") or f"uniswap_{version}"),
@@ -9063,8 +9255,8 @@ def _render_positions_page() -> str:
       }
     }
     function scheduleBackgroundWarmup(reason = "auto") {
-      if (posAutoWarmupTimer) clearTimeout(posAutoWarmupTimer);
-      posAutoWarmupTimer = setTimeout(() => startBackgroundWarmup(reason), 700);
+      // Temporarily disabled: no additional background scan passes.
+      return;
     }
     function stopPosScanProgressTicker() {
       if (posScanTicker) {
@@ -9479,7 +9671,8 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      const baseCols = 11;
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th><th>c:source</th><th>c:pm</th><th>c:tokenId</th><th>c:nonce</th><th>c:operator</th><th>c:token0</th><th>c:token1</th><th>c:fee</th><th>c:tickL</th><th>c:tickU</th><th>c:liq</th><th>c:owed0_raw</th><th>c:owed1_raw</th><th>c:pool</th><th>c:sqrtX96</th><th>c:poolLiq</th><th>c:dec0</th><th>c:dec1</th><th>c:sym0</th><th>c:sym1</th><th>c:qAmt0</th><th>c:qAmt1</th><th>c:qFee0</th><th>c:qFee1</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -9520,9 +9713,33 @@ def _render_positions_page() -> str:
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
         const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
+        html += `<td>${esc(r.contract_source || "")}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_position_manager || ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token_id ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_nonce ?? ""))}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_operator || ""))}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_token0 || ""))}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_token1 || ""))}</td>`;
+        html += `<td>${esc(String(r.contract_fee ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_tick_lower ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_tick_upper ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_liquidity ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_tokens_owed0_raw ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_tokens_owed1_raw ?? ""))}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_pool_address || ""))}</td>`;
+        html += `<td>${esc(String(r.contract_pool_sqrt_price_x96 ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_pool_liquidity ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token0_decimals ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token1_decimals ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token0_symbol ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token1_symbol ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_quote_amount0 ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_quote_amount1 ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_quote_fee0 ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_quote_fee1 ?? ""))}</td>`;
         html += "</tr>";
       }
-      if (!visible.length) html += "<tr><td colspan='11'>No pool positions found.</td></tr>";
+      if (!visible.length) html += "<tr><td colspan='35'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
         hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position created</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
@@ -9538,7 +9755,7 @@ def _render_positions_page() -> str:
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
-        html += `<tr><td colspan='11'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='35'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       const detailsEl = document.getElementById("posHiddenDetails");
@@ -9569,6 +9786,18 @@ def _render_positions_page() -> str:
         if (infos.length) return ` | ${String(infos[0] || "")}`;
         return "";
       }
+      function statusMetrics(payload) {
+        const pools = Array.isArray(payload?.pool_positions) ? payload.pool_positions.length : 0;
+        const checks = Array.isArray(payload?.debug?.pool_scan) ? payload.debug.pool_scan.length : 0;
+        let cacheHits = 0;
+        const sum = Array.isArray(payload?.debug?.summary) ? payload.debug.summary : [];
+        for (const s of sum) {
+          if (String(s?.query_mode || "") === "ownership_cache") {
+            cacheHits += Math.max(0, Number(s?.count || 0));
+          }
+        }
+        return ` | pools=${pools} checks=${checks}${cacheHits ? ` cache=${cacheHits}` : ""}`;
+      }
       while (true) {
         const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
         const data = await r.json().catch(() => ({}));
@@ -9576,6 +9805,8 @@ def _render_positions_page() -> str:
         const st = String(data.status || "");
         const stageLabel = String(data.stage_label || data.stage || "");
         const progress = Number(data.progress || 0);
+        const startedAt = Number(data.started_at || 0);
+        const elapsedSec = startedAt > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - startedAt)) : 0;
         const partial = data.result || {};
         if (partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length) {
           posCache.pools = partial.pool_positions || [];
@@ -9589,10 +9820,12 @@ def _render_positions_page() -> str:
           return Object.assign({__partial: true}, partial);
         }
         const statusTail = statusTailFromPayload(partial);
+        const metrics = statusMetrics(partial);
+        const elapsedTxt = elapsedSec > 0 ? ` ${elapsedSec}s` : "";
         if (partialRendered) {
-          setPosStatus(`${stageLabel || "Background scan"}... ${progress}% (table updates live)${statusTail}`, false);
+          setPosStatus(`${stageLabel || "Background scan"}${elapsedTxt}... ${progress}% (table updates live)${metrics}${statusTail}`, false);
         } else {
-          setPosStatus(`${stageLabel || "Scanning in background"}... ${progress}%${statusTail}`, false);
+          setPosStatus(`${stageLabel || "Scanning in background"}${elapsedTxt}... ${progress}%${metrics}${statusTail}`, false);
         }
         await new Promise((resolve) => setTimeout(resolve, 1200));
       }
@@ -12067,24 +12300,16 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
     pool_rows = result.get("pool_positions") or []
     if not isinstance(pool_rows, list) or not pool_rows:
         return
-    if not hard_scan:
-        if _update_pos_job(
-            job_id,
-            result=result,
-            stage="fast_dates",
-            stage_label="Fast mode: quick date backfill",
-            progress=82,
-        ) is None:
-            return
-        _enrich_missing_creation_dates(pool_rows, max_seconds=6, max_rows=120)
-        _update_pos_job(
-            job_id,
-            result=result,
-            stage="finalize",
-            stage_label="Fast mode: skipping heavy enrichments",
-            progress=95,
-        )
-        return
+    # Temporary mode: disable post-scan enrichment phases entirely.
+    # Keep only base scan payload so the table reflects direct scan outputs.
+    _update_pos_job(
+        job_id,
+        result=result,
+        stage="finalize",
+        stage_label="Post-scan enrichment is temporarily disabled",
+        progress=95,
+    )
+    return
     rows_count = int(len(pool_rows))
     if _update_pos_job(
         job_id,
