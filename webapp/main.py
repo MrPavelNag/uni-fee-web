@@ -3264,29 +3264,20 @@ def _scan_erc721_token_ids_by_explorer_api(
     if not _is_eth_address(c) or not _is_eth_address(o):
         return []
     chainid_for_v2 = {56: "56", 8453: "8453"}.get(cid, "")
-    api_base_v1 = {56: "https://api.bscscan.com/api", 8453: "https://api.basescan.org/api"}.get(cid, "")
-    if not chainid_for_v2 and not api_base_v1:
+    if not chainid_for_v2:
         return []
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
-    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
+    v2_key = {56: bsc_key, 8453: (base_key or eth_key)}.get(cid, "") or eth_key
+    if not v2_key:
+        return []
     urls: list[str] = []
-    if chainid_for_v2 and eth_key:
-        urls.append(
-            "https://api.etherscan.io/v2/api"
-            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={eth_key}"
-        )
-    if cid == 56 and bsc_key:
-        urls.append(
-            f"{api_base_v1}?module=account&action=tokennfttx"
-            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={bsc_key}"
-        )
-    elif cid == 8453 and base_key:
-        urls.append(
-            f"{api_base_v1}?module=account&action=tokennfttx"
-            f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={base_key}"
-        )
+    urls.append(
+        "https://api.etherscan.io/v2/api"
+        f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+        f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={v2_key}"
+    )
     if not urls:
         return []
     rows: list[dict[str, Any]] = []
@@ -3332,29 +3323,20 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     if not _is_eth_address(o):
         return []
     chainid_for_v2 = {56: "56", 8453: "8453"}.get(cid, "")
-    api_base_v1 = {56: "https://api.bscscan.com/api", 8453: "https://api.basescan.org/api"}.get(cid, "")
-    if not chainid_for_v2 and not api_base_v1:
+    if not chainid_for_v2:
         return []
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
-    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
+    v2_key = {56: bsc_key, 8453: (base_key or eth_key)}.get(cid, "") or eth_key
+    if not v2_key:
+        return []
     urls: list[str] = []
-    if chainid_for_v2 and eth_key:
-        urls.append(
-            "https://api.etherscan.io/v2/api"
-            f"?chainid={chainid_for_v2}&module=account&action=txlist"
-            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={eth_key}"
-        )
-    if cid == 56 and bsc_key:
-        urls.append(
-            f"{api_base_v1}?module=account&action=txlist"
-            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={bsc_key}"
-        )
-    elif cid == 8453 and base_key:
-        urls.append(
-            f"{api_base_v1}?module=account&action=txlist"
-            f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={base_key}"
-        )
+    urls.append(
+        "https://api.etherscan.io/v2/api"
+        f"?chainid={chainid_for_v2}&module=account&action=txlist"
+        f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={v2_key}"
+    )
     if not urls:
         return []
     for url in urls:
