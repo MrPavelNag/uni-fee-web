@@ -1172,6 +1172,7 @@ def _position_index_refresh_owner_chain(
                     inf_bin_mgr,
                     owner_addr,
                     max_ids=max(40, POSITIONS_OWNERSHIP_INDEX_MAX_NFTS // 2),
+                    protocol="pancake_infinity_bin",
                 )
             except Exception:
                 bin_ids = []
@@ -1303,7 +1304,13 @@ def _update_infinity_index_for_owner(
         raise HTTPException(status_code=400, detail=f"Infinity CL position manager is not configured for chain {cid}.")
 
     deadline_ts = time.monotonic() + 25.0
-    explorer_ids = _scan_erc721_token_ids_by_explorer_api(cid, pm, owner_addr, max_ids=240)
+    explorer_ids = _scan_erc721_token_ids_by_explorer_api(
+        cid,
+        pm,
+        owner_addr,
+        max_ids=240,
+        protocol="pancake_infinity_cl",
+    )
     receipt_ids, receipt_checked = _scan_cl_token_ids_from_owner_receipts(
         cid,
         pm,
@@ -3466,6 +3473,17 @@ def _position_creation_date_peek(chain_id: int, protocol: str, position_id: Any)
     return str(cached or "")
 
 
+def _position_creation_date_cache_set(chain_id: int, protocol: str, position_id: Any, date_str: str) -> None:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    tid = _position_token_id_from_raw(position_id)
+    d = str(date_str or "").strip()
+    if cid <= 0 or not proto or tid <= 0 or not d:
+        return
+    with POSITION_CREATION_DATE_CACHE_LOCK:
+        POSITION_CREATION_DATE_CACHE[(cid, proto, int(tid))] = d
+
+
 def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -3873,13 +3891,13 @@ def _scan_cl_mintposition_token_ids_by_owner(
     return out
 
 
-def _scan_erc721_token_ids_by_explorer_api(
+def _explorer_nfttx_rows(
     chain_id: int,
     contract: str,
     owner: str,
     *,
-    max_ids: int = 120,
-) -> list[int]:
+    max_rows: int = 200,
+) -> list[dict[str, Any]]:
     cid = int(chain_id)
     c = str(contract or "").strip().lower()
     o = str(owner or "").strip().lower()
@@ -3891,15 +3909,27 @@ def _scan_erc721_token_ids_by_explorer_api(
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
-    v2_key = {56: bsc_key, 8453: (base_key or eth_key)}.get(cid, "") or eth_key
-    if not v2_key:
-        return []
     urls: list[str] = []
-    urls.append(
-        "https://api.etherscan.io/v2/api"
-        f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-        f"&contractaddress={c}&address={o}&page=1&offset=200&sort=desc&apikey={v2_key}"
-    )
+    offset = max(20, min(1000, int(max_rows)))
+    if cid == 56 and bsc_key:
+        urls.append(
+            "https://api.bscscan.com/api"
+            f"?module=account&action=tokennfttx&contractaddress={c}"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}"
+        )
+    elif cid == 8453 and base_key:
+        urls.append(
+            "https://api.basescan.org/api"
+            f"?module=account&action=tokennfttx&contractaddress={c}"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}"
+        )
+    # Secondary fallback via Etherscan V2 unified endpoint.
+    if eth_key:
+        urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+            f"&contractaddress={c}&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}"
+        )
     if not urls:
         return []
     rows: list[dict[str, Any]] = []
@@ -3915,10 +3945,30 @@ def _scan_erc721_token_ids_by_explorer_api(
                     break
         except Exception:
             continue
+    return rows
+
+
+def _scan_erc721_token_ids_by_explorer_api(
+    chain_id: int,
+    contract: str,
+    owner: str,
+    *,
+    max_ids: int = 120,
+    protocol: str = "",
+) -> list[int]:
+    cid = int(chain_id)
+    rows = _explorer_nfttx_rows(
+        cid,
+        contract,
+        owner,
+        max_rows=max(200, int(max_ids) * 4),
+    )
     if not rows:
         return []
     out: list[int] = []
     seen: set[int] = set()
+    proto = str(protocol or "").strip().lower()
+    min_ts_by_tid: dict[int, int] = {}
     for r in rows:
         tid_raw = str(r.get("tokenID") or "").strip()
         if not tid_raw:
@@ -3931,11 +3981,31 @@ def _scan_erc721_token_ids_by_explorer_api(
             except Exception:
                 continue
         if tid <= 0 or tid in seen:
-            continue
-        seen.add(tid)
-        out.append(int(tid))
+            pass
+        else:
+            seen.add(tid)
+            out.append(int(tid))
+        ts = _parse_int_like(r.get("timeStamp") or 0)
+        if ts > 0:
+            prev = int(min_ts_by_tid.get(int(tid), 0) or 0)
+            if prev <= 0 or int(ts) < prev:
+                min_ts_by_tid[int(tid)] = int(ts)
         if len(out) >= int(max_ids):
-            break
+            # keep scanning current rows for earlier timestamps of already collected tokenIds
+            continue
+    if len(out) > int(max_ids):
+        out = out[: int(max_ids)]
+    if proto:
+        for tid in out:
+            ts = int(min_ts_by_tid.get(int(tid), 0) or 0)
+            if ts <= 0:
+                continue
+            try:
+                d = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
+            except Exception:
+                d = ""
+            if d:
+                _position_creation_date_cache_set(cid, proto, tid, d)
     return out
 
 
@@ -3950,15 +4020,25 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
-    v2_key = {56: bsc_key, 8453: (base_key or eth_key)}.get(cid, "") or eth_key
-    if not v2_key:
-        return []
     urls: list[str] = []
-    urls.append(
-        "https://api.etherscan.io/v2/api"
-        f"?chainid={chainid_for_v2}&module=account&action=txlist"
-        f"&address={o}&page=1&offset={max(50, int(max_items))}&sort=desc&apikey={v2_key}"
-    )
+    offset = max(50, int(max_items))
+    if cid == 56 and bsc_key:
+        urls.append(
+            "https://api.bscscan.com/api"
+            f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}"
+        )
+    elif cid == 8453 and base_key:
+        urls.append(
+            "https://api.basescan.org/api"
+            f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}"
+        )
+    # Secondary fallback via Etherscan V2 unified endpoint.
+    if eth_key:
+        urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=txlist"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}"
+        )
     if not urls:
         return []
     for url in urls:
@@ -4893,6 +4973,7 @@ def _scan_infinity_position_ids_for_owner(
     owner = str(owner_addr or "").strip().lower()
     if not _is_eth_address(owner):
         return []
+    owner_word = _encode_address_word(owner)[-40:]
     pm = str(position_manager or "").strip().lower()
     if not _is_eth_address(pm):
         return []
@@ -4996,9 +5077,46 @@ def _scan_infinity_position_ids_for_owner(
             seen_ids.add(int(tid))
             token_ids.append(int(tid))
     if POSITIONS_CONTRACT_ONLY_ENABLED:
-        # Root-cause fix for hangs and misses:
-        # 1) use direct Transfer(to=owner) logs first (contract-native discovery),
-        # 2) only then fallback to ownerOf batch scan if ids are still missing.
+        # Stage 1 (fast): explorer NFT transfers for candidate token IDs.
+        # Keep final ownership strict via direct ownerOf verification.
+        proto_hint = ""
+        if pm == str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid, "") or "").strip().lower():
+            proto_hint = "pancake_infinity_cl"
+        elif pm == str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid, "") or "").strip().lower():
+            proto_hint = "pancake_infinity_bin"
+        if len(token_ids) < limit:
+            explorer_ids = _scan_erc721_token_ids_by_explorer_api(
+                cid,
+                pm,
+                owner,
+                max_ids=max(limit * 4, limit),
+                protocol=proto_hint,
+            )
+            if dbg is not None:
+                dbg["explorer_token_ids"] = int(len(explorer_ids))
+            for tid in explorer_ids:
+                if len(token_ids) >= limit:
+                    break
+                if int(tid) in seen_ids:
+                    continue
+                if dbg is not None:
+                    dbg["explorer_ownerof_checked"] = int(dbg.get("explorer_ownerof_checked") or 0) + 1
+                try:
+                    owner_data = "0x6352211e" + _encode_uint_word(int(tid))
+                    owner_hex = _eth_call_hex(cid, pm, owner_data)
+                    owner_words = _hex_words(owner_hex)
+                    if not owner_words:
+                        continue
+                    current_owner = owner_words[0][-40:].lower()
+                    if current_owner != owner_word:
+                        continue
+                except Exception:
+                    continue
+                if dbg is not None:
+                    dbg["explorer_ownerof_matched"] = int(dbg.get("explorer_ownerof_matched") or 0) + 1
+                seen_ids.add(int(tid))
+                token_ids.append(int(tid))
+        # Stage 2 fallback: direct Transfer(to=owner) logs (contract-native discovery).
         if len(token_ids) < limit:
             t_logs0 = time.perf_counter()
             log_ids = _scan_erc721_token_ids_by_incoming_logs(
