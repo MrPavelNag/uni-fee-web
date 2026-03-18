@@ -220,6 +220,10 @@ POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().l
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "45")))
+POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = max(
+    int(POSITIONS_SCAN_MAX_SECONDS),
+    int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY", "90")),
+)
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
@@ -246,6 +250,10 @@ POSITIONS_INFINITY_HEAVY_METHODS = os.environ.get("POSITIONS_INFINITY_HEAVY_METH
 POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
+POSITIONS_INFINITY_BATCH_MAX_CHECKS_ON_PRUNED = max(
+    500,
+    int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS_ON_PRUNED", "3000")),
+)
 POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
 POSITIONS_RPC_BATCH_MAX_ITEMS = max(10, min(200, int(os.environ.get("POSITIONS_RPC_BATCH_MAX_ITEMS", "50"))))
 POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK = os.environ.get("POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK", "0").strip().lower() in (
@@ -4942,6 +4950,8 @@ def _scan_infinity_position_ids_for_owner(
                 "rpc_getlogs_last_error": "",
                 "rpc_getlogs_pruned_errors": 0,
                 "rpc_getlogs_stop_reason": "",
+                "direct_contract_only": False,
+                "direct_contract_no_ids": False,
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -4997,6 +5007,8 @@ def _scan_infinity_position_ids_for_owner(
             seen_ids.add(int(tid))
             token_ids.append(int(tid))
     if POSITIONS_CONTRACT_ONLY_ENABLED:
+        if dbg is not None:
+            dbg["direct_contract_only"] = True
         # Root-cause fix for hangs and misses:
         # 1) use direct Transfer(to=owner) logs first (contract-native discovery),
         # 2) only then fallback to ownerOf batch scan if ids are still missing.
@@ -5022,15 +5034,19 @@ def _scan_infinity_position_ids_for_owner(
                 seen_ids.add(int(tid))
                 token_ids.append(int(tid))
         stop_reason = str((dbg or {}).get("rpc_getlogs_stop_reason") or "").strip().lower()
-        skip_batch_on_pruned = stop_reason == "pruned_history"
-        if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN and not skip_batch_on_pruned:
+        pruned_history = stop_reason == "pruned_history"
+        if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN:
             t_batch0 = time.perf_counter()
+            max_checks = int(POSITIONS_INFINITY_BATCH_MAX_CHECKS)
+            if pruned_history:
+                # Provider cannot serve deep historical logs; use bounded recent ownerOf sweep.
+                max_checks = min(max_checks, int(POSITIONS_INFINITY_BATCH_MAX_CHECKS_ON_PRUNED))
             batch_ids, batch_checked, batch_errors = _scan_erc721_token_ids_by_ownerof_batch(
                 cid,
                 pm,
                 owner,
                 max_ids=max(limit * 4, limit),
-                max_checks=int(POSITIONS_INFINITY_BATCH_MAX_CHECKS),
+                max_checks=max_checks,
                 batch_size=int(POSITIONS_INFINITY_BATCH_SIZE),
                 deadline_ts=deadline_ts,
             )
@@ -5039,6 +5055,9 @@ def _scan_infinity_position_ids_for_owner(
                 dbg["batch_ownerof_errors"] = int((dbg.get("batch_ownerof_errors") or 0) + int(batch_errors))
                 dbg["batch_ownerof_matched"] = int((dbg.get("batch_ownerof_matched") or 0) + len(batch_ids))
                 dbg["rpc_ms_batch_ownerof"] = int((dbg.get("rpc_ms_batch_ownerof") or 0) + int(max(0.0, (time.perf_counter() - t_batch0) * 1000.0)))
+                if pruned_history:
+                    dbg["rpc_ownerof_batch_mode"] = "bounded_after_pruned_history"
+                    dbg["rpc_ownerof_batch_max_checks"] = int(max_checks)
             for tid in batch_ids:
                 if len(token_ids) >= limit:
                     break
@@ -5046,10 +5065,10 @@ def _scan_infinity_position_ids_for_owner(
                     continue
                 seen_ids.add(int(tid))
                 token_ids.append(int(tid))
-        elif skip_batch_on_pruned and dbg is not None:
-            dbg["rpc_ownerof_batch_skipped"] = "pruned_history"
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
+            if int(balance) > 0 and not token_ids:
+                dbg["direct_contract_no_ids"] = True
         return token_ids
     if not POSITIONS_INFINITY_HEAVY_METHODS:
         if dbg is not None:
@@ -7740,6 +7759,10 @@ def _scan_pool_positions_chain(
         v_debug: list[dict[str, Any]] = []
         v_timed_out = False
         owner_workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(addresses)))
+        if POSITIONS_CONTRACT_ONLY_ENABLED and not hard_scan:
+            # In contract-only fast mode, scan owners concurrently so one heavy owner
+            # cannot starve other addresses on the same chain.
+            owner_workers = max(2, int(owner_workers))
         if owner_workers <= 1 or len(addresses) <= 1:
             for owner in addresses:
                 if time.monotonic() >= deadline_ts:
@@ -7821,7 +7844,11 @@ def _scan_pool_positions_chain(
         has_position_liquidity = _endpoint_supports_position_liquidity(endpoint) if endpoint else True
         return endpoint, has_pool_liquidity, has_position_liquidity
 
-    for version in ("v3", "v4"):
+    version_order = ("v3", "v4")
+    if POSITIONS_CONTRACT_ONLY_ENABLED:
+        # In contract-only mode, run v4 first so Unichain v4 is not starved by long v3 scans.
+        version_order = ("v4", "v3")
+    for version in version_order:
         if time.monotonic() >= deadline_ts:
             timed_out = True
             break
@@ -8139,8 +8166,11 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], 
 def _order_chain_ids_for_pool_scan(valid_chain_ids: list[int], priority_chain_ids: list[int]) -> list[int]:
     ordered_chain_ids: list[int] = []
     seen_chain_ids: set[int] = set()
+    allowed_chain_ids = {int(cid) for cid in (valid_chain_ids or []) if int(cid) > 0}
     for cid in list(priority_chain_ids) + list(valid_chain_ids):
         cc = int(cid)
+        if cc not in allowed_chain_ids:
+            continue
         if cc in seen_chain_ids:
             continue
         seen_chain_ids.add(cc)
@@ -8162,7 +8192,10 @@ def _scan_pool_positions(
     debug_rows: list[dict[str, Any]] = []
     timings: dict[str, Any] = {}
     scan_started = time.monotonic()
-    deadline_ts = time.monotonic() + float(POSITIONS_SCAN_MAX_SECONDS)
+    scan_budget_sec = int(POSITIONS_SCAN_MAX_SECONDS)
+    if POSITIONS_CONTRACT_ONLY_ENABLED:
+        scan_budget_sec = int(POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY)
+    deadline_ts = time.monotonic() + float(scan_budget_sec)
     timed_out = False
 
     t_filter = time.monotonic()
@@ -8171,15 +8204,22 @@ def _scan_pool_positions(
     if not valid_chain_ids:
         timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
         return [], [], [], timings
-    priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
+    priority_chain_ids = [130, 56, 8453]  # Prioritize Unichain first, then BSC + Base
     ordered_chain_ids = _order_chain_ids_for_pool_scan(valid_chain_ids, priority_chain_ids)
     max_workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
+    run_all_chains_parallel = bool(POSITIONS_CONTRACT_ONLY_ENABLED and (not hard_scan))
+    if POSITIONS_CONTRACT_ONLY_ENABLED and not hard_scan:
+        # In contract-only fast mode, avoid single-chain starvation.
+        max_workers = max(3, int(max_workers))
     timings["chains_total"] = len(ordered_chain_ids)
     timings["chain_workers"] = int(max_workers)
     chain_durations_sec: dict[str, float] = {}
 
     # Run priority chains first in sequence to avoid deadline starvation.
     priority_ids = [c for c in ordered_chain_ids if c in priority_chain_ids]
+    if run_all_chains_parallel:
+        # For contract-only fast mode, skip serial pre-pass and run all in parallel below.
+        priority_ids = []
     t_prio = time.monotonic()
     p_rows, p_errors, p_debug, p_timed_out, p_chain_durations = _run_pool_chain_batch_serial(
         priority_ids,
@@ -8197,7 +8237,11 @@ def _scan_pool_positions(
     chain_durations_sec.update(p_chain_durations or {})
     timed_out = bool(p_timed_out)
 
-    remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
+    remaining_chain_ids = (
+        list(ordered_chain_ids)
+        if run_all_chains_parallel
+        else [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
+    )
     remaining_deadline_ts = float(deadline_ts)
     use_fast_chain_caps = bool((not hard_scan) and (not POSITIONS_CONTRACT_ONLY_ENABLED))
     if use_fast_chain_caps and remaining_chain_ids:
@@ -8320,7 +8364,7 @@ def _scan_pool_positions(
             dedup_errors.append("Pool scan reached fast-mode budget. Showing partial results.")
         else:
             dedup_errors.append(
-                f"Pool scan timed out after {POSITIONS_SCAN_MAX_SECONDS}s. Showing partial results."
+                f"Pool scan timed out after {int(scan_budget_sec)}s. Showing partial results."
             )
     timings["rows_before_aggregate"] = int(rows_before_aggregate)
     timings["rows_after_aggregate"] = int(len(uniq_rows))
@@ -13378,7 +13422,7 @@ def _select_positions_chain_ids(requested_chain_ids_raw: list[int]) -> list[int]
     # By default scan all supported EVM chains; if chain_ids provided, preserve user order.
     # Prioritize chains where users most often track active LPs, and keep heavy
     # ethereum scan later so partial results include L2 pools under timeout.
-    preferred_order = [56, 42161, 8453, 130, 1, 10, 137]
+    preferred_order = [56, 130, 42161, 8453, 1, 10, 137]
     preferred_rank = {cid: idx for idx, cid in enumerate(preferred_order)}
     all_chain_ids = sorted(
         (
