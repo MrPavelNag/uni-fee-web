@@ -1245,8 +1245,33 @@ def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: in
             )
         except Exception:
             log_ids = []
-    merged_ids = sorted({int(x) for x in explorer_ids + receipt_ids + log_ids if _parse_int_like(x) > 0}, reverse=True)
+    onchain_ids: list[int] = []
+    if not explorer_ids and not receipt_ids and not log_ids:
+        # Final fallback: query CL positions directly and derive token ids from returned position objects.
+        try:
+            cl_positions = _scan_pancake_infinity_cl_positions_onchain(
+                owner_addr,
+                cid,
+                deadline_ts=time.monotonic() + 12.0,
+                debug_out={},
+            )
+            for p in cl_positions:
+                pid = str((p or {}).get("id") or "")
+                if pid.startswith("inf-cl:"):
+                    tid = _parse_int_like(pid.split(":", 1)[1])
+                else:
+                    tid = _parse_int_like(pid)
+                if tid > 0:
+                    onchain_ids.append(int(tid))
+        except Exception:
+            onchain_ids = []
+    merged_ids = sorted(
+        {int(x) for x in explorer_ids + receipt_ids + log_ids + onchain_ids if _parse_int_like(x) > 0},
+        reverse=True,
+    )
     source_tag = "logs" if log_ids else "receipt"
+    if onchain_ids:
+        source_tag = "onchain"
     upserted = _infinity_index_upsert(cid, owner_addr, merged_ids, source_tag)
     indexed_now = _infinity_index_get_token_ids(cid, owner_addr, limit=400)
     return {
@@ -1257,6 +1282,7 @@ def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: in
         "explorer_ids": len(explorer_ids),
         "receipt_ids": len(receipt_ids),
         "log_ids": len(log_ids),
+        "onchain_ids": len(onchain_ids),
         "merged_ids": len(merged_ids),
         "upserted": int(upserted),
         "indexed_total_for_owner": len(indexed_now),
