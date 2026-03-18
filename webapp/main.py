@@ -2445,6 +2445,8 @@ def _fetch_v3_position_contract_snapshot(
     protocol: str,
     token_id: int,
     owner_hint: str,
+    *,
+    include_quotes: bool = True,
 ) -> dict[str, Any] | None:
     cid = int(chain_id)
     proto = str(protocol or "").strip().lower()
@@ -2508,12 +2510,17 @@ def _fetch_v3_position_contract_snapshot(
             sym0 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token0) or "")
         if not sym1:
             sym1 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token1) or "")
-        q_amount0, q_amount1 = _quote_v3_decrease_liquidity_amounts(
-            cid, proto, tid, liq, owner_addr, dec0, dec1
-        )
-        q_fee0, q_fee1 = _quote_v3_collect_fees_amounts(
-            cid, proto, tid, owner_addr, dec0, dec1
-        )
+        q_amount0: float | None = None
+        q_amount1: float | None = None
+        q_fee0: float | None = None
+        q_fee1: float | None = None
+        if bool(include_quotes):
+            q_amount0, q_amount1 = _quote_v3_decrease_liquidity_amounts(
+                cid, proto, tid, liq, owner_addr, dec0, dec1
+            )
+            q_fee0, q_fee1 = _quote_v3_collect_fees_amounts(
+                cid, proto, tid, owner_addr, dec0, dec1
+            )
         payload: dict[str, Any] = {
             "chain_id": cid,
             "protocol": proto,
@@ -4388,7 +4395,9 @@ def _enrich_rows_liquidity_usd(rows: list[dict[str, Any]], *, max_seconds: int =
     for r in rows:
         if time.monotonic() >= deadline_ts:
             break
-        if bool(r.get("suspected_spam")):
+        if bool(r.get("suspected_spam")) or bool(r.get("spam_skipped")):
+            r["liquidity_usd"] = None
+            r["liquidity_display"] = "-"
             continue
         cid = int(r.get("chain_id") or 0)
         if cid <= 0:
@@ -4408,7 +4417,9 @@ def _enrich_rows_liquidity_usd(rows: list[dict[str, Any]], *, max_seconds: int =
         except Exception:
             prices_by_chain[int(cid)] = {}
     for r in rows:
-        if bool(r.get("suspected_spam")):
+        if bool(r.get("suspected_spam")) or bool(r.get("spam_skipped")):
+            r["liquidity_usd"] = None
+            r["liquidity_display"] = "-"
             continue
         cid = int(r.get("chain_id") or 0)
         if cid <= 0:
@@ -6666,45 +6677,6 @@ def _scan_pool_positions_chain(
             elif str(t1).upper() == "UNK":
                 t1 = f"#{pid}" if pid else "Position"
                 t1_src = "infinity_placeholder"
-        # Source of truth for v3 rows is on-chain position snapshot.
-        # If precheck flags spam, re-verify token symbols from contract first.
-        if suspected_spam_pre and version == "v3" and is_v3_npm_protocol and time.monotonic() < deadline_ts:
-            try:
-                contract_snapshot = _fetch_v3_position_contract_snapshot(
-                    int(chain_id),
-                    proto_label,
-                    _position_token_id_from_raw(p.get("id")),
-                    owner,
-                )
-            except Exception:
-                contract_snapshot = None
-            if contract_snapshot:
-                t0_snap = _normalize_display_symbol(str(contract_snapshot.get("token0_symbol") or ""))
-                t1_snap = _normalize_display_symbol(str(contract_snapshot.get("token1_symbol") or ""))
-                if t0_snap:
-                    t0 = t0_snap
-                    t0_src = "snapshot_symbol"
-                if t1_snap:
-                    t1 = t1_snap
-                    t1_src = "snapshot_symbol"
-                t0_obj = dict(t0_obj or {})
-                t1_obj = dict(t1_obj or {})
-                t0_obj["id"] = str(contract_snapshot.get("token0") or t0_obj.get("id") or "")
-                t1_obj["id"] = str(contract_snapshot.get("token1") or t1_obj.get("id") or "")
-                t0_obj["symbol"] = str(contract_snapshot.get("token0_symbol") or t0_obj.get("symbol") or "")
-                t1_obj["symbol"] = str(contract_snapshot.get("token1_symbol") or t1_obj.get("symbol") or "")
-                suspected_spam_pre = _is_suspected_spam_pair(
-                    chain_key,
-                    t0_obj if isinstance(t0_obj, dict) else {},
-                    t1_obj if isinstance(t1_obj, dict) else {},
-                    str(t0 or ""),
-                    str(t1 or ""),
-                    None,
-                )
-                if proto_label.startswith("pancake_"):
-                    suspected_spam_pre = False
-                if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
-                    suspected_spam_pre = False
         if suspected_spam_pre:
             # Early spam path must sanitize displayed pair symbols too,
             # otherwise hidden rows can show garbage names (e.g. ETH/JamesThomas).
@@ -6732,8 +6704,8 @@ def _scan_pool_positions_chain(
                 "token1_id": str((pool.get("token1") or {}).get("id") or ""),
                 "position_id": str(p.get("id") or ""),
                 "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
-                "fee_tier": fee_disp,
-                "fee_tier_raw": fee_raw,
+                "fee_tier": "-",
+                "fee_tier_raw": "",
                 "position_status": "inactive",
                 "liquidity_display": _format_usd_compact(None),
                 "liquidity": str(p.get("liquidity") or "0"),
@@ -6771,6 +6743,7 @@ def _scan_pool_positions_chain(
                     proto_label,
                     _position_token_id_from_raw(p.get("id")),
                     owner,
+                    include_quotes=False,
                 )
             except Exception:
                 contract_snapshot = None
@@ -6846,6 +6819,54 @@ def _scan_pool_positions_chain(
 
         t0, t0_src = _sanitize_pair_symbol(t0, t0_obj if isinstance(t0_obj, dict) else {}, str(t0_src or ""))
         t1, t1_src = _sanitize_pair_symbol(t1, t1_obj if isinstance(t1_obj, dict) else {}, str(t1_src or ""))
+
+        suspected_spam_now = _is_suspected_spam_pair(
+            chain_key,
+            t0_obj if isinstance(t0_obj, dict) else {},
+            t1_obj if isinstance(t1_obj, dict) else {},
+            str(t0 or ""),
+            str(t1 or ""),
+            None,
+        )
+        if proto_label.startswith("pancake_"):
+            suspected_spam_now = False
+        if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
+            suspected_spam_now = False
+        if bool(suspected_spam_now):
+            # Do not query In position / Unclaimed fees for spam-marked rows.
+            return {
+                "address": owner,
+                "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
+                "chain": chain_key,
+                "chain_id": int(chain_id),
+                "kind": "pool",
+                "pool_id": str(pool.get("id") or ""),
+                "pair": f"{t0}/{t1}",
+                "token0_id": str((pool.get("token0") or {}).get("id") or ""),
+                "token1_id": str((pool.get("token1") or {}).get("id") or ""),
+                "position_id": str(p.get("id") or ""),
+                "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
+                "fee_tier": "-",
+                "fee_tier_raw": "",
+                "position_status": "inactive",
+                "liquidity_display": _format_usd_compact(None),
+                "liquidity": str(p.get("liquidity") or "0"),
+                "pool_liquidity": str(pool.get("liquidity") or "0"),
+                "position_amount0": 0.0,
+                "position_amount1": 0.0,
+                "position_symbol0": str(t0 or ""),
+                "position_symbol1": str(t1 or ""),
+                "pair_symbol_source0": str(t0_src or ""),
+                "pair_symbol_source1": str(t1_src or ""),
+                "pair_symbol_source": f"0:{str(t0_src or '-')} | 1:{str(t1_src or '-')}",
+                "position_amounts_display": "0 / 0",
+                "fees_owed0": 0.0,
+                "fees_owed1": 0.0,
+                "fees_owed_display": "0 / 0",
+                "suspected_spam": True,
+                "spam_skipped": True,
+                "liquidity_usd": None,
+            }
 
         amount0_val: float | None = None
         amount1_val: float | None = None
@@ -7318,10 +7339,16 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
         if key not in uniq:
             base = dict(row)
             base["position_count"] = 1
+            if bool(base.get("suspected_spam")) or bool(base.get("spam_skipped")):
+                base["liquidity_usd"] = None
+                base["liquidity_display"] = "-"
             uniq[key] = base
             continue
         acc = uniq[key]
         acc["position_count"] = int(acc.get("position_count") or 1) + 1
+        # Keep spam mark sticky across merged rows.
+        acc["suspected_spam"] = bool(acc.get("suspected_spam")) or bool(row.get("suspected_spam"))
+        acc["spam_skipped"] = bool(acc.get("spam_skipped")) or bool(row.get("spam_skipped"))
         acc_ids = [str(x) for x in (acc.get("position_ids") or []) if str(x).strip()]
         row_ids = [str(x) for x in (row.get("position_ids") or []) if str(x).strip()]
         if row_ids:
@@ -7364,7 +7391,11 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
                 return f"{x / 1_000_000_000.0:.1f}B".rstrip("0").rstrip(".")
             return f"{x / 1_000_000_000_000.0:.1f}T".rstrip("0").rstrip(".")
 
-        acc["liquidity_display"] = _format_usd_compact(_opt_float(acc.get("liquidity_usd")))
+        if bool(acc.get("suspected_spam")) or bool(acc.get("spam_skipped")):
+            acc["liquidity_usd"] = None
+            acc["liquidity_display"] = "-"
+        else:
+            acc["liquidity_display"] = _format_usd_compact(_opt_float(acc.get("liquidity_usd")))
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     return list(uniq.values())
 
@@ -8999,11 +9030,21 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
     except Exception:
         liq_usd = None
     liq_disp = _format_usd_compact(liq_usd)
+    fee_raw = str(snap.get("fee") or "").strip()
+    fee_disp = fee_raw
+    try:
+        fee_int = int(fee_raw)
+        if fee_int > 0:
+            fee_disp = f"{fee_int / 10000.0:.2f}%"
+    except Exception:
+        fee_disp = fee_raw or "-"
     return {
         "position_amount0": (float(amount0) if amount0 is not None else 0.0),
         "position_amount1": (float(amount1) if amount1 is not None else 0.0),
         "fees_owed0": (float(fee0) if fee0 is not None else 0.0),
         "fees_owed1": (float(fee1) if fee1 is not None else 0.0),
+        "fee_tier_raw": fee_raw,
+        "fee_tier": fee_disp,
         "position_amounts_display": f"{_fmt_amt(amount0)} / {_fmt_amt(amount1)}",
         "fees_owed_display": f"{_fmt_amt(fee0, zero_if_missing=True)} / {_fmt_amt(fee1, zero_if_missing=True)}",
         "position_status": status,
@@ -9018,6 +9059,9 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
             f"{_normalize_display_symbol(str(snap.get('token0_symbol') or row.get('position_symbol0') or '?'))}/"
             f"{_normalize_display_symbol(str(snap.get('token1_symbol') or row.get('position_symbol1') or '?'))}"
         ),
+        "pair_symbol_source0": "snapshot_symbol",
+        "pair_symbol_source1": "snapshot_symbol",
+        "pair_symbol_source": "0:snapshot_symbol | 1:snapshot_symbol",
         "suspected_spam": False,
         "spam_skipped": False,
     }
@@ -12960,12 +13004,15 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
         return
 
     def _is_symbol_anomaly(row: dict[str, Any]) -> bool:
+        # Strict rule: once row is marked as spam, do not query it anymore
+        # in background phases. Manual unspam uses dedicated row/enrich endpoint.
+        if bool(row.get("suspected_spam")) or bool(row.get("spam_skipped")):
+            return False
         s0 = str(row.get("position_symbol0") or "").strip().upper()
         s1 = str(row.get("position_symbol1") or "").strip().upper()
         pair = str(row.get("pair") or "").strip().upper()
         return bool(
-            row.get("spam_skipped")
-            or s0 in {"", "?", "UNK"}
+            s0 in {"", "?", "UNK"}
             or s1 in {"", "?", "UNK"}
             or "UNK" in pair
             or "/?" in pair
