@@ -223,8 +223,8 @@ POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECON
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
-POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "10")))
-POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "1")))
+POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "14")))
+POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
     "1",
     "true",
@@ -6357,6 +6357,44 @@ def _scan_pool_positions_chain(
         if not hard_scan:
             # Fast mode: keep strict index-only path; heavy discovery/fallback is reserved for hard scan.
             can_use_live_discovery = False
+            # Lightweight fast fallback: try Pancake v3 staked positions from MasterChefV3.
+            # This path is much narrower than legacy discovery and helps avoid missing
+            # legitimate Pancake v3 rows when index cache is cold.
+            if (
+                version == "v3"
+                and not positions
+                and int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID
+                and time.monotonic() < (deadline_ts - 0.1)
+            ):
+                try:
+                    fast_deadline = min(deadline_ts, time.monotonic() + 1.6)
+                    farm_positions = _scan_pancake_staked_v3_positions_onchain(
+                        owner,
+                        int(chain_id),
+                        deadline_ts=fast_deadline,
+                    )
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "fast",
+                            "query_mode": "fast_onchain_pancake_masterchef_v3",
+                            "count": len(farm_positions),
+                            "ok": True,
+                        }
+                    )
+                    if farm_positions:
+                        positions = list(farm_positions)
+                except Exception as e:
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "fast",
+                            "query_mode": "fast_onchain_pancake_masterchef_v3",
+                            "count": 0,
+                            "ok": False,
+                            "error": str(e)[:220],
+                        }
+                    )
         # Cold-cache safety: when strict index-first disables live discovery and cache is empty,
         # do one bounded synchronous warmup for this owner/chain to avoid empty first response.
         # Also warm up once when cache hit has v3 rows but is missing Infinity rows.
@@ -6673,6 +6711,23 @@ def _scan_pool_positions_chain(
                 t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
                 t0 = _normalize_display_symbol(t0)
                 t1 = _normalize_display_symbol(t1)
+
+        def _sanitize_pair_symbol(sym: str, token_obj: dict[str, Any]) -> str:
+            s = _normalize_display_symbol(str(sym or ""))
+            if proto_label.startswith("pancake_infinity_"):
+                return s
+            addr = str((token_obj or {}).get("id") or "").strip().lower()
+            curated = bool(addr and (addr in chain_addr_map))
+            if curated:
+                return s
+            if _is_probably_spam_symbol(s):
+                if _is_eth_address(addr):
+                    return f"TKN_{addr[-4:].upper()}"
+                return "?"
+            return s
+
+        t0 = _sanitize_pair_symbol(t0, t0_obj if isinstance(t0_obj, dict) else {})
+        t1 = _sanitize_pair_symbol(t1, t1_obj if isinstance(t1_obj, dict) else {})
 
         amount0_val: float | None = None
         amount1_val: float | None = None
@@ -9346,26 +9401,15 @@ def _render_positions_page() -> str:
     @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
     .pos-status { color:#475569; font-size:13px; }
     .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
-    table { width:100%; border-collapse:collapse; font-size:11px; min-width:860px; }
-    th, td { border-bottom:1px solid #e2e8f0; padding:4px 5px; text-align:left; vertical-align:top; }
-    th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
+    table { width:100%; border-collapse:collapse; font-size:12px; min-width:860px; }
+    th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
+    th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; font-size:12px; font-weight:700; padding:6px 6px; }
     #posPoolsTable { min-width: 1200px; table-layout: auto; }
     #posPoolsTable th, #posPoolsTable td { white-space: nowrap; }
     #posPoolsTable th:nth-child(1), #posPoolsTable td:nth-child(1) {
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
     #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
-    .table-nav-btn {
-      border:1px solid #bfdbfe;
-      background:#eff6ff;
-      color:#1d4ed8;
-      border-radius:8px;
-      padding:2px 8px;
-      cursor:pointer;
-      font-weight:700;
-      line-height:1.2;
-    }
-    .table-nav-btn:hover { background:#dbeafe; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
     .status-dot {
       display:inline-block;
@@ -9438,8 +9482,6 @@ def _render_positions_page() -> str:
             <span class="pos-status" id="posStatus">Ready</span>
             <button id="posInfinityScanBtn" class="search-link-btn" type="button" onclick="scanPositions('pools', {infinityScan:true})">Infinity scan</button>
             <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan</button>
-            <button class="table-nav-btn" type="button" onclick="scrollPosTable(-600)" title="Scroll table left">◀</button>
-            <button class="table-nav-btn" type="button" onclick="scrollPosTable(600)" title="Scroll table right">▶</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
@@ -9659,11 +9701,6 @@ def _render_positions_page() -> str:
       const text = String(value || "").trim();
       if (!text) return;
       navigator.clipboard.writeText(text).then(() => setPosStatus("Copied to clipboard", false)).catch(() => {});
-    }
-    function scrollPosTable(delta) {
-      const wrap = document.querySelector("#posPoolsBody .table-wrap");
-      if (!wrap) return;
-      wrap.scrollBy({left: Number(delta) || 0, behavior: "smooth"});
     }
     function shortAddr4(value) {
       const v = String(value || "").trim();
