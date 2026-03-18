@@ -6639,12 +6639,17 @@ def _scan_pool_positions_chain(
             return None
         t0_hint_u = str(t0 or "").strip().upper()
         t1_hint_u = str(t1 or "").strip().upper()
-        # Early spam pre-filter is allowed only when both token hints are informative.
-        # Unknown placeholders ("?", "UNK", empty) should not hide legitimate rows.
-        precheck_symbols_ready = bool(
-            t0_hint_u not in {"", "?", "UNK"}
-            and t1_hint_u not in {"", "?", "UNK"}
+        t0_info = bool(t0_hint_u not in {"", "?", "UNK"})
+        t1_info = bool(t1_hint_u not in {"", "?", "UNK"})
+        # Early spam pre-filter:
+        # - full check when both symbols are informative
+        # - or when any informative symbol already looks spammy
+        #   (to avoid tokenId/contract requests for obvious spam rows).
+        has_spam_hint = bool(
+            (t0_info and _is_probably_spam_symbol(str(t0 or "")))
+            or (t1_info and _is_probably_spam_symbol(str(t1 or "")))
         )
+        precheck_symbols_ready = bool((t0_info and t1_info) or has_spam_hint)
         suspected_spam_pre = (
             _is_suspected_spam_pair(
                 chain_key,
