@@ -264,6 +264,10 @@ POSITIONS_INFINITY_OWNEROF_FALLBACK_MAX_CHECKS = max(
     100,
     int(os.environ.get("POSITIONS_INFINITY_OWNEROF_FALLBACK_MAX_CHECKS", "6000")),
 )
+POSITIONS_EXPLORER_NFTTX_MAX_PAGES = max(
+    5,
+    int(os.environ.get("POSITIONS_EXPLORER_NFTTX_MAX_PAGES", "80")),
+)
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
 POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
@@ -4103,7 +4107,7 @@ def _explorer_nfttx_rows(
         return []
     out: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
-    max_pages = 8
+    max_pages = int(POSITIONS_EXPLORER_NFTTX_MAX_PAGES)
     for tmpl in contract_urls:
         for page in range(1, max_pages + 1):
             batch = _fetch_rows(str(tmpl).replace("{page}", str(page)))
@@ -4127,9 +4131,6 @@ def _explorer_nfttx_rows(
                 seen_keys.add(key)
                 out.append(r)
                 matched += 1
-            # If page has no owner-related rows and we're already deep enough, stop early.
-            if matched == 0 and page >= 3:
-                break
             if len(out) >= int(max_rows):
                 return out[: int(max_rows)]
         if out:
