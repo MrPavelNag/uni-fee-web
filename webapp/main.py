@@ -247,6 +247,7 @@ POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", 
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
 POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
+POSITIONS_RPC_BATCH_MAX_ITEMS = max(10, min(200, int(os.environ.get("POSITIONS_RPC_BATCH_MAX_ITEMS", "80"))))
 POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK = os.environ.get("POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK", "0").strip().lower() in (
     "1",
     "true",
@@ -2842,21 +2843,39 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
     return list(DEFAULT_RPC_URLS_BY_CHAIN_ID.get(int(chain_id), []))
 
 
-def _json_rpc_call(chain_id: int, method: str, params: list[Any]) -> Any:
+def _json_rpc_call(
+    chain_id: int,
+    method: str,
+    params: list[Any],
+    *,
+    timeout_sec: float | None = None,
+    deadline_ts: float | None = None,
+    max_urls: int | None = None,
+) -> Any:
     rpc_urls = _rpc_urls_for_chain(chain_id)
     if not rpc_urls:
         raise RuntimeError(f"No RPC configured for chain_id={chain_id}")
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     body = json.dumps(payload).encode("utf-8")
     last_err = "unknown rpc error"
-    for rpc_url in rpc_urls:
+    urls = list(rpc_urls)
+    url_limit = 2 if max_urls is None else max(1, int(max_urls))
+    urls = urls[:url_limit]
+    for rpc_url in urls:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            raise RuntimeError("rpc deadline exceeded")
         try:
             req = UrlRequest(
                 rpc_url,
                 data=body,
                 headers={"Content-Type": "application/json", "User-Agent": "uni-fee-web/0.0.2"},
             )
-            with urlopen(req, timeout=POSITIONS_ONCHAIN_TIMEOUT_SEC) as resp:
+            timeout_s = float(POSITIONS_ONCHAIN_TIMEOUT_SEC)
+            if timeout_sec is not None:
+                timeout_s = max(1.0, float(timeout_sec))
+            if deadline_ts is not None:
+                timeout_s = min(timeout_s, max(0.25, float(deadline_ts) - time.monotonic()))
+            with urlopen(req, timeout=timeout_s) as resp:
                 parsed = json.loads(resp.read().decode("utf-8"))
             if isinstance(parsed, dict) and parsed.get("error"):
                 last_err = str((parsed.get("error") or {}).get("message") or parsed.get("error"))
@@ -2874,40 +2893,80 @@ def _json_rpc_batch_call(
     payloads: list[dict[str, Any]],
     *,
     deadline_ts: float | None = None,
+    max_urls: int | None = None,
 ) -> list[dict[str, Any]]:
     rpc_urls = _rpc_urls_for_chain(chain_id)
     if not rpc_urls:
         raise RuntimeError(f"No RPC configured for chain_id={chain_id}")
+    if not payloads:
+        return []
     # Prefer known batch-friendly public RPCs for batched ownerOf scans.
     if int(chain_id) in (56, 8453):
         rpc_urls = sorted(
             rpc_urls,
             key=lambda u: 0 if "publicnode.com" in str(u).lower() else 1,
         )
-    body = json.dumps(payloads).encode("utf-8")
-    last_err = "unknown batch rpc error"
-    for rpc_url in rpc_urls:
+    out_rows: list[dict[str, Any]] = []
+    chunk_size = max(10, min(int(POSITIONS_RPC_BATCH_MAX_ITEMS), len(payloads)))
+    for i in range(0, len(payloads), chunk_size):
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             raise RuntimeError("batch rpc deadline exceeded")
-        try:
-            req = UrlRequest(
-                rpc_url,
-                data=body,
-                headers={"Content-Type": "application/json", "User-Agent": "uni-fee-web/0.0.2"},
-            )
-            timeout_s = max(8, POSITIONS_ONCHAIN_TIMEOUT_SEC * 3)
-            if deadline_ts is not None:
-                left = max(0.25, deadline_ts - time.monotonic())
-                timeout_s = min(timeout_s, left)
-            with urlopen(req, timeout=timeout_s) as resp:
-                parsed = json.loads(resp.read().decode("utf-8"))
-            if not isinstance(parsed, list):
-                last_err = "batch rpc did not return list"
+        chunk = payloads[i : i + chunk_size]
+        body = json.dumps(chunk).encode("utf-8")
+        last_err = "unknown batch rpc error"
+        chunk_ok = False
+        urls = list(rpc_urls)
+        url_limit = 2 if max_urls is None else max(1, int(max_urls))
+        urls = urls[:url_limit]
+        for rpc_url in urls:
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                raise RuntimeError("batch rpc deadline exceeded")
+            try:
+                req = UrlRequest(
+                    rpc_url,
+                    data=body,
+                    headers={"Content-Type": "application/json", "User-Agent": "uni-fee-web/0.0.2"},
+                )
+                timeout_s = max(8, POSITIONS_ONCHAIN_TIMEOUT_SEC * 3)
+                if deadline_ts is not None:
+                    left = max(0.25, deadline_ts - time.monotonic())
+                    timeout_s = min(timeout_s, left)
+                with urlopen(req, timeout=timeout_s) as resp:
+                    parsed = json.loads(resp.read().decode("utf-8"))
+                if not isinstance(parsed, list):
+                    last_err = "batch rpc did not return list"
+                    continue
+                out_rows.extend([x for x in parsed if isinstance(x, dict)])
+                chunk_ok = True
+                break
+            except Exception as e:
+                last_err = str(e)
                 continue
-            return [x for x in parsed if isinstance(x, dict)]
-        except Exception as e:
-            last_err = str(e)
-    raise RuntimeError(last_err)
+        if chunk_ok:
+            continue
+        # Hard fallback: execute requests one-by-one when providers reject batch.
+        for p in chunk:
+            rid = p.get("id")
+            method = str(p.get("method") or "").strip()
+            params = p.get("params")
+            if not method or not isinstance(params, list):
+                out_rows.append({"id": rid, "error": {"message": "invalid batch payload item"}})
+                continue
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                out_rows.append({"id": rid, "error": {"message": "rpc deadline exceeded"}})
+                continue
+            try:
+                single_result = _json_rpc_call(
+                    int(chain_id),
+                    method,
+                    params,
+                    timeout_sec=max(2.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC)),
+                    deadline_ts=deadline_ts,
+                )
+                out_rows.append({"id": rid, "result": single_result})
+            except Exception as e:
+                out_rows.append({"id": rid, "error": {"message": str(e) or last_err}})
+    return out_rows
 
 
 def _scan_pancake_infinity_cl_positions_graph(
@@ -3145,10 +3204,57 @@ def _eth_block_number(chain_id: int) -> int:
     return int(out or "0")
 
 
-def _eth_get_logs(chain_id: int, params: dict[str, Any]) -> list[dict[str, Any]]:
-    out = _json_rpc_call(int(chain_id), "eth_getLogs", [params])
-    if isinstance(out, list):
-        return [x for x in out if isinstance(x, dict)]
+def _eth_get_logs(
+    chain_id: int,
+    params: dict[str, Any],
+    *,
+    deadline_ts: float | None = None,
+    timeout_sec: float | None = None,
+    max_attempts: int = 2,
+    debug_out: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    last_exc: Exception | None = None
+    attempts = min(2, max(1, int(max_attempts)))
+    req_started = time.perf_counter()
+    first_try_failed = False
+    if isinstance(debug_out, dict):
+        debug_out["rpc_getlogs_requests"] = int(debug_out.get("rpc_getlogs_requests") or 0) + 1
+    for attempt_idx in range(attempts):
+        try:
+            if isinstance(debug_out, dict):
+                debug_out["rpc_getlogs_attempts"] = int(debug_out.get("rpc_getlogs_attempts") or 0) + 1
+            out = _json_rpc_call(
+                int(chain_id),
+                "eth_getLogs",
+                [params],
+                timeout_sec=(timeout_sec if timeout_sec is not None else max(12.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 4.0)),
+                deadline_ts=deadline_ts,
+                max_urls=2,
+            )
+            if isinstance(out, list):
+                if isinstance(debug_out, dict):
+                    debug_out["rpc_getlogs_success"] = int(debug_out.get("rpc_getlogs_success") or 0) + 1
+                    debug_out["rpc_getlogs_ms"] = int(debug_out.get("rpc_getlogs_ms") or 0) + int(
+                        max(0.0, (time.perf_counter() - req_started) * 1000.0)
+                    )
+                    if first_try_failed:
+                        debug_out["rpc_getlogs_retry_success"] = int(debug_out.get("rpc_getlogs_retry_success") or 0) + 1
+                return [x for x in out if isinstance(x, dict)]
+            return []
+        except Exception as e:
+            last_exc = e
+            if attempt_idx == 0:
+                first_try_failed = True
+            if isinstance(debug_out, dict):
+                debug_out["rpc_getlogs_failures"] = int(debug_out.get("rpc_getlogs_failures") or 0) + 1
+                if attempt_idx == 0:
+                    debug_out["rpc_getlogs_first_try_fail"] = int(debug_out.get("rpc_getlogs_first_try_fail") or 0) + 1
+                debug_out["rpc_getlogs_last_error"] = str(e)[:180]
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            continue
+    if last_exc is not None:
+        raise last_exc
     return []
 
 
@@ -3538,6 +3644,7 @@ def _scan_erc721_token_ids_by_incoming_logs(
     deadline_ts: float | None = None,
     max_ids: int = 120,
     lookback_blocks: int | None = None,
+    debug_out: dict[str, Any] | None = None,
 ) -> list[int]:
     cid = int(chain_id)
     c = str(contract or "").strip().lower()
@@ -3569,7 +3676,7 @@ def _scan_erc721_token_ids_by_incoming_logs(
             "topics": [topic_transfer, None, topic_to_owner],
         }
         try:
-            logs = _eth_get_logs(cid, params)
+            logs = _eth_get_logs(cid, params, deadline_ts=deadline_ts, debug_out=debug_out)
         except Exception:
             # Reduce chunk size on provider "too many results" style failures.
             if step > 5000:
@@ -3641,7 +3748,7 @@ def _scan_erc721_token_ids_by_recent_transfers_ownerof(
             "topics": [topic_transfer],
         }
         try:
-            logs = _eth_get_logs(cid, params)
+            logs = _eth_get_logs(cid, params, deadline_ts=deadline_ts)
         except Exception:
             if step > 5000:
                 step = max(5000, step // 2)
@@ -3724,7 +3831,7 @@ def _scan_cl_mintposition_token_ids_by_owner(
             "topics": [topic_mint],
         }
         try:
-            logs = _eth_get_logs(cid, params)
+            logs = _eth_get_logs(cid, params, deadline_ts=deadline_ts)
         except Exception:
             if step > 5000:
                 step = max(5000, step // 2)
@@ -3989,7 +4096,7 @@ def _scan_erc721_token_ids_by_ownerof_batch(
     if int(start_from_token_id) > 0:
         hi = min(hi, int(start_from_token_id))
     lo = 1
-    bsz = max(50, min(1000, int(batch_size)))
+    bsz = max(20, min(200, int(batch_size)))
     to_check = min(max(1, int(max_checks)), max(0, hi - lo + 1))
     ranges: list[list[int]] = []
     cur = hi
@@ -4008,37 +4115,43 @@ def _scan_erc721_token_ids_by_ownerof_batch(
     def _scan_chunk(tids: list[int]) -> tuple[list[int], int]:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             return [], 0
-        payloads = [
-            {
-                "jsonrpc": "2.0",
-                "id": idx,
-                "method": "eth_call",
-                "params": [{"to": c, "data": "0x6352211e" + _encode_uint_word(int(tid))}, "latest"],
-            }
-            for idx, tid in enumerate(tids)
-        ]
-        try:
-            resp = _json_rpc_batch_call(cid, payloads, deadline_ts=deadline_ts)
-        except Exception:
-            return [], len(tids)
-        by_id: dict[int, dict[str, Any]] = {}
-        for row in resp:
-            try:
-                rid = int(row.get("id"))
-            except Exception:
-                continue
-            by_id[rid] = row
         found: list[int] = []
         errs = 0
-        for idx, tid in enumerate(tids):
-            row = by_id.get(idx) or {}
-            raw = str(row.get("result") or "").strip().lower()
-            if not raw.startswith("0x") or len(raw) < 42:
-                if row.get("error") is not None:
-                    errs += 1
+        rpc_batch = max(10, min(100, int(POSITIONS_RPC_BATCH_MAX_ITEMS)))
+        for i in range(0, len(tids), rpc_batch):
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            sub_tids = tids[i : i + rpc_batch]
+            payloads = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": idx,
+                    "method": "eth_call",
+                    "params": [{"to": c, "data": "0x6352211e" + _encode_uint_word(int(tid))}, "latest"],
+                }
+                for idx, tid in enumerate(sub_tids)
+            ]
+            try:
+                resp = _json_rpc_batch_call(cid, payloads, deadline_ts=deadline_ts)
+            except Exception:
+                errs += len(sub_tids)
                 continue
-            if raw[-40:] == owner_word:
-                found.append(int(tid))
+            by_id: dict[int, dict[str, Any]] = {}
+            for row in resp:
+                try:
+                    rid = int(row.get("id"))
+                except Exception:
+                    continue
+                by_id[rid] = row
+            for idx, tid in enumerate(sub_tids):
+                row = by_id.get(idx) or {}
+                raw = str(row.get("result") or "").strip().lower()
+                if not raw.startswith("0x") or len(raw) < 42:
+                    if row.get("error") is not None:
+                        errs += 1
+                    continue
+                if raw[-40:] == owner_word:
+                    found.append(int(tid))
         return found, errs
 
     checked = 0
@@ -4797,6 +4910,17 @@ def _scan_infinity_position_ids_for_owner(
                 "batch_ownerof_checked": 0,
                 "batch_ownerof_matched": 0,
                 "batch_ownerof_errors": 0,
+                "rpc_ms_balance": 0,
+                "rpc_ms_logs": 0,
+                "rpc_ms_batch_ownerof": 0,
+                "rpc_getlogs_requests": 0,
+                "rpc_getlogs_attempts": 0,
+                "rpc_getlogs_success": 0,
+                "rpc_getlogs_failures": 0,
+                "rpc_getlogs_first_try_fail": 0,
+                "rpc_getlogs_retry_success": 0,
+                "rpc_getlogs_ms": 0,
+                "rpc_getlogs_last_error": "",
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -4804,11 +4928,14 @@ def _scan_infinity_position_ids_for_owner(
                 "early_exit_no_balance": False,
             }
         )
+    t_balance0 = time.perf_counter()
     try:
         bal_data = "0x70a08231" + _encode_address_word(owner)
         balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
     except Exception:
         balance = 0
+    if dbg is not None:
+        dbg["rpc_ms_balance"] = int(max(0.0, (time.perf_counter() - t_balance0) * 1000.0))
     if dbg is not None:
         dbg["balance"] = int(balance)
     if int(balance) <= 0:
@@ -4825,7 +4952,8 @@ def _scan_infinity_position_ids_for_owner(
     if dbg is not None:
         dbg["enumerable_ok"] = bool(enumerable_ok)
         dbg["enumerable_token_ids"] = len(token_ids)
-    if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN:
+    if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN and not POSITIONS_CONTRACT_ONLY_ENABLED:
+        t_batch0 = time.perf_counter()
         batch_ids, batch_checked, batch_errors = _scan_erc721_token_ids_by_ownerof_batch(
             cid,
             pm,
@@ -4839,6 +4967,7 @@ def _scan_infinity_position_ids_for_owner(
             dbg["batch_ownerof_checked"] = int(batch_checked)
             dbg["batch_ownerof_errors"] = int(batch_errors)
             dbg["batch_ownerof_matched"] = int(len(batch_ids))
+            dbg["rpc_ms_batch_ownerof"] = int(max(0.0, (time.perf_counter() - t_batch0) * 1000.0))
         for tid in batch_ids:
             if len(token_ids) >= limit:
                 break
@@ -4846,7 +4975,58 @@ def _scan_infinity_position_ids_for_owner(
                 continue
             seen_ids.add(int(tid))
             token_ids.append(int(tid))
-    if POSITIONS_CONTRACT_ONLY_ENABLED or not POSITIONS_INFINITY_HEAVY_METHODS:
+    if POSITIONS_CONTRACT_ONLY_ENABLED:
+        # Root-cause fix for hangs and misses:
+        # 1) use direct Transfer(to=owner) logs first (contract-native discovery),
+        # 2) only then fallback to ownerOf batch scan if ids are still missing.
+        if len(token_ids) < limit:
+            t_logs0 = time.perf_counter()
+            log_ids = _scan_erc721_token_ids_by_incoming_logs(
+                cid,
+                pm,
+                owner,
+                deadline_ts=deadline_ts,
+                max_ids=max(limit * 4, limit),
+                lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 20_000_000),
+                debug_out=dbg,
+            )
+            if dbg is not None:
+                dbg["log_token_ids"] = len(log_ids)
+                dbg["rpc_ms_logs"] = int(max(0.0, (time.perf_counter() - t_logs0) * 1000.0))
+            for tid in log_ids:
+                if len(token_ids) >= limit:
+                    break
+                if int(tid) in seen_ids:
+                    continue
+                seen_ids.add(int(tid))
+                token_ids.append(int(tid))
+        if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN:
+            t_batch0 = time.perf_counter()
+            batch_ids, batch_checked, batch_errors = _scan_erc721_token_ids_by_ownerof_batch(
+                cid,
+                pm,
+                owner,
+                max_ids=max(limit * 4, limit),
+                max_checks=int(POSITIONS_INFINITY_BATCH_MAX_CHECKS),
+                batch_size=int(POSITIONS_INFINITY_BATCH_SIZE),
+                deadline_ts=deadline_ts,
+            )
+            if dbg is not None:
+                dbg["batch_ownerof_checked"] = int((dbg.get("batch_ownerof_checked") or 0) + int(batch_checked))
+                dbg["batch_ownerof_errors"] = int((dbg.get("batch_ownerof_errors") or 0) + int(batch_errors))
+                dbg["batch_ownerof_matched"] = int((dbg.get("batch_ownerof_matched") or 0) + len(batch_ids))
+                dbg["rpc_ms_batch_ownerof"] = int((dbg.get("rpc_ms_batch_ownerof") or 0) + int(max(0.0, (time.perf_counter() - t_batch0) * 1000.0)))
+            for tid in batch_ids:
+                if len(token_ids) >= limit:
+                    break
+                if int(tid) in seen_ids:
+                    continue
+                seen_ids.add(int(tid))
+                token_ids.append(int(tid))
+        if dbg is not None:
+            dbg["final_token_ids"] = len(token_ids)
+        return token_ids
+    if not POSITIONS_INFINITY_HEAVY_METHODS:
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
         return token_ids
@@ -4859,6 +5039,7 @@ def _scan_infinity_position_ids_for_owner(
             owner,
             deadline_ts=deadline_ts,
             max_ids=max(limit * 3, limit),
+            debug_out=dbg,
         )
         if dbg is not None:
             dbg["log_token_ids"] = len(log_ids)
@@ -4903,6 +5084,7 @@ def _scan_infinity_position_ids_for_owner(
             deadline_ts=deadline_ts,
             max_ids=max(limit * 10, limit),
             lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 20_000_000),
+            debug_out=dbg,
         )
         if dbg is not None:
             dbg["deep_log_token_ids"] = len(deep_ids)
@@ -8065,6 +8247,47 @@ def _scan_pool_positions(
     _enrich_rows_liquidity_usd(uniq_rows, max_seconds=4 if not hard_scan else 10)
     timings["liquidity_usd_enrich_sec"] = round(max(0.0, time.monotonic() - t_liq), 3)
     _apply_creation_dates_phase(uniq_rows, include_creation_dates=include_creation_dates)
+    # Aggregate low-level Infinity RPC diagnostics from per-owner attempts.
+    infinity_rpc = {
+        "requests": 0,
+        "attempts": 0,
+        "success": 0,
+        "failures": 0,
+        "first_try_fail": 0,
+        "retry_success": 0,
+        "ms_total": 0,
+        "last_error": "",
+    }
+    for d in debug_rows:
+        attempts = (d or {}).get("attempts") or []
+        if not isinstance(attempts, list):
+            continue
+        for a in attempts:
+            if not isinstance(a, dict):
+                continue
+            inf = a.get("infinity_debug") or {}
+            if not isinstance(inf, dict):
+                continue
+            infinity_rpc["requests"] += int(inf.get("rpc_getlogs_requests") or 0)
+            infinity_rpc["attempts"] += int(inf.get("rpc_getlogs_attempts") or 0)
+            infinity_rpc["success"] += int(inf.get("rpc_getlogs_success") or 0)
+            infinity_rpc["failures"] += int(inf.get("rpc_getlogs_failures") or 0)
+            infinity_rpc["first_try_fail"] += int(inf.get("rpc_getlogs_first_try_fail") or 0)
+            infinity_rpc["retry_success"] += int(inf.get("rpc_getlogs_retry_success") or 0)
+            infinity_rpc["ms_total"] += int(inf.get("rpc_getlogs_ms") or 0)
+            if not infinity_rpc["last_error"]:
+                infinity_rpc["last_error"] = str(inf.get("rpc_getlogs_last_error") or "").strip()[:180]
+    if int(infinity_rpc["requests"]) > 0 or int(infinity_rpc["attempts"]) > 0:
+        timings["infinity_rpc"] = {
+            "getlogs_requests": int(infinity_rpc["requests"]),
+            "getlogs_attempts": int(infinity_rpc["attempts"]),
+            "getlogs_success": int(infinity_rpc["success"]),
+            "getlogs_failures": int(infinity_rpc["failures"]),
+            "getlogs_first_try_fail": int(infinity_rpc["first_try_fail"]),
+            "getlogs_retry_success": int(infinity_rpc["retry_success"]),
+            "getlogs_ms_total": int(infinity_rpc["ms_total"]),
+            "getlogs_last_error": str(infinity_rpc["last_error"] or ""),
+        }
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
         elapsed_total = max(0.0, time.monotonic() - scan_started)
@@ -10518,6 +10741,21 @@ def _render_positions_page() -> str:
           .map((x) => `${x[0]}=${x[1]}s`);
         if (slowChains.length) {
           timingLines.push(`slow_chains: ${slowChains.join(", ")}`);
+        }
+        const infRpc = (pool && typeof pool.infinity_rpc === "object" && pool.infinity_rpc) ? pool.infinity_rpc : {};
+        if (Number(infRpc?.getlogs_requests || 0) > 0 || Number(infRpc?.getlogs_attempts || 0) > 0) {
+          timingLines.push(
+            `infinity_getLogs: req=${Number(infRpc.getlogs_requests || 0)} `
+            + `attempts=${Number(infRpc.getlogs_attempts || 0)} `
+            + `first_fail=${Number(infRpc.getlogs_first_try_fail || 0)} `
+            + `retry_ok=${Number(infRpc.getlogs_retry_success || 0)} `
+            + `ok=${Number(infRpc.getlogs_success || 0)} `
+            + `fail=${Number(infRpc.getlogs_failures || 0)} `
+            + `ms=${Number(infRpc.getlogs_ms_total || 0)}`
+          );
+          if (String(infRpc.getlogs_last_error || "").trim()) {
+            timingLines.push(`infinity_getLogs_last_error: ${String(infRpc.getlogs_last_error || "")}`);
+          }
         }
         if (!infinityMode) {
           const compactLines = summaryFiltered
@@ -12987,6 +13225,26 @@ def _build_pool_debug_summary_rows(pool_debug_rows: list[dict[str, Any]]) -> lis
             mode = f"{a.get('query_mode') or ''}:{a.get('owner_type') or ''}"
             key = (chain, version, mode, "ok" if a.get("ok") else "fail")
             debug_summary[key] = int(debug_summary.get(key, 0)) + int(a.get("count") or 0)
+            inf_dbg = a.get("infinity_debug") if isinstance(a.get("infinity_debug"), dict) else None
+            if isinstance(inf_dbg, dict):
+                metric_map = [
+                    ("infinity_rpc_getlogs_requests", "rpc_getlogs_requests"),
+                    ("infinity_rpc_getlogs_attempts", "rpc_getlogs_attempts"),
+                    ("infinity_rpc_getlogs_success", "rpc_getlogs_success"),
+                    ("infinity_rpc_getlogs_failures", "rpc_getlogs_failures"),
+                    ("infinity_rpc_getlogs_first_try_fail", "rpc_getlogs_first_try_fail"),
+                    ("infinity_rpc_getlogs_retry_success", "rpc_getlogs_retry_success"),
+                    ("infinity_rpc_getlogs_ms", "rpc_getlogs_ms"),
+                ]
+                for m_name, src_key in metric_map:
+                    try:
+                        m_val = int(inf_dbg.get(src_key) or 0)
+                    except Exception:
+                        m_val = 0
+                    if m_val <= 0:
+                        continue
+                    mk = (chain, version, m_name, "ok")
+                    debug_summary[mk] = int(debug_summary.get(mk, 0)) + int(m_val)
     return [
         {
             "chain": chain,
@@ -13471,6 +13729,31 @@ def _scan_positions_core(
     cache_hits, cache_misses, skip_live, legacy_disabled, row_live_enrich_disabled = _extract_index_scan_counters(
         pool_debug_rows
     )
+    rpc_logs_req = 0
+    rpc_logs_attempts = 0
+    rpc_logs_first_fail = 0
+    rpc_logs_retry_ok = 0
+    rpc_logs_ms = 0
+    for d in pool_debug_rows:
+        if not isinstance(d, dict):
+            continue
+        for a in (d.get("attempts") or []):
+            if not isinstance(a, dict):
+                continue
+            inf_dbg = a.get("infinity_debug") if isinstance(a.get("infinity_debug"), dict) else None
+            if not isinstance(inf_dbg, dict):
+                continue
+            rpc_logs_req += int(inf_dbg.get("rpc_getlogs_requests") or 0)
+            rpc_logs_attempts += int(inf_dbg.get("rpc_getlogs_attempts") or 0)
+            rpc_logs_first_fail += int(inf_dbg.get("rpc_getlogs_first_try_fail") or 0)
+            rpc_logs_retry_ok += int(inf_dbg.get("rpc_getlogs_retry_success") or 0)
+            rpc_logs_ms += int(inf_dbg.get("rpc_getlogs_ms") or 0)
+    if rpc_logs_req > 0:
+        info_notes.append(
+            "RPC getLogs debug: "
+            f"requests={rpc_logs_req}, attempts={rpc_logs_attempts}, "
+            f"first_try_fail={rpc_logs_first_fail}, retry_success={rpc_logs_retry_ok}, total_ms={rpc_logs_ms}."
+        )
     debug_timings["build_debug_sec"] = round(max(0.0, time.monotonic() - t_debug), 3)
     t_analytics = time.monotonic()
     _record_positions_scan_analytics(
