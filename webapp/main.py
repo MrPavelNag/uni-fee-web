@@ -222,6 +222,7 @@ POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_A
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "45")))
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "4")))
+POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "6"))))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
     "1",
     "true",
@@ -2484,18 +2485,56 @@ def _fetch_v3_position_contract_snapshot(
             + _encode_address_word(token1)
             + _encode_uint_word(int(fee))
         )
-        pool_words = _hex_words(_eth_call_hex(cid, str(factory), pool_data))
+        pool_addr = ""
+        dec0 = 18
+        dec1 = 18
+        sym0 = ""
+        sym1 = ""
+        primary_batch = _eth_call_hex_batch(
+            cid,
+            [
+                {"to": str(factory), "data": pool_data},
+                {"to": token0, "data": "0x313ce567"},
+                {"to": token1, "data": "0x313ce567"},
+                {"to": token0, "data": "0x95d89b41"},
+                {"to": token1, "data": "0x95d89b41"},
+            ],
+        )
+        pool_words = _hex_words(primary_batch[0] or "0x")
         pool_addr = _decode_address_from_word(pool_words[0]).lower() if pool_words else ""
+        try:
+            if primary_batch[1]:
+                dec0 = _decode_uint_eth_call(primary_batch[1])
+            if primary_batch[2]:
+                dec1 = _decode_uint_eth_call(primary_batch[2])
+        except Exception:
+            dec0, dec1 = 18, 18
+        if dec0 <= 0 or dec0 > 36:
+            dec0 = 18
+        if dec1 <= 0 or dec1 > 36:
+            dec1 = 18
+        sym0 = _normalize_display_symbol(_decode_abi_string(primary_batch[3] or "") or "")
+        sym1 = _normalize_display_symbol(_decode_abi_string(primary_batch[4] or "") or "")
+        if not sym0:
+            sym0 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token0) or "")
+        if not sym1:
+            sym1 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token1) or "")
         sqrt_price_x96 = 0
         pool_liq = 0
         if _is_eth_address(pool_addr):
-            slot0_words = _hex_words(_eth_call_hex(cid, pool_addr, "0x3850c7bd"))
+            pool_batch = _eth_call_hex_batch(
+                cid,
+                [
+                    {"to": pool_addr, "data": "0x3850c7bd"},
+                    {"to": pool_addr, "data": "0x1a686502"},
+                ],
+            )
+            slot0_words = _hex_words(pool_batch[0] or "0x")
             sqrt_price_x96 = _decode_uint_from_word(slot0_words[0]) if slot0_words else 0
-            pool_liq = max(0, _decode_uint_eth_call(_eth_call_hex(cid, pool_addr, "0x1a686502")))
-        dec0 = _fetch_erc20_decimals_onchain(cid, token0)
-        dec1 = _fetch_erc20_decimals_onchain(cid, token1)
-        sym0 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token0) or "")
-        sym1 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token1) or "")
+            try:
+                pool_liq = max(0, _decode_uint_eth_call(pool_batch[1] or "0x"))
+            except Exception:
+                pool_liq = 0
         q_amount0, q_amount1 = _quote_v3_decrease_liquidity_amounts(
             cid, proto, tid, liq, owner_addr, dec0, dec1
         )
@@ -3054,6 +3093,56 @@ def _eth_call_hex(chain_id: int, to: str, data_hex: str, *, from_addr: str | Non
     out = str(result or "").strip().lower()
     if not out.startswith("0x"):
         raise RuntimeError("Invalid eth_call result")
+    return out
+
+
+def _eth_call_hex_batch(
+    chain_id: int,
+    calls: list[dict[str, Any]],
+) -> list[str | None]:
+    if not calls:
+        return []
+    payloads: list[dict[str, Any]] = []
+    for idx, call in enumerate(calls, start=1):
+        to = str((call or {}).get("to") or "").strip()
+        data_hex = str((call or {}).get("data") or "").strip()
+        from_addr = str((call or {}).get("from") or "").strip().lower()
+        if not _is_eth_address(to) or not str(data_hex).startswith("0x"):
+            payloads.append({})
+            continue
+        call_obj: dict[str, Any] = {"to": to, "data": data_hex}
+        if _is_eth_address(from_addr):
+            call_obj["from"] = from_addr
+        payloads.append(
+            {
+                "jsonrpc": "2.0",
+                "id": idx,
+                "method": "eth_call",
+                "params": [call_obj, "latest"],
+            }
+        )
+    try:
+        resp = _json_rpc_batch_call(int(chain_id), [p for p in payloads if p])
+    except Exception:
+        return [None for _ in calls]
+    by_id: dict[int, dict[str, Any]] = {}
+    for row in resp:
+        try:
+            rid = int(row.get("id"))
+        except Exception:
+            continue
+        by_id[rid] = row
+    out: list[str | None] = []
+    for idx, p in enumerate(payloads, start=1):
+        if not p:
+            out.append(None)
+            continue
+        row = by_id.get(idx) or {}
+        raw = str(row.get("result") or "").strip().lower()
+        if raw.startswith("0x") and row.get("error") is None:
+            out.append(raw)
+        else:
+            out.append(None)
     return out
 
 
@@ -5630,9 +5719,11 @@ def _scan_pool_positions_chain(
     if not chain_key:
         return rows, errors, debug_rows, timed_out
     owner_has_nft_balance: dict[str, bool] = {}
-    # Owner-level NFT balance precheck имеет смысл только там, где он реально нужен
-    # для Infinity/нагрузки — на BSC и Base. Для остальных v3-сетей не режем скан.
-    if int(chain_id) in (56, 8453):
+    if not hard_scan:
+        for owner in addresses:
+            owner_has_nft_balance[str(owner).strip().lower()] = True
+    # Owner-level NFT balance precheck stays only for hard scan.
+    elif int(chain_id) in (56, 8453):
         for owner in addresses:
             owner_has_nft_balance[str(owner).strip().lower()] = _owner_has_any_position_nft_balance(int(chain_id), owner)
     else:
@@ -6032,14 +6123,21 @@ def _scan_pool_positions_chain(
         *,
         compare: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        attempts_for_payload = owner_attempts
+        if not hard_scan:
+            attempts_for_payload = []
         return {
             "chain": chain_key,
             "version": version,
             "owner": owner,
             "positions_found": len(positions),
             "failed": False,
-            "attempts": owner_attempts,
-            "compare": compare if isinstance(compare, dict) else _build_owner_compare_debug(positions, owner_attempts),
+            "attempts": attempts_for_payload,
+            "compare": (
+                compare
+                if isinstance(compare, dict)
+                else (_build_owner_compare_debug(positions, attempts_for_payload) if hard_scan else {})
+            ),
         }
 
     def _make_no_nft_owner_debug(owner: str, version: str, owner_attempts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -6067,7 +6165,7 @@ def _scan_pool_positions_chain(
         owner_attempts: list[dict[str, Any]],
     ) -> bool:
         can_use_live_discovery = bool(POSITIONS_LEGACY_DISCOVERY_ENABLED and not skip_live_discovery)
-        if not can_use_live_discovery and not positions:
+        if hard_scan and not can_use_live_discovery and not positions:
             owner_attempts.append(
                 {
                     "owner_value": owner,
@@ -6160,7 +6258,7 @@ def _scan_pool_positions_chain(
                         "ok": True,
                     }
                 )
-                if POSITIONS_INDEX_FIRST_STRICT and index_cache_hit:
+                if hard_scan and POSITIONS_INDEX_FIRST_STRICT and index_cache_hit:
                     skip_live_discovery = True
                     owner_attempts.append(
                         {
@@ -6222,15 +6320,6 @@ def _scan_pool_positions_chain(
         if not hard_scan:
             # Fast mode: keep strict index-only path; heavy discovery/fallback is reserved for hard scan.
             can_use_live_discovery = False
-            owner_attempts.append(
-                {
-                    "owner_value": owner,
-                    "owner_type": "fast",
-                    "query_mode": "hard_scan_required_for_live_discovery",
-                    "count": len(positions),
-                    "ok": True,
-                }
-            )
         # Cold-cache safety: when strict index-first disables live discovery and cache is empty,
         # do one bounded synchronous warmup for this owner/chain to avoid empty first response.
         # Also warm up once when cache hit has v3 rows but is missing Infinity rows.
@@ -6337,7 +6426,7 @@ def _scan_pool_positions_chain(
                     "ok": True,
                 }
             )
-        if positions and not can_use_live_discovery:
+        if hard_scan and positions and not can_use_live_discovery:
             owner_attempts.append(
                 {
                     "owner_value": owner,
@@ -6688,9 +6777,38 @@ def _scan_pool_positions_chain(
     ) -> tuple[list[dict[str, Any]], bool]:
         out_rows: list[dict[str, Any]] = []
         owner_timed_out = False
-        for p in positions:
-            try:
-                row = _build_owner_pool_row(
+        workers = max(1, min(int(POSITIONS_NFT_PARALLEL_WORKERS), len(positions)))
+        if workers <= 1:
+            for p in positions:
+                try:
+                    row = _build_owner_pool_row(
+                        p,
+                        owner=owner,
+                        version=version,
+                        endpoint=endpoint,
+                        has_pool_liquidity=has_pool_liquidity,
+                        allow_live_enrich=allow_live_enrich,
+                    )
+                    if row:
+                        out_rows.append(row)
+                except Exception as e:
+                    if POSITIONS_DEBUG_ERRORS:
+                        owner_errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
+                    continue
+                if time.monotonic() >= deadline_ts:
+                    owner_timed_out = True
+                    break
+            return out_rows, owner_timed_out
+
+        indexed_rows: list[tuple[int, dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_to_idx: dict[Any, int] = {}
+            for idx, p in enumerate(positions):
+                if time.monotonic() >= deadline_ts:
+                    owner_timed_out = True
+                    break
+                fut = ex.submit(
+                    _build_owner_pool_row,
                     p,
                     owner=owner,
                     version=version,
@@ -6698,15 +6816,23 @@ def _scan_pool_positions_chain(
                     has_pool_liquidity=has_pool_liquidity,
                     allow_live_enrich=allow_live_enrich,
                 )
-                if row:
-                    out_rows.append(row)
-            except Exception as e:
-                if POSITIONS_DEBUG_ERRORS:
-                    owner_errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
-                continue
-            if time.monotonic() >= deadline_ts:
-                owner_timed_out = True
-                break
+                fut_to_idx[fut] = idx
+            for fut in as_completed(list(fut_to_idx.keys())):
+                if time.monotonic() >= deadline_ts:
+                    owner_timed_out = True
+                    break
+                idx = int(fut_to_idx.get(fut, -1))
+                try:
+                    row = fut.result()
+                    if row and idx >= 0:
+                        indexed_rows.append((idx, row))
+                except Exception as e:
+                    if POSITIONS_DEBUG_ERRORS:
+                        owner_errors.append(f"Pool row skipped [{chain_key}/{version}] for {owner}: {e}")
+                    continue
+        if indexed_rows:
+            indexed_rows.sort(key=lambda x: x[0])
+            out_rows.extend([r for _, r in indexed_rows])
         return out_rows, owner_timed_out
 
     def _scan_pool_positions_owner(
@@ -6726,7 +6852,7 @@ def _scan_pool_positions_chain(
             return owner_rows, owner_errors, _make_owner_debug(owner, version, [], owner_attempts), True
         owner_key = str(owner).strip().lower()
         owner_has_nft = bool(owner_has_nft_balance.get(owner_key, True))
-        if int(chain_id) in (56, 8453):
+        if hard_scan and int(chain_id) in (56, 8453):
             owner_attempts.append(
                 {
                     "owner_value": owner,
@@ -6736,7 +6862,7 @@ def _scan_pool_positions_chain(
                     "ok": True,
                 }
             )
-        if version == "v3" and not owner_has_nft:
+        if hard_scan and version == "v3" and not owner_has_nft:
             owner_debug = _make_no_nft_owner_debug(owner, version, owner_attempts)
             return owner_rows, owner_errors, owner_debug, False
         positions, allow_live_enrich = _discover_owner_positions(
@@ -6837,6 +6963,11 @@ def _scan_pool_positions_chain(
 
     def _prepare_version_scan_context(version: str) -> tuple[str, bool, bool] | None:
         endpoint = get_graph_endpoint(chain_key, version=version)
+        if not hard_scan:
+            # Fast mode: do not spend requests on endpoint schema introspection.
+            if not endpoint and version != "v3" and not POSITIONS_OWNERSHIP_INDEX_ENABLED:
+                return None
+            return endpoint, False, True
         if not endpoint and version != "v3":
             # In index-first mode we can still serve cached v4 positions even without live graph endpoint.
             if not POSITIONS_OWNERSHIP_INDEX_ENABLED:
@@ -7059,7 +7190,7 @@ def _run_pool_chain_batch_parallel(
     return rows, errors, debug_rows, timed_out
 
 
-def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str]) -> list[int]:
+def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], *, hard_scan: bool = False) -> list[int]:
     valid_chain_ids = [int(cid) for cid in chain_ids if CHAIN_ID_TO_KEY.get(int(cid), "")]
     if not valid_chain_ids:
         return []
@@ -7084,6 +7215,8 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str]) 
                 return narrowed
             except Exception:
                 return []
+    if not hard_scan:
+        return valid_chain_ids
     if not POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
         return valid_chain_ids
     filtered_chain_ids: list[int] = []
@@ -7120,7 +7253,7 @@ def _scan_pool_positions(
     deadline_ts = time.monotonic() + float(POSITIONS_SCAN_MAX_SECONDS)
     timed_out = False
 
-    valid_chain_ids = _filter_chain_ids_for_pool_scan(chain_ids, addresses)
+    valid_chain_ids = _filter_chain_ids_for_pool_scan(chain_ids, addresses, hard_scan=hard_scan)
     if not valid_chain_ids:
         return [], [], []
     priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
@@ -9022,24 +9155,12 @@ def _render_positions_page() -> str:
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
-    #posPoolsTable { min-width: 1200px; table-layout: auto; }
+    #posPoolsTable { min-width: 3600px; table-layout: auto; }
     #posPoolsTable th, #posPoolsTable td { white-space: nowrap; }
     #posPoolsTable th:nth-child(1), #posPoolsTable td:nth-child(1) {
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
     #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
-    .contract-details-row td {
-      background: #f8fbff;
-      color: #334155;
-      font-size: 11px;
-      white-space: normal !important;
-      line-height: 1.35;
-      border-bottom: 1px dashed #dbe3ef;
-    }
-    .contract-details-row .label {
-      color: #1e3a8a;
-      font-weight: 700;
-    }
     .table-nav-btn {
       border:1px solid #bfdbfe;
       background:#eff6ff;
@@ -9470,131 +9591,37 @@ def _render_positions_page() -> str:
       const infos = data?.infos || [];
       const dbg = data?.debug || {};
       const dbgSummary = Array.isArray(dbg.summary) ? dbg.summary : [];
-      const dbgRows = Array.isArray(dbg.pool_scan) ? dbg.pool_scan : [];
       let dbgHtml = "";
-      if (dbgSummary.length || dbgRows.length) {
+      if (dbgSummary.length) {
         const infoText = infos.map((x) => String(x || "")).join(" | ").toLowerCase();
         const hardMode = infoText.includes("hard scan is enabled");
-        const fastMode = !hardMode;
-        const heavyModes = new Set([
-          "index_sync_warmup",
-          "index_graph_fallback",
-          "onchain_v3_prefetch",
-          "onchain_v3_npm",
-          "onchain_pancake_infinity_cl",
-          "onchain_pancake_infinity_bin",
-          "indexer_pancake_infinity_cl",
-          "graph_pancake_infinity_cl",
-        ]);
-        const summaryFiltered = dbgSummary.filter((x) => {
-          const qm = String(x?.query_mode || "");
-          // Hide service-line noise in debug summary.
-          if (qm === "hard_scan_required_for_live_discovery") return false;
-          return true;
-        });
+        const summaryFiltered = dbgSummary.filter((x) => String(x?.query_mode || "") !== "hard_scan_required_for_live_discovery");
         const cacheHits = summaryFiltered
           .filter((x) => String(x?.query_mode || "") === "ownership_cache")
           .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
-        const heavyPathsUsed = summaryFiltered
-          .filter((x) => heavyModes.has(String(x?.query_mode || "")) && Number(x?.count || 0) > 0)
-          .reduce((acc, x) => acc + 1, 0);
-        const sumLines = summaryFiltered.slice(0, 40).map((x) =>
-          `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`
-        );
-
-        // Keep "zero found" concise and useful:
-        // - in fast mode: show only v3 rows
-        // - and only where owner_nft_balance_precheck indicates non-zero NFT balance
-        const nftPositiveOwnerChain = new Set();
-        for (const row of dbgRows) {
-          const owner = String(row?.owner || "").toLowerCase();
-          const chain = String(row?.chain || "").toLowerCase();
-          const attempts = Array.isArray(row?.attempts) ? row.attempts : [];
-          for (const a of attempts) {
-            if (String(a?.query_mode || "") !== "owner_nft_balance_precheck") continue;
-            if (Number(a?.count || 0) > 0) {
-              nftPositiveOwnerChain.add(`${owner}|${chain}`);
-            }
+        const modeText = hardMode ? "hard" : "fast";
+        if (!hardMode) {
+          const compactLines = summaryFiltered
+            .slice(0, 8)
+            .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")}: ${Number(x.count || 0)}`);
+          const body = []
+            .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
+            .concat(compactLines.length ? compactLines : [])
+            .join("\\n");
+          if (body.trim()) {
+            dbgHtml = `<div class='info-box'><details><summary>Debug scan (compact)</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
           }
-        }
-        const zeroRows = dbgRows
-          .filter((x) => Number(x.positions_found || 0) === 0)
-          .filter((x) => (fastMode ? String(x.version || "").toLowerCase() === "v3" : true))
-          .filter((x) => nftPositiveOwnerChain.has(`${String(x.owner || "").toLowerCase()}|${String(x.chain || "").toLowerCase()}`))
-          .slice(0, 30)
-          .map((x) => `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} (0)`);
-        const zeroRowsDedup = Array.from(new Set(zeroRows));
-        const cmpRows = dbgRows
-          .filter((x) => {
-            const c = x.compare || {};
-            return Boolean(c.graph_checked) && (Number(c.only_onchain_count || 0) > 0 || Number(c.only_graph_count || 0) > 0);
-          })
-          .slice(0, 30)
-          .map((x) => {
-            const c = x.compare || {};
-            const o = Number(c.only_onchain_count || 0);
-            const g = Number(c.only_graph_count || 0);
-            const oid = (Array.isArray(c.only_onchain_ids) ? c.only_onchain_ids : []).slice(0, 2).join(",");
-            const gid = (Array.isArray(c.only_graph_ids) ? c.only_graph_ids : []).slice(0, 2).join(",");
-            return `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} only_onchain=${o}${oid ? ` [${esc(oid)}]` : ""}, only_graph=${g}${gid ? ` [${esc(gid)}]` : ""}`;
-          });
-        const cmpRowsDedup = Array.from(new Set(cmpRows));
-        const infinityRows = [];
-        for (const row of dbgRows.slice(0, 200)) {
-          const attempts = Array.isArray(row?.attempts) ? row.attempts : [];
-          for (const a of attempts) {
-            const qm = String(a?.query_mode || "");
-            if (!(qm === "onchain_pancake_infinity_cl" || qm === "onchain_pancake_infinity_bin" || qm === "indexer_pancake_infinity_cl")) continue;
-            const d = a?.infinity_debug || {};
-            const line = `${esc(row.owner || "?")} -> ${esc(row.chain || "?")}/${esc(qm.replace("onchain_", "").replace("indexer_", ""))} `
-              + `count=${Number(a?.count || 0)} `
-              + `balance=${Number(d.balance || 0)} `
-              + `enum_ok=${d.enumerable_ok ? "1" : "0"} enum_ids=${Number(d.enumerable_token_ids || 0)} `
-              + `log_ids=${Number(d.log_token_ids || 0)} `
-              + `ownerOf_checked=${Number(d.ownerof_checked_from_logs || 0)} `
-              + `ownerOf_match=${Number(d.ownerof_matched_from_logs || 0)} `
-              + `ownerOf_mismatch=${Number(d.ownerof_mismatched_from_logs || 0)} `
-              + `ownerOf_err=${Number(d.ownerof_errors_from_logs || 0)} `
-              + `deep_log_ids=${Number(d.deep_log_token_ids || 0)} `
-              + `recent_ids=${Number(d.recent_transfer_token_ids || 0)} `
-              + `recent_checked=${Number(d.recent_transfer_ownerof_checked || 0)} `
-              + `recent_match=${Number(d.recent_transfer_ownerof_matched || 0)} `
-              + `explorer_ids=${Number(d.explorer_token_ids || 0)} `
-              + `explorer_checked=${Number(d.explorer_ownerof_checked || 0)} `
-              + `explorer_match=${Number(d.explorer_ownerof_matched || 0)} `
-              + `batch_checked=${Number(d.batch_ownerof_checked || 0)} `
-              + `batch_match=${Number(d.batch_ownerof_matched || 0)} `
-              + `batch_err=${Number(d.batch_ownerof_errors || 0)} `
-              + `mint_ids=${Number(d.mint_log_ids || 0)} `
-              + `mint_checked=${Number(d.mint_log_ownerof_checked || 0)} `
-              + `mint_match=${Number(d.mint_log_ownerof_matched || 0)} `
-              + `receipt_ids=${Number(d.receipt_mint_ids || 0)} `
-              + `receipt_checked=${Number(d.receipt_checked || 0)} `
-              + `supply=${Number(d.total_supply || 0)} `
-              + `tbi_checked=${Number(d.tokenbyindex_checked || 0)} `
-              + `tbi_match=${Number(d.tokenbyindex_matched || 0)} `
-              + `tbi_err=${Number(d.tokenbyindex_errors || 0)} `
-              + `scan_checked=${Number(d.owner_scan_checked || 0)} `
-              + `scan_match=${Number(d.owner_scan_matched || 0)} `
-              + `scan_err=${Number(d.owner_scan_errors || 0)} `
-              + `final_ids=${Number(d.final_token_ids || 0)} `
-              + `no_balance_exit=${d.early_exit_no_balance ? "1" : "0"}`
-              + `${d.pm ? ` pm=${esc(d.pm)}` : ""}`;
-            infinityRows.push(line);
+        } else {
+          const detailedLines = summaryFiltered
+            .slice(0, 40)
+            .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`);
+          const body = []
+            .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
+            .concat(detailedLines.length ? detailedLines : [])
+            .join("\\n");
+          if (body.trim()) {
+            dbgHtml = `<div class='info-box'><details><summary>Debug scan details</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
           }
-        }
-        const body = []
-          .concat([
-            "Summary:",
-            `mode=${hardMode ? "hard" : "fast"} | cache_hits=${cacheHits} | heavy_paths_used=${heavyPathsUsed}`,
-          ])
-          .concat(sumLines.length ? sumLines : [])
-          .concat(zeroRowsDedup.length ? ["", "Zero-found owners:", ...zeroRowsDedup] : [])
-          .concat(cmpRowsDedup.length ? ["", "Source compare (onchain vs graph):", ...cmpRowsDedup] : [])
-          .concat(infinityRows.length ? ["", "Infinity debug:", ...infinityRows.slice(0, 40)] : [])
-          .join("\\n");
-        if (body.trim()) {
-          dbgHtml = `<div class='info-box'><details><summary>Debug scan details</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
         }
       }
       const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
@@ -9707,8 +9734,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      const baseCols = 11;
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th><th>Contract source</th><th>Position manager</th><th>Token ID</th><th>Position nonce</th><th>Approved operator</th><th>Token0 address</th><th>Token1 address</th><th>Fee (raw)</th><th>Tick lower</th><th>Tick upper</th><th>Position liquidity</th><th>Owed0 raw</th><th>Owed1 raw</th><th>Pool address</th><th>Pool sqrtPriceX96</th><th>Pool liquidity</th><th>Token0 decimals</th><th>Token1 decimals</th><th>Token0 symbol</th><th>Token1 symbol</th><th>Quote amount0</th><th>Quote amount1</th><th>Quote fee0</th><th>Quote fee1</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -9749,13 +9775,33 @@ def _render_positions_page() -> str:
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
         const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
+        html += `<td>${esc(r.contract_source || "")}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_position_manager || ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token_id ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_nonce ?? ""))}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_operator || ""))}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_token0 || ""))}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_token1 || ""))}</td>`;
+        html += `<td>${esc(String(r.contract_fee ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_tick_lower ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_tick_upper ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_liquidity ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_tokens_owed0_raw ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_tokens_owed1_raw ?? ""))}</td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.contract_pool_address || ""))}</td>`;
+        html += `<td>${esc(String(r.contract_pool_sqrt_price_x96 ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_pool_liquidity ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token0_decimals ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token1_decimals ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token0_symbol ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_token1_symbol ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_quote_amount0 ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_quote_amount1 ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_quote_fee0 ?? ""))}</td>`;
+        html += `<td>${esc(String(r.contract_quote_fee1 ?? ""))}</td>`;
         html += "</tr>";
-        const detailsPos = `<span class='label'>Position:</span> source=${esc(r.contract_source || "-")}; pm=${esc(String(r.contract_position_manager || ""))}; tokenId=${esc(String(r.contract_token_id ?? ""))}; nonce=${esc(String(r.contract_nonce ?? ""))}; operator=${esc(String(r.contract_operator || ""))}; token0=${esc(String(r.contract_token0_symbol || ""))} (${esc(String(r.contract_token0 || ""))}); token1=${esc(String(r.contract_token1_symbol || ""))} (${esc(String(r.contract_token1 || ""))}); feeRaw=${esc(String(r.contract_fee ?? ""))}; tick=[${esc(String(r.contract_tick_lower ?? ""))}, ${esc(String(r.contract_tick_upper ?? ""))}]; liq=${esc(String(r.contract_liquidity ?? ""))}; owedRaw=${esc(String(r.contract_tokens_owed0_raw ?? ""))}/${esc(String(r.contract_tokens_owed1_raw ?? ""))}`;
-        const detailsPool = `<span class='label'>Pool:</span> address=${esc(String(r.contract_pool_address || ""))}; sqrtPriceX96=${esc(String(r.contract_pool_sqrt_price_x96 ?? ""))}; poolLiq=${esc(String(r.contract_pool_liquidity ?? ""))}; decimals=${esc(String(r.contract_token0_decimals ?? ""))}/${esc(String(r.contract_token1_decimals ?? ""))}`;
-        const detailsQuote = `<span class='label'>Quote:</span> amount=${esc(String(r.contract_quote_amount0 ?? ""))}/${esc(String(r.contract_quote_amount1 ?? ""))}; fee=${esc(String(r.contract_quote_fee0 ?? ""))}/${esc(String(r.contract_quote_fee1 ?? ""))}`;
-        html += `<tr class='contract-details-row'><td colspan='11'>${detailsPos}<br/>${detailsPool}<br/>${detailsQuote}</td></tr>`;
       }
-      if (!visible.length) html += "<tr><td colspan='11'>No pool positions found.</td></tr>";
+      if (!visible.length) html += "<tr><td colspan='35'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
         hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position created</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
@@ -9771,7 +9817,7 @@ def _render_positions_page() -> str:
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
-        html += `<tr><td colspan='11'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='35'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       const detailsEl = document.getElementById("posHiddenDetails");
@@ -12232,21 +12278,23 @@ def _build_positions_scan_response(
     info_notes: list[str],
     pool_debug_rows: list[dict[str, Any]],
     debug_summary_rows: list[dict[str, Any]],
+    include_debug_details: bool,
     evm_count: int,
     sol_count: int,
     tron_count: int,
     chains_count: int,
 ) -> dict[str, Any]:
+    debug_payload = {
+        "pool_scan": pool_debug_rows[:500] if include_debug_details else [],
+        "summary": debug_summary_rows[:120] if include_debug_details else debug_summary_rows[:20],
+    }
     return {
         "pool_positions": pool_rows,
         "lending_positions": lending_rows,
         "reward_positions": reward_rows,
         "errors": (pool_errs + lending_errs + reward_errs)[:40],
         "infos": info_notes[:20],
-        "debug": {
-            "pool_scan": pool_debug_rows[:500],
-            "summary": debug_summary_rows[:500],
-        },
+        "debug": debug_payload,
         "summary": {
             "evm_addresses": int(evm_count),
             "solana_addresses": int(sol_count),
@@ -12452,6 +12500,7 @@ def _scan_positions_core(
         info_notes=info_notes,
         pool_debug_rows=pool_debug_rows,
         debug_summary_rows=debug_summary_rows,
+        include_debug_details=hard_scan_enabled,
         evm_count=len(evm_addresses),
         sol_count=len(solana_addresses),
         tron_count=len(tron_addresses),
