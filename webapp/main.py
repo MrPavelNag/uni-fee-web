@@ -6126,6 +6126,7 @@ def _scan_pool_positions_chain(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
+    progress_out: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -6134,6 +6135,20 @@ def _scan_pool_positions_chain(
     chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
     if not chain_key:
         return rows, errors, debug_rows, timed_out
+
+    progress_slot = progress_out if isinstance(progress_out, dict) else None
+
+    def _set_chain_progress(stage: str, **extra: Any) -> None:
+        if not isinstance(progress_slot, dict):
+            return
+        progress_slot["chain"] = str(chain_key)
+        progress_slot["chain_id"] = int(chain_id)
+        progress_slot["stage"] = str(stage or "")
+        progress_slot["ts"] = float(time.monotonic())
+        for k, v in (extra or {}).items():
+            progress_slot[str(k)] = v
+
+    _set_chain_progress("init", status="running", owners_total=len(addresses))
     owner_has_nft_balance: dict[str, bool] = {}
     if not hard_scan:
         for owner in addresses:
@@ -6737,6 +6752,7 @@ def _scan_pool_positions_chain(
             if version == "v3" and time.monotonic() < deadline_ts:
                 try:
                     t_call = time.monotonic()
+                    _set_chain_progress("call_contract_only_onchain_v3_npm", version=version, owner=str(owner))
                     v3_dbg: dict[str, Any] = {}
                     v3_rows = _scan_v3_positions_onchain(
                         owner,
@@ -6776,6 +6792,7 @@ def _scan_pool_positions_chain(
                 if int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                     try:
                         t_call = time.monotonic()
+                        _set_chain_progress("call_contract_only_onchain_pancake_masterchef_v3", version=version, owner=str(owner))
                         pc_dbg: dict[str, Any] = {}
                         staked_rows = _scan_pancake_staked_v3_positions_onchain(
                             owner,
@@ -6812,6 +6829,7 @@ def _scan_pool_positions_chain(
                 if int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                     try:
                         t_call = time.monotonic()
+                        _set_chain_progress("call_contract_only_onchain_pancake_infinity_cl", version=version, owner=str(owner))
                         inf_dbg: dict[str, Any] = {}
                         inf_cl_rows = _scan_pancake_infinity_cl_positions_onchain(
                             owner,
@@ -6848,6 +6866,7 @@ def _scan_pool_positions_chain(
                 if int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                     try:
                         t_call = time.monotonic()
+                        _set_chain_progress("call_contract_only_onchain_pancake_infinity_bin", version=version, owner=str(owner))
                         inf_dbg: dict[str, Any] = {}
                         inf_bin_rows = _scan_pancake_infinity_bin_positions_onchain(
                             owner,
@@ -6883,6 +6902,7 @@ def _scan_pool_positions_chain(
             if version == "v4" and int(chain_id) in UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                 try:
                     t_call = time.monotonic()
+                    _set_chain_progress("call_contract_only_onchain_uniswap_v4_pm", version=version, owner=str(owner))
                     v4_rows = _scan_uniswap_v4_positions_onchain(
                         owner,
                         int(chain_id),
@@ -7703,12 +7723,20 @@ def _scan_pool_positions_chain(
         has_pool_liquidity: bool,
         has_position_liquidity: bool,
     ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], bool]:
+        owner_started = time.monotonic()
+        _set_chain_progress("owner_scan_start", version=version, owner=str(owner))
         owner_rows: list[dict[str, Any]] = []
         owner_errors: list[str] = []
         owner_attempts: list[dict[str, Any]] = []
         positions: list[dict[str, Any]] = []
         owner_timed_out = time.monotonic() >= deadline_ts
         if owner_timed_out:
+            _set_chain_progress(
+                "owner_scan_timeout",
+                version=version,
+                owner=str(owner),
+                owner_elapsed_ms=int(round(max(0.0, time.monotonic() - owner_started) * 1000.0)),
+            )
             return owner_rows, owner_errors, _make_owner_debug(owner, version, [], owner_attempts), True
         owner_key = str(owner).strip().lower()
         owner_has_nft = bool(owner_has_nft_balance.get(owner_key, True))
@@ -7755,6 +7783,16 @@ def _scan_pool_positions_chain(
             owner_errors=owner_errors,
             deadline_ts=deadline_ts,
         )
+        _set_chain_progress(
+            "owner_scan_done",
+            version=version,
+            owner=str(owner),
+            owner_elapsed_ms=int(round(max(0.0, time.monotonic() - owner_started) * 1000.0)),
+            owner_rows=len(owner_rows),
+            owner_positions=len(positions),
+            owner_timed_out=bool(owner_timed_out),
+            owner_attempts_ms=int(owner_debug.get("attempts_total_ms") or 0),
+        )
         return owner_rows, owner_errors, owner_debug, owner_timed_out
 
     def _scan_version_owners(
@@ -7771,6 +7809,7 @@ def _scan_pool_positions_chain(
         owner_workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(addresses)))
         if owner_workers <= 1 or len(addresses) <= 1:
             for owner in addresses:
+                _set_chain_progress("version_owner_loop", version=version, owner=str(owner), owner_workers=int(owner_workers))
                 if time.monotonic() >= deadline_ts:
                     v_timed_out = True
                     break
@@ -7788,6 +7827,7 @@ def _scan_pool_positions_chain(
                     v_timed_out = True
                     break
         else:
+            _set_chain_progress("version_owner_parallel", version=version, owner_workers=int(owner_workers), owners=len(addresses))
             owner_executor = ThreadPoolExecutor(max_workers=owner_workers)
             owner_futures = [
                 owner_executor.submit(
@@ -7854,6 +7894,7 @@ def _scan_pool_positions_chain(
         return endpoint, has_pool_liquidity, has_position_liquidity
 
     for version in ("v3", "v4"):
+        _set_chain_progress("version_start", version=version)
         if time.monotonic() >= deadline_ts:
             timed_out = True
             break
@@ -7874,6 +7915,7 @@ def _scan_pool_positions_chain(
             timed_out = True
         if timed_out:
             break
+    _set_chain_progress("done" if not timed_out else "timed_out", status=("done" if not timed_out else "timed_out"))
     return rows, errors, debug_rows, timed_out
 
 
@@ -7978,6 +8020,7 @@ def _run_pool_chain_scan(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
+    progress_out: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     return _scan_pool_positions_chain(
         chain_id,
@@ -7986,6 +8029,7 @@ def _run_pool_chain_scan(
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
         hard_scan=hard_scan,
         deep_infinity_scan=deep_infinity_scan,
+        progress_out=progress_out,
     )
 
 
@@ -7996,6 +8040,7 @@ def _run_pool_chain_scan_timed(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
+    progress_out: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, float]:
     started = time.monotonic()
     rows, errors, debug_rows, timed_out = _run_pool_chain_scan(
@@ -8005,6 +8050,7 @@ def _run_pool_chain_scan_timed(
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
         hard_scan=hard_scan,
         deep_infinity_scan=deep_infinity_scan,
+        progress_out=progress_out,
     )
     elapsed = round(max(0.0, time.monotonic() - started), 3)
     return rows, errors, debug_rows, timed_out, elapsed
@@ -8019,12 +8065,13 @@ def _run_pool_chain_batch_serial(
     deep_infinity_scan: bool = False,
     per_chain_timeout_sec: int | None = None,
     per_chain_timeout_overrides: dict[int, int] | None = None,
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float]]:
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float], dict[str, dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
     timed_out = False
     chain_durations_sec: dict[str, float] = {}
+    chain_progress: dict[str, dict[str, Any]] = {}
     for chain_id in chain_ids:
         if time.monotonic() >= deadline_ts:
             timed_out = True
@@ -8037,6 +8084,15 @@ def _run_pool_chain_batch_serial(
                 chain_timeout = ov
         if chain_timeout is not None and int(chain_timeout) > 0:
             chain_deadline = min(chain_deadline, time.monotonic() + float(int(chain_timeout)))
+        chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id), str(chain_id)) or str(chain_id))
+        progress_slot: dict[str, Any] = {
+            "chain": chain_key,
+            "chain_id": int(chain_id),
+            "stage": "queued",
+            "status": "queued",
+            "started_at_monotonic": float(time.monotonic()),
+        }
+        chain_progress[chain_key] = progress_slot
         chain_rows, chain_errors, chain_debug, chain_timed_out, chain_elapsed = _run_pool_chain_scan_timed(
             int(chain_id),
             addresses,
@@ -8044,16 +8100,18 @@ def _run_pool_chain_batch_serial(
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
+            progress_out=progress_slot,
         )
         rows.extend(chain_rows)
         errors.extend(chain_errors)
         debug_rows.extend(chain_debug)
-        chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id), str(chain_id)) or str(chain_id))
         chain_durations_sec[chain_key] = float(chain_elapsed)
+        progress_slot["elapsed_sec"] = float(chain_elapsed)
+        progress_slot["status"] = "timed_out" if bool(chain_timed_out) else "done"
         if chain_timed_out:
             timed_out = True
             break
-    return rows, errors, debug_rows, timed_out, chain_durations_sec
+    return rows, errors, debug_rows, timed_out, chain_durations_sec, chain_progress
 
 
 def _run_pool_chain_batch_parallel(
@@ -8066,16 +8124,26 @@ def _run_pool_chain_batch_parallel(
     deep_infinity_scan: bool = False,
     per_chain_timeout_sec: int | None = None,
     per_chain_timeout_overrides: dict[int, int] | None = None,
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float]]:
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float], dict[str, dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
     timed_out = False
     chain_durations_sec: dict[str, float] = {}
+    chain_progress: dict[str, dict[str, Any]] = {}
     executor = ThreadPoolExecutor(max_workers=max_workers)
     future_map: dict[Any, int] = {}
     futures = []
     for chain_id in chain_ids:
+        chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id), str(chain_id)) or str(chain_id))
+        progress_slot: dict[str, Any] = {
+            "chain": chain_key,
+            "chain_id": int(chain_id),
+            "stage": "queued",
+            "status": "queued",
+            "started_at_monotonic": float(time.monotonic()),
+        }
+        chain_progress[chain_key] = progress_slot
         chain_deadline = float(deadline_ts)
         chain_timeout = per_chain_timeout_sec
         if isinstance(per_chain_timeout_overrides, dict):
@@ -8092,6 +8160,7 @@ def _run_pool_chain_batch_parallel(
             pre_enqueued_ownership_refresh,
             hard_scan,
             deep_infinity_scan,
+            progress_slot,
         )
         futures.append(fut)
         future_map[fut] = int(chain_id)
@@ -8117,6 +8186,10 @@ def _run_pool_chain_batch_parallel(
                     continue
                 chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id), str(chain_id)) or str(chain_id))
                 chain_durations_sec[chain_key] = float(chain_elapsed)
+                slot = chain_progress.get(chain_key)
+                if isinstance(slot, dict):
+                    slot["elapsed_sec"] = float(chain_elapsed)
+                    slot["status"] = "timed_out" if bool(chain_timed_out) else "done"
                 rows.extend(chain_rows)
                 errors.extend(chain_errors)
                 debug_rows.extend(chain_debug)
@@ -8129,7 +8202,7 @@ def _run_pool_chain_batch_parallel(
                 break
     finally:
         executor.shutdown(wait=not aborted, cancel_futures=aborted)
-    return rows, errors, debug_rows, timed_out, chain_durations_sec
+    return rows, errors, debug_rows, timed_out, chain_durations_sec, chain_progress
 
 
 def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], *, hard_scan: bool = False) -> list[int]:
@@ -8236,7 +8309,7 @@ def _scan_pool_positions(
     if run_all_chains_parallel:
         priority_ids = []
     t_prio = time.monotonic()
-    p_rows, p_errors, p_debug, p_timed_out, p_chain_durations = _run_pool_chain_batch_serial(
+    p_rows, p_errors, p_debug, p_timed_out, p_chain_durations, p_chain_progress = _run_pool_chain_batch_serial(
         priority_ids,
         addresses,
         deadline_ts,
@@ -8250,6 +8323,8 @@ def _scan_pool_positions(
     errors.extend(p_errors)
     debug_rows.extend(p_debug)
     chain_durations_sec.update(p_chain_durations or {})
+    chain_progress: dict[str, dict[str, Any]] = {}
+    chain_progress.update(p_chain_progress or {})
     timed_out = bool(p_timed_out)
 
     remaining_chain_ids = (
@@ -8286,7 +8361,7 @@ def _scan_pool_positions(
 
     if not timed_out and (max_workers <= 1 or len(remaining_chain_ids) <= 1):
         t_rest = time.monotonic()
-        r_rows, r_errors, r_debug, r_timed_out, r_chain_durations = _run_pool_chain_batch_serial(
+        r_rows, r_errors, r_debug, r_timed_out, r_chain_durations, r_chain_progress = _run_pool_chain_batch_serial(
             remaining_chain_ids,
             addresses,
             remaining_deadline_ts,
@@ -8300,11 +8375,12 @@ def _scan_pool_positions(
         errors.extend(r_errors)
         debug_rows.extend(r_debug)
         chain_durations_sec.update(r_chain_durations or {})
+        chain_progress.update(r_chain_progress or {})
         timed_out = bool(r_timed_out)
         timings["remaining_chains_sec"] = round(max(0.0, time.monotonic() - t_rest), 3)
     elif not timed_out:
         t_rest = time.monotonic()
-        r_rows, r_errors, r_debug, r_timed_out, r_chain_durations = _run_pool_chain_batch_parallel(
+        r_rows, r_errors, r_debug, r_timed_out, r_chain_durations, r_chain_progress = _run_pool_chain_batch_parallel(
             remaining_chain_ids,
             addresses,
             remaining_deadline_ts,
@@ -8319,6 +8395,7 @@ def _scan_pool_positions(
         errors.extend(r_errors)
         debug_rows.extend(r_debug)
         chain_durations_sec.update(r_chain_durations or {})
+        chain_progress.update(r_chain_progress or {})
         timed_out = bool(r_timed_out)
         timings["remaining_chains_sec"] = round(max(0.0, time.monotonic() - t_rest), 3)
 
@@ -8367,6 +8444,23 @@ def _scan_pool_positions(
     timings["contract_only_mode"] = bool(POSITIONS_CONTRACT_ONLY_ENABLED)
     timings["parallelism_disabled"] = bool(POSITIONS_DISABLE_PARALLELISM)
     timings["chain_durations_sec"] = chain_durations_sec
+    if chain_progress:
+        now_mono = time.monotonic()
+        inflight: dict[str, dict[str, Any]] = {}
+        for ck, st in chain_progress.items():
+            if not isinstance(st, dict):
+                continue
+            item = dict(st)
+            try:
+                started_at = float(item.get("started_at_monotonic") or 0.0)
+            except Exception:
+                started_at = 0.0
+            if started_at > 0:
+                item["running_for_sec"] = round(max(0.0, now_mono - started_at), 3)
+            if str(item.get("status") or "").strip().lower() != "done":
+                inflight[str(ck)] = item
+        if inflight:
+            timings["unfinished_chain_progress"] = inflight
     finished_chain_keys = {str(k).strip().lower() for k in (chain_durations_sec or {}).keys() if str(k).strip()}
     unfinished_chain_keys: list[str] = []
     unfinished_seen: set[str] = set()
@@ -10824,6 +10918,20 @@ def _render_positions_page() -> str:
         }
         const unfinished = Array.isArray(pool?.unfinished_chains) ? pool.unfinished_chains.map((x) => String(x || "")).filter(Boolean) : [];
         if (unfinished.length) timingLines.push(`unfinished_chains: ${unfinished.join(", ")}`);
+        const unfinishedProgress = (pool && typeof pool.unfinished_chain_progress === "object" && pool.unfinished_chain_progress) ? pool.unfinished_chain_progress : {};
+        const unfinishedDetails = Object.entries(unfinishedProgress)
+          .map(([k, v]) => {
+            const d = (v && typeof v === "object") ? v : {};
+            const stage = String(d.stage || "?");
+            const ver = String(d.version || "");
+            const owner = String(d.owner || "");
+            const t = Number(d.running_for_sec || 0);
+            const ownerPart = owner ? ` owner=${shortAddr4(owner)}` : "";
+            const verPart = ver ? ` ${ver}` : "";
+            return `${String(k)}:${stage}${verPart}${ownerPart}${t > 0 ? ` ${t}s` : ""}`;
+          })
+          .filter(Boolean);
+        if (unfinishedDetails.length) timingLines.push(`unfinished_detail: ${unfinishedDetails.join(", ")}`);
         const v3Scan = (pool && typeof pool.v3_contract_scan === "object" && pool.v3_contract_scan) ? pool.v3_contract_scan : {};
         timingLines.push(
           `v3_scan: scanned=${Number(v3Scan.scanned_token_ids || 0)} `
@@ -11136,9 +11244,9 @@ def _render_positions_page() -> str:
         const metrics = statusMetrics(partial);
         const elapsedTxt = elapsedSec > 0 ? ` ${elapsedSec}s` : "";
         let uiProgress = progress;
-        if (st === "running" && progress <= 15) {
-          // Backend keeps 15% during core scan; show a smooth front-end estimate meanwhile.
-          uiProgress = Math.min(64, 15 + Math.floor(elapsedSec * 2.2));
+        if (st === "running" && progress <= 5) {
+          // Backend can stay low during core scan; show a smooth front-end estimate meanwhile.
+          uiProgress = Math.min(94, 5 + Math.floor(elapsedSec * 2.2));
         }
         const sLabel = statusStageLabel(stageLabel, st, partialRendered);
         const liveTag = partialRendered ? " | live" : "";
