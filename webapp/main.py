@@ -1089,6 +1089,36 @@ def _position_index_refresh_owner_chain(
                         inf_cl_ids,
                         source="onchain_infinity_cl",
                     )
+                # If token IDs are known but full position decoding fails, keep lightweight
+                # cache stubs so strict index-first scans can still surface Infinity rows.
+                if not inf_cl_ids and inf_ids:
+                    for tid in inf_ids:
+                        tid_int = _parse_int_like(tid)
+                        if tid_int <= 0:
+                            continue
+                        stub = {
+                            "id": str(tid_int),
+                            "liquidity": "1",
+                            "tickLower": {"tickIdx": "0"},
+                            "tickUpper": {"tickIdx": "1"},
+                            "pool": {
+                                "id": "0x" + _encode_uint_word(tid_int),
+                                "feeTier": "",
+                                "liquidity": "0",
+                                "sqrtPrice": "0",
+                                "token0Price": "0",
+                                "totalValueLockedUSD": "0",
+                                "totalValueLockedToken0": "0",
+                                "totalValueLockedToken1": "0",
+                                "token0": {"id": "", "decimals": "18", "symbol": "UNK"},
+                                "token1": {"id": "", "decimals": "18", "symbol": "UNK"},
+                            },
+                            "_protocol_label": "pancake_infinity_cl",
+                            "_source": "ownership_index_stub",
+                            "_skip_enrich": True,
+                        }
+                        _position_details_cache_upsert(cid, "pancake_infinity_cl", stub)
+                        summary["cached"] += 1
         inf_bin_mgr = PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid, "")
         if run_v3 and inf_bin_mgr:
             try:
