@@ -4353,10 +4353,12 @@ def _is_suspected_spam_pair(
     a0 = str((token0_obj or {}).get("id") or "").strip().lower()
     a1 = str((token1_obj or {}).get("id") or "").strip().lower()
     both_curated = (a0 in chain_addr_map) and (a1 in chain_addr_map)
-    if both_curated:
-        return False
     spam0 = _is_probably_spam_symbol(s0)
     spam1 = _is_probably_spam_symbol(s1)
+    # In contract-only mode do not blindly trust "curated" addresses:
+    # if symbol itself looks spammy, treat as spam early and skip heavy calls.
+    if both_curated and not POSITIONS_CONTRACT_ONLY_ENABLED:
+        return False
     # If pair tokens are not from curated list, mark clearly suspicious symbols.
     return bool(spam0 or spam1)
 
@@ -6374,12 +6376,15 @@ def _scan_pool_positions_chain(
             # Fast mode: keep strict index-only path; heavy discovery/fallback is reserved for hard scan.
             can_use_live_discovery = False
             # Lightweight fast fallback: try Pancake v3 staked positions from MasterChefV3.
-            # This path is much narrower than legacy discovery and helps avoid missing
-            # legitimate Pancake v3 rows when index cache is cold.
+            # Run even when other v3 positions already exist, so Pancake rows are not missed.
             if (
                 version == "v3"
-                and not positions
                 and int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID
+                and not any(
+                    str((pp or {}).get("_protocol_label") or "").strip().lower() == "pancake_v3_staked"
+                    for pp in (positions or [])
+                    if isinstance(pp, dict)
+                )
                 and time.monotonic() < (deadline_ts - 0.1)
             ):
                 try:
@@ -6399,7 +6404,20 @@ def _scan_pool_positions_chain(
                         }
                     )
                     if farm_positions:
-                        positions = list(farm_positions)
+                        seen_keys: set[str] = set()
+                        for pp in positions:
+                            if not isinstance(pp, dict):
+                                continue
+                            k = f"{str(pp.get('_protocol_label') or '').lower()}|{str(pp.get('id') or '')}"
+                            seen_keys.add(k)
+                        for fp in farm_positions:
+                            if not isinstance(fp, dict):
+                                continue
+                            fk = f"{str(fp.get('_protocol_label') or '').lower()}|{str(fp.get('id') or '')}"
+                            if fk in seen_keys:
+                                continue
+                            seen_keys.add(fk)
+                            positions.append(fp)
                 except Exception as e:
                     owner_attempts.append(
                         {
