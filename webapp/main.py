@@ -2461,9 +2461,6 @@ def _fetch_v3_position_contract_snapshot(
     pm = _position_manager_for_protocol(cid, proto)
     if not _is_eth_address(pm):
         return None
-    factory = UNISWAP_V3_FACTORY_BY_CHAIN_ID.get(cid)
-    if not _is_eth_address(str(factory or "")):
-        return None
     try:
         pos_data = "0x99fbab88" + _encode_uint_word(int(tid))
         words = _hex_words(_eth_call_hex(cid, pm, pos_data))
@@ -2479,13 +2476,6 @@ def _fetch_v3_position_contract_snapshot(
         liq = max(0, _decode_uint_from_word(words[7]))
         owed0_raw = max(0, _decode_uint_from_word(words[10]))
         owed1_raw = max(0, _decode_uint_from_word(words[11]))
-        pool_data = (
-            "0x1698ee82"
-            + _encode_address_word(token0)
-            + _encode_address_word(token1)
-            + _encode_uint_word(int(fee))
-        )
-        pool_addr = ""
         dec0 = 18
         dec1 = 18
         sym0 = ""
@@ -2493,48 +2483,29 @@ def _fetch_v3_position_contract_snapshot(
         primary_batch = _eth_call_hex_batch(
             cid,
             [
-                {"to": str(factory), "data": pool_data},
                 {"to": token0, "data": "0x313ce567"},
                 {"to": token1, "data": "0x313ce567"},
                 {"to": token0, "data": "0x95d89b41"},
                 {"to": token1, "data": "0x95d89b41"},
             ],
         )
-        pool_words = _hex_words(primary_batch[0] or "0x")
-        pool_addr = _decode_address_from_word(pool_words[0]).lower() if pool_words else ""
         try:
+            if primary_batch[0]:
+                dec0 = _decode_uint_eth_call(primary_batch[0])
             if primary_batch[1]:
-                dec0 = _decode_uint_eth_call(primary_batch[1])
-            if primary_batch[2]:
-                dec1 = _decode_uint_eth_call(primary_batch[2])
+                dec1 = _decode_uint_eth_call(primary_batch[1])
         except Exception:
             dec0, dec1 = 18, 18
         if dec0 <= 0 or dec0 > 36:
             dec0 = 18
         if dec1 <= 0 or dec1 > 36:
             dec1 = 18
-        sym0 = _normalize_display_symbol(_decode_abi_string(primary_batch[3] or "") or "")
-        sym1 = _normalize_display_symbol(_decode_abi_string(primary_batch[4] or "") or "")
+        sym0 = _normalize_display_symbol(_decode_abi_string(primary_batch[2] or "") or "")
+        sym1 = _normalize_display_symbol(_decode_abi_string(primary_batch[3] or "") or "")
         if not sym0:
             sym0 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token0) or "")
         if not sym1:
             sym1 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token1) or "")
-        sqrt_price_x96 = 0
-        pool_liq = 0
-        if _is_eth_address(pool_addr):
-            pool_batch = _eth_call_hex_batch(
-                cid,
-                [
-                    {"to": pool_addr, "data": "0x3850c7bd"},
-                    {"to": pool_addr, "data": "0x1a686502"},
-                ],
-            )
-            slot0_words = _hex_words(pool_batch[0] or "0x")
-            sqrt_price_x96 = _decode_uint_from_word(slot0_words[0]) if slot0_words else 0
-            try:
-                pool_liq = max(0, _decode_uint_eth_call(pool_batch[1] or "0x"))
-            except Exception:
-                pool_liq = 0
         q_amount0, q_amount1 = _quote_v3_decrease_liquidity_amounts(
             cid, proto, tid, liq, owner_addr, dec0, dec1
         )
@@ -2557,9 +2528,6 @@ def _fetch_v3_position_contract_snapshot(
             "liquidity": int(liq),
             "tokens_owed0_raw": int(owed0_raw),
             "tokens_owed1_raw": int(owed1_raw),
-            "pool_address": str(pool_addr or ""),
-            "pool_sqrt_price_x96": int(sqrt_price_x96),
-            "pool_liquidity": int(pool_liq),
             "token0_decimals": int(dec0),
             "token1_decimals": int(dec1),
             "token0_symbol": str(sym0 or ""),
@@ -6524,7 +6492,6 @@ def _scan_pool_positions_chain(
                     p["liquidity"] = str(int(contract_snapshot.get("liquidity") or 0))
                     p["tokensOwed0"] = str(int(contract_snapshot.get("tokens_owed0_raw") or 0))
                     p["tokensOwed1"] = str(int(contract_snapshot.get("tokens_owed1_raw") or 0))
-                    p["_contract_snapshot_source"] = "v3_npm_eth_call"
                 except Exception:
                     pass
                 t0_snap = _normalize_display_symbol(str(contract_snapshot.get("token0_symbol") or ""))
@@ -6537,9 +6504,6 @@ def _scan_pool_positions_chain(
                     pool = {}
                 pool = dict(pool)
                 pool["feeTier"] = str(contract_snapshot.get("fee") or pool.get("feeTier") or "")
-                pool["liquidity"] = str(contract_snapshot.get("pool_liquidity") or pool.get("liquidity") or "0")
-                pool["sqrtPrice"] = str(contract_snapshot.get("pool_sqrt_price_x96") or pool.get("sqrtPrice") or "0")
-                pool["id"] = str(contract_snapshot.get("pool_address") or pool.get("id") or "")
                 t0_obj = dict(t0_obj or {})
                 t1_obj = dict(t1_obj or {})
                 t0_obj["id"] = str(contract_snapshot.get("token0") or t0_obj.get("id") or "")
@@ -6709,20 +6673,16 @@ def _scan_pool_positions_chain(
             "address": owner,
             "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
             "chain": chain_key,
-            "chain_id": int(chain_id),
             "kind": "pool",
             "pool_id": str(pool.get("id") or ""),
             "pair": f"{t0}/{t1}",
-            "token0_id": str((pool.get("token0") or {}).get("id") or ""),
-            "token1_id": str((pool.get("token1") or {}).get("id") or ""),
             "position_id": str(p.get("id") or ""),
             "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
             "fee_tier": fee_disp,
             "fee_tier_raw": fee_raw,
+            "position_status": ("active" if int(liq_int) > 0 else "closed"),
             "liquidity": str(p.get("liquidity") or "0"),
             "pool_liquidity": str(pool.get("liquidity") or "0"),
-            "pool_tvl_usd": None,
-            "tvl_usd": None,
             "position_amount0": amount0_val,
             "position_amount1": amount1_val,
             "position_symbol0": str(t0 or ""),
@@ -6731,36 +6691,6 @@ def _scan_pool_positions_chain(
             "fees_owed0": fees0_val,
             "fees_owed1": fees1_val,
             "fees_owed_display": fees_owed_display,
-            "contract_source": str(p.get("_contract_snapshot_source") or ""),
-            "contract_position_manager": str((contract_snapshot or {}).get("position_manager") or ""),
-            "contract_token_id": int((contract_snapshot or {}).get("token_id") or _position_token_id_from_raw(p.get("id")) or 0),
-            "contract_nonce": int((contract_snapshot or {}).get("nonce") or 0),
-            "contract_operator": str((contract_snapshot or {}).get("operator") or ""),
-            "contract_token0": str((contract_snapshot or {}).get("token0") or ""),
-            "contract_token1": str((contract_snapshot or {}).get("token1") or ""),
-            "contract_fee": int((contract_snapshot or {}).get("fee") or _parse_int_like(fee_raw) or 0),
-            "contract_tick_lower": int((contract_snapshot or {}).get("tick_lower") or 0),
-            "contract_tick_upper": int((contract_snapshot or {}).get("tick_upper") or 0),
-            "contract_liquidity": int((contract_snapshot or {}).get("liquidity") or liq_int or 0),
-            "contract_tokens_owed0_raw": int((contract_snapshot or {}).get("tokens_owed0_raw") or owed0_raw or 0),
-            "contract_tokens_owed1_raw": int((contract_snapshot or {}).get("tokens_owed1_raw") or owed1_raw or 0),
-            "contract_pool_address": str((contract_snapshot or {}).get("pool_address") or str(pool.get("id") or "")),
-            "contract_pool_sqrt_price_x96": int((contract_snapshot or {}).get("pool_sqrt_price_x96") or _parse_int_like(pool.get("sqrtPrice") or 0) or 0),
-            "contract_pool_liquidity": int((contract_snapshot or {}).get("pool_liquidity") or _parse_int_like(pool.get("liquidity") or 0) or 0),
-            "contract_token0_decimals": int((contract_snapshot or {}).get("token0_decimals") or dec0 or 18),
-            "contract_token1_decimals": int((contract_snapshot or {}).get("token1_decimals") or dec1 or 18),
-            "contract_token0_symbol": str((contract_snapshot or {}).get("token0_symbol") or t0 or ""),
-            "contract_token1_symbol": str((contract_snapshot or {}).get("token1_symbol") or t1 or ""),
-            "contract_quote_amount0": amount0_val,
-            "contract_quote_amount1": amount1_val,
-            "contract_quote_fee0": fees0_val,
-            "contract_quote_fee1": fees1_val,
-            "position_created_date": _position_creation_date_peek(
-                int(chain_id),
-                str(p.get("_protocol_label") or f"uniswap_{version}"),
-                str(p.get("id") or ""),
-            ),
-            "valuation_mode": "exact-onchain-amounts",
             "suspected_spam": bool(suspected_spam),
         }
 
@@ -7045,18 +6975,6 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
                     seen_ids.add(pid)
                     acc_ids.append(pid)
             acc["position_ids"] = acc_ids
-        cur_tvl = acc.get("tvl_usd")
-        row_tvl = row.get("tvl_usd")
-        if cur_tvl is None:
-            acc["tvl_usd"] = row_tvl
-        elif row_tvl is not None:
-            acc["tvl_usd"] = _safe_float(cur_tvl) + _safe_float(row_tvl)
-        m1 = str(acc.get("valuation_mode") or "")
-        m2 = str(row.get("valuation_mode") or "")
-        if m1 and m2 and m1 != m2:
-            acc["valuation_mode"] = "mixed"
-        elif not m1 and m2:
-            acc["valuation_mode"] = m2
         # Sum position values across all NFTs in the same owner/protocol/pool group.
         for fld in ("position_amount0", "position_amount1", "fees_owed0", "fees_owed1"):
             av = _opt_float(acc.get(fld))
@@ -7073,22 +6991,12 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
             f"{_fmt_amt(_opt_float(acc.get('fees_owed0')), zero_if_missing=True)} / "
             f"{_fmt_amt(_opt_float(acc.get('fees_owed1')), zero_if_missing=True)}"
         )
-        # Keep a real date if any grouped position has it.
-        acc_date = str(acc.get("position_created_date") or "").strip()
-        row_date = str(row.get("position_created_date") or "").strip()
-        if (not acc_date or acc_date == "-") and row_date and row_date != "-":
-            acc["position_created_date"] = row_date
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     return list(uniq.values())
 
 
 def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_dates: bool) -> None:
-    if include_creation_dates:
-        _populate_creation_dates_parallel(rows)
-        return
-    for row in rows:
-        if "position_created_date" not in row:
-            row["position_created_date"] = "-"
+    return
 
 
 def _run_pool_chain_scan(
@@ -9155,7 +9063,7 @@ def _render_positions_page() -> str:
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
-    #posPoolsTable { min-width: 3600px; table-layout: auto; }
+    #posPoolsTable { min-width: 1400px; table-layout: auto; }
     #posPoolsTable th, #posPoolsTable td { white-space: nowrap; }
     #posPoolsTable th:nth-child(1), #posPoolsTable td:nth-child(1) {
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
@@ -9734,7 +9642,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th><th>Contract source</th><th>Position manager</th><th>Token ID</th><th>Position nonce</th><th>Approved operator</th><th>Token0 address</th><th>Token1 address</th><th>Fee (raw)</th><th>Tick lower</th><th>Tick upper</th><th>Position liquidity</th><th>Owed0 raw</th><th>Owed1 raw</th><th>Pool address</th><th>Pool sqrtPriceX96</th><th>Pool liquidity</th><th>Token0 decimals</th><th>Token1 decimals</th><th>Token0 symbol</th><th>Token1 symbol</th><th>Quote amount0</th><th>Quote amount1</th><th>Quote fee0</th><th>Quote fee1</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -9761,6 +9669,7 @@ def _render_positions_page() -> str:
         const mismatchTitle = mismatch ? ` title="${escAttr(mismatchHint(r))}"` : "";
         html += "<tr>";
         html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
+        html += `<td class='mono'>${esc(String(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(r.protocol || "")}</td>`;
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
@@ -9768,43 +9677,19 @@ def _render_positions_page() -> str:
         const feeRaw = String(r.fee_tier_raw || "").trim();
         const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.pool_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
-        html += `<td>${esc(r.position_created_date || "-")}</td>`;
+        html += `<td>${esc(r.position_status || "-")}</td>`;
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        html += `<td>${esc(String(r.liquidity || "0"))}</td>`;
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
         const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
-        html += `<td>${esc(r.contract_source || "")}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_position_manager || ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token_id ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_nonce ?? ""))}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_operator || ""))}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_token0 || ""))}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_token1 || ""))}</td>`;
-        html += `<td>${esc(String(r.contract_fee ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_tick_lower ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_tick_upper ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_liquidity ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_tokens_owed0_raw ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_tokens_owed1_raw ?? ""))}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_pool_address || ""))}</td>`;
-        html += `<td>${esc(String(r.contract_pool_sqrt_price_x96 ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_pool_liquidity ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token0_decimals ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token1_decimals ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token0_symbol ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token1_symbol ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_quote_amount0 ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_quote_amount1 ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_quote_fee0 ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_quote_fee1 ?? ""))}</td>`;
         html += "</tr>";
       }
-      if (!visible.length) html += "<tr><td colspan='35'>No pool positions found.</td></tr>";
+      if (!visible.length) html += "<tr><td colspan='12'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
-        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position created</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
+        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Position ID</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
         for (let i = 0; i < hiddenRows.length; i++) {
           const r = hiddenRows[i];
           const mismatch = hasPairMismatch(r);
@@ -9813,11 +9698,11 @@ def _render_positions_page() -> str:
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.position_created_date || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(String(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${esc(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
-        html += `<tr><td colspan='35'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='12'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       const detailsEl = document.getElementById("posHiddenDetails");
@@ -9850,7 +9735,6 @@ def _render_positions_page() -> str:
       }
       function statusMetrics(payload) {
         const pools = Array.isArray(payload?.pool_positions) ? payload.pool_positions.length : 0;
-        const checks = Array.isArray(payload?.debug?.pool_scan) ? payload.debug.pool_scan.length : 0;
         let cacheHits = 0;
         const sum = Array.isArray(payload?.debug?.summary) ? payload.debug.summary : [];
         for (const s of sum) {
@@ -9858,7 +9742,7 @@ def _render_positions_page() -> str:
             cacheHits += Math.max(0, Number(s?.count || 0));
           }
         }
-        return ` | pools=${pools} checks=${checks}${cacheHits ? ` cache=${cacheHits}` : ""}`;
+        return ` | pools=${pools}${cacheHits ? ` cache=${cacheHits}` : ""}`;
       }
       while (true) {
         const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
