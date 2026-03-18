@@ -220,6 +220,10 @@ POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().l
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "45")))
+POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = max(
+    int(POSITIONS_SCAN_MAX_SECONDS),
+    int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY", "300")),
+)
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
@@ -6535,9 +6539,12 @@ def _scan_pool_positions_chain(
         *,
         compare: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        attempts_for_payload = owner_attempts
-        if not hard_scan:
-            attempts_for_payload = []
+        attempts_for_payload = owner_attempts if (hard_scan or POSITIONS_CONTRACT_ONLY_ENABLED) else []
+        total_attempt_ms = 0
+        for a in attempts_for_payload:
+            if not isinstance(a, dict):
+                continue
+            total_attempt_ms += max(0, int(a.get("elapsed_ms") or 0))
         return {
             "chain": chain_key,
             "version": version,
@@ -6545,6 +6552,7 @@ def _scan_pool_positions_chain(
             "positions_found": len(positions),
             "failed": False,
             "attempts": attempts_for_payload,
+            "attempts_total_ms": int(total_attempt_ms),
             "compare": (
                 compare
                 if isinstance(compare, dict)
@@ -6728,6 +6736,7 @@ def _scan_pool_positions_chain(
 
             if version == "v3" and time.monotonic() < deadline_ts:
                 try:
+                    t_call = time.monotonic()
                     v3_dbg: dict[str, Any] = {}
                     v3_rows = _scan_v3_positions_onchain(
                         owner,
@@ -6745,11 +6754,13 @@ def _scan_pool_positions_chain(
                             "query_mode": "contract_only_onchain_v3_npm",
                             "count": len(v3_rows),
                             "ok": True,
+                            "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
                             "v3_debug": v3_dbg,
                         }
                     )
                     _merge_positions(v3_rows)
                 except Exception as e:
+                    elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                     owner_attempts.append(
                         {
                             "owner_value": owner,
@@ -6757,12 +6768,14 @@ def _scan_pool_positions_chain(
                             "query_mode": "contract_only_onchain_v3_npm",
                             "count": 0,
                             "ok": False,
+                            "elapsed_ms": int(elapsed_ms),
                             "error": str(e)[:220],
                         }
                     )
 
                 if int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                     try:
+                        t_call = time.monotonic()
                         pc_dbg: dict[str, Any] = {}
                         staked_rows = _scan_pancake_staked_v3_positions_onchain(
                             owner,
@@ -6777,11 +6790,13 @@ def _scan_pool_positions_chain(
                                 "query_mode": "contract_only_onchain_pancake_masterchef_v3",
                                 "count": len(staked_rows),
                                 "ok": True,
+                                "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
                                 "pancake_v3_debug": pc_dbg,
                             }
                         )
                         _merge_positions(staked_rows)
                     except Exception as e:
+                        elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                         owner_attempts.append(
                             {
                                 "owner_value": owner,
@@ -6789,12 +6804,14 @@ def _scan_pool_positions_chain(
                                 "query_mode": "contract_only_onchain_pancake_masterchef_v3",
                                 "count": 0,
                                 "ok": False,
+                                "elapsed_ms": int(elapsed_ms),
                                 "error": str(e)[:220],
                             }
                         )
 
                 if int(chain_id) in PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                     try:
+                        t_call = time.monotonic()
                         inf_dbg: dict[str, Any] = {}
                         inf_cl_rows = _scan_pancake_infinity_cl_positions_onchain(
                             owner,
@@ -6809,11 +6826,13 @@ def _scan_pool_positions_chain(
                                 "query_mode": "contract_only_onchain_pancake_infinity_cl",
                                 "count": len(inf_cl_rows),
                                 "ok": True,
+                                "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
                                 "infinity_debug": inf_dbg,
                             }
                         )
                         _merge_positions(inf_cl_rows)
                     except Exception as e:
+                        elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                         owner_attempts.append(
                             {
                                 "owner_value": owner,
@@ -6821,12 +6840,14 @@ def _scan_pool_positions_chain(
                                 "query_mode": "contract_only_onchain_pancake_infinity_cl",
                                 "count": 0,
                                 "ok": False,
+                                "elapsed_ms": int(elapsed_ms),
                                 "error": str(e)[:220],
                             }
                         )
 
                 if int(chain_id) in PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                     try:
+                        t_call = time.monotonic()
                         inf_dbg: dict[str, Any] = {}
                         inf_bin_rows = _scan_pancake_infinity_bin_positions_onchain(
                             owner,
@@ -6841,11 +6862,13 @@ def _scan_pool_positions_chain(
                                 "query_mode": "contract_only_onchain_pancake_infinity_bin",
                                 "count": len(inf_bin_rows),
                                 "ok": True,
+                                "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
                                 "infinity_debug": inf_dbg,
                             }
                         )
                         _merge_positions(inf_bin_rows)
                     except Exception as e:
+                        elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                         owner_attempts.append(
                             {
                                 "owner_value": owner,
@@ -6853,11 +6876,13 @@ def _scan_pool_positions_chain(
                                 "query_mode": "contract_only_onchain_pancake_infinity_bin",
                                 "count": 0,
                                 "ok": False,
+                                "elapsed_ms": int(elapsed_ms),
                                 "error": str(e)[:220],
                             }
                         )
             if version == "v4" and int(chain_id) in UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                 try:
+                    t_call = time.monotonic()
                     v4_rows = _scan_uniswap_v4_positions_onchain(
                         owner,
                         int(chain_id),
@@ -6870,10 +6895,12 @@ def _scan_pool_positions_chain(
                             "query_mode": "contract_only_onchain_uniswap_v4_pm",
                             "count": len(v4_rows),
                             "ok": True,
+                            "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
                         }
                     )
                     _merge_positions(v4_rows)
                 except Exception as e:
+                    elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                     owner_attempts.append(
                         {
                             "owner_value": owner,
@@ -6881,6 +6908,7 @@ def _scan_pool_positions_chain(
                             "query_mode": "contract_only_onchain_uniswap_v4_pm",
                             "count": 0,
                             "ok": False,
+                            "elapsed_ms": int(elapsed_ms),
                             "error": str(e)[:220],
                         }
                     )
@@ -7799,6 +7827,9 @@ def _scan_pool_positions_chain(
         return v_rows, v_errors, v_debug, v_timed_out
 
     def _prepare_version_scan_context(version: str) -> tuple[str, bool, bool] | None:
+        if POSITIONS_CONTRACT_ONLY_ENABLED:
+            # Strict contract-only mode: endpoint/graph capabilities are irrelevant.
+            return "", False, True
         endpoint = get_graph_endpoint(chain_key, version=version)
         if not hard_scan:
             # Fast mode: do not spend requests on endpoint schema introspection.
@@ -8103,7 +8134,7 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], 
         return []
     # In strict index-first mode, scan only owner-known chains from ownership index.
     # No fallback to broad chain fanout when index has no chains for the owners.
-    if POSITIONS_OWNERSHIP_INDEX_ENABLED and POSITIONS_INDEX_FIRST_STRICT:
+    if (not POSITIONS_CONTRACT_ONLY_ENABLED) and POSITIONS_OWNERSHIP_INDEX_ENABLED and POSITIONS_INDEX_FIRST_STRICT:
         known_owner_addrs = [str(a or "").strip().lower() for a in addresses if _is_eth_address(str(a or "").strip().lower())]
         if known_owner_addrs:
             try:
@@ -8119,10 +8150,22 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], 
                     ).fetchall()
                 known_chain_ids = {int(r[0] or 0) for r in (rows or []) if int(r[0] or 0) > 0}
                 narrowed = [cid for cid in valid_chain_ids if int(cid) in known_chain_ids]
+                if POSITIONS_CONTRACT_ONLY_ENABLED and not hard_scan and POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
+                    filtered: list[int] = []
+                    for cid in narrowed:
+                        if _chain_has_any_position_nft_balance(int(cid), addresses):
+                            filtered.append(int(cid))
+                    return filtered
                 return narrowed
             except Exception:
                 return []
     if not hard_scan:
+        if POSITIONS_CONTRACT_ONLY_ENABLED and POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
+            filtered_fast: list[int] = []
+            for cid in valid_chain_ids:
+                if _chain_has_any_position_nft_balance(int(cid), addresses):
+                    filtered_fast.append(int(cid))
+            return filtered_fast
         return valid_chain_ids
     if not POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
         return valid_chain_ids
@@ -8136,8 +8179,11 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], 
 def _order_chain_ids_for_pool_scan(valid_chain_ids: list[int], priority_chain_ids: list[int]) -> list[int]:
     ordered_chain_ids: list[int] = []
     seen_chain_ids: set[int] = set()
+    allowed_chain_ids = {int(cid) for cid in (valid_chain_ids or []) if int(cid) > 0}
     for cid in list(priority_chain_ids) + list(valid_chain_ids):
         cc = int(cid)
+        if cc not in allowed_chain_ids:
+            continue
         if cc in seen_chain_ids:
             continue
         seen_chain_ids.add(cc)
@@ -8159,7 +8205,10 @@ def _scan_pool_positions(
     debug_rows: list[dict[str, Any]] = []
     timings: dict[str, Any] = {}
     scan_started = time.monotonic()
-    deadline_ts = time.monotonic() + float(POSITIONS_SCAN_MAX_SECONDS)
+    scan_budget_sec = int(POSITIONS_SCAN_MAX_SECONDS)
+    if POSITIONS_CONTRACT_ONLY_ENABLED:
+        scan_budget_sec = int(POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY)
+    deadline_ts = time.monotonic() + float(scan_budget_sec)
     timed_out = False
 
     t_filter = time.monotonic()
@@ -8168,15 +8217,20 @@ def _scan_pool_positions(
     if not valid_chain_ids:
         timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
         return [], [], [], timings
-    priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
+    priority_chain_ids = [130, 56, 8453]  # Prioritize Unichain, then BSC/Base
     ordered_chain_ids = _order_chain_ids_for_pool_scan(valid_chain_ids, priority_chain_ids)
     max_workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
+    run_all_chains_parallel = bool(POSITIONS_CONTRACT_ONLY_ENABLED and (not hard_scan))
+    if POSITIONS_CONTRACT_ONLY_ENABLED and not hard_scan:
+        max_workers = max(3, int(max_workers))
     timings["chains_total"] = len(ordered_chain_ids)
     timings["chain_workers"] = int(max_workers)
     chain_durations_sec: dict[str, float] = {}
 
     # Run priority chains first in sequence to avoid deadline starvation.
     priority_ids = [c for c in ordered_chain_ids if c in priority_chain_ids]
+    if run_all_chains_parallel:
+        priority_ids = []
     t_prio = time.monotonic()
     p_rows, p_errors, p_debug, p_timed_out, p_chain_durations = _run_pool_chain_batch_serial(
         priority_ids,
@@ -8194,7 +8248,11 @@ def _scan_pool_positions(
     chain_durations_sec.update(p_chain_durations or {})
     timed_out = bool(p_timed_out)
 
-    remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
+    remaining_chain_ids = (
+        list(ordered_chain_ids)
+        if run_all_chains_parallel
+        else [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
+    )
     remaining_deadline_ts = float(deadline_ts)
     use_fast_chain_caps = bool((not hard_scan) and (not POSITIONS_CONTRACT_ONLY_ENABLED))
     if use_fast_chain_caps and remaining_chain_ids:
@@ -8284,7 +8342,7 @@ def _scan_pool_positions(
             v3_ctr["kept"] += int(vd.get("kept_positions") or 0)
             v3_ctr["skipped0"] += int(vd.get("skipped_zero_liq") or 0)
             v3_ctr["invalid"] += int(vd.get("invalid_positions") or 0)
-    if int(v3_ctr["scanned"]) > 0 or int(v3_ctr["kept"]) > 0:
+    if POSITIONS_CONTRACT_ONLY_ENABLED or int(v3_ctr["scanned"]) > 0 or int(v3_ctr["kept"]) > 0:
         timings["v3_contract_scan"] = {
             "scanned_token_ids": int(v3_ctr["scanned"]),
             "kept_positions": int(v3_ctr["kept"]),
@@ -8298,7 +8356,7 @@ def _scan_pool_positions(
             dedup_errors.append("Pool scan reached fast-mode budget. Showing partial results.")
         else:
             dedup_errors.append(
-                f"Pool scan timed out after {POSITIONS_SCAN_MAX_SECONDS}s. Showing partial results."
+                f"Pool scan timed out after {int(scan_budget_sec)}s. Showing partial results."
             )
     timings["rows_before_aggregate"] = int(rows_before_aggregate)
     timings["rows_after_aggregate"] = int(len(uniq_rows))
@@ -10763,17 +10821,14 @@ def _render_positions_page() -> str:
         const unfinished = Array.isArray(pool?.unfinished_chains) ? pool.unfinished_chains.map((x) => String(x || "")).filter(Boolean) : [];
         if (unfinished.length) timingLines.push(`unfinished_chains: ${unfinished.join(", ")}`);
         const v3Scan = (pool && typeof pool.v3_contract_scan === "object" && pool.v3_contract_scan) ? pool.v3_contract_scan : {};
-        if (Number(v3Scan?.scanned_token_ids || 0) > 0 || Number(v3Scan?.kept_positions || 0) > 0) {
-          timingLines.push(
-            `v3_scan: scanned=${Number(v3Scan.scanned_token_ids || 0)} `
-            + `kept=${Number(v3Scan.kept_positions || 0)} `
-            + `skipped0=${Number(v3Scan.skipped_zero_liq || 0)} `
-            + `invalid=${Number(v3Scan.invalid_positions || 0)}`
-          );
-        }
+        timingLines.push(
+          `v3_scan: scanned=${Number(v3Scan.scanned_token_ids || 0)} `
+          + `kept=${Number(v3Scan.kept_positions || 0)} `
+          + `skipped0=${Number(v3Scan.skipped_zero_liq || 0)} `
+          + `invalid=${Number(v3Scan.invalid_positions || 0)}`
+        );
         if (!infinityMode) {
           const compactLines = summaryFiltered
-            .slice(0, 8)
             .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")}: ${Number(x.count || 0)}`);
           const body = []
             .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
@@ -10786,7 +10841,6 @@ def _render_positions_page() -> str:
           }
         } else {
           const detailedLines = summaryFiltered
-            .slice(0, 40)
             .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`);
           const body = []
             .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
@@ -13241,6 +13295,12 @@ def _build_pool_debug_summary_rows(pool_debug_rows: list[dict[str, Any]]) -> lis
             mode = f"{a.get('query_mode') or ''}:{a.get('owner_type') or ''}"
             key = (chain, version, mode, "ok" if a.get("ok") else "fail")
             debug_summary[key] = int(debug_summary.get(key, 0)) + int(a.get("count") or 0)
+            elapsed_ms = max(0, int(a.get("elapsed_ms") or 0))
+            if elapsed_ms > 0:
+                tm_key = (chain, version, f"{mode}#elapsed_ms", "ok")
+                debug_summary[tm_key] = int(debug_summary.get(tm_key, 0)) + int(elapsed_ms)
+            calls_key = (chain, version, f"{mode}#calls", "ok")
+            debug_summary[calls_key] = int(debug_summary.get(calls_key, 0)) + 1
             inf_dbg = a.get("infinity_debug") if isinstance(a.get("infinity_debug"), dict) else None
             if isinstance(inf_dbg, dict):
                 metric_map = [
@@ -13344,6 +13404,8 @@ def _append_index_mode_info_note(
     skip_live: int,
     row_live_enrich_disabled: int,
 ) -> None:
+    if POSITIONS_CONTRACT_ONLY_ENABLED:
+        return
     if not POSITIONS_OWNERSHIP_INDEX_ENABLED:
         return
     mode_text = "strict" if POSITIONS_INDEX_FIRST_STRICT else "hybrid"
@@ -13523,9 +13585,15 @@ def _build_positions_scan_response(
     tron_count: int,
     chains_count: int,
 ) -> dict[str, Any]:
+    if POSITIONS_CONTRACT_ONLY_ENABLED:
+        summary_limit = 5000
+        pool_scan_limit = 5000
+    else:
+        summary_limit = 120 if include_debug_details else 20
+        pool_scan_limit = 500 if include_debug_details else 0
     debug_payload = {
-        "pool_scan": pool_debug_rows[:500] if include_debug_details else [],
-        "summary": debug_summary_rows[:120] if include_debug_details else debug_summary_rows[:20],
+        "pool_scan": pool_debug_rows[:pool_scan_limit],
+        "summary": debug_summary_rows[:summary_limit],
         "timings": debug_timings if isinstance(debug_timings, dict) else {},
     }
     return {
