@@ -242,6 +242,12 @@ POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", 
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
 POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
+POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK = os.environ.get("POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -1296,7 +1302,14 @@ def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: in
         except Exception:
             onchain_ids = []
     owner_scan_ids: list[int] = []
-    if not explorer_ids and not receipt_ids and not log_ids and not onchain_ids and int(max_receipts) >= 200:
+    if (
+        POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK
+        and not explorer_ids
+        and not receipt_ids
+        and not log_ids
+        and not onchain_ids
+        and int(max_receipts) >= 200
+    ):
         # Full mode only: run the deep owner scanner (can be expensive) to recover ids
         # for non-enumerable PM contracts when explorer/receipt paths are empty.
         try:
