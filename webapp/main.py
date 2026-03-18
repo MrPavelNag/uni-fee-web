@@ -1265,13 +1265,29 @@ def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: in
                     onchain_ids.append(int(tid))
         except Exception:
             onchain_ids = []
+    owner_scan_ids: list[int] = []
+    if not explorer_ids and not receipt_ids and not log_ids and not onchain_ids and int(max_receipts) >= 200:
+        # Full mode only: run the deep owner scanner (can be expensive) to recover ids
+        # for non-enumerable PM contracts when explorer/receipt paths are empty.
+        try:
+            owner_scan_ids = _scan_infinity_position_ids_for_owner(
+                pm,
+                owner_addr,
+                cid,
+                deadline_ts=time.monotonic() + 90.0,
+                debug_out={},
+            )
+        except Exception:
+            owner_scan_ids = []
     merged_ids = sorted(
-        {int(x) for x in explorer_ids + receipt_ids + log_ids + onchain_ids if _parse_int_like(x) > 0},
+        {int(x) for x in explorer_ids + receipt_ids + log_ids + onchain_ids + owner_scan_ids if _parse_int_like(x) > 0},
         reverse=True,
     )
     source_tag = "logs" if log_ids else "receipt"
     if onchain_ids:
         source_tag = "onchain"
+    elif owner_scan_ids:
+        source_tag = "owner_scan"
     upserted = _infinity_index_upsert(cid, owner_addr, merged_ids, source_tag)
     indexed_now = _infinity_index_get_token_ids(cid, owner_addr, limit=400)
     return {
@@ -1283,6 +1299,7 @@ def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: in
         "receipt_ids": len(receipt_ids),
         "log_ids": len(log_ids),
         "onchain_ids": len(onchain_ids),
+        "owner_scan_ids": len(owner_scan_ids),
         "merged_ids": len(merged_ids),
         "upserted": int(upserted),
         "indexed_total_for_owner": len(indexed_now),
