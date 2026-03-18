@@ -7190,7 +7190,11 @@ def _scan_pool_positions_chain(
         t1, t1_src = _token_symbol_hint(t1_obj)
         proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
         is_v3_npm_protocol = proto_label in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
-        if POSITIONS_CONTRACT_ONLY_ENABLED and not ((version == "v3" and is_v3_npm_protocol) or proto_label == "uniswap_v4"):
+        is_infinity_protocol = proto_label.startswith("pancake_infinity_")
+        if POSITIONS_CONTRACT_ONLY_ENABLED and not (
+            (version == "v3" and (is_v3_npm_protocol or is_infinity_protocol))
+            or proto_label == "uniswap_v4"
+        ):
             return None
         t0_hint_u = str(t0 or "").strip().upper()
         t1_hint_u = str(t1 or "").strip().upper()
