@@ -1116,8 +1116,8 @@ def _position_index_refresh_owner_chain(
                                 "totalValueLockedUSD": "0",
                                 "totalValueLockedToken0": "0",
                                 "totalValueLockedToken1": "0",
-                                "token0": {"id": "", "decimals": "18", "symbol": "UNK"},
-                                "token1": {"id": "", "decimals": "18", "symbol": "UNK"},
+                                "token0": {"id": "infinity", "decimals": "18", "symbol": "Infinity"},
+                                "token1": {"id": f"position-{tid_int}", "decimals": "18", "symbol": f"#{tid_int}"},
                             },
                             "_protocol_label": "pancake_infinity_cl",
                             "_source": "ownership_index_stub",
@@ -5995,6 +5995,17 @@ def _scan_pool_positions_chain(
         t1_obj = pool.get("token1") or {}
         t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
         t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
+        proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
+        if proto_label.startswith("pancake_infinity_"):
+            raw_pid = str(p.get("id") or "").strip()
+            pid = raw_pid.split(":", 1)[1] if ":" in raw_pid else raw_pid
+            if str(t0).upper() == "UNK" and str(t1).upper() == "UNK":
+                t0 = "Infinity"
+                t1 = f"#{pid}" if pid else "Position"
+            elif str(t0).upper() == "UNK":
+                t0 = "Infinity"
+            elif str(t1).upper() == "UNK":
+                t1 = f"#{pid}" if pid else "Position"
         # Prefer exact-external, then exact-subgraph, then share-external fallback.
         if detailed_external_tvl is None or detailed_external_tvl <= 0:
             if allow_live_enrich and version == "v3":
