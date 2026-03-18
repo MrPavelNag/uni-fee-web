@@ -221,8 +221,8 @@ POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_P
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
 POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "45")))
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
-POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "4")))
-POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "6"))))
+POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
+POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
     "1",
     "true",
@@ -2329,17 +2329,6 @@ def _quote_v3_decrease_liquidity_amounts(
     callers: list[str] = []
     if _is_eth_address(owner_addr):
         callers.append(owner_addr)
-    try:
-        owner_of_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(tid)))
-        owner_words = _hex_words(owner_of_hex)
-        if owner_words:
-            current_owner = owner_words[0][-40:].lower()
-            if _is_eth_address("0x" + current_owner):
-                owner_of_addr = "0x" + current_owner
-                if owner_of_addr not in callers:
-                    callers.append(owner_of_addr)
-    except Exception:
-        pass
     callers.append("")
     for caller in callers:
         try:
@@ -2410,15 +2399,6 @@ def _quote_v3_collect_fees_amounts(
     callers: list[str] = []
     if _is_eth_address(owner_addr):
         callers.append(owner_addr)
-    try:
-        owner_of_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(tid)))
-        owner_words = _hex_words(owner_of_hex)
-        if owner_words:
-            current_owner = "0x" + owner_words[0][-40:].lower()
-            if _is_eth_address(current_owner) and current_owner not in callers:
-                callers.append(current_owner)
-    except Exception:
-        pass
     callers.append("")
     for caller in callers:
         try:
@@ -6598,7 +6578,7 @@ def _scan_pool_positions_chain(
                     amount1_val = None
         owed0_raw = max(0, _parse_int_like(p.get("tokensOwed0") or 0))
         owed1_raw = max(0, _parse_int_like(p.get("tokensOwed1") or 0))
-        if version == "v3" and is_v3_npm_protocol and owed0_raw == 0 and owed1_raw == 0 and liq_int > 0:
+        if version == "v3" and is_v3_npm_protocol and not contract_snapshot and owed0_raw == 0 and owed1_raw == 0 and liq_int > 0:
             owed_direct = _fetch_v3_tokens_owed_raw(
                 int(chain_id),
                 str(p.get("_protocol_label") or f"uniswap_{version}"),
@@ -6651,15 +6631,21 @@ def _scan_pool_positions_chain(
                 return "0" if zero_if_missing else "-"
             av = abs(float(v))
             if av >= 1000:
-                s = f"{float(v):,.2f}"
+                s = f"{float(v):,.1f}"
             elif av >= 1:
-                s = f"{float(v):,.4f}"
+                s = f"{float(v):,.2f}"
+            elif av >= 0.01:
+                s = f"{float(v):,.3f}"
             else:
-                s = f"{float(v):,.6f}"
+                s = f"{float(v):,.4f}"
             return s.rstrip("0").rstrip(".")
 
         position_amounts_display = f"{_fmt_amt(amount0_val)} / {_fmt_amt(amount1_val)}"
         fees_owed_display = f"{_fmt_amt(fees0_val, zero_if_missing=True)} / {_fmt_amt(fees1_val, zero_if_missing=True)}"
+        has_position_value = bool((amount0_val or 0.0) > 0 or (amount1_val or 0.0) > 0)
+        has_fees_value = bool((fees0_val or 0.0) > 0 or (fees1_val or 0.0) > 0)
+        position_status = "active" if (has_position_value or has_fees_value or liq_int > 0) else "empty"
+        liquidity_display = "non-zero" if (has_position_value or liq_int > 0) else "0"
         suspected_spam = _is_suspected_spam_pair(
             chain_key,
             t0_obj if isinstance(t0_obj, dict) else {},
@@ -6680,7 +6666,8 @@ def _scan_pool_positions_chain(
             "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
             "fee_tier": fee_disp,
             "fee_tier_raw": fee_raw,
-            "position_status": ("active" if int(liq_int) > 0 else "closed"),
+            "position_status": position_status,
+            "liquidity_display": liquidity_display,
             "liquidity": str(p.get("liquidity") or "0"),
             "pool_liquidity": str(pool.get("liquidity") or "0"),
             "position_amount0": amount0_val,
@@ -6949,11 +6936,13 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
             return "0" if zero_if_missing else "-"
         av = abs(float(v))
         if av >= 1000:
-            s = f"{float(v):,.2f}"
+            s = f"{float(v):,.1f}"
         elif av >= 1:
-            s = f"{float(v):,.4f}"
+            s = f"{float(v):,.2f}"
+        elif av >= 0.01:
+            s = f"{float(v):,.3f}"
         else:
-            s = f"{float(v):,.6f}"
+            s = f"{float(v):,.4f}"
         return s.rstrip("0").rstrip(".")
 
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -6991,6 +6980,13 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
             f"{_fmt_amt(_opt_float(acc.get('fees_owed0')), zero_if_missing=True)} / "
             f"{_fmt_amt(_opt_float(acc.get('fees_owed1')), zero_if_missing=True)}"
         )
+        a0 = _opt_float(acc.get("position_amount0")) or 0.0
+        a1 = _opt_float(acc.get("position_amount1")) or 0.0
+        f0 = _opt_float(acc.get("fees_owed0")) or 0.0
+        f1 = _opt_float(acc.get("fees_owed1")) or 0.0
+        liq_raw = max(0, _parse_int_like(acc.get("liquidity") or 0))
+        acc["position_status"] = "active" if (a0 > 0 or a1 > 0 or f0 > 0 or f1 > 0 or liq_raw > 0) else "empty"
+        acc["liquidity_display"] = "non-zero" if (a0 > 0 or a1 > 0 or liq_raw > 0) else "0"
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     return list(uniq.values())
 
@@ -7154,22 +7150,30 @@ def _scan_pool_positions(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
+    timings: dict[str, Any] = {}
+    scan_started = time.monotonic()
     deadline_ts = time.monotonic() + float(POSITIONS_SCAN_MAX_SECONDS)
     timed_out = False
 
+    t_filter = time.monotonic()
     valid_chain_ids = _filter_chain_ids_for_pool_scan(chain_ids, addresses, hard_scan=hard_scan)
+    timings["filter_chain_ids_sec"] = round(max(0.0, time.monotonic() - t_filter), 3)
     if not valid_chain_ids:
-        return [], [], []
+        timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
+        return [], [], [], timings
     priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
     ordered_chain_ids = _order_chain_ids_for_pool_scan(valid_chain_ids, priority_chain_ids)
     max_workers = max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
+    timings["chains_total"] = len(ordered_chain_ids)
+    timings["chain_workers"] = int(max_workers)
 
     # Run priority chains first in sequence to avoid deadline starvation.
     priority_ids = [c for c in ordered_chain_ids if c in priority_chain_ids]
+    t_prio = time.monotonic()
     p_rows, p_errors, p_debug, p_timed_out = _run_pool_chain_batch_serial(
         priority_ids,
         addresses,
@@ -7178,6 +7182,7 @@ def _scan_pool_positions(
         hard_scan=hard_scan,
         deep_infinity_scan=deep_infinity_scan,
     )
+    timings["priority_chains_sec"] = round(max(0.0, time.monotonic() - t_prio), 3)
     rows.extend(p_rows)
     errors.extend(p_errors)
     debug_rows.extend(p_debug)
@@ -7186,6 +7191,7 @@ def _scan_pool_positions(
     remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
 
     if not timed_out and (max_workers <= 1 or len(remaining_chain_ids) <= 1):
+        t_rest = time.monotonic()
         r_rows, r_errors, r_debug, r_timed_out = _run_pool_chain_batch_serial(
             remaining_chain_ids,
             addresses,
@@ -7198,7 +7204,9 @@ def _scan_pool_positions(
         errors.extend(r_errors)
         debug_rows.extend(r_debug)
         timed_out = bool(r_timed_out)
+        timings["remaining_chains_sec"] = round(max(0.0, time.monotonic() - t_rest), 3)
     elif not timed_out:
+        t_rest = time.monotonic()
         r_rows, r_errors, r_debug, r_timed_out = _run_pool_chain_batch_parallel(
             remaining_chain_ids,
             addresses,
@@ -7212,16 +7220,24 @@ def _scan_pool_positions(
         errors.extend(r_errors)
         debug_rows.extend(r_debug)
         timed_out = bool(r_timed_out)
+        timings["remaining_chains_sec"] = round(max(0.0, time.monotonic() - t_rest), 3)
 
     # Aggregate by owner/protocol/pool id (wallet can hold multiple NFT positions in one pool).
+    rows_before_aggregate = len(rows)
+    t_agg = time.monotonic()
     uniq_rows = _aggregate_pool_rows_by_owner_protocol_pool(rows)
+    timings["aggregate_rows_sec"] = round(max(0.0, time.monotonic() - t_agg), 3)
     _apply_creation_dates_phase(uniq_rows, include_creation_dates=include_creation_dates)
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
         dedup_errors.append(
             f"Pool scan timed out after {POSITIONS_SCAN_MAX_SECONDS}s. Showing partial results."
         )
-    return uniq_rows, dedup_errors, debug_rows
+    timings["rows_before_aggregate"] = int(rows_before_aggregate)
+    timings["rows_after_aggregate"] = int(len(uniq_rows))
+    timings["timed_out"] = bool(timed_out)
+    timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
+    return uniq_rows, dedup_errors, debug_rows, timings
 
 
 def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
@@ -9499,8 +9515,9 @@ def _render_positions_page() -> str:
       const infos = data?.infos || [];
       const dbg = data?.debug || {};
       const dbgSummary = Array.isArray(dbg.summary) ? dbg.summary : [];
+      const dbgTimings = (dbg && typeof dbg.timings === "object" && dbg.timings) ? dbg.timings : {};
       let dbgHtml = "";
-      if (dbgSummary.length) {
+      if (dbgSummary.length || Object.keys(dbgTimings).length) {
         const infoText = infos.map((x) => String(x || "")).join(" | ").toLowerCase();
         const hardMode = infoText.includes("hard scan is enabled");
         const summaryFiltered = dbgSummary.filter((x) => String(x?.query_mode || "") !== "hard_scan_required_for_live_discovery");
@@ -9508,12 +9525,28 @@ def _render_positions_page() -> str:
           .filter((x) => String(x?.query_mode || "") === "ownership_cache")
           .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
         const modeText = hardMode ? "hard" : "fast";
+        const timingLines = [];
+        const ts = (k) => Number(dbgTimings?.[k] || 0);
+        if (ts("total_sec") > 0) timingLines.push(`total=${ts("total_sec")}s`);
+        if (ts("prepare_request_sec") > 0) timingLines.push(`prepare=${ts("prepare_request_sec")}s`);
+        if (ts("evm_components_sec") > 0) timingLines.push(`evm=${ts("evm_components_sec")}s`);
+        if (ts("sort_rows_sec") > 0) timingLines.push(`sort=${ts("sort_rows_sec")}s`);
+        if (ts("build_debug_sec") > 0) timingLines.push(`debug=${ts("build_debug_sec")}s`);
+        if (ts("analytics_sec") > 0) timingLines.push(`analytics=${ts("analytics_sec")}s`);
+        const pool = (dbgTimings?.evm && typeof dbgTimings.evm.pool === "object") ? dbgTimings.evm.pool : {};
+        if (Number(pool?.total_sec || 0) > 0) {
+          timingLines.push(`pool=${Number(pool.total_sec)}s`);
+        }
+        if (Number(pool?.priority_chains_sec || 0) > 0 || Number(pool?.remaining_chains_sec || 0) > 0) {
+          timingLines.push(`chains(prio/rest)=${Number(pool.priority_chains_sec || 0)}s/${Number(pool.remaining_chains_sec || 0)}s`);
+        }
         if (!hardMode) {
           const compactLines = summaryFiltered
             .slice(0, 8)
             .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")}: ${Number(x.count || 0)}`);
           const body = []
             .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
+            .concat(timingLines.length ? [`time: ${timingLines.join(" | ")}`] : [])
             .concat(compactLines.length ? compactLines : [])
             .join("\\n");
           if (body.trim()) {
@@ -9525,6 +9558,7 @@ def _render_positions_page() -> str:
             .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`);
           const body = []
             .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
+            .concat(timingLines.length ? [`time: ${timingLines.join(" | ")}`] : [])
             .concat(detailedLines.length ? detailedLines : [])
             .join("\\n");
           if (body.trim()) {
@@ -9679,7 +9713,7 @@ def _render_positions_page() -> str:
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
         html += `<td>${esc(r.position_status || "-")}</td>`;
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
-        html += `<td>${esc(String(r.liquidity || "0"))}</td>`;
+        html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
         const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
@@ -9698,7 +9732,7 @@ def _render_positions_page() -> str:
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(String(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${esc(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(String(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${esc(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
@@ -9737,12 +9771,14 @@ def _render_positions_page() -> str:
         const pools = Array.isArray(payload?.pool_positions) ? payload.pool_positions.length : 0;
         let cacheHits = 0;
         const sum = Array.isArray(payload?.debug?.summary) ? payload.debug.summary : [];
+        const timings = (payload?.debug && typeof payload.debug.timings === "object" && payload.debug.timings) ? payload.debug.timings : {};
         for (const s of sum) {
           if (String(s?.query_mode || "") === "ownership_cache") {
             cacheHits += Math.max(0, Number(s?.count || 0));
           }
         }
-        return ` | pools=${pools}${cacheHits ? ` cache=${cacheHits}` : ""}`;
+        const totalSec = Number(timings?.total_sec || 0);
+        return ` | pools=${pools}${cacheHits ? ` cache=${cacheHits}` : ""}${totalSec > 0 ? ` total=${totalSec}s` : ""}`;
       }
       while (true) {
         const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
@@ -12072,11 +12108,24 @@ def _scan_positions_evm_components(
     include_creation_dates: bool,
     hard_scan: bool,
     deep_infinity_scan: bool,
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], list[str]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[str],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[str],
+    list[dict[str, Any]],
+    list[str],
+    dict[str, Any],
+]:
+    timings: dict[str, Any] = {}
     if scan_pools:
+        t_enqueue = time.monotonic()
         _enqueue_positions_ownership_refresh_for_addresses(selected_chain_ids, evm_addresses)
+        timings["enqueue_refresh_sec"] = round(max(0.0, time.monotonic() - t_enqueue), 3)
     if scan_pools:
-        pool_rows, pool_errs, pool_debug_rows = _scan_pool_positions(
+        t_pool = time.monotonic()
+        pool_rows, pool_errs, pool_debug_rows, pool_timings = _scan_pool_positions(
             evm_addresses,
             selected_chain_ids,
             include_creation_dates=include_creation_dates,
@@ -12084,10 +12133,17 @@ def _scan_positions_evm_components(
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
         )
+        timings["pool_scan_sec"] = round(max(0.0, time.monotonic() - t_pool), 3)
+        if isinstance(pool_timings, dict):
+            timings["pool"] = pool_timings
     else:
         pool_rows, pool_errs, pool_debug_rows = [], [], []
+    t_lending = time.monotonic()
     lending_rows, lending_errs = (_scan_aave_positions(evm_addresses, selected_chain_ids) if scan_lending else ([], []))
+    timings["lending_scan_sec"] = round(max(0.0, time.monotonic() - t_lending), 3)
+    t_rewards = time.monotonic()
     reward_rows, reward_errs = (_scan_aave_merit_rewards(evm_addresses, selected_chain_ids) if scan_rewards else ([], []))
+    timings["reward_scan_sec"] = round(max(0.0, time.monotonic() - t_rewards), 3)
     return (
         pool_rows,
         pool_errs,
@@ -12096,6 +12152,7 @@ def _scan_positions_evm_components(
         lending_errs,
         reward_rows,
         reward_errs,
+        timings,
     )
 
 
@@ -12162,6 +12219,7 @@ def _build_positions_scan_response(
     info_notes: list[str],
     pool_debug_rows: list[dict[str, Any]],
     debug_summary_rows: list[dict[str, Any]],
+    debug_timings: dict[str, Any],
     include_debug_details: bool,
     evm_count: int,
     sol_count: int,
@@ -12171,6 +12229,7 @@ def _build_positions_scan_response(
     debug_payload = {
         "pool_scan": pool_debug_rows[:500] if include_debug_details else [],
         "summary": debug_summary_rows[:120] if include_debug_details else debug_summary_rows[:20],
+        "timings": debug_timings if isinstance(debug_timings, dict) else {},
     }
     return {
         "pool_positions": pool_rows,
@@ -12306,6 +12365,9 @@ def _scan_positions_core(
     *,
     include_creation_dates: bool = True,
 ) -> dict[str, Any]:
+    core_started = time.monotonic()
+    debug_timings: dict[str, Any] = {}
+    t_prepare = time.monotonic()
     hard_scan_enabled = bool(req.hard_scan)
     deep_infinity_enabled = bool(req.deep_infinity_scan or req.hard_scan)
     (
@@ -12317,9 +12379,12 @@ def _scan_positions_core(
         scan_lending,
         scan_rewards,
     ) = _prepare_positions_scan_request(req)
+    debug_timings["prepare_request_sec"] = round(max(0.0, time.monotonic() - t_prepare), 3)
     scan_pools_effective = bool(scan_pools and evm_addresses)
     pool_debug_rows: list[dict[str, Any]] = []
+    evm_timings: dict[str, Any] = {}
     if evm_addresses:
+        t_evm = time.monotonic()
         (
             pool_rows,
             pool_errs,
@@ -12328,6 +12393,7 @@ def _scan_positions_core(
             lending_errs,
             reward_rows,
             reward_errs,
+            evm_timings,
         ) = _scan_positions_evm_components(
             evm_addresses,
             selected_chain_ids,
@@ -12338,6 +12404,9 @@ def _scan_positions_core(
             hard_scan=hard_scan_enabled,
             deep_infinity_scan=deep_infinity_enabled,
         )
+        debug_timings["evm_components_sec"] = round(max(0.0, time.monotonic() - t_evm), 3)
+        if isinstance(evm_timings, dict):
+            debug_timings["evm"] = evm_timings
     else:
         pool_rows, pool_errs = [], []
         lending_rows, lending_errs = [], []
@@ -12353,12 +12422,17 @@ def _scan_positions_core(
         deep_infinity_scan=deep_infinity_enabled,
     )
 
+    t_sort = time.monotonic()
     _sort_positions_scan_rows(pool_rows, lending_rows, reward_rows)
+    debug_timings["sort_rows_sec"] = round(max(0.0, time.monotonic() - t_sort), 3)
 
+    t_debug = time.monotonic()
     debug_summary_rows = _build_pool_debug_summary_rows(pool_debug_rows)
     cache_hits, cache_misses, skip_live, legacy_disabled, row_live_enrich_disabled = _extract_index_scan_counters(
         pool_debug_rows
     )
+    debug_timings["build_debug_sec"] = round(max(0.0, time.monotonic() - t_debug), 3)
+    t_analytics = time.monotonic()
     _record_positions_scan_analytics(
         sid=sid,
         evm_addresses=evm_addresses,
@@ -12374,6 +12448,8 @@ def _scan_positions_core(
         row_live_enrich_disabled=row_live_enrich_disabled,
         info_notes=info_notes,
     )
+    debug_timings["analytics_sec"] = round(max(0.0, time.monotonic() - t_analytics), 3)
+    debug_timings["total_sec"] = round(max(0.0, time.monotonic() - core_started), 3)
     return _build_positions_scan_response(
         pool_rows=pool_rows,
         lending_rows=lending_rows,
@@ -12384,6 +12460,7 @@ def _scan_positions_core(
         info_notes=info_notes,
         pool_debug_rows=pool_debug_rows,
         debug_summary_rows=debug_summary_rows,
+        debug_timings=debug_timings,
         include_debug_details=hard_scan_enabled,
         evm_count=len(evm_addresses),
         sol_count=len(solana_addresses),
