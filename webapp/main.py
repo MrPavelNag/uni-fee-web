@@ -224,6 +224,7 @@ POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKE
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
 POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "18")))
+POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
     "1",
     "true",
@@ -280,6 +281,24 @@ POSITIONS_SPAM_MAX_TVL_USD = max(0.0, float(os.environ.get("POSITIONS_SPAM_MAX_T
 POSITIONS_MAX_TOKEN_PRICE_USD = max(100.0, float(os.environ.get("POSITIONS_MAX_TOKEN_PRICE_USD", "1000000")))
 POSITIONS_MIN_TOKEN_PRICE_USD = max(0.0, float(os.environ.get("POSITIONS_MIN_TOKEN_PRICE_USD", "0.000000000001")))
 POSITIONS_MAX_TOKEN_PRICE_RATIO = max(10.0, float(os.environ.get("POSITIONS_MAX_TOKEN_PRICE_RATIO", "10000000000")))
+
+
+def _parse_csv_int_set(raw: str) -> set[int]:
+    out: set[int] = set()
+    for part in str(raw or "").split(","):
+        s = str(part).strip()
+        if not s:
+            continue
+        try:
+            v = int(s)
+            if v > 0:
+                out.add(v)
+        except Exception:
+            continue
+    return out
+
+
+POSITIONS_NOT_SPAM_POSITION_IDS = _parse_csv_int_set(os.environ.get("POSITIONS_NOT_SPAM_IDS", "1227707,1011627"))
 POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
     int(x.strip())
     for x in os.environ.get("POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS", "42161,8453,130,56").split(",")
@@ -4326,6 +4345,75 @@ def _is_suspected_spam_pair(
     return bool(spam0 or spam1)
 
 
+def _format_usd_compact(value: float | None) -> str:
+    v = _safe_float(value)
+    if v <= 0:
+        return "-"
+    if v < 1:
+        return f"${v:.3f}".rstrip("0").rstrip(".")
+    if v < 1000:
+        return f"${v:,.2f}".rstrip("0").rstrip(".")
+    if v < 1_000_000:
+        return f"${(v / 1000.0):,.2f}K".rstrip("0").rstrip(".")
+    if v < 1_000_000_000:
+        return f"${(v / 1_000_000.0):,.2f}M".rstrip("0").rstrip(".")
+    if v < 1_000_000_000_000:
+        return f"${(v / 1_000_000_000.0):,.2f}B".rstrip("0").rstrip(".")
+    return f"${(v / 1_000_000_000_000.0):,.2f}T".rstrip("0").rstrip(".")
+
+
+def _enrich_rows_liquidity_usd(rows: list[dict[str, Any]], *, max_seconds: int = 4) -> None:
+    if not isinstance(rows, list) or not rows:
+        return
+    deadline_ts = time.monotonic() + max(1, int(max_seconds))
+    by_chain_tokens: dict[int, set[str]] = {}
+    for r in rows:
+        if time.monotonic() >= deadline_ts:
+            break
+        if bool(r.get("suspected_spam")):
+            continue
+        cid = int(r.get("chain_id") or 0)
+        if cid <= 0:
+            continue
+        t0 = str(r.get("token0_id") or "").strip().lower()
+        t1 = str(r.get("token1_id") or "").strip().lower()
+        if _is_eth_address(t0):
+            by_chain_tokens.setdefault(cid, set()).add(t0)
+        if _is_eth_address(t1):
+            by_chain_tokens.setdefault(cid, set()).add(t1)
+    prices_by_chain: dict[int, dict[str, float]] = {}
+    for cid, toks in by_chain_tokens.items():
+        if time.monotonic() >= deadline_ts:
+            break
+        try:
+            prices_by_chain[int(cid)] = _get_token_prices_usd(int(cid), sorted(list(toks)))
+        except Exception:
+            prices_by_chain[int(cid)] = {}
+    for r in rows:
+        if bool(r.get("suspected_spam")):
+            continue
+        cid = int(r.get("chain_id") or 0)
+        if cid <= 0:
+            continue
+        prices = prices_by_chain.get(int(cid), {})
+        if not prices:
+            continue
+        a0 = _safe_float(r.get("position_amount0"))
+        a1 = _safe_float(r.get("position_amount1"))
+        t0 = str(r.get("token0_id") or "").strip().lower()
+        t1 = str(r.get("token1_id") or "").strip().lower()
+        p0 = _safe_float(prices.get(t0))
+        p1 = _safe_float(prices.get(t1))
+        usd = 0.0
+        if a0 > 0 and p0 > 0:
+            usd += a0 * p0
+        if a1 > 0 and p1 > 0:
+            usd += a1 * p1
+        if usd > 0:
+            r["liquidity_usd"] = float(usd)
+            r["liquidity_display"] = _format_usd_compact(float(usd))
+
+
 def _pool_token0_price_from_sqrt_x96(sqrt_price_x96: int, dec0: int, dec1: int) -> float | None:
     try:
         if sqrt_price_x96 <= 0:
@@ -6459,14 +6547,29 @@ def _scan_pool_positions_chain(
         t1 = _token_symbol_hint(t1_obj)
         proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
         is_v3_npm_protocol = proto_label in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
-        suspected_spam_pre = _is_suspected_spam_pair(
-            chain_key,
-            t0_obj if isinstance(t0_obj, dict) else {},
-            t1_obj if isinstance(t1_obj, dict) else {},
-            str(t0 or ""),
-            str(t1 or ""),
-            None,
+        t0_hint_u = str(t0 or "").strip().upper()
+        t1_hint_u = str(t1 or "").strip().upper()
+        # Early spam pre-filter is allowed only when both token hints are informative.
+        # Unknown placeholders ("?", "UNK", empty) should not hide legitimate rows.
+        precheck_symbols_ready = bool(
+            t0_hint_u not in {"", "?", "UNK"}
+            and t1_hint_u not in {"", "?", "UNK"}
         )
+        suspected_spam_pre = (
+            _is_suspected_spam_pair(
+                chain_key,
+                t0_obj if isinstance(t0_obj, dict) else {},
+                t1_obj if isinstance(t1_obj, dict) else {},
+                str(t0 or ""),
+                str(t1 or ""),
+                None,
+            )
+            if precheck_symbols_ready
+            else False
+        )
+        pos_token_id = _position_token_id_from_raw(p.get("id"))
+        if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
+            suspected_spam_pre = False
         contract_snapshot: dict[str, Any] | None = None
         if proto_label.startswith("pancake_infinity_"):
             raw_pid = str(p.get("id") or "").strip()
@@ -6484,15 +6587,18 @@ def _scan_pool_positions_chain(
                 "address": owner,
                 "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
                 "chain": chain_key,
+                "chain_id": int(chain_id),
                 "kind": "pool",
                 "pool_id": str(pool.get("id") or ""),
                 "pair": f"{t0}/{t1}",
+                "token0_id": str((pool.get("token0") or {}).get("id") or ""),
+                "token1_id": str((pool.get("token1") or {}).get("id") or ""),
                 "position_id": str(p.get("id") or ""),
                 "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
                 "fee_tier": fee_disp,
                 "fee_tier_raw": fee_raw,
                 "position_status": "inactive",
-                "liquidity_display": str(liq_spam),
+                "liquidity_display": _format_usd_compact(None),
                 "liquidity": str(p.get("liquidity") or "0"),
                 "pool_liquidity": str(pool.get("liquidity") or "0"),
                 "position_amount0": 0.0,
@@ -6505,6 +6611,7 @@ def _scan_pool_positions_chain(
                 "fees_owed_display": "0 / 0",
                 "suspected_spam": True,
                 "spam_skipped": True,
+                "liquidity_usd": None,
             }
         # For non-spam rows, allow on-chain symbol fallback.
         if not proto_label.startswith("pancake_infinity_"):
@@ -6722,14 +6829,19 @@ def _scan_pool_positions_chain(
             str(t1 or ""),
             None,
         )
+        if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
+            suspected_spam = False
 
         return {
             "address": owner,
             "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
             "chain": chain_key,
+            "chain_id": int(chain_id),
             "kind": "pool",
             "pool_id": str(pool.get("id") or ""),
             "pair": f"{t0}/{t1}",
+            "token0_id": str((pool.get("token0") or {}).get("id") or ""),
+            "token1_id": str((pool.get("token1") or {}).get("id") or ""),
             "position_id": str(p.get("id") or ""),
             "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
             "fee_tier": fee_disp,
@@ -6747,6 +6859,7 @@ def _scan_pool_positions_chain(
             "fees_owed1": fees1_val,
             "fees_owed_display": fees_owed_display,
             "suspected_spam": bool(suspected_spam),
+            "liquidity_usd": None,
         }
 
     def _build_owner_rows_from_positions(
@@ -7327,6 +7440,9 @@ def _scan_pool_positions(
     t_agg = time.monotonic()
     uniq_rows = _aggregate_pool_rows_by_owner_protocol_pool(rows)
     timings["aggregate_rows_sec"] = round(max(0.0, time.monotonic() - t_agg), 3)
+    t_liq = time.monotonic()
+    _enrich_rows_liquidity_usd(uniq_rows, max_seconds=4 if not hard_scan else 10)
+    timings["liquidity_usd_enrich_sec"] = round(max(0.0, time.monotonic() - t_liq), 3)
     _apply_creation_dates_phase(uniq_rows, include_creation_dates=include_creation_dates)
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
@@ -9811,6 +9927,15 @@ def _render_positions_page() -> str:
     function mismatchHint(r) {
       return `Pair=${String(r?.pair || "-")} | Position symbols=${String(r?.position_symbol0 || "-")}/${String(r?.position_symbol1 || "-")}`;
     }
+    function shortProtocol(v) {
+      const p = String(v || "").trim().toLowerCase();
+      if (!p) return "";
+      if (p === "uniswap_v3") return "UNI_V3";
+      if (p === "uniswap_v4") return "UNI_V4";
+      if (p === "pancake_v3" || p === "pancake_v3_staked") return "PanC_V3";
+      if (p === "pancake_infinity_cl" || p === "pancake_infinity_bin") return "PanC_INF";
+      return String(v || "");
+    }
     function escAttr(v) {
       return esc(v).replace(/"/g, "&quot;");
     }
@@ -9848,7 +9973,7 @@ def _render_positions_page() -> str:
         html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
         html += `<td class='mono'>${esc(String(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
-        html += `<td>${esc(r.protocol || "")}</td>`;
+        html += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td>`;
         const feeRaw = String(r.fee_tier_raw || "").trim();
@@ -9875,7 +10000,7 @@ def _render_positions_page() -> str:
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(String(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${esc(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(String(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${esc(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
