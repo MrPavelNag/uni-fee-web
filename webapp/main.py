@@ -9022,33 +9022,23 @@ def _render_positions_page() -> str:
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
-    #posPoolsTable { min-width: 3600px; table-layout: auto; }
+    #posPoolsTable { min-width: 1200px; table-layout: auto; }
     #posPoolsTable th, #posPoolsTable td { white-space: nowrap; }
-    #posPoolsTable tr.contract-group-row th {
-      position: sticky;
-      top: 0;
-      z-index: 7;
-      background: #dbeafe;
-      color: #1e3a8a;
-      font-weight: 800;
-      text-transform: uppercase;
-      font-size: 11px;
-      letter-spacing: .02em;
-    }
-    #posPoolsTable tr.contract-col-row th {
-      position: sticky;
-      top: 24px;
-      z-index: 6;
-      background: #eff6ff;
-    }
     #posPoolsTable th:nth-child(1), #posPoolsTable td:nth-child(1) {
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
-    #posPoolsTable th:nth-child(2), #posPoolsTable td:nth-child(2) {
-      position: sticky; left: 120px; z-index: 4; background: #f8fbff;
+    #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
+    .contract-details-row td {
+      background: #f8fbff;
+      color: #334155;
+      font-size: 11px;
+      white-space: normal !important;
+      line-height: 1.35;
+      border-bottom: 1px dashed #dbe3ef;
     }
-    #posPoolsTable th:nth-child(1), #posPoolsTable th:nth-child(2) {
-      background: #eff6ff; z-index: 5;
+    .contract-details-row .label {
+      color: #1e3a8a;
+      font-weight: 700;
     }
     .table-nav-btn {
       border:1px solid #bfdbfe;
@@ -9718,8 +9708,7 @@ def _render_positions_page() -> str:
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
       const baseCols = 11;
-      let html = `<tr class='contract-group-row'><th colspan='11'>Base columns</th><th colspan='12'>Contract position fields</th><th colspan='7'>Contract pool fields</th><th colspan='4'>Contract quote fields</th></tr>`;
-      html += `<tr class='contract-col-row'><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th><th>Contract source</th><th>Position manager</th><th>Token ID</th><th>Position nonce</th><th>Approved operator</th><th>Token0 address</th><th>Token1 address</th><th>Fee (raw)</th><th>Tick lower</th><th>Tick upper</th><th>Position liquidity</th><th>Owed0 raw</th><th>Owed1 raw</th><th>Pool address</th><th>Pool sqrtPriceX96</th><th>Pool liquidity</th><th>Token0 decimals</th><th>Token1 decimals</th><th>Token0 symbol</th><th>Token1 symbol</th><th>Quote amount0</th><th>Quote amount1</th><th>Quote fee0</th><th>Quote fee1</th></tr>`;
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -9760,33 +9749,13 @@ def _render_positions_page() -> str:
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
         const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
-        html += `<td>${esc(r.contract_source || "")}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_position_manager || ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token_id ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_nonce ?? ""))}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_operator || ""))}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_token0 || ""))}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_token1 || ""))}</td>`;
-        html += `<td>${esc(String(r.contract_fee ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_tick_lower ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_tick_upper ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_liquidity ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_tokens_owed0_raw ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_tokens_owed1_raw ?? ""))}</td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.contract_pool_address || ""))}</td>`;
-        html += `<td>${esc(String(r.contract_pool_sqrt_price_x96 ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_pool_liquidity ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token0_decimals ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token1_decimals ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token0_symbol ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_token1_symbol ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_quote_amount0 ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_quote_amount1 ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_quote_fee0 ?? ""))}</td>`;
-        html += `<td>${esc(String(r.contract_quote_fee1 ?? ""))}</td>`;
         html += "</tr>";
+        const detailsPos = `<span class='label'>Position:</span> source=${esc(r.contract_source || "-")}; pm=${esc(String(r.contract_position_manager || ""))}; tokenId=${esc(String(r.contract_token_id ?? ""))}; nonce=${esc(String(r.contract_nonce ?? ""))}; operator=${esc(String(r.contract_operator || ""))}; token0=${esc(String(r.contract_token0_symbol || ""))} (${esc(String(r.contract_token0 || ""))}); token1=${esc(String(r.contract_token1_symbol || ""))} (${esc(String(r.contract_token1 || ""))}); feeRaw=${esc(String(r.contract_fee ?? ""))}; tick=[${esc(String(r.contract_tick_lower ?? ""))}, ${esc(String(r.contract_tick_upper ?? ""))}]; liq=${esc(String(r.contract_liquidity ?? ""))}; owedRaw=${esc(String(r.contract_tokens_owed0_raw ?? ""))}/${esc(String(r.contract_tokens_owed1_raw ?? ""))}`;
+        const detailsPool = `<span class='label'>Pool:</span> address=${esc(String(r.contract_pool_address || ""))}; sqrtPriceX96=${esc(String(r.contract_pool_sqrt_price_x96 ?? ""))}; poolLiq=${esc(String(r.contract_pool_liquidity ?? ""))}; decimals=${esc(String(r.contract_token0_decimals ?? ""))}/${esc(String(r.contract_token1_decimals ?? ""))}`;
+        const detailsQuote = `<span class='label'>Quote:</span> amount=${esc(String(r.contract_quote_amount0 ?? ""))}/${esc(String(r.contract_quote_amount1 ?? ""))}; fee=${esc(String(r.contract_quote_fee0 ?? ""))}/${esc(String(r.contract_quote_fee1 ?? ""))}`;
+        html += `<tr class='contract-details-row'><td colspan='11'>${detailsPos}<br/>${detailsPool}<br/>${detailsQuote}</td></tr>`;
       }
-      if (!visible.length) html += "<tr><td colspan='35'>No pool positions found.</td></tr>";
+      if (!visible.length) html += "<tr><td colspan='11'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
         hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position created</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
@@ -9802,7 +9771,7 @@ def _render_positions_page() -> str:
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
-        html += `<tr><td colspan='35'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='11'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       const detailsEl = document.getElementById("posHiddenDetails");
