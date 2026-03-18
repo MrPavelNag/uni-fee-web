@@ -79,6 +79,20 @@ docker run -p 8000:8000 -e THE_GRAPH_API_KEY="ваш_ключ" uni-fee-web
 
 В репозитории уже есть `render.yaml` для автоконфигурации.
 
+### Быстрый деплой одной командой
+
+```bash
+chmod +x scripts/deploy_render.sh
+./scripts/deploy_render.sh "your commit message"
+```
+
+Что делает скрипт:
+- проверяет, что вы на ветке `milestone/web-mvp-stable`;
+- коммитит изменения (исключая `data/*.sqlite3*`);
+- пушит в `origin/milestone/web-mvp-stable`.
+
+После этого в Render: **Manual Deploy** -> **Deploy latest commit** (или автодеплой, если включен).
+
 ### Шаги
 
 1. Запушьте проект в GitHub (если еще не там).

@@ -1004,7 +1004,7 @@ def _position_index_refresh_owner_chain(
             rows = _scan_v3_positions_onchain(
                 owner_addr,
                 cid,
-                include_price_details=False,
+                include_price_details=True,
                 protocol_label=protocol_label,
                 source_tag="ownership_index",
             )
@@ -4136,6 +4136,8 @@ def _fetch_v3_position_onchain_by_token_id(
         tick_lower = _decode_int_from_word(pos_words[5])
         tick_upper = _decode_int_from_word(pos_words[6])
         liq = _decode_uint_from_word(pos_words[7])
+        tokens_owed0 = _decode_uint_from_word(pos_words[10]) if len(pos_words) > 10 else 0
+        tokens_owed1 = _decode_uint_from_word(pos_words[11]) if len(pos_words) > 11 else 0
         if liq <= 0:
             return None
         pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
@@ -4162,6 +4164,8 @@ def _fetch_v3_position_onchain_by_token_id(
         return {
             "id": str(tid),
             "liquidity": str(liq),
+            "tokensOwed0": str(max(0, int(tokens_owed0))),
+            "tokensOwed1": str(max(0, int(tokens_owed1))),
             "tickLower": {"tickIdx": str(tick_lower)},
             "tickUpper": {"tickIdx": str(tick_upper)},
             "pool": {
@@ -5310,6 +5314,7 @@ def _scan_pool_positions_chain(
     addresses: list[str],
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
+    hard_scan: bool = False,
     deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
@@ -5909,6 +5914,18 @@ def _scan_pool_positions_chain(
             positions=positions,
             owner_attempts=owner_attempts,
         )
+        if not hard_scan:
+            # Fast mode: keep strict index-only path; heavy discovery/fallback is reserved for hard scan.
+            can_use_live_discovery = False
+            owner_attempts.append(
+                {
+                    "owner_value": owner,
+                    "owner_type": "fast",
+                    "query_mode": "hard_scan_required_for_live_discovery",
+                    "count": len(positions),
+                    "ok": True,
+                }
+            )
         # Cold-cache safety: when strict index-first disables live discovery and cache is empty,
         # do one bounded synchronous warmup for this owner/chain to avoid empty first response.
         # Also warm up once when cache hit has v3 rows but is missing Infinity rows.
@@ -5916,6 +5933,7 @@ def _scan_pool_positions_chain(
             version == "v3"
             and ((not positions) or needs_infinity_gap_warmup)
             and not can_use_live_discovery
+            and hard_scan
             and POSITIONS_OWNERSHIP_INDEX_ENABLED
             and POSITIONS_INDEX_SYNC_WARMUP_ENABLED
             and int(chain_id) in POSITIONS_INDEX_SYNC_WARMUP_CHAIN_IDS
@@ -5962,6 +5980,7 @@ def _scan_pool_positions_chain(
             version == "v3"
             and not positions
             and not can_use_live_discovery
+            and hard_scan
             and POSITIONS_INDEX_MISS_GRAPH_FALLBACK_ENABLED
             and str(endpoint or "").strip()
             and _endpoint_supports_uniswap_positions(endpoint)
@@ -6057,7 +6076,7 @@ def _scan_pool_positions_chain(
     ) -> dict[str, Any] | None:
         if not isinstance(p, dict):
             return None
-        if allow_live_enrich and not _position_has_full_detail(p) and not bool(p.get("_skip_enrich")):
+        if hard_scan and allow_live_enrich and not _position_has_full_detail(p) and not bool(p.get("_skip_enrich")):
             enriched = _fetch_position_by_id_with_detail(
                 endpoint,
                 str(p.get("id") or ""),
@@ -6093,7 +6112,7 @@ def _scan_pool_positions_chain(
             elif str(t1).upper() == "UNK":
                 t1 = f"#{pid}" if pid else "Position"
         # Exact-only output: show on-chain token amounts and owed fees.
-        if allow_live_enrich and version == "v3":
+        if hard_scan and allow_live_enrich and version == "v3":
             onchain_enriched = _fetch_v3_position_onchain_by_token_id(
                 int(chain_id),
                 str(p.get("id") or ""),
@@ -6110,6 +6129,12 @@ def _scan_pool_positions_chain(
 
         amount0_val: float | None = None
         amount1_val: float | None = None
+        raw_amount0 = _safe_float(p.get("position_amount0"))
+        raw_amount1 = _safe_float(p.get("position_amount1"))
+        if raw_amount0 is not None:
+            amount0_val = float(raw_amount0)
+        if raw_amount1 is not None:
+            amount1_val = float(raw_amount1)
         amounts = _position_amounts_from_detail(p, pool)
         if amounts:
             try:
@@ -6141,12 +6166,19 @@ def _scan_pool_positions_chain(
         def _fmt_amt(v: float | None) -> str:
             if v is None:
                 return "-"
-            if abs(v) >= 1000:
-                return f"{v:,.4f}".rstrip("0").rstrip(".")
-            return f"{v:.8f}".rstrip("0").rstrip(".")
+            # Rounded compact value for UI table cells.
+            return f"{v:,.4f}".rstrip("0").rstrip(".")
 
-        position_amounts_display = f"{_fmt_amt(amount0_val)} {t0} / {_fmt_amt(amount1_val)} {t1}"
-        fees_owed_display = f"{_fmt_amt(fees0_val)} {t0} / {_fmt_amt(fees1_val)} {t1}"
+        position_amounts_display = f"{_fmt_amt(amount0_val)} / {_fmt_amt(amount1_val)}"
+        fees_owed_display = f"{_fmt_amt(fees0_val)} / {_fmt_amt(fees1_val)}"
+        suspected_spam = _is_suspected_spam_pair(
+            chain_key,
+            t0_obj if isinstance(t0_obj, dict) else {},
+            t1_obj if isinstance(t1_obj, dict) else {},
+            str(t0 or ""),
+            str(t1 or ""),
+            None,
+        )
 
         return {
             "address": owner,
@@ -6168,6 +6200,8 @@ def _scan_pool_positions_chain(
             "tvl_usd": None,
             "position_amount0": amount0_val,
             "position_amount1": amount1_val,
+            "position_symbol0": str(t0 or ""),
+            "position_symbol1": str(t1 or ""),
             "position_amounts_display": position_amounts_display,
             "fees_owed0": fees0_val,
             "fees_owed1": fees1_val,
@@ -6178,7 +6212,7 @@ def _scan_pool_positions_chain(
                 str(p.get("id") or ""),
             ),
             "valuation_mode": "exact-onchain-amounts",
-            "suspected_spam": False,
+            "suspected_spam": bool(suspected_spam),
         }
 
     def _build_owner_rows_from_positions(
@@ -6430,6 +6464,7 @@ def _run_pool_chain_scan(
     addresses: list[str],
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
+    hard_scan: bool = False,
     deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     return _scan_pool_positions_chain(
@@ -6437,6 +6472,7 @@ def _run_pool_chain_scan(
         addresses,
         deadline_ts,
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+        hard_scan=hard_scan,
         deep_infinity_scan=deep_infinity_scan,
     )
 
@@ -6446,6 +6482,7 @@ def _run_pool_chain_batch_serial(
     addresses: list[str],
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
+    hard_scan: bool = False,
     deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
@@ -6461,6 +6498,7 @@ def _run_pool_chain_batch_serial(
             addresses,
             deadline_ts,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+            hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
         )
         rows.extend(chain_rows)
@@ -6478,6 +6516,7 @@ def _run_pool_chain_batch_parallel(
     deadline_ts: float,
     max_workers: int,
     pre_enqueued_ownership_refresh: bool = False,
+    hard_scan: bool = False,
     deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
@@ -6492,6 +6531,7 @@ def _run_pool_chain_batch_parallel(
             addresses,
             deadline_ts,
             pre_enqueued_ownership_refresh,
+            hard_scan,
             deep_infinity_scan,
         )
         for chain_id in chain_ids
@@ -6570,6 +6610,7 @@ def _scan_pool_positions(
     *,
     include_creation_dates: bool = True,
     pre_enqueued_ownership_refresh: bool = False,
+    hard_scan: bool = False,
     deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
@@ -6592,6 +6633,7 @@ def _scan_pool_positions(
         addresses,
         deadline_ts,
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+        hard_scan=hard_scan,
         deep_infinity_scan=deep_infinity_scan,
     )
     rows.extend(p_rows)
@@ -6607,6 +6649,7 @@ def _scan_pool_positions(
             addresses,
             deadline_ts,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+            hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
         )
         rows.extend(r_rows)
@@ -6620,6 +6663,7 @@ def _scan_pool_positions(
             deadline_ts,
             max_workers=max_workers,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+            hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
         )
         rows.extend(r_rows)
@@ -7838,6 +7882,7 @@ class PositionsScanRequest(BaseModel):
     include_pools: bool = True
     include_lending: bool = True
     include_rewards: bool = True
+    hard_scan: bool = False
     deep_infinity_scan: bool = False
     # Backward-compatible fields from the previous UI version.
     addresses: list[str] = Field(default_factory=list)
@@ -8539,8 +8584,8 @@ def _render_positions_page() -> str:
           <div class="section-actions">
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
+            <button id="posHardScanBtn" class="search-link-btn" type="button" onclick="scanPositions('pools', {hardScan:true})">Hard scan</button>
             <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan</button>
-            <button id="posDeepInfinityBtn" class="search-link-btn" type="button" onclick="scanPositions('pools', true)">Скан Infinity</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
@@ -8665,10 +8710,10 @@ def _render_positions_page() -> str:
     function setPosBusy(flag) {
       const el = document.getElementById("posProgress");
       const scanBtn = document.getElementById("posSearchBtn");
-      const deepBtn = document.getElementById("posDeepInfinityBtn");
+      const hardBtn = document.getElementById("posHardScanBtn");
       if (el) el.style.display = flag ? "block" : "none";
       if (scanBtn) scanBtn.disabled = !!flag;
-      if (deepBtn) deepBtn.disabled = !!flag;
+      if (hardBtn) hardBtn.disabled = !!flag;
     }
     function updatePosSearchButton() {
       const btn = document.getElementById("posSearchBtn");
@@ -8901,6 +8946,7 @@ def _render_positions_page() -> str:
           .filter((x) => Number(x.positions_found || 0) === 0)
           .slice(0, 30)
           .map((x) => `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} (0)`);
+        const zeroRowsDedup = Array.from(new Set(zeroRows));
         const cmpRows = dbgRows
           .filter((x) => {
             const c = x.compare || {};
@@ -8962,7 +9008,7 @@ def _render_positions_page() -> str:
         }
         const body = []
           .concat(sumLines.length ? ["Summary:", ...sumLines] : [])
-          .concat(zeroRows.length ? ["", "Zero-found owners:", ...zeroRows] : [])
+          .concat(zeroRowsDedup.length ? ["", "Zero-found owners:", ...zeroRowsDedup] : [])
           .concat(cmpRowsDedup.length ? ["", "Source compare (onchain vs graph):", ...cmpRowsDedup] : [])
           .concat(infinityRows.length ? ["", "Infinity debug:", ...infinityRows.slice(0, 40)] : [])
           .join("\\n");
@@ -9046,6 +9092,28 @@ def _render_positions_page() -> str:
         setPosHistoryStatus("History load failed", true);
       }
     }
+    function normPosSym(v) {
+      return String(v || "").trim().toUpperCase();
+    }
+    function pairParts(v) {
+      const s = String(v || "");
+      if (!s.includes("/")) return ["", ""];
+      const parts = s.split("/", 2);
+      return [normPosSym(parts[0]), normPosSym(parts[1])];
+    }
+    function hasPairMismatch(r) {
+      const [p0, p1] = pairParts(r?.pair || "");
+      const s0 = normPosSym(r?.position_symbol0 || "");
+      const s1 = normPosSym(r?.position_symbol1 || "");
+      if (!p0 || !p1 || !s0 || !s1) return false;
+      return p0 !== s0 || p1 !== s1;
+    }
+    function mismatchHint(r) {
+      return `Pair=${String(r?.pair || "-")} | Position symbols=${String(r?.position_symbol0 || "-")}/${String(r?.position_symbol1 || "-")}`;
+    }
+    function escAttr(v) {
+      return esc(v).replace(/"/g, "&quot;");
+    }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
       const trustedSpamKeys = getTrustedSpamKeys();
@@ -9073,19 +9141,22 @@ def _render_positions_page() -> str:
       }
       for (let i = 0; i < visible.length; i++) {
         const r = visible[i];
+        const mismatch = hasPairMismatch(r);
+        const mismatchCellStyle = mismatch ? " style='background:#fff7ed;color:#9a3412;font-weight:600'" : "";
+        const mismatchTitle = mismatch ? ` title="${escAttr(mismatchHint(r))}"` : "";
         html += "<tr>";
         html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(r.protocol || "")}</td>`;
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        html += `<td>${esc(r.pair || "")}</td>`;
+        html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td>`;
         const feeRaw = String(r.fee_tier_raw || "").trim();
         const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
         html += `<td class='mono'>${esc(shortAddr4(r.pool_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
         html += `<td>${esc(r.position_created_date || "-")}</td>`;
-        html += `<td>${esc(r.position_amounts_display || "-")}</td>`;
-        html += `<td>${esc(r.fees_owed_display || "-")}</td>`;
+        html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
         const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
@@ -9097,10 +9168,13 @@ def _render_positions_page() -> str:
         hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position created</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
         for (let i = 0; i < hiddenRows.length; i++) {
           const r = hiddenRows[i];
+          const mismatch = hasPairMismatch(r);
+          const mismatchStyle = mismatch ? "background:#fff7ed;color:#9a3412;font-weight:600;" : "";
+          const mismatchTitle = mismatch ? ` title="${escAttr(mismatchHint(r))}"` : "";
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.position_created_date || "-")}</td><td style='padding:3px 6px'>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.position_created_date || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
@@ -9128,6 +9202,13 @@ def _render_positions_page() -> str:
       const jid = String(jobId || "").trim();
       if (!jid) throw new Error("Missing job id");
       let partialRendered = false;
+      function statusTailFromPayload(payload) {
+        const errs = Array.isArray(payload?.errors) ? payload.errors : [];
+        const infos = Array.isArray(payload?.infos) ? payload.infos : [];
+        if (errs.length) return ` | ${String(errs[0] || "")}`;
+        if (infos.length) return ` | ${String(infos[0] || "")}`;
+        return "";
+      }
       while (true) {
         const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
         const data = await r.json().catch(() => ({}));
@@ -9147,17 +9228,21 @@ def _render_positions_page() -> str:
         if (allowPartialReturn && partialRendered && String(data.stage || "").startsWith("enrich_")) {
           return Object.assign({__partial: true}, partial);
         }
+        const statusTail = statusTailFromPayload(partial);
         if (partialRendered) {
-          setPosStatus(`${stageLabel || "Background scan"}... ${progress}% (table updates live)`, false);
+          setPosStatus(`${stageLabel || "Background scan"}... ${progress}% (table updates live)${statusTail}`, false);
         } else {
-          setPosStatus(`${stageLabel || "Scanning in background"}... ${progress}%`, false);
+          setPosStatus(`${stageLabel || "Scanning in background"}... ${progress}%${statusTail}`, false);
         }
         await new Promise((resolve) => setTimeout(resolve, 1200));
       }
     }
-    async function scanPositions(targetSection = "all", deepInfinityScan = false) {
+    async function scanPositions(targetSection = "all", opts = {}) {
       let handoffToBackground = false;
-      const modeLabel = deepInfinityScan ? "Infinity deep scan" : "scan";
+      const options = (typeof opts === "boolean") ? {deepInfinityScan: !!opts} : (opts || {});
+      const hardScan = !!options.hardScan;
+      const deepInfinityScan = !!(options.deepInfinityScan || hardScan);
+      const modeLabel = hardScan ? "hard scan" : (deepInfinityScan ? "Infinity deep scan" : "scan");
       if (posHasScannedOnce) {
         const ok = window.confirm(`Run ${modeLabel} again and replace current results?`);
         if (!ok) return;
@@ -9184,6 +9269,7 @@ def _render_positions_page() -> str:
             include_pools: true,
             include_lending: false,
             include_rewards: false,
+            hard_scan: !!hardScan,
             deep_infinity_scan: !!deepInfinityScan,
           }),
         });
@@ -9213,7 +9299,13 @@ def _render_positions_page() -> str:
         });
         posHasScannedOnce = true;
         updatePosSearchButton();
-        setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}${finishedChecks ? ` | Owner-chain checks: ${finishedChecks}` : ""}`, false);
+        const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
+        const infoCount = Array.isArray(data?.infos) ? data.infos.length : 0;
+        const firstInfo = infoCount ? String(data.infos[0] || "") : "";
+        setPosStatus(
+          `Done. Pools: ${(data.pool_positions || []).length}${finishedChecks ? ` | Owner-chain checks: ${finishedChecks}` : ""}${errCount ? ` | warnings: ${errCount}` : ""}${firstInfo ? ` | ${firstInfo}` : ""}`,
+          false
+        );
       } catch (e) {
         saveActivePosJob("");
         setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
@@ -9242,7 +9334,12 @@ def _render_positions_page() -> str:
         });
         posHasScannedOnce = true;
         updatePosSearchButton();
-        setPosStatus(`Done. Pools: ${(data.pool_positions || []).length}`, false);
+        const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
+        const firstInfo = Array.isArray(data?.infos) && data.infos.length ? String(data.infos[0] || "") : "";
+        setPosStatus(
+          `Done. Pools: ${(data.pool_positions || []).length}${errCount ? ` | warnings: ${errCount}` : ""}${firstInfo ? ` | ${firstInfo}` : ""}`,
+          false
+        );
       } catch (e) {
         saveActivePosJob("");
         setPosStatus("Background scan failed: " + (e?.message || "unknown"), true);
@@ -11434,6 +11531,7 @@ def _scan_positions_evm_components(
     scan_lending: bool,
     scan_rewards: bool,
     include_creation_dates: bool,
+    hard_scan: bool,
     deep_infinity_scan: bool,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], list[str]]:
     if scan_pools:
@@ -11444,6 +11542,7 @@ def _scan_positions_evm_components(
             selected_chain_ids,
             include_creation_dates=include_creation_dates,
             pre_enqueued_ownership_refresh=bool(POSITIONS_OWNERSHIP_INDEX_ENABLED),
+            hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
         )
     else:
@@ -11494,6 +11593,7 @@ def _build_positions_info_notes(
     *,
     scan_pools: bool,
     include_creation_dates: bool,
+    hard_scan: bool,
     deep_infinity_scan: bool,
 ) -> list[str]:
     info_notes: list[str] = []
@@ -11503,6 +11603,10 @@ def _build_positions_info_notes(
         info_notes.append("TRON scanning is not available yet in this build.")
     if scan_pools and not include_creation_dates:
         info_notes.append("Creation dates are in fast mode (deferred/background).")
+    if scan_pools and not hard_scan:
+        info_notes.append("Fast mode: heavy fallbacks and deep enrichments are disabled.")
+    if hard_scan:
+        info_notes.append("Hard scan is enabled: heavy fallbacks and deep enrichment are allowed.")
     if deep_infinity_scan:
         info_notes.append("Deep Infinity scan mode is enabled for this run.")
     return info_notes
@@ -11599,17 +11703,43 @@ def _update_pos_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
         return job
 
 
-def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any]) -> None:
+def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, hard_scan: bool = False) -> None:
     pool_rows = result.get("pool_positions") or []
     if not isinstance(pool_rows, list) or not pool_rows:
         return
+    if not hard_scan:
+        _update_pos_job(
+            job_id,
+            result=result,
+            stage="finalize",
+            stage_label="Fast mode: skipping heavy enrichments",
+            progress=95,
+        )
+        return
+    rows_count = int(len(pool_rows))
+    if _update_pos_job(
+        job_id,
+        result=result,
+        stage="enrich_dates",
+        stage_label=f"Resolving position creation dates ({rows_count} rows)",
+        progress=65,
+    ) is None:
+        return
     _populate_creation_dates_parallel(pool_rows)
+    if _update_pos_job(
+        job_id,
+        result=result,
+        stage="enrich_dates_backfill",
+        stage_label="Backfilling missing creation dates",
+        progress=74,
+    ) is None:
+        return
     _enrich_missing_creation_dates(pool_rows, max_seconds=45, max_rows=500)
     if _update_pos_job(
         job_id,
         result=result,
         stage="enrich_pairs",
-        stage_label="Resolving pair symbols",
+        stage_label="Resolving pair symbols for unknown tokens",
         progress=85,
     ) is None:
         return
@@ -11617,8 +11747,8 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any]) -> No
     if _update_pos_job(
         job_id,
         result=result,
-        stage="enrich_exact",
-        stage_label="Refreshing exact on-chain values",
+        stage="finalize",
+        stage_label="Finalizing table fields",
         progress=92,
     ) is None:
         return
@@ -11634,6 +11764,8 @@ def _scan_positions_core(
     *,
     include_creation_dates: bool = True,
 ) -> dict[str, Any]:
+    hard_scan_enabled = bool(req.hard_scan)
+    deep_infinity_enabled = bool(req.deep_infinity_scan or req.hard_scan)
     (
         evm_addresses,
         solana_addresses,
@@ -11661,7 +11793,8 @@ def _scan_positions_core(
             scan_lending=scan_lending,
             scan_rewards=scan_rewards,
             include_creation_dates=include_creation_dates,
-            deep_infinity_scan=bool(req.deep_infinity_scan),
+            hard_scan=hard_scan_enabled,
+            deep_infinity_scan=deep_infinity_enabled,
         )
     else:
         pool_rows, pool_errs = [], []
@@ -11674,7 +11807,8 @@ def _scan_positions_core(
         tron_addresses,
         scan_pools=scan_pools_effective,
         include_creation_dates=include_creation_dates,
-        deep_infinity_scan=bool(req.deep_infinity_scan),
+        hard_scan=hard_scan_enabled,
+        deep_infinity_scan=deep_infinity_enabled,
     )
 
     _sort_positions_scan_rows(pool_rows, lending_rows, reward_rows)
@@ -11716,11 +11850,12 @@ def _scan_positions_core(
 
 
 def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: str) -> None:
+    hard_scan_enabled = bool(req.hard_scan)
     if _update_pos_job(
         job_id,
         status="running",
         stage="scan",
-        stage_label="Scanning positions",
+        stage_label=("Hard scan: scanning positions" if hard_scan_enabled else "Scanning positions"),
         progress=15,
         started_at=time.time(),
     ) is None:
@@ -11731,11 +11866,11 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
             job_id,
             result=result,
             stage="enrich_dates",
-            stage_label="Enriching dates",
+            stage_label=("Hard scan: enriching data" if hard_scan_enabled else "Fast mode: finalizing"),
             progress=65,
         ) is None:
             return
-        _run_positions_scan_enrich_phases(job_id, result)
+        _run_positions_scan_enrich_phases(job_id, result, hard_scan=hard_scan_enabled)
         _update_pos_job(
             job_id,
             status="done",
