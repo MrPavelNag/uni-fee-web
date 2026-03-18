@@ -223,6 +223,7 @@ POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECON
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
+POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "18")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
     "1",
     "true",
@@ -6440,12 +6441,32 @@ def _scan_pool_positions_chain(
             fee_disp = fee_raw or "-"
         t0_obj = pool.get("token0") or {}
         t1_obj = pool.get("token1") or {}
-        t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
-        t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
-        t0 = _normalize_display_symbol(t0)
-        t1 = _normalize_display_symbol(t1)
+        chain_addr_map = _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}
+
+        def _token_symbol_hint(token_obj: dict[str, Any]) -> str:
+            sym = str((token_obj or {}).get("symbol") or "").strip()
+            if sym:
+                return _normalize_display_symbol(sym)
+            addr = str((token_obj or {}).get("id") or "").strip().lower()
+            cfg = str(chain_addr_map.get(addr) or "").strip()
+            if cfg:
+                return _normalize_display_symbol(cfg)
+            return "?"
+
+        # Fast pre-check for suspected spam based on existing/cached symbols only.
+        # Do this before expensive on-chain quote/snapshot calls.
+        t0 = _token_symbol_hint(t0_obj)
+        t1 = _token_symbol_hint(t1_obj)
         proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
         is_v3_npm_protocol = proto_label in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
+        suspected_spam_pre = _is_suspected_spam_pair(
+            chain_key,
+            t0_obj if isinstance(t0_obj, dict) else {},
+            t1_obj if isinstance(t1_obj, dict) else {},
+            str(t0 or ""),
+            str(t1 or ""),
+            None,
+        )
         contract_snapshot: dict[str, Any] | None = None
         if proto_label.startswith("pancake_infinity_"):
             raw_pid = str(p.get("id") or "").strip()
@@ -6457,7 +6478,39 @@ def _scan_pool_positions_chain(
                 t0 = "Infinity"
             elif str(t1).upper() == "UNK":
                 t1 = f"#{pid}" if pid else "Position"
-        elif version == "v3" and is_v3_npm_protocol:
+        if suspected_spam_pre:
+            liq_spam = max(0, _parse_int_like(p.get("liquidity") or 0))
+            return {
+                "address": owner,
+                "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
+                "chain": chain_key,
+                "kind": "pool",
+                "pool_id": str(pool.get("id") or ""),
+                "pair": f"{t0}/{t1}",
+                "position_id": str(p.get("id") or ""),
+                "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
+                "fee_tier": fee_disp,
+                "fee_tier_raw": fee_raw,
+                "position_status": "inactive",
+                "liquidity_display": str(liq_spam),
+                "liquidity": str(p.get("liquidity") or "0"),
+                "pool_liquidity": str(pool.get("liquidity") or "0"),
+                "position_amount0": 0.0,
+                "position_amount1": 0.0,
+                "position_symbol0": str(t0 or ""),
+                "position_symbol1": str(t1 or ""),
+                "position_amounts_display": "0 / 0",
+                "fees_owed0": 0.0,
+                "fees_owed1": 0.0,
+                "fees_owed_display": "0 / 0",
+                "suspected_spam": True,
+                "spam_skipped": True,
+            }
+        # For non-spam rows, allow on-chain symbol fallback.
+        if not proto_label.startswith("pancake_infinity_"):
+            t0 = _normalize_display_symbol(_token_display_symbol(int(chain_id), chain_key, t0_obj))
+            t1 = _normalize_display_symbol(_token_display_symbol(int(chain_id), chain_key, t1_obj))
+        if version == "v3" and is_v3_npm_protocol:
             try:
                 contract_snapshot = _fetch_v3_position_contract_snapshot(
                     int(chain_id),
@@ -6642,10 +6695,25 @@ def _scan_pool_positions_chain(
 
         position_amounts_display = f"{_fmt_amt(amount0_val)} / {_fmt_amt(amount1_val)}"
         fees_owed_display = f"{_fmt_amt(fees0_val, zero_if_missing=True)} / {_fmt_amt(fees1_val, zero_if_missing=True)}"
-        has_position_value = bool((amount0_val or 0.0) > 0 or (amount1_val or 0.0) > 0)
-        has_fees_value = bool((fees0_val or 0.0) > 0 or (fees1_val or 0.0) > 0)
-        position_status = "active" if (has_position_value or has_fees_value or liq_int > 0) else "empty"
-        liquidity_display = "non-zero" if (has_position_value or liq_int > 0) else "0"
+        a0_now = max(0.0, float(amount0_val or 0.0))
+        a1_now = max(0.0, float(amount1_val or 0.0))
+        # Status is derived only from "In position":
+        # inactive when either side is zero; active otherwise.
+        position_status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
+
+        def _fmt_liq_compact(v: int) -> str:
+            x = max(0, int(v or 0))
+            if x < 1000:
+                return str(x)
+            if x < 1_000_000:
+                return f"{x / 1000.0:.1f}K".rstrip("0").rstrip(".")
+            if x < 1_000_000_000:
+                return f"{x / 1_000_000.0:.1f}M".rstrip("0").rstrip(".")
+            if x < 1_000_000_000_000:
+                return f"{x / 1_000_000_000.0:.1f}B".rstrip("0").rstrip(".")
+            return f"{x / 1_000_000_000_000.0:.1f}T".rstrip("0").rstrip(".")
+
+        liquidity_display = _fmt_liq_compact(liq_int)
         suspected_spam = _is_suspected_spam_pair(
             chain_key,
             t0_obj if isinstance(t0_obj, dict) else {},
@@ -6980,13 +7048,24 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
             f"{_fmt_amt(_opt_float(acc.get('fees_owed0')), zero_if_missing=True)} / "
             f"{_fmt_amt(_opt_float(acc.get('fees_owed1')), zero_if_missing=True)}"
         )
-        a0 = _opt_float(acc.get("position_amount0")) or 0.0
-        a1 = _opt_float(acc.get("position_amount1")) or 0.0
-        f0 = _opt_float(acc.get("fees_owed0")) or 0.0
-        f1 = _opt_float(acc.get("fees_owed1")) or 0.0
+        a0 = max(0.0, float(_opt_float(acc.get("position_amount0")) or 0.0))
+        a1 = max(0.0, float(_opt_float(acc.get("position_amount1")) or 0.0))
         liq_raw = max(0, _parse_int_like(acc.get("liquidity") or 0))
-        acc["position_status"] = "active" if (a0 > 0 or a1 > 0 or f0 > 0 or f1 > 0 or liq_raw > 0) else "empty"
-        acc["liquidity_display"] = "non-zero" if (a0 > 0 or a1 > 0 or liq_raw > 0) else "0"
+        acc["position_status"] = "inactive" if (a0 <= 0.0 or a1 <= 0.0) else "active"
+
+        def _fmt_liq_compact(v: int) -> str:
+            x = max(0, int(v or 0))
+            if x < 1000:
+                return str(x)
+            if x < 1_000_000:
+                return f"{x / 1000.0:.1f}K".rstrip("0").rstrip(".")
+            if x < 1_000_000_000:
+                return f"{x / 1_000_000.0:.1f}M".rstrip("0").rstrip(".")
+            if x < 1_000_000_000_000:
+                return f"{x / 1_000_000_000.0:.1f}B".rstrip("0").rstrip(".")
+            return f"{x / 1_000_000_000_000.0:.1f}T".rstrip("0").rstrip(".")
+
+        acc["liquidity_display"] = _fmt_liq_compact(liq_raw)
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     return list(uniq.values())
 
@@ -7020,15 +7099,17 @@ def _run_pool_chain_batch_serial(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
     timed_out = False
+    chain_durations_sec: dict[str, float] = {}
     for chain_id in chain_ids:
         if time.monotonic() >= deadline_ts:
             timed_out = True
             break
+        chain_started = time.monotonic()
         chain_rows, chain_errors, chain_debug, chain_timed_out = _run_pool_chain_scan(
             int(chain_id),
             addresses,
@@ -7040,10 +7121,12 @@ def _run_pool_chain_batch_serial(
         rows.extend(chain_rows)
         errors.extend(chain_errors)
         debug_rows.extend(chain_debug)
+        chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id), str(chain_id)) or str(chain_id))
+        chain_durations_sec[chain_key] = round(max(0.0, time.monotonic() - chain_started), 3)
         if chain_timed_out:
             timed_out = True
             break
-    return rows, errors, debug_rows, timed_out
+    return rows, errors, debug_rows, timed_out, chain_durations_sec
 
 
 def _run_pool_chain_batch_parallel(
@@ -7054,14 +7137,17 @@ def _run_pool_chain_batch_parallel(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
     timed_out = False
+    chain_durations_sec: dict[str, float] = {}
     executor = ThreadPoolExecutor(max_workers=max_workers)
-    futures = [
-        executor.submit(
+    future_map: dict[Any, tuple[int, float]] = {}
+    futures = []
+    for chain_id in chain_ids:
+        fut = executor.submit(
             _run_pool_chain_scan,
             int(chain_id),
             addresses,
@@ -7070,16 +7156,19 @@ def _run_pool_chain_batch_parallel(
             hard_scan,
             deep_infinity_scan,
         )
-        for chain_id in chain_ids
-    ]
+        futures.append(fut)
+        future_map[fut] = (int(chain_id), time.monotonic())
     aborted = False
     try:
         for fut in as_completed(futures):
+            chain_id, started = future_map.get(fut, (0, time.monotonic()))
             try:
                 chain_rows, chain_errors, chain_debug, chain_timed_out = fut.result()
             except Exception as e:
                 errors.append(f"Pool scan worker failed: {e}")
                 continue
+            chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id), str(chain_id)) or str(chain_id))
+            chain_durations_sec[chain_key] = round(max(0.0, time.monotonic() - started), 3)
             rows.extend(chain_rows)
             errors.extend(chain_errors)
             debug_rows.extend(chain_debug)
@@ -7091,7 +7180,7 @@ def _run_pool_chain_batch_parallel(
                 break
     finally:
         executor.shutdown(wait=not aborted, cancel_futures=aborted)
-    return rows, errors, debug_rows, timed_out
+    return rows, errors, debug_rows, timed_out, chain_durations_sec
 
 
 def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], *, hard_scan: bool = False) -> list[int]:
@@ -7170,11 +7259,12 @@ def _scan_pool_positions(
     max_workers = max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
     timings["chains_total"] = len(ordered_chain_ids)
     timings["chain_workers"] = int(max_workers)
+    chain_durations_sec: dict[str, float] = {}
 
     # Run priority chains first in sequence to avoid deadline starvation.
     priority_ids = [c for c in ordered_chain_ids if c in priority_chain_ids]
     t_prio = time.monotonic()
-    p_rows, p_errors, p_debug, p_timed_out = _run_pool_chain_batch_serial(
+    p_rows, p_errors, p_debug, p_timed_out, p_chain_durations = _run_pool_chain_batch_serial(
         priority_ids,
         addresses,
         deadline_ts,
@@ -7186,16 +7276,24 @@ def _scan_pool_positions(
     rows.extend(p_rows)
     errors.extend(p_errors)
     debug_rows.extend(p_debug)
+    chain_durations_sec.update(p_chain_durations or {})
     timed_out = bool(p_timed_out)
 
     remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
+    remaining_deadline_ts = float(deadline_ts)
+    if not hard_scan and remaining_chain_ids:
+        remaining_deadline_ts = min(
+            float(deadline_ts),
+            time.monotonic() + float(POSITIONS_FAST_REMAINING_BUDGET_SEC),
+        )
+        timings["remaining_budget_sec"] = int(POSITIONS_FAST_REMAINING_BUDGET_SEC)
 
     if not timed_out and (max_workers <= 1 or len(remaining_chain_ids) <= 1):
         t_rest = time.monotonic()
-        r_rows, r_errors, r_debug, r_timed_out = _run_pool_chain_batch_serial(
+        r_rows, r_errors, r_debug, r_timed_out, r_chain_durations = _run_pool_chain_batch_serial(
             remaining_chain_ids,
             addresses,
-            deadline_ts,
+            remaining_deadline_ts,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
@@ -7203,14 +7301,15 @@ def _scan_pool_positions(
         rows.extend(r_rows)
         errors.extend(r_errors)
         debug_rows.extend(r_debug)
+        chain_durations_sec.update(r_chain_durations or {})
         timed_out = bool(r_timed_out)
         timings["remaining_chains_sec"] = round(max(0.0, time.monotonic() - t_rest), 3)
     elif not timed_out:
         t_rest = time.monotonic()
-        r_rows, r_errors, r_debug, r_timed_out = _run_pool_chain_batch_parallel(
+        r_rows, r_errors, r_debug, r_timed_out, r_chain_durations = _run_pool_chain_batch_parallel(
             remaining_chain_ids,
             addresses,
-            deadline_ts,
+            remaining_deadline_ts,
             max_workers=max_workers,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
@@ -7219,6 +7318,7 @@ def _scan_pool_positions(
         rows.extend(r_rows)
         errors.extend(r_errors)
         debug_rows.extend(r_debug)
+        chain_durations_sec.update(r_chain_durations or {})
         timed_out = bool(r_timed_out)
         timings["remaining_chains_sec"] = round(max(0.0, time.monotonic() - t_rest), 3)
 
@@ -7235,6 +7335,7 @@ def _scan_pool_positions(
         )
     timings["rows_before_aggregate"] = int(rows_before_aggregate)
     timings["rows_after_aggregate"] = int(len(uniq_rows))
+    timings["chain_durations_sec"] = chain_durations_sec
     timings["timed_out"] = bool(timed_out)
     timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
     return uniq_rows, dedup_errors, debug_rows, timings
@@ -8439,6 +8540,7 @@ class PositionsScanRequest(BaseModel):
     include_rewards: bool = True
     hard_scan: bool = False
     deep_infinity_scan: bool = False
+    infinity_scan: bool = False
     # Backward-compatible fields from the previous UI version.
     addresses: list[str] = Field(default_factory=list)
     chain_ids: list[int] = Field(default_factory=list)
@@ -8453,6 +8555,10 @@ class PositionPoolSeriesRequest(BaseModel):
     position_liquidity: str = "0"
     pool_liquidity: str = "0"
     days: int = 30
+
+
+class PositionsRowEnrichRequest(BaseModel):
+    row: dict[str, Any] = Field(default_factory=dict)
 
 
 INTENT_OPTIONS: list[tuple[str, str]] = [
@@ -9156,7 +9262,7 @@ def _render_positions_page() -> str:
           <div class="section-actions">
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
-            <button id="posHardScanBtn" class="search-link-btn" type="button" onclick="scanPositions('pools', {hardScan:true})">Hard scan</button>
+            <button id="posInfinityScanBtn" class="search-link-btn" type="button" onclick="scanPositions('pools', {infinityScan:true})">Infinity scan</button>
             <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan</button>
             <button class="table-nav-btn" type="button" onclick="scrollPosTable(-600)" title="Scroll table left">◀</button>
             <button class="table-nav-btn" type="button" onclick="scrollPosTable(600)" title="Scroll table right">▶</button>
@@ -9284,10 +9390,10 @@ def _render_positions_page() -> str:
     function setPosBusy(flag) {
       const el = document.getElementById("posProgress");
       const scanBtn = document.getElementById("posSearchBtn");
-      const hardBtn = document.getElementById("posHardScanBtn");
+      const infBtn = document.getElementById("posInfinityScanBtn");
       if (el) el.style.display = flag ? "block" : "none";
       if (scanBtn) scanBtn.disabled = !!flag;
-      if (hardBtn) hardBtn.disabled = !!flag;
+      if (infBtn) infBtn.disabled = !!flag;
     }
     function updatePosSearchButton() {
       const btn = document.getElementById("posSearchBtn");
@@ -9441,6 +9547,30 @@ def _render_positions_page() -> str:
       renderPools(posCache.pools || []);
       setPosStatus("Position moved back to suspected spam.", false);
     }
+    async function enrichTrustedSpamRow(key) {
+      const rowKey = String(key || "");
+      if (!rowKey) return;
+      const list = Array.isArray(posCache?.pools) ? posCache.pools : [];
+      let idx = -1;
+      for (let i = 0; i < list.length; i++) {
+        if (poolRowKey(list[i] || {}) === rowKey) { idx = i; break; }
+      }
+      if (idx < 0) return;
+      const row = Object.assign({}, list[idx] || {});
+      try {
+        const res = await fetch("/api/positions/row/enrich", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({row}),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data?.ok || typeof data?.row_updates !== "object") return;
+        list[idx] = Object.assign({}, row, data.row_updates || {});
+        posCache.pools = list;
+        renderPools(posCache.pools || []);
+        setPosStatus("Position details loaded.", false);
+      } catch (_) {}
+    }
     function setHideRow(key, hidden, suspected) {
       const rowKey = String(key || "");
       const manual = getManualHiddenKeys();
@@ -9456,6 +9586,9 @@ def _render_positions_page() -> str:
       setTrustedSpamKeys(trusted);
       renderPools(posCache.pools || []);
       setPosStatus(hidden ? "Position hidden." : "Position shown.", false);
+      if (!hidden && suspected) {
+        enrichTrustedSpamRow(rowKey);
+      }
     }
     function setSectionCollapsed(key, collapsed) {
       const bodyMap = {pools: "posPoolsBody"};
@@ -9519,12 +9652,12 @@ def _render_positions_page() -> str:
       let dbgHtml = "";
       if (dbgSummary.length || Object.keys(dbgTimings).length) {
         const infoText = infos.map((x) => String(x || "")).join(" | ").toLowerCase();
-        const hardMode = infoText.includes("hard scan is enabled");
+        const infinityMode = infoText.includes("infinity scan mode");
         const summaryFiltered = dbgSummary.filter((x) => String(x?.query_mode || "") !== "hard_scan_required_for_live_discovery");
         const cacheHits = summaryFiltered
           .filter((x) => String(x?.query_mode || "") === "ownership_cache")
           .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
-        const modeText = hardMode ? "hard" : "fast";
+        const modeText = infinityMode ? "infinity" : "fast";
         const timingLines = [];
         const ts = (k) => Number(dbgTimings?.[k] || 0);
         if (ts("total_sec") > 0) timingLines.push(`total=${ts("total_sec")}s`);
@@ -9540,7 +9673,17 @@ def _render_positions_page() -> str:
         if (Number(pool?.priority_chains_sec || 0) > 0 || Number(pool?.remaining_chains_sec || 0) > 0) {
           timingLines.push(`chains(prio/rest)=${Number(pool.priority_chains_sec || 0)}s/${Number(pool.remaining_chains_sec || 0)}s`);
         }
-        if (!hardMode) {
+        const chainDur = (pool && typeof pool.chain_durations_sec === "object" && pool.chain_durations_sec) ? pool.chain_durations_sec : {};
+        const slowChains = Object.entries(chainDur)
+          .map(([k, v]) => [String(k), Number(v || 0)])
+          .filter((x) => Number(x[1]) > 0)
+          .sort((a, b) => Number(b[1]) - Number(a[1]))
+          .slice(0, 5)
+          .map((x) => `${x[0]}=${x[1]}s`);
+        if (slowChains.length) {
+          timingLines.push(`slow_chains: ${slowChains.join(", ")}`);
+        }
+        if (!infinityMode) {
           const compactLines = summaryFiltered
             .slice(0, 8)
             .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")}: ${Number(x.count || 0)}`);
@@ -9814,10 +9957,9 @@ def _render_positions_page() -> str:
     }
     async function scanPositions(targetSection = "all", opts = {}) {
       let handoffToBackground = false;
-      const options = (typeof opts === "boolean") ? {deepInfinityScan: !!opts} : (opts || {});
-      const hardScan = !!options.hardScan;
-      const deepInfinityScan = !!(options.deepInfinityScan || hardScan);
-      const modeLabel = hardScan ? "hard scan" : (deepInfinityScan ? "Infinity deep scan" : "scan");
+      const options = (typeof opts === "boolean") ? {infinityScan: !!opts} : (opts || {});
+      const infinityScan = !!options.infinityScan;
+      const modeLabel = infinityScan ? "Infinity scan" : "scan";
       if (posHasScannedOnce) {
         const ok = window.confirm(`Run ${modeLabel} again and replace current results?`);
         if (!ok) return;
@@ -9844,8 +9986,9 @@ def _render_positions_page() -> str:
             include_pools: true,
             include_lending: false,
             include_rewards: false,
-            hard_scan: !!hardScan,
-            deep_infinity_scan: !!deepInfinityScan,
+            hard_scan: false,
+            deep_infinity_scan: false,
+            infinity_scan: !!infinityScan,
           }),
         });
         const startData = await startRes.json().catch(() => ({}));
@@ -12108,6 +12251,7 @@ def _scan_positions_evm_components(
     include_creation_dates: bool,
     hard_scan: bool,
     deep_infinity_scan: bool,
+    infinity_scan: bool,
 ) -> tuple[
     list[dict[str, Any]],
     list[str],
@@ -12133,6 +12277,10 @@ def _scan_positions_evm_components(
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
         )
+        if infinity_scan:
+            pool_rows = [
+                r for r in pool_rows if str((r or {}).get("protocol") or "").strip().lower().startswith("pancake_infinity_")
+            ]
         timings["pool_scan_sec"] = round(max(0.0, time.monotonic() - t_pool), 3)
         if isinstance(pool_timings, dict):
             timings["pool"] = pool_timings
@@ -12189,22 +12337,16 @@ def _build_positions_info_notes(
     *,
     scan_pools: bool,
     include_creation_dates: bool,
-    hard_scan: bool,
     deep_infinity_scan: bool,
+    infinity_scan: bool,
 ) -> list[str]:
     info_notes: list[str] = []
     if solana_addresses:
         info_notes.append("Solana scanning is not available yet in this build.")
     if tron_addresses:
         info_notes.append("TRON scanning is not available yet in this build.")
-    if scan_pools and not include_creation_dates:
-        info_notes.append("Creation dates are in fast mode (deferred/background).")
-    if scan_pools and not hard_scan:
-        info_notes.append("Fast mode: heavy fallbacks and deep enrichments are disabled.")
-    if hard_scan:
-        info_notes.append("Hard scan is enabled: heavy fallbacks and deep enrichment are allowed.")
-    if deep_infinity_scan:
-        info_notes.append("Deep Infinity scan mode is enabled for this run.")
+    if infinity_scan:
+        info_notes.append("Infinity scan mode: showing only Pancake Infinity positions.")
     return info_notes
 
 
@@ -12284,14 +12426,6 @@ def _record_positions_scan_analytics(
             row_live_enrich_disabled=row_live_enrich_disabled,
         ),
     )
-    if scan_pools:
-        _append_index_mode_info_note(
-            info_notes,
-            cache_hits=cache_hits,
-            cache_misses=cache_misses,
-            skip_live=skip_live,
-            row_live_enrich_disabled=row_live_enrich_disabled,
-        )
 
 
 def _update_pos_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
@@ -12368,8 +12502,9 @@ def _scan_positions_core(
     core_started = time.monotonic()
     debug_timings: dict[str, Any] = {}
     t_prepare = time.monotonic()
-    hard_scan_enabled = bool(req.hard_scan)
-    deep_infinity_enabled = bool(req.deep_infinity_scan or req.hard_scan)
+    hard_scan_enabled = False
+    infinity_scan_enabled = bool(req.infinity_scan)
+    deep_infinity_enabled = False
     (
         evm_addresses,
         solana_addresses,
@@ -12403,6 +12538,7 @@ def _scan_positions_core(
             include_creation_dates=include_creation_dates,
             hard_scan=hard_scan_enabled,
             deep_infinity_scan=deep_infinity_enabled,
+            infinity_scan=infinity_scan_enabled,
         )
         debug_timings["evm_components_sec"] = round(max(0.0, time.monotonic() - t_evm), 3)
         if isinstance(evm_timings, dict):
@@ -12418,8 +12554,8 @@ def _scan_positions_core(
         tron_addresses,
         scan_pools=scan_pools_effective,
         include_creation_dates=include_creation_dates,
-        hard_scan=hard_scan_enabled,
         deep_infinity_scan=deep_infinity_enabled,
+        infinity_scan=infinity_scan_enabled,
     )
 
     t_sort = time.monotonic()
@@ -12470,12 +12606,13 @@ def _scan_positions_core(
 
 
 def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: str) -> None:
-    hard_scan_enabled = bool(req.hard_scan)
+    hard_scan_enabled = False
+    infinity_scan_enabled = bool(req.infinity_scan)
     if _update_pos_job(
         job_id,
         status="running",
         stage="scan",
-        stage_label=("Hard scan: scanning positions" if hard_scan_enabled else "Scanning positions"),
+        stage_label=("Infinity scan: scanning positions" if infinity_scan_enabled else "Scanning positions"),
         progress=15,
         started_at=time.time(),
     ) is None:
@@ -12486,7 +12623,7 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
             job_id,
             result=result,
             stage="enrich_dates",
-            stage_label=("Hard scan: enriching data" if hard_scan_enabled else "Fast mode: finalizing"),
+            stage_label=("Infinity scan: finalizing" if infinity_scan_enabled else "Fast mode: finalizing"),
             progress=65,
         ) is None:
             return
@@ -12560,6 +12697,90 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
         sid=sid,
         include_creation_dates=bool(POSITIONS_DIRECT_INCLUDE_CREATION_DATES),
     )
+
+
+@app.post("/api/positions/row/enrich")
+def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
+    row = dict(req.row or {})
+    chain_key = str(row.get("chain") or "").strip().lower()
+    protocol = str(row.get("protocol") or "").strip().lower()
+    owner = str(row.get("address") or "").strip().lower()
+    pos_id = str(row.get("position_id") or "").strip()
+    chain_id = _chain_id_by_chain_key(chain_key)
+    token_id = _position_token_id_from_raw(pos_id)
+    if chain_id <= 0 or token_id <= 0:
+        return {"ok": False, "reason": "invalid_row"}
+    if protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+        return {"ok": False, "reason": "unsupported_protocol"}
+    snap = _fetch_v3_position_contract_snapshot(int(chain_id), protocol, int(token_id), owner)
+    if not isinstance(snap, dict):
+        return {"ok": False, "reason": "snapshot_unavailable"}
+    dec0 = _parse_int_like(snap.get("token0_decimals") or 18)
+    dec1 = _parse_int_like(snap.get("token1_decimals") or 18)
+    if dec0 <= 0 or dec0 > 36:
+        dec0 = 18
+    if dec1 <= 0 or dec1 > 36:
+        dec1 = 18
+    amount0 = snap.get("quote_amount0")
+    amount1 = snap.get("quote_amount1")
+    fee0 = snap.get("quote_fee0")
+    fee1 = snap.get("quote_fee1")
+    try:
+        if fee0 is None:
+            fee0 = float(Decimal(int(snap.get("tokens_owed0_raw") or 0)) / (Decimal(10) ** dec0))
+        if fee1 is None:
+            fee1 = float(Decimal(int(snap.get("tokens_owed1_raw") or 0)) / (Decimal(10) ** dec1))
+    except Exception:
+        pass
+
+    def _fmt_amt(v: float | None, *, zero_if_missing: bool = False) -> str:
+        if v is None:
+            return "0" if zero_if_missing else "-"
+        av = abs(float(v))
+        if av >= 1000:
+            s = f"{float(v):,.1f}"
+        elif av >= 1:
+            s = f"{float(v):,.2f}"
+        elif av >= 0.01:
+            s = f"{float(v):,.3f}"
+        else:
+            s = f"{float(v):,.4f}"
+        return s.rstrip("0").rstrip(".")
+
+    liq_raw = max(0, int(snap.get("liquidity") or 0))
+    if liq_raw < 1000:
+        liq_disp = str(liq_raw)
+    elif liq_raw < 1_000_000:
+        liq_disp = f"{liq_raw / 1000.0:.1f}K".rstrip("0").rstrip(".")
+    elif liq_raw < 1_000_000_000:
+        liq_disp = f"{liq_raw / 1_000_000.0:.1f}M".rstrip("0").rstrip(".")
+    elif liq_raw < 1_000_000_000_000:
+        liq_disp = f"{liq_raw / 1_000_000_000.0:.1f}B".rstrip("0").rstrip(".")
+    else:
+        liq_disp = f"{liq_raw / 1_000_000_000_000.0:.1f}T".rstrip("0").rstrip(".")
+    a0_now = max(0.0, float(amount0 or 0.0))
+    a1_now = max(0.0, float(amount1 or 0.0))
+    status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
+    updates = {
+        "position_amount0": (float(amount0) if amount0 is not None else 0.0),
+        "position_amount1": (float(amount1) if amount1 is not None else 0.0),
+        "fees_owed0": (float(fee0) if fee0 is not None else 0.0),
+        "fees_owed1": (float(fee1) if fee1 is not None else 0.0),
+        "position_amounts_display": f"{_fmt_amt(amount0)} / {_fmt_amt(amount1)}",
+        "fees_owed_display": f"{_fmt_amt(fee0, zero_if_missing=True)} / {_fmt_amt(fee1, zero_if_missing=True)}",
+        "position_status": status,
+        "liquidity": str(liq_raw),
+        "liquidity_display": liq_disp,
+        "position_symbol0": _normalize_display_symbol(str(snap.get("token0_symbol") or row.get("position_symbol0") or "")),
+        "position_symbol1": _normalize_display_symbol(str(snap.get("token1_symbol") or row.get("position_symbol1") or "")),
+        "pair": (
+            f"{_normalize_display_symbol(str(snap.get('token0_symbol') or row.get('position_symbol0') or '?'))}/"
+            f"{_normalize_display_symbol(str(snap.get('token1_symbol') or row.get('position_symbol1') or '?'))}"
+        ),
+        "suspected_spam": False,
+        "spam_skipped": False,
+    }
+    return {"ok": True, "row_updates": updates}
 
 
 @app.post("/api/positions/pool-value-series")
