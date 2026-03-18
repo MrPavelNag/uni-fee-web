@@ -223,6 +223,8 @@ POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECON
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
+POSITIONS_CONTRACT_ONLY_ENABLED = os.environ.get("POSITIONS_CONTRACT_ONLY_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_DISABLE_PARALLELISM = os.environ.get("POSITIONS_DISABLE_PARALLELISM", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "16")))
 POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
@@ -6604,6 +6606,8 @@ def _scan_pool_positions_chain(
         t1, t1_src = _token_symbol_hint(t1_obj)
         proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
         is_v3_npm_protocol = proto_label in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
+        if POSITIONS_CONTRACT_ONLY_ENABLED and not (version == "v3" and is_v3_npm_protocol):
+            return None
         t0_hint_u = str(t0 or "").strip().upper()
         t1_hint_u = str(t1 or "").strip().upper()
         # Early spam pre-filter is allowed only when both token hints are informative.
@@ -6732,7 +6736,10 @@ def _scan_pool_positions_chain(
                 "liquidity_usd": None,
             }
         # For non-spam rows, allow on-chain symbol fallback.
-        if not proto_label.startswith("pancake_infinity_"):
+        # In contract-only mode for v3 NPM-like rows, final pair is taken from snapshot.
+        if not proto_label.startswith("pancake_infinity_") and not (
+            POSITIONS_CONTRACT_ONLY_ENABLED and version == "v3" and is_v3_npm_protocol
+        ):
             t0_raw, t0_src = _token_display_symbol_with_source(int(chain_id), chain_key, t0_obj)
             t1_raw, t1_src = _token_display_symbol_with_source(int(chain_id), chain_key, t1_obj)
             t0 = _normalize_display_symbol(t0_raw)
@@ -6778,6 +6785,17 @@ def _scan_pool_positions_chain(
                 t1_obj["symbol"] = str(contract_snapshot.get("token1_symbol") or t1_obj.get("symbol") or "")
                 pool["token0"] = t0_obj
                 pool["token1"] = t1_obj
+                fee_raw = str(contract_snapshot.get("fee") or fee_raw or "").strip()
+                fee_disp = fee_raw
+                try:
+                    fee_int = int(fee_raw)
+                    if fee_int > 0:
+                        fee_disp = f"{fee_int / 10000.0:.2f}%"
+                except Exception:
+                    fee_disp = fee_raw or "-"
+        if POSITIONS_CONTRACT_ONLY_ENABLED and version == "v3" and is_v3_npm_protocol and not contract_snapshot:
+            # Strict contract-only mode: skip rows that cannot be confirmed from contract.
+            return None
         # Exact-only output: show on-chain token amounts and owed fees.
         if hard_scan and allow_live_enrich and version == "v3":
             onchain_enriched = _fetch_v3_position_onchain_by_token_id(
@@ -6823,13 +6841,6 @@ def _scan_pool_positions_chain(
                     amount1_val = float(q1)
             except Exception:
                 pass
-        raw_amount0 = _safe_float(p.get("position_amount0"))
-        raw_amount1 = _safe_float(p.get("position_amount1"))
-        if raw_amount0 is not None and amount0_val is None:
-            amount0_val = float(raw_amount0)
-        if raw_amount1 is not None and amount1_val is None:
-            amount1_val = float(raw_amount1)
-
         dec0 = _parse_int_like((pool.get("token0") or {}).get("decimals") or 18)
         dec1 = _parse_int_like((pool.get("token1") or {}).get("decimals") or 18)
         if dec0 <= 0 or dec0 > 36:
@@ -6841,12 +6852,7 @@ def _scan_pool_positions_chain(
         need_direct_quote = bool(
             version == "v3"
             and is_v3_npm_protocol
-            and not contract_snapshot
-            and (
-                amount0_val is None
-                or amount1_val is None
-                or ((amount0_val or 0.0) == 0.0 and (amount1_val or 0.0) == 0.0 and liq_int > 0)
-            )
+            and (amount0_val is None or amount1_val is None)
         )
         if need_direct_quote:
             if time.monotonic() >= deadline_ts:
@@ -6867,19 +6873,9 @@ def _scan_pool_positions_chain(
                     amount1_val = quoted1
             except Exception:
                 pass
-        if (amount0_val is None or amount1_val is None) and (hard_scan or version != "v3"):
-            # Optional fallback path kept for hard scan and non-v3 protocols.
-            amounts = _position_amounts_from_detail(p, pool)
-            if amounts:
-                try:
-                    amount0_val = float(amounts[0])
-                    amount1_val = float(amounts[1])
-                except Exception:
-                    amount0_val = None
-                    amount1_val = None
-        owed0_raw = max(0, _parse_int_like(p.get("tokensOwed0") or 0))
-        owed1_raw = max(0, _parse_int_like(p.get("tokensOwed1") or 0))
-        if version == "v3" and is_v3_npm_protocol and not contract_snapshot and owed0_raw == 0 and owed1_raw == 0 and liq_int > 0:
+        owed0_raw = max(0, _parse_int_like((contract_snapshot or {}).get("tokens_owed0_raw") or 0))
+        owed1_raw = max(0, _parse_int_like((contract_snapshot or {}).get("tokens_owed1_raw") or 0))
+        if version == "v3" and is_v3_npm_protocol and owed0_raw == 0 and owed1_raw == 0 and liq_int > 0:
             owed_direct = _fetch_v3_tokens_owed_raw(
                 int(chain_id),
                 str(p.get("_protocol_label") or f"uniswap_{version}"),
@@ -7023,7 +7019,7 @@ def _scan_pool_positions_chain(
     ) -> tuple[list[dict[str, Any]], bool]:
         out_rows: list[dict[str, Any]] = []
         owner_timed_out = False
-        workers = max(1, min(int(POSITIONS_NFT_PARALLEL_WORKERS), len(positions)))
+        workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_NFT_PARALLEL_WORKERS), len(positions)))
         if workers <= 1:
             for p in positions:
                 try:
@@ -7169,7 +7165,7 @@ def _scan_pool_positions_chain(
         v_errors: list[str] = []
         v_debug: list[dict[str, Any]] = []
         v_timed_out = False
-        owner_workers = max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(addresses)))
+        owner_workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(addresses)))
         if owner_workers <= 1 or len(addresses) <= 1:
             for owner in addresses:
                 if time.monotonic() >= deadline_ts:
@@ -7593,7 +7589,7 @@ def _scan_pool_positions(
         return [], [], [], timings
     priority_chain_ids = [56, 8453]  # BSC/Base first for Pancake Infinity discovery
     ordered_chain_ids = _order_chain_ids_for_pool_scan(valid_chain_ids, priority_chain_ids)
-    max_workers = max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
+    max_workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
     timings["chains_total"] = len(ordered_chain_ids)
     timings["chain_workers"] = int(max_workers)
     chain_durations_sec: dict[str, float] = {}
@@ -7702,6 +7698,8 @@ def _scan_pool_positions(
             )
     timings["rows_before_aggregate"] = int(rows_before_aggregate)
     timings["rows_after_aggregate"] = int(len(uniq_rows))
+    timings["contract_only_mode"] = bool(POSITIONS_CONTRACT_ONLY_ENABLED)
+    timings["parallelism_disabled"] = bool(POSITIONS_DISABLE_PARALLELISM)
     timings["chain_durations_sec"] = chain_durations_sec
     timings["timed_out"] = bool(timed_out)
     timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
@@ -12837,6 +12835,8 @@ def _build_positions_info_notes(
         info_notes.append("TRON scanning is not available yet in this build.")
     if infinity_scan:
         info_notes.append("Infinity scan mode: showing only Pancake Infinity positions.")
+    if POSITIONS_CONTRACT_ONLY_ENABLED:
+        info_notes.append("Contract-only mode: Pair/Fee/In position/Unclaimed are from on-chain contract calls only.")
     return info_notes
 
 
