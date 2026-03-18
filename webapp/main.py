@@ -4670,8 +4670,6 @@ def _scan_v3_positions_onchain(
         liq = _decode_uint_from_word(pos_words[7])
         tokens_owed0 = _decode_uint_from_word(pos_words[10]) if len(pos_words) > 10 else 0
         tokens_owed1 = _decode_uint_from_word(pos_words[11]) if len(pos_words) > 11 else 0
-        if liq <= 0:
-            return None
 
         # getPool(address,address,uint24)
         pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
@@ -4772,8 +4770,6 @@ def _fetch_v3_position_onchain_by_token_id(
         liq = _decode_uint_from_word(pos_words[7])
         tokens_owed0 = _decode_uint_from_word(pos_words[10]) if len(pos_words) > 10 else 0
         tokens_owed1 = _decode_uint_from_word(pos_words[11]) if len(pos_words) > 11 else 0
-        if liq <= 0:
-            return None
         pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
         pool_words = _hex_words(_eth_call_hex(cid, factory, pool_data))
         if not pool_words:
@@ -7152,9 +7148,9 @@ def _scan_pool_positions_chain(
             )
             if enriched:
                 p = enriched
+        # Keep zero-liquidity positions (inactive/closed) in table output.
+        # They can still have unclaimed fees and are important for full discovery.
         liq_raw = p.get("liquidity")
-        if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
-            return None
         pool = p.get("pool") or {}
         fee_raw = str(pool.get("feeTier") or "").strip()
         fee_disp = fee_raw
@@ -8149,10 +8145,22 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str], 
                     ).fetchall()
                 known_chain_ids = {int(r[0] or 0) for r in (rows or []) if int(r[0] or 0) > 0}
                 narrowed = [cid for cid in valid_chain_ids if int(cid) in known_chain_ids]
+                if POSITIONS_CONTRACT_ONLY_ENABLED and not hard_scan and POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
+                    filtered: list[int] = []
+                    for cid in narrowed:
+                        if _chain_has_any_position_nft_balance(int(cid), addresses):
+                            filtered.append(int(cid))
+                    return filtered
                 return narrowed
             except Exception:
                 return []
     if not hard_scan:
+        if POSITIONS_CONTRACT_ONLY_ENABLED and POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
+            filtered_fast: list[int] = []
+            for cid in valid_chain_ids:
+                if _chain_has_any_position_nft_balance(int(cid), addresses):
+                    filtered_fast.append(int(cid))
+            return filtered_fast
         return valid_chain_ids
     if not POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
         return valid_chain_ids
@@ -8373,9 +8381,11 @@ def _scan_pool_positions(
     timings["chain_durations_sec"] = chain_durations_sec
     finished_chain_keys = {str(k).strip().lower() for k in (chain_durations_sec or {}).keys() if str(k).strip()}
     unfinished_chain_keys: list[str] = []
+    unfinished_seen: set[str] = set()
     for cid in ordered_chain_ids:
         ck = str(CHAIN_ID_TO_KEY.get(int(cid), str(cid)) or str(cid)).strip().lower()
-        if ck and ck not in finished_chain_keys:
+        if ck and ck not in finished_chain_keys and ck not in unfinished_seen:
+            unfinished_seen.add(ck)
             unfinished_chain_keys.append(ck)
     timings["unfinished_chains"] = unfinished_chain_keys
     timings["timed_out"] = bool(timed_out)
@@ -10989,7 +10999,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Pool</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -11020,7 +11030,7 @@ def _render_positions_page() -> str:
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         html += "<tr>";
         html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.pool_id || ""))}</td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
         html += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
@@ -11040,7 +11050,7 @@ def _render_positions_page() -> str:
       if (!visible.length) html += "<tr><td colspan='12'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
-        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Position ID</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
+        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Pool</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
         for (let i = 0; i < hiddenRows.length; i++) {
           const r = hiddenRows[i];
           const mismatch = hasPairMismatch(r);
@@ -11053,7 +11063,7 @@ def _render_positions_page() -> str:
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
