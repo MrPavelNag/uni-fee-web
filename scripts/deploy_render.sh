@@ -4,14 +4,22 @@ set -euo pipefail
 # One-command helper for deploy flow:
 # - commit local code changes (excluding SQLite runtime files)
 # - push to GitHub branch used by Render
+# - optionally trigger Render deploy hook
+# - optionally wait for healthcheck
 #
 # Usage:
 #   ./scripts/deploy_render.sh "your commit message"
 #   TARGET_BRANCH=milestone/web-mvp-stable ./scripts/deploy_render.sh
+#   RENDER_DEPLOY_HOOK_URL="https://api.render.com/deploy/..." ./scripts/deploy_render.sh
+#   RENDER_DEPLOY_HOOK_URL="..." RENDER_HEALTHCHECK_URL="https://uni-fee-web.onrender.com/healthz" ./scripts/deploy_render.sh
 
 TARGET_BRANCH="${TARGET_BRANCH:-milestone/web-mvp-stable}"
 DEFAULT_MSG="webapp: update before Render deploy"
 COMMIT_MSG="${1:-$DEFAULT_MSG}"
+RENDER_DEPLOY_HOOK_URL="${RENDER_DEPLOY_HOOK_URL:-}"
+RENDER_HEALTHCHECK_URL="${RENDER_HEALTHCHECK_URL:-https://uni-fee-web.onrender.com/healthz}"
+HEALTHCHECK_TIMEOUT_SEC="${HEALTHCHECK_TIMEOUT_SEC:-240}"
+HEALTHCHECK_INTERVAL_SEC="${HEALTHCHECK_INTERVAL_SEC:-5}"
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "Error: run this script inside a git repository."
@@ -47,5 +55,29 @@ echo "==> Pushing to origin/${CURRENT_BRANCH}"
 git push origin "${CURRENT_BRANCH}"
 
 echo
-echo "Done."
-echo "Next in Render: Manual Deploy -> Deploy latest commit (or wait for auto deploy)."
+if [[ -n "${RENDER_DEPLOY_HOOK_URL}" ]]; then
+  echo "==> Triggering Render deploy hook"
+  curl -fsS -X POST "${RENDER_DEPLOY_HOOK_URL}" >/dev/null
+  echo "==> Deploy triggered"
+  if [[ -n "${RENDER_HEALTHCHECK_URL}" ]]; then
+    echo "==> Waiting for healthcheck: ${RENDER_HEALTHCHECK_URL}"
+    started_at="$(date +%s)"
+    while true; do
+      if curl -fsS "${RENDER_HEALTHCHECK_URL}" >/dev/null; then
+        echo "==> Healthcheck OK"
+        break
+      fi
+      now_ts="$(date +%s)"
+      elapsed="$((now_ts - started_at))"
+      if [[ "${elapsed}" -ge "${HEALTHCHECK_TIMEOUT_SEC}" ]]; then
+        echo "Error: healthcheck timeout after ${HEALTHCHECK_TIMEOUT_SEC}s"
+        exit 1
+      fi
+      sleep "${HEALTHCHECK_INTERVAL_SEC}"
+    done
+  fi
+else
+  echo "Done."
+  echo "No RENDER_DEPLOY_HOOK_URL set."
+  echo "Next: trigger deploy in Render UI (or enable Auto Deploy)."
+fi
