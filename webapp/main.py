@@ -23,7 +23,7 @@ import time
 import uuid
 import shutil
 from queue import Empty, Queue
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -223,7 +223,7 @@ POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECON
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
-POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "14")))
+POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "16")))
 POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
     "1",
@@ -7122,22 +7122,31 @@ def _scan_pool_positions_chain(
                 for owner in addresses
             ]
             aborted = False
+            pending: set[Any] = set(owner_futures)
             try:
-                for owner_fut in as_completed(owner_futures):
-                    try:
-                        owner_rows, owner_errors, owner_debug, owner_timed_out = owner_fut.result()
-                    except Exception as e:
-                        v_errors.append(f"Pool owner worker failed [{chain_key}/{version}]: {e}")
-                        continue
-                    v_rows.extend(owner_rows)
-                    v_errors.extend(owner_errors)
-                    v_debug.append(owner_debug)
-                    if owner_timed_out:
-                        v_timed_out = True
-                    if time.monotonic() >= deadline_ts:
+                while pending:
+                    now = time.monotonic()
+                    if now >= deadline_ts:
                         v_timed_out = True
                         aborted = True
                         break
+                    timeout = min(0.25, max(0.01, deadline_ts - now))
+                    done, not_done = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+                    if not done:
+                        pending = set(not_done)
+                        continue
+                    for owner_fut in done:
+                        try:
+                            owner_rows, owner_errors, owner_debug, owner_timed_out = owner_fut.result()
+                        except Exception as e:
+                            v_errors.append(f"Pool owner worker failed [{chain_key}/{version}]: {e}")
+                            continue
+                        v_rows.extend(owner_rows)
+                        v_errors.extend(owner_errors)
+                        v_debug.append(owner_debug)
+                        if owner_timed_out:
+                            v_timed_out = True
+                    pending = set(not_done)
             finally:
                 owner_executor.shutdown(wait=not aborted, cancel_futures=aborted)
         return v_rows, v_errors, v_debug, v_timed_out
@@ -7317,6 +7326,7 @@ def _run_pool_chain_batch_serial(
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
     per_chain_timeout_sec: int | None = None,
+    per_chain_timeout_overrides: dict[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -7328,8 +7338,13 @@ def _run_pool_chain_batch_serial(
             timed_out = True
             break
         chain_deadline = float(deadline_ts)
-        if per_chain_timeout_sec is not None and int(per_chain_timeout_sec) > 0:
-            chain_deadline = min(chain_deadline, time.monotonic() + float(int(per_chain_timeout_sec)))
+        chain_timeout = per_chain_timeout_sec
+        if isinstance(per_chain_timeout_overrides, dict):
+            ov = int(per_chain_timeout_overrides.get(int(chain_id), 0) or 0)
+            if ov > 0:
+                chain_timeout = ov
+        if chain_timeout is not None and int(chain_timeout) > 0:
+            chain_deadline = min(chain_deadline, time.monotonic() + float(int(chain_timeout)))
         chain_rows, chain_errors, chain_debug, chain_timed_out, chain_elapsed = _run_pool_chain_scan_timed(
             int(chain_id),
             addresses,
@@ -7358,6 +7373,7 @@ def _run_pool_chain_batch_parallel(
     hard_scan: bool = False,
     deep_infinity_scan: bool = False,
     per_chain_timeout_sec: int | None = None,
+    per_chain_timeout_overrides: dict[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -7369,8 +7385,13 @@ def _run_pool_chain_batch_parallel(
     futures = []
     for chain_id in chain_ids:
         chain_deadline = float(deadline_ts)
-        if per_chain_timeout_sec is not None and int(per_chain_timeout_sec) > 0:
-            chain_deadline = min(chain_deadline, time.monotonic() + float(int(per_chain_timeout_sec)))
+        chain_timeout = per_chain_timeout_sec
+        if isinstance(per_chain_timeout_overrides, dict):
+            ov = int(per_chain_timeout_overrides.get(int(chain_id), 0) or 0)
+            if ov > 0:
+                chain_timeout = ov
+        if chain_timeout is not None and int(chain_timeout) > 0:
+            chain_deadline = min(chain_deadline, time.monotonic() + float(int(chain_timeout)))
         fut = executor.submit(
             _run_pool_chain_scan_timed,
             int(chain_id),
@@ -7519,12 +7540,29 @@ def _scan_pool_positions(
     remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
     remaining_deadline_ts = float(deadline_ts)
     if not hard_scan and remaining_chain_ids:
+        fast_timeout_base = int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)
+        fast_timeout_overrides: dict[int, int] = {}
+        for cid in remaining_chain_ids:
+            cc = int(cid)
+            timeout_s = int(fast_timeout_base)
+            if cc == 130:
+                timeout_s = max(timeout_s, 4)  # unichain often needs slightly longer RPC window
+            elif cc in (1, 42161, 137, 10):
+                timeout_s = max(timeout_s, 3)  # keep major chains from being cut too early
+            fast_timeout_overrides[cc] = int(timeout_s)
         remaining_deadline_ts = min(
             float(deadline_ts),
             time.monotonic() + float(POSITIONS_FAST_REMAINING_BUDGET_SEC),
         )
         timings["remaining_budget_sec"] = int(POSITIONS_FAST_REMAINING_BUDGET_SEC)
-        timings["per_chain_timeout_sec"] = int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)
+        timings["per_chain_timeout_sec"] = int(fast_timeout_base)
+        timings["per_chain_timeout_overrides"] = {
+            str(CHAIN_ID_TO_KEY.get(int(cid), str(cid))): int(sec)
+            for cid, sec in fast_timeout_overrides.items()
+            if int(sec) != int(fast_timeout_base)
+        }
+    else:
+        fast_timeout_overrides = {}
 
     if not timed_out and (max_workers <= 1 or len(remaining_chain_ids) <= 1):
         t_rest = time.monotonic()
@@ -7536,6 +7574,7 @@ def _scan_pool_positions(
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
             per_chain_timeout_sec=(None if hard_scan else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
+            per_chain_timeout_overrides=(None if hard_scan else fast_timeout_overrides),
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
@@ -7554,6 +7593,7 @@ def _scan_pool_positions(
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
             per_chain_timeout_sec=(None if hard_scan else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
+            per_chain_timeout_overrides=(None if hard_scan else fast_timeout_overrides),
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
@@ -9505,7 +9545,17 @@ def _render_positions_page() -> str:
     .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
     .pos-progress .bar { width: 40%; height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); animation: posLoad 1s linear infinite; }
     @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
-    .pos-status { color:#475569; font-size:13px; }
+    .pos-status {
+      color:#475569;
+      font-size:13px;
+      display:inline-block;
+      min-width: 300px;
+      max-width: 520px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      vertical-align: middle;
+    }
     .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:860px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
@@ -9544,7 +9594,7 @@ def _render_positions_page() -> str:
       .addr-input-row input { font-size: 12px; padding: 7px; }
       .btn-plus { width: 24px; min-width: 24px; height: 24px; font-size: 20px; }
       .chip { font-size: 11px; padding: 3px 7px; }
-      .pos-status { font-size: 12px; }
+      .pos-status { font-size: 12px; min-width: 180px; max-width: 72vw; }
       .table-wrap { border-radius: 8px; }
       table { min-width: 740px; font-size: 11px; }
       th, td { padding: 6px; }
@@ -10239,22 +10289,35 @@ def _render_positions_page() -> str:
       function statusTailFromPayload(payload) {
         const errs = Array.isArray(payload?.errors) ? payload.errors : [];
         const infos = Array.isArray(payload?.infos) ? payload.infos : [];
-        if (errs.length) return ` | ${String(errs[0] || "")}`;
-        if (infos.length) return ` | ${String(infos[0] || "")}`;
+        const maxTail = 52;
+        const cut = (v) => {
+          const s = String(v || "").replace(/\s+/g, " ").trim();
+          if (!s) return "";
+          return s.length > maxTail ? (s.slice(0, maxTail - 1) + "…") : s;
+        };
+        if (errs.length) return ` | ${cut(errs[0] || "")}`;
+        if (infos.length) return ` | ${cut(infos[0] || "")}`;
         return "";
       }
       function statusMetrics(payload) {
         const pools = Array.isArray(payload?.pool_positions) ? payload.pool_positions.length : 0;
         let cacheHits = 0;
         const sum = Array.isArray(payload?.debug?.summary) ? payload.debug.summary : [];
-        const timings = (payload?.debug && typeof payload.debug.timings === "object" && payload.debug.timings) ? payload.debug.timings : {};
         for (const s of sum) {
           if (String(s?.query_mode || "") === "ownership_cache") {
             cacheHits += Math.max(0, Number(s?.count || 0));
           }
         }
-        const totalSec = Number(timings?.total_sec || 0);
-        return ` | pools=${pools}${cacheHits ? ` cache=${cacheHits}` : ""}${totalSec > 0 ? ` total=${totalSec}s` : ""}`;
+        return ` | p=${pools}${cacheHits ? ` c=${cacheHits}` : ""}`;
+      }
+      function statusStageLabel(raw, st, partialRendered) {
+        const src = String(raw || "").trim().toLowerCase();
+        if (src.includes("enrich")) return "Background enrich";
+        if (src.includes("finaliz")) return "Finalizing";
+        if (src.includes("infinity")) return "Infinity scan";
+        if (src.includes("scan")) return partialRendered ? "Background scan" : "Scanning";
+        if (String(st || "") === "running") return partialRendered ? "Background scan" : "Scanning";
+        return partialRendered ? "Background scan" : "Scanning";
       }
       while (true) {
         const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
@@ -10283,11 +10346,14 @@ def _render_positions_page() -> str:
         const statusTail = statusTailFromPayload(partial);
         const metrics = statusMetrics(partial);
         const elapsedTxt = elapsedSec > 0 ? ` ${elapsedSec}s` : "";
-        if (partialRendered) {
-          setPosStatus(`${stageLabel || "Background scan"}${elapsedTxt}... ${progress}% (table updates live)${metrics}${statusTail}`, false);
-        } else {
-          setPosStatus(`${stageLabel || "Scanning in background"}${elapsedTxt}... ${progress}%${metrics}${statusTail}`, false);
+        let uiProgress = progress;
+        if (st === "running" && progress <= 15) {
+          // Backend keeps 15% during core scan; show a smooth front-end estimate meanwhile.
+          uiProgress = Math.min(64, 15 + Math.floor(elapsedSec * 2.2));
         }
+        const sLabel = statusStageLabel(stageLabel, st, partialRendered);
+        const liveTag = partialRendered ? " | live" : "";
+        setPosStatus(`${sLabel}${elapsedTxt} | ${uiProgress}%${metrics}${liveTag}${statusTail}`, false);
         await new Promise((resolve) => setTimeout(resolve, 1200));
       }
     }
