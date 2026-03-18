@@ -4003,7 +4003,14 @@ def _scan_erc721_token_ids_by_explorer_api(
         max_rows=max(200, int(max_ids) * 4),
     )
     if not rows:
-        return []
+        rcpt_ids, _ = _scan_erc721_token_ids_by_owner_receipts(
+            cid,
+            contract,
+            owner,
+            max_ids=max_ids,
+            max_receipts=max(120, int(max_ids) * 10),
+        )
+        return rcpt_ids
     out: list[int] = []
     seen: set[int] = set()
     proto = str(protocol or "").strip().lower()
@@ -4046,6 +4053,63 @@ def _scan_erc721_token_ids_by_explorer_api(
             if d:
                 _position_creation_date_cache_set(cid, proto, tid, d)
     return out
+
+
+def _scan_erc721_token_ids_by_owner_receipts(
+    chain_id: int,
+    contract: str,
+    owner: str,
+    *,
+    max_ids: int = 120,
+    max_receipts: int = 400,
+) -> tuple[list[int], int]:
+    cid = int(chain_id)
+    c = str(contract or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(c) or not _is_eth_address(o):
+        return [], 0
+    tx_hashes = _explorer_txlist_hashes_for_owner(cid, o, max_items=max(50, min(2500, int(max_receipts))))
+    if not tx_hashes:
+        return [], 0
+    topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    topic_to_owner = "0x" + ("0" * 24) + o[2:]
+    out: list[int] = []
+    seen: set[int] = set()
+    checked = 0
+    for txh in tx_hashes:
+        checked += 1
+        try:
+            rcpt = _json_rpc_call(cid, "eth_getTransactionReceipt", [txh], timeout_sec=max(3.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC)))
+        except Exception:
+            continue
+        if not isinstance(rcpt, dict):
+            continue
+        logs = rcpt.get("logs") or []
+        if not isinstance(logs, list):
+            continue
+        for lg in logs:
+            if not isinstance(lg, dict):
+                continue
+            if str(lg.get("address") or "").strip().lower() != c:
+                continue
+            topics = lg.get("topics") or []
+            if not isinstance(topics, list) or len(topics) < 4:
+                continue
+            if str(topics[0] or "").strip().lower() != topic_transfer:
+                continue
+            if str(topics[2] or "").strip().lower() != topic_to_owner:
+                continue
+            try:
+                tid = int(str(topics[3] or "0x0"), 16)
+            except Exception:
+                tid = 0
+            if tid <= 0 or tid in seen:
+                continue
+            seen.add(int(tid))
+            out.append(int(tid))
+            if len(out) >= int(max_ids):
+                return out, checked
+    return out, checked
 
 
 def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int = 400) -> list[str]:
