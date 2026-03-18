@@ -426,6 +426,10 @@ PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID: dict[int, str] = {
     56: "0x3d311d6283dd8ab90bb0031835c8e606349e2850",
     8453: "0x3d311d6283dd8ab90bb0031835c8e606349e2850",
 }
+UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID: dict[int, str] = {
+    # Uniswap v4 deployments: https://docs.uniswap.org/contracts/v4/deployments
+    130: "0x4529a01c7a0410167c5740c487a8de60232617bf",  # Unichain
+}
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
     10: ["https://optimism-rpc.publicnode.com"],
@@ -2865,7 +2869,12 @@ def _json_rpc_call(chain_id: int, method: str, params: list[Any]) -> Any:
     raise RuntimeError(last_err)
 
 
-def _json_rpc_batch_call(chain_id: int, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _json_rpc_batch_call(
+    chain_id: int,
+    payloads: list[dict[str, Any]],
+    *,
+    deadline_ts: float | None = None,
+) -> list[dict[str, Any]]:
     rpc_urls = _rpc_urls_for_chain(chain_id)
     if not rpc_urls:
         raise RuntimeError(f"No RPC configured for chain_id={chain_id}")
@@ -2878,13 +2887,19 @@ def _json_rpc_batch_call(chain_id: int, payloads: list[dict[str, Any]]) -> list[
     body = json.dumps(payloads).encode("utf-8")
     last_err = "unknown batch rpc error"
     for rpc_url in rpc_urls:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            raise RuntimeError("batch rpc deadline exceeded")
         try:
             req = UrlRequest(
                 rpc_url,
                 data=body,
                 headers={"Content-Type": "application/json", "User-Agent": "uni-fee-web/0.0.2"},
             )
-            with urlopen(req, timeout=max(8, POSITIONS_ONCHAIN_TIMEOUT_SEC * 3)) as resp:
+            timeout_s = max(8, POSITIONS_ONCHAIN_TIMEOUT_SEC * 3)
+            if deadline_ts is not None:
+                left = max(0.25, deadline_ts - time.monotonic())
+                timeout_s = min(timeout_s, left)
+            with urlopen(req, timeout=timeout_s) as resp:
                 parsed = json.loads(resp.read().decode("utf-8"))
             if not isinstance(parsed, list):
                 last_err = "batch rpc did not return list"
@@ -3991,6 +4006,8 @@ def _scan_erc721_token_ids_by_ownerof_batch(
         cur = chunk_start - 1
 
     def _scan_chunk(tids: list[int]) -> tuple[list[int], int]:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            return [], 0
         payloads = [
             {
                 "jsonrpc": "2.0",
@@ -4001,7 +4018,7 @@ def _scan_erc721_token_ids_by_ownerof_batch(
             for idx, tid in enumerate(tids)
         ]
         try:
-            resp = _json_rpc_batch_call(cid, payloads)
+            resp = _json_rpc_batch_call(cid, payloads, deadline_ts=deadline_ts)
         except Exception:
             return [], len(tids)
         by_id: dict[int, dict[str, Any]] = {}
@@ -4029,6 +4046,8 @@ def _scan_erc721_token_ids_by_ownerof_batch(
     out: list[int] = []
     seen: set[int] = set()
     workers = max(1, min(int(POSITIONS_INFINITY_BATCH_WORKERS), len(ranges)))
+    if POSITIONS_DISABLE_PARALLELISM:
+        workers = 1
     if workers <= 1:
         for tids in ranges:
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
@@ -4048,26 +4067,40 @@ def _scan_erc721_token_ids_by_ownerof_batch(
     ex = ThreadPoolExecutor(max_workers=workers)
     futures = [ex.submit(_scan_chunk, tids) for tids in ranges]
     aborted = False
+    pending: set[Any] = set(futures)
     try:
-        for fut in as_completed(futures):
+        while pending:
+            now = time.monotonic()
+            if deadline_ts is not None and now >= deadline_ts:
+                aborted = True
+                break
+            timeout = 0.25
+            if deadline_ts is not None:
+                timeout = min(timeout, max(0.01, deadline_ts - now))
+            done, not_done = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+            if not done:
+                pending = set(not_done)
+                continue
+            for fut in done:
+                try:
+                    found, errs = fut.result()
+                except Exception:
+                    found, errs = [], bsz
+                # checked approximation by fixed chunk size is enough for debug/progress.
+                checked += bsz
+                errors += int(errs)
+                for tid in found:
+                    if tid in seen:
+                        continue
+                    seen.add(tid)
+                    out.append(tid)
+                    if len(out) >= int(max_ids):
+                        aborted = True
+                        return out, checked, errors
+            pending = set(not_done)
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
                 aborted = True
                 break
-            try:
-                found, errs = fut.result()
-            except Exception:
-                found, errs = [], bsz
-            # checked approximation by fixed chunk size is enough for debug/progress.
-            checked += bsz
-            errors += int(errs)
-            for tid in found:
-                if tid in seen:
-                    continue
-                seen.add(tid)
-                out.append(tid)
-                if len(out) >= int(max_ids):
-                    aborted = True
-                    return out, checked, errors
     finally:
         ex.shutdown(wait=not aborted, cancel_futures=aborted)
     return out, checked, errors
@@ -5246,6 +5279,120 @@ def _scan_pancake_infinity_bin_positions_onchain(
                     },
                     "_protocol_label": "pancake_infinity_bin",
                     "_source": "onchain_pancake_infinity_bin",
+                    "_skip_enrich": True,
+                }
+            )
+        except Exception:
+            continue
+    return out
+
+
+def _decode_signed_int24_from_packed_word(word_value: int, shift_bits: int) -> int:
+    raw = int((int(word_value) >> int(shift_bits)) & 0xFFFFFF)
+    return raw - 0x1000000 if raw >= 0x800000 else raw
+
+
+def _scan_uniswap_v4_positions_onchain(
+    owner: str,
+    chain_id: int,
+    *,
+    deadline_ts: float | None = None,
+) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    if not _is_eth_address(pm):
+        return []
+    owner_addr = str(owner or "").strip().lower()
+    if not _is_eth_address(owner_addr):
+        return []
+    if deadline_ts is not None and time.monotonic() >= deadline_ts:
+        return []
+
+    # Run only if owner has v4 NFTs.
+    try:
+        bal_data = "0x70a08231" + _encode_address_word(owner_addr)
+        balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
+    except Exception:
+        return []
+    if int(balance) <= 0:
+        return []
+
+    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
+    # v4 PositionManager is non-enumerable: discover tokenIds via Transfer(to=owner) logs.
+    token_ids = _scan_erc721_token_ids_by_incoming_logs(
+        cid,
+        pm,
+        owner_addr,
+        deadline_ts=deadline_ts,
+        max_ids=max(limit * 4, limit),
+        lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 20_000_000),
+    )
+    if not token_ids:
+        return []
+
+    out: list[dict[str, Any]] = []
+    owner_word = _encode_address_word(owner_addr)[-40:]
+    sel_pool_and_info = "0x7ba03aad"  # getPoolAndPositionInfo(uint256)
+    sel_liq = "0x1efeed33"  # getPositionLiquidity(uint256)
+    for token_id in token_ids:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        try:
+            owner_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(token_id)))
+            owner_words = _hex_words(owner_hex)
+            if not owner_words or owner_words[0][-40:].lower() != owner_word:
+                continue
+
+            batch = _eth_call_hex_batch(
+                cid,
+                [
+                    {"to": pm, "data": sel_pool_and_info + _encode_uint_word(int(token_id))},
+                    {"to": pm, "data": sel_liq + _encode_uint_word(int(token_id))},
+                ],
+            )
+            p_words = _hex_words(batch[0] or "")
+            if len(p_words) < 6:
+                continue
+            liq = _decode_uint_eth_call(batch[1] or "0x0")
+            if int(liq) <= 0:
+                continue
+
+            raw0 = _decode_address_from_word(p_words[0])
+            raw1 = _decode_address_from_word(p_words[1])
+            fee = _decode_uint_from_word(p_words[2])
+            tick_spacing = _decode_int_from_word(p_words[3])
+            hooks = _decode_address_from_word(p_words[4]).lower()
+            info_val = int(p_words[5], 16)
+            tick_upper = _decode_signed_int24_from_packed_word(info_val, 32)
+            tick_lower = _decode_signed_int24_from_packed_word(info_val, 8)
+
+            token0_addr, token0_sym, dec0 = _normalize_infinity_currency(cid, raw0)
+            token1_addr, token1_sym, dec1 = _normalize_infinity_currency(cid, raw1)
+            poolkey_blob = bytes.fromhex("".join(p_words[:5]))
+            pool_id_hex = _keccak256_hex(poolkey_blob) or ("0x" + _encode_uint_word(int(token_id)))
+
+            out.append(
+                {
+                    "id": str(int(token_id)),
+                    "liquidity": str(int(liq)),
+                    "tickLower": {"tickIdx": str(int(tick_lower))},
+                    "tickUpper": {"tickIdx": str(int(tick_upper))},
+                    "pool": {
+                        "id": str(pool_id_hex).lower(),
+                        "feeTier": str(int(fee)),
+                        "liquidity": str(int(liq)),
+                        "sqrtPrice": "0",
+                        "token0Price": "0",
+                        "totalValueLockedUSD": "0",
+                        "totalValueLockedToken0": "0",
+                        "totalValueLockedToken1": "0",
+                        "token0": {"id": token0_addr, "decimals": str(dec0), "symbol": token0_sym},
+                        "token1": {"id": token1_addr, "decimals": str(dec1), "symbol": token1_sym},
+                        "tickSpacing": str(int(tick_spacing)),
+                        "hooks": str(hooks or ""),
+                    },
+                    "_protocol_label": "uniswap_v4",
+                    "_source": "onchain_uniswap_v4_pm",
                     "_skip_enrich": True,
                 }
             )
@@ -6505,6 +6652,35 @@ def _scan_pool_positions_chain(
                                 "error": str(e)[:220],
                             }
                         )
+            if version == "v4" and int(chain_id) in UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
+                try:
+                    v4_rows = _scan_uniswap_v4_positions_onchain(
+                        owner,
+                        int(chain_id),
+                        deadline_ts=deadline_ts,
+                    )
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "onchain",
+                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
+                            "count": len(v4_rows),
+                            "ok": True,
+                        }
+                    )
+                    _merge_positions(v4_rows)
+                except Exception as e:
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "onchain",
+                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
+                            "count": 0,
+                            "ok": False,
+                            "error": str(e)[:220],
+                        }
+                    )
+
             return positions, False
 
         cached_positions, index_cache_hit, skip_live_discovery = _apply_ownership_cache(
@@ -6782,7 +6958,7 @@ def _scan_pool_positions_chain(
         t1, t1_src = _token_symbol_hint(t1_obj)
         proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
         is_v3_npm_protocol = proto_label in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
-        if POSITIONS_CONTRACT_ONLY_ENABLED and not (version == "v3" and is_v3_npm_protocol):
+        if POSITIONS_CONTRACT_ONLY_ENABLED and not ((version == "v3" and is_v3_npm_protocol) or proto_label == "uniswap_v4"):
             return None
         t0_hint_u = str(t0 or "").strip().upper()
         t1_hint_u = str(t1 or "").strip().upper()
