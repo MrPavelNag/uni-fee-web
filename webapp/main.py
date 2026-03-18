@@ -238,7 +238,7 @@ POSITIONS_ONCHAIN_TIMEOUT_SEC = max(2, int(os.environ.get("POSITIONS_ONCHAIN_TIM
 POSITIONS_ONCHAIN_MAX_NFTS = max(1, int(os.environ.get("POSITIONS_ONCHAIN_MAX_NFTS", "120")))
 POSITIONS_INFINITY_OWNER_LOOKBACK = max(200, int(os.environ.get("POSITIONS_INFINITY_OWNER_LOOKBACK", "800")))
 POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS = max(20000, int(os.environ.get("POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS", "2500000")))
-POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "150000")))
+POSITIONS_ERC721_LOG_BLOCK_STEP = max(5000, int(os.environ.get("POSITIONS_ERC721_LOG_BLOCK_STEP", "20000")))
 POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS = max(20, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_CHECKS", "120")))
 POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS = max(10, int(os.environ.get("POSITIONS_INFINITY_OWNER_SCAN_MAX_ERRORS", "60")))
 POSITIONS_ENABLE_INFINITY = os.environ.get("POSITIONS_ENABLE_INFINITY", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -247,7 +247,7 @@ POSITIONS_INFINITY_BATCH_SCAN = os.environ.get("POSITIONS_INFINITY_BATCH_SCAN", 
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
 POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
-POSITIONS_RPC_BATCH_MAX_ITEMS = max(10, min(200, int(os.environ.get("POSITIONS_RPC_BATCH_MAX_ITEMS", "80"))))
+POSITIONS_RPC_BATCH_MAX_ITEMS = max(10, min(200, int(os.environ.get("POSITIONS_RPC_BATCH_MAX_ITEMS", "50"))))
 POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK = os.environ.get("POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK", "0").strip().lower() in (
     "1",
     "true",
@@ -3659,7 +3659,8 @@ def _scan_erc721_token_ids_by_incoming_logs(
         return []
     lb = int(lookback_blocks) if lookback_blocks is not None else int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS)
     min_block = max(0, int(latest) - max(1, lb))
-    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
+    # Keep log queries in small ranges; large ranges are unstable on public RPCs.
+    step = max(5000, min(30000, int(POSITIONS_ERC721_LOG_BLOCK_STEP)))
     topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     topic_to_owner = "0x" + ("0" * 24) + o[2:]
     end_block = int(latest)
@@ -3677,7 +3678,23 @@ def _scan_erc721_token_ids_by_incoming_logs(
         }
         try:
             logs = _eth_get_logs(cid, params, deadline_ts=deadline_ts, debug_out=debug_out)
-        except Exception:
+        except Exception as e:
+            err_txt = str(e or "").strip().lower()
+            # Root-cause fix: archival/pruned-history errors mean older ranges are unavailable
+            # on this RPC provider; continuing the backward loop is guaranteed waste.
+            if any(
+                s in err_txt
+                for s in (
+                    "history has been pruned",
+                    "historical state",
+                    "missing trie node",
+                    "state is not available",
+                )
+            ):
+                if isinstance(debug_out, dict):
+                    debug_out["rpc_getlogs_pruned_errors"] = int(debug_out.get("rpc_getlogs_pruned_errors") or 0) + 1
+                    debug_out["rpc_getlogs_stop_reason"] = "pruned_history"
+                break
             # Reduce chunk size on provider "too many results" style failures.
             if step > 5000:
                 step = max(5000, step // 2)
@@ -3731,7 +3748,8 @@ def _scan_erc721_token_ids_by_recent_transfers_ownerof(
         return []
     lb = int(lookback_blocks) if lookback_blocks is not None else int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS)
     min_block = max(0, int(latest) - max(1, lb))
-    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
+    # Keep log queries in small ranges; large ranges are unstable on public RPCs.
+    step = max(5000, min(30000, int(POSITIONS_ERC721_LOG_BLOCK_STEP)))
     topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     owner_word = _encode_address_word(o)[-40:]
     end_block = int(latest)
@@ -3813,7 +3831,8 @@ def _scan_cl_mintposition_token_ids_by_owner(
         return []
     lb = int(lookback_blocks) if lookback_blocks is not None else int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS)
     min_block = max(0, int(latest) - max(1, lb))
-    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
+    # Keep log queries in small ranges; large ranges are unstable on public RPCs.
+    step = max(5000, min(30000, int(POSITIONS_ERC721_LOG_BLOCK_STEP)))
     # event MintPosition(uint256 indexed tokenId)
     topic_mint = "0x2c0223eed283e194c1112e080d31bdec9e2760ba1454153666cd9d7d6a877964"
     owner_word = _encode_address_word(o)[-40:]
@@ -4921,6 +4940,8 @@ def _scan_infinity_position_ids_for_owner(
                 "rpc_getlogs_retry_success": 0,
                 "rpc_getlogs_ms": 0,
                 "rpc_getlogs_last_error": "",
+                "rpc_getlogs_pruned_errors": 0,
+                "rpc_getlogs_stop_reason": "",
                 "owner_scan_checked": 0,
                 "owner_scan_matched": 0,
                 "owner_scan_errors": 0,
@@ -5000,7 +5021,9 @@ def _scan_infinity_position_ids_for_owner(
                     continue
                 seen_ids.add(int(tid))
                 token_ids.append(int(tid))
-        if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN:
+        stop_reason = str((dbg or {}).get("rpc_getlogs_stop_reason") or "").strip().lower()
+        skip_batch_on_pruned = stop_reason == "pruned_history"
+        if len(token_ids) < limit and POSITIONS_INFINITY_BATCH_SCAN and not skip_batch_on_pruned:
             t_batch0 = time.perf_counter()
             batch_ids, batch_checked, batch_errors = _scan_erc721_token_ids_by_ownerof_batch(
                 cid,
@@ -5023,6 +5046,8 @@ def _scan_infinity_position_ids_for_owner(
                     continue
                 seen_ids.add(int(tid))
                 token_ids.append(int(tid))
+        elif skip_batch_on_pruned and dbg is not None:
+            dbg["rpc_ownerof_batch_skipped"] = "pruned_history"
         if dbg is not None:
             dbg["final_token_ids"] = len(token_ids)
         return token_ids
