@@ -984,6 +984,7 @@ def _position_index_refresh_owner_chain(
     *,
     target_version: str = "all",
     warmup_mode: bool = False,
+    deep_infinity_scan: bool = False,
 ) -> dict[str, int]:
     cid = int(chain_id)
     owner_addr = str(owner or "").strip().lower()
@@ -1056,6 +1057,7 @@ def _position_index_refresh_owner_chain(
                         cid,
                         owner_addr,
                         max_receipts=max_receipts,
+                        deep_infinity_scan=deep_infinity_scan,
                     )
                     summary["cached"] += int(run_stats.get("merged_ids") or 0)
                 except Exception:
@@ -1250,7 +1252,13 @@ def _stop_positions_index_workers() -> None:
     POSITIONS_INDEX_WORKERS.clear()
 
 
-def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: int = 220) -> dict[str, Any]:
+def _update_infinity_index_for_owner(
+    chain_id: int,
+    owner: str,
+    max_receipts: int = 220,
+    *,
+    deep_infinity_scan: bool = False,
+) -> dict[str, Any]:
     cid = int(chain_id)
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
@@ -1304,8 +1312,9 @@ def _update_infinity_index_for_owner(chain_id: int, owner: str, max_receipts: in
         except Exception:
             onchain_ids = []
     owner_scan_ids: list[int] = []
+    deep_scan_enabled = bool(POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK or deep_infinity_scan)
     if (
-        POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK
+        deep_scan_enabled
         and not explorer_ids
         and not receipt_ids
         and not log_ids
@@ -5301,6 +5310,7 @@ def _scan_pool_positions_chain(
     addresses: list[str],
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
+    deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -5918,6 +5928,7 @@ def _scan_pool_positions_chain(
                     owner,
                     target_version=version,
                     warmup_mode=True,
+                    deep_infinity_scan=deep_infinity_scan,
                 )
                 cached_positions = _load_cached_positions_for_owner(owner, version)
                 if cached_positions:
@@ -6419,12 +6430,14 @@ def _run_pool_chain_scan(
     addresses: list[str],
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
+    deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     return _scan_pool_positions_chain(
         chain_id,
         addresses,
         deadline_ts,
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+        deep_infinity_scan=deep_infinity_scan,
     )
 
 
@@ -6433,6 +6446,7 @@ def _run_pool_chain_batch_serial(
     addresses: list[str],
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
+    deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -6447,6 +6461,7 @@ def _run_pool_chain_batch_serial(
             addresses,
             deadline_ts,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+            deep_infinity_scan=deep_infinity_scan,
         )
         rows.extend(chain_rows)
         errors.extend(chain_errors)
@@ -6463,6 +6478,7 @@ def _run_pool_chain_batch_parallel(
     deadline_ts: float,
     max_workers: int,
     pre_enqueued_ownership_refresh: bool = False,
+    deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -6476,6 +6492,7 @@ def _run_pool_chain_batch_parallel(
             addresses,
             deadline_ts,
             pre_enqueued_ownership_refresh,
+            deep_infinity_scan,
         )
         for chain_id in chain_ids
     ]
@@ -6553,6 +6570,7 @@ def _scan_pool_positions(
     *,
     include_creation_dates: bool = True,
     pre_enqueued_ownership_refresh: bool = False,
+    deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -6574,6 +6592,7 @@ def _scan_pool_positions(
         addresses,
         deadline_ts,
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+        deep_infinity_scan=deep_infinity_scan,
     )
     rows.extend(p_rows)
     errors.extend(p_errors)
@@ -6588,6 +6607,7 @@ def _scan_pool_positions(
             addresses,
             deadline_ts,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+            deep_infinity_scan=deep_infinity_scan,
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
@@ -6600,6 +6620,7 @@ def _scan_pool_positions(
             deadline_ts,
             max_workers=max_workers,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+            deep_infinity_scan=deep_infinity_scan,
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
@@ -7817,6 +7838,7 @@ class PositionsScanRequest(BaseModel):
     include_pools: bool = True
     include_lending: bool = True
     include_rewards: bool = True
+    deep_infinity_scan: bool = False
     # Backward-compatible fields from the previous UI version.
     addresses: list[str] = Field(default_factory=list)
     chain_ids: list[int] = Field(default_factory=list)
@@ -8518,6 +8540,7 @@ def _render_positions_page() -> str:
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
             <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan</button>
+            <button id="posDeepInfinityBtn" class="search-link-btn" type="button" onclick="scanPositions('pools', true)">Скан Infinity</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
@@ -8641,8 +8664,11 @@ def _render_positions_page() -> str:
     }
     function setPosBusy(flag) {
       const el = document.getElementById("posProgress");
-      if (!el) return;
-      el.style.display = flag ? "block" : "none";
+      const scanBtn = document.getElementById("posSearchBtn");
+      const deepBtn = document.getElementById("posDeepInfinityBtn");
+      if (el) el.style.display = flag ? "block" : "none";
+      if (scanBtn) scanBtn.disabled = !!flag;
+      if (deepBtn) deepBtn.disabled = !!flag;
     }
     function updatePosSearchButton() {
       const btn = document.getElementById("posSearchBtn");
@@ -9129,10 +9155,11 @@ def _render_positions_page() -> str:
         await new Promise((resolve) => setTimeout(resolve, 1200));
       }
     }
-    async function scanPositions(targetSection = "all") {
+    async function scanPositions(targetSection = "all", deepInfinityScan = false) {
       let handoffToBackground = false;
+      const modeLabel = deepInfinityScan ? "Infinity deep scan" : "scan";
       if (posHasScannedOnce) {
-        const ok = window.confirm("Run scan again and replace current results?");
+        const ok = window.confirm(`Run ${modeLabel} again and replace current results?`);
         if (!ok) return;
       }
       if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
@@ -9157,6 +9184,7 @@ def _render_positions_page() -> str:
             include_pools: true,
             include_lending: false,
             include_rewards: false,
+            deep_infinity_scan: !!deepInfinityScan,
           }),
         });
         const startData = await startRes.json().catch(() => ({}));
@@ -9167,7 +9195,7 @@ def _render_positions_page() -> str:
         const data = await pollPosJob(jobId, true);
         if (data && data.__partial) {
           handoffToBackground = true;
-          setPosStatus("Base results loaded. Background enrichment continues...", false);
+          setPosStatus(`Base results loaded (${modeLabel}). Background enrichment continues...`, false);
           setTimeout(() => { resumePosJobIfAny(); }, 900);
           return;
         }
@@ -11406,6 +11434,7 @@ def _scan_positions_evm_components(
     scan_lending: bool,
     scan_rewards: bool,
     include_creation_dates: bool,
+    deep_infinity_scan: bool,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], list[str]]:
     if scan_pools:
         _enqueue_positions_ownership_refresh_for_addresses(selected_chain_ids, evm_addresses)
@@ -11415,6 +11444,7 @@ def _scan_positions_evm_components(
             selected_chain_ids,
             include_creation_dates=include_creation_dates,
             pre_enqueued_ownership_refresh=bool(POSITIONS_OWNERSHIP_INDEX_ENABLED),
+            deep_infinity_scan=deep_infinity_scan,
         )
     else:
         pool_rows, pool_errs, pool_debug_rows = [], [], []
@@ -11464,6 +11494,7 @@ def _build_positions_info_notes(
     *,
     scan_pools: bool,
     include_creation_dates: bool,
+    deep_infinity_scan: bool,
 ) -> list[str]:
     info_notes: list[str] = []
     if solana_addresses:
@@ -11472,6 +11503,8 @@ def _build_positions_info_notes(
         info_notes.append("TRON scanning is not available yet in this build.")
     if scan_pools and not include_creation_dates:
         info_notes.append("Creation dates are in fast mode (deferred/background).")
+    if deep_infinity_scan:
+        info_notes.append("Deep Infinity scan mode is enabled for this run.")
     return info_notes
 
 
@@ -11628,6 +11661,7 @@ def _scan_positions_core(
             scan_lending=scan_lending,
             scan_rewards=scan_rewards,
             include_creation_dates=include_creation_dates,
+            deep_infinity_scan=bool(req.deep_infinity_scan),
         )
     else:
         pool_rows, pool_errs = [], []
@@ -11640,6 +11674,7 @@ def _scan_positions_core(
         tron_addresses,
         scan_pools=scan_pools_effective,
         include_creation_dates=include_creation_dates,
+        deep_infinity_scan=bool(req.deep_infinity_scan),
     )
 
     _sort_positions_scan_rows(pool_rows, lending_rows, reward_rows)
