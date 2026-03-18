@@ -8371,6 +8371,13 @@ def _scan_pool_positions(
     timings["contract_only_mode"] = bool(POSITIONS_CONTRACT_ONLY_ENABLED)
     timings["parallelism_disabled"] = bool(POSITIONS_DISABLE_PARALLELISM)
     timings["chain_durations_sec"] = chain_durations_sec
+    finished_chain_keys = {str(k).strip().lower() for k in (chain_durations_sec or {}).keys() if str(k).strip()}
+    unfinished_chain_keys: list[str] = []
+    for cid in ordered_chain_ids:
+        ck = str(CHAIN_ID_TO_KEY.get(int(cid), str(cid)) or str(cid)).strip().lower()
+        if ck and ck not in finished_chain_keys:
+            unfinished_chain_keys.append(ck)
+    timings["unfinished_chains"] = unfinished_chain_keys
     timings["timed_out"] = bool(timed_out)
     timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
     return uniq_rows, dedup_errors, debug_rows, timings
@@ -10811,6 +10818,10 @@ def _render_positions_page() -> str:
         if (slowChains.length) {
           timingLines.push(`slow_chains: ${slowChains.join(", ")}`);
         }
+        const unfinished = Array.isArray(pool?.unfinished_chains) ? pool.unfinished_chains.map((x) => String(x || "")).filter(Boolean) : [];
+        if (unfinished.length) {
+          timingLines.push(`unfinished_chains: ${unfinished.join(", ")}`);
+        }
         const infRpc = (pool && typeof pool.infinity_rpc === "object" && pool.infinity_rpc) ? pool.infinity_rpc : {};
         if (Number(infRpc?.getlogs_requests || 0) > 0 || Number(infRpc?.getlogs_attempts || 0) > 0) {
           timingLines.push(
@@ -11132,8 +11143,9 @@ def _render_positions_page() -> str:
         const elapsedTxt = elapsedSec > 0 ? ` ${elapsedSec}s` : "";
         let uiProgress = progress;
         if (st === "running" && progress <= 15) {
-          // Backend keeps 15% during core scan; show a smooth front-end estimate meanwhile.
-          uiProgress = Math.min(64, 15 + Math.floor(elapsedSec * 2.2));
+          // Backend can stay at 15% during core scan; keep UI moving smoothly.
+          // Do not pin at 64%, which looks like a frozen scan.
+          uiProgress = Math.min(94, 15 + Math.floor(elapsedSec * 2.2));
         }
         const sLabel = statusStageLabel(stageLabel, st, partialRendered);
         const liveTag = partialRendered ? " | live" : "";
