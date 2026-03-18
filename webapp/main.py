@@ -7615,7 +7615,8 @@ def _scan_pool_positions(
 
     remaining_chain_ids = [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
     remaining_deadline_ts = float(deadline_ts)
-    if not hard_scan and remaining_chain_ids:
+    use_fast_chain_caps = bool((not hard_scan) and (not POSITIONS_CONTRACT_ONLY_ENABLED))
+    if use_fast_chain_caps and remaining_chain_ids:
         fast_timeout_base = int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)
         fast_timeout_overrides: dict[int, int] = {}
         for cid in remaining_chain_ids:
@@ -7649,8 +7650,8 @@ def _scan_pool_positions(
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
-            per_chain_timeout_sec=(None if hard_scan else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
-            per_chain_timeout_overrides=(None if hard_scan else fast_timeout_overrides),
+            per_chain_timeout_sec=(None if (hard_scan or POSITIONS_CONTRACT_ONLY_ENABLED) else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
+            per_chain_timeout_overrides=(None if (hard_scan or POSITIONS_CONTRACT_ONLY_ENABLED) else fast_timeout_overrides),
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
@@ -7668,8 +7669,8 @@ def _scan_pool_positions(
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
-            per_chain_timeout_sec=(None if hard_scan else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
-            per_chain_timeout_overrides=(None if hard_scan else fast_timeout_overrides),
+            per_chain_timeout_sec=(None if (hard_scan or POSITIONS_CONTRACT_ONLY_ENABLED) else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
+            per_chain_timeout_overrides=(None if (hard_scan or POSITIONS_CONTRACT_ONLY_ENABLED) else fast_timeout_overrides),
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
@@ -7689,8 +7690,8 @@ def _scan_pool_positions(
     _apply_creation_dates_phase(uniq_rows, include_creation_dates=include_creation_dates)
     dedup_errors = list(dict.fromkeys(errors))
     if timed_out:
-        elapsed_total = _safe_float(timings.get("total_sec"))
-        if (not hard_scan) and elapsed_total > 0 and elapsed_total < float(POSITIONS_SCAN_MAX_SECONDS) - 1.0:
+        elapsed_total = max(0.0, time.monotonic() - scan_started)
+        if use_fast_chain_caps and elapsed_total < float(POSITIONS_SCAN_MAX_SECONDS) - 1.0:
             dedup_errors.append("Pool scan reached fast-mode budget. Showing partial results.")
         else:
             dedup_errors.append(
