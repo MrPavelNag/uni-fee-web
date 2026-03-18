@@ -9022,6 +9022,45 @@ def _render_positions_page() -> str:
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
+    #posPoolsTable { min-width: 3600px; table-layout: auto; }
+    #posPoolsTable th, #posPoolsTable td { white-space: nowrap; }
+    #posPoolsTable tr.contract-group-row th {
+      position: sticky;
+      top: 0;
+      z-index: 7;
+      background: #dbeafe;
+      color: #1e3a8a;
+      font-weight: 800;
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: .02em;
+    }
+    #posPoolsTable tr.contract-col-row th {
+      position: sticky;
+      top: 24px;
+      z-index: 6;
+      background: #eff6ff;
+    }
+    #posPoolsTable th:nth-child(1), #posPoolsTable td:nth-child(1) {
+      position: sticky; left: 0; z-index: 4; background: #f8fbff;
+    }
+    #posPoolsTable th:nth-child(2), #posPoolsTable td:nth-child(2) {
+      position: sticky; left: 120px; z-index: 4; background: #f8fbff;
+    }
+    #posPoolsTable th:nth-child(1), #posPoolsTable th:nth-child(2) {
+      background: #eff6ff; z-index: 5;
+    }
+    .table-nav-btn {
+      border:1px solid #bfdbfe;
+      background:#eff6ff;
+      color:#1d4ed8;
+      border-radius:8px;
+      padding:2px 8px;
+      cursor:pointer;
+      font-weight:700;
+      line-height:1.2;
+    }
+    .table-nav-btn:hover { background:#dbeafe; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
@@ -9084,6 +9123,8 @@ def _render_positions_page() -> str:
             <span class="pos-status" id="posStatus">Ready</span>
             <button id="posHardScanBtn" class="search-link-btn" type="button" onclick="scanPositions('pools', {hardScan:true})">Hard scan</button>
             <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan</button>
+            <button class="table-nav-btn" type="button" onclick="scrollPosTable(-600)" title="Scroll table left">◀</button>
+            <button class="table-nav-btn" type="button" onclick="scrollPosTable(600)" title="Scroll table right">▶</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
@@ -9303,6 +9344,11 @@ def _render_positions_page() -> str:
       const text = String(value || "").trim();
       if (!text) return;
       navigator.clipboard.writeText(text).then(() => setPosStatus("Copied to clipboard", false)).catch(() => {});
+    }
+    function scrollPosTable(delta) {
+      const wrap = document.querySelector("#posPoolsBody .table-wrap");
+      if (!wrap) return;
+      wrap.scrollBy({left: Number(delta) || 0, behavior: "smooth"});
     }
     function shortAddr4(value) {
       const v = String(value || "").trim();
@@ -9672,7 +9718,8 @@ def _render_positions_page() -> str:
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
       const baseCols = 11;
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th><th>c:source</th><th>c:pm</th><th>c:tokenId</th><th>c:nonce</th><th>c:operator</th><th>c:token0</th><th>c:token1</th><th>c:fee</th><th>c:tickL</th><th>c:tickU</th><th>c:liq</th><th>c:owed0_raw</th><th>c:owed1_raw</th><th>c:pool</th><th>c:sqrtX96</th><th>c:poolLiq</th><th>c:dec0</th><th>c:dec1</th><th>c:sym0</th><th>c:sym1</th><th>c:qAmt0</th><th>c:qAmt1</th><th>c:qFee0</th><th>c:qFee1</th></tr>`;
+      let html = `<tr class='contract-group-row'><th colspan='11'>Base columns</th><th colspan='12'>Contract position fields</th><th colspan='7'>Contract pool fields</th><th colspan='4'>Contract quote fields</th></tr>`;
+      html += `<tr class='contract-col-row'><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Exact amounts currently in the position'>In position</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th><th>Contract source</th><th>Position manager</th><th>Token ID</th><th>Position nonce</th><th>Approved operator</th><th>Token0 address</th><th>Token1 address</th><th>Fee (raw)</th><th>Tick lower</th><th>Tick upper</th><th>Position liquidity</th><th>Owed0 raw</th><th>Owed1 raw</th><th>Pool address</th><th>Pool sqrtPriceX96</th><th>Pool liquidity</th><th>Token0 decimals</th><th>Token1 decimals</th><th>Token0 symbol</th><th>Token1 symbol</th><th>Quote amount0</th><th>Quote amount1</th><th>Quote fee0</th><th>Quote fee1</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
