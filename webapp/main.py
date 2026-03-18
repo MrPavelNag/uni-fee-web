@@ -6520,8 +6520,8 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str]) 
     valid_chain_ids = [int(cid) for cid in chain_ids if CHAIN_ID_TO_KEY.get(int(cid), "")]
     if not valid_chain_ids:
         return []
-    # In strict index-first mode, if ownership index already knows chains for the owners,
-    # scan only those chains to avoid expensive zero-chain fanout.
+    # In strict index-first mode, scan only owner-known chains from ownership index.
+    # No fallback to broad chain fanout when index has no chains for the owners.
     if POSITIONS_OWNERSHIP_INDEX_ENABLED and POSITIONS_INDEX_FIRST_STRICT:
         known_owner_addrs = [str(a or "").strip().lower() for a in addresses if _is_eth_address(str(a or "").strip().lower())]
         if known_owner_addrs:
@@ -6538,10 +6538,9 @@ def _filter_chain_ids_for_pool_scan(chain_ids: list[int], addresses: list[str]) 
                     ).fetchall()
                 known_chain_ids = {int(r[0] or 0) for r in (rows or []) if int(r[0] or 0) > 0}
                 narrowed = [cid for cid in valid_chain_ids if int(cid) in known_chain_ids]
-                if narrowed:
-                    return narrowed
+                return narrowed
             except Exception:
-                pass
+                return []
     if not POSITIONS_SKIP_CHAINS_WITHOUT_NFTS:
         return valid_chain_ids
     filtered_chain_ids: list[int] = []
