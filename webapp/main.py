@@ -219,7 +219,7 @@ _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
-POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "90")))
+POSITIONS_SCAN_MAX_SECONDS = max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "45")))
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "4")))
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
@@ -248,7 +248,7 @@ POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK = os.environ.get("POSITIONS_INFINITY
     "yes",
     "on",
 )
-POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "0").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_CREATION_DATE_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_CREATION_DATE_WORKERS", "6"))))
@@ -339,7 +339,7 @@ POSITIONS_INDEX_MISS_GRAPH_FALLBACK_ENABLED = os.environ.get(
 )
 POSITIONS_INDEX_MISS_GRAPH_FALLBACK_DEADLINE_SEC = max(
     2,
-    int(os.environ.get("POSITIONS_INDEX_MISS_GRAPH_FALLBACK_DEADLINE_SEC", "5")),
+    int(os.environ.get("POSITIONS_INDEX_MISS_GRAPH_FALLBACK_DEADLINE_SEC", "2")),
 )
 POSITIONS_LEGACY_DISCOVERY_ENABLED = os.environ.get("POSITIONS_LEGACY_DISCOVERY_ENABLED", "0").strip().lower() in (
     "1",
