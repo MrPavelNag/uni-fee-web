@@ -354,6 +354,8 @@ TOKEN_SYMBOL_CACHE: dict[tuple[int, str], str] = {}
 TOKEN_SYMBOL_CACHE_LOCK = threading.Lock()
 CONTRACT_CREATION_DATE_CACHE: dict[tuple[int, str], str] = {}
 CONTRACT_CREATION_DATE_CACHE_LOCK = threading.Lock()
+POSITION_CREATION_DATE_CACHE: dict[tuple[int, str, int], str] = {}
+POSITION_CREATION_DATE_CACHE_LOCK = threading.Lock()
 MAJOR_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 MAJOR_ASSET_PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("MAJOR_ASSET_PRICE_CACHE_TTL_SEC", "300")))
 getcontext().prec = 48
@@ -2925,20 +2927,104 @@ def _contract_creation_date_peek(chain_id: int, contract_address: str) -> str:
     return str(cached or "")
 
 
+def _position_token_id_from_raw(position_id: Any) -> int:
+    raw = str(position_id or "").strip()
+    if not raw:
+        return 0
+    if ":" in raw:
+        raw = raw.split(":", 1)[1].strip()
+    return _parse_int_like(raw)
+
+
+def _position_manager_for_protocol(chain_id: int, protocol: str) -> str:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    if proto == "uniswap_v3":
+        return str(UNISWAP_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    if proto in {"pancake_v3", "pancake_v3_staked"}:
+        return str(PANCAKE_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    if proto == "pancake_infinity_cl":
+        return str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    if proto == "pancake_infinity_bin":
+        return str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    return ""
+
+
+def _position_creation_date_ymd(chain_id: int, protocol: str, position_id: Any) -> str:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    tid = _position_token_id_from_raw(position_id)
+    if cid <= 0 or not proto or tid <= 0:
+        return ""
+    key = (cid, proto, int(tid))
+    with POSITION_CREATION_DATE_CACHE_LOCK:
+        cached = POSITION_CREATION_DATE_CACHE.get(key)
+    if cached is not None:
+        return str(cached or "")
+    pm = _position_manager_for_protocol(cid, proto)
+    if not _is_eth_address(pm):
+        with POSITION_CREATION_DATE_CACHE_LOCK:
+            POSITION_CREATION_DATE_CACHE[key] = ""
+        return ""
+    date_str = ""
+    try:
+        topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        topic_tid = "0x" + _encode_uint_word(int(tid))
+        logs = _eth_get_logs(
+            cid,
+            {
+                "address": pm,
+                "fromBlock": "0x0",
+                "toBlock": "latest",
+                "topics": [topic_transfer, None, None, topic_tid],
+            },
+        )
+        first_block = 0
+        for lg in (logs or []):
+            try:
+                bn = int(str((lg or {}).get("blockNumber") or "0x0"), 16)
+            except Exception:
+                bn = 0
+            if bn > 0 and (first_block <= 0 or bn < first_block):
+                first_block = bn
+        if first_block > 0:
+            ts = _eth_get_block_timestamp(cid, first_block)
+            if ts > 0:
+                date_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
+    except Exception:
+        date_str = ""
+    with POSITION_CREATION_DATE_CACHE_LOCK:
+        POSITION_CREATION_DATE_CACHE[key] = date_str
+    return date_str
+
+
+def _position_creation_date_peek(chain_id: int, protocol: str, position_id: Any) -> str:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    tid = _position_token_id_from_raw(position_id)
+    if cid <= 0 or not proto or tid <= 0:
+        return ""
+    key = (cid, proto, int(tid))
+    with POSITION_CREATION_DATE_CACHE_LOCK:
+        cached = POSITION_CREATION_DATE_CACHE.get(key)
+    return str(cached or "")
+
+
 def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    keys: list[tuple[int, str]] = []
-    seen: set[tuple[int, str]] = set()
+    keys: list[tuple[int, str, str]] = []
+    seen: set[tuple[int, str, str]] = set()
     for r in rows:
         try:
             cid = int(r.get("chain_id") or 0)
         except Exception:
             cid = 0
-        pool_id = str(r.get("pool_id") or "").strip().lower()
-        if cid <= 0 or not _is_eth_address(pool_id):
+        proto = str(r.get("protocol") or "").strip().lower()
+        pid = str(r.get("position_id") or "").strip()
+        if cid <= 0 or not proto or not pid:
             continue
-        k = (cid, pool_id)
+        k = (cid, proto, pid)
         if k in seen:
             continue
         seen.add(k)
@@ -2948,13 +3034,13 @@ def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
     deadline = time.monotonic() + float(POSITIONS_CREATION_DATE_MAX_SECONDS)
     workers = max(1, min(int(POSITIONS_CREATION_DATE_WORKERS), len(keys)))
     if workers <= 1:
-        for cid, pool_id in keys:
+        for cid, proto, pid in keys:
             if time.monotonic() >= deadline:
                 break
-            _contract_creation_date_ymd(cid, pool_id)
+            _position_creation_date_ymd(cid, proto, pid)
     else:
         ex = ThreadPoolExecutor(max_workers=workers)
-        futures = [ex.submit(_contract_creation_date_ymd, cid, pool_id) for cid, pool_id in keys]
+        futures = [ex.submit(_position_creation_date_ymd, cid, proto, pid) for cid, proto, pid in keys]
         aborted = False
         try:
             pending = set(futures)
@@ -2976,11 +3062,13 @@ def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
             cid = int(r.get("chain_id") or 0)
         except Exception:
             cid = 0
-        pool_id = str(r.get("pool_id") or "").strip().lower()
-        if cid <= 0 or not pool_id:
+        proto = str(r.get("protocol") or "").strip().lower()
+        pid = str(r.get("position_id") or "").strip()
+        if cid <= 0 or not proto or not pid:
             continue
-        d = _contract_creation_date_peek(cid, pool_id)
+        d = _position_creation_date_peek(cid, proto, pid)
         if d:
+            r["position_created_date"] = d
             r["contract_created_date"] = d
 
 
@@ -3081,17 +3169,19 @@ def _enrich_missing_creation_dates(rows: list[dict[str, Any]], max_seconds: int 
     for r in rows:
         if checked >= int(max_rows) or time.monotonic() >= deadline:
             break
-        if str(r.get("contract_created_date") or "").strip() not in {"", "-"}:
+        if str(r.get("position_created_date") or r.get("contract_created_date") or "").strip() not in {"", "-"}:
             continue
         try:
             cid = int(r.get("chain_id") or 0)
         except Exception:
             cid = 0
-        pool_id = str(r.get("pool_id") or "").strip().lower()
-        if cid <= 0 or not _is_eth_address(pool_id):
+        proto = str(r.get("protocol") or "").strip().lower()
+        pid = str(r.get("position_id") or "").strip()
+        if cid <= 0 or not proto or not pid:
             continue
-        d = _contract_creation_date_ymd(cid, pool_id)
+        d = _position_creation_date_ymd(cid, proto, pid)
         if d:
+            r["position_created_date"] = d
             r["contract_created_date"] = d
         checked += 1
 
@@ -6079,7 +6169,16 @@ def _scan_pool_positions_chain(
             "pool_liquidity": str(pool.get("liquidity") or "0"),
             "pool_tvl_usd": tvl_usd,
             "tvl_usd": position_tvl_usd,
-            "contract_created_date": _contract_creation_date_peek(int(chain_id), str(pool.get("id") or "")),
+            "position_created_date": _position_creation_date_peek(
+                int(chain_id),
+                str(p.get("_protocol_label") or f"uniswap_{version}"),
+                str(p.get("id") or ""),
+            ),
+            "contract_created_date": _position_creation_date_peek(
+                int(chain_id),
+                str(p.get("_protocol_label") or f"uniswap_{version}"),
+                str(p.get("id") or ""),
+            ),
             "valuation_mode": valuation_mode,
             "suspected_spam": bool(suspected_spam),
         }
@@ -6324,6 +6423,8 @@ def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_
         _populate_creation_dates_parallel(rows)
         return
     for row in rows:
+        if "position_created_date" not in row:
+            row["position_created_date"] = "-"
         if "contract_created_date" not in row:
             row["contract_created_date"] = "-"
 
@@ -8918,7 +9019,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Created</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Pool ID</th><th>Position created</th><th title='Estimated by liquidity share in pool; shown as - when pool liquidity is unavailable'>Position TVL</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -8950,7 +9051,7 @@ def _render_positions_page() -> str:
         const feeTip = feeRaw ? ` title="raw: ${esc(feeRaw)}"` : "";
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
         html += `<td class='mono'>${esc(shortAddr4(r.pool_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.pool_id || "").replace(/'/g, "\\\\'"))}')" title='Copy pool id'>⧉</button></td>`;
-        html += `<td>${esc(r.contract_created_date || "-")}</td>`;
+        html += `<td>${esc(r.position_created_date || r.contract_created_date || "-")}</td>`;
         const tvlVal = (r.tvl_usd == null) ? "-" : Number(r.tvl_usd).toLocaleString(undefined, {maximumFractionDigits: 2});
         html += `<td>${tvlVal}</td>`;
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
@@ -8961,14 +9062,14 @@ def _render_positions_page() -> str:
       if (!visible.length) html += "<tr><td colspan='10'>No pool positions found.</td></tr>";
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
-        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Created</th><th style='text-align:left;padding:4px 6px'>Position TVL</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
+        hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Pool ID</th><th style='text-align:left;padding:4px 6px'>Position created</th><th style='text-align:left;padding:4px 6px'>Position TVL</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
         for (let i = 0; i < hiddenRows.length; i++) {
           const r = hiddenRows[i];
           const rowKey = String(r._row_key || "");
           const tvlVal = "-";
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.contract_created_date || "-")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(r.protocol || "")}</td><td style='padding:3px 6px'>${esc(r.pair || "")}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.pool_id || ""))}</td><td style='padding:3px 6px'>${esc(r.position_created_date || r.contract_created_date || "-")}</td><td style='padding:3px 6px'>${tvlVal}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
@@ -11485,8 +11586,10 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any]) -> No
         return
     _enrich_tvl_background(pool_rows, max_seconds=25)
     for r in pool_rows:
+        if not str(r.get("position_created_date") or "").strip():
+            r["position_created_date"] = str(r.get("contract_created_date") or "").strip() or "-"
         if not str(r.get("contract_created_date") or "").strip():
-            r["contract_created_date"] = "-"
+            r["contract_created_date"] = str(r.get("position_created_date") or "").strip() or "-"
     _update_pos_job(job_id, result=result, progress=95)
 
 
