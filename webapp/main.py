@@ -2277,6 +2277,163 @@ def _position_amounts_from_detail(position: dict[str, Any], pool: dict[str, Any]
         return None
 
 
+def _method_selector(signature: str) -> str:
+    sig = str(signature or "").strip()
+    if not sig:
+        return ""
+    h = _keccak256_hex(sig.encode("utf-8"))
+    if h and h.startswith("0x") and len(h) >= 10:
+        return "0x" + h[2:10]
+    # Fallback constants for common methods if keccak helper is unavailable.
+    known = {
+        "decreaseLiquidity((uint256,uint128,uint256,uint256,uint256))": "0x0c49ccbe",
+    }
+    return known.get(sig, "")
+
+
+def _quote_v3_decrease_liquidity_amounts(
+    chain_id: int,
+    protocol: str,
+    token_id: int,
+    liquidity: int,
+    owner_hint: str,
+    dec0: int,
+    dec1: int,
+) -> tuple[float | None, float | None]:
+    cid = int(chain_id)
+    tid = int(token_id)
+    liq = int(liquidity)
+    owner_addr = str(owner_hint or "").strip().lower()
+    if tid <= 0 or liq <= 0:
+        return None, None
+    pm = _position_manager_for_protocol(cid, protocol)
+    if not _is_eth_address(pm):
+        return None, None
+    selector = _method_selector("decreaseLiquidity((uint256,uint128,uint256,uint256,uint256))")
+    if not selector:
+        return None, None
+    deadline = int(time.time()) + 86400
+    liq_128 = max(0, min(int(liq), (1 << 128) - 1))
+    data = (
+        selector
+        + _encode_uint_word(int(tid))
+        + _encode_uint_word(int(liq_128))
+        + _encode_uint_word(0)
+        + _encode_uint_word(0)
+        + _encode_uint_word(int(deadline))
+    )
+    callers: list[str] = []
+    if _is_eth_address(owner_addr):
+        callers.append(owner_addr)
+    try:
+        owner_of_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(tid)))
+        owner_words = _hex_words(owner_of_hex)
+        if owner_words:
+            current_owner = owner_words[0][-40:].lower()
+            if _is_eth_address("0x" + current_owner):
+                owner_of_addr = "0x" + current_owner
+                if owner_of_addr not in callers:
+                    callers.append(owner_of_addr)
+    except Exception:
+        pass
+    callers.append("")
+    for caller in callers:
+        try:
+            out = _eth_call_hex(cid, pm, data, from_addr=caller or None)
+            words = _hex_words(out)
+            if len(words) < 2:
+                continue
+            a0_raw = max(0, _decode_uint_from_word(words[0]))
+            a1_raw = max(0, _decode_uint_from_word(words[1]))
+            d0 = int(dec0) if 0 <= int(dec0) <= 36 else 18
+            d1 = int(dec1) if 0 <= int(dec1) <= 36 else 18
+            a0 = float(Decimal(a0_raw) / (Decimal(10) ** d0))
+            a1 = float(Decimal(a1_raw) / (Decimal(10) ** d1))
+            return a0, a1
+        except Exception:
+            continue
+    return None, None
+
+
+def _fetch_v3_tokens_owed_raw(chain_id: int, protocol: str, token_id: int) -> tuple[int, int] | None:
+    cid = int(chain_id)
+    tid = int(token_id)
+    if tid <= 0:
+        return None
+    pm = _position_manager_for_protocol(cid, protocol)
+    if not _is_eth_address(pm):
+        return None
+    try:
+        pos_data = "0x99fbab88" + _encode_uint_word(int(tid))
+        pos_words = _hex_words(_eth_call_hex(cid, pm, pos_data))
+        if len(pos_words) < 12:
+            return None
+        owed0 = max(0, _decode_uint_from_word(pos_words[10]))
+        owed1 = max(0, _decode_uint_from_word(pos_words[11]))
+        return owed0, owed1
+    except Exception:
+        return None
+
+
+def _quote_v3_collect_fees_amounts(
+    chain_id: int,
+    protocol: str,
+    token_id: int,
+    owner_hint: str,
+    dec0: int,
+    dec1: int,
+) -> tuple[float | None, float | None]:
+    cid = int(chain_id)
+    tid = int(token_id)
+    owner_addr = str(owner_hint or "").strip().lower()
+    if tid <= 0:
+        return None, None
+    pm = _position_manager_for_protocol(cid, protocol)
+    if not _is_eth_address(pm):
+        return None, None
+    selector = _method_selector("collect((uint256,address,uint128,uint128))")
+    if not selector:
+        return None, None
+    amount_max_128 = (1 << 128) - 1
+    recipient = owner_addr if _is_eth_address(owner_addr) else "0x0000000000000000000000000000000000000000"
+    data = (
+        selector
+        + _encode_uint_word(int(tid))
+        + _encode_address_word(recipient)
+        + _encode_uint_word(int(amount_max_128))
+        + _encode_uint_word(int(amount_max_128))
+    )
+    callers: list[str] = []
+    if _is_eth_address(owner_addr):
+        callers.append(owner_addr)
+    try:
+        owner_of_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(tid)))
+        owner_words = _hex_words(owner_of_hex)
+        if owner_words:
+            current_owner = "0x" + owner_words[0][-40:].lower()
+            if _is_eth_address(current_owner) and current_owner not in callers:
+                callers.append(current_owner)
+    except Exception:
+        pass
+    callers.append("")
+    for caller in callers:
+        try:
+            out = _eth_call_hex(cid, pm, data, from_addr=caller or None)
+            words = _hex_words(out)
+            if len(words) < 2:
+                continue
+            fee0_raw = max(0, _decode_uint_from_word(words[0]))
+            fee1_raw = max(0, _decode_uint_from_word(words[1]))
+            d0 = int(dec0) if 0 <= int(dec0) <= 36 else 18
+            d1 = int(dec1) if 0 <= int(dec1) <= 36 else 18
+            fee0 = float(Decimal(fee0_raw) / (Decimal(10) ** d0))
+            fee1 = float(Decimal(fee1_raw) / (Decimal(10) ** d1))
+            return fee0, fee1
+        except Exception:
+            continue
+    return None, None
+
+
 def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[str, Any]) -> float | None:
     try:
         amounts = _position_amounts_from_detail(position, pool)
@@ -2781,11 +2938,15 @@ def _scan_pancake_infinity_cl_positions_graph(
     return out
 
 
-def _eth_call_hex(chain_id: int, to: str, data_hex: str) -> str:
+def _eth_call_hex(chain_id: int, to: str, data_hex: str, *, from_addr: str | None = None) -> str:
+    call_obj: dict[str, Any] = {"to": str(to).strip(), "data": str(data_hex).strip()}
+    fa = str(from_addr or "").strip().lower()
+    if _is_eth_address(fa):
+        call_obj["from"] = fa
     result = _json_rpc_call(
         chain_id,
         "eth_call",
-        [{"to": str(to).strip(), "data": str(data_hex).strip()}, "latest"],
+        [call_obj, "latest"],
     )
     out = str(result or "").strip().lower()
     if not out.startswith("0x"):
@@ -3939,6 +4100,47 @@ def _token_display_symbol(chain_id: int, chain_key: str, token_obj: dict[str, An
     if onchain:
         return onchain
     return (addr[:8] if len(addr) >= 8 else addr) or "?"
+
+
+def _canonical_wrapped_native_symbol(symbol: str) -> str:
+    s = str(symbol or "").strip().lower()
+    aliases: dict[str, str] = {
+        "eth": "eth",
+        "weth": "eth",
+        "weth.e": "eth",
+        "weth9": "eth",
+        "bnb": "bnb",
+        "wbnb": "bnb",
+        "matic": "pol",
+        "wmatic": "pol",
+        "pol": "pol",
+        "wpol": "pol",
+        "avax": "avax",
+        "wavax": "avax",
+        "ftm": "ftm",
+        "wftm": "ftm",
+        "celo": "celo",
+        "wcelo": "celo",
+    }
+    return aliases.get(s, s)
+
+
+def _normalize_display_symbol(symbol: str) -> str:
+    s = str(symbol or "").strip()
+    c = _canonical_wrapped_native_symbol(s)
+    if c == "eth":
+        return "ETH"
+    if c == "bnb":
+        return "BNB"
+    if c == "pol":
+        return "POL"
+    if c == "avax":
+        return "AVAX"
+    if c == "ftm":
+        return "FTM"
+    if c == "celo":
+        return "CELO"
+    return s
 
 
 def _is_probably_spam_symbol(symbol: str) -> bool:
@@ -6100,6 +6302,8 @@ def _scan_pool_positions_chain(
         t1_obj = pool.get("token1") or {}
         t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
         t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
+        t0 = _normalize_display_symbol(t0)
+        t1 = _normalize_display_symbol(t1)
         proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
         if proto_label.startswith("pancake_infinity_"):
             raw_pid = str(p.get("id") or "").strip()
@@ -6126,6 +6330,8 @@ def _scan_pool_positions_chain(
                 t1_obj = pool.get("token1") or {}
                 t0 = _token_display_symbol(int(chain_id), chain_key, t0_obj)
                 t1 = _token_display_symbol(int(chain_id), chain_key, t1_obj)
+                t0 = _normalize_display_symbol(t0)
+                t1 = _normalize_display_symbol(t1)
 
         amount0_val: float | None = None
         amount1_val: float | None = None
@@ -6135,14 +6341,6 @@ def _scan_pool_positions_chain(
             amount0_val = float(raw_amount0)
         if raw_amount1 is not None:
             amount1_val = float(raw_amount1)
-        amounts = _position_amounts_from_detail(p, pool)
-        if amounts:
-            try:
-                amount0_val = float(amounts[0])
-                amount1_val = float(amounts[1])
-            except Exception:
-                amount0_val = None
-                amount1_val = None
 
         dec0 = _parse_int_like((pool.get("token0") or {}).get("decimals") or 18)
         dec1 = _parse_int_like((pool.get("token1") or {}).get("decimals") or 18)
@@ -6150,27 +6348,97 @@ def _scan_pool_positions_chain(
             dec0 = 18
         if dec1 <= 0 or dec1 > 36:
             dec1 = 18
+        liq_int = max(0, _parse_int_like(p.get("liquidity") or 0))
+        # Prefer direct on-chain quote from position manager instead of local math.
+        need_direct_quote = bool(
+            version == "v3"
+            and (
+                amount0_val is None
+                or amount1_val is None
+                or ((amount0_val or 0.0) == 0.0 and (amount1_val or 0.0) == 0.0 and liq_int > 0)
+            )
+        )
+        if need_direct_quote:
+            try:
+                quoted0, quoted1 = _quote_v3_decrease_liquidity_amounts(
+                    int(chain_id),
+                    str(p.get("_protocol_label") or f"uniswap_{version}"),
+                    _position_token_id_from_raw(p.get("id")),
+                    liq_int,
+                    owner,
+                    dec0,
+                    dec1,
+                )
+                if quoted0 is not None:
+                    amount0_val = quoted0
+                if quoted1 is not None:
+                    amount1_val = quoted1
+            except Exception:
+                pass
+        if (amount0_val is None or amount1_val is None) and (hard_scan or version != "v3"):
+            # Optional fallback path kept for hard scan and non-v3 protocols.
+            amounts = _position_amounts_from_detail(p, pool)
+            if amounts:
+                try:
+                    amount0_val = float(amounts[0])
+                    amount1_val = float(amounts[1])
+                except Exception:
+                    amount0_val = None
+                    amount1_val = None
         owed0_raw = max(0, _parse_int_like(p.get("tokensOwed0") or 0))
         owed1_raw = max(0, _parse_int_like(p.get("tokensOwed1") or 0))
+        if version == "v3" and owed0_raw == 0 and owed1_raw == 0 and liq_int > 0:
+            owed_direct = _fetch_v3_tokens_owed_raw(
+                int(chain_id),
+                str(p.get("_protocol_label") or f"uniswap_{version}"),
+                _position_token_id_from_raw(p.get("id")),
+            )
+            if owed_direct:
+                owed0_raw = int(owed_direct[0] or 0)
+                owed1_raw = int(owed_direct[1] or 0)
         fees0_val: float | None = None
         fees1_val: float | None = None
+        if version == "v3":
+            try:
+                qf0, qf1 = _quote_v3_collect_fees_amounts(
+                    int(chain_id),
+                    str(p.get("_protocol_label") or f"uniswap_{version}"),
+                    _position_token_id_from_raw(p.get("id")),
+                    owner,
+                    dec0,
+                    dec1,
+                )
+                if qf0 is not None:
+                    fees0_val = float(qf0)
+                if qf1 is not None:
+                    fees1_val = float(qf1)
+            except Exception:
+                pass
         try:
-            if owed0_raw > 0:
+            if fees0_val is None and owed0_raw > 0:
                 fees0_val = float(Decimal(owed0_raw) / (Decimal(10) ** dec0))
-            if owed1_raw > 0:
+            if fees1_val is None and owed1_raw > 0:
                 fees1_val = float(Decimal(owed1_raw) / (Decimal(10) ** dec1))
         except Exception:
-            fees0_val = None
-            fees1_val = None
+            if fees0_val is None:
+                fees0_val = None
+            if fees1_val is None:
+                fees1_val = None
 
-        def _fmt_amt(v: float | None) -> str:
+        def _fmt_amt(v: float | None, *, zero_if_missing: bool = False) -> str:
             if v is None:
-                return "-"
-            # Rounded compact value for UI table cells.
-            return f"{v:,.4f}".rstrip("0").rstrip(".")
+                return "0" if zero_if_missing else "-"
+            av = abs(float(v))
+            if av >= 1000:
+                s = f"{float(v):,.2f}"
+            elif av >= 1:
+                s = f"{float(v):,.4f}"
+            else:
+                s = f"{float(v):,.6f}"
+            return s.rstrip("0").rstrip(".")
 
         position_amounts_display = f"{_fmt_amt(amount0_val)} / {_fmt_amt(amount1_val)}"
-        fees_owed_display = f"{_fmt_amt(fees0_val)} / {_fmt_amt(fees1_val)}"
+        fees_owed_display = f"{_fmt_amt(fees0_val, zero_if_missing=True)} / {_fmt_amt(fees1_val, zero_if_missing=True)}"
         suspected_spam = _is_suspected_spam_pair(
             chain_key,
             t0_obj if isinstance(t0_obj, dict) else {},
@@ -6415,6 +6683,26 @@ def _scan_pool_positions_chain(
 
 
 def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _opt_float(v: Any) -> float | None:
+        try:
+            if v is None:
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _fmt_amt(v: float | None, *, zero_if_missing: bool = False) -> str:
+        if v is None:
+            return "0" if zero_if_missing else "-"
+        av = abs(float(v))
+        if av >= 1000:
+            s = f"{float(v):,.2f}"
+        elif av >= 1:
+            s = f"{float(v):,.4f}"
+        else:
+            s = f"{float(v):,.6f}"
+        return s.rstrip("0").rstrip(".")
+
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
         key = (str(row.get("address")), str(row.get("protocol")), str(row.get("pool_id")))
@@ -6446,6 +6734,27 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
             acc["valuation_mode"] = "mixed"
         elif not m1 and m2:
             acc["valuation_mode"] = m2
+        # Sum position values across all NFTs in the same owner/protocol/pool group.
+        for fld in ("position_amount0", "position_amount1", "fees_owed0", "fees_owed1"):
+            av = _opt_float(acc.get(fld))
+            bv = _opt_float(row.get(fld))
+            if av is None and bv is None:
+                acc[fld] = None
+            else:
+                acc[fld] = float((av or 0.0) + (bv or 0.0))
+        acc["position_amounts_display"] = (
+            f"{_fmt_amt(_opt_float(acc.get('position_amount0')))} / "
+            f"{_fmt_amt(_opt_float(acc.get('position_amount1')))}"
+        )
+        acc["fees_owed_display"] = (
+            f"{_fmt_amt(_opt_float(acc.get('fees_owed0')), zero_if_missing=True)} / "
+            f"{_fmt_amt(_opt_float(acc.get('fees_owed1')), zero_if_missing=True)}"
+        )
+        # Keep a real date if any grouped position has it.
+        acc_date = str(acc.get("position_created_date") or "").strip()
+        row_date = str(row.get("position_created_date") or "").strip()
+        if (not acc_date or acc_date == "-") and row_date and row_date != "-":
+            acc["position_created_date"] = row_date
         # Keep pool level metadata stable; liquidity fields are not additive across NFTs.
     return list(uniq.values())
 
@@ -7468,10 +7777,7 @@ def _merge_for_web(
 
 
 def _canonical_token_symbol(sym: str) -> str:
-    s = (sym or "").strip().lower()
-    if s in {"eth", "weth", "weth.e", "weth9"}:
-        return "eth"
-    return s
+    return _canonical_wrapped_native_symbol(sym)
 
 
 def _requested_pair_key(a: str, b: str) -> tuple[str, str]:
@@ -8939,11 +9245,54 @@ def _render_positions_page() -> str:
       const dbgRows = Array.isArray(dbg.pool_scan) ? dbg.pool_scan : [];
       let dbgHtml = "";
       if (dbgSummary.length || dbgRows.length) {
-        const sumLines = dbgSummary.slice(0, 40).map((x) =>
+        const infoText = infos.map((x) => String(x || "")).join(" | ").toLowerCase();
+        const hardMode = infoText.includes("hard scan is enabled");
+        const fastMode = !hardMode;
+        const heavyModes = new Set([
+          "index_sync_warmup",
+          "index_graph_fallback",
+          "onchain_v3_prefetch",
+          "onchain_v3_npm",
+          "onchain_pancake_infinity_cl",
+          "onchain_pancake_infinity_bin",
+          "indexer_pancake_infinity_cl",
+          "graph_pancake_infinity_cl",
+        ]);
+        const summaryFiltered = dbgSummary.filter((x) => {
+          const qm = String(x?.query_mode || "");
+          // Hide service-line noise in debug summary.
+          if (qm === "hard_scan_required_for_live_discovery") return false;
+          return true;
+        });
+        const cacheHits = summaryFiltered
+          .filter((x) => String(x?.query_mode || "") === "ownership_cache")
+          .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
+        const heavyPathsUsed = summaryFiltered
+          .filter((x) => heavyModes.has(String(x?.query_mode || "")) && Number(x?.count || 0) > 0)
+          .reduce((acc, x) => acc + 1, 0);
+        const sumLines = summaryFiltered.slice(0, 40).map((x) =>
           `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`
         );
+
+        // Keep "zero found" concise and useful:
+        // - in fast mode: show only v3 rows
+        // - and only where owner_nft_balance_precheck indicates non-zero NFT balance
+        const nftPositiveOwnerChain = new Set();
+        for (const row of dbgRows) {
+          const owner = String(row?.owner || "").toLowerCase();
+          const chain = String(row?.chain || "").toLowerCase();
+          const attempts = Array.isArray(row?.attempts) ? row.attempts : [];
+          for (const a of attempts) {
+            if (String(a?.query_mode || "") !== "owner_nft_balance_precheck") continue;
+            if (Number(a?.count || 0) > 0) {
+              nftPositiveOwnerChain.add(`${owner}|${chain}`);
+            }
+          }
+        }
         const zeroRows = dbgRows
           .filter((x) => Number(x.positions_found || 0) === 0)
+          .filter((x) => (fastMode ? String(x.version || "").toLowerCase() === "v3" : true))
+          .filter((x) => nftPositiveOwnerChain.has(`${String(x.owner || "").toLowerCase()}|${String(x.chain || "").toLowerCase()}`))
           .slice(0, 30)
           .map((x) => `${esc(x.owner || "?")} -> ${esc(x.chain || "?")}/${esc(x.version || "?")} (0)`);
         const zeroRowsDedup = Array.from(new Set(zeroRows));
@@ -9007,7 +9356,11 @@ def _render_positions_page() -> str:
           }
         }
         const body = []
-          .concat(sumLines.length ? ["Summary:", ...sumLines] : [])
+          .concat([
+            "Summary:",
+            `mode=${hardMode ? "hard" : "fast"} | cache_hits=${cacheHits} | heavy_paths_used=${heavyPathsUsed}`,
+          ])
+          .concat(sumLines.length ? sumLines : [])
           .concat(zeroRowsDedup.length ? ["", "Zero-found owners:", ...zeroRowsDedup] : [])
           .concat(cmpRowsDedup.length ? ["", "Source compare (onchain vs graph):", ...cmpRowsDedup] : [])
           .concat(infinityRows.length ? ["", "Infinity debug:", ...infinityRows.slice(0, 40)] : [])
@@ -9093,7 +9446,14 @@ def _render_positions_page() -> str:
       }
     }
     function normPosSym(v) {
-      return String(v || "").trim().toUpperCase();
+      const s = String(v || "").trim().toUpperCase();
+      if (s === "WETH" || s === "WETH.E" || s === "WETH9") return "ETH";
+      if (s === "WBNB") return "BNB";
+      if (s === "WMATIC" || s === "MATIC" || s === "WPOL") return "POL";
+      if (s === "WAVAX") return "AVAX";
+      if (s === "WFTM") return "FTM";
+      if (s === "WCELO") return "CELO";
+      return s;
     }
     function pairParts(v) {
       const s = String(v || "");
@@ -11708,6 +12068,15 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
     if not isinstance(pool_rows, list) or not pool_rows:
         return
     if not hard_scan:
+        if _update_pos_job(
+            job_id,
+            result=result,
+            stage="fast_dates",
+            stage_label="Fast mode: quick date backfill",
+            progress=82,
+        ) is None:
+            return
+        _enrich_missing_creation_dates(pool_rows, max_seconds=6, max_rows=120)
         _update_pos_job(
             job_id,
             result=result,

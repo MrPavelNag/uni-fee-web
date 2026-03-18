@@ -91,7 +91,19 @@ chmod +x scripts/deploy_render.sh
 - коммитит изменения (исключая `data/*.sqlite3*`);
 - пушит в `origin/milestone/web-mvp-stable`.
 
-После этого в Render: **Manual Deploy** -> **Deploy latest commit** (или автодеплой, если включен).
+Если хотите запускать деплой и проверку healthz сразу из терминала:
+
+```bash
+export RENDER_DEPLOY_HOOK_URL="https://api.render.com/deploy/srv-...?..."
+export RENDER_HEALTHCHECK_URL="https://uni-fee-web.onrender.com/healthz"
+./scripts/deploy_render.sh "your commit message"
+```
+
+После этого скрипт сам:
+- триггерит Deploy Hook;
+- ждет успешный `/healthz`.
+
+Если `RENDER_DEPLOY_HOOK_URL` не задан, скрипт только коммитит+пушит.
 
 ### Шаги
 
