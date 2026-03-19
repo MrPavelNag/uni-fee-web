@@ -291,6 +291,14 @@ POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC = max(
 POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS = max(
     1, min(12, int(os.environ.get("POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS", "4")))
 )
+# True: call api.etherscan.io/v2 (chainid) before bscscan/basescan/optimistic. Same ETHERSCAN_API_KEY
+# usually works on v2 for all mapped chains; native hosts often return Invalid API Key for that key.
+POSITIONS_EXPLORER_NFTTX_V2_FIRST = os.environ.get("POSITIONS_EXPLORER_NFTTX_V2_FIRST", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS = max(
     4,
     min(60, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS", "18"))),
@@ -563,6 +571,10 @@ POSITIONS_EXPLORER_GRAPH_ID_UNION = os.environ.get("POSITIONS_EXPLORER_GRAPH_ID_
     "yes",
     "on",
 )
+# NFT catalog (tokennfttx): оставить в выдаче только позиции с liquidity>0 на известном PM (Multicall3).
+POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER = os.environ.get(
+    "POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER", "1"
+).strip().lower() in ("1", "true", "yes", "on")
 
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
@@ -3419,6 +3431,39 @@ def _explorer_nfttx_row_token_id_str(row: dict[str, Any]) -> str:
     return ""
 
 
+def _explorer_normalize_hex_address(val: Any) -> str:
+    """0x + 40 hex lower; accepts optional 0x prefix."""
+    s = str(val or "").strip()
+    if not s:
+        return ""
+    if s.lower().startswith("0x"):
+        s = "0x" + s[2:].lower()
+    elif re.fullmatch(r"(?i)[a-f0-9]{40}", s):
+        s = "0x" + s.lower()
+    else:
+        return ""
+    return s if _is_eth_address(s) else ""
+
+
+def _explorer_row_contract_address(row: dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    for k in (
+        "contractAddress",
+        "contractaddress",
+        "contract_address",
+        "ContractAddress",
+        "tokenAddress",
+        "tokenaddress",
+        "TokenAddress",
+    ):
+        v = row.get(k)
+        a = _explorer_normalize_hex_address(v)
+        if a:
+            return a
+    return ""
+
+
 def _explorer_debug_benign_status0_message(message: str) -> bool:
     """Etherscan-family APIs use status \"0\" both for real errors and for normal empty results."""
     m = str(message or "").strip().lower()
@@ -3441,6 +3486,9 @@ def _etherscan_api_coerce_result_rows(raw: Any) -> list[Any]:
     """Normalize Etherscan `result`: usually a list of dicts, occasionally a JSON string (V1/V2)."""
     if raw is None:
         return []
+    if isinstance(raw, dict):
+        # Some endpoints return one transfer object instead of a one-element list.
+        return [raw]
     if isinstance(raw, list):
         return raw
     if isinstance(raw, str):
@@ -4643,48 +4691,54 @@ def _explorer_owner_nfttx_rows(
         debug_out["has_polygon_key"] = bool(polygon_key)
         debug_out["has_optimistic_key"] = bool(optimistic_key)
         debug_out["has_uni_key"] = bool(uni_key)
-    url_templates: list[str] = []
     offset = max(20, min(1000, int(max_rows)))
-    # Prefer chain-native explorers first: tokennfttx indexing on api.etherscan.io/v2 is sometimes empty
-    # for an L2/L1 while the sibling explorer (e.g. Arbiscan, Polygonscan) returns rows. Same Etherscan
-    # account key often works on those hosts; fall back to v2 below.
+    v2_tmpl = ""
+    if eth_key:
+        v2_tmpl = (
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+            f"&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={eth_key}"
+        )
+    native_templates: list[str] = []
+    # Chain-native explorers (dedicated API keys). ETHERSCAN_API_KEY alone is often rejected here.
     if cid == 56 and bsc_key:
-        url_templates.append(
+        native_templates.append(
             "https://api.bscscan.com/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={bsc_key}"
         )
     if cid == 8453 and base_key:
-        url_templates.append(
+        native_templates.append(
             "https://api.basescan.org/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={base_key}"
         )
     if cid == 42161 and arb_key:
-        url_templates.append(
+        native_templates.append(
             "https://api.arbiscan.io/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={arb_key}"
         )
     if cid == 137 and polygon_key:
-        url_templates.append(
+        native_templates.append(
             "https://api.polygonscan.com/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={polygon_key}"
         )
     if cid == 10 and optimistic_key:
-        url_templates.append(
+        native_templates.append(
             "https://api-optimistic.etherscan.io/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={optimistic_key}"
         )
     if cid in {130, 1301} and uni_key:
         uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
-        url_templates.append(
+        native_templates.append(
             f"{uniscan_api}?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={uni_key}"
         )
-    # Multichain v2 (same ETHERSCAN_API_KEY + chainid) — after native so we don't miss L2 index gaps.
-    if eth_key:
-        url_templates.append(
-            "https://api.etherscan.io/v2/api"
-            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-            f"&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={eth_key}"
-        )
+    url_templates: list[str] = []
+    if POSITIONS_EXPLORER_NFTTX_V2_FIRST and v2_tmpl:
+        url_templates.append(v2_tmpl)
+        url_templates.extend(native_templates)
+    else:
+        url_templates.extend(native_templates)
+        if v2_tmpl:
+            url_templates.append(v2_tmpl)
     if not url_templates:
         if isinstance(debug_out, dict):
             debug_out["reason"] = "no_explorer_urls_configured"
@@ -4715,12 +4769,7 @@ def _explorer_owner_nfttx_rows(
         for r in rows:
             if not isinstance(r, dict):
                 continue
-            caddr = str(
-                r.get("contractAddress")
-                or r.get("contractaddress")
-                or r.get("tokenAddress")
-                or ""
-            ).strip().lower()
+            caddr = _explorer_row_contract_address(r).lower()
             txh = str(r.get("hash") or "").strip().lower()
             logi = str(r.get("logIndex") or "").strip().lower()
             tid_raw = _explorer_nfttx_row_token_id_str(r).strip().lower()
@@ -10134,6 +10183,104 @@ def _explorer_nft_catalog_is_uniswap_or_pancake(token_name: str, token_symbol: s
     return "uniswap" in blob or "pancake" in blob
 
 
+def _explorer_nft_contract_pm_kind(chain_id: int, contract: str) -> str:
+    """Известный Position Manager для сети: v3npm | v4pm | infinity_cl | ''."""
+    c = str(contract or "").strip().lower()
+    if not _is_eth_address(c):
+        return ""
+    cid = int(chain_id)
+    if c == str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower():
+        return "v3npm"
+    if c == str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower():
+        return "v4pm"
+    if c == str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower():
+        return "infinity_cl"
+    return ""
+
+
+def _nft_catalog_compute_open_liquidity_allowed(
+    fetch_results: list[dict[str, Any]],
+    *,
+    deadline_ts: float | None,
+) -> set[tuple[int, str, int]]:
+    """Множество (chain_id, contract_lc, token_id) с ненулевой ликвидностью на PM."""
+    from collections import defaultdict
+
+    v3_batches: dict[tuple[int, str], list[int]] = defaultdict(list)
+    v4_batches: dict[tuple[int, str], list[int]] = defaultdict(list)
+    for fr in fetch_results or []:
+        if not isinstance(fr, dict):
+            continue
+        cid = int(fr.get("chain_id") or 0)
+        if cid <= 0:
+            continue
+        for item in fr.get("owned") or []:
+            if not (isinstance(item, tuple) and len(item) == 2):
+                continue
+            contract, tid = item[0], item[1]
+            c = str(contract or "").strip().lower()
+            try:
+                tid_i = int(tid)
+            except Exception:
+                continue
+            if tid_i <= 0 or not _is_eth_address(c):
+                continue
+            meta = _explorer_nft_meta_get(cid, c, tid_i)
+            tn = str(meta.get("token_name") or "")
+            tsym = str(meta.get("token_symbol") or "")
+            if not _explorer_nft_catalog_is_uniswap_or_pancake(tn, tsym):
+                continue
+            kind = _explorer_nft_contract_pm_kind(cid, c)
+            if kind == "v3npm":
+                v3_batches[(cid, c)].append(tid_i)
+            elif kind in ("v4pm", "infinity_cl"):
+                v4_batches[(cid, c)].append(tid_i)
+
+    allowed: set[tuple[int, str, int]] = set()
+    for (cid, npm_c), tids in v3_batches.items():
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        tids_u = sorted({int(t) for t in tids if int(t) > 0})
+        if not tids_u:
+            continue
+        v4_pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        try:
+            frf = filter_uniswap_v3_v4_open_liquidity_token_ids(
+                int(cid),
+                tids_u,
+                deadline_ts=deadline_ts,
+                v3_position_manager=npm_c,
+                v4_position_manager=v4_pm if _is_eth_address(v4_pm) else "",
+            )
+            for t in frf.get("open_v3") or []:
+                allowed.add((int(cid), npm_c, int(t)))
+        except Exception:
+            for t in tids_u:
+                allowed.add((int(cid), npm_c, int(t)))
+
+    for (cid, pm_c), tids in v4_batches.items():
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        tids_u = sorted({int(t) for t in tids if int(t) > 0})
+        if not tids_u:
+            continue
+        npm = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        try:
+            frf = filter_uniswap_v3_v4_open_liquidity_token_ids(
+                int(cid),
+                tids_u,
+                deadline_ts=deadline_ts,
+                v3_position_manager=npm if _is_eth_address(npm) else "",
+                v4_position_manager=pm_c,
+            )
+            for t in frf.get("open_v4") or []:
+                allowed.add((int(cid), pm_c, int(t)))
+        except Exception:
+            for t in tids_u:
+                allowed.add((int(cid), pm_c, int(t)))
+    return allowed
+
+
 def _explorer_nft_catalog_owner_chain_scan(
     cid: int,
     ok: str,
@@ -10314,6 +10461,16 @@ def _scan_pool_positions_explorer_nft_catalog(
     t_merge0 = time.monotonic()
     fetch_results.sort(key=lambda x: (int(x.get("chain_id") or 0), str(x.get("owner") or "")))
 
+    nft_open_allowed: set[tuple[int, str, int]] | None = None
+    if POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER and time.monotonic() < deadline_ts:
+        try:
+            nft_open_allowed = _nft_catalog_compute_open_liquidity_allowed(
+                fetch_results,
+                deadline_ts=deadline_ts,
+            )
+        except Exception:
+            nft_open_allowed = None
+
     results_by_chain: dict[int, list[dict[str, Any]]] = {}
     for fr in fetch_results:
         cid = int(fr.get("chain_id") or 0)
@@ -10366,6 +10523,16 @@ def _scan_pool_positions_explorer_nft_catalog(
                         created = ""
                 supported = _explorer_nft_catalog_is_uniswap_or_pancake(token_name, token_symbol)
                 unsupported_protocol = not supported
+                if (
+                    nft_open_allowed is not None
+                    and supported
+                    and POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER
+                ):
+                    pmk = _explorer_nft_contract_pm_kind(int(cid), str(contract))
+                    if pmk:
+                        _olk = (int(cid), str(contract).strip().lower(), int(tid))
+                        if _olk not in nft_open_allowed:
+                            continue
                 blob = f"{token_name} {token_symbol}".lower()
                 if "uniswap" in blob:
                     proto_col = (token_symbol or "Uniswap").strip()[:24] or "Uniswap"
