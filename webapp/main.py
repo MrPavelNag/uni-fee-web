@@ -12517,6 +12517,51 @@ def _render_positions_page() -> str:
         if (String(st || "") === "running") return partialRendered ? "Background scan" : "Scanning";
         return partialRendered ? "Background scan" : "Scanning";
       }
+    const POS_STAGE_EVENT_LABELS = {
+      init: "Initialize chain scan",
+      version_start: "Start protocol pass",
+      version_owner_loop: "Owner loop",
+      version_owner_parallel: "Owner parallel workers",
+      owner_scan_start: "Start owner scan",
+      owner_scan_done: "Owner scan done",
+      owner_scan_timeout: "Owner scan timeout",
+      call_contract_only_explorer_owner_rows: "Explorer owner rows",
+      call_contract_only_explorer_contract_rows_fallback: "Explorer contract fallback",
+      call_contract_only_explorer_v4_ids: "Explorer v4 ids",
+      call_contract_only_onchain_v3_npm: "On-chain v3 positions()",
+      call_contract_only_onchain_pancake_masterchef_v3: "On-chain Pancake MasterChefV3",
+      call_contract_only_onchain_pancake_infinity_cl: "On-chain Pancake Infinity CL",
+      call_contract_only_onchain_pancake_infinity_bin: "On-chain Pancake Infinity BIN",
+      call_contract_only_onchain_uniswap_v4_pm: "On-chain Uniswap v4 PM",
+      done: "Chain complete",
+      timed_out: "Chain timed out",
+    };
+    function stageEventTextFromPartial(partial, fallbackStageLabel) {
+      const poolTimings = (partial?.debug?.timings?.pool && typeof partial.debug.timings.pool === "object")
+        ? partial.debug.timings.pool
+        : {};
+      const inflight = (poolTimings?.unfinished_chain_progress && typeof poolTimings.unfinished_chain_progress === "object")
+        ? poolTimings.unfinished_chain_progress
+        : {};
+      const entries = Object.entries(inflight);
+      if (!entries.length) {
+        const fb = String(fallbackStageLabel || "").trim();
+        return fb ? ` | event: ${fb}` : "";
+      }
+      entries.sort((a, b) => Number((b?.[1] || {}).running_for_sec || 0) - Number((a?.[1] || {}).running_for_sec || 0));
+      const [chainKey, payload] = entries[0];
+      const d = (payload && typeof payload === "object") ? payload : {};
+      const stageKey = String(d.stage || "").trim();
+      const stageLabel = POS_STAGE_EVENT_LABELS[stageKey] || stageKey.replace(/_/g, " ").trim() || "Running";
+      const ver = String(d.version || "").trim();
+      const owner = String(d.owner || "").trim();
+      const sec = Math.max(0, Math.floor(Number(d.running_for_sec || 0)));
+      const chainTxt = String(chainKey || "").trim();
+      const verTxt = ver ? ` ${ver.toUpperCase()}` : "";
+      const ownerTxt = owner ? ` owner=${shortAddr4(owner)}` : "";
+      const secTxt = sec > 0 ? ` ${sec}s` : "";
+      return ` | event: ${chainTxt}${verTxt} - ${stageLabel}${ownerTxt}${secTxt}`;
+    }
       while (true) {
         const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
         const data = await r.json().catch(() => ({}));
@@ -12551,7 +12596,8 @@ def _render_positions_page() -> str:
         }
         const sLabel = statusStageLabel(stageLabel, st, partialRendered);
         const liveTag = partialRendered ? " | live" : "";
-        setPosStatus(`${sLabel}${elapsedTxt} | ${uiProgress}%${metrics}${liveTag}${statusTail}`, false);
+        const eventTxt = stageEventTextFromPartial(partial, stageLabel);
+        setPosStatus(`${sLabel}${elapsedTxt} | ${uiProgress}%${metrics}${liveTag}${eventTxt}${statusTail}`, false);
         await new Promise((resolve) => setTimeout(resolve, 1200));
       }
     }
