@@ -303,24 +303,23 @@ POSITIONS_EXPLORER_NFTTX_V2_FIRST = os.environ.get("POSITIONS_EXPLORER_NFTTX_V2_
 POSITIONS_BLOCKSCOUT_TOKENNFTTX_FALLBACK = os.environ.get(
     "POSITIONS_BLOCKSCOUT_TOKENNFTTX_FALLBACK", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
-# getLogs Transfer по NPM/PM когда explorer пуст (по умолчанию BSC; переопредели env).
-_POSITIONS_NFT_RPC_PM_FB_RAW = os.environ.get("POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS", "56").strip()
+# PM enumeration при пустом HTTP: "*" = все chain_id, где в конфиге есть V3 NPM или V4 PM; иначе список id через запятую (напр. 56,8453).
+_POSITIONS_NFT_RPC_PM_FB_RAW = os.environ.get("POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS", "*").strip().lower()
+POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS_ALL = _POSITIONS_NFT_RPC_PM_FB_RAW in ("*", "all", "")
 POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS: set[int] = set()
-for _x in _POSITIONS_NFT_RPC_PM_FB_RAW.split(","):
-    _x = _x.strip()
-    if not _x:
-        continue
-    try:
-        POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS.add(int(_x))
-    except ValueError:
-        continue
+if not POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS_ALL:
+    for _x in _POSITIONS_NFT_RPC_PM_FB_RAW.split(","):
+        _x = _x.strip()
+        if not _x:
+            continue
+        try:
+            POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS.add(int(_x))
+        except ValueError:
+            continue
+# Доп. NFT при пустом explorer: перечисление ERC721 balanceOf+tokenOfOwnerByIndex на NPM/V4 PM (O(N) RPC, без скана блоков).
 POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK = os.environ.get(
     "POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
-POSITIONS_NFT_RPC_PM_FALLBACK_MAX_BLOCKS = max(
-    200_000,
-    int(os.environ.get("POSITIONS_NFT_RPC_PM_FALLBACK_MAX_BLOCKS", "6000000")),
-)
 POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS = max(
     4,
     min(60, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS", "18"))),
@@ -3499,7 +3498,17 @@ def _blockscout_tokennfttx_api_root(chain_id: int) -> str:
     return str(defaults.get(cid, "") or "").strip().rstrip("/")
 
 
-def _explorer_rpc_pm_tokennfttx_fallback_rows(
+def _explorer_pm_enumeration_allowed_for_chain(chain_id: int) -> bool:
+    """Разрешено ли on-chain перечисление PM для сети (после пустого tokennfttx)."""
+    cid = int(chain_id)
+    if POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS_ALL:
+        v3 = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        v4 = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        return bool(_is_eth_address(v3) or _is_eth_address(v4))
+    return cid in POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS
+
+
+def _explorer_pm_enumeration_tokennfttx_fallback_rows(
     chain_id: int,
     owner_lower: str,
     *,
@@ -3508,127 +3517,95 @@ def _explorer_rpc_pm_tokennfttx_fallback_rows(
     debug_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Когда BscScan/Etherscan v2 недоступны на free tier: собрать ERC-721 Transfer по известным PM/NPM
-    (Uniswap V3/V4, Pancake Infinity) через eth_getLogs — достаточно для LP NFT каталога.
+    Когда индексатор (Etherscan/Blockscout) не отдаёт tokennfttx: собрать текущие NFT на известных PM
+    через balanceOf + tokenOfOwnerByIndex (стандартный ERC721Enumerable / OZ-совместимый NPM).
+
+    Число RPC ≈ sum(balance) по контрактам — без скана истории блоков и без искусственного wall-time.
+    Pancake Infinity CL/Bin (Solmate ERC721 без enumeration) здесь пропускаются — их только explorer/logs.
     """
     cid = int(chain_id)
     o = str(owner_lower or "").strip().lower()
     if not _is_eth_address(o):
         return []
+    inf_cl = str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    inf_bin = str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    skip_non_enum = {x for x in (inf_cl, inf_bin) if _is_eth_address(x)}
+
     contracts: list[str] = []
     seen_c: set[str] = set()
     for addr in (
         UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid),
         UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid),
-        PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid),
-        PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid),
     ):
         ca = str(addr or "").strip().lower()
-        if _is_eth_address(ca) and ca not in seen_c:
-            seen_c.add(ca)
-            contracts.append(ca)
+        if not _is_eth_address(ca) or ca in seen_c:
+            continue
+        if ca in skip_non_enum:
+            continue
+        seen_c.add(ca)
+        contracts.append(ca)
+
     if not contracts:
         return []
-    topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-    owner_topic = "0x" + ("0" * 24) + o[2:]
-    latest = 0
-    try:
-        latest = int(_eth_block_number(cid))
-    except Exception:
-        return []
-    if latest <= 0:
-        return []
-    step = max(20_000, int(POSITIONS_ERC721_LOG_BLOCK_STEP))
-    span = min(int(latest), int(POSITIONS_NFT_RPC_PM_FALLBACK_MAX_BLOCKS))
-    min_block = max(0, int(latest) - int(span))
-    seen_log: set[str] = set()
-    raw_logs: list[tuple[str, dict[str, Any]]] = []
-    for contract in contracts:
-        end_b = int(latest)
-        while end_b >= min_block:
-            if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                break
-            start_b = max(min_block, end_b - step + 1)
-            for topics in (
-                [topic_transfer, None, owner_topic, None],
-                [topic_transfer, owner_topic, None, None],
-            ):
-                if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                    break
-                try:
-                    logs = _eth_get_logs(
-                        cid,
-                        {
-                            "address": contract,
-                            "fromBlock": hex(int(start_b)),
-                            "toBlock": hex(int(end_b)),
-                            "topics": topics,
-                        },
-                        deadline_ts=deadline_ts,
-                    )
-                except Exception:
-                    logs = []
-                for lg in logs or []:
-                    if not isinstance(lg, dict):
-                        continue
-                    txh = str(lg.get("transactionHash") or lg.get("hash") or "").strip().lower()
-                    lix = str(lg.get("logIndex") or "")
-                    lk = "|".join([contract, txh, lix])
-                    if lk in seen_log:
-                        continue
-                    seen_log.add(lk)
-                    raw_logs.append((contract, lg))
-            end_b = int(start_b) - 1
+
+    cap_total = max(50, min(int(max_rows), int(POSITIONS_ONCHAIN_MAX_NFTS)))
     synth: list[dict[str, Any]] = []
-    cap = max(200, int(max_rows) * 30)
-    for contract, lg in raw_logs:
-        tops = lg.get("topics") or []
-        if not isinstance(tops, list) or len(tops) < 4:
-            continue
-        try:
-            tid = int(str(tops[3]), 16)
-        except Exception:
-            continue
-        if tid <= 0:
-            continue
-        try:
-            from_a = _explorer_normalize_hex_address("0x" + str(tops[1])[-40:])
-            to_a = _explorer_normalize_hex_address("0x" + str(tops[2])[-40:])
-        except Exception:
-            continue
-        if not from_a or not to_a:
-            continue
-        txh = str(lg.get("transactionHash") or lg.get("hash") or "").strip().lower()
-        bl = str(lg.get("blockNumber") or "0x0")
-        try:
-            bn = int(bl, 16) if str(bl).strip().lower().startswith("0x") else int(bl)
-        except Exception:
-            bn = 0
-        li_raw = str(lg.get("logIndex") or "0x0")
-        try:
-            li_i = int(li_raw, 16) if str(li_raw).strip().lower().startswith("0x") else int(li_raw)
-        except Exception:
-            li_i = 0
-        ts = _eth_get_block_timestamp(cid, bn) if bn > 0 else 0
-        synth.append(
-            {
-                "contractAddress": contract,
-                "from": from_a,
-                "to": to_a,
-                "tokenID": str(int(tid)),
-                "hash": txh,
-                "blockNumber": str(int(bn)),
-                "logIndex": str(int(li_i)),
-                "timeStamp": str(int(ts)) if ts > 0 else "0",
-            }
-        )
-        if len(synth) >= cap:
+    per_contract: dict[str, dict[str, int]] = {}
+    base_bn = 1_500_000_000
+
+    def _deadline() -> bool:
+        return deadline_ts is not None and time.monotonic() >= float(deadline_ts)
+
+    for contract in contracts:
+        if _deadline():
             break
+        if len(synth) >= cap_total:
+            break
+        try:
+            bal_data = "0x70a08231" + _encode_address_word(o)
+            bal = int(_decode_uint_eth_call(_eth_call_hex(cid, contract, bal_data)))
+        except Exception:
+            bal = 0
+        bal = max(0, min(int(bal), cap_total - len(synth)))
+        per_contract[contract] = {"balance": int(bal), "enumerated": 0}
+        if bal <= 0:
+            continue
+        enum_ok = False
+        for idx in range(int(bal)):
+            if _deadline():
+                break
+            if len(synth) >= cap_total:
+                break
+            try:
+                tok_data = "0x2f745c59" + _encode_address_word(o) + _encode_uint_word(idx)
+                tid = int(_decode_uint_eth_call(_eth_call_hex(cid, contract, tok_data)))
+            except Exception:
+                break
+            if tid <= 0:
+                continue
+            enum_ok = True
+            per_contract[contract]["enumerated"] = int(per_contract[contract].get("enumerated") or 0) + 1
+            synth.append(
+                {
+                    "contractAddress": contract,
+                    "from": "0x0000000000000000000000000000000000000000",
+                    "to": o,
+                    "tokenID": str(int(tid)),
+                    "hash": "",
+                    "blockNumber": str(int(base_bn + len(synth))),
+                    "logIndex": "0",
+                    "timeStamp": "0",
+                }
+            )
+        if not enum_ok and int(per_contract[contract].get("balance") or 0) > 0:
+            per_contract[contract]["note"] = "tokenOfOwnerByIndex_failed_non_enumerable"
+
     if isinstance(debug_out, dict):
-        debug_out["nft_rpc_pm_fallback"] = {
+        debug_out["nft_pm_enumeration_fallback"] = {
             "contracts": list(contracts),
-            "logs_matched": int(len(raw_logs)),
             "synth_rows": int(len(synth)),
+            "per_contract": per_contract,
+            "method": "balanceOf+tokenOfOwnerByIndex",
         }
     return synth
 
@@ -4832,6 +4809,7 @@ def _explorer_owner_nfttx_rows(
     max_rows: int = 400,
     debug_out: dict[str, Any] | None = None,
     deadline_ts: float | None = None,
+    pm_rpc_fallback: bool = True,
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
     o = str(owner or "").strip().lower()
@@ -5088,13 +5066,14 @@ def _explorer_owner_nfttx_rows(
         if out:
             return _finalize()
     if (
-        not out
+        pm_rpc_fallback
+        and not out
         and POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK
-        and int(cid) in POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS
+        and _explorer_pm_enumeration_allowed_for_chain(int(cid))
         and (deadline_ts is None or time.monotonic() < float(deadline_ts))
     ):
         try:
-            rpc_rows = _explorer_rpc_pm_tokennfttx_fallback_rows(
+            rpc_rows = _explorer_pm_enumeration_tokennfttx_fallback_rows(
                 int(cid),
                 o,
                 max_rows=int(max_rows),
@@ -10500,7 +10479,12 @@ def _explorer_nft_catalog_owner_chain_scan(
     owned: list[tuple[str, int]] = []
     try:
         nft_rows = _explorer_owner_nfttx_rows(
-            int(cid), ok, max_rows=max_rows, debug_out=dbg, deadline_ts=deadline_ts
+            int(cid),
+            ok,
+            max_rows=max_rows,
+            debug_out=dbg,
+            deadline_ts=deadline_ts,
+            pm_rpc_fallback=True,
         )
         owned = _explorer_tokennfttx_currently_owned_contract_token_ids(nft_rows, ok)
     except Exception as e:
