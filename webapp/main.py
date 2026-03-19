@@ -5342,6 +5342,41 @@ def _is_probably_spam_symbol(symbol: str) -> bool:
     s = str(symbol or "").strip()
     if not s or s == "?":
         return True
+    good_symbols = {
+        "BTC",
+        "WBTC",
+        "ETH",
+        "WETH",
+        "BNB",
+        "WBNB",
+        "USDT",
+        "USDC",
+        "DAI",
+        "FDUSD",
+        "TUSD",
+        "BUSD",
+        "USDE",
+        "USDS",
+        "USD0",
+        "FRAX",
+        "CRVUSD",
+        "LUSD",
+        "SUSDE",
+        "AAVE",
+        "LINK",
+        "UNI",
+        "CAKE",
+        "ARB",
+        "OP",
+        "MATIC",
+        "POL",
+        "AVAX",
+        "CELO",
+        "TRX",
+        "SOL",
+    }
+    if s.upper() in good_symbols:
+        return False
     low = s.lower()
     if len(s) > 16:
         return True
@@ -5367,6 +5402,28 @@ def _is_probably_spam_symbol(symbol: str) -> bool:
     return False
 
 
+def _is_probably_spam_name(name: str) -> bool:
+    n = str(name or "").strip()
+    if not n:
+        return False
+    low = n.lower()
+    if any(x in low for x in ("http", "www", ".com", ".io", ".org", "t.me", "telegram", "twitter", "x.com")):
+        return True
+    if any(x in low for x in ("airdrop", "claim", "bonus", "reward", "free token", "official channel")):
+        return True
+    if any(ch in n for ch in ("@", "|", "\\", "/")):
+        return True
+    if len(n) > 42:
+        return True
+    words = [w for w in re.split(r"\s+", n) if w]
+    if len(words) >= 5:
+        return True
+    # Long CamelCase names are often fake branding used in spam tokens.
+    if re.fullmatch(r"[A-Z][a-z]+(?:[A-Z][a-z]+){2,}", n):
+        return True
+    return False
+
+
 def _is_suspected_spam_pair(
     chain_key: str,
     token0_obj: dict[str, Any],
@@ -5374,6 +5431,9 @@ def _is_suspected_spam_pair(
     s0: str,
     s1: str,
     position_tvl_usd: float | None,
+    *,
+    explorer_token_name: str = "",
+    explorer_token_symbol: str = "",
 ) -> bool:
     if not POSITIONS_FILTER_SPAM_TOKENS:
         return False
@@ -5383,12 +5443,27 @@ def _is_suspected_spam_pair(
     both_curated = (a0 in chain_addr_map) and (a1 in chain_addr_map)
     spam0 = _is_probably_spam_symbol(s0)
     spam1 = _is_probably_spam_symbol(s1)
+    exp_name = str(explorer_token_name or "").strip()
+    exp_symbol = str(explorer_token_symbol or "").strip()
     # In contract-only mode do not blindly trust "curated" addresses:
     # if symbol itself looks spammy, treat as spam early and skip heavy calls.
     if both_curated and not POSITIONS_CONTRACT_ONLY_ENABLED:
-        return False
+        exp_name_spam = _is_probably_spam_name(exp_name) if exp_name else False
+        exp_symbol_spam = _is_probably_spam_symbol(exp_symbol) if exp_symbol else False
+        if not exp_name_spam and not exp_symbol_spam:
+            return False
     # If pair tokens are not from curated list, mark clearly suspicious symbols.
-    return bool(spam0 or spam1)
+    spam_meta_symbol = _is_probably_spam_symbol(exp_symbol) if exp_symbol else False
+    spam_meta_name = _is_probably_spam_name(exp_name) if exp_name else False
+    if spam0 or spam1 or spam_meta_symbol:
+        return True
+    if spam_meta_name:
+        tvl = _safe_float(position_tvl_usd)
+        if tvl <= 0 or tvl <= float(POSITIONS_SPAM_MAX_TVL_USD):
+            return True
+        if not both_curated:
+            return True
+    return False
 
 
 def _format_usd_compact(value: float | None) -> str:
@@ -8580,6 +8655,8 @@ def _scan_pool_positions_chain(
                 str(t0 or ""),
                 str(t1 or ""),
                 None,
+                explorer_token_name=str(explorer_fields.get("explorer_token_name") or ""),
+                explorer_token_symbol=str(explorer_fields.get("explorer_token_symbol") or ""),
             )
             if precheck_symbols_ready
             else False
@@ -8754,6 +8831,8 @@ def _scan_pool_positions_chain(
             str(t0 or ""),
             str(t1 or ""),
             None,
+            explorer_token_name=str(explorer_fields.get("explorer_token_name") or ""),
+            explorer_token_symbol=str(explorer_fields.get("explorer_token_symbol") or ""),
         )
         if proto_label.startswith("pancake_"):
             suspected_spam_now = False
@@ -8938,6 +9017,8 @@ def _scan_pool_positions_chain(
             str(t0 or ""),
             str(t1 or ""),
             None,
+            explorer_token_name=str(explorer_fields.get("explorer_token_name") or ""),
+            explorer_token_symbol=str(explorer_fields.get("explorer_token_symbol") or ""),
         )
         if proto_label.startswith("pancake_"):
             suspected_spam = False
