@@ -33,7 +33,9 @@ fi
 FILES=(
   "webapp/main.py"
   "README.md"
+  "docs/SMOKE_CHECKLIST.md"
   "scripts/deploy_render.sh"
+  "scripts/smoke_render.sh"
   "scripts/deploy_sync.sh"
 )
 
@@ -52,6 +54,7 @@ for rel in "${FILES[@]}"; do
 done
 
 chmod +x "${DST_ROOT}/scripts/deploy_render.sh" 2>/dev/null || true
+chmod +x "${DST_ROOT}/scripts/smoke_render.sh" 2>/dev/null || true
 chmod +x "${DST_ROOT}/scripts/deploy_sync.sh" 2>/dev/null || true
 
 echo "==> Staging files"

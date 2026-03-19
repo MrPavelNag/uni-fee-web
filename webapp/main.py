@@ -3330,32 +3330,54 @@ def _eth_get_block_timestamp(chain_id: int, block_number: int) -> int:
         return 0
 
 
+def _explorer_v2_chainid(chain_id: int) -> str:
+    return {
+        1: "1",
+        10: "10",
+        56: "56",
+        137: "137",
+        8453: "8453",
+        42161: "42161",
+    }.get(int(chain_id), "")
+
+
+def _explorer_v2_api_keys(chain_id: int) -> list[str]:
+    cid = int(chain_id)
+    eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
+    raw: list[str] = []
+    if eth_key:
+        raw.append(eth_key)
+    if cid == 56 and bsc_key:
+        raw.append(bsc_key)
+    if cid == 8453 and base_key:
+        raw.append(base_key)
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in raw:
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(k)
+    return out
+
+
 def _explorer_contract_creation_block(chain_id: int, contract_address: str) -> int:
     cid = int(chain_id)
     addr = str(contract_address or "").strip().lower()
     if not _is_eth_address(addr):
         return 0
-    # Prefer Etherscan V2 when key exists (supports multiple chains via chainid).
-    eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
-    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
-    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
-    chainid_for_v2 = {1: "1", 10: "10", 56: "56", 137: "137", 8453: "8453", 42161: "42161"}.get(cid, "")
+    chainid_for_v2 = _explorer_v2_chainid(cid)
+    api_keys = _explorer_v2_api_keys(cid)
     urls: list[str] = []
-    if chainid_for_v2 and eth_key:
+    for apikey in api_keys:
+        if not chainid_for_v2:
+            continue
         urls.append(
             "https://api.etherscan.io/v2/api"
             f"?chainid={chainid_for_v2}&module=contract&action=getcontractcreation"
-            f"&contractaddresses={addr}&apikey={eth_key}"
-        )
-    if cid == 56 and bsc_key:
-        urls.append(
-            f"https://api.bscscan.com/api?module=contract&action=getcontractcreation"
-            f"&contractaddresses={addr}&apikey={bsc_key}"
-        )
-    elif cid == 8453 and base_key:
-        urls.append(
-            f"https://api.basescan.org/api?module=contract&action=getcontractcreation"
-            f"&contractaddresses={addr}&apikey={base_key}"
+            f"&contractaddresses={addr}&apikey={apikey}"
         )
     for url in urls:
         try:
