@@ -360,7 +360,7 @@ def _parse_chain_address_allowlist(raw: str) -> dict[int, set[str]]:
     return out
 
 
-POSITIONS_NOT_SPAM_POSITION_IDS = _parse_csv_int_set(os.environ.get("POSITIONS_NOT_SPAM_IDS", "1227707,1011627,151509"))
+POSITIONS_NOT_SPAM_POSITION_IDS = _parse_csv_int_set(os.environ.get("POSITIONS_NOT_SPAM_IDS", "1227707,1011627"))
 POSITIONS_CUSTODY_OWNER_ALLOWLIST = _parse_csv_address_set(POSITIONS_CUSTODY_OWNER_ALLOWLIST_RAW)
 POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN = _parse_chain_address_allowlist(POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN_RAW)
 POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
@@ -4302,6 +4302,157 @@ def _scan_erc721_token_ids_by_explorer_api(
     return out
 
 
+def _explorer_owner_nfttx_rows(chain_id: int, owner: str, *, max_rows: int = 400) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(o):
+        return []
+    chainid_for_v2 = _explorer_v2_chainid(cid)
+    if not chainid_for_v2:
+        return []
+    eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
+    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
+    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
+    urls: list[str] = []
+    offset = max(20, min(1000, int(max_rows)))
+    if eth_key:
+        urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}"
+        )
+    if cid == 56 and bsc_key:
+        urls.append(
+            "https://api.bscscan.com/api"
+            f"?module=account&action=tokennfttx&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}"
+        )
+    elif cid == 8453 and base_key:
+        urls.append(
+            "https://api.basescan.org/api"
+            f"?module=account&action=tokennfttx&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}"
+        )
+    elif cid == 42161 and arb_key:
+        urls.append(
+            "https://api.arbiscan.io/api"
+            f"?module=account&action=tokennfttx&address={o}&page=1&offset={offset}&sort=desc&apikey={arb_key}"
+        )
+    elif cid == 130 and uni_key:
+        uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
+        urls.append(
+            f"{uniscan_api}?module=account&action=tokennfttx&address={o}&page=1&offset={offset}&sort=desc&apikey={uni_key}"
+        )
+    if not urls:
+        return []
+
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for url in urls:
+        try:
+            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            with urlopen(req, timeout=12) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            rows = (payload or {}).get("result")
+            if not isinstance(rows, list):
+                continue
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                caddr = str(
+                    r.get("contractAddress")
+                    or r.get("contractaddress")
+                    or r.get("tokenAddress")
+                    or ""
+                ).strip().lower()
+                tid = str(r.get("tokenID") or "").strip().lower()
+                txh = str(r.get("hash") or "").strip().lower()
+                logi = str(r.get("logIndex") or "").strip().lower()
+                if not _is_eth_address(caddr) or not tid:
+                    continue
+                k = "|".join([txh, logi, caddr, tid])
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(r)
+                if len(out) >= int(max_rows):
+                    return out
+            if out:
+                return out
+        except Exception:
+            continue
+    return out
+
+
+def _scan_v4_position_ids_by_explorer_any_contract(
+    chain_id: int,
+    owner: str,
+    *,
+    max_ids: int = 120,
+) -> dict[str, list[int]]:
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    if not _is_eth_address(owner_addr):
+        return {}
+    rows = _explorer_owner_nfttx_rows(cid, owner_addr, max_rows=max(200, int(max_ids) * 8))
+    if not rows:
+        return {}
+    by_contract: dict[str, list[int]] = {}
+    seen_by_contract: dict[str, set[int]] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        caddr = str(
+            r.get("contractAddress")
+            or r.get("contractaddress")
+            or r.get("tokenAddress")
+            or ""
+        ).strip().lower()
+        if not _is_eth_address(caddr):
+            continue
+        tid_raw = str(r.get("tokenID") or "").strip()
+        if not tid_raw:
+            continue
+        try:
+            tid = int(tid_raw, 10)
+        except Exception:
+            try:
+                tid = int(tid_raw, 16) if tid_raw.lower().startswith("0x") else int(tid_raw)
+            except Exception:
+                continue
+        if tid <= 0:
+            continue
+        seen = seen_by_contract.setdefault(caddr, set())
+        if int(tid) in seen:
+            continue
+        seen.add(int(tid))
+        by_contract.setdefault(caddr, []).append(int(tid))
+
+    out: dict[str, list[int]] = {}
+    sel_info = "0x7ba03aad"
+    sel_liq = "0x1efeed33"
+    for caddr, tids in by_contract.items():
+        if not tids:
+            continue
+        try:
+            code = _eth_get_code(cid, caddr, "latest")
+            if code in {"0x", "0x0"}:
+                continue
+        except Exception:
+            continue
+        sample_id = int(tids[0])
+        try:
+            info_hex = _eth_call_hex(cid, caddr, sel_info + _encode_uint_word(sample_id))
+            liq_hex = _eth_call_hex(cid, caddr, sel_liq + _encode_uint_word(sample_id))
+            if len(_hex_words(info_hex or "")) < 6:
+                continue
+            _decode_uint_eth_call(liq_hex or "0x0")
+        except Exception:
+            continue
+        out[caddr] = list(tids[: int(max_ids)])
+    return out
+
+
 def _scan_erc721_token_ids_by_owner_receipts(
     chain_id: int,
     contract: str,
@@ -6053,9 +6204,11 @@ def _scan_uniswap_v4_positions_onchain(
     *,
     deadline_ts: float | None = None,
     token_ids_override: list[int] | None = None,
+    position_manager: str | None = None,
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
-    pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    pm = str(position_manager or UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    v4_hidden_key = f"uniswap_v4@{pm}" if _is_eth_address(pm) else "uniswap_v4"
     if not _is_eth_address(pm):
         return []
     owner_addr = str(owner or "").strip().lower()
@@ -6072,8 +6225,7 @@ def _scan_uniswap_v4_positions_onchain(
             if v <= 0 or v in seen_ids:
                 continue
             seen_ids.add(int(v))
-            force_visible = int(v) in POSITIONS_NOT_SPAM_POSITION_IDS
-            if (not force_visible) and _is_auto_hidden_closed_position(int(cid), "uniswap_v4", int(v)):
+            if _is_auto_hidden_closed_position(int(cid), v4_hidden_key, int(v)):
                 continue
             token_ids.append(int(v))
             if len(token_ids) >= int(POSITIONS_ONCHAIN_MAX_NFTS):
@@ -6111,15 +6263,14 @@ def _scan_uniswap_v4_positions_onchain(
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
         try:
-            force_visible = int(token_id) in POSITIONS_NOT_SPAM_POSITION_IDS
-            if (not force_visible) and _is_auto_hidden_closed_position(int(cid), "uniswap_v4", int(token_id)):
+            if _is_auto_hidden_closed_position(int(cid), v4_hidden_key, int(token_id)):
                 continue
             owner_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(token_id)))
             owner_words = _hex_words(owner_hex)
             if not owner_words:
                 continue
             owner_match = bool(owner_words[0][-40:].lower() == owner_word)
-            if (not owner_match) and (not force_visible):
+            if not owner_match:
                 continue
 
             batch = _eth_call_hex_batch(
@@ -6148,9 +6299,8 @@ def _scan_uniswap_v4_positions_onchain(
                 continue
             liq = _decode_uint_eth_call(liq_hex or "0x0")
             if int(liq) <= 0:
-                if not force_visible:
-                    _mark_auto_hidden_closed_position(int(cid), "uniswap_v4", int(token_id))
-                    continue
+                _mark_auto_hidden_closed_position(int(cid), v4_hidden_key, int(token_id))
+                continue
 
             raw0 = _decode_address_from_word(p_words[0])
             raw1 = _decode_address_from_word(p_words[1])
@@ -6189,7 +6339,7 @@ def _scan_uniswap_v4_positions_onchain(
                     "_protocol_label": "uniswap_v4",
                     "_source": "onchain_uniswap_v4_pm",
                     "_skip_enrich": True,
-                    "_force_visible": bool(force_visible),
+                    "_nft_contract": str(pm),
                 }
             )
         except Exception:
@@ -7098,7 +7248,18 @@ def _scan_pool_positions_chain(
             elif proto == "pancake_infinity_bin":
                 manager = str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "")
             elif proto == "uniswap_v4":
-                manager = ""
+                for pp in positions:
+                    if not isinstance(pp, dict):
+                        continue
+                    pp_proto = str(pp.get("_protocol_label") or "").strip().lower()
+                    if pp_proto != "uniswap_v4":
+                        continue
+                    cc = str(pp.get("_nft_contract") or "").strip().lower()
+                    if _is_eth_address(cc):
+                        manager = cc
+                        break
+                if not manager:
+                    manager = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "")
             else:
                 manager = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(int(chain_id), "") or "")
             _position_ownership_upsert(
@@ -7330,14 +7491,20 @@ def _scan_pool_positions_chain(
                 if not add_rows:
                     return
                 seen_keys = {
-                    f"{str((x or {}).get('_protocol_label') or '').strip().lower()}|{str((x or {}).get('id') or '').strip()}"
+                    f"{str((x or {}).get('_protocol_label') or '').strip().lower()}|"
+                    f"{str((x or {}).get('id') or '').strip()}|"
+                    f"{str((x or {}).get('_nft_contract') or '').strip().lower()}"
                     for x in positions
                     if isinstance(x, dict)
                 }
                 for row in add_rows:
                     if not isinstance(row, dict):
                         continue
-                    k = f"{str((row or {}).get('_protocol_label') or '').strip().lower()}|{str((row or {}).get('id') or '').strip()}"
+                    k = (
+                        f"{str((row or {}).get('_protocol_label') or '').strip().lower()}|"
+                        f"{str((row or {}).get('id') or '').strip()}|"
+                        f"{str((row or {}).get('_nft_contract') or '').strip().lower()}"
+                    )
                     if k in seen_keys:
                         continue
                     seen_keys.add(k)
@@ -7516,11 +7683,11 @@ def _scan_pool_positions_chain(
                                 "error": str(e)[:220],
                             }
                         )
-            if version == "v4" and int(chain_id) in UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
+            if version == "v4" and time.monotonic() < deadline_ts:
                 try:
+                    v4_contract_to_ids: dict[str, list[int]] = {}
                     t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_explorer_v4_ids", version=version, owner=str(owner))
-                    explorer_v4_ids: list[int] = []
                     v4_pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
                     if _is_eth_address(v4_pm):
                         explorer_v4_ids = _scan_erc721_token_ids_by_explorer_api(
@@ -7530,35 +7697,85 @@ def _scan_pool_positions_chain(
                             max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
                             protocol="uniswap_v4",
                         )
+                        if explorer_v4_ids:
+                            v4_contract_to_ids[v4_pm] = list(explorer_v4_ids)
                     owner_attempts.append(
                         {
                             "owner_value": owner,
                             "owner_type": "explorer",
                             "query_mode": "contract_only_explorer_v4_ids",
-                            "count": len(explorer_v4_ids),
+                            "count": len(v4_contract_to_ids.get(v4_pm, [])),
                             "ok": True,
                             "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
+                            "nft_contract": v4_pm,
                         }
                     )
                     t_call = time.monotonic()
-                    _set_chain_progress("call_contract_only_onchain_uniswap_v4_pm", version=version, owner=str(owner))
-                    v4_rows = _scan_uniswap_v4_positions_onchain(
-                        owner,
+                    any_v4 = _scan_v4_position_ids_by_explorer_any_contract(
                         int(chain_id),
-                        deadline_ts=deadline_ts,
-                        token_ids_override=explorer_v4_ids,
+                        owner,
+                        max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
                     )
+                    extra_contracts = 0
+                    extra_ids = 0
+                    for caddr, ids in (any_v4 or {}).items():
+                        if not _is_eth_address(caddr) or not ids:
+                            continue
+                        if caddr in v4_contract_to_ids:
+                            seen = set(v4_contract_to_ids[caddr])
+                            for tid in ids:
+                                tv = _parse_int_like(tid)
+                                if tv <= 0 or tv in seen:
+                                    continue
+                                seen.add(int(tv))
+                                v4_contract_to_ids[caddr].append(int(tv))
+                            continue
+                        v4_contract_to_ids[caddr] = [int(_parse_int_like(t)) for t in ids if _parse_int_like(t) > 0]
+                        if v4_contract_to_ids[caddr]:
+                            extra_contracts += 1
+                            extra_ids += len(v4_contract_to_ids[caddr])
                     owner_attempts.append(
                         {
                             "owner_value": owner,
-                            "owner_type": "onchain",
-                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
-                            "count": len(v4_rows),
+                            "owner_type": "explorer",
+                            "query_mode": "contract_only_explorer_v4_ids_any_contracts",
+                            "count": int(extra_ids),
                             "ok": True,
                             "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
+                            "contracts": int(extra_contracts),
                         }
                     )
-                    _merge_positions(v4_rows)
+                    for pm_addr, pm_ids in list(v4_contract_to_ids.items()):
+                        if time.monotonic() >= deadline_ts:
+                            break
+                        if not _is_eth_address(pm_addr):
+                            continue
+                        t_call = time.monotonic()
+                        _set_chain_progress(
+                            "call_contract_only_onchain_uniswap_v4_pm",
+                            version=version,
+                            owner=str(owner),
+                            nft_contract=str(pm_addr),
+                        )
+                        v4_rows = _scan_uniswap_v4_positions_onchain(
+                            owner,
+                            int(chain_id),
+                            deadline_ts=deadline_ts,
+                            token_ids_override=list(pm_ids or []),
+                            position_manager=str(pm_addr),
+                        )
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "onchain",
+                                "query_mode": "contract_only_onchain_uniswap_v4_pm",
+                                "count": len(v4_rows),
+                                "ok": True,
+                                "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
+                                "nft_contract": str(pm_addr),
+                            }
+                        )
+                        _merge_positions(v4_rows)
                 except Exception as e:
                     elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                     owner_attempts.append(
@@ -7570,6 +7787,7 @@ def _scan_pool_positions_chain(
                             "ok": False,
                             "elapsed_ms": int(elapsed_ms),
                             "error": str(e)[:220],
+                            "nft_contract": str(v4_pm if "v4_pm" in locals() else ""),
                         }
                     )
 
@@ -7809,7 +8027,6 @@ def _scan_pool_positions_chain(
         if not isinstance(p, dict):
             return None
         pos_token_id = _position_token_id_from_raw(p.get("id"))
-        force_visible = bool(int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS or bool(p.get("_force_visible")))
         if hard_scan and allow_live_enrich and not _position_has_full_detail(p) and not bool(p.get("_skip_enrich")):
             if time.monotonic() >= deadline_ts:
                 return None
@@ -7821,7 +8038,7 @@ def _scan_pool_positions_chain(
             if enriched:
                 p = enriched
         liq_raw = p.get("liquidity")
-        if (not force_visible) and liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
+        if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
             return None
         pool = p.get("pool") or {}
         fee_raw = str(pool.get("feeTier") or "").strip()
@@ -7928,6 +8145,7 @@ def _scan_pool_positions_chain(
                 "token0_id": str((pool.get("token0") or {}).get("id") or ""),
                 "token1_id": str((pool.get("token1") or {}).get("id") or ""),
                 "position_id": str(p.get("id") or ""),
+                "position_contract": str(p.get("_nft_contract") or ""),
                 "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
                 "fee_tier": "-",
                 "fee_tier_raw": "",
@@ -8070,6 +8288,7 @@ def _scan_pool_positions_chain(
                 "token0_id": str((pool.get("token0") or {}).get("id") or ""),
                 "token1_id": str((pool.get("token1") or {}).get("id") or ""),
                 "position_id": str(p.get("id") or ""),
+                "position_contract": str(p.get("_nft_contract") or ""),
                 "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
                 "fee_tier": "-",
                 "fee_tier_raw": "",
@@ -8208,7 +8427,7 @@ def _scan_pool_positions_chain(
         a0_now = max(0.0, float(amount0_val or 0.0))
         a1_now = max(0.0, float(amount1_val or 0.0))
         # Zero-liquidity / 0-0 position rows are auto-hidden and skipped from future scans.
-        if (not force_visible) and (liq_int <= 0 or (a0_now <= 0.0 and a1_now <= 0.0)):
+        if liq_int <= 0 or (a0_now <= 0.0 and a1_now <= 0.0):
             _mark_auto_hidden_closed_position(int(chain_id), str(proto_label or ""), _position_token_id_from_raw(p.get("id")))
             return None
         # Status is derived only from "In position":
@@ -8252,6 +8471,7 @@ def _scan_pool_positions_chain(
             "token0_id": str((pool.get("token0") or {}).get("id") or ""),
             "token1_id": str((pool.get("token1") or {}).get("id") or ""),
             "position_id": str(p.get("id") or ""),
+            "position_contract": str(p.get("_nft_contract") or ""),
             "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
             "fee_tier": fee_disp,
             "fee_tier_raw": fee_raw,
@@ -11419,6 +11639,7 @@ def _render_positions_page() -> str:
         String(r.chain || "").toLowerCase(),
         String(r.protocol || "").toLowerCase(),
         String(r.position_id || ""),
+        String(r.position_contract || "").toLowerCase(),
         String(r.pool_id || "").toLowerCase(),
       ].join("|");
     }
