@@ -438,6 +438,8 @@ CONTRACT_CREATION_DATE_CACHE: dict[tuple[int, str], str] = {}
 CONTRACT_CREATION_DATE_CACHE_LOCK = threading.Lock()
 POSITION_CREATION_DATE_CACHE: dict[tuple[int, str, int], str] = {}
 POSITION_CREATION_DATE_CACHE_LOCK = threading.Lock()
+AUTO_HIDDEN_CLOSED_POSITION_IDS: set[tuple[int, str, int]] = set()
+AUTO_HIDDEN_CLOSED_POSITION_IDS_LOCK = threading.Lock()
 POSITION_CONTRACT_SNAPSHOT_TTL_SEC = max(30, int(os.environ.get("POSITION_CONTRACT_SNAPSHOT_TTL_SEC", "600")))
 POSITION_CONTRACT_SNAPSHOT_CACHE: dict[tuple[int, str, int], tuple[float, dict[str, Any]]] = {}
 POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK = threading.Lock()
@@ -3474,6 +3476,39 @@ def _position_token_id_from_raw(position_id: Any) -> int:
     return _parse_int_like(raw)
 
 
+def _closed_position_key(chain_id: int, protocol: str, position_id: Any) -> tuple[int, str, int] | None:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    tid = _position_token_id_from_raw(position_id)
+    if cid <= 0 or not proto or tid <= 0:
+        return None
+    return (cid, proto, int(tid))
+
+
+def _is_auto_hidden_closed_position(chain_id: int, protocol: str, position_id: Any) -> bool:
+    key = _closed_position_key(chain_id, protocol, position_id)
+    if not key:
+        return False
+    with AUTO_HIDDEN_CLOSED_POSITION_IDS_LOCK:
+        return key in AUTO_HIDDEN_CLOSED_POSITION_IDS
+
+
+def _mark_auto_hidden_closed_position(chain_id: int, protocol: str, position_id: Any) -> None:
+    key = _closed_position_key(chain_id, protocol, position_id)
+    if not key:
+        return
+    with AUTO_HIDDEN_CLOSED_POSITION_IDS_LOCK:
+        AUTO_HIDDEN_CLOSED_POSITION_IDS.add(key)
+
+
+def _unhide_auto_hidden_closed_position(chain_id: int, protocol: str, position_id: Any) -> None:
+    key = _closed_position_key(chain_id, protocol, position_id)
+    if not key:
+        return
+    with AUTO_HIDDEN_CLOSED_POSITION_IDS_LOCK:
+        AUTO_HIDDEN_CLOSED_POSITION_IDS.discard(key)
+
+
 def _position_manager_for_protocol(chain_id: int, protocol: str) -> str:
     cid = int(chain_id)
     proto = str(protocol or "").strip().lower()
@@ -5003,9 +5038,12 @@ def _scan_v3_positions_onchain(
         dbg["scanned_token_ids"] = 0
         dbg["kept_positions"] = 0
         dbg["skipped_zero_liq"] = 0
+        dbg["closed_auto_hidden"] = 0
         dbg["invalid_positions"] = 0
 
     def _build_position_from_token_id(token_id: int) -> dict[str, Any] | None:
+        if _is_auto_hidden_closed_position(int(chain_id), str(protocol_label or "uniswap_v3"), int(token_id)):
+            return None
         # positions(uint256)
         pos_data = "0x99fbab88" + _encode_uint_word(token_id)
         pos_words = _hex_words(_eth_call_hex(int(chain_id), npm, pos_data))
@@ -5020,6 +5058,10 @@ def _scan_v3_positions_onchain(
         tokens_owed0 = _decode_uint_from_word(pos_words[10]) if len(pos_words) > 10 else 0
         tokens_owed1 = _decode_uint_from_word(pos_words[11]) if len(pos_words) > 11 else 0
         if liq <= 0:
+            if int(tokens_owed0) <= 0 and int(tokens_owed1) <= 0:
+                _mark_auto_hidden_closed_position(int(chain_id), str(protocol_label or "uniswap_v3"), int(token_id))
+                if dbg is not None:
+                    dbg["closed_auto_hidden"] = int(dbg.get("closed_auto_hidden") or 0) + 1
             if dbg is not None:
                 dbg["skipped_zero_liq"] = int(dbg.get("skipped_zero_liq") or 0) + 1
             return None
@@ -5125,6 +5167,8 @@ def _fetch_v3_position_onchain_by_token_id(
         return None
     if tid <= 0:
         return None
+    if _is_auto_hidden_closed_position(int(cid), str(protocol_label or "uniswap_v3"), int(tid)):
+        return None
     npm = UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid)
     factory = UNISWAP_V3_FACTORY_BY_CHAIN_ID.get(cid)
     if not npm or not factory:
@@ -5143,6 +5187,8 @@ def _fetch_v3_position_onchain_by_token_id(
         tokens_owed0 = _decode_uint_from_word(pos_words[10]) if len(pos_words) > 10 else 0
         tokens_owed1 = _decode_uint_from_word(pos_words[11]) if len(pos_words) > 11 else 0
         if liq <= 0:
+            if int(tokens_owed0) <= 0 and int(tokens_owed1) <= 0:
+                _mark_auto_hidden_closed_position(int(cid), str(protocol_label or "uniswap_v3"), int(tid))
             return None
         pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(fee)
         pool_words = _hex_words(_eth_call_hex(cid, factory, pool_data))
@@ -8882,7 +8928,7 @@ def _scan_pool_positions(
     _enrich_rows_liquidity_usd(uniq_rows, max_seconds=4 if not hard_scan else 10)
     timings["liquidity_usd_enrich_sec"] = round(max(0.0, time.monotonic() - t_liq), 3)
     _apply_creation_dates_phase(uniq_rows, include_creation_dates=include_creation_dates)
-    v3_ctr = {"scanned": 0, "kept": 0, "skipped0": 0, "invalid": 0}
+    v3_ctr = {"scanned": 0, "kept": 0, "skipped0": 0, "closed_hidden": 0, "invalid": 0}
     for d in debug_rows:
         attempts = (d or {}).get("attempts") or []
         if not isinstance(attempts, list):
@@ -8896,12 +8942,14 @@ def _scan_pool_positions(
             v3_ctr["scanned"] += int(vd.get("scanned_token_ids") or 0)
             v3_ctr["kept"] += int(vd.get("kept_positions") or 0)
             v3_ctr["skipped0"] += int(vd.get("skipped_zero_liq") or 0)
+            v3_ctr["closed_hidden"] += int(vd.get("closed_auto_hidden") or 0)
             v3_ctr["invalid"] += int(vd.get("invalid_positions") or 0)
     if POSITIONS_CONTRACT_ONLY_ENABLED or int(v3_ctr["scanned"]) > 0 or int(v3_ctr["kept"]) > 0:
         timings["v3_contract_scan"] = {
             "scanned_token_ids": int(v3_ctr["scanned"]),
             "kept_positions": int(v3_ctr["kept"]),
             "skipped_zero_liq": int(v3_ctr["skipped0"]),
+            "closed_auto_hidden_count": int(v3_ctr["closed_hidden"]),
             "invalid_positions": int(v3_ctr["invalid"]),
         }
     dedup_errors = list(dict.fromkeys(errors))
@@ -11411,6 +11459,7 @@ def _render_positions_page() -> str:
           `v3_scan: scanned=${Number(v3Scan.scanned_token_ids || 0)} `
           + `kept=${Number(v3Scan.kept_positions || 0)} `
           + `skipped0=${Number(v3Scan.skipped_zero_liq || 0)} `
+          + `closed=${Number(v3Scan.closed_auto_hidden_count || 0)} `
           + `invalid=${Number(v3Scan.invalid_positions || 0)}`
         );
         if (!infinityMode) {
@@ -14568,6 +14617,7 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     token_id = _position_token_id_from_raw(pos_id)
     if chain_id <= 0 or token_id <= 0:
         return {"ok": False, "reason": "invalid_row"}
+    _unhide_auto_hidden_closed_position(int(chain_id), protocol, int(token_id))
     if protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
         return {"ok": False, "reason": "unsupported_protocol"}
     snap = _fetch_v3_position_contract_snapshot(int(chain_id), protocol, int(token_id), owner)
