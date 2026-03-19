@@ -6216,6 +6216,7 @@ def _scan_uniswap_v4_positions_onchain(
         return []
     if deadline_ts is not None and time.monotonic() >= deadline_ts:
         return []
+    from_explorer_ids = bool(isinstance(token_ids_override, list) and token_ids_override)
 
     token_ids: list[int] = []
     if isinstance(token_ids_override, list) and token_ids_override:
@@ -6270,7 +6271,8 @@ def _scan_uniswap_v4_positions_onchain(
             if not owner_words:
                 continue
             owner_match = bool(owner_words[0][-40:].lower() == owner_word)
-            if not owner_match:
+            owner_mismatch_allowed = bool(from_explorer_ids and not owner_match)
+            if not owner_match and not owner_mismatch_allowed:
                 continue
 
             batch = _eth_call_hex_batch(
@@ -6298,9 +6300,15 @@ def _scan_uniswap_v4_positions_onchain(
             if len(p_words) < 6:
                 continue
             liq = _decode_uint_eth_call(liq_hex or "0x0")
+            allow_zero_liq = False
             if int(liq) <= 0:
-                _mark_auto_hidden_closed_position(int(cid), v4_hidden_key, int(token_id))
-                continue
+                if from_explorer_ids:
+                    # Explorer-confirmed v4 IDs may belong to compatible managers that expose
+                    # liquidity differently; keep them visible instead of auto-hiding.
+                    allow_zero_liq = True
+                else:
+                    _mark_auto_hidden_closed_position(int(cid), v4_hidden_key, int(token_id))
+                    continue
 
             raw0 = _decode_address_from_word(p_words[0])
             raw1 = _decode_address_from_word(p_words[1])
@@ -6340,6 +6348,8 @@ def _scan_uniswap_v4_positions_onchain(
                     "_source": "onchain_uniswap_v4_pm",
                     "_skip_enrich": True,
                     "_nft_contract": str(pm),
+                    "_allow_zero_liq": bool(allow_zero_liq),
+                    "_owner_mismatch": bool(not owner_match),
                 }
             )
         except Exception:
@@ -8038,7 +8048,8 @@ def _scan_pool_positions_chain(
             if enriched:
                 p = enriched
         liq_raw = p.get("liquidity")
-        if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
+        allow_zero_liq = bool(p.get("_allow_zero_liq"))
+        if (not allow_zero_liq) and liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
             return None
         pool = p.get("pool") or {}
         fee_raw = str(pool.get("feeTier") or "").strip()
@@ -8427,7 +8438,7 @@ def _scan_pool_positions_chain(
         a0_now = max(0.0, float(amount0_val or 0.0))
         a1_now = max(0.0, float(amount1_val or 0.0))
         # Zero-liquidity / 0-0 position rows are auto-hidden and skipped from future scans.
-        if liq_int <= 0 or (a0_now <= 0.0 and a1_now <= 0.0):
+        if (not allow_zero_liq) and (liq_int <= 0 or (a0_now <= 0.0 and a1_now <= 0.0)):
             _mark_auto_hidden_closed_position(int(chain_id), str(proto_label or ""), _position_token_id_from_raw(p.get("id")))
             return None
         # Status is derived only from "In position":
