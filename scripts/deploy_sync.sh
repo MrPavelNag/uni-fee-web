@@ -8,6 +8,7 @@ set -euo pipefail
 #   ./scripts/deploy_sync.sh "commit message"
 #   SYNC_ONLY=1 ./scripts/deploy_sync.sh
 #   NO_PUSH=1 ./scripts/deploy_sync.sh "commit without push"
+#   SYNC_INCLUDE_SCRIPTS=1 ./scripts/deploy_sync.sh "sync scripts too"
 #
 # Default source worktree:
 #   /Users/pavelnag/.cursor/worktrees/uni_fee/lbw
@@ -20,6 +21,7 @@ COMMIT_MSG="${1:-$DEFAULT_MSG}"
 DST_ROOT="${DST_ROOT:-/Users/pavelnag/agents/uni_fee}"
 SYNC_ONLY="${SYNC_ONLY:-0}"
 NO_PUSH="${NO_PUSH:-0}"
+SYNC_INCLUDE_SCRIPTS="${SYNC_INCLUDE_SCRIPTS:-0}"
 
 if ! git -C "${DST_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "Error: destination is not a git repository: ${DST_ROOT}"
@@ -36,8 +38,6 @@ fi
 REQUIRED_FILES=(
   "webapp/main.py"
   "README.md"
-  "scripts/deploy_render.sh"
-  "scripts/deploy_sync.sh"
 )
 
 echo "==> Source: ${SRC_ROOT}"
@@ -52,6 +52,15 @@ OPTIONAL_FILES=(
   "docs/SMOKE_CHECKLIST.md"
   "scripts/smoke_render.sh"
 )
+
+if [[ "${SYNC_INCLUDE_SCRIPTS}" == "1" ]]; then
+  OPTIONAL_FILES+=(
+    "scripts/deploy_render.sh"
+    "scripts/deploy_sync.sh"
+  )
+else
+  echo "==> SYNC_INCLUDE_SCRIPTS=0 (default): skipping deploy script sync"
+fi
 
 STAGE_FILES=()
 

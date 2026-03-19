@@ -144,6 +144,13 @@ chmod +x scripts/deploy_sync.sh
 ./scripts/deploy_sync.sh "sync latest changes"
 ```
 
+По умолчанию `deploy_sync.sh` синхронизирует только `webapp/main.py`, `README.md` и optional-артефакты (например, smoke checklist), но **не** перезаписывает deploy-скрипты.
+Чтобы явно синхронизировать deploy-скрипты тоже:
+
+```bash
+SYNC_INCLUDE_SCRIPTS=1 ./scripts/deploy_sync.sh "sync including scripts"
+```
+
 Без commit/push (только скопировать и застейджить):
 
 ```bash
