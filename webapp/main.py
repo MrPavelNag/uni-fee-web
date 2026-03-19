@@ -4389,72 +4389,75 @@ def _explorer_owner_nfttx_rows(chain_id: int, owner: str, *, max_rows: int = 400
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
     arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
     uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
-    urls: list[str] = []
+    url_templates: list[str] = []
     offset = max(20, min(1000, int(max_rows)))
     if eth_key:
-        urls.append(
+        url_templates.append(
             "https://api.etherscan.io/v2/api"
             f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}"
+            f"&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={eth_key}"
         )
     if cid == 56 and bsc_key:
-        urls.append(
+        url_templates.append(
             "https://api.bscscan.com/api"
-            f"?module=account&action=tokennfttx&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}"
+            f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={bsc_key}"
         )
     elif cid == 8453 and base_key:
-        urls.append(
+        url_templates.append(
             "https://api.basescan.org/api"
-            f"?module=account&action=tokennfttx&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}"
+            f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={base_key}"
         )
     elif cid == 42161 and arb_key:
-        urls.append(
+        url_templates.append(
             "https://api.arbiscan.io/api"
-            f"?module=account&action=tokennfttx&address={o}&page=1&offset={offset}&sort=desc&apikey={arb_key}"
+            f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={arb_key}"
         )
     elif cid == 130 and uni_key:
         uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
-        urls.append(
-            f"{uniscan_api}?module=account&action=tokennfttx&address={o}&page=1&offset={offset}&sort=desc&apikey={uni_key}"
+        url_templates.append(
+            f"{uniscan_api}?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={uni_key}"
         )
-    if not urls:
+    if not url_templates:
         return []
 
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
-    for url in urls:
-        try:
-            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
-            with urlopen(req, timeout=12) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            rows = (payload or {}).get("result")
-            if not isinstance(rows, list):
+    max_pages = int(POSITIONS_EXPLORER_NFTTX_MAX_PAGES)
+    for tmpl in url_templates:
+        for page in range(1, max_pages + 1):
+            try:
+                url = str(tmpl).replace("{page}", str(page))
+                req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+                with urlopen(req, timeout=12) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                rows = (payload or {}).get("result")
+                if not isinstance(rows, list) or not rows:
+                    break
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    caddr = str(
+                        r.get("contractAddress")
+                        or r.get("contractaddress")
+                        or r.get("tokenAddress")
+                        or ""
+                    ).strip().lower()
+                    tid = str(r.get("tokenID") or "").strip().lower()
+                    txh = str(r.get("hash") or "").strip().lower()
+                    logi = str(r.get("logIndex") or "").strip().lower()
+                    if not _is_eth_address(caddr) or not tid:
+                        continue
+                    k = "|".join([txh, logi, caddr, tid])
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    out.append(r)
+                    if len(out) >= int(max_rows):
+                        return out
+            except Exception:
                 continue
-            for r in rows:
-                if not isinstance(r, dict):
-                    continue
-                caddr = str(
-                    r.get("contractAddress")
-                    or r.get("contractaddress")
-                    or r.get("tokenAddress")
-                    or ""
-                ).strip().lower()
-                tid = str(r.get("tokenID") or "").strip().lower()
-                txh = str(r.get("hash") or "").strip().lower()
-                logi = str(r.get("logIndex") or "").strip().lower()
-                if not _is_eth_address(caddr) or not tid:
-                    continue
-                k = "|".join([txh, logi, caddr, tid])
-                if k in seen:
-                    continue
-                seen.add(k)
-                out.append(r)
-                if len(out) >= int(max_rows):
-                    return out
-            if out:
-                return out
-        except Exception:
-            continue
+        if out:
+            return out
     return out
 
 
