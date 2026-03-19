@@ -4408,6 +4408,7 @@ def _scan_erc721_token_ids_from_explorer_rows(
     owner: str,
     max_ids: int = 120,
     protocol: str = "",
+    only_current_owner: bool = False,
 ) -> list[int]:
     cid = int(chain_id)
     c = str(contract or "").strip().lower()
@@ -4421,6 +4422,7 @@ def _scan_erc721_token_ids_from_explorer_rows(
     out: list[int] = []
     seen: set[int] = set()
     min_ts_by_tid: dict[int, int] = {}
+    latest_evt_by_tid: dict[int, tuple[int, int, bool]] = {}
     for r in rows or []:
         if not isinstance(r, dict):
             continue
@@ -4448,6 +4450,13 @@ def _scan_erc721_token_ids_from_explorer_rows(
                 continue
         if tid <= 0:
             continue
+        block_n = _parse_int_like(r.get("blockNumber") or 0)
+        ts_n = _parse_int_like(r.get("timeStamp") or 0)
+        to_is_owner = bool(to_addr in owner_candidates)
+        prev_evt = latest_evt_by_tid.get(int(tid))
+        cur_evt = (int(block_n), int(ts_n), bool(to_is_owner))
+        if prev_evt is None or (cur_evt[0], cur_evt[1]) >= (prev_evt[0], prev_evt[1]):
+            latest_evt_by_tid[int(tid)] = cur_evt
         if tid not in seen:
             seen.add(tid)
             out.append(int(tid))
@@ -4460,6 +4469,15 @@ def _scan_erc721_token_ids_from_explorer_rows(
             continue
     if len(out) > int(max_ids):
         out = out[: int(max_ids)]
+    if only_current_owner:
+        filtered: list[int] = []
+        for tid in out:
+            evt = latest_evt_by_tid.get(int(tid))
+            if not evt:
+                continue
+            if bool(evt[2]):
+                filtered.append(int(tid))
+        out = filtered[: int(max_ids)]
     proto = str(protocol or "").strip().lower()
     if proto:
         for tid in out:
@@ -4614,6 +4632,10 @@ def _scan_v4_position_ids_by_explorer_any_contract(
         return {}
     by_contract: dict[str, list[int]] = {}
     seen_by_contract: dict[str, set[int]] = {}
+    owner_candidates = _position_owner_allowlist(cid, "uniswap_v4", owner_addr)
+    if not owner_candidates:
+        owner_candidates = {owner_addr}
+    latest_evt: dict[tuple[str, int], tuple[int, int, bool]] = {}
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -4637,6 +4659,17 @@ def _scan_v4_position_ids_by_explorer_any_contract(
                 continue
         if tid <= 0:
             continue
+        to_addr = str(r.get("to") or "").strip().lower()
+        from_addr = str(r.get("from") or "").strip().lower()
+        if to_addr not in owner_candidates and from_addr not in owner_candidates:
+            continue
+        block_n = _parse_int_like(r.get("blockNumber") or 0)
+        ts_n = _parse_int_like(r.get("timeStamp") or 0)
+        key_evt = (str(caddr), int(tid))
+        cur_evt = (int(block_n), int(ts_n), bool(to_addr in owner_candidates))
+        prev_evt = latest_evt.get(key_evt)
+        if prev_evt is None or (cur_evt[0], cur_evt[1]) >= (prev_evt[0], prev_evt[1]):
+            latest_evt[key_evt] = cur_evt
         seen = seen_by_contract.setdefault(caddr, set())
         if int(tid) in seen:
             continue
@@ -4649,13 +4682,20 @@ def _scan_v4_position_ids_by_explorer_any_contract(
     for caddr, tids in by_contract.items():
         if not tids:
             continue
+        owned_tids: list[int] = []
+        for tid in tids:
+            evt = latest_evt.get((str(caddr), int(tid)))
+            if evt and bool(evt[2]):
+                owned_tids.append(int(tid))
+        if not owned_tids:
+            continue
         try:
             code = _eth_get_code(cid, caddr, "latest")
             if code in {"0x", "0x0"}:
                 continue
         except Exception:
             continue
-        sample_id = int(tids[0])
+        sample_id = int(owned_tids[0])
         try:
             info_hex = _eth_call_hex(cid, caddr, sel_info + _encode_uint_word(sample_id))
             liq_hex = _eth_call_hex(cid, caddr, sel_liq + _encode_uint_word(sample_id))
@@ -4664,7 +4704,7 @@ def _scan_v4_position_ids_by_explorer_any_contract(
             _decode_uint_eth_call(liq_hex or "0x0")
         except Exception:
             continue
-        out[caddr] = list(tids[: int(max_ids)])
+        out[caddr] = list(owned_tids[: int(max_ids)])
     return out
 
 
@@ -7408,6 +7448,7 @@ def _scan_pool_positions_chain(
                     owner=owner,
                     max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
                     protocol=v3_proto,
+                    only_current_owner=False,
                 )
             out["v3_ids"] = list(explorer_v3_ids or [])
             out["v3_ids_count"] = len(explorer_v3_ids)
@@ -7426,6 +7467,7 @@ def _scan_pool_positions_chain(
                     owner=owner,
                     max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
                     protocol="uniswap_v4",
+                    only_current_owner=True,
                 )
                 if explorer_v4_ids:
                     v4_contract_to_ids[v4_pm] = list(explorer_v4_ids)
