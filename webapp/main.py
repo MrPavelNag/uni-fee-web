@@ -3091,6 +3091,37 @@ def _explorer_nfttx_row_token_id_str(row: dict[str, Any]) -> str:
     return ""
 
 
+def _explorer_debug_count_request_failures(dbg: dict[str, Any]) -> int:
+    """Count failed / empty explorer HTTP attempts from _explorer_owner_nfttx_rows debug payload."""
+    reqs = dbg.get("requests") if isinstance(dbg, dict) else None
+    if not isinstance(reqs, list):
+        return 0
+    n = 0
+    for r in reqs:
+        if not isinstance(r, dict):
+            continue
+        st = str(r.get("status") or "").strip().lower()
+        if st in {"error", "0"}:
+            n += 1
+            continue
+        msg = str(r.get("message") or "").lower()
+        if any(
+            x in msg
+            for x in (
+                "rate limit",
+                "invalid api",
+                "notok",
+                "timeout",
+                "missing",
+                "unexpected",
+                "max rate",
+                "api pro",
+            )
+        ):
+            n += 1
+    return int(n)
+
+
 def _explorer_v2_api_keys(chain_id: int) -> list[str]:
     """Only ETHERSCAN_API_KEY is used with api.etherscan.io/v2 (chain selected via chainid=)."""
     _ = int(chain_id)
@@ -4221,26 +4252,30 @@ def _explorer_owner_nfttx_rows(
     if not chainid_for_v2:
         return []
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
-    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
-    base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
-    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
-    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip() or eth_key
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
+    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip() or eth_key
+    polygon_key = os.environ.get("POLYGONSCAN_API_KEY", "").strip() or eth_key
+    optimistic_key = (
+        os.environ.get("OPTIMISTIC_ETHERSCAN_API_KEY", "").strip()
+        or os.environ.get("OPTIMISM_ETHERSCAN_API_KEY", "").strip()
+        or eth_key
+    )
+    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip() or eth_key
     if isinstance(debug_out, dict):
         debug_out["chain_id"] = int(cid)
         debug_out["has_eth_key"] = bool(eth_key)
         debug_out["has_bsc_key"] = bool(bsc_key)
         debug_out["has_base_key"] = bool(base_key)
         debug_out["has_arb_key"] = bool(arb_key)
+        debug_out["has_polygon_key"] = bool(polygon_key)
+        debug_out["has_optimistic_key"] = bool(optimistic_key)
         debug_out["has_uni_key"] = bool(uni_key)
     url_templates: list[str] = []
     offset = max(20, min(1000, int(max_rows)))
-    # Primary for all supported EVM chains (incl. BSC=56): Etherscan API v2 + ETHERSCAN_API_KEY.
-    if eth_key:
-        url_templates.append(
-            "https://api.etherscan.io/v2/api"
-            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-            f"&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={eth_key}"
-        )
+    # Prefer chain-native explorers first: tokennfttx indexing on api.etherscan.io/v2 is sometimes empty
+    # for an L2/L1 while the sibling explorer (e.g. Arbiscan, Polygonscan) returns rows. Same Etherscan
+    # account key often works on those hosts; fall back to v2 below.
     if cid == 56 and bsc_key:
         url_templates.append(
             "https://api.bscscan.com/api"
@@ -4251,15 +4286,32 @@ def _explorer_owner_nfttx_rows(
             "https://api.basescan.org/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={base_key}"
         )
-    elif cid == 42161 and arb_key:
+    if cid == 42161 and arb_key:
         url_templates.append(
             "https://api.arbiscan.io/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={arb_key}"
         )
-    elif cid in {130, 1301} and uni_key:
+    if cid == 137 and polygon_key:
+        url_templates.append(
+            "https://api.polygonscan.com/api"
+            f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={polygon_key}"
+        )
+    if cid == 10 and optimistic_key:
+        url_templates.append(
+            "https://api-optimistic.etherscan.io/api"
+            f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={optimistic_key}"
+        )
+    if cid in {130, 1301} and uni_key:
         uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
         url_templates.append(
             f"{uniscan_api}?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={uni_key}"
+        )
+    # Multichain v2 (same ETHERSCAN_API_KEY + chainid) — after native so we don't miss L2 index gaps.
+    if eth_key:
+        url_templates.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+            f"&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={eth_key}"
         )
     if not url_templates:
         if isinstance(debug_out, dict):
@@ -9540,6 +9592,7 @@ def _scan_pool_positions_explorer_nft_catalog(
     include_creation_dates: bool = True,
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
+    pos_job_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
     """tokennfttx per (chain, owner) in parallel → SQLite (supported DEX only) + UI rows."""
     _ = (pre_enqueued_ownership_refresh, hard_scan)
@@ -9555,6 +9608,23 @@ def _scan_pool_positions_explorer_nft_catalog(
     raw_ids = sorted(set(raw_ids))
     if not raw_ids or not addresses:
         timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
+        timings["nft_tokennfttx_rows_scanned"] = 0
+        timings["nft_owned_positions_total"] = 0
+        timings["nft_owner_chain_tasks_planned"] = 0
+        timings["nft_owner_chain_tasks_failed"] = 0
+        timings["nft_explorer_api_request_failures"] = 0
+        timings["nft_missing_or_error_events"] = 0
+        if pos_job_id:
+            _update_pos_job(
+                pos_job_id,
+                stage_label="Scanning NFT collections — skipped (no chains or addresses)",
+                progress=25.0,
+                nft_scan_tasks_total=0,
+                nft_scan_tasks_done=0,
+                nft_scan_rows_total=0,
+                nft_scan_task_errors=0,
+                nft_scan_api_errors=0,
+            )
         return [], errors, debug_rows, timings
 
     priority_chain_ids = [130, 56, 8453, 1, 42161, 137, 10]
@@ -9578,18 +9648,86 @@ def _scan_pool_positions_explorer_nft_catalog(
     timings["parallel_workers"] = int(workers)
     timings["owner_chain_tasks"] = int(len(tasks))
 
+    n_tasks = int(len(tasks))
+
+    def _nft_parallel_job_progress(done: int, total: int) -> float:
+        if total <= 0:
+            return 64.0
+        return 15.0 + (49.0 * float(done) / float(total))
+
     fetch_results: list[dict[str, Any]] = []
-    if tasks:
+    if not tasks:
+        if pos_job_id:
+            _update_pos_job(
+                pos_job_id,
+                stage_label="Scanning NFT collections — 100% (no wallet×chain tasks)",
+                progress=30.0,
+                nft_scan_tasks_total=0,
+                nft_scan_tasks_done=0,
+                nft_scan_rows_total=0,
+                nft_scan_task_errors=0,
+                nft_scan_api_errors=0,
+            )
+    elif tasks:
+        done_ct = 0
+        rows_sum = 0
+        task_err_ct = 0
+        api_err_sum = 0
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [
-                ex.submit(_explorer_nft_catalog_owner_chain_scan, cid, ok, max_rows, deadline_ts)
+            futs = {
+                ex.submit(_explorer_nft_catalog_owner_chain_scan, cid, ok, max_rows, deadline_ts): (cid, ok)
                 for cid, ok in tasks
-            ]
+            }
             for fut in as_completed(futs):
+                cid0, ok0 = futs[fut]
                 try:
-                    fetch_results.append(fut.result())
+                    fr = fut.result()
+                    fetch_results.append(fr)
                 except Exception as e:
-                    errors.append(f"explorer_nft_catalog: {e}"[:200])
+                    err_s = str(e)[:200]
+                    errors.append(f"explorer_nft_catalog wallet={ok0[:10]}… chain={cid0}: {err_s}")
+                    fr = {
+                        "chain_id": int(cid0),
+                        "owner": str(ok0).strip().lower(),
+                        "nft_rows": [],
+                        "owned": [],
+                        "debug": {"error": err_s},
+                        "error": err_s,
+                    }
+                    fetch_results.append(fr)
+                dbg_fr = fr.get("debug") if isinstance(fr.get("debug"), dict) else {}
+                api_err_sum += int(_explorer_debug_count_request_failures(dbg_fr))
+                if str(fr.get("error") or "").strip():
+                    task_err_ct += 1
+                nr = fr.get("nft_rows") if isinstance(fr.get("nft_rows"), list) else []
+                rows_sum += int(len(nr))
+                done_ct += 1
+                if pos_job_id:
+                    pct = (100.0 * float(done_ct) / float(n_tasks)) if n_tasks else 100.0
+                    _update_pos_job(
+                        pos_job_id,
+                        progress=float(_nft_parallel_job_progress(done_ct, n_tasks)),
+                        stage_label=(
+                            f"Scanning NFT collections — {pct:.1f}% "
+                            f"({done_ct}/{n_tasks} wallet×chain)"
+                        ),
+                        nft_scan_tasks_total=int(n_tasks),
+                        nft_scan_tasks_done=int(done_ct),
+                        nft_scan_rows_total=int(rows_sum),
+                        nft_scan_task_errors=int(task_err_ct),
+                        nft_scan_api_errors=int(api_err_sum),
+                    )
+        if pos_job_id:
+            _update_pos_job(
+                pos_job_id,
+                progress=61.0,
+                stage_label="Aggregating NFT catalog…",
+                nft_scan_tasks_total=int(n_tasks),
+                nft_scan_tasks_done=int(n_tasks),
+                nft_scan_rows_total=int(rows_sum),
+                nft_scan_task_errors=int(task_err_ct),
+                nft_scan_api_errors=int(api_err_sum),
+            )
     fetch_results.sort(key=lambda x: (int(x.get("chain_id") or 0), str(x.get("owner") or "")))
 
     results_by_chain: dict[int, list[dict[str, Any]]] = {}
@@ -9736,6 +9874,36 @@ def _scan_pool_positions_explorer_nft_catalog(
 
     timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
     timings["rows"] = len(rows_out)
+    nft_rows_total = sum(
+        len(fr.get("nft_rows")) if isinstance(fr.get("nft_rows"), list) else 0 for fr in fetch_results
+    )
+    owned_total = sum(
+        len(fr.get("owned")) if isinstance(fr.get("owned"), list) else 0 for fr in fetch_results
+    )
+    tasks_failed_final = sum(1 for fr in fetch_results if str(fr.get("error") or "").strip())
+    api_err_total_final = 0
+    for fr in fetch_results:
+        d = fr.get("debug")
+        if isinstance(d, dict):
+            api_err_total_final += int(_explorer_debug_count_request_failures(d))
+    timings["nft_tokennfttx_rows_scanned"] = int(nft_rows_total)
+    timings["nft_owned_positions_total"] = int(owned_total)
+    timings["nft_owner_chain_tasks_planned"] = int(len(tasks))
+    timings["nft_owner_chain_tasks_failed"] = int(tasks_failed_final)
+    timings["nft_explorer_api_request_failures"] = int(api_err_total_final)
+    timings["nft_missing_or_error_events"] = int(tasks_failed_final + api_err_total_final)
+    if pos_job_id and int(len(tasks)) > 0:
+        _update_pos_job(
+            pos_job_id,
+            nft_scan_rows_total=int(nft_rows_total),
+            nft_scan_task_errors=int(tasks_failed_final),
+            nft_scan_api_errors=int(api_err_total_final),
+            progress=64.0,
+            stage_label=(
+                f"NFT catalog done — scanned {int(nft_rows_total)} tokennfttx rows, "
+                f"{int(tasks_failed_final)} task error(s), {int(api_err_total_final)} API failure(s)"
+            ),
+        )
     return rows_out, errors, debug_rows, timings
 
 
@@ -9746,6 +9914,7 @@ def _scan_pool_positions(
     include_creation_dates: bool = True,
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
+    pos_job_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         return _scan_pool_positions_explorer_nft_catalog(
@@ -9754,6 +9923,7 @@ def _scan_pool_positions(
             include_creation_dates=include_creation_dates,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
+            pos_job_id=pos_job_id,
         )
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -11907,6 +12077,10 @@ def _render_positions_page() -> str:
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
     #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
+    #posPoolsTable td.pos-pools-details-cell { white-space: normal; vertical-align: middle; background: #f1f5f9; }
+    #posPoolsTable .pos-collapsed-section summary {
+      cursor: pointer; font-weight: 700; color: #1e3a8a; padding: 8px 6px; user-select: none;
+    }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
     .status-dot {
       display:inline-block;
@@ -12398,6 +12572,17 @@ def _render_positions_page() -> str:
         if (Number(pool?.total_sec || 0) > 0) {
           timingLines.push(`pool=${Number(pool.total_sec)}s`);
         }
+        if (String(pool?.mode || "") === "explorer_nft_catalog") {
+          const nftDbg = (dbg && typeof dbg.nft_scan === "object" && dbg.nft_scan) ? dbg.nft_scan : {};
+          const rowsN = Number(nftDbg.tokennfttx_rows_scanned ?? pool.nft_tokennfttx_rows_scanned ?? 0);
+          const ownedN = Number(nftDbg.owned_nft_positions ?? pool.nft_owned_positions_total ?? 0);
+          const taskFail = Number(nftDbg.wallet_chain_tasks_failed ?? pool.nft_owner_chain_tasks_failed ?? 0);
+          const apiFail = Number(nftDbg.explorer_api_request_failures ?? pool.nft_explorer_api_request_failures ?? 0);
+          const gapN = Number(nftDbg.missing_or_error_total ?? pool.nft_missing_or_error_events ?? taskFail + apiFail);
+          timingLines.push(
+            `NFT: tokennfttx_rows=${rowsN} owned_positions=${ownedN} | task_errors=${taskFail} api_errors=${apiFail} gaps=${gapN}`
+          );
+        }
         if (Number(pool?.priority_chains_sec || 0) > 0 || Number(pool?.remaining_chains_sec || 0) > 0) {
           timingLines.push(`chains(prio/rest)=${Number(pool.priority_chains_sec || 0)}s/${Number(pool.remaining_chains_sec || 0)}s`);
         }
@@ -12596,7 +12781,8 @@ def _render_positions_page() -> str:
         const trusted = trustedSpamKeys.has(row._row_key);
         const manual = manualHiddenKeys.has(row._row_key);
         const suspected = Boolean(row && (row.suspected_spam || row.spam_skipped));
-        const unsupported = Boolean(row && row.unsupported_protocol);
+        const up = row && row.unsupported_protocol;
+        const unsupported = up === true || up === 1 || up === "true";
         row._is_trusted_spam = trusted;
         row._is_manual_hidden = manual;
         row._is_suspected_spam = suspected;
@@ -12642,23 +12828,27 @@ def _render_positions_page() -> str:
         html += "</tr>";
       }
       if (!visible.length) html += `<tr><td colspan='${totalCols}'>No pool positions found.</td></tr>`;
-      if (unsupportedRows.length) {
+      {
         let unsupInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
         unsupInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Position ID</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
-        for (let ui = 0; ui < unsupportedRows.length; ui++) {
-          const r = unsupportedRows[ui];
-          const mismatch = hasPairMismatch(r);
-          const mismatchStyle = mismatch ? "background:#f1f5f9;color:#475569;font-weight:600;" : "";
-          const pairTrace = String(r.pair_symbol_source || "").trim();
-          const pairTitleRaw = mismatch
-            ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`
-            : (pairTrace ? `source: ${pairTrace}` : "");
-          const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
-          unsupInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked disabled title='Hidden: unsupported protocol (excluded from processing)' /></td><td style='padding:3px 6px'><input type='checkbox' disabled title='Unsupported protocol' /></td></tr>`;
+        if (unsupportedRows.length) {
+          for (let ui = 0; ui < unsupportedRows.length; ui++) {
+            const r = unsupportedRows[ui];
+            const mismatch = hasPairMismatch(r);
+            const mismatchStyle = mismatch ? "background:#f1f5f9;color:#475569;font-weight:600;" : "";
+            const pairTrace = String(r.pair_symbol_source || "").trim();
+            const pairTitleRaw = mismatch
+              ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`
+              : (pairTrace ? `source: ${pairTrace}` : "");
+            const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
+            unsupInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked disabled title='Hidden: unsupported protocol (excluded from processing)' /></td><td style='padding:3px 6px'><input type='checkbox' disabled title='Unsupported protocol' /></td></tr>`;
+          }
+        } else {
+          unsupInner += "<tr><td colspan='12' style='padding:10px 8px;color:#64748b;font-size:13px'>No NFTs classified as unsupported protocols (all rows matched Uniswap or Pancake in collection name/symbol), or run a fresh scan if this table was restored from an older cache.</td></tr>";
         }
         unsupInner += "</table>";
         const unsupOpen = unsupportedExpanded ? " open" : "";
-        html += `<tr><td colspan='${totalCols}'><details id='posUnsupportedDetails'${unsupOpen}><summary>Unsupported protocols (${unsupportedRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${unsupInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='${totalCols}' class='pos-pools-details-cell'><details id='posUnsupportedDetails' class='pos-collapsed-section'${unsupOpen}><summary>Unsupported protocols (${unsupportedRows.length})</summary><div style='margin-top:8px;max-height:280px;overflow:auto'>${unsupInner}</div></details></td></tr>`;
       }
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
@@ -12682,7 +12872,7 @@ def _render_positions_page() -> str:
         const hiddenSummary = (spamHiddenCount > 0)
           ? `Hidden positions (${hiddenRows.length}; spam=${spamHiddenCount})`
           : `Hidden positions (${hiddenRows.length})`;
-        html += `<tr><td colspan='${totalCols}'><details id='posHiddenDetails'${openAttr}><summary>${hiddenSummary}</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='${totalCols}' class='pos-pools-details-cell'><details id='posHiddenDetails' class='pos-collapsed-section'${openAttr}><summary>${hiddenSummary}</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       const unsupEl = document.getElementById("posUnsupportedDetails");
@@ -12814,15 +13004,27 @@ def _render_positions_page() -> str:
         const statusTail = statusTailFromPayload(partial);
         const metrics = statusMetrics(partial);
         const elapsedTxt = elapsedSec > 0 ? ` ${elapsedSec}s` : "";
-        let uiProgress = progress;
-        if (st === "running" && progress <= 5) {
-          // Backend can stay low during core scan; show a smooth front-end estimate meanwhile.
+        let uiProgress = Math.round(Number(progress || 0));
+        const backendLbl = String(data.stage_label || "").trim();
+        const nftProgressMode = Number(data.nft_scan_tasks_total || 0) > 0 || /nft|tokennfttx/i.test(backendLbl);
+        if (st === "running" && uiProgress <= 5 && !nftProgressMode) {
+          // Backend can stay low during some scans; show a smooth front-end estimate meanwhile.
           uiProgress = Math.min(94, 5 + Math.floor(elapsedSec * 2.2));
         }
-        const sLabel = statusStageLabel(stageLabel, st, partialRendered);
+        const sLabel = (nftProgressMode && backendLbl)
+          ? backendLbl
+          : statusStageLabel(stageLabel, st, partialRendered);
+        const nftTail = (typeof data.nft_scan_tasks_total === "number")
+          ? (
+            ` | NFT rows=${Number(data.nft_scan_rows_total || 0)} `
+            + `task_err=${Number(data.nft_scan_task_errors || 0)} `
+            + `api_err=${Number(data.nft_scan_api_errors || 0)} `
+            + `(${Number(data.nft_scan_tasks_done || 0)}/${Number(data.nft_scan_tasks_total || 0)})`
+          )
+          : "";
         const liveTag = partialRendered ? " | live" : "";
-        const eventTxt = stageEventTextFromPartial(partial, stageLabel);
-        setPosStatus(`${sLabel}${elapsedTxt} | ${uiProgress}%${metrics}${liveTag}${eventTxt}${statusTail}`, false);
+        const eventTxt = nftProgressMode ? "" : stageEventTextFromPartial(partial, stageLabel);
+        setPosStatus(`${sLabel}${elapsedTxt} | ${uiProgress}%${nftTail}${metrics}${liveTag}${eventTxt}${statusTail}`, false);
         await new Promise((resolve) => setTimeout(resolve, 1200));
       }
     }
@@ -14891,6 +15093,7 @@ def _scan_positions_evm_components(
     scan_rewards: bool,
     include_creation_dates: bool,
     hard_scan: bool,
+    pos_job_id: str | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[str],
@@ -14915,6 +15118,7 @@ def _scan_positions_evm_components(
             include_creation_dates=include_creation_dates,
             pre_enqueued_ownership_refresh=bool(POSITIONS_OWNERSHIP_INDEX_ENABLED),
             hard_scan=hard_scan,
+            pos_job_id=pos_job_id,
         )
         timings["pool_scan_sec"] = round(max(0.0, time.monotonic() - t_pool), 3)
         if isinstance(pool_timings, dict):
@@ -15019,6 +15223,17 @@ def _build_positions_scan_response(
         "summary": debug_summary_rows[:summary_limit],
         "timings": debug_timings if isinstance(debug_timings, dict) else {},
     }
+    evm_dbg = debug_timings.get("evm") if isinstance(debug_timings, dict) else None
+    pool_t = evm_dbg.get("pool") if isinstance(evm_dbg, dict) else None
+    if isinstance(pool_t, dict) and str(pool_t.get("mode") or "") == "explorer_nft_catalog":
+        debug_payload["nft_scan"] = {
+            "tokennfttx_rows_scanned": int(pool_t.get("nft_tokennfttx_rows_scanned") or 0),
+            "owned_nft_positions": int(pool_t.get("nft_owned_positions_total") or 0),
+            "wallet_chain_tasks_planned": int(pool_t.get("nft_owner_chain_tasks_planned") or 0),
+            "wallet_chain_tasks_failed": int(pool_t.get("nft_owner_chain_tasks_failed") or 0),
+            "explorer_api_request_failures": int(pool_t.get("nft_explorer_api_request_failures") or 0),
+            "missing_or_error_total": int(pool_t.get("nft_missing_or_error_events") or 0),
+        }
     return {
         "pool_positions": pool_rows,
         "lending_positions": lending_rows,
@@ -15171,6 +15386,7 @@ def _scan_positions_core(
     sid: str = "unknown",
     *,
     include_creation_dates: bool = True,
+    pos_job_id: str | None = None,
 ) -> dict[str, Any]:
     core_started = time.monotonic()
     debug_timings: dict[str, Any] = {}
@@ -15208,6 +15424,7 @@ def _scan_positions_core(
             scan_rewards=scan_rewards,
             include_creation_dates=include_creation_dates,
             hard_scan=hard_scan_enabled,
+            pos_job_id=pos_job_id,
         )
         debug_timings["evm_components_sec"] = round(max(0.0, time.monotonic() - t_evm), 3)
         if isinstance(evm_timings, dict):
@@ -15297,17 +15514,28 @@ def _scan_positions_core(
 
 def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: str) -> None:
     hard_scan_enabled = False
+    if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
+        start_label = "Scanning NFT collections — starting…"
+        start_progress = 12.0
+    else:
+        start_label = "Scanning positions"
+        start_progress = 15.0
     if _update_pos_job(
         job_id,
         status="running",
         stage="scan",
-        stage_label="Scanning positions",
-        progress=15,
+        stage_label=start_label,
+        progress=start_progress,
         started_at=time.time(),
     ) is None:
         return
     try:
-        result = _scan_positions_core(req, sid=session_id, include_creation_dates=True)
+        result = _scan_positions_core(
+            req,
+            sid=session_id,
+            include_creation_dates=True,
+            pos_job_id=job_id,
+        )
         if _update_pos_job(
             job_id,
             result=result,
