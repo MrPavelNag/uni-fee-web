@@ -5,4 +5,5 @@ pandas>=2.0.0
 fastapi>=0.115.0
 uvicorn>=0.30.0
 eth-account>=0.13.4
+eth_abi>=4.0.0
 cryptography

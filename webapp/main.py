@@ -521,10 +521,41 @@ PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID: dict[int, str] = {
     8453: "0x3d311d6283dd8ab90bb0031835c8e606349e2850",
 }
 UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID: dict[int, str] = {
-    # Uniswap v4 deployments: https://docs.uniswap.org/contracts/v4/deployments
+    # Uniswap v4 PositionManager — mainnets (see docs.uniswap.org/contracts/v4/deployments; refreshed 2026-03)
+    1: "0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e",
+    10: "0x3c3ea4b57a46241e54610e5f022e5c45859a1017",
+    137: "0x1ec2ebf4f37e7363fdfe3551602425af0b3ceef9",
+    8453: "0x7c5f5a4bbd8fd63184577525326123b519429bdc",
+    42161: "0xd88f38f930b7952f2db2432cb002e7abbf3dd869",
     130: "0x4529a01c7a0410167c5740c487a8de60232617bf",  # Unichain
-    1301: "0xd88f38f930b7952f2db2432cb002e7abbf3dd869",  # Unichain Sepolia (positions NFT)
+    1301: "0xd88f38f930b7952f2db2432cb002e7abbf3dd869",  # Unichain Sepolia
 }
+# Multicall3 — same address on Ethereum + major L2s
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
+POSITIONS_MULTICALL3_CHUNK = max(8, min(200, int(os.environ.get("POSITIONS_MULTICALL3_CHUNK", "96"))))
+
+
+def _positions_open_liquidity_prefilter_enabled() -> bool:
+    return os.environ.get("POSITIONS_OPEN_LIQUIDITY_PREFILTER", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _positions_open_liquidity_prefilter_min_ids() -> int:
+    return max(1, int(os.environ.get("POSITIONS_OPEN_LIQUIDITY_PREFILTER_MIN_IDS", "4")))
+
+
+# The Graph: сначала запросы с liquidity_gt: "0" (только активные позиции).
+POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST = os.environ.get("POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
     10: ["https://optimism-rpc.publicnode.com"],
@@ -2783,7 +2814,7 @@ def _scan_pancake_infinity_cl_positions_graph(
 
     def _rows_from_payload(payload: dict[str, Any], mode: str) -> list[dict[str, Any]]:
         data = payload.get("data") or {}
-        if mode in ("positions", "positions_in"):
+        if mode in ("positions", "positions_in", "positions_liq_gt0", "positions_in_liq_gt0"):
             return (data.get("positions") or []) or []
         if mode == "account":
             acc = data.get("account") or {}
@@ -2794,7 +2825,61 @@ def _scan_pancake_infinity_cl_positions_graph(
             return (first.get("positions") or []) or []
         return []
 
-    queries: list[tuple[str, str]] = [
+    _inf_where_active = (
+        """
+            query InfinityPositions($owner: Bytes!, $skip: Int!) {
+              positions(first: 200, skip: $skip, where: { owner: $owner, liquidity_gt: "0" }) {
+                id
+                liquidity
+                tickLower
+                tickUpper
+                pool {
+                  id
+                  feeTier
+                  liquidity
+                  sqrtPrice
+                  token0Price
+                  totalValueLockedUSD
+                  token0 { id decimals symbol }
+                  token1 { id decimals symbol }
+                }
+              }
+            }
+        """
+        if POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST
+        else ""
+    )
+    _inf_where_active_in = (
+        """
+            query InfinityPositions($owner: Bytes!, $skip: Int!) {
+              positions(first: 200, skip: $skip, where: { owner_in: [$owner], liquidity_gt: "0" }) {
+                id
+                liquidity
+                tickLower
+                tickUpper
+                pool {
+                  id
+                  feeTier
+                  liquidity
+                  sqrtPrice
+                  token0Price
+                  totalValueLockedUSD
+                  token0 { id decimals symbol }
+                  token1 { id decimals symbol }
+                }
+              }
+            }
+        """
+        if POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST
+        else ""
+    )
+    queries: list[tuple[str, str]] = []
+    if _inf_where_active.strip():
+        queries.append(("positions_liq_gt0", _inf_where_active))
+    if _inf_where_active_in.strip():
+        queries.append(("positions_in_liq_gt0", _inf_where_active_in))
+    queries.extend(
+        [
         (
             "positions",
             """
@@ -2866,14 +2951,18 @@ def _scan_pancake_infinity_cl_positions_graph(
             }
             """,
         ),
-    ]
+    ],
+    )
 
     for mode, query in queries:
         skip = 0
         while True:
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
                 break
-            payload = graphql_query(ep, query, {"owner": owner_bytes, "skip": skip}, retries=1)
+            try:
+                payload = graphql_query(ep, query, {"owner": owner_bytes, "skip": skip}, retries=1)
+            except Exception:
+                break
             rows = _rows_from_payload(payload, mode)
             if not rows:
                 break
@@ -2991,6 +3080,237 @@ def _eth_call_hex_batch(
     return out
 
 
+def _evm_selector_4(sig: str) -> bytes:
+    try:
+        from eth_hash.auto import keccak as _keccak
+
+        return _keccak(sig.encode())[:4]
+    except Exception:
+        return b""
+
+
+def _multicall3_aggregate3(
+    chain_id: int,
+    calls: list[tuple[str, bool, bytes]],
+    *,
+    deadline_ts: float | None = None,
+) -> list[tuple[bool, bytes]]:
+    """Multicall3.aggregate3 — sub-calls use allowFailure (no revert on invalid tokenId)."""
+    if not calls:
+        return []
+    if deadline_ts is not None and time.monotonic() >= deadline_ts:
+        return [(False, b"") for _ in calls]
+    try:
+        from eth_abi import decode as _abi_decode, encode as _abi_encode
+    except Exception:
+        return [(False, b"") for _ in calls]
+    mc = str(MULTICALL3_ADDRESS).strip().lower()
+    if not _is_eth_address(mc):
+        return [(False, b"") for _ in calls]
+    sel = _evm_selector_4("aggregate3((address,bool,bytes)[])")
+    if len(sel) != 4:
+        return [(False, b"") for _ in calls]
+    packed: list[tuple[str, bool, bytes]] = []
+    for target, allow_fail, calldata in calls:
+        t = str(target or "").strip().lower()
+        if not _is_eth_address(t):
+            return [(False, b"") for _ in calls]
+        if not isinstance(calldata, (bytes, bytearray)):
+            return [(False, b"") for _ in calls]
+        packed.append((t, bool(allow_fail), bytes(calldata)))
+    try:
+        body = _abi_encode(["(address,bool,bytes)[]"], [packed])
+    except Exception:
+        return [(False, b"") for _ in calls]
+    data_hex = "0x" + (sel + body).hex()
+    try:
+        ret_hex = _eth_call_hex(int(chain_id), mc, data_hex)
+    except Exception:
+        return [(False, b"") for _ in calls]
+    try:
+        raw = bytes.fromhex(ret_hex[2:])
+        decoded = _abi_decode(["(bool,bytes)[]"], raw)
+    except Exception:
+        return [(False, b"") for _ in calls]
+    inner = decoded[0] if isinstance(decoded, (list, tuple)) and decoded else ()
+    rows = list(inner) if isinstance(inner, (list, tuple)) else []
+    out: list[tuple[bool, bytes]] = []
+    for i in range(len(calls)):
+        if i < len(rows):
+            ok, data = rows[i]
+            out.append((bool(ok), bytes(data or b"")))
+        else:
+            out.append((False, b""))
+    return out
+
+
+def _nfpm_owner_of_calldata(token_id: int) -> bytes:
+    return bytes.fromhex("6352211e") + int(token_id).to_bytes(32, "big")
+
+
+def _nfpm_positions_calldata(token_id: int) -> bytes:
+    return bytes.fromhex("99fbab88") + int(token_id).to_bytes(32, "big")
+
+
+def _v4pm_get_liquidity_calldata(token_id: int) -> bytes:
+    return bytes.fromhex("1efeed33") + int(token_id).to_bytes(32, "big")
+
+
+def _decode_v3_positions_liquidity_and_fees(ret: bytes) -> tuple[int, int, int]:
+    """(liquidity, tokensOwed0, tokensOwed1) from NonfungiblePositionManager.positions()."""
+    try:
+        words = _hex_words("0x" + ret.hex())
+    except Exception:
+        return 0, 0, 0
+    if len(words) < 12:
+        return 0, 0, 0
+    try:
+        liq = int(_decode_uint_from_word(words[7]))
+        owed0 = int(_decode_uint_from_word(words[10]))
+        owed1 = int(_decode_uint_from_word(words[11]))
+        return liq, owed0, owed1
+    except Exception:
+        return 0, 0, 0
+
+
+def filter_uniswap_v3_v4_open_liquidity_token_ids(
+    chain_id: int,
+    token_ids: list[int],
+    *,
+    deadline_ts: float | None = None,
+    keep_v3_if_unclaimed_fees: bool = False,
+    v3_position_manager: str | None = None,
+    v4_position_manager: str | None = None,
+) -> dict[str, Any]:
+    """
+    Быстрый отсев сгоревших NFT и позиций с liquidity==0 (Multicall3 aggregate3).
+
+    Для каждого tokenId: ownerOf на Uniswap V3 NFPM; при неуспехе — ownerOf на V4 PM;
+    оба неуспешны → сожжённый NFT. Затем только для «живых» NFT: V3 positions() или
+    V4 getPositionLiquidity().
+
+    v3_position_manager / v4_position_manager — опционально (иначе из мап по chain_id).
+
+    Возвращает dict: open_v3, open_v4, burned, closed_zero_liquidity, unknown, multicall_roundtrips.
+    """
+    cid = int(chain_id)
+    v3_pm = str(v3_position_manager or UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    v4_pm = str(v4_position_manager or UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    ids = sorted({int(t) for t in (token_ids or []) if int(t) > 0})
+    out: dict[str, Any] = {
+        "open_v3": [],
+        "open_v4": [],
+        "burned": [],
+        "closed_zero_liquidity": [],
+        "unknown": [],
+        "multicall_roundtrips": 0,
+    }
+    if not ids:
+        return out
+    if deadline_ts is not None and time.monotonic() >= deadline_ts:
+        out["unknown"] = list(ids)
+        return out
+
+    chunk = int(POSITIONS_MULTICALL3_CHUNK)
+
+    def _chunks(xs: list[int]) -> list[list[int]]:
+        return [xs[i : i + chunk] for i in range(0, len(xs), chunk)]
+
+    rounds = 0
+    v3_nft: set[int] = set()
+    v4_nft: set[int] = set()
+    burned: set[int] = set()
+
+    # --- Phase 1a: ownerOf on V3 ---
+    if _is_eth_address(v3_pm):
+        for group in _chunks(list(ids)):
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                out["unknown"].extend(t for t in group if t not in v3_nft and t not in v4_nft and t not in burned)
+                break
+            calls = [(v3_pm, True, _nfpm_owner_of_calldata(t)) for t in group]
+            res = _multicall3_aggregate3(cid, calls, deadline_ts=deadline_ts)
+            rounds += 1
+            for tid, (ok, data) in zip(group, res):
+                if ok and len(data) >= 32:
+                    v3_nft.add(int(tid))
+
+    need_v4 = [t for t in ids if t not in v3_nft]
+    # --- Phase 1b: ownerOf on V4 (candidates not on V3 PM) ---
+    if _is_eth_address(v4_pm) and need_v4:
+        for group in _chunks(need_v4):
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                out["unknown"].extend(int(t) for t in group)
+                continue
+            calls = [(v4_pm, True, _nfpm_owner_of_calldata(t)) for t in group]
+            res = _multicall3_aggregate3(cid, calls, deadline_ts=deadline_ts)
+            rounds += 1
+            for tid, (ok, data) in zip(group, res):
+                if ok and len(data) >= 32:
+                    v4_nft.add(int(tid))
+                else:
+                    burned.add(int(tid))
+    elif need_v4:
+        # Нет адреса V4 PM в мапе — не помечаем как burned, оставляем unknown.
+        out["unknown"].extend(int(t) for t in need_v4)
+
+    # --- Phase 2: liquidity ---
+    v3_check = sorted(v3_nft)
+    v4_check = sorted(v4_nft)
+    open_v3: list[int] = []
+    open_v4: list[int] = []
+    closed_z: set[int] = set()
+
+    if _is_eth_address(v3_pm) and v3_check:
+        for group in _chunks(v3_check):
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                out["unknown"].extend(t for t in group)
+                continue
+            calls = [(v3_pm, True, _nfpm_positions_calldata(t)) for t in group]
+            res = _multicall3_aggregate3(cid, calls, deadline_ts=deadline_ts)
+            rounds += 1
+            for tid, (ok, data) in zip(group, res):
+                if not ok or not data:
+                    closed_z.add(int(tid))
+                    continue
+                liq, ow0, ow1 = _decode_v3_positions_liquidity_and_fees(data)
+                if liq > 0:
+                    open_v3.append(int(tid))
+                elif keep_v3_if_unclaimed_fees and (ow0 > 0 or ow1 > 0):
+                    open_v3.append(int(tid))
+                else:
+                    closed_z.add(int(tid))
+
+    if _is_eth_address(v4_pm) and v4_check:
+        for group in _chunks(v4_check):
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                out["unknown"].extend(t for t in group)
+                continue
+            calls = [(v4_pm, True, _v4pm_get_liquidity_calldata(t)) for t in group]
+            res = _multicall3_aggregate3(cid, calls, deadline_ts=deadline_ts)
+            rounds += 1
+            for tid, (ok, data) in zip(group, res):
+                if not ok or len(data) < 32:
+                    closed_z.add(int(tid))
+                    continue
+                try:
+                    liq = int.from_bytes(data[-32:], "big", signed=False)
+                except Exception:
+                    liq = 0
+                if liq > 0:
+                    open_v4.append(int(tid))
+                else:
+                    closed_z.add(int(tid))
+
+    out["open_v3"] = sorted(open_v3)
+    out["open_v4"] = sorted(open_v4)
+    out["burned"] = sorted(burned)
+    out["closed_zero_liquidity"] = sorted(closed_z)
+    out["multicall_roundtrips"] = int(rounds)
+    # de-dupe unknown
+    out["unknown"] = sorted(set(int(x) for x in out["unknown"]))
+    return out
+
+
 def _eth_block_number(chain_id: int) -> int:
     out = str(_json_rpc_call(int(chain_id), "eth_blockNumber", []) or "0x0").strip().lower()
     if out.startswith("0x"):
@@ -3091,8 +3411,47 @@ def _explorer_nfttx_row_token_id_str(row: dict[str, Any]) -> str:
     return ""
 
 
+def _explorer_debug_benign_status0_message(message: str) -> bool:
+    """Etherscan-family APIs use status \"0\" both for real errors and for normal empty results."""
+    m = str(message or "").strip().lower()
+    if not m:
+        return False
+    benign = (
+        "no transactions found",
+        "no transaction found",
+        "no records found",
+        "no record found",
+        "no data found",
+        "no token transfer",
+        "no matching entries",
+        "query returned no results",
+    )
+    return any(x in m for x in benign)
+
+
+def _etherscan_api_coerce_result_rows(raw: Any) -> list[Any]:
+    """Normalize Etherscan `result`: usually a list of dicts, occasionally a JSON string (V1/V2)."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        t = raw.strip()
+        if not t or t.lower() in ("null", "none"):
+            return []
+        try:
+            parsed = json.loads(t)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                return [parsed]
+        except Exception:
+            return []
+    return []
+
+
 def _explorer_debug_count_request_failures(dbg: dict[str, Any]) -> int:
-    """Count failed / empty explorer HTTP attempts from _explorer_owner_nfttx_rows debug payload."""
+    """Count real explorer/API failures from _explorer_owner_nfttx_rows debug (not empty-result status=0)."""
     reqs = dbg.get("requests") if isinstance(dbg, dict) else None
     if not isinstance(reqs, list):
         return 0
@@ -3101,18 +3460,23 @@ def _explorer_debug_count_request_failures(dbg: dict[str, Any]) -> int:
         if not isinstance(r, dict):
             continue
         st = str(r.get("status") or "").strip().lower()
-        if st in {"error", "0"}:
+        msg = str(r.get("message") or "").lower()
+        if st == "error":
             n += 1
             continue
-        msg = str(r.get("message") or "").lower()
+        if st == "0":
+            if not _explorer_debug_benign_status0_message(str(r.get("message") or "")):
+                n += 1
+            continue
         if any(
             x in msg
             for x in (
                 "rate limit",
                 "invalid api",
+                "missing api",
+                "missing parameter",
                 "notok",
                 "timeout",
-                "missing",
                 "unexpected",
                 "max rate",
                 "api pro",
@@ -3982,8 +4346,8 @@ def _explorer_nfttx_rows(
             req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
             with urlopen(req, timeout=float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-            result_rows = (payload or {}).get("result")
-            if isinstance(result_rows, list):
+            result_rows = _etherscan_api_coerce_result_rows((payload or {}).get("result"))
+            if result_rows:
                 return [x for x in result_rows if isinstance(x, dict)]
         except Exception:
             return []
@@ -4335,9 +4699,10 @@ def _explorer_owner_nfttx_rows(
         debug_out["http_timeout_sec"] = round(http_timeout, 3)
         debug_out["page_workers"] = int(page_workers)
 
-    def _append_from_result(rows: Any) -> str:
+    def _append_from_result(rows_raw: Any) -> str:
         """Return 'empty', 'ok', or 'full'."""
-        if not isinstance(rows, list) or not rows:
+        rows = _etherscan_api_coerce_result_rows(rows_raw)
+        if not rows:
             return "empty"
         for r in rows:
             if not isinstance(r, dict):
@@ -4365,13 +4730,14 @@ def _explorer_owner_nfttx_rows(
     def _dbg_append(page: int, url: str, payload: dict[str, Any] | None, *, err: str = "") -> None:
         if not isinstance(debug_out, dict):
             return
-        rows = (payload or {}).get("result") if isinstance(payload, dict) else None
+        raw_rows = (payload or {}).get("result") if isinstance(payload, dict) else None
+        coerced = _etherscan_api_coerce_result_rows(raw_rows)
         dbg_req = {
             "page": int(page),
             "status": str((payload or {}).get("status") or "") if payload else "",
             "message": str((payload or {}).get("message") or "") if payload else "",
-            "result_type": type(rows).__name__ if rows is not None else "none",
-            "result_len": (len(rows) if isinstance(rows, list) else None),
+            "result_type": type(raw_rows).__name__ if raw_rows is not None else "none",
+            "result_len": (len(coerced) if raw_rows is not None else None),
             "url": str(url).split("&apikey=", 1)[0],
         }
         if err:
@@ -4381,9 +4747,15 @@ def _explorer_owner_nfttx_rows(
         if isinstance(reqs, list) and len(reqs) < 40:
             reqs.append(dbg_req)
 
-    for tmpl in url_templates:
+    if isinstance(debug_out, dict):
+        debug_out["template_traces"] = []
+
+    for ti, tmpl in enumerate(url_templates):
         if _deadline_hit():
             break
+        out_len_tpl_start = len(out)
+        last_status = ""
+        last_message = ""
 
         def _fetch_page(page_num: int) -> tuple[int, dict[str, Any] | None]:
             try:
@@ -4400,7 +4772,12 @@ def _explorer_owner_nfttx_rows(
         while page <= max_pages and len(out) < int(max_rows):
             if _deadline_hit():
                 return _finalize()
-            batch_end = min(page + page_workers - 1, max_pages)
+            # Page 1 alone first: empty chain+template returns "no txs" on page 1 — avoids N-1 useless
+            # parallel requests when page_workers>1 (saves time and explorer quota).
+            if page == 1 and page_workers > 1:
+                batch_end = 1
+            else:
+                batch_end = min(page + page_workers - 1, max_pages)
             page_payloads: dict[int, dict[str, Any] | None] = {}
             if page_workers <= 1:
                 pn, pl = _fetch_page(page)
@@ -4429,8 +4806,10 @@ def _explorer_owner_nfttx_rows(
                 pl = page_payloads.get(pn)
                 if pl is None:
                     continue
-                rows = pl.get("result")
-                st = _append_from_result(rows)
+                if isinstance(pl, dict):
+                    last_status = str(pl.get("status") or "")
+                    last_message = str(pl.get("message") or "")
+                st = _append_from_result(pl.get("result"))
                 if st == "empty":
                     stop_tmpl = True
                     break
@@ -4439,6 +4818,27 @@ def _explorer_owner_nfttx_rows(
             if stop_tmpl:
                 break
             page = batch_end + 1
+
+        if isinstance(debug_out, dict):
+            traces = debug_out.setdefault("template_traces", [])
+            if isinstance(traces, list) and len(traces) < 16:
+                host = ""
+                try:
+                    u = str(tmpl)
+                    if "://" in u:
+                        host = u.split("/")[2].split("?")[0]
+                except Exception:
+                    host = ""
+                traces.append(
+                    {
+                        "i": int(ti),
+                        "host": host,
+                        "rows_added": int(len(out) - out_len_tpl_start),
+                        "cum_rows": int(len(out)),
+                        "last_status": last_status,
+                        "last_message": str(last_message)[:240],
+                    }
+                )
 
         if out:
             return _finalize()
@@ -5646,6 +6046,36 @@ def _scan_v3_positions_onchain(
             except Exception:
                 continue
 
+    if (
+        token_ids_prefetched
+        and scan_token_ids
+        and _positions_open_liquidity_prefilter_enabled()
+        and len(scan_token_ids) >= _positions_open_liquidity_prefilter_min_ids()
+    ):
+        n_pref_in = len(scan_token_ids)
+        try:
+            fr = filter_uniswap_v3_v4_open_liquidity_token_ids(
+                int(chain_id),
+                list(scan_token_ids),
+                deadline_ts=deadline_ts,
+                v3_position_manager=str(npm).strip().lower(),
+                v4_position_manager=str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id)) or ""),
+            )
+            scan_token_ids = [int(t) for t in (fr.get("open_v3") or [])]
+            if dbg is not None:
+                dbg["open_liquidity_prefilter"] = {
+                    "path": "v3_token_ids_override",
+                    "ids_in": int(n_pref_in),
+                    "open_v3_out": int(len(scan_token_ids)),
+                    "open_v4_side": int(len(fr.get("open_v4") or [])),
+                    "burned": int(len(fr.get("burned") or [])),
+                    "closed_zero_liquidity": int(len(fr.get("closed_zero_liquidity") or [])),
+                    "multicall_roundtrips": int(fr.get("multicall_roundtrips") or 0),
+                }
+        except Exception as ex:
+            if dbg is not None:
+                dbg["open_liquidity_prefilter"] = {"path": "v3_token_ids_override", "error": str(ex)[:220]}
+
     for token_id in scan_token_ids:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
@@ -6561,6 +6991,23 @@ def _scan_uniswap_v4_positions_onchain(
             max_ids=max(limit * 4, limit),
             lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 20_000_000),
         )
+    if (
+        token_ids
+        and _positions_open_liquidity_prefilter_enabled()
+        and len(token_ids) >= _positions_open_liquidity_prefilter_min_ids()
+    ):
+        _v4_ids_before_filter = list(token_ids)
+        try:
+            fr = filter_uniswap_v3_v4_open_liquidity_token_ids(
+                cid,
+                _v4_ids_before_filter,
+                deadline_ts=deadline_ts,
+                v3_position_manager=str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or ""),
+                v4_position_manager=str(pm),
+            )
+            token_ids = [int(t) for t in (fr.get("open_v4") or [])]
+        except Exception:
+            token_ids = _v4_ids_before_filter
     if not token_ids:
         return []
 
@@ -6761,7 +7208,28 @@ def _query_uniswap_positions_for_owner(
     light_mode: bool = False,
 ) -> list[dict[str, Any]]:
     def _build_id_queries(owner_type: str, *, extended: bool = False) -> list[tuple[str, str]]:
-        queries: list[tuple[str, str]] = [
+        liq_head: list[tuple[str, str]] = []
+        if POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST:
+            # The Graph / Goldsky: только позиции с ненулевой ликвидностью (как tokenId-лист без мусора).
+            liq_head = [
+                (
+                    "positions_liq_gt0",
+                    f"""
+                    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                      positions(first: 200, skip: $skip, where: {{ owner: $owner, liquidity_gt: "0" }}) {{ id }}
+                    }}
+                    """,
+                ),
+                (
+                    "positions_in_liq_gt0",
+                    f"""
+                    query UserPositions($owner: {owner_type}!, $skip: Int!) {{
+                      positions(first: 200, skip: $skip, where: {{ owner_in: [$owner], liquidity_gt: "0" }}) {{ id }}
+                    }}
+                    """,
+                ),
+            ]
+        queries: list[tuple[str, str]] = liq_head + [
             (
                 "positions",
                 f"""
@@ -9644,8 +10112,10 @@ def _scan_pool_positions_explorer_nft_catalog(
             ok = str(o).strip().lower()
             tasks.append((int(cid), ok))
 
-    workers = max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(tasks)))
+    # NFT catalog: dedicated cap so tuning doesn't affect subgraph / contract-only paths.
+    workers = max(1, min(int(POSITIONS_NFT_PARALLEL_WORKERS), len(tasks)))
     timings["parallel_workers"] = int(workers)
+    timings["nft_parallel_workers_cap"] = int(POSITIONS_NFT_PARALLEL_WORKERS)
     timings["owner_chain_tasks"] = int(len(tasks))
 
     n_tasks = int(len(tasks))
@@ -9673,6 +10143,7 @@ def _scan_pool_positions_explorer_nft_catalog(
         rows_sum = 0
         task_err_ct = 0
         api_err_sum = 0
+        t_parallel0 = time.monotonic()
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {
                 ex.submit(_explorer_nft_catalog_owner_chain_scan, cid, ok, max_rows, deadline_ts): (cid, ok)
@@ -9717,6 +10188,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                         nft_scan_task_errors=int(task_err_ct),
                         nft_scan_api_errors=int(api_err_sum),
                     )
+        timings["nft_parallel_fetch_sec"] = round(max(0.0, time.monotonic() - t_parallel0), 3)
         if pos_job_id:
             _update_pos_job(
                 pos_job_id,
@@ -9728,6 +10200,9 @@ def _scan_pool_positions_explorer_nft_catalog(
                 nft_scan_task_errors=int(task_err_ct),
                 nft_scan_api_errors=int(api_err_sum),
             )
+    if "nft_parallel_fetch_sec" not in timings:
+        timings["nft_parallel_fetch_sec"] = 0.0
+    t_merge0 = time.monotonic()
     fetch_results.sort(key=lambda x: (int(x.get("chain_id") or 0), str(x.get("owner") or "")))
 
     results_by_chain: dict[int, list[dict[str, Any]]] = {}
@@ -9874,6 +10349,24 @@ def _scan_pool_positions_explorer_nft_catalog(
 
     timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
     timings["rows"] = len(rows_out)
+    probe_by_chain: list[dict[str, Any]] = []
+    seen_probe_cid: set[int] = set()
+    for fr in fetch_results:
+        if not isinstance(fr, dict):
+            continue
+        cid_fr = int(fr.get("chain_id") or 0)
+        if cid_fr <= 0 or cid_fr in seen_probe_cid:
+            continue
+        dbg = fr.get("debug")
+        if not isinstance(dbg, dict):
+            continue
+        tt = dbg.get("template_traces")
+        if not isinstance(tt, list) or not tt:
+            continue
+        seen_probe_cid.add(cid_fr)
+        probe_by_chain.append({"chain_id": cid_fr, "template_traces": tt[:10]})
+    timings["nft_probe_by_chain"] = probe_by_chain
+
     nft_rows_total = sum(
         len(fr.get("nft_rows")) if isinstance(fr.get("nft_rows"), list) else 0 for fr in fetch_results
     )
@@ -9892,6 +10385,7 @@ def _scan_pool_positions_explorer_nft_catalog(
     timings["nft_owner_chain_tasks_failed"] = int(tasks_failed_final)
     timings["nft_explorer_api_request_failures"] = int(api_err_total_final)
     timings["nft_missing_or_error_events"] = int(tasks_failed_final + api_err_total_final)
+    timings["nft_aggregate_merge_sec"] = round(max(0.0, time.monotonic() - t_merge0), 3)
     if pos_job_id and int(len(tasks)) > 0:
         _update_pos_job(
             pos_job_id,
@@ -12579,9 +13073,24 @@ def _render_positions_page() -> str:
           const taskFail = Number(nftDbg.wallet_chain_tasks_failed ?? pool.nft_owner_chain_tasks_failed ?? 0);
           const apiFail = Number(nftDbg.explorer_api_request_failures ?? pool.nft_explorer_api_request_failures ?? 0);
           const gapN = Number(nftDbg.missing_or_error_total ?? pool.nft_missing_or_error_events ?? taskFail + apiFail);
+          const fetchS = Number(pool.nft_parallel_fetch_sec ?? nftDbg.parallel_fetch_sec ?? 0);
+          const mergeS = Number(pool.nft_aggregate_merge_sec ?? nftDbg.aggregate_merge_sec ?? 0);
+          const pw = Number(pool.parallel_workers ?? nftDbg.parallel_workers ?? 0);
           timingLines.push(
             `NFT: tokennfttx_rows=${rowsN} owned_positions=${ownedN} | task_errors=${taskFail} api_errors=${apiFail} gaps=${gapN}`
           );
+          if (fetchS > 0 || mergeS > 0) {
+            timingLines.push(`NFT_time: parallel_fetch=${fetchS}s merge=${mergeS}s workers=${pw}`);
+          }
+          const probe = Array.isArray(pool.nft_probe_by_chain) ? pool.nft_probe_by_chain : [];
+          if (probe.length) {
+            const bits = probe.slice(0, 6).map((p) => {
+              const trs = Array.isArray(p.template_traces) ? p.template_traces : [];
+              const s = trs.map((t) => `${String(t.host || "").replace(".io", "")}:st${t.last_status}+${t.rows_added}`).join(";");
+              return `c${p.chain_id}{${s}}`;
+            });
+            timingLines.push(`NFT_probe(chains): ${bits.join(" ")}`);
+          }
         }
         if (Number(pool?.priority_chains_sec || 0) > 0 || Number(pool?.remaining_chains_sec || 0) > 0) {
           timingLines.push(`chains(prio/rest)=${Number(pool.priority_chains_sec || 0)}s/${Number(pool.remaining_chains_sec || 0)}s`);
@@ -15233,6 +15742,9 @@ def _build_positions_scan_response(
             "wallet_chain_tasks_failed": int(pool_t.get("nft_owner_chain_tasks_failed") or 0),
             "explorer_api_request_failures": int(pool_t.get("nft_explorer_api_request_failures") or 0),
             "missing_or_error_total": int(pool_t.get("nft_missing_or_error_events") or 0),
+            "parallel_fetch_sec": float(pool_t.get("nft_parallel_fetch_sec") or 0.0),
+            "aggregate_merge_sec": float(pool_t.get("nft_aggregate_merge_sec") or 0.0),
+            "parallel_workers": int(pool_t.get("parallel_workers") or 0),
         }
     return {
         "pool_positions": pool_rows,
