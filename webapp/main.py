@@ -219,25 +219,17 @@ _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
-POSITIONS_SCAN_MAX_SECONDS = min(60, max(8, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "45"))))
-POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = min(
-    60,
-    max(
-        int(POSITIONS_SCAN_MAX_SECONDS),
-        int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY", "300")),
-    ),
-)
+# Hard cap for one request: always 60s for both regular and contract-only scans.
+POSITIONS_SCAN_MAX_SECONDS = 60
+POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = 60
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
 POSITIONS_CONTRACT_ONLY_ENABLED = os.environ.get("POSITIONS_CONTRACT_ONLY_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_DISABLE_PARALLELISM = os.environ.get("POSITIONS_DISABLE_PARALLELISM", "1").strip().lower() in ("1", "true", "yes", "on")
-POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "16")))
+POSITIONS_FAST_REMAINING_BUDGET_SEC = 60
 POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
-POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC = max(
-    8,
-    min(60, int(os.environ.get("POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC", "54"))),
-)
+POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC = 60
 POSITIONS_FAST_CONTRACT_ONLY_PER_CHAIN_TIMEOUT_SEC = max(
     2,
     min(30, int(os.environ.get("POSITIONS_FAST_CONTRACT_ONLY_PER_CHAIN_TIMEOUT_SEC", "12"))),
@@ -12394,6 +12386,23 @@ def _render_positions_page() -> str:
           .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
         const v4Errors = v4Rows.filter((x) => String(x?.status || "") !== "ok").length;
         const modeText = infinityMode ? "infinity" : "fast";
+        const stageExplorerMs = summaryFiltered
+          .filter((x) => String(x?.query_mode || "").endsWith(":explorer#elapsed_ms"))
+          .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
+        const stageOnchainMs = summaryFiltered
+          .filter((x) => String(x?.query_mode || "").endsWith(":onchain#elapsed_ms"))
+          .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
+        const stageExplorerCalls = summaryFiltered
+          .filter((x) => String(x?.query_mode || "").endsWith(":explorer#calls"))
+          .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
+        const stageOnchainCalls = summaryFiltered
+          .filter((x) => String(x?.query_mode || "").endsWith(":onchain#calls"))
+          .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
+        const stageSplitLine = [
+          `stages: explorer=${(stageExplorerMs / 1000).toFixed(3)}s`,
+          `onchain=${(stageOnchainMs / 1000).toFixed(3)}s`,
+          `calls(explorer/onchain)=${stageExplorerCalls}/${stageOnchainCalls}`,
+        ].join(" | ");
         const timingLines = [];
         const ts = (k) => Number(dbgTimings?.[k] || 0);
         if (ts("total_sec") > 0) timingLines.push(`total=${ts("total_sec")}s`);
@@ -12443,6 +12452,7 @@ def _render_positions_page() -> str:
           + `closed=${Number(v3Scan.closed_auto_hidden_count || 0)} `
           + `invalid=${Number(v3Scan.invalid_positions || 0)}`
         );
+        timingLines.push(stageSplitLine);
         if (!infinityMode) {
           const compactLines = summaryFiltered
             .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")}: ${Number(x.count || 0)}`);
