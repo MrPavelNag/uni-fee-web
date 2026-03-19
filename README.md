@@ -89,7 +89,8 @@ chmod +x scripts/deploy_render.sh
 Что делает скрипт:
 - проверяет, что вы на ветке `milestone/web-mvp-stable`;
 - коммитит изменения (исключая `data/*.sqlite3*`);
-- пушит в `origin/milestone/web-mvp-stable`.
+- пушит в `origin/milestone/web-mvp-stable`;
+- запускает smoke-check (`scripts/smoke_render.sh`) после пуша.
 
 Если хотите запускать деплой и проверку healthz сразу из терминала:
 
@@ -104,6 +105,56 @@ export RENDER_HEALTHCHECK_URL="https://uni-fee-web.onrender.com/healthz"
 - ждет успешный `/healthz`.
 
 Если `RENDER_DEPLOY_HOOK_URL` не задан, скрипт только коммитит+пушит.
+
+Управление smoke-check из `deploy_render.sh`:
+- `AUTO_SMOKE_CHECK=1` (по умолчанию) — запускать smoke-check;
+- `AUTO_SMOKE_CHECK=0` — пропустить smoke-check;
+- `SMOKE_BASE_URL=...` — вручную задать base URL для smoke.
+
+### Smoke-check после deploy (1-2 минуты)
+
+Быстрая автоматическая проверка:
+
+```bash
+chmod +x scripts/smoke_render.sh
+./scripts/smoke_render.sh
+```
+
+По умолчанию скрипт проверяет:
+- `/healthz`
+- `/api/meta`
+- `/api/positions/chains`
+
+`/api/meta` возвращает сервисную секцию `service` (например, `service.git_commit`, `service.git_branch`, `service.started_at`) для верификации текущего билда в проде.
+
+Если нужен другой URL:
+
+```bash
+SMOKE_BASE_URL="https://your-service.onrender.com" ./scripts/smoke_render.sh
+```
+
+Полный чеклист: `docs/SMOKE_CHECKLIST.md`
+
+### Sync из Cursor worktree
+
+Если работаете в Cursor worktree и хотите синхронизировать изменения в основной репозиторий:
+
+```bash
+chmod +x scripts/deploy_sync.sh
+./scripts/deploy_sync.sh "sync latest changes"
+```
+
+Без commit/push (только скопировать и застейджить):
+
+```bash
+SYNC_ONLY=1 ./scripts/deploy_sync.sh
+```
+
+С commit, но без push:
+
+```bash
+NO_PUSH=1 ./scripts/deploy_sync.sh "sync without push"
+```
 
 ### Шаги
 
