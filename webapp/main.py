@@ -4302,6 +4302,80 @@ def _scan_erc721_token_ids_by_explorer_api(
     return out
 
 
+def _scan_erc721_token_ids_from_explorer_rows(
+    rows: list[dict[str, Any]],
+    *,
+    chain_id: int,
+    contract: str,
+    owner: str,
+    max_ids: int = 120,
+    protocol: str = "",
+) -> list[int]:
+    cid = int(chain_id)
+    c = str(contract or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(c) or not _is_eth_address(o):
+        return []
+    owner_candidates = _position_owner_allowlist(cid, str(protocol or ""), o)
+    if not owner_candidates:
+        owner_candidates = {o}
+    out: list[int] = []
+    seen: set[int] = set()
+    min_ts_by_tid: dict[int, int] = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        caddr = str(
+            r.get("contractAddress")
+            or r.get("contractaddress")
+            or r.get("tokenAddress")
+            or ""
+        ).strip().lower()
+        if caddr != c:
+            continue
+        to_addr = str(r.get("to") or "").strip().lower()
+        from_addr = str(r.get("from") or "").strip().lower()
+        if to_addr not in owner_candidates and from_addr not in owner_candidates:
+            continue
+        tid_raw = str(r.get("tokenID") or "").strip()
+        if not tid_raw:
+            continue
+        try:
+            tid = int(tid_raw, 10)
+        except Exception:
+            try:
+                tid = int(tid_raw, 16) if tid_raw.lower().startswith("0x") else int(tid_raw)
+            except Exception:
+                continue
+        if tid <= 0:
+            continue
+        if tid not in seen:
+            seen.add(tid)
+            out.append(int(tid))
+        ts = _parse_int_like(r.get("timeStamp") or 0)
+        if ts > 0:
+            prev = int(min_ts_by_tid.get(int(tid), 0) or 0)
+            if prev <= 0 or int(ts) < prev:
+                min_ts_by_tid[int(tid)] = int(ts)
+        if len(out) >= int(max_ids):
+            continue
+    if len(out) > int(max_ids):
+        out = out[: int(max_ids)]
+    proto = str(protocol or "").strip().lower()
+    if proto:
+        for tid in out:
+            ts = int(min_ts_by_tid.get(int(tid), 0) or 0)
+            if ts <= 0:
+                continue
+            try:
+                d = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
+            except Exception:
+                d = ""
+            if d:
+                _position_creation_date_cache_set(cid, proto, tid, d)
+    return out
+
+
 def _explorer_owner_nfttx_rows(chain_id: int, owner: str, *, max_rows: int = 400) -> list[dict[str, Any]]:
     cid = int(chain_id)
     o = str(owner or "").strip().lower()
@@ -4389,12 +4463,17 @@ def _scan_v4_position_ids_by_explorer_any_contract(
     owner: str,
     *,
     max_ids: int = 120,
+    owner_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[int]]:
     cid = int(chain_id)
     owner_addr = str(owner or "").strip().lower()
     if not _is_eth_address(owner_addr):
         return {}
-    rows = _explorer_owner_nfttx_rows(cid, owner_addr, max_rows=max(200, int(max_ids) * 8))
+    rows = (
+        [x for x in owner_rows if isinstance(x, dict)]
+        if isinstance(owner_rows, list)
+        else _explorer_owner_nfttx_rows(cid, owner_addr, max_rows=max(200, int(max_ids) * 8))
+    )
     if not rows:
         return {}
     by_contract: dict[str, list[int]] = {}
@@ -7532,6 +7611,7 @@ def _scan_pool_positions_chain(
     ) -> tuple[list[dict[str, Any]], bool]:
         if POSITIONS_CONTRACT_ONLY_ENABLED:
             positions: list[dict[str, Any]] = []
+            owner_explorer_rows: list[dict[str, Any]] = []
 
             def _merge_positions(add_rows: list[dict[str, Any]]) -> None:
                 if not add_rows:
@@ -7559,16 +7639,34 @@ def _scan_pool_positions_chain(
             if version == "v3" and time.monotonic() < deadline_ts:
                 try:
                     t_call = time.monotonic()
+                    _set_chain_progress("call_contract_only_explorer_owner_rows", version=version, owner=str(owner))
+                    owner_explorer_rows = _explorer_owner_nfttx_rows(
+                        int(chain_id),
+                        owner,
+                        max_rows=max(300, int(POSITIONS_ONCHAIN_MAX_NFTS) * 10),
+                    )
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "explorer",
+                            "query_mode": "contract_only_explorer_owner_rows",
+                            "count": len(owner_explorer_rows),
+                            "ok": True,
+                            "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
+                        }
+                    )
+                    t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_onchain_v3_npm", version=version, owner=str(owner))
                     v3_dbg: dict[str, Any] = {}
                     v3_proto = str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3") or "uniswap_v3").strip().lower()
                     explorer_v3_ids: list[int] = []
                     npm = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
                     if _is_eth_address(npm):
-                        explorer_v3_ids = _scan_erc721_token_ids_by_explorer_api(
-                            int(chain_id),
-                            npm,
-                            owner,
+                        explorer_v3_ids = _scan_erc721_token_ids_from_explorer_rows(
+                            owner_explorer_rows,
+                            chain_id=int(chain_id),
+                            contract=npm,
+                            owner=owner,
                             max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
                             protocol=v3_proto,
                         )
@@ -7734,12 +7832,19 @@ def _scan_pool_positions_chain(
                     v4_contract_to_ids: dict[str, list[int]] = {}
                     t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_explorer_v4_ids", version=version, owner=str(owner))
+                    if not owner_explorer_rows:
+                        owner_explorer_rows = _explorer_owner_nfttx_rows(
+                            int(chain_id),
+                            owner,
+                            max_rows=max(300, int(POSITIONS_ONCHAIN_MAX_NFTS) * 10),
+                        )
                     v4_pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
                     if _is_eth_address(v4_pm):
-                        explorer_v4_ids = _scan_erc721_token_ids_by_explorer_api(
-                            int(chain_id),
-                            v4_pm,
-                            owner,
+                        explorer_v4_ids = _scan_erc721_token_ids_from_explorer_rows(
+                            owner_explorer_rows,
+                            chain_id=int(chain_id),
+                            contract=v4_pm,
+                            owner=owner,
                             max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
                             protocol="uniswap_v4",
                         )
@@ -7761,6 +7866,7 @@ def _scan_pool_positions_chain(
                         int(chain_id),
                         owner,
                         max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
+                        owner_rows=owner_explorer_rows,
                     )
                     extra_contracts = 0
                     extra_ids = 0
