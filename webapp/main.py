@@ -8306,6 +8306,11 @@ def _scan_pool_positions_chain(
         )
         if proto_label.startswith("pancake_"):
             suspected_spam_pre = False
+        # Contract-only mode relies on contract calls to confirm token symbols and
+        # amounts. Do not let early spam heuristic short-circuit these calls,
+        # otherwise token symbols can remain unknown (self-reinforcing "spam" state).
+        if POSITIONS_CONTRACT_ONLY_ENABLED and (is_v3_npm_protocol or proto_label == "uniswap_v4"):
+            suspected_spam_pre = False
         if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
             suspected_spam_pre = False
         contract_snapshot: dict[str, Any] | None = None
