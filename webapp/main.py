@@ -101,6 +101,7 @@ def _on_startup() -> None:
     _start_analytics()
     _start_positions_index_workers()
     _start_infinity_indexer_daily()
+    _start_erc721_contract_refresh_weekly()
 
 
 @app.on_event("shutdown")
@@ -108,6 +109,7 @@ def _on_shutdown() -> None:
     _stop_catalog_auto_refresh()
     _stop_positions_index_workers()
     _stop_infinity_indexer_daily()
+    _stop_erc721_contract_refresh_weekly()
     _stop_analytics()
 
 # Simple in-memory job storage (MVP)
@@ -163,6 +165,32 @@ INFINITY_INDEXER_DAILY_MAX_TARGETS = max(1, min(2000, int(os.environ.get("INFINI
 INFINITY_INDEXER_DAILY_MAX_SECONDS = max(30, int(os.environ.get("INFINITY_INDEXER_DAILY_MAX_SECONDS", "900")))
 INFINITY_INDEXER_DAILY_STOP = threading.Event()
 INFINITY_INDEXER_DAILY_THREAD: threading.Thread | None = None
+ERC721_CONTRACT_REFRESH_ENABLED = os.environ.get("ERC721_CONTRACT_REFRESH_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+ERC721_CONTRACT_REFRESH_INTERVAL_SEC = max(
+    3600,
+    int(os.environ.get("ERC721_CONTRACT_REFRESH_INTERVAL_SEC", str(7 * 24 * 60 * 60))),
+)
+ERC721_CONTRACT_REFRESH_ON_STARTUP = os.environ.get("ERC721_CONTRACT_REFRESH_ON_STARTUP", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+ERC721_CONTRACT_REFRESH_MAX_TARGETS = max(
+    1,
+    min(5000, int(os.environ.get("ERC721_CONTRACT_REFRESH_MAX_TARGETS", "1200"))),
+)
+ERC721_CONTRACT_REFRESH_MAX_SECONDS = max(
+    30,
+    int(os.environ.get("ERC721_CONTRACT_REFRESH_MAX_SECONDS", "1200")),
+)
+ERC721_CONTRACT_REFRESH_STOP = threading.Event()
+ERC721_CONTRACT_REFRESH_THREAD: threading.Thread | None = None
 AUTH_NONCE_TTL_SEC = int(os.environ.get("AUTH_NONCE_TTL_SEC", "300"))
 AUTH_NONCES: dict[str, dict[str, Any]] = {}
 AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
@@ -270,6 +298,14 @@ POSITIONS_INFINITY_OWNEROF_FALLBACK_MAX_CHECKS = max(
 POSITIONS_EXPLORER_NFTTX_MAX_PAGES = max(
     5,
     int(os.environ.get("POSITIONS_EXPLORER_NFTTX_MAX_PAGES", "80")),
+)
+POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS = max(
+    4,
+    min(60, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS", "18"))),
+)
+POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_RECEIPTS = max(
+    20,
+    min(800, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_RECEIPTS", "180"))),
 )
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
@@ -726,9 +762,24 @@ def _init_analytics_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS owner_erc721_contracts (
+              chain_id INTEGER NOT NULL,
+              owner TEXT NOT NULL,
+              contract TEXT NOT NULL,
+              source TEXT NOT NULL DEFAULT '',
+              first_seen_ts TEXT NOT NULL,
+              last_seen_ts TEXT NOT NULL,
+              PRIMARY KEY(chain_id, owner, contract)
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pos_own_owner_chain ON position_ownership_index(owner, chain_id, protocol)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pos_own_seen ON position_ownership_index(last_seen_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pos_details_updated ON position_details_cache(updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_erc721_owner_chain ON owner_erc721_contracts(owner, chain_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_erc721_seen ON owner_erc721_contracts(last_seen_ts)")
         # Ensure default infinity indexer config exists.
         conn.execute(
             """
@@ -940,6 +991,65 @@ def _infinity_index_get_token_ids(chain_id: int, owner: str, limit: int = 180) -
             continue
         seen.add(tid)
         out.append(tid)
+    return out
+
+
+def _owner_erc721_contracts_upsert(chain_id: int, owner: str, contracts: list[str], *, source: str = "weekly_refresh") -> int:
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(owner_addr):
+        return 0
+    now = _iso_now()
+    rows: list[tuple[Any, ...]] = []
+    seen: set[str] = set()
+    for raw in contracts:
+        c = str(raw or "").strip().lower()
+        if not _is_eth_address(c) or c in seen:
+            continue
+        seen.add(c)
+        rows.append((cid, owner_addr, c, str(source or "weekly_refresh")[:32], now, now))
+    if not rows:
+        return 0
+    with _analytics_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO owner_erc721_contracts(chain_id, owner, contract, source, first_seen_ts, last_seen_ts)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chain_id, owner, contract) DO UPDATE SET
+              source = excluded.source,
+              last_seen_ts = excluded.last_seen_ts
+            """,
+            rows,
+        )
+        conn.commit()
+    return len(rows)
+
+
+def _owner_erc721_contracts_get(chain_id: int, owner: str, limit: int = 80) -> list[str]:
+    cid = int(chain_id)
+    owner_addr = str(owner or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(owner_addr):
+        return []
+    lim = max(1, min(500, int(limit)))
+    with _analytics_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT contract
+            FROM owner_erc721_contracts
+            WHERE chain_id = ? AND owner = ?
+            ORDER BY last_seen_ts DESC
+            LIMIT ?
+            """,
+            (cid, owner_addr, lim),
+        ).fetchall()
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        c = str((r or [None])[0] or "").strip().lower()
+        if not _is_eth_address(c) or c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
     return out
 
 
@@ -1574,6 +1684,118 @@ def _collect_infinity_indexer_targets(limit: int = 400) -> list[tuple[int, str]]
             if len(out) >= lim:
                 break
     return out[:lim]
+
+
+def _collect_owner_chain_targets_for_erc721_refresh(limit: int = 1200) -> list[tuple[int, str]]:
+    lim = max(1, min(5000, int(limit)))
+    out: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    with _analytics_conn() as conn:
+        # Prioritize wallets/chains seen recently in ownership index.
+        rows = conn.execute(
+            """
+            SELECT chain_id, owner, MAX(last_seen_ts) AS last_seen
+            FROM position_ownership_index
+            GROUP BY chain_id, owner
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+        for r in rows:
+            cid = _parse_int_like((r or [0])[0])
+            owner = str((r or [None, ""])[1] or "").strip().lower()
+            key = (cid, owner)
+            if cid <= 0 or not _is_eth_address(owner) or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        if len(out) < lim:
+            # Include owners discovered earlier by fallback runs.
+            rows2 = conn.execute(
+                """
+                SELECT chain_id, owner, MAX(last_seen_ts) AS last_seen
+                FROM owner_erc721_contracts
+                GROUP BY chain_id, owner
+                ORDER BY last_seen DESC
+                LIMIT ?
+                """,
+                (lim,),
+            ).fetchall()
+            for r in rows2:
+                cid = _parse_int_like((r or [0])[0])
+                owner = str((r or [None, ""])[1] or "").strip().lower()
+                key = (cid, owner)
+                if cid <= 0 or not _is_eth_address(owner) or key in seen:
+                    continue
+                seen.add(key)
+                out.append(key)
+                if len(out) >= lim:
+                    break
+    return out[:lim]
+
+
+def _run_erc721_contract_refresh_once(max_targets: int | None = None) -> dict[str, Any]:
+    if not ERC721_CONTRACT_REFRESH_ENABLED:
+        return {"status": "skipped", "reason": "disabled", "processed": 0, "updated": 0, "errors": 0}
+    if not INDEXER_LOCK.acquire(blocking=False):
+        return {"status": "skipped", "reason": "busy", "processed": 0, "updated": 0, "errors": 0}
+    try:
+        targets = _collect_owner_chain_targets_for_erc721_refresh(
+            limit=max_targets if max_targets is not None else ERC721_CONTRACT_REFRESH_MAX_TARGETS
+        )
+        if not targets:
+            return {"status": "skipped", "reason": "no_targets", "processed": 0, "updated": 0, "errors": 0}
+        deadline_ts = time.monotonic() + float(ERC721_CONTRACT_REFRESH_MAX_SECONDS)
+        processed = 0
+        updated_total = 0
+        errors = 0
+        first_error = ""
+        for chain_id, owner in targets:
+            if time.monotonic() >= deadline_ts:
+                break
+            processed += 1
+            try:
+                contracts = _discover_owner_erc721_contracts_from_tx_receipts(
+                    int(chain_id),
+                    owner,
+                    max_contracts=int(POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS),
+                    max_receipts=int(POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_RECEIPTS),
+                    deadline_ts=deadline_ts,
+                )
+                updated_total += _owner_erc721_contracts_upsert(
+                    int(chain_id),
+                    owner,
+                    contracts,
+                    source="weekly_refresh",
+                )
+            except Exception as e:
+                errors += 1
+                if not first_error:
+                    first_error = str(e)[:220]
+        timed_out = processed < len(targets)
+        if errors == 0 and not timed_out:
+            status = "ok"
+        elif processed == 0 and errors > 0:
+            status = "error"
+        else:
+            status = "partial"
+        details = (
+            f"weekly_erc721_refresh processed={processed}/{len(targets)} updated={updated_total} errors={errors}"
+            + (f" first_error={first_error}" if first_error else "")
+            + (" timed_out=1" if timed_out else "")
+        )
+        _indexer_log_run("erc721_contract_refresh", status, details)
+        return {
+            "status": status,
+            "processed": processed,
+            "targets": len(targets),
+            "updated": updated_total,
+            "errors": errors,
+            "timed_out": timed_out,
+        }
+    finally:
+        INDEXER_LOCK.release()
 
 
 def _run_infinity_indexer_daily_once(max_targets: int | None = None) -> dict[str, Any]:
@@ -4907,6 +5129,61 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     return []
 
 
+def _discover_owner_erc721_contracts_from_tx_receipts(
+    chain_id: int,
+    owner: str,
+    *,
+    max_contracts: int = 18,
+    max_receipts: int = 180,
+    deadline_ts: float | None = None,
+) -> list[str]:
+    cid = int(chain_id)
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(o):
+        return []
+    tx_hashes = _explorer_txlist_hashes_for_owner(cid, o, max_items=max(20, min(2500, int(max_receipts))))
+    if not tx_hashes:
+        return []
+    topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    owner_word = ("0x" + ("0" * 24) + o[2:]).lower()
+    candidates: list[str] = []
+    seen: set[str] = set()
+    checked = 0
+    for txh in tx_hashes:
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        checked += 1
+        try:
+            rcpt = _json_rpc_call(cid, "eth_getTransactionReceipt", [txh], timeout_sec=max(3.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC)))
+        except Exception:
+            continue
+        logs = (rcpt or {}).get("logs") if isinstance(rcpt, dict) else []
+        if not isinstance(logs, list):
+            continue
+        for lg in logs:
+            if not isinstance(lg, dict):
+                continue
+            topics = lg.get("topics") or []
+            if not isinstance(topics, list) or len(topics) < 4:
+                continue
+            if str(topics[0] or "").strip().lower() != topic_transfer:
+                continue
+            t_from = str(topics[1] or "").strip().lower()
+            t_to = str(topics[2] or "").strip().lower()
+            if t_from != owner_word and t_to != owner_word:
+                continue
+            caddr = str(lg.get("address") or "").strip().lower()
+            if not _is_eth_address(caddr) or caddr in seen:
+                continue
+            seen.add(caddr)
+            candidates.append(caddr)
+            if len(candidates) >= int(max_contracts):
+                return candidates
+        if checked >= int(max_receipts):
+            break
+    return candidates
+
+
 def _scan_cl_token_ids_from_owner_receipts(
     chain_id: int,
     position_manager: str,
@@ -7387,6 +7664,8 @@ def _scan_pool_positions_chain(
             "fallback_debug": {},
             "fallback_rows_count": 0,
             "fallback_elapsed_ms": 0,
+            "fallback_cached_contracts": 0,
+            "fallback_dynamic_contracts": 0,
             "v3_ids": [],
             "v3_ids_count": 0,
             "v3_ids_elapsed_ms": 0,
@@ -7423,6 +7702,45 @@ def _scan_pool_positions_chain(
                     fallback_contracts.append((inf_bin, "pancake_infinity_bin"))
                 if _is_eth_address(v4_pm):
                     fallback_contracts.append((v4_pm, "uniswap_v4"))
+                cached_contracts = _owner_erc721_contracts_get(
+                    int(chain_id),
+                    owner,
+                    limit=max(20, int(POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS) * 3),
+                )
+                for cc in cached_contracts:
+                    if not _is_eth_address(cc):
+                        continue
+                    if any(str(ex).strip().lower() == str(cc).strip().lower() for ex, _ in fallback_contracts):
+                        continue
+                    # Keep protocol generic; downstream contract checks classify whether it's truly v4-like.
+                    fallback_contracts.append((str(cc).strip().lower(), "uniswap_v4"))
+                dyn_contracts = _discover_owner_erc721_contracts_from_tx_receipts(
+                    int(chain_id),
+                    owner,
+                    max_contracts=int(POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS),
+                    max_receipts=int(POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_RECEIPTS),
+                    deadline_ts=deadline_ts,
+                )
+                for dc in dyn_contracts:
+                    if not _is_eth_address(dc):
+                        continue
+                    already = False
+                    for cc, _pp in fallback_contracts:
+                        if str(cc).strip().lower() == str(dc).strip().lower():
+                            already = True
+                            break
+                    if already:
+                        continue
+                    # Unknown ERC721 manager; keep protocol generic so downstream v4 detector can classify.
+                    fallback_contracts.append((str(dc).strip().lower(), "uniswap_v4"))
+                _owner_erc721_contracts_upsert(
+                    int(chain_id),
+                    owner,
+                    dyn_contracts,
+                    source="prefetch_dynamic_fallback",
+                )
+                out["fallback_dynamic_contracts"] = int(len(dyn_contracts))
+                out["fallback_cached_contracts"] = int(len(cached_contracts))
                 if fallback_contracts:
                     t_fallback = time.monotonic()
                     _set_chain_progress("call_contract_only_explorer_contract_rows_fallback", version="prefetch", owner=str(owner))
@@ -10609,6 +10927,31 @@ def _infinity_indexer_daily_loop(interval_sec: int, run_on_startup: bool) -> Non
             _indexer_log_run("infinity_bsc", "error", f"daily_loop error={str(e)[:220]}")
 
 
+def _erc721_contract_refresh_weekly_loop(interval_sec: int, run_on_startup: bool) -> None:
+    if run_on_startup:
+        try:
+            result = _run_erc721_contract_refresh_once()
+            if str(result.get("status") or "") == "skipped":
+                _indexer_log_run(
+                    "erc721_contract_refresh",
+                    "skip",
+                    f"weekly_startup reason={result.get('reason') or 'unknown'}",
+                )
+        except Exception as e:
+            _indexer_log_run("erc721_contract_refresh", "error", f"weekly_startup error={str(e)[:220]}")
+    while not ERC721_CONTRACT_REFRESH_STOP.wait(interval_sec):
+        try:
+            result = _run_erc721_contract_refresh_once()
+            if str(result.get("status") or "") == "skipped":
+                _indexer_log_run(
+                    "erc721_contract_refresh",
+                    "skip",
+                    f"weekly reason={result.get('reason') or 'unknown'}",
+                )
+        except Exception as e:
+            _indexer_log_run("erc721_contract_refresh", "error", f"weekly_loop error={str(e)[:220]}")
+
+
 def _start_catalog_auto_refresh() -> None:
     global CATALOG_REFRESH_THREAD
     if CATALOG_REFRESH_THREAD and CATALOG_REFRESH_THREAD.is_alive():
@@ -10639,12 +10982,32 @@ def _start_infinity_indexer_daily() -> None:
     INFINITY_INDEXER_DAILY_THREAD.start()
 
 
+def _start_erc721_contract_refresh_weekly() -> None:
+    global ERC721_CONTRACT_REFRESH_THREAD
+    if not ERC721_CONTRACT_REFRESH_ENABLED:
+        return
+    if ERC721_CONTRACT_REFRESH_THREAD and ERC721_CONTRACT_REFRESH_THREAD.is_alive():
+        return
+    ERC721_CONTRACT_REFRESH_STOP.clear()
+    ERC721_CONTRACT_REFRESH_THREAD = threading.Thread(
+        target=_erc721_contract_refresh_weekly_loop,
+        args=(ERC721_CONTRACT_REFRESH_INTERVAL_SEC, ERC721_CONTRACT_REFRESH_ON_STARTUP),
+        daemon=True,
+        name="erc721-contract-refresh-weekly",
+    )
+    ERC721_CONTRACT_REFRESH_THREAD.start()
+
+
 def _stop_catalog_auto_refresh() -> None:
     CATALOG_REFRESH_STOP.set()
 
 
 def _stop_infinity_indexer_daily() -> None:
     INFINITY_INDEXER_DAILY_STOP.set()
+
+
+def _stop_erc721_contract_refresh_weekly() -> None:
+    ERC721_CONTRACT_REFRESH_STOP.set()
 
 
 def _final_income(data: dict) -> float:
