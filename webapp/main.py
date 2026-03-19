@@ -3517,8 +3517,9 @@ def _explorer_pm_enumeration_tokennfttx_fallback_rows(
     debug_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Когда индексатор (Etherscan/Blockscout) не отдаёт tokennfttx: собрать текущие NFT на известных PM
-    через balanceOf + tokenOfOwnerByIndex (стандартный ERC721Enumerable / OZ-совместимый NPM).
+    Дополняет tokennfttx: собрать текущие NFT на известных PM через balanceOf + tokenOfOwnerByIndex
+    (ERC721Enumerable / OZ-совместимый NPM). Вызывается и при пустом, и при неполном ответе индексатора
+    (например v2 отдаёт часть событий, а native explorer — остальное; перечисление добивает по факту баланса).
 
     Число RPC ≈ sum(balance) по контрактам — без скана истории блоков и без искусственного wall-time.
     Pancake Infinity CL/Bin (Solmate ERC721 без enumeration) здесь пропускаются — их только explorer/logs.
@@ -4472,6 +4473,11 @@ def _explorer_nfttx_rows(
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
     arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
+    optimistic_key = (
+        os.environ.get("OPTIMISTIC_ETHERSCAN_API_KEY", "").strip()
+        or os.environ.get("OPTIMISM_ETHERSCAN_API_KEY", "").strip()
+        or eth_key
+    )
     uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
     urls: list[tuple[str, bool]] = []
     offset = max(20, min(1000, int(max_rows)))
@@ -4527,6 +4533,19 @@ def _explorer_nfttx_rows(
                 "https://api.arbiscan.io/api"
                 f"?module=account&action=tokennfttx"
                 f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={arb_key}",
+                False,
+            ))
+        elif cid == 10 and optimistic_key:
+            urls.append((
+                "https://api-optimistic.etherscan.io/api"
+                f"?module=account&action=tokennfttx&contractaddress={c}"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={optimistic_key}",
+                True,
+            ))
+            urls.append((
+                "https://api-optimistic.etherscan.io/api"
+                f"?module=account&action=tokennfttx"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={optimistic_key}",
                 False,
             ))
         elif cid in {130, 1301} and uni_key:
@@ -4604,6 +4623,12 @@ def _explorer_nfttx_rows(
             "https://api.arbiscan.io/api"
             f"?module=account&action=tokennfttx&contractaddress={c}"
             f"&page={{page}}&offset={offset}&sort=desc&apikey={arb_key}"
+        )
+    elif cid == 10 and optimistic_key:
+        contract_urls.append(
+            "https://api-optimistic.etherscan.io/api"
+            f"?module=account&action=tokennfttx&contractaddress={c}"
+            f"&page={{page}}&offset={offset}&sort=desc&apikey={optimistic_key}"
         )
     elif cid in {130, 1301} and uni_key:
         uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
@@ -5063,11 +5088,12 @@ def _explorer_owner_nfttx_rows(
                     }
                 )
 
-        if out:
+        # Do not return on first non-empty template: Etherscan v2 often returns partial tokennfttx for
+        # Base/BSC while native explorer or Blockscout has more; merging all sources improves coverage.
+        if len(out) >= int(max_rows):
             return _finalize()
     if (
         pm_rpc_fallback
-        and not out
         and POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK
         and _explorer_pm_enumeration_allowed_for_chain(int(cid))
         and (deadline_ts is None or time.monotonic() < float(deadline_ts))
@@ -5327,6 +5353,11 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
     arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
+    optimistic_key = (
+        os.environ.get("OPTIMISTIC_ETHERSCAN_API_KEY", "").strip()
+        or os.environ.get("OPTIMISM_ETHERSCAN_API_KEY", "").strip()
+        or eth_key
+    )
     uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
     urls: list[str] = []
     offset = max(50, int(max_items))
@@ -5350,6 +5381,11 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
         urls.append(
             "https://api.arbiscan.io/api"
             f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={arb_key}"
+        )
+    elif cid == 10 and optimistic_key:
+        urls.append(
+            "https://api-optimistic.etherscan.io/api"
+            f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={optimistic_key}"
         )
     elif cid in {130, 1301} and uni_key:
         uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
