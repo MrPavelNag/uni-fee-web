@@ -4395,6 +4395,13 @@ def _explorer_owner_nfttx_rows(
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
     arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
     uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
+    if isinstance(debug_out, dict):
+        debug_out["chain_id"] = int(cid)
+        debug_out["has_eth_key"] = bool(eth_key)
+        debug_out["has_bsc_key"] = bool(bsc_key)
+        debug_out["has_base_key"] = bool(base_key)
+        debug_out["has_arb_key"] = bool(arb_key)
+        debug_out["has_uni_key"] = bool(uni_key)
     url_templates: list[str] = []
     offset = max(20, min(1000, int(max_rows)))
     if eth_key:
@@ -4424,6 +4431,8 @@ def _explorer_owner_nfttx_rows(
             f"{uniscan_api}?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={uni_key}"
         )
     if not url_templates:
+        if isinstance(debug_out, dict):
+            debug_out["reason"] = "no_explorer_urls_configured"
         return []
 
     seen: set[str] = set()
