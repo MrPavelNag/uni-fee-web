@@ -299,6 +299,28 @@ POSITIONS_EXPLORER_NFTTX_V2_FIRST = os.environ.get("POSITIONS_EXPLORER_NFTTX_V2_
     "yes",
     "on",
 )
+# Бесплатный api.etherscan.io/v2 часто не покрывает BSC/Base/OP — используем Blockscout tokennfttx (без ключа).
+POSITIONS_BLOCKSCOUT_TOKENNFTTX_FALLBACK = os.environ.get(
+    "POSITIONS_BLOCKSCOUT_TOKENNFTTX_FALLBACK", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+# getLogs Transfer по NPM/PM когда explorer пуст (по умолчанию BSC; переопредели env).
+_POSITIONS_NFT_RPC_PM_FB_RAW = os.environ.get("POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS", "56").strip()
+POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS: set[int] = set()
+for _x in _POSITIONS_NFT_RPC_PM_FB_RAW.split(","):
+    _x = _x.strip()
+    if not _x:
+        continue
+    try:
+        POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS.add(int(_x))
+    except ValueError:
+        continue
+POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK = os.environ.get(
+    "POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_NFT_RPC_PM_FALLBACK_MAX_BLOCKS = max(
+    200_000,
+    int(os.environ.get("POSITIONS_NFT_RPC_PM_FALLBACK_MAX_BLOCKS", "6000000")),
+)
 POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS = max(
     4,
     min(60, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS", "18"))),
@@ -3464,6 +3486,153 @@ def _explorer_row_contract_address(row: dict[str, Any]) -> str:
     return ""
 
 
+def _blockscout_tokennfttx_api_root(chain_id: int) -> str:
+    """Публичный Blockscout v1 API (Etherscan-совместимый tokennfttx), без apikey."""
+    cid = int(chain_id)
+    env_ov = os.environ.get(f"POSITIONS_BLOCKSCOUT_TOKENNFTTX_URL_{cid}", "").strip().rstrip("/")
+    if env_ov:
+        return env_ov
+    defaults: dict[int, str] = {
+        8453: "https://base.blockscout.com/api",
+        10: "https://optimism.blockscout.com/api",
+    }
+    return str(defaults.get(cid, "") or "").strip().rstrip("/")
+
+
+def _explorer_rpc_pm_tokennfttx_fallback_rows(
+    chain_id: int,
+    owner_lower: str,
+    *,
+    max_rows: int,
+    deadline_ts: float | None,
+    debug_out: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Когда BscScan/Etherscan v2 недоступны на free tier: собрать ERC-721 Transfer по известным PM/NPM
+    (Uniswap V3/V4, Pancake Infinity) через eth_getLogs — достаточно для LP NFT каталога.
+    """
+    cid = int(chain_id)
+    o = str(owner_lower or "").strip().lower()
+    if not _is_eth_address(o):
+        return []
+    contracts: list[str] = []
+    seen_c: set[str] = set()
+    for addr in (
+        UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid),
+        UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid),
+        PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid),
+        PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid),
+    ):
+        ca = str(addr or "").strip().lower()
+        if _is_eth_address(ca) and ca not in seen_c:
+            seen_c.add(ca)
+            contracts.append(ca)
+    if not contracts:
+        return []
+    topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    owner_topic = "0x" + ("0" * 24) + o[2:]
+    latest = 0
+    try:
+        latest = int(_eth_block_number(cid))
+    except Exception:
+        return []
+    if latest <= 0:
+        return []
+    step = max(20_000, int(POSITIONS_ERC721_LOG_BLOCK_STEP))
+    span = min(int(latest), int(POSITIONS_NFT_RPC_PM_FALLBACK_MAX_BLOCKS))
+    min_block = max(0, int(latest) - int(span))
+    seen_log: set[str] = set()
+    raw_logs: list[tuple[str, dict[str, Any]]] = []
+    for contract in contracts:
+        end_b = int(latest)
+        while end_b >= min_block:
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                break
+            start_b = max(min_block, end_b - step + 1)
+            for topics in (
+                [topic_transfer, None, owner_topic, None],
+                [topic_transfer, owner_topic, None, None],
+            ):
+                if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                    break
+                try:
+                    logs = _eth_get_logs(
+                        cid,
+                        {
+                            "address": contract,
+                            "fromBlock": hex(int(start_b)),
+                            "toBlock": hex(int(end_b)),
+                            "topics": topics,
+                        },
+                        deadline_ts=deadline_ts,
+                    )
+                except Exception:
+                    logs = []
+                for lg in logs or []:
+                    if not isinstance(lg, dict):
+                        continue
+                    txh = str(lg.get("transactionHash") or lg.get("hash") or "").strip().lower()
+                    lix = str(lg.get("logIndex") or "")
+                    lk = "|".join([contract, txh, lix])
+                    if lk in seen_log:
+                        continue
+                    seen_log.add(lk)
+                    raw_logs.append((contract, lg))
+            end_b = int(start_b) - 1
+    synth: list[dict[str, Any]] = []
+    cap = max(200, int(max_rows) * 30)
+    for contract, lg in raw_logs:
+        tops = lg.get("topics") or []
+        if not isinstance(tops, list) or len(tops) < 4:
+            continue
+        try:
+            tid = int(str(tops[3]), 16)
+        except Exception:
+            continue
+        if tid <= 0:
+            continue
+        try:
+            from_a = _explorer_normalize_hex_address("0x" + str(tops[1])[-40:])
+            to_a = _explorer_normalize_hex_address("0x" + str(tops[2])[-40:])
+        except Exception:
+            continue
+        if not from_a or not to_a:
+            continue
+        txh = str(lg.get("transactionHash") or lg.get("hash") or "").strip().lower()
+        bl = str(lg.get("blockNumber") or "0x0")
+        try:
+            bn = int(bl, 16) if str(bl).strip().lower().startswith("0x") else int(bl)
+        except Exception:
+            bn = 0
+        li_raw = str(lg.get("logIndex") or "0x0")
+        try:
+            li_i = int(li_raw, 16) if str(li_raw).strip().lower().startswith("0x") else int(li_raw)
+        except Exception:
+            li_i = 0
+        ts = _eth_get_block_timestamp(cid, bn) if bn > 0 else 0
+        synth.append(
+            {
+                "contractAddress": contract,
+                "from": from_a,
+                "to": to_a,
+                "tokenID": str(int(tid)),
+                "hash": txh,
+                "blockNumber": str(int(bn)),
+                "logIndex": str(int(li_i)),
+                "timeStamp": str(int(ts)) if ts > 0 else "0",
+            }
+        )
+        if len(synth) >= cap:
+            break
+    if isinstance(debug_out, dict):
+        debug_out["nft_rpc_pm_fallback"] = {
+            "contracts": list(contracts),
+            "logs_matched": int(len(raw_logs)),
+            "synth_rows": int(len(synth)),
+        }
+    return synth
+
+
 def _explorer_debug_benign_status0_message(message: str) -> bool:
     """Etherscan-family APIs use status \"0\" both for real errors and for normal empty results."""
     m = str(message or "").strip().lower()
@@ -4731,18 +4900,37 @@ def _explorer_owner_nfttx_rows(
         native_templates.append(
             f"{uniscan_api}?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={uni_key}"
         )
+    blockscout_tmpl = ""
+    if POSITIONS_BLOCKSCOUT_TOKENNFTTX_FALLBACK:
+        _bs_root = _blockscout_tokennfttx_api_root(cid)
+        if _bs_root:
+            blockscout_tmpl = (
+                f"{_bs_root}?module=account&action=tokennfttx"
+                f"&address={o}&page={{page}}&offset={offset}&sort=desc"
+            )
+    if isinstance(debug_out, dict):
+        debug_out["nft_blockscout_fallback_url"] = bool(blockscout_tmpl)
+
     url_templates: list[str] = []
-    if POSITIONS_EXPLORER_NFTTX_V2_FIRST and v2_tmpl:
-        url_templates.append(v2_tmpl)
+    if POSITIONS_EXPLORER_NFTTX_V2_FIRST:
+        if v2_tmpl:
+            url_templates.append(v2_tmpl)
+        if blockscout_tmpl:
+            url_templates.append(blockscout_tmpl)
         url_templates.extend(native_templates)
     else:
         url_templates.extend(native_templates)
+        if blockscout_tmpl:
+            url_templates.append(blockscout_tmpl)
         if v2_tmpl:
             url_templates.append(v2_tmpl)
     if not url_templates:
-        if isinstance(debug_out, dict):
-            debug_out["reason"] = "no_explorer_urls_configured"
-        return []
+        if blockscout_tmpl:
+            url_templates = [blockscout_tmpl]
+        else:
+            if isinstance(debug_out, dict):
+                debug_out["reason"] = "no_explorer_urls_configured"
+            return []
 
     def _deadline_hit() -> bool:
         return deadline_ts is not None and time.monotonic() >= float(deadline_ts)
@@ -4899,6 +5087,24 @@ def _explorer_owner_nfttx_rows(
 
         if out:
             return _finalize()
+    if (
+        not out
+        and POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK
+        and int(cid) in POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS
+        and (deadline_ts is None or time.monotonic() < float(deadline_ts))
+    ):
+        try:
+            rpc_rows = _explorer_rpc_pm_tokennfttx_fallback_rows(
+                int(cid),
+                o,
+                max_rows=int(max_rows),
+                deadline_ts=deadline_ts,
+                debug_out=debug_out,
+            )
+            if rpc_rows:
+                _append_from_result(rpc_rows)
+        except Exception:
+            pass
     return _finalize()
 
 
