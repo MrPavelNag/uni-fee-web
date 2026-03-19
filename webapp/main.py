@@ -3340,6 +3340,7 @@ def _explorer_v2_chainid(chain_id: int) -> str:
         1: "1",
         10: "10",
         56: "56",
+        130: "130",
         137: "137",
         8453: "8453",
         42161: "42161",
@@ -3351,6 +3352,8 @@ def _explorer_v2_api_keys(chain_id: int) -> list[str]:
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
+    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
+    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
     raw: list[str] = []
     if eth_key:
         raw.append(eth_key)
@@ -3358,6 +3361,10 @@ def _explorer_v2_api_keys(chain_id: int) -> list[str]:
         raw.append(bsc_key)
     if cid == 8453 and base_key:
         raw.append(base_key)
+    if cid == 42161 and arb_key:
+        raw.append(arb_key)
+    if cid == 130 and uni_key:
+        raw.append(uni_key)
     out: list[str] = []
     seen: set[str] = set()
     for k in raw:
@@ -3520,6 +3527,8 @@ def _position_manager_for_protocol(chain_id: int, protocol: str) -> str:
     if proto in {"pancake_v3", "pancake_v3_staked"}:
         # Pancake v3 NPM is stored in chain-specific v3 NPM map.
         return str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    if proto == "uniswap_v4":
+        return str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
     if proto == "pancake_infinity_cl":
         return str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
     if proto == "pancake_infinity_bin":
@@ -4049,22 +4058,32 @@ def _explorer_nfttx_rows(
     owner_candidates = sorted(_position_owner_allowlist(int(cid), str(protocol or ""), o))
     if not owner_candidates:
         owner_candidates = [o]
-    chainid_for_v2 = {
-        1: "1",
-        10: "10",
-        56: "56",
-        137: "137",
-        8453: "8453",
-        42161: "42161",
-    }.get(cid, "")
+    chainid_for_v2 = _explorer_v2_chainid(cid)
     if not chainid_for_v2:
         return []
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
+    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
+    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
     urls: list[tuple[str, bool]] = []
     offset = max(20, min(1000, int(max_rows)))
     for owner_addr in owner_candidates:
+        # Primary path: one ETHERSCAN_API_KEY across all supported chains.
+        if eth_key:
+            urls.append((
+                "https://api.etherscan.io/v2/api"
+                f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+                f"&contractaddress={c}&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
+                True,
+            ))
+            urls.append((
+                "https://api.etherscan.io/v2/api"
+                f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
+                False,
+            ))
+        # Optional scanner-specific fallbacks if dedicated keys are present.
         if cid == 56 and bsc_key:
             urls.append((
                 "https://api.bscscan.com/api"
@@ -4091,18 +4110,29 @@ def _explorer_nfttx_rows(
                 f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={base_key}",
                 False,
             ))
-        # Secondary fallback via Etherscan V2 unified endpoint.
-        if eth_key:
+        elif cid == 42161 and arb_key:
             urls.append((
-                "https://api.etherscan.io/v2/api"
-                f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-                f"&contractaddress={c}&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
+                "https://api.arbiscan.io/api"
+                f"?module=account&action=tokennfttx&contractaddress={c}"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={arb_key}",
                 True,
             ))
             urls.append((
-                "https://api.etherscan.io/v2/api"
-                f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
+                "https://api.arbiscan.io/api"
+                f"?module=account&action=tokennfttx"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={arb_key}",
+                False,
+            ))
+        elif cid == 130 and uni_key:
+            uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
+            urls.append((
+                f"{uniscan_api}?module=account&action=tokennfttx&contractaddress={c}"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={uni_key}",
+                True,
+            ))
+            urls.append((
+                f"{uniscan_api}?module=account&action=tokennfttx"
+                f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={uni_key}",
                 False,
             ))
     if not urls:
@@ -4145,6 +4175,12 @@ def _explorer_nfttx_rows(
     # Fallback: query tokennfttx by contract only (without owner filter),
     # then filter rows locally by owner in from/to fields.
     contract_urls: list[str] = []
+    if eth_key:
+        contract_urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
+            f"&contractaddress={c}&page={{page}}&offset={offset}&sort=desc&apikey={eth_key}"
+        )
     if cid == 56 and bsc_key:
         contract_urls.append(
             "https://api.bscscan.com/api"
@@ -4157,11 +4193,17 @@ def _explorer_nfttx_rows(
             f"?module=account&action=tokennfttx&contractaddress={c}"
             f"&page={{page}}&offset={offset}&sort=desc&apikey={base_key}"
         )
-    if eth_key:
+    elif cid == 42161 and arb_key:
         contract_urls.append(
-            "https://api.etherscan.io/v2/api"
-            f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
-            f"&contractaddress={c}&page={{page}}&offset={offset}&sort=desc&apikey={eth_key}"
+            "https://api.arbiscan.io/api"
+            f"?module=account&action=tokennfttx&contractaddress={c}"
+            f"&page={{page}}&offset={offset}&sort=desc&apikey={arb_key}"
+        )
+    elif cid == 130 and uni_key:
+        uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
+        contract_urls.append(
+            f"{uniscan_api}?module=account&action=tokennfttx&contractaddress={c}"
+            f"&page={{page}}&offset={offset}&sort=desc&apikey={uni_key}"
         )
     if not contract_urls:
         return []
@@ -4215,14 +4257,7 @@ def _scan_erc721_token_ids_by_explorer_api(
         protocol=protocol,
     )
     if not rows:
-        rcpt_ids, _ = _scan_erc721_token_ids_by_owner_receipts(
-            cid,
-            contract,
-            owner,
-            max_ids=max_ids,
-            max_receipts=max(120, int(max_ids) * 10),
-        )
-        return rcpt_ids
+        return []
     out: list[int] = []
     seen: set[int] = set()
     proto = str(protocol or "").strip().lower()
@@ -4329,21 +4364,22 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     o = str(owner or "").strip().lower()
     if not _is_eth_address(o):
         return []
-    chainid_for_v2 = {
-        1: "1",
-        10: "10",
-        56: "56",
-        137: "137",
-        8453: "8453",
-        42161: "42161",
-    }.get(cid, "")
+    chainid_for_v2 = _explorer_v2_chainid(cid)
     if not chainid_for_v2:
         return []
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
+    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
+    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
     urls: list[str] = []
     offset = max(50, int(max_items))
+    if eth_key:
+        urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=txlist"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}"
+        )
     if cid == 56 and bsc_key:
         urls.append(
             "https://api.bscscan.com/api"
@@ -4354,12 +4390,16 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
             "https://api.basescan.org/api"
             f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}"
         )
-    # Secondary fallback via Etherscan V2 unified endpoint.
-    if eth_key:
+    elif cid == 42161 and arb_key:
         urls.append(
-            "https://api.etherscan.io/v2/api"
-            f"?chainid={chainid_for_v2}&module=account&action=txlist"
-            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}"
+            "https://api.arbiscan.io/api"
+            f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={arb_key}"
+        )
+    elif cid == 130 and uni_key:
+        uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
+        urls.append(
+            f"{uniscan_api}?module=account&action=txlist"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={uni_key}"
         )
     if not urls:
         return []
@@ -5999,6 +6039,7 @@ def _scan_uniswap_v4_positions_onchain(
     chain_id: int,
     *,
     deadline_ts: float | None = None,
+    token_ids_override: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
     pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
@@ -6010,25 +6051,41 @@ def _scan_uniswap_v4_positions_onchain(
     if deadline_ts is not None and time.monotonic() >= deadline_ts:
         return []
 
-    # Run only if owner has v4 NFTs.
-    try:
-        bal_data = "0x70a08231" + _encode_address_word(owner_addr)
-        balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
-    except Exception:
-        return []
-    if int(balance) <= 0:
-        return []
-
-    limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
-    # v4 PositionManager is non-enumerable: discover tokenIds via Transfer(to=owner) logs.
-    token_ids = _scan_erc721_token_ids_by_incoming_logs(
-        cid,
-        pm,
-        owner_addr,
-        deadline_ts=deadline_ts,
-        max_ids=max(limit * 4, limit),
-        lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 20_000_000),
-    )
+    token_ids: list[int] = []
+    if isinstance(token_ids_override, list) and token_ids_override:
+        seen_ids: set[int] = set()
+        for tid in token_ids_override:
+            v = _parse_int_like(tid)
+            if v <= 0 or v in seen_ids:
+                continue
+            seen_ids.add(int(v))
+            if _is_auto_hidden_closed_position(int(cid), "uniswap_v4", int(v)):
+                continue
+            token_ids.append(int(v))
+            if len(token_ids) >= int(POSITIONS_ONCHAIN_MAX_NFTS):
+                break
+    else:
+        # Strict contract-only flow: IDs must come from explorer API first.
+        if POSITIONS_CONTRACT_ONLY_ENABLED:
+            return []
+        # Run only if owner has v4 NFTs.
+        try:
+            bal_data = "0x70a08231" + _encode_address_word(owner_addr)
+            balance = _decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data))
+        except Exception:
+            return []
+        if int(balance) <= 0:
+            return []
+        limit = min(int(balance), POSITIONS_ONCHAIN_MAX_NFTS)
+        # v4 PositionManager is non-enumerable: discover tokenIds via Transfer(to=owner) logs.
+        token_ids = _scan_erc721_token_ids_by_incoming_logs(
+            cid,
+            pm,
+            owner_addr,
+            deadline_ts=deadline_ts,
+            max_ids=max(limit * 4, limit),
+            lookback_blocks=max(int(POSITIONS_ERC721_LOG_LOOKBACK_BLOCKS), 20_000_000),
+        )
     if not token_ids:
         return []
 
@@ -6040,6 +6097,8 @@ def _scan_uniswap_v4_positions_onchain(
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
         try:
+            if _is_auto_hidden_closed_position(int(cid), "uniswap_v4", int(token_id)):
+                continue
             owner_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(token_id)))
             owner_words = _hex_words(owner_hex)
             if not owner_words or owner_words[0][-40:].lower() != owner_word:
@@ -6057,6 +6116,7 @@ def _scan_uniswap_v4_positions_onchain(
                 continue
             liq = _decode_uint_eth_call(batch[1] or "0x0")
             if int(liq) <= 0:
+                _mark_auto_hidden_closed_position(int(cid), "uniswap_v4", int(token_id))
                 continue
 
             raw0 = _decode_address_from_word(p_words[0])
@@ -7425,11 +7485,34 @@ def _scan_pool_positions_chain(
             if version == "v4" and int(chain_id) in UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID and time.monotonic() < deadline_ts:
                 try:
                     t_call = time.monotonic()
+                    _set_chain_progress("call_contract_only_explorer_v4_ids", version=version, owner=str(owner))
+                    explorer_v4_ids: list[int] = []
+                    v4_pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
+                    if _is_eth_address(v4_pm):
+                        explorer_v4_ids = _scan_erc721_token_ids_by_explorer_api(
+                            int(chain_id),
+                            v4_pm,
+                            owner,
+                            max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
+                            protocol="uniswap_v4",
+                        )
+                    owner_attempts.append(
+                        {
+                            "owner_value": owner,
+                            "owner_type": "explorer",
+                            "query_mode": "contract_only_explorer_v4_ids",
+                            "count": len(explorer_v4_ids),
+                            "ok": True,
+                            "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
+                        }
+                    )
+                    t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_onchain_uniswap_v4_pm", version=version, owner=str(owner))
                     v4_rows = _scan_uniswap_v4_positions_onchain(
                         owner,
                         int(chain_id),
                         deadline_ts=deadline_ts,
+                        token_ids_override=explorer_v4_ids,
                     )
                     owner_attempts.append(
                         {
@@ -8089,6 +8172,10 @@ def _scan_pool_positions_chain(
         fees_owed_display = f"{_fmt_amt(fees0_val, zero_if_missing=True)} / {_fmt_amt(fees1_val, zero_if_missing=True)}"
         a0_now = max(0.0, float(amount0_val or 0.0))
         a1_now = max(0.0, float(amount1_val or 0.0))
+        # Zero-liquidity / 0-0 position rows are auto-hidden and skipped from future scans.
+        if liq_int <= 0 or (a0_now <= 0.0 and a1_now <= 0.0):
+            _mark_auto_hidden_closed_position(int(chain_id), str(proto_label or ""), _position_token_id_from_raw(p.get("id")))
+            return None
         # Status is derived only from "In position":
         # inactive when either side is zero; active otherwise.
         position_status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
