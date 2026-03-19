@@ -441,6 +441,8 @@ CONTRACT_CREATION_DATE_CACHE: dict[tuple[int, str], str] = {}
 CONTRACT_CREATION_DATE_CACHE_LOCK = threading.Lock()
 POSITION_CREATION_DATE_CACHE: dict[tuple[int, str, int], str] = {}
 POSITION_CREATION_DATE_CACHE_LOCK = threading.Lock()
+EXPLORER_NFT_META_CACHE: dict[tuple[int, str, int], dict[str, Any]] = {}
+EXPLORER_NFT_META_CACHE_LOCK = threading.Lock()
 AUTO_HIDDEN_CLOSED_POSITION_IDS: set[tuple[int, str, int]] = set()
 AUTO_HIDDEN_CLOSED_POSITION_IDS_LOCK = threading.Lock()
 POSITION_CONTRACT_SNAPSHOT_TTL_SEC = max(30, int(os.environ.get("POSITION_CONTRACT_SNAPSHOT_TTL_SEC", "600")))
@@ -3635,6 +3637,93 @@ def _position_creation_date_cache_set(chain_id: int, protocol: str, position_id:
         POSITION_CREATION_DATE_CACHE[(cid, proto, int(tid))] = d
 
 
+def _explorer_nft_meta_cache_upsert_rows(
+    chain_id: int,
+    rows: list[dict[str, Any]],
+    *,
+    protocol_hint: str = "",
+) -> None:
+    cid = int(chain_id)
+    proto = str(protocol_hint or "").strip().lower()
+    if cid <= 0 or not isinstance(rows, list):
+        return
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        caddr = str(
+            r.get("contractAddress")
+            or r.get("contractaddress")
+            or r.get("tokenAddress")
+            or ""
+        ).strip().lower()
+        if not _is_eth_address(caddr):
+            continue
+        tid = _position_token_id_from_raw(r.get("tokenID"))
+        if tid <= 0:
+            continue
+        ts = _parse_int_like(r.get("timeStamp") or 0)
+        bn = _parse_int_like(r.get("blockNumber") or 0)
+        txh = str(r.get("hash") or "").strip().lower()
+        from_addr = str(r.get("from") or "").strip().lower()
+        to_addr = str(r.get("to") or "").strip().lower()
+        token_name = str(r.get("tokenName") or "").strip()
+        token_symbol = str(r.get("tokenSymbol") or "").strip()
+        k = (cid, caddr, int(tid))
+        with EXPLORER_NFT_META_CACHE_LOCK:
+            cur = dict(EXPLORER_NFT_META_CACHE.get(k) or {})
+            first_ts = int(cur.get("first_seen_ts") or 0)
+            last_ts = int(cur.get("last_seen_ts") or 0)
+            first_bn = int(cur.get("first_seen_block") or 0)
+            last_bn = int(cur.get("last_seen_block") or 0)
+            if ts > 0 and (first_ts <= 0 or ts < first_ts):
+                cur["first_seen_ts"] = int(ts)
+            elif first_ts > 0:
+                cur["first_seen_ts"] = first_ts
+            if ts > 0 and (last_ts <= 0 or ts >= last_ts):
+                cur["last_seen_ts"] = int(ts)
+                if txh:
+                    cur["last_tx_hash"] = txh
+                if from_addr:
+                    cur["last_from"] = from_addr
+                if to_addr:
+                    cur["last_to"] = to_addr
+            elif last_ts > 0:
+                cur["last_seen_ts"] = last_ts
+            if bn > 0 and (first_bn <= 0 or bn < first_bn):
+                cur["first_seen_block"] = int(bn)
+            elif first_bn > 0:
+                cur["first_seen_block"] = first_bn
+            if bn > 0 and (last_bn <= 0 or bn >= last_bn):
+                cur["last_seen_block"] = int(bn)
+            elif last_bn > 0:
+                cur["last_seen_block"] = last_bn
+            if token_name and not str(cur.get("token_name") or "").strip():
+                cur["token_name"] = token_name
+            if token_symbol and not str(cur.get("token_symbol") or "").strip():
+                cur["token_symbol"] = token_symbol
+            cur["contract"] = caddr
+            cur["token_id"] = int(tid)
+            EXPLORER_NFT_META_CACHE[k] = cur
+        if proto and ts > 0:
+            try:
+                d = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
+            except Exception:
+                d = ""
+            if d:
+                _position_creation_date_cache_set(cid, proto, tid, d)
+
+
+def _explorer_nft_meta_get(chain_id: int, contract: str, position_id: Any) -> dict[str, Any]:
+    cid = int(chain_id)
+    c = str(contract or "").strip().lower()
+    tid = _position_token_id_from_raw(position_id)
+    if cid <= 0 or not _is_eth_address(c) or tid <= 0:
+        return {}
+    with EXPLORER_NFT_META_CACHE_LOCK:
+        cur = dict(EXPLORER_NFT_META_CACHE.get((cid, c, int(tid))) or {})
+    return cur
+
+
 def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -4258,6 +4347,7 @@ def _scan_erc721_token_ids_by_explorer_api(
     )
     if not rows:
         return []
+    _explorer_nft_meta_cache_upsert_rows(cid, rows, protocol_hint=protocol)
     out: list[int] = []
     seen: set[int] = set()
     proto = str(protocol or "").strip().lower()
@@ -4316,6 +4406,7 @@ def _scan_erc721_token_ids_from_explorer_rows(
     o = str(owner or "").strip().lower()
     if not _is_eth_address(c) or not _is_eth_address(o):
         return []
+    _explorer_nft_meta_cache_upsert_rows(cid, rows, protocol_hint=protocol)
     owner_candidates = _position_owner_allowlist(cid, str(protocol or ""), o)
     if not owner_candidates:
         owner_candidates = {o}
@@ -4491,6 +4582,7 @@ def _explorer_owner_nfttx_rows(
                 continue
         if out:
             return out
+    _explorer_nft_meta_cache_upsert_rows(cid, out, protocol_hint="")
     return out
 
 
@@ -4600,6 +4692,7 @@ def _collect_explorer_rows_for_owner_contracts(
             max_rows=max(80, int(max_rows_per_contract)),
             protocol=pp,
         )
+        _explorer_nft_meta_cache_upsert_rows(cid, rows, protocol_hint=pp)
         per_contract.append(
             {
                 "contract": cc,
@@ -8373,6 +8466,22 @@ def _scan_pool_positions_chain(
         t0, t0_src = _token_symbol_hint(t0_obj)
         t1, t1_src = _token_symbol_hint(t1_obj)
         proto_label = str(p.get("_protocol_label") or f"uniswap_{version}").strip().lower()
+        nft_contract = str(p.get("_nft_contract") or "").strip().lower()
+        if not _is_eth_address(nft_contract):
+            nft_contract = _position_manager_for_protocol(int(chain_id), proto_label)
+        explorer_meta = _explorer_nft_meta_get(int(chain_id), nft_contract, p.get("id"))
+        explorer_fields = {
+            "position_contract": str(nft_contract or ""),
+            "explorer_first_seen_ts": int(explorer_meta.get("first_seen_ts") or 0),
+            "explorer_first_seen_block": int(explorer_meta.get("first_seen_block") or 0),
+            "explorer_last_seen_ts": int(explorer_meta.get("last_seen_ts") or 0),
+            "explorer_last_seen_block": int(explorer_meta.get("last_seen_block") or 0),
+            "explorer_last_tx_hash": str(explorer_meta.get("last_tx_hash") or ""),
+            "explorer_last_from": str(explorer_meta.get("last_from") or ""),
+            "explorer_last_to": str(explorer_meta.get("last_to") or ""),
+            "explorer_token_name": str(explorer_meta.get("token_name") or ""),
+            "explorer_token_symbol": str(explorer_meta.get("token_symbol") or ""),
+        }
         is_v3_npm_protocol = proto_label in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
         is_infinity_protocol = proto_label.startswith("pancake_infinity_")
         if POSITIONS_CONTRACT_ONLY_ENABLED and not (
@@ -8450,7 +8559,7 @@ def _scan_pool_positions_chain(
                 "token0_id": str((pool.get("token0") or {}).get("id") or ""),
                 "token1_id": str((pool.get("token1") or {}).get("id") or ""),
                 "position_id": str(p.get("id") or ""),
-                "position_contract": str(p.get("_nft_contract") or ""),
+                **explorer_fields,
                 "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
                 "fee_tier": "-",
                 "fee_tier_raw": "",
@@ -8593,7 +8702,7 @@ def _scan_pool_positions_chain(
                 "token0_id": str((pool.get("token0") or {}).get("id") or ""),
                 "token1_id": str((pool.get("token1") or {}).get("id") or ""),
                 "position_id": str(p.get("id") or ""),
-                "position_contract": str(p.get("_nft_contract") or ""),
+                **explorer_fields,
                 "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
                 "fee_tier": "-",
                 "fee_tier_raw": "",
@@ -8776,7 +8885,7 @@ def _scan_pool_positions_chain(
             "token0_id": str((pool.get("token0") or {}).get("id") or ""),
             "token1_id": str((pool.get("token1") or {}).get("id") or ""),
             "position_id": str(p.get("id") or ""),
-            "position_contract": str(p.get("_nft_contract") or ""),
+            **explorer_fields,
             "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
             "fee_tier": fee_disp,
             "fee_tier_raw": fee_raw,
