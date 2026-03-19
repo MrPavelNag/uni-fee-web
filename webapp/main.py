@@ -23,7 +23,7 @@ import time
 import uuid
 import shutil
 from queue import Empty, Queue
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -219,17 +219,21 @@ _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
 POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
-# Hard cap for one request: always 60s for both regular and contract-only scans.
-POSITIONS_SCAN_MAX_SECONDS = 60
-POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = 60
+# Hard cap for one positions scan (explorer NFT catalog uses the same budget).
+POSITIONS_SCAN_MAX_SECONDS = max(30, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "120")))
+POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = max(
+    30, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY", str(POSITIONS_SCAN_MAX_SECONDS)))
+)
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
 POSITIONS_CONTRACT_ONLY_ENABLED = os.environ.get("POSITIONS_CONTRACT_ONLY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_DISABLE_PARALLELISM = os.environ.get("POSITIONS_DISABLE_PARALLELISM", "1").strip().lower() in ("1", "true", "yes", "on")
-POSITIONS_FAST_REMAINING_BUDGET_SEC = 60
+POSITIONS_FAST_REMAINING_BUDGET_SEC = max(30, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "120")))
 POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
-POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC = 60
+POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC = max(
+    30, int(os.environ.get("POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC", "120"))
+)
 POSITIONS_FAST_CONTRACT_ONLY_PER_CHAIN_TIMEOUT_SEC = max(
     2,
     min(30, int(os.environ.get("POSITIONS_FAST_CONTRACT_ONLY_PER_CHAIN_TIMEOUT_SEC", "12"))),
@@ -279,6 +283,14 @@ POSITIONS_EXPLORER_NFT_CATALOG_SCAN = os.environ.get("POSITIONS_EXPLORER_NFT_CAT
     "on",
 )
 POSITIONS_EXPLORER_NFT_CATALOG_MAX_ROWS = max(50, min(10000, int(os.environ.get("POSITIONS_EXPLORER_NFT_CATALOG_MAX_ROWS", "2000"))))
+# HTTP read timeout per explorer tokennfttx request (slow indexers / large pages).
+POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC = max(
+    12, min(180, int(os.environ.get("POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC", "55")))
+)
+# Parallel tokennfttx pages per owner (same URL template); 1 = sequential.
+POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS = max(
+    1, min(12, int(os.environ.get("POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS", "4")))
+)
 POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS = max(
     4,
     min(60, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS", "18"))),
@@ -547,7 +559,7 @@ def _analytics_conn() -> sqlite3.Connection:
     global ANALYTICS_DB_PATH
     try:
         ANALYTICS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(ANALYTICS_DB_PATH), timeout=10)
+        conn = sqlite3.connect(str(ANALYTICS_DB_PATH), timeout=60)
     except Exception:
         # Runtime-safe fallback to local writable path to prevent admin/help 500s.
         fallback = DATA_DIR / "analytics.sqlite3"
@@ -558,8 +570,9 @@ def _analytics_conn() -> sqlite3.Connection:
             except Exception:
                 pass
         ANALYTICS_DB_PATH = fallback
-        conn = sqlite3.connect(str(ANALYTICS_DB_PATH), timeout=10)
+        conn = sqlite3.connect(str(ANALYTICS_DB_PATH), timeout=60)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=120000")
     return conn
 
 
@@ -3067,32 +3080,22 @@ def _explorer_v2_chainid(chain_id: int) -> str:
     }.get(int(chain_id), "")
 
 
+def _explorer_nfttx_row_token_id_str(row: dict[str, Any]) -> str:
+    """Etherscan-family tokennfttx rows usually use tokenID; some scanners use tokenId."""
+    if not isinstance(row, dict):
+        return ""
+    for k in ("tokenID", "tokenId", "token_id", "TokenId"):
+        v = row.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return ""
+
+
 def _explorer_v2_api_keys(chain_id: int) -> list[str]:
-    cid = int(chain_id)
+    """Only ETHERSCAN_API_KEY is used with api.etherscan.io/v2 (chain selected via chainid=)."""
+    _ = int(chain_id)
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
-    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
-    base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
-    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
-    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
-    raw: list[str] = []
-    if eth_key:
-        raw.append(eth_key)
-    if cid == 56 and bsc_key:
-        raw.append(bsc_key)
-    if cid == 8453 and base_key:
-        raw.append(base_key)
-    if cid == 42161 and arb_key:
-        raw.append(arb_key)
-    if cid in {130, 1301} and uni_key:
-        raw.append(uni_key)
-    out: list[str] = []
-    seen: set[str] = set()
-    for k in raw:
-        if not k or k in seen:
-            continue
-        seen.add(k)
-        out.append(k)
-    return out
+    return [eth_key] if eth_key else []
 
 
 def _explorer_contract_creation_block(chain_id: int, contract_address: str) -> int:
@@ -3376,7 +3379,7 @@ def _explorer_nft_meta_cache_upsert_rows(
         ).strip().lower()
         if not _is_eth_address(caddr):
             continue
-        tid = _position_token_id_from_raw(r.get("tokenID"))
+        tid = _position_token_id_from_raw(_explorer_nfttx_row_token_id_str(r) or r.get("tokenID"))
         if tid <= 0:
             continue
         ts = _parse_int_like(r.get("timeStamp") or 0)
@@ -3876,7 +3879,7 @@ def _explorer_nfttx_rows(
     urls: list[tuple[str, bool]] = []
     offset = max(20, min(1000, int(max_rows)))
     for owner_addr in owner_candidates:
-        # Primary path: one ETHERSCAN_API_KEY across all supported chains.
+        # Primary: Etherscan API v2 + ETHERSCAN_API_KEY for all mapped chains (incl. BSC).
         if eth_key:
             urls.append((
                 "https://api.etherscan.io/v2/api"
@@ -3890,7 +3893,6 @@ def _explorer_nfttx_rows(
                 f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={eth_key}",
                 False,
             ))
-        # Optional scanner-specific fallbacks if dedicated keys are present.
         if cid == 56 and bsc_key:
             urls.append((
                 "https://api.bscscan.com/api"
@@ -3904,7 +3906,7 @@ def _explorer_nfttx_rows(
                 f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={bsc_key}",
                 False,
             ))
-        elif cid == 8453 and base_key:
+        if cid == 8453 and base_key:
             urls.append((
                 "https://api.basescan.org/api"
                 f"?module=account&action=tokennfttx&contractaddress={c}"
@@ -3947,7 +3949,7 @@ def _explorer_nfttx_rows(
     def _fetch_rows(url: str) -> list[dict[str, Any]]:
         try:
             req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
-            with urlopen(req, timeout=12) as resp:
+            with urlopen(req, timeout=float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             result_rows = (payload or {}).get("result")
             if isinstance(result_rows, list):
@@ -3994,7 +3996,7 @@ def _explorer_nfttx_rows(
             f"?module=account&action=tokennfttx&contractaddress={c}"
             f"&page={{page}}&offset={offset}&sort=desc&apikey={bsc_key}"
         )
-    elif cid == 8453 and base_key:
+    if cid == 8453 and base_key:
         contract_urls.append(
             "https://api.basescan.org/api"
             f"?module=account&action=tokennfttx&contractaddress={c}"
@@ -4031,7 +4033,7 @@ def _explorer_nfttx_rows(
                 key = "|".join(
                     [
                         str(r.get("hash") or "").strip().lower(),
-                        str(r.get("tokenID") or "").strip().lower(),
+                        str(_explorer_nfttx_row_token_id_str(r) or "").strip().lower(),
                         str(r.get("logIndex") or "").strip().lower(),
                     ]
                 )
@@ -4209,6 +4211,7 @@ def _explorer_owner_nfttx_rows(
     *,
     max_rows: int = 400,
     debug_out: dict[str, Any] | None = None,
+    deadline_ts: float | None = None,
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
     o = str(owner or "").strip().lower()
@@ -4231,6 +4234,7 @@ def _explorer_owner_nfttx_rows(
         debug_out["has_uni_key"] = bool(uni_key)
     url_templates: list[str] = []
     offset = max(20, min(1000, int(max_rows)))
+    # Primary for all supported EVM chains (incl. BSC=56): Etherscan API v2 + ETHERSCAN_API_KEY.
     if eth_key:
         url_templates.append(
             "https://api.etherscan.io/v2/api"
@@ -4242,7 +4246,7 @@ def _explorer_owner_nfttx_rows(
             "https://api.bscscan.com/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={bsc_key}"
         )
-    elif cid == 8453 and base_key:
+    if cid == 8453 and base_key:
         url_templates.append(
             "https://api.basescan.org/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={base_key}"
@@ -4262,66 +4266,131 @@ def _explorer_owner_nfttx_rows(
             debug_out["reason"] = "no_explorer_urls_configured"
         return []
 
+    def _deadline_hit() -> bool:
+        return deadline_ts is not None and time.monotonic() >= float(deadline_ts)
+
+    def _finalize() -> list[dict[str, Any]]:
+        _explorer_nft_meta_cache_upsert_rows(cid, out, protocol_hint="")
+        return out
+
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     max_pages = int(POSITIONS_EXPLORER_NFTTX_MAX_PAGES)
+    http_timeout = float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)
+    page_workers = max(1, int(POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS))
     if isinstance(debug_out, dict):
         debug_out["requests"] = []
-    for tmpl in url_templates:
-        for page in range(1, max_pages + 1):
-            try:
-                url = str(tmpl).replace("{page}", str(page))
-                req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
-                with urlopen(req, timeout=12) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                rows = (payload or {}).get("result")
-                if isinstance(debug_out, dict):
-                    dbg_req = {
-                        "page": int(page),
-                        "status": str((payload or {}).get("status") or ""),
-                        "message": str((payload or {}).get("message") or ""),
-                        "result_type": type(rows).__name__,
-                        "result_len": (len(rows) if isinstance(rows, list) else None),
-                        "url": str(url).split("&apikey=", 1)[0],
-                    }
-                    reqs = debug_out.get("requests")
-                    if isinstance(reqs, list) and len(reqs) < 20:
-                        reqs.append(dbg_req)
-                if not isinstance(rows, list) or not rows:
-                    break
-                for r in rows:
-                    if not isinstance(r, dict):
-                        continue
-                    caddr = str(
-                        r.get("contractAddress")
-                        or r.get("contractaddress")
-                        or r.get("tokenAddress")
-                        or ""
-                    ).strip().lower()
-                    tid = str(r.get("tokenID") or "").strip().lower()
-                    txh = str(r.get("hash") or "").strip().lower()
-                    logi = str(r.get("logIndex") or "").strip().lower()
-                    if not _is_eth_address(caddr) or not tid:
-                        continue
-                    k = "|".join([txh, logi, caddr, tid])
-                    if k in seen:
-                        continue
-                    seen.add(k)
-                    out.append(r)
-                    if len(out) >= int(max_rows):
-                        _explorer_nft_meta_cache_upsert_rows(cid, out, protocol_hint="")
-                        return out
-            except Exception:
-                if isinstance(debug_out, dict):
-                    reqs = debug_out.get("requests")
-                    if isinstance(reqs, list) and len(reqs) < 20:
-                        reqs.append({"page": int(page), "status": "error", "message": "request_failed"})
+        debug_out["http_timeout_sec"] = round(http_timeout, 3)
+        debug_out["page_workers"] = int(page_workers)
+
+    def _append_from_result(rows: Any) -> str:
+        """Return 'empty', 'ok', or 'full'."""
+        if not isinstance(rows, list) or not rows:
+            return "empty"
+        for r in rows:
+            if not isinstance(r, dict):
                 continue
+            caddr = str(
+                r.get("contractAddress")
+                or r.get("contractaddress")
+                or r.get("tokenAddress")
+                or ""
+            ).strip().lower()
+            txh = str(r.get("hash") or "").strip().lower()
+            logi = str(r.get("logIndex") or "").strip().lower()
+            tid_raw = _explorer_nfttx_row_token_id_str(r).strip().lower()
+            if not _is_eth_address(caddr) or not tid_raw:
+                continue
+            k = "|".join([txh, logi, caddr, tid_raw])
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(r)
+            if len(out) >= int(max_rows):
+                return "full"
+        return "ok"
+
+    def _dbg_append(page: int, url: str, payload: dict[str, Any] | None, *, err: str = "") -> None:
+        if not isinstance(debug_out, dict):
+            return
+        rows = (payload or {}).get("result") if isinstance(payload, dict) else None
+        dbg_req = {
+            "page": int(page),
+            "status": str((payload or {}).get("status") or "") if payload else "",
+            "message": str((payload or {}).get("message") or "") if payload else "",
+            "result_type": type(rows).__name__ if rows is not None else "none",
+            "result_len": (len(rows) if isinstance(rows, list) else None),
+            "url": str(url).split("&apikey=", 1)[0],
+        }
+        if err:
+            dbg_req["status"] = "error"
+            dbg_req["message"] = err
+        reqs = debug_out.get("requests")
+        if isinstance(reqs, list) and len(reqs) < 40:
+            reqs.append(dbg_req)
+
+    for tmpl in url_templates:
+        if _deadline_hit():
+            break
+
+        def _fetch_page(page_num: int) -> tuple[int, dict[str, Any] | None]:
+            try:
+                url = str(tmpl).replace("{page}", str(page_num))
+                req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+                with urlopen(req, timeout=http_timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                pl = payload if isinstance(payload, dict) else {}
+                return int(page_num), pl
+            except Exception:
+                return int(page_num), None
+
+        page = 1
+        while page <= max_pages and len(out) < int(max_rows):
+            if _deadline_hit():
+                return _finalize()
+            batch_end = min(page + page_workers - 1, max_pages)
+            page_payloads: dict[int, dict[str, Any] | None] = {}
+            if page_workers <= 1:
+                pn, pl = _fetch_page(page)
+                url = str(tmpl).replace("{page}", str(pn))
+                if pl is None:
+                    _dbg_append(pn, url, None, err="request_failed")
+                else:
+                    _dbg_append(pn, url, pl)
+                page_payloads[pn] = pl
+            else:
+                with ThreadPoolExecutor(max_workers=max(1, batch_end - page + 1)) as px:
+                    futs = {px.submit(_fetch_page, p): int(p) for p in range(page, batch_end + 1)}
+                    for fut in as_completed(futs):
+                        pn, pl = fut.result()
+                        page_payloads[int(pn)] = pl
+                for pn in sorted(page_payloads.keys()):
+                    pl = page_payloads[pn]
+                    url = str(tmpl).replace("{page}", str(pn))
+                    if pl is None:
+                        _dbg_append(pn, url, None, err="request_failed")
+                    else:
+                        _dbg_append(pn, url, pl)
+
+            stop_tmpl = False
+            for pn in sorted(page_payloads.keys()):
+                pl = page_payloads.get(pn)
+                if pl is None:
+                    continue
+                rows = pl.get("result")
+                st = _append_from_result(rows)
+                if st == "empty":
+                    stop_tmpl = True
+                    break
+                if st == "full":
+                    return _finalize()
+            if stop_tmpl:
+                break
+            page = batch_end + 1
+
         if out:
-            _explorer_nft_meta_cache_upsert_rows(cid, out, protocol_hint="")
-            return out
-    _explorer_nft_meta_cache_upsert_rows(cid, out, protocol_hint="")
-    return out
+            return _finalize()
+    return _finalize()
 
 
 def _scan_v4_position_ids_by_explorer_any_contract(
@@ -5314,6 +5383,10 @@ def _enrich_rows_liquidity_usd(rows: list[dict[str, Any]], *, max_seconds: int =
     for r in rows:
         if time.monotonic() >= deadline_ts:
             break
+        if bool(r.get("unsupported_protocol")):
+            r["liquidity_usd"] = None
+            r["liquidity_display"] = "-"
+            continue
         if bool(r.get("suspected_spam")) or bool(r.get("spam_skipped")):
             r["liquidity_usd"] = None
             r["liquidity_display"] = "-"
@@ -5336,6 +5409,10 @@ def _enrich_rows_liquidity_usd(rows: list[dict[str, Any]], *, max_seconds: int =
         except Exception:
             prices_by_chain[int(cid)] = {}
     for r in rows:
+        if bool(r.get("unsupported_protocol")):
+            r["liquidity_usd"] = None
+            r["liquidity_display"] = "-"
+            continue
         if bool(r.get("suspected_spam")) or bool(r.get("spam_skipped")):
             r["liquidity_usd"] = None
             r["liquidity_display"] = "-"
@@ -9389,14 +9466,15 @@ def _explorer_tokennfttx_currently_owned_contract_token_ids(
         ).strip().lower()
         if not _is_eth_address(caddr):
             continue
-        tid_raw = str(r.get("tokenID") or "").strip()
+        tid_raw = _explorer_nfttx_row_token_id_str(r)
         if not tid_raw:
             continue
         try:
-            tid = int(tid_raw, 10)
+            tid = int(str(tid_raw).strip(), 10)
         except Exception:
             try:
-                tid = int(tid_raw, 16) if tid_raw.lower().startswith("0x") else int(tid_raw)
+                ts = str(tid_raw).strip()
+                tid = int(ts, 16) if ts.lower().startswith("0x") else int(ts)
             except Exception:
                 continue
         if tid <= 0:
@@ -9421,6 +9499,40 @@ def _explorer_tokennfttx_currently_owned_contract_token_ids(
     return out
 
 
+def _explorer_nft_catalog_is_uniswap_or_pancake(token_name: str, token_symbol: str) -> bool:
+    """True if explorer token name/symbol indicates Uniswap or Pancake (case-insensitive)."""
+    blob = f"{token_name} {token_symbol}".lower()
+    return "uniswap" in blob or "pancake" in blob
+
+
+def _explorer_nft_catalog_owner_chain_scan(
+    cid: int,
+    ok: str,
+    max_rows: int,
+    deadline_ts: float,
+) -> dict[str, Any]:
+    """Fetch tokennfttx + owned ids for one (chain, owner); safe inside thread pool."""
+    dbg: dict[str, Any] = {}
+    err = ""
+    nft_rows: list[dict[str, Any]] = []
+    owned: list[tuple[str, int]] = []
+    try:
+        nft_rows = _explorer_owner_nfttx_rows(
+            int(cid), ok, max_rows=max_rows, debug_out=dbg, deadline_ts=deadline_ts
+        )
+        owned = _explorer_tokennfttx_currently_owned_contract_token_ids(nft_rows, ok)
+    except Exception as e:
+        err = str(e)[:400]
+    return {
+        "chain_id": int(cid),
+        "owner": ok,
+        "nft_rows": nft_rows,
+        "owned": owned,
+        "debug": dbg,
+        "error": err,
+    }
+
+
 def _scan_pool_positions_explorer_nft_catalog(
     addresses: list[str],
     chain_ids: list[int],
@@ -9429,7 +9541,7 @@ def _scan_pool_positions_explorer_nft_catalog(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
-    """One pass per chain/address: account tokennfttx → meta cache → SQLite + table rows (explorer fields only)."""
+    """tokennfttx per (chain, owner) in parallel → SQLite (supported DEX only) + UI rows."""
     _ = (pre_enqueued_ownership_refresh, hard_scan)
     rows_out: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -9450,23 +9562,58 @@ def _scan_pool_positions_explorer_nft_catalog(
     timings["chains_total"] = len(ordered_chain_ids)
     all_contracts_by_owner: dict[tuple[int, str], set[str]] = {}
 
+    tasks: list[tuple[int, str]] = []
     for cid in ordered_chain_ids:
-        if time.monotonic() >= deadline_ts:
-            break
         chain_key = str(CHAIN_ID_TO_KEY.get(int(cid), "") or "").strip().lower()
         if not chain_key or not _explorer_v2_chainid(int(cid)):
             continue
-        chain_attempts: list[dict[str, Any]] = []
         for owner in addresses:
-            if time.monotonic() >= deadline_ts:
-                break
             o = str(owner or "").strip()
             if not _is_eth_address(o):
                 continue
             ok = str(o).strip().lower()
-            dbg: dict[str, Any] = {}
-            nft_rows = _explorer_owner_nfttx_rows(int(cid), ok, max_rows=max_rows, debug_out=dbg)
-            owned = _explorer_tokennfttx_currently_owned_contract_token_ids(nft_rows, ok)
+            tasks.append((int(cid), ok))
+
+    workers = max(1, min(int(POSITIONS_ADDRESS_PARALLEL_WORKERS), len(tasks)))
+    timings["parallel_workers"] = int(workers)
+    timings["owner_chain_tasks"] = int(len(tasks))
+
+    fetch_results: list[dict[str, Any]] = []
+    if tasks:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [
+                ex.submit(_explorer_nft_catalog_owner_chain_scan, cid, ok, max_rows, deadline_ts)
+                for cid, ok in tasks
+            ]
+            for fut in as_completed(futs):
+                try:
+                    fetch_results.append(fut.result())
+                except Exception as e:
+                    errors.append(f"explorer_nft_catalog: {e}"[:200])
+    fetch_results.sort(key=lambda x: (int(x.get("chain_id") or 0), str(x.get("owner") or "")))
+
+    results_by_chain: dict[int, list[dict[str, Any]]] = {}
+    for fr in fetch_results:
+        cid = int(fr.get("chain_id") or 0)
+        if cid > 0:
+            results_by_chain.setdefault(cid, []).append(fr)
+
+    for cid in ordered_chain_ids:
+        chain_key = str(CHAIN_ID_TO_KEY.get(int(cid), "") or "").strip().lower()
+        if not chain_key or not _explorer_v2_chainid(int(cid)):
+            continue
+        fr_list = results_by_chain.get(int(cid), [])
+        if not fr_list:
+            continue
+        chain_attempts: list[dict[str, Any]] = []
+        for fr in fr_list:
+            ok = str(fr.get("owner") or "").strip().lower()
+            dbg = fr.get("debug") if isinstance(fr.get("debug"), dict) else {}
+            err = str(fr.get("error") or "").strip()
+            if err:
+                errors.append(f"{chain_key} {ok[:6]}…: {err}"[:240])
+            nft_rows = fr.get("nft_rows") if isinstance(fr.get("nft_rows"), list) else []
+            owned = fr.get("owned") if isinstance(fr.get("owned"), list) else []
             chain_attempts.append(
                 {
                     "owner_value": ok,
@@ -9474,12 +9621,15 @@ def _scan_pool_positions_explorer_nft_catalog(
                     "query_mode": "explorer_nft_catalog:tokennfttx",
                     "count": len(nft_rows),
                     "owned_nfts": len(owned),
-                    "ok": True,
+                    "ok": not bool(err),
                     "debug": dbg,
                 }
             )
             contracts_here: set[str] = set()
-            for contract, tid in owned:
+            for item in owned:
+                if not (isinstance(item, tuple) and len(item) == 2):
+                    continue
+                contract, tid = item[0], item[1]
                 contracts_here.add(str(contract).strip().lower())
                 meta = _explorer_nft_meta_get(int(cid), contract, tid)
                 token_name = str(meta.get("token_name") or "").strip()
@@ -9492,31 +9642,41 @@ def _scan_pool_positions_explorer_nft_catalog(
                         created = datetime.fromtimestamp(ts_first, tz=timezone.utc).date().isoformat()
                     except Exception:
                         created = ""
-                if include_creation_dates and created:
-                    _position_creation_date_cache_set(int(cid), _EXPLORER_NFT_CATALOG_PROTOCOL, tid, created)
-                cache_payload: dict[str, Any] = {
-                    "id": str(tid),
-                    "_protocol_label": _EXPLORER_NFT_CATALOG_PROTOCOL,
-                    "_source": "explorer_tokennfttx",
-                    "nft_contract": str(contract).strip().lower(),
-                    "explorer_token_name": token_name,
-                    "explorer_token_symbol": token_symbol,
-                    "first_seen_ts": meta.get("first_seen_ts"),
-                    "last_seen_ts": meta.get("last_seen_ts"),
-                    "last_tx_hash": meta.get("last_tx_hash"),
-                }
-                _position_details_cache_upsert(int(cid), _EXPLORER_NFT_CATALOG_PROTOCOL, cache_payload)
-                _position_ownership_upsert(
-                    int(cid),
-                    ok,
-                    _EXPLORER_NFT_CATALOG_PROTOCOL,
-                    str(contract).strip().lower(),
-                    [tid],
-                    source="explorer_nfttx",
-                )
-                proto_col = token_symbol[:24] if token_symbol else "nft"
+                supported = _explorer_nft_catalog_is_uniswap_or_pancake(token_name, token_symbol)
+                unsupported_protocol = not supported
+                blob = f"{token_name} {token_symbol}".lower()
+                if "uniswap" in blob:
+                    proto_col = (token_symbol or "Uniswap").strip()[:24] or "Uniswap"
+                elif "pancake" in blob:
+                    proto_col = (token_symbol or "Pancake").strip()[:24] or "Pancake"
+                else:
+                    proto_col = (token_symbol or "nft").strip()[:24] or "nft"
+                if supported:
+                    contracts_here.add(str(contract).strip().lower())
+                    if include_creation_dates and created:
+                        _position_creation_date_cache_set(int(cid), _EXPLORER_NFT_CATALOG_PROTOCOL, tid, created)
+                    cache_payload: dict[str, Any] = {
+                        "id": str(tid),
+                        "_protocol_label": _EXPLORER_NFT_CATALOG_PROTOCOL,
+                        "_source": "explorer_tokennfttx",
+                        "nft_contract": str(contract).strip().lower(),
+                        "explorer_token_name": token_name,
+                        "explorer_token_symbol": token_symbol,
+                        "first_seen_ts": meta.get("first_seen_ts"),
+                        "last_seen_ts": meta.get("last_seen_ts"),
+                        "last_tx_hash": meta.get("last_tx_hash"),
+                    }
+                    _position_details_cache_upsert(int(cid), _EXPLORER_NFT_CATALOG_PROTOCOL, cache_payload)
+                    _position_ownership_upsert(
+                        int(cid),
+                        ok,
+                        _EXPLORER_NFT_CATALOG_PROTOCOL,
+                        str(contract).strip().lower(),
+                        [tid],
+                        source="explorer_nfttx",
+                    )
                 row: dict[str, Any] = {
-                    "address": o,
+                    "address": ok,
                     "protocol": proto_col,
                     "chain": chain_key,
                     "chain_id": int(cid),
@@ -9550,6 +9710,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                     "spam_skipped": False,
                     "liquidity_usd": None,
                     "position_created_date": created if created else "-",
+                    "unsupported_protocol": bool(unsupported_protocol),
                 }
                 rows_out.append(row)
             if contracts_here:
@@ -11919,6 +12080,7 @@ def _render_positions_page() -> str:
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_HIDDEN_EXPANDED_KEY = "positions_hidden_expanded_v1";
+    const POS_UNSUPPORTED_EXPANDED_KEY = "positions_unsupported_protocols_expanded_v1";
     let posHasScannedOnce = false;
     let posScanTicker = null;
     let posScanStartedAt = 0;
@@ -12320,6 +12482,7 @@ def _render_positions_page() -> str:
           const idx = selected[i];
           const row = (posCache.pools || [])[idx];
           if (!row) continue;
+          if (row.unsupported_protocol) continue;
           const payload = {
             chain: row.chain,
             protocol: row.protocol,
@@ -12418,10 +12581,13 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
+      const unsupportedExpanded = localStorage.getItem(POS_UNSUPPORTED_EXPANDED_KEY) === "1";
+      const totalCols = 13;
       let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
+      const unsupportedRows = [];
       let spamHiddenCount = 0;
       for (let i = 0; i < list.length; i++) {
         const r0 = list[i];
@@ -12430,9 +12596,15 @@ def _render_positions_page() -> str:
         const trusted = trustedSpamKeys.has(row._row_key);
         const manual = manualHiddenKeys.has(row._row_key);
         const suspected = Boolean(row && (row.suspected_spam || row.spam_skipped));
+        const unsupported = Boolean(row && row.unsupported_protocol);
         row._is_trusted_spam = trusted;
         row._is_manual_hidden = manual;
         row._is_suspected_spam = suspected;
+        row._is_unsupported_protocol = unsupported;
+        if (unsupported) {
+          unsupportedRows.push(row);
+          continue;
+        }
         if (suspected && !trusted) spamHiddenCount += 1;
         if (manual || (suspected && !trusted)) {
           hiddenRows.push(row);
@@ -12469,7 +12641,25 @@ def _render_positions_page() -> str:
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
         html += "</tr>";
       }
-      if (!visible.length) html += "<tr><td colspan='13'>No pool positions found.</td></tr>";
+      if (!visible.length) html += `<tr><td colspan='${totalCols}'>No pool positions found.</td></tr>`;
+      if (unsupportedRows.length) {
+        let unsupInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
+        unsupInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Position ID</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
+        for (let ui = 0; ui < unsupportedRows.length; ui++) {
+          const r = unsupportedRows[ui];
+          const mismatch = hasPairMismatch(r);
+          const mismatchStyle = mismatch ? "background:#f1f5f9;color:#475569;font-weight:600;" : "";
+          const pairTrace = String(r.pair_symbol_source || "").trim();
+          const pairTitleRaw = mismatch
+            ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`
+            : (pairTrace ? `source: ${pairTrace}` : "");
+          const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
+          unsupInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked disabled title='Hidden: unsupported protocol (excluded from processing)' /></td><td style='padding:3px 6px'><input type='checkbox' disabled title='Unsupported protocol' /></td></tr>`;
+        }
+        unsupInner += "</table>";
+        const unsupOpen = unsupportedExpanded ? " open" : "";
+        html += `<tr><td colspan='${totalCols}'><details id='posUnsupportedDetails'${unsupOpen}><summary>Unsupported protocols (${unsupportedRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${unsupInner}</div></details></td></tr>`;
+      }
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
         hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Position ID</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
@@ -12492,9 +12682,15 @@ def _render_positions_page() -> str:
         const hiddenSummary = (spamHiddenCount > 0)
           ? `Hidden positions (${hiddenRows.length}; spam=${spamHiddenCount})`
           : `Hidden positions (${hiddenRows.length})`;
-        html += `<tr><td colspan='13'><details id='posHiddenDetails'${openAttr}><summary>${hiddenSummary}</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        html += `<tr><td colspan='${totalCols}'><details id='posHiddenDetails'${openAttr}><summary>${hiddenSummary}</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
+      const unsupEl = document.getElementById("posUnsupportedDetails");
+      if (unsupEl) {
+        unsupEl.addEventListener("toggle", () => {
+          localStorage.setItem(POS_UNSUPPORTED_EXPANDED_KEY, unsupEl.open ? "1" : "0");
+        });
+      }
       const detailsEl = document.getElementById("posHiddenDetails");
       if (detailsEl) {
         detailsEl.addEventListener("toggle", () => {
@@ -14781,7 +14977,9 @@ def _build_positions_info_notes(
         info_notes.append("TRON scanning is not available yet in this build.")
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         info_notes.append(
-            "Explorer NFT catalog: tokennfttx per chain/address; rows and SQLite cache use explorer fields only."
+            f"Explorer NFT catalog: tokennfttx only; parallel owner×chain workers={POSITIONS_ADDRESS_PARALLEL_WORKERS}, "
+            f"page_workers={POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS}, scan_budget={POSITIONS_SCAN_MAX_SECONDS}s, "
+            f"http_timeout={POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC}s; non-Uniswap/Pancake NFTs are listed as unsupported only."
         )
     if POSITIONS_CONTRACT_ONLY_ENABLED:
         info_notes.append("Contract-only mode: Pair/Fee/In position/Unclaimed are from on-chain contract calls only.")
@@ -14901,6 +15099,8 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
     def _is_symbol_anomaly(row: dict[str, Any]) -> bool:
         # Strict rule: once row is marked as spam, do not query it anymore
         # in background phases. Manual unspam uses dedicated row/enrich endpoint.
+        if bool(row.get("unsupported_protocol")):
+            return False
         if bool(row.get("suspected_spam")) or bool(row.get("spam_skipped")):
             return False
         s0 = str(row.get("position_symbol0") or "").strip().upper()
@@ -14923,6 +15123,8 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
             break
         if checked >= max_rows:
             break
+        if bool(row.get("unsupported_protocol")):
+            continue
         if not isinstance(row, dict) or not _is_symbol_anomaly(row):
             continue
         proto = str(row.get("protocol") or "").strip().lower()
@@ -15189,6 +15391,8 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
 @app.post("/api/positions/row/enrich")
 def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     row = dict(req.row or {})
+    if bool(row.get("unsupported_protocol")):
+        return {"ok": False, "reason": "unsupported_protocol"}
     chain_key = str(row.get("chain") or "").strip().lower()
     protocol = str(row.get("protocol") or "").strip().lower()
     owner = str(row.get("address") or "").strip().lower()
