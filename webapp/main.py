@@ -5589,6 +5589,7 @@ def _scan_v3_positions_onchain(
             "_skip_enrich": not include_price_details,
             "_protocol_label": str(protocol_label or "uniswap_v3"),
             "_source": str(source_tag or "onchain_npm"),
+            "_nft_contract": str(npm),
         }
     if token_ids_prefetched:
         scan_token_ids = list(token_ids_prefetched[: int(limit)])
@@ -5707,6 +5708,7 @@ def _fetch_v3_position_onchain_by_token_id(
             "_skip_enrich": not include_price_details,
             "_protocol_label": str(protocol_label or "uniswap_v3"),
             "_source": str(source_tag or "onchain_tokenid"),
+            "_nft_contract": str(npm),
         }
     except Exception:
         return None
