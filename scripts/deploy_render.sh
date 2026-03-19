@@ -20,40 +20,6 @@ RENDER_DEPLOY_HOOK_URL="${RENDER_DEPLOY_HOOK_URL:-}"
 RENDER_HEALTHCHECK_URL="${RENDER_HEALTHCHECK_URL:-https://uni-fee-web.onrender.com/healthz}"
 HEALTHCHECK_TIMEOUT_SEC="${HEALTHCHECK_TIMEOUT_SEC:-240}"
 HEALTHCHECK_INTERVAL_SEC="${HEALTHCHECK_INTERVAL_SEC:-5}"
-AUTO_SMOKE_CHECK="${AUTO_SMOKE_CHECK:-1}"
-SMOKE_SCRIPT_PATH="${SMOKE_SCRIPT_PATH:-./scripts/smoke_render.sh}"
-SMOKE_BASE_URL="${SMOKE_BASE_URL:-}"
-
-run_smoke_check() {
-  if [[ "${AUTO_SMOKE_CHECK}" != "1" ]]; then
-    echo "==> AUTO_SMOKE_CHECK=0, skipping smoke checks"
-    return
-  fi
-
-  if [[ ! -f "${SMOKE_SCRIPT_PATH}" ]]; then
-    echo "==> Smoke script not found: ${SMOKE_SCRIPT_PATH}"
-    echo "==> Skipping smoke checks"
-    return
-  fi
-
-  if [[ ! -x "${SMOKE_SCRIPT_PATH}" ]]; then
-    chmod +x "${SMOKE_SCRIPT_PATH}"
-  fi
-
-  local inferred_base="${SMOKE_BASE_URL}"
-  if [[ -z "${inferred_base}" && -n "${RENDER_HEALTHCHECK_URL}" ]]; then
-    if [[ "${RENDER_HEALTHCHECK_URL}" == */healthz ]]; then
-      inferred_base="${RENDER_HEALTHCHECK_URL%/healthz}"
-    fi
-  fi
-
-  echo "==> Running smoke checks"
-  if [[ -n "${inferred_base}" ]]; then
-    SMOKE_BASE_URL="${inferred_base}" "${SMOKE_SCRIPT_PATH}"
-  else
-    "${SMOKE_SCRIPT_PATH}"
-  fi
-}
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "Error: run this script inside a git repository."
@@ -110,9 +76,7 @@ if [[ -n "${RENDER_DEPLOY_HOOK_URL}" ]]; then
       sleep "${HEALTHCHECK_INTERVAL_SEC}"
     done
   fi
-  run_smoke_check
 else
-  run_smoke_check
   echo "Done."
   echo "No RENDER_DEPLOY_HOOK_URL set."
   echo "Next: trigger deploy in Render UI (or enable Auto Deploy)."

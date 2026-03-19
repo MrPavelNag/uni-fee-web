@@ -43,7 +43,6 @@ from uniswap_client import get_graph_endpoint, graphql_query
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-APP_STARTED_AT_ISO = datetime.now(timezone.utc).isoformat()
 
 
 def _resolve_catalog_dir() -> Path:
@@ -14951,13 +14950,6 @@ def admin_faq_publish(req: AdminFaqPublish, request: Request, response: Response
 def meta() -> dict[str, Any]:
     token_catalog = _load_token_catalog(refresh=False)
     chain_catalog = _load_chain_catalog(refresh=False)
-    render_service = {
-        "service_id": str(os.environ.get("RENDER_SERVICE_ID", "") or ""),
-        "service_name": str(os.environ.get("RENDER_SERVICE_NAME", "") or ""),
-        "git_branch": str(os.environ.get("RENDER_GIT_BRANCH", "") or ""),
-        "git_commit": str(os.environ.get("RENDER_GIT_COMMIT", "") or ""),
-        "started_at": APP_STARTED_AT_ISO,
-    }
     return {
         "tokens": token_catalog.get("items", []),
         "chains": chain_catalog.get("items", []),
@@ -14971,7 +14963,6 @@ def meta() -> dict[str, Any]:
             "count": chain_catalog.get("count", 0),
             "updated_at": chain_catalog.get("updated_at"),
         },
-        "service": render_service,
     }
 
 
