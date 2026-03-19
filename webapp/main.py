@@ -360,7 +360,7 @@ def _parse_chain_address_allowlist(raw: str) -> dict[int, set[str]]:
     return out
 
 
-POSITIONS_NOT_SPAM_POSITION_IDS = _parse_csv_int_set(os.environ.get("POSITIONS_NOT_SPAM_IDS", "1227707,1011627"))
+POSITIONS_NOT_SPAM_POSITION_IDS = _parse_csv_int_set(os.environ.get("POSITIONS_NOT_SPAM_IDS", "1227707,1011627,151509"))
 POSITIONS_CUSTODY_OWNER_ALLOWLIST = _parse_csv_address_set(POSITIONS_CUSTODY_OWNER_ALLOWLIST_RAW)
 POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN = _parse_chain_address_allowlist(POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN_RAW)
 POSITIONS_ONCHAIN_PREFETCH_CHAIN_IDS = {
@@ -6059,7 +6059,8 @@ def _scan_uniswap_v4_positions_onchain(
             if v <= 0 or v in seen_ids:
                 continue
             seen_ids.add(int(v))
-            if _is_auto_hidden_closed_position(int(cid), "uniswap_v4", int(v)):
+            force_visible = int(v) in POSITIONS_NOT_SPAM_POSITION_IDS
+            if (not force_visible) and _is_auto_hidden_closed_position(int(cid), "uniswap_v4", int(v)):
                 continue
             token_ids.append(int(v))
             if len(token_ids) >= int(POSITIONS_ONCHAIN_MAX_NFTS):
@@ -6097,11 +6098,15 @@ def _scan_uniswap_v4_positions_onchain(
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
         try:
-            if _is_auto_hidden_closed_position(int(cid), "uniswap_v4", int(token_id)):
+            force_visible = int(token_id) in POSITIONS_NOT_SPAM_POSITION_IDS
+            if (not force_visible) and _is_auto_hidden_closed_position(int(cid), "uniswap_v4", int(token_id)):
                 continue
             owner_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(token_id)))
             owner_words = _hex_words(owner_hex)
-            if not owner_words or owner_words[0][-40:].lower() != owner_word:
+            if not owner_words:
+                continue
+            owner_match = bool(owner_words[0][-40:].lower() == owner_word)
+            if (not owner_match) and (not force_visible):
                 continue
 
             batch = _eth_call_hex_batch(
@@ -6116,8 +6121,9 @@ def _scan_uniswap_v4_positions_onchain(
                 continue
             liq = _decode_uint_eth_call(batch[1] or "0x0")
             if int(liq) <= 0:
-                _mark_auto_hidden_closed_position(int(cid), "uniswap_v4", int(token_id))
-                continue
+                if not force_visible:
+                    _mark_auto_hidden_closed_position(int(cid), "uniswap_v4", int(token_id))
+                    continue
 
             raw0 = _decode_address_from_word(p_words[0])
             raw1 = _decode_address_from_word(p_words[1])
@@ -6156,6 +6162,7 @@ def _scan_uniswap_v4_positions_onchain(
                     "_protocol_label": "uniswap_v4",
                     "_source": "onchain_uniswap_v4_pm",
                     "_skip_enrich": True,
+                    "_force_visible": bool(force_visible),
                 }
             )
         except Exception:
@@ -7774,6 +7781,8 @@ def _scan_pool_positions_chain(
             return None
         if not isinstance(p, dict):
             return None
+        pos_token_id = _position_token_id_from_raw(p.get("id"))
+        force_visible = bool(int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS or bool(p.get("_force_visible")))
         if hard_scan and allow_live_enrich and not _position_has_full_detail(p) and not bool(p.get("_skip_enrich")):
             if time.monotonic() >= deadline_ts:
                 return None
@@ -7785,7 +7794,7 @@ def _scan_pool_positions_chain(
             if enriched:
                 p = enriched
         liq_raw = p.get("liquidity")
-        if liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
+        if (not force_visible) and liq_raw not in (None, "") and _safe_float(liq_raw) <= 0:
             return None
         pool = p.get("pool") or {}
         fee_raw = str(pool.get("feeTier") or "").strip()
@@ -7849,7 +7858,6 @@ def _scan_pool_positions_chain(
         )
         if proto_label.startswith("pancake_"):
             suspected_spam_pre = False
-        pos_token_id = _position_token_id_from_raw(p.get("id"))
         if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
             suspected_spam_pre = False
         contract_snapshot: dict[str, Any] | None = None
@@ -8173,7 +8181,7 @@ def _scan_pool_positions_chain(
         a0_now = max(0.0, float(amount0_val or 0.0))
         a1_now = max(0.0, float(amount1_val or 0.0))
         # Zero-liquidity / 0-0 position rows are auto-hidden and skipped from future scans.
-        if liq_int <= 0 or (a0_now <= 0.0 and a1_now <= 0.0):
+        if (not force_visible) and (liq_int <= 0 or (a0_now <= 0.0 and a1_now <= 0.0)):
             _mark_auto_hidden_closed_position(int(chain_id), str(proto_label or ""), _position_token_id_from_raw(p.get("id")))
             return None
         # Status is derived only from "In position":
