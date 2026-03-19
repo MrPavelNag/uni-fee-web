@@ -218,7 +218,7 @@ _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 POSITIONS_DEBUG_ERRORS = os.environ.get("POSITIONS_DEBUG_ERRORS", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_MAX_PAGES_PER_QUERY = max(1, int(os.environ.get("POSITIONS_MAX_PAGES_PER_QUERY", "3")))
-POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "36")))
+POSITIONS_MAX_QUERY_ATTEMPTS = max(12, int(os.environ.get("POSITIONS_MAX_QUERY_ATTEMPTS", "72")))
 # Hard cap for one positions scan (explorer NFT catalog uses the same budget).
 POSITIONS_SCAN_MAX_SECONDS = max(30, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS", "120")))
 POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = max(
@@ -545,11 +545,19 @@ def _positions_open_liquidity_prefilter_enabled() -> bool:
 
 
 def _positions_open_liquidity_prefilter_min_ids() -> int:
-    return max(1, int(os.environ.get("POSITIONS_OPEN_LIQUIDITY_PREFILTER_MIN_IDS", "4")))
+    return max(1, int(os.environ.get("POSITIONS_OPEN_LIQUIDITY_PREFILTER_MIN_IDS", "1")))
 
 
-# The Graph: сначала запросы с liquidity_gt: "0" (только активные позиции).
-POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST = os.environ.get("POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST", "1").strip().lower() in (
+# The Graph: опционально добавить запросы liquidity_gt (ускорение); по умолчанию выкл.,
+# иначе при раннем выходе можно потерять id, которые есть только в полном positions(where: {owner}).
+POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST = os.environ.get("POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Contract-only: объединять tokenId из explorer с id из The Graph (v3/v4 endpoint).
+POSITIONS_EXPLORER_GRAPH_ID_UNION = os.environ.get("POSITIONS_EXPLORER_GRAPH_ID_UNION", "1").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -7197,20 +7205,28 @@ def _estimate_position_tvl_usd_from_share_external(
         return None
 
 
-def _query_uniswap_positions_for_owner(
+def _graph_collect_owner_position_ids(
     endpoint: str,
     owner: str,
     *,
-    include_pool_liquidity: bool = False,
-    include_position_liquidity: bool = True,
-    debug_steps: list[dict[str, Any]] | None = None,
     deadline_ts: float | None = None,
+    debug_steps: list[dict[str, Any]] | None = None,
     light_mode: bool = False,
-) -> list[dict[str, Any]]:
+    run_extended: bool | None = None,
+) -> list[str]:
+    """
+    The Graph: union всех token id по вариантам запросов (owner / owner_in / account / …)
+    и по кандидатам адреса, без раннего выхода после первого непустого ответа.
+    """
+    ep = str(endpoint or "").strip()
+    if not ep:
+        return []
+    if run_extended is None:
+        run_extended = bool(POSITIONS_EXTENDED_QUERY_FALLBACK)
+
     def _build_id_queries(owner_type: str, *, extended: bool = False) -> list[tuple[str, str]]:
         liq_head: list[tuple[str, str]] = []
         if POSITIONS_GRAPH_LIQUIDITY_GT_ZERO_FIRST:
-            # The Graph / Goldsky: только позиции с ненулевой ликвидностью (как tokenId-лист без мусора).
             liq_head = [
                 (
                     "positions_liq_gt0",
@@ -7247,7 +7263,6 @@ def _query_uniswap_positions_for_owner(
                 """,
             ),
         ]
-        # snapshots* queries are intentionally disabled: they are expensive and noisy.
         if extended:
             queries.extend(
                 [
@@ -7282,7 +7297,7 @@ def _query_uniswap_positions_for_owner(
                           positions(first: 200, skip: $skip, where: {{ owner_: {{ id_in: [$owner] }} }}) {{ id }}
                         }}
                         """,
-                    )
+                    ),
                 ]
             )
         return queries
@@ -7304,7 +7319,7 @@ def _query_uniswap_positions_for_owner(
         while True:
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
                 break
-            data = graphql_query(endpoint, q, {"owner": owner_value, "skip": skip}, retries=1)
+            data = graphql_query(ep, q, {"owner": owner_value, "skip": skip}, retries=1)
             payload = data.get("data", {}) or {}
             batch_ids: list[str] = []
             if mode.startswith("positions"):
@@ -7335,7 +7350,6 @@ def _query_uniswap_positions_for_owner(
             skip += 200
         return out
 
-    # Fast profile by default: prefer filters that work across most indexers.
     owner_types_primary = ["ID", "String"]
     if POSITIONS_TRY_BYTES_TYPE:
         owner_types_primary.append("Bytes")
@@ -7343,67 +7357,94 @@ def _query_uniswap_positions_for_owner(
     query_sets_extended = [] if light_mode else [(x, _build_id_queries(x, extended=True)) for x in ["ID", "String", "Bytes"]]
     attempts_count = 0
     found_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    def _merge_ids(batch: list[str]) -> None:
+        for pid in batch:
+            ps = str(pid or "").strip()
+            if not ps or ps in seen_ids:
+                continue
+            seen_ids.add(ps)
+            found_ids.append(ps)
+
+    def _consume_query_sets(query_sets: list[tuple[str, list[tuple[str, str]]]], owner_value: str) -> bool:
+        """Returns False if auth error (caller should stop)."""
+        nonlocal attempts_count
+        for owner_type, queries in query_sets:
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                return True
+            for mode, q in queries:
+                if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                    return True
+                if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
+                    return True
+                try:
+                    attempts_count += 1
+                    ids = _run_ids(q, mode, owner_value)
+                    if debug_steps is not None:
+                        debug_steps.append(
+                            {
+                                "owner_value": owner_value,
+                                "owner_type": owner_type,
+                                "query_mode": mode,
+                                "count": len(ids),
+                                "ok": True,
+                            }
+                        )
+                    _merge_ids(ids)
+                except Exception as e:
+                    err_text = str(e).lower()
+                    if debug_steps is not None:
+                        debug_steps.append(
+                            {
+                                "owner_value": owner_value,
+                                "owner_type": owner_type,
+                                "query_mode": mode,
+                                "count": 0,
+                                "ok": False,
+                                "error": str(e)[:220],
+                            }
+                        )
+                    if ("api key not found" in err_text) or ("auth error" in err_text):
+                        return False
+        return True
+
     for owner_value in owner_candidates:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
-
-        def _run_query_sets(query_sets: list[tuple[str, list[tuple[str, str]]]]) -> bool:
-            nonlocal attempts_count, found_ids
-            for owner_type, queries in query_sets:
-                if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                    return False
-                for mode, q in queries:
-                    if found_ids:
-                        return True
-                    if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                        return False
-                    if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
-                        return False
-                    try:
-                        attempts_count += 1
-                        ids = _run_ids(q, mode, owner_value)
-                        if debug_steps is not None:
-                            debug_steps.append(
-                                {
-                                    "owner_value": owner_value,
-                                    "owner_type": owner_type,
-                                    "query_mode": mode,
-                                    "count": len(ids),
-                                    "ok": True,
-                                }
-                            )
-                        if ids:
-                            seen = set(found_ids)
-                            for pid in ids:
-                                if pid not in seen:
-                                    seen.add(pid)
-                                    found_ids.append(pid)
-                            return True
-                    except Exception as e:
-                        err_text = str(e).lower()
-                        if debug_steps is not None:
-                            debug_steps.append(
-                                {
-                                    "owner_value": owner_value,
-                                    "owner_type": owner_type,
-                                    "query_mode": mode,
-                                    "count": 0,
-                                    "ok": False,
-                                    "error": str(e)[:220],
-                                }
-                            )
-                        # Fast-fail on endpoint auth gating: extra query variants won't help.
-                        if ("api key not found" in err_text) or ("auth error" in err_text):
-                            return False
-            return bool(found_ids)
-
-        _run_query_sets(query_sets_primary)
-        if query_sets_extended and not found_ids and POSITIONS_EXTENDED_QUERY_FALLBACK and (deadline_ts is None or time.monotonic() < deadline_ts):
-            _run_query_sets(query_sets_extended)
-        if found_ids:
+        if not _consume_query_sets(query_sets_primary, owner_value):
             break
+        if (
+            run_extended
+            and query_sets_extended
+            and (deadline_ts is None or time.monotonic() < deadline_ts)
+            and attempts_count < POSITIONS_MAX_QUERY_ATTEMPTS
+        ):
+            if not _consume_query_sets(query_sets_extended, owner_value):
+                break
         if attempts_count >= POSITIONS_MAX_QUERY_ATTEMPTS:
             break
+    return found_ids
+
+
+def _query_uniswap_positions_for_owner(
+    endpoint: str,
+    owner: str,
+    *,
+    include_pool_liquidity: bool = False,
+    include_position_liquidity: bool = True,
+    debug_steps: list[dict[str, Any]] | None = None,
+    deadline_ts: float | None = None,
+    light_mode: bool = False,
+) -> list[dict[str, Any]]:
+    found_ids = _graph_collect_owner_position_ids(
+        endpoint,
+        owner,
+        deadline_ts=deadline_ts,
+        debug_steps=debug_steps,
+        light_mode=light_mode,
+        run_extended=None,
+    )
     if not found_ids:
         return []
 
@@ -8422,6 +8463,35 @@ def _scan_pool_positions_chain(
                     _set_chain_progress("call_contract_only_onchain_v3_npm", version=version, owner=str(owner))
                     v3_dbg: dict[str, Any] = {}
                     explorer_v3_ids = [int(_parse_int_like(x)) for x in (prefetch.get("v3_ids") or []) if _parse_int_like(x) > 0]
+                    v3_scan_ids: list[int] = list(explorer_v3_ids)
+                    graph_v3_extra = 0
+                    if (
+                        POSITIONS_EXPLORER_GRAPH_ID_UNION
+                        and str(endpoint or "").strip()
+                        and _endpoint_supports_uniswap_positions(str(endpoint).strip())
+                        and time.monotonic() < deadline_ts
+                    ):
+                        try:
+                            g_ids = _graph_collect_owner_position_ids(
+                                str(endpoint).strip(),
+                                owner,
+                                deadline_ts=deadline_ts,
+                                debug_steps=None,
+                                light_mode=True,
+                                run_extended=False,
+                            )
+                            seen_m: set[int] = {int(x) for x in v3_scan_ids if _parse_int_like(x) > 0}
+                            for sid in g_ids:
+                                v = _parse_int_like(sid)
+                                if v <= 0 or v in seen_m:
+                                    continue
+                                seen_m.add(int(v))
+                                v3_scan_ids.append(int(v))
+                                graph_v3_extra += 1
+                                if len(v3_scan_ids) >= int(POSITIONS_ONCHAIN_MAX_NFTS):
+                                    break
+                        except Exception:
+                            pass
                     owner_attempts.append(
                         {
                             "owner_value": owner,
@@ -8430,6 +8500,8 @@ def _scan_pool_positions_chain(
                             "count": int(prefetch.get("v3_ids_count") or len(explorer_v3_ids)),
                             "ok": True,
                             "elapsed_ms": int(prefetch.get("v3_ids_elapsed_ms") or 0),
+                            "graph_id_union_extra": int(graph_v3_extra),
+                            "v3_scan_ids_total": int(len(v3_scan_ids)),
                         }
                     )
                     t_call = time.monotonic()
@@ -8441,7 +8513,7 @@ def _scan_pool_positions_chain(
                         protocol_label=v3_proto,
                         source_tag="contract_only_onchain_v3_npm",
                         debug_out=v3_dbg,
-                        token_ids_override=explorer_v3_ids,
+                        token_ids_override=v3_scan_ids,
                     )
                     owner_attempts.append(
                         {
@@ -8510,9 +8582,46 @@ def _scan_pool_positions_chain(
                 try:
                     _set_chain_progress("call_contract_only_explorer_v4_ids", version=version, owner=str(owner))
                     v4_pm = str(prefetch.get("v4_primary_contract") or "").strip().lower()
-                    v4_contract_to_ids = prefetch.get("v4_contract_to_ids") or {}
-                    if not isinstance(v4_contract_to_ids, dict):
-                        v4_contract_to_ids = {}
+                    v4_contract_to_ids: dict[str, list[int]] = {}
+                    _raw_v4 = prefetch.get("v4_contract_to_ids") or {}
+                    if isinstance(_raw_v4, dict):
+                        for _ca, _ids in _raw_v4.items():
+                            cak = str(_ca or "").strip().lower()
+                            if not _is_eth_address(cak):
+                                continue
+                            v4_contract_to_ids[cak] = [
+                                int(_parse_int_like(x)) for x in (_ids or []) if _parse_int_like(x) > 0
+                            ]
+                    if (
+                        POSITIONS_EXPLORER_GRAPH_ID_UNION
+                        and _is_eth_address(v4_pm)
+                        and time.monotonic() < deadline_ts
+                    ):
+                        try:
+                            ep_v4 = get_graph_endpoint(chain_key, version="v4")
+                            if str(ep_v4 or "").strip():
+                                g4 = _graph_collect_owner_position_ids(
+                                    str(ep_v4).strip(),
+                                    owner,
+                                    deadline_ts=deadline_ts,
+                                    debug_steps=None,
+                                    light_mode=True,
+                                    run_extended=False,
+                                )
+                                lst0 = list(v4_contract_to_ids.get(v4_pm) or [])
+                                seen4 = {int(x) for x in lst0 if _parse_int_like(x) > 0}
+                                for sid in g4:
+                                    v = _parse_int_like(sid)
+                                    if v <= 0 or v in seen4:
+                                        continue
+                                    seen4.add(int(v))
+                                    lst0.append(int(v))
+                                    if len(lst0) >= int(POSITIONS_ONCHAIN_MAX_NFTS):
+                                        break
+                                if lst0:
+                                    v4_contract_to_ids[v4_pm] = lst0
+                        except Exception:
+                            pass
                     if bool(prefetch.get("fallback_used")):
                         owner_attempts.append(
                             {
