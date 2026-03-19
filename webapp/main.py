@@ -4376,7 +4376,13 @@ def _scan_erc721_token_ids_from_explorer_rows(
     return out
 
 
-def _explorer_owner_nfttx_rows(chain_id: int, owner: str, *, max_rows: int = 400) -> list[dict[str, Any]]:
+def _explorer_owner_nfttx_rows(
+    chain_id: int,
+    owner: str,
+    *,
+    max_rows: int = 400,
+    debug_out: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     cid = int(chain_id)
     o = str(owner or "").strip().lower()
     if not _is_eth_address(o):
@@ -4423,6 +4429,8 @@ def _explorer_owner_nfttx_rows(chain_id: int, owner: str, *, max_rows: int = 400
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     max_pages = int(POSITIONS_EXPLORER_NFTTX_MAX_PAGES)
+    if isinstance(debug_out, dict):
+        debug_out["requests"] = []
     for tmpl in url_templates:
         for page in range(1, max_pages + 1):
             try:
@@ -4431,6 +4439,18 @@ def _explorer_owner_nfttx_rows(chain_id: int, owner: str, *, max_rows: int = 400
                 with urlopen(req, timeout=12) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 rows = (payload or {}).get("result")
+                if isinstance(debug_out, dict):
+                    dbg_req = {
+                        "page": int(page),
+                        "status": str((payload or {}).get("status") or ""),
+                        "message": str((payload or {}).get("message") or ""),
+                        "result_type": type(rows).__name__,
+                        "result_len": (len(rows) if isinstance(rows, list) else None),
+                        "url": str(url).split("&apikey=", 1)[0],
+                    }
+                    reqs = debug_out.get("requests")
+                    if isinstance(reqs, list) and len(reqs) < 20:
+                        reqs.append(dbg_req)
                 if not isinstance(rows, list) or not rows:
                     break
                 for r in rows:
@@ -4455,6 +4475,10 @@ def _explorer_owner_nfttx_rows(chain_id: int, owner: str, *, max_rows: int = 400
                     if len(out) >= int(max_rows):
                         return out
             except Exception:
+                if isinstance(debug_out, dict):
+                    reqs = debug_out.get("requests")
+                    if isinstance(reqs, list) and len(reqs) < 20:
+                        reqs.append({"page": int(page), "status": "error", "message": "request_failed"})
                 continue
         if out:
             return out
@@ -7643,10 +7667,12 @@ def _scan_pool_positions_chain(
                 try:
                     t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_explorer_owner_rows", version=version, owner=str(owner))
+                    owner_rows_dbg: dict[str, Any] = {}
                     owner_explorer_rows = _explorer_owner_nfttx_rows(
                         int(chain_id),
                         owner,
                         max_rows=max(300, int(POSITIONS_ONCHAIN_MAX_NFTS) * 10),
+                        debug_out=owner_rows_dbg,
                     )
                     owner_attempts.append(
                         {
@@ -7656,6 +7682,7 @@ def _scan_pool_positions_chain(
                             "count": len(owner_explorer_rows),
                             "ok": True,
                             "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
+                            "owner_rows_debug": owner_rows_dbg,
                         }
                     )
                     t_call = time.monotonic()
@@ -7836,10 +7863,22 @@ def _scan_pool_positions_chain(
                     t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_explorer_v4_ids", version=version, owner=str(owner))
                     if not owner_explorer_rows:
+                        owner_rows_dbg = {}
                         owner_explorer_rows = _explorer_owner_nfttx_rows(
                             int(chain_id),
                             owner,
                             max_rows=max(300, int(POSITIONS_ONCHAIN_MAX_NFTS) * 10),
+                            debug_out=owner_rows_dbg,
+                        )
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "explorer",
+                                "query_mode": "contract_only_explorer_owner_rows",
+                                "count": len(owner_explorer_rows),
+                                "ok": True,
+                                "owner_rows_debug": owner_rows_dbg,
+                            }
                         )
                     v4_pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
                     if _is_eth_address(v4_pm):
