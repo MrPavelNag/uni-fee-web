@@ -309,7 +309,7 @@ POSITIONS_SKIP_PER_ID_DETAIL_FETCH = os.environ.get("POSITIONS_SKIP_PER_ID_DETAI
 INFINITY_INDEXER_ENABLED_DEFAULT = os.environ.get("INFINITY_INDEXER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 INFINITY_INDEXER_MODE_DEFAULT = os.environ.get("INFINITY_INDEXER_MODE", "auto").strip().lower() or "auto"
 INFINITY_INDEXER_MAX_RECEIPTS = max(20, int(os.environ.get("INFINITY_INDEXER_MAX_RECEIPTS", "220")))
-POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "1").strip().lower() in (
+POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "0").strip().lower() in (
     "1",
     "true",
     "yes",
