@@ -6263,6 +6263,35 @@ def _scan_uniswap_v4_positions_onchain(
     for token_id in token_ids:
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
+        def _append_fallback_v4_row() -> None:
+            out.append(
+                {
+                    "id": str(int(token_id)),
+                    "liquidity": "0",
+                    "tickLower": {"tickIdx": "0"},
+                    "tickUpper": {"tickIdx": "1"},
+                    "pool": {
+                        "id": "0x" + _encode_uint_word(int(token_id)),
+                        "feeTier": "0",
+                        "liquidity": "0",
+                        "sqrtPrice": "0",
+                        "token0Price": "0",
+                        "totalValueLockedUSD": "0",
+                        "totalValueLockedToken0": "0",
+                        "totalValueLockedToken1": "0",
+                        "token0": {"id": "0x0000000000000000000000000000000000000000", "decimals": "18", "symbol": "V4"},
+                        "token1": {"id": "0x0000000000000000000000000000000000000001", "decimals": "18", "symbol": "POS"},
+                        "tickSpacing": "0",
+                        "hooks": "",
+                    },
+                    "_protocol_label": "uniswap_v4",
+                    "_source": "onchain_uniswap_v4_pm_fallback",
+                    "_skip_enrich": True,
+                    "_nft_contract": str(pm),
+                    "_allow_zero_liq": True,
+                    "_owner_mismatch": True,
+                }
+            )
         try:
             if _is_auto_hidden_closed_position(int(cid), v4_hidden_key, int(token_id)):
                 continue
@@ -6298,6 +6327,8 @@ def _scan_uniswap_v4_positions_onchain(
                     liq_hex = "0x0"
             p_words = _hex_words(info_hex or "")
             if len(p_words) < 6:
+                if from_explorer_ids:
+                    _append_fallback_v4_row()
                 continue
             liq = _decode_uint_eth_call(liq_hex or "0x0")
             allow_zero_liq = False
@@ -6353,6 +6384,11 @@ def _scan_uniswap_v4_positions_onchain(
                 }
             )
         except Exception:
+            if from_explorer_ids:
+                try:
+                    _append_fallback_v4_row()
+                except Exception:
+                    pass
             continue
     return out
 
