@@ -4568,6 +4568,69 @@ def _scan_v4_position_ids_by_explorer_any_contract(
     return out
 
 
+def _collect_explorer_rows_for_owner_contracts(
+    chain_id: int,
+    owner: str,
+    contracts: list[tuple[str, str]],
+    *,
+    max_rows_per_contract: int = 300,
+    debug_out: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(o):
+        return []
+    uniq_contracts: list[tuple[str, str]] = []
+    seen_contracts: set[str] = set()
+    for c, proto in contracts or []:
+        cc = str(c or "").strip().lower()
+        pp = str(proto or "").strip().lower()
+        if not _is_eth_address(cc) or not pp or cc in seen_contracts:
+            continue
+        seen_contracts.add(cc)
+        uniq_contracts.append((cc, pp))
+    out: list[dict[str, Any]] = []
+    seen_rows: set[str] = set()
+    per_contract: list[dict[str, Any]] = []
+    for cc, pp in uniq_contracts:
+        rows = _explorer_nfttx_rows(
+            cid,
+            cc,
+            o,
+            max_rows=max(80, int(max_rows_per_contract)),
+            protocol=pp,
+        )
+        per_contract.append(
+            {
+                "contract": cc,
+                "protocol": pp,
+                "rows": len(rows),
+            }
+        )
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            caddr = str(
+                r.get("contractAddress")
+                or r.get("contractaddress")
+                or r.get("tokenAddress")
+                or ""
+            ).strip().lower()
+            tid = str(r.get("tokenID") or "").strip().lower()
+            txh = str(r.get("hash") or "").strip().lower()
+            logi = str(r.get("logIndex") or "").strip().lower()
+            k = "|".join([txh, logi, caddr, tid])
+            if k in seen_rows:
+                continue
+            seen_rows.add(k)
+            out.append(r)
+    if isinstance(debug_out, dict):
+        debug_out["contracts_checked"] = len(uniq_contracts)
+        debug_out["rows_total"] = len(out)
+        debug_out["per_contract"] = per_contract[:20]
+    return out
+
+
 def _scan_erc721_token_ids_by_owner_receipts(
     chain_id: int,
     contract: str,
@@ -7674,6 +7737,7 @@ def _scan_pool_positions_chain(
 
             if version == "v3" and time.monotonic() < deadline_ts:
                 try:
+                    v3_proto = str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3") or "uniswap_v3").strip().lower()
                     t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_explorer_owner_rows", version=version, owner=str(owner))
                     owner_rows_dbg: dict[str, Any] = {}
@@ -7694,10 +7758,40 @@ def _scan_pool_positions_chain(
                             "owner_rows_debug": owner_rows_dbg,
                         }
                     )
+                    if not owner_explorer_rows:
+                        fallback_contracts: list[tuple[str, str]] = []
+                        npm = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
+                        if _is_eth_address(npm):
+                            fallback_contracts.append((npm, str(v3_proto)))
+                        inf_cl = str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
+                        if _is_eth_address(inf_cl):
+                            fallback_contracts.append((inf_cl, "pancake_infinity_cl"))
+                        inf_bin = str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
+                        if _is_eth_address(inf_bin):
+                            fallback_contracts.append((inf_bin, "pancake_infinity_bin"))
+                        t_fallback = time.monotonic()
+                        fallback_dbg: dict[str, Any] = {}
+                        owner_explorer_rows = _collect_explorer_rows_for_owner_contracts(
+                            int(chain_id),
+                            owner,
+                            fallback_contracts,
+                            max_rows_per_contract=max(120, int(POSITIONS_ONCHAIN_MAX_NFTS) * 8),
+                            debug_out=fallback_dbg,
+                        )
+                        owner_attempts.append(
+                            {
+                                "owner_value": owner,
+                                "owner_type": "explorer",
+                                "query_mode": "contract_only_explorer_contract_rows_fallback",
+                                "count": len(owner_explorer_rows),
+                                "ok": True,
+                                "elapsed_ms": int(round(max(0.0, time.monotonic() - t_fallback) * 1000.0)),
+                                "fallback_debug": fallback_dbg,
+                            }
+                        )
                     t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_onchain_v3_npm", version=version, owner=str(owner))
                     v3_dbg: dict[str, Any] = {}
-                    v3_proto = str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3") or "uniswap_v3").strip().lower()
                     explorer_v3_ids: list[int] = []
                     npm = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
                     if _is_eth_address(npm):
@@ -7872,21 +7966,28 @@ def _scan_pool_positions_chain(
                     t_call = time.monotonic()
                     _set_chain_progress("call_contract_only_explorer_v4_ids", version=version, owner=str(owner))
                     if not owner_explorer_rows:
-                        owner_rows_dbg = {}
-                        owner_explorer_rows = _explorer_owner_nfttx_rows(
+                        v4_pm_probe = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
+                        fallback_contracts_v4: list[tuple[str, str]] = []
+                        if _is_eth_address(v4_pm_probe):
+                            fallback_contracts_v4.append((v4_pm_probe, "uniswap_v4"))
+                        t_fallback = time.monotonic()
+                        fallback_dbg_v4: dict[str, Any] = {}
+                        owner_explorer_rows = _collect_explorer_rows_for_owner_contracts(
                             int(chain_id),
                             owner,
-                            max_rows=max(300, int(POSITIONS_ONCHAIN_MAX_NFTS) * 10),
-                            debug_out=owner_rows_dbg,
+                            fallback_contracts_v4,
+                            max_rows_per_contract=max(120, int(POSITIONS_ONCHAIN_MAX_NFTS) * 8),
+                            debug_out=fallback_dbg_v4,
                         )
                         owner_attempts.append(
                             {
                                 "owner_value": owner,
                                 "owner_type": "explorer",
-                                "query_mode": "contract_only_explorer_owner_rows",
+                                "query_mode": "contract_only_explorer_contract_rows_fallback",
                                 "count": len(owner_explorer_rows),
                                 "ok": True,
-                                "owner_rows_debug": owner_rows_dbg,
+                                "elapsed_ms": int(round(max(0.0, time.monotonic() - t_fallback) * 1000.0)),
+                                "fallback_debug": fallback_dbg_v4,
                             }
                         )
                     v4_pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(int(chain_id), "") or "").strip().lower()
