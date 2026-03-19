@@ -234,6 +234,14 @@ POSITIONS_CONTRACT_ONLY_ENABLED = os.environ.get("POSITIONS_CONTRACT_ONLY_ENABLE
 POSITIONS_DISABLE_PARALLELISM = os.environ.get("POSITIONS_DISABLE_PARALLELISM", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_FAST_REMAINING_BUDGET_SEC = max(4, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "16")))
 POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
+POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC = max(
+    8,
+    min(60, int(os.environ.get("POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC", "54"))),
+)
+POSITIONS_FAST_CONTRACT_ONLY_PER_CHAIN_TIMEOUT_SEC = max(
+    2,
+    min(30, int(os.environ.get("POSITIONS_FAST_CONTRACT_ONLY_PER_CHAIN_TIMEOUT_SEC", "12"))),
+)
 POSITIONS_EXTENDED_QUERY_FALLBACK = os.environ.get("POSITIONS_EXTENDED_QUERY_FALLBACK", "1").strip().lower() in (
     "1",
     "true",
@@ -9629,23 +9637,36 @@ def _scan_pool_positions(
         else [c for c in ordered_chain_ids if c not in set(priority_chain_ids)]
     )
     remaining_deadline_ts = float(deadline_ts)
-    use_fast_chain_caps = bool((not hard_scan) and (not POSITIONS_CONTRACT_ONLY_ENABLED))
+    use_fast_chain_caps = bool(not hard_scan)
     if use_fast_chain_caps and remaining_chain_ids:
-        fast_timeout_base = int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)
+        if POSITIONS_CONTRACT_ONLY_ENABLED:
+            fast_timeout_base = int(POSITIONS_FAST_CONTRACT_ONLY_PER_CHAIN_TIMEOUT_SEC)
+            remaining_budget_cap = int(POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC)
+        else:
+            fast_timeout_base = int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)
+            remaining_budget_cap = int(POSITIONS_FAST_REMAINING_BUDGET_SEC)
         fast_timeout_overrides: dict[int, int] = {}
         for cid in remaining_chain_ids:
             cc = int(cid)
             timeout_s = int(fast_timeout_base)
-            if cc == 130:
-                timeout_s = max(timeout_s, 4)  # unichain often needs slightly longer RPC window
-            elif cc in (1, 42161, 137, 10):
-                timeout_s = max(timeout_s, 3)  # keep major chains from being cut too early
+            if POSITIONS_CONTRACT_ONLY_ENABLED:
+                if cc == 130:
+                    timeout_s = max(timeout_s, 18)  # unichain explorer/rpc often spikes
+                elif cc in (1, 8453, 42161):
+                    timeout_s = max(timeout_s, 14)  # major chains with larger owner history
+                elif cc in (56, 137, 10):
+                    timeout_s = max(timeout_s, 10)
+            else:
+                if cc == 130:
+                    timeout_s = max(timeout_s, 4)  # unichain often needs slightly longer RPC window
+                elif cc in (1, 42161, 137, 10):
+                    timeout_s = max(timeout_s, 3)  # keep major chains from being cut too early
             fast_timeout_overrides[cc] = int(timeout_s)
         remaining_deadline_ts = min(
             float(deadline_ts),
-            time.monotonic() + float(POSITIONS_FAST_REMAINING_BUDGET_SEC),
+            time.monotonic() + float(remaining_budget_cap),
         )
-        timings["remaining_budget_sec"] = int(POSITIONS_FAST_REMAINING_BUDGET_SEC)
+        timings["remaining_budget_sec"] = int(remaining_budget_cap)
         timings["per_chain_timeout_sec"] = int(fast_timeout_base)
         timings["per_chain_timeout_overrides"] = {
             str(CHAIN_ID_TO_KEY.get(int(cid), str(cid))): int(sec)
@@ -9664,8 +9685,8 @@ def _scan_pool_positions(
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
-            per_chain_timeout_sec=(None if (hard_scan or POSITIONS_CONTRACT_ONLY_ENABLED) else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
-            per_chain_timeout_overrides=(None if (hard_scan or POSITIONS_CONTRACT_ONLY_ENABLED) else fast_timeout_overrides),
+            per_chain_timeout_sec=(int(fast_timeout_base) if use_fast_chain_caps else None),
+            per_chain_timeout_overrides=(fast_timeout_overrides if use_fast_chain_caps else None),
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
@@ -9684,8 +9705,8 @@ def _scan_pool_positions(
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             deep_infinity_scan=deep_infinity_scan,
-            per_chain_timeout_sec=(None if (hard_scan or POSITIONS_CONTRACT_ONLY_ENABLED) else int(POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC)),
-            per_chain_timeout_overrides=(None if (hard_scan or POSITIONS_CONTRACT_ONLY_ENABLED) else fast_timeout_overrides),
+            per_chain_timeout_sec=(int(fast_timeout_base) if use_fast_chain_caps else None),
+            per_chain_timeout_overrides=(fast_timeout_overrides if use_fast_chain_caps else None),
         )
         rows.extend(r_rows)
         errors.extend(r_errors)
