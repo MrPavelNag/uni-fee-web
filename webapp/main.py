@@ -225,7 +225,7 @@ POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = 60
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
-POSITIONS_CONTRACT_ONLY_ENABLED = os.environ.get("POSITIONS_CONTRACT_ONLY_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_CONTRACT_ONLY_ENABLED = os.environ.get("POSITIONS_CONTRACT_ONLY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_DISABLE_PARALLELISM = os.environ.get("POSITIONS_DISABLE_PARALLELISM", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_FAST_REMAINING_BUDGET_SEC = 60
 POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
@@ -271,6 +271,14 @@ POSITIONS_EXPLORER_NFTTX_MAX_PAGES = max(
     5,
     int(os.environ.get("POSITIONS_EXPLORER_NFTTX_MAX_PAGES", "80")),
 )
+# One-pass scan: account tokennfttx only → SQLite cache + UI rows (explorer columns only).
+POSITIONS_EXPLORER_NFT_CATALOG_SCAN = os.environ.get("POSITIONS_EXPLORER_NFT_CATALOG_SCAN", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_EXPLORER_NFT_CATALOG_MAX_ROWS = max(50, min(10000, int(os.environ.get("POSITIONS_EXPLORER_NFT_CATALOG_MAX_ROWS", "2000"))))
 POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS = max(
     4,
     min(60, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS", "18"))),
@@ -289,8 +297,8 @@ POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK = os.environ.get("POSITIONS_INFINITY
     "yes",
     "on",
 )
-POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "1").strip().lower() in ("1", "true", "yes", "on")
-POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_SKIP_CHAINS_WITHOUT_NFTS = os.environ.get("POSITIONS_SKIP_CHAINS_WITHOUT_NFTS", "0").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BALANCE_FILTER", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_CREATION_DATE_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_CREATION_DATE_WORKERS", "6"))))
 POSITIONS_CREATION_DATE_MAX_SECONDS = max(1, int(os.environ.get("POSITIONS_CREATION_DATE_MAX_SECONDS", "20")))
@@ -390,7 +398,7 @@ POSITIONS_OWNERSHIP_INDEX_ENABLED = os.environ.get("POSITIONS_OWNERSHIP_INDEX_EN
 )
 POSITIONS_OWNERSHIP_INDEX_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_OWNERSHIP_INDEX_WORKERS", "2"))))
 POSITIONS_OWNERSHIP_INDEX_MAX_NFTS = max(20, min(600, int(os.environ.get("POSITIONS_OWNERSHIP_INDEX_MAX_NFTS", "240"))))
-POSITIONS_INDEX_FIRST_STRICT = os.environ.get("POSITIONS_INDEX_FIRST_STRICT", "1").strip().lower() in (
+POSITIONS_INDEX_FIRST_STRICT = os.environ.get("POSITIONS_INDEX_FIRST_STRICT", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -1075,7 +1083,6 @@ def _position_index_refresh_owner_chain(
     *,
     target_version: str = "all",
     warmup_mode: bool = False,
-    deep_infinity_scan: bool = False,
 ) -> dict[str, int]:
     cid = int(chain_id)
     owner_addr = str(owner or "").strip().lower()
@@ -4302,6 +4309,7 @@ def _explorer_owner_nfttx_rows(
                     seen.add(k)
                     out.append(r)
                     if len(out) >= int(max_rows):
+                        _explorer_nft_meta_cache_upsert_rows(cid, out, protocol_hint="")
                         return out
             except Exception:
                 if isinstance(debug_out, dict):
@@ -4310,6 +4318,7 @@ def _explorer_owner_nfttx_rows(
                         reqs.append({"page": int(page), "status": "error", "message": "request_failed"})
                 continue
         if out:
+            _explorer_nft_meta_cache_upsert_rows(cid, out, protocol_hint="")
             return out
     _explorer_nft_meta_cache_upsert_rows(cid, out, protocol_hint="")
     return out
@@ -7085,7 +7094,6 @@ def _scan_pool_positions_chain(
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
-    deep_infinity_scan: bool = False,
     progress_out: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
@@ -8090,7 +8098,6 @@ def _scan_pool_positions_chain(
                     owner,
                     target_version=version,
                     warmup_mode=True,
-                    deep_infinity_scan=deep_infinity_scan,
                 )
                 cached_positions = _load_cached_positions_for_owner(owner, version)
                 if cached_positions:
@@ -9117,7 +9124,6 @@ def _run_pool_chain_scan(
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
-    deep_infinity_scan: bool = False,
     progress_out: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool]:
     return _scan_pool_positions_chain(
@@ -9126,7 +9132,6 @@ def _run_pool_chain_scan(
         deadline_ts,
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
         hard_scan=hard_scan,
-        deep_infinity_scan=deep_infinity_scan,
         progress_out=progress_out,
     )
 
@@ -9137,7 +9142,6 @@ def _run_pool_chain_scan_timed(
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
-    deep_infinity_scan: bool = False,
     progress_out: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, float]:
     started = time.monotonic()
@@ -9147,7 +9151,6 @@ def _run_pool_chain_scan_timed(
         deadline_ts,
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
         hard_scan=hard_scan,
-        deep_infinity_scan=deep_infinity_scan,
         progress_out=progress_out,
     )
     elapsed = round(max(0.0, time.monotonic() - started), 3)
@@ -9160,7 +9163,6 @@ def _run_pool_chain_batch_serial(
     deadline_ts: float,
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
-    deep_infinity_scan: bool = False,
     per_chain_timeout_sec: int | None = None,
     per_chain_timeout_overrides: dict[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float], dict[str, dict[str, Any]]]:
@@ -9197,7 +9199,6 @@ def _run_pool_chain_batch_serial(
             chain_deadline,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
-            deep_infinity_scan=deep_infinity_scan,
             progress_out=progress_slot,
         )
         rows.extend(chain_rows)
@@ -9219,7 +9220,6 @@ def _run_pool_chain_batch_parallel(
     max_workers: int,
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
-    deep_infinity_scan: bool = False,
     per_chain_timeout_sec: int | None = None,
     per_chain_timeout_overrides: dict[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], bool, dict[str, float], dict[str, dict[str, Any]]]:
@@ -9257,7 +9257,6 @@ def _run_pool_chain_batch_parallel(
             chain_deadline,
             pre_enqueued_ownership_refresh,
             hard_scan,
-            deep_infinity_scan,
             progress_slot,
         )
         futures.append(fut)
@@ -9366,6 +9365,219 @@ def _order_chain_ids_for_pool_scan(valid_chain_ids: list[int], priority_chain_id
     return ordered_chain_ids
 
 
+_EXPLORER_NFT_CATALOG_PROTOCOL = "explorer_nft"
+
+
+def _explorer_tokennfttx_currently_owned_contract_token_ids(
+    rows: list[dict[str, Any]],
+    owner: str,
+) -> list[tuple[str, int]]:
+    """From Etherscan-like tokennfttx rows, return (contract, tokenId) the wallet currently holds."""
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(o):
+        return []
+    owner_candidates = {o}
+    latest_evt: dict[tuple[str, int], tuple[int, int, bool]] = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        caddr = str(
+            r.get("contractAddress")
+            or r.get("contractaddress")
+            or r.get("tokenAddress")
+            or ""
+        ).strip().lower()
+        if not _is_eth_address(caddr):
+            continue
+        tid_raw = str(r.get("tokenID") or "").strip()
+        if not tid_raw:
+            continue
+        try:
+            tid = int(tid_raw, 10)
+        except Exception:
+            try:
+                tid = int(tid_raw, 16) if tid_raw.lower().startswith("0x") else int(tid_raw)
+            except Exception:
+                continue
+        if tid <= 0:
+            continue
+        to_addr = str(r.get("to") or "").strip().lower()
+        from_addr = str(r.get("from") or "").strip().lower()
+        if to_addr not in owner_candidates and from_addr not in owner_candidates:
+            continue
+        block_n = _parse_int_like(r.get("blockNumber") or 0)
+        log_i = _parse_int_like(r.get("logIndex") or r.get("logindex") or 0)
+        to_is_owner = bool(to_addr in owner_candidates)
+        key = (caddr, int(tid))
+        prev = latest_evt.get(key)
+        cur = (int(block_n), int(log_i), bool(to_is_owner))
+        if prev is None or (cur[0], cur[1]) > (prev[0], prev[1]):
+            latest_evt[key] = cur
+    out: list[tuple[str, int]] = []
+    for (caddr, tid), evt in latest_evt.items():
+        if bool(evt[2]):
+            out.append((str(caddr), int(tid)))
+    out.sort(key=lambda x: (x[0], x[1]))
+    return out
+
+
+def _scan_pool_positions_explorer_nft_catalog(
+    addresses: list[str],
+    chain_ids: list[int],
+    *,
+    include_creation_dates: bool = True,
+    pre_enqueued_ownership_refresh: bool = False,
+    hard_scan: bool = False,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
+    """One pass per chain/address: account tokennfttx → meta cache → SQLite + table rows (explorer fields only)."""
+    _ = (pre_enqueued_ownership_refresh, hard_scan)
+    rows_out: list[dict[str, Any]] = []
+    errors: list[str] = []
+    debug_rows: list[dict[str, Any]] = []
+    timings: dict[str, Any] = {"mode": "explorer_nft_catalog"}
+    scan_started = time.monotonic()
+    deadline_ts = time.monotonic() + float(int(POSITIONS_SCAN_MAX_SECONDS))
+    max_rows = int(POSITIONS_EXPLORER_NFT_CATALOG_MAX_ROWS)
+
+    raw_ids = [int(c) for c in (chain_ids or []) if int(c) > 0 and CHAIN_ID_TO_KEY.get(int(c), "")]
+    raw_ids = sorted(set(raw_ids))
+    if not raw_ids or not addresses:
+        timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
+        return [], errors, debug_rows, timings
+
+    priority_chain_ids = [130, 56, 8453, 1, 42161, 137, 10]
+    ordered_chain_ids = _order_chain_ids_for_pool_scan(raw_ids, priority_chain_ids)
+    timings["chains_total"] = len(ordered_chain_ids)
+    all_contracts_by_owner: dict[tuple[int, str], set[str]] = {}
+
+    for cid in ordered_chain_ids:
+        if time.monotonic() >= deadline_ts:
+            break
+        chain_key = str(CHAIN_ID_TO_KEY.get(int(cid), "") or "").strip().lower()
+        if not chain_key or not _explorer_v2_chainid(int(cid)):
+            continue
+        chain_attempts: list[dict[str, Any]] = []
+        for owner in addresses:
+            if time.monotonic() >= deadline_ts:
+                break
+            o = str(owner or "").strip()
+            if not _is_eth_address(o):
+                continue
+            ok = str(o).strip().lower()
+            dbg: dict[str, Any] = {}
+            nft_rows = _explorer_owner_nfttx_rows(int(cid), ok, max_rows=max_rows, debug_out=dbg)
+            owned = _explorer_tokennfttx_currently_owned_contract_token_ids(nft_rows, ok)
+            chain_attempts.append(
+                {
+                    "owner_value": ok,
+                    "owner_type": "explorer",
+                    "query_mode": "explorer_nft_catalog:tokennfttx",
+                    "count": len(nft_rows),
+                    "owned_nfts": len(owned),
+                    "ok": True,
+                    "debug": dbg,
+                }
+            )
+            contracts_here: set[str] = set()
+            for contract, tid in owned:
+                contracts_here.add(str(contract).strip().lower())
+                meta = _explorer_nft_meta_get(int(cid), contract, tid)
+                token_name = str(meta.get("token_name") or "").strip()
+                token_symbol = str(meta.get("token_symbol") or "").strip()
+                pair_disp = token_name or (f"{token_symbol} #{tid}" if token_symbol else f"NFT #{tid}")
+                created = ""
+                ts_first = int(meta.get("first_seen_ts") or 0)
+                if ts_first > 0:
+                    try:
+                        created = datetime.fromtimestamp(ts_first, tz=timezone.utc).date().isoformat()
+                    except Exception:
+                        created = ""
+                if include_creation_dates and created:
+                    _position_creation_date_cache_set(int(cid), _EXPLORER_NFT_CATALOG_PROTOCOL, tid, created)
+                cache_payload: dict[str, Any] = {
+                    "id": str(tid),
+                    "_protocol_label": _EXPLORER_NFT_CATALOG_PROTOCOL,
+                    "_source": "explorer_tokennfttx",
+                    "nft_contract": str(contract).strip().lower(),
+                    "explorer_token_name": token_name,
+                    "explorer_token_symbol": token_symbol,
+                    "first_seen_ts": meta.get("first_seen_ts"),
+                    "last_seen_ts": meta.get("last_seen_ts"),
+                    "last_tx_hash": meta.get("last_tx_hash"),
+                }
+                _position_details_cache_upsert(int(cid), _EXPLORER_NFT_CATALOG_PROTOCOL, cache_payload)
+                _position_ownership_upsert(
+                    int(cid),
+                    ok,
+                    _EXPLORER_NFT_CATALOG_PROTOCOL,
+                    str(contract).strip().lower(),
+                    [tid],
+                    source="explorer_nfttx",
+                )
+                proto_col = token_symbol[:24] if token_symbol else "nft"
+                row: dict[str, Any] = {
+                    "address": o,
+                    "protocol": proto_col,
+                    "chain": chain_key,
+                    "chain_id": int(cid),
+                    "kind": "pool",
+                    "pool_id": str(contract).strip().lower(),
+                    "pair": pair_disp[:240],
+                    "token0_id": "",
+                    "token1_id": "",
+                    "position_id": str(tid),
+                    "explorer_token_name": token_name,
+                    "explorer_token_symbol": token_symbol,
+                    "position_ids": [str(tid)],
+                    "fee_tier": "-",
+                    "fee_tier_raw": "",
+                    "position_status": "explorer",
+                    "liquidity_display": "-",
+                    "liquidity": "0",
+                    "pool_liquidity": "0",
+                    "position_amount0": 0.0,
+                    "position_amount1": 0.0,
+                    "position_symbol0": "",
+                    "position_symbol1": "",
+                    "pair_symbol_source0": "explorer",
+                    "pair_symbol_source1": "explorer",
+                    "pair_symbol_source": "explorer:tokennfttx",
+                    "position_amounts_display": "-",
+                    "fees_owed0": 0.0,
+                    "fees_owed1": 0.0,
+                    "fees_owed_display": "-",
+                    "suspected_spam": False,
+                    "spam_skipped": False,
+                    "liquidity_usd": None,
+                    "position_created_date": created if created else "-",
+                }
+                rows_out.append(row)
+            if contracts_here:
+                all_contracts_by_owner.setdefault((int(cid), ok), set()).update(contracts_here)
+        if chain_attempts:
+            debug_rows.append(
+                {
+                    "chain": chain_key,
+                    "chain_id": int(cid),
+                    "attempts": chain_attempts,
+                    "attempts_total_ms": int(round(max(0.0, time.monotonic() - scan_started) * 1000.0)),
+                }
+            )
+
+    for (cid_k, ok_k), cset in all_contracts_by_owner.items():
+        if cset:
+            _owner_erc721_contracts_upsert(
+                int(cid_k),
+                ok_k,
+                sorted(cset),
+                source="explorer_nft_catalog",
+            )
+
+    timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
+    timings["rows"] = len(rows_out)
+    return rows_out, errors, debug_rows, timings
+
+
 def _scan_pool_positions(
     addresses: list[str],
     chain_ids: list[int],
@@ -9373,8 +9585,15 @@ def _scan_pool_positions(
     include_creation_dates: bool = True,
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
-    deep_infinity_scan: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
+    if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
+        return _scan_pool_positions_explorer_nft_catalog(
+            addresses,
+            chain_ids,
+            include_creation_dates=include_creation_dates,
+            pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
+            hard_scan=hard_scan,
+        )
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
@@ -9413,7 +9632,6 @@ def _scan_pool_positions(
         deadline_ts,
         pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
         hard_scan=hard_scan,
-        deep_infinity_scan=deep_infinity_scan,
         per_chain_timeout_sec=None,
     )
     timings["priority_chains_sec"] = round(max(0.0, time.monotonic() - t_prio), 3)
@@ -9478,7 +9696,6 @@ def _scan_pool_positions(
             remaining_deadline_ts,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
-            deep_infinity_scan=deep_infinity_scan,
             per_chain_timeout_sec=(int(fast_timeout_base) if use_fast_chain_caps else None),
             per_chain_timeout_overrides=(fast_timeout_overrides if use_fast_chain_caps else None),
         )
@@ -9498,7 +9715,6 @@ def _scan_pool_positions(
             max_workers=max_workers,
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
-            deep_infinity_scan=deep_infinity_scan,
             per_chain_timeout_sec=(int(fast_timeout_base) if use_fast_chain_caps else None),
             per_chain_timeout_overrides=(fast_timeout_overrides if use_fast_chain_caps else None),
         )
@@ -10779,8 +10995,6 @@ class PositionsScanRequest(BaseModel):
     include_lending: bool = True
     include_rewards: bool = True
     hard_scan: bool = False
-    deep_infinity_scan: bool = False
-    infinity_scan: bool = False
     # Backward-compatible fields from the previous UI version.
     addresses: list[str] = Field(default_factory=list)
     chain_ids: list[int] = Field(default_factory=list)
@@ -11602,7 +11816,6 @@ def _render_positions_page() -> str:
           <div class="section-actions">
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
-            <button id="posInfinityScanBtn" class="search-link-btn" type="button" onclick="scanPositions('pools', {infinityScan:true})">Infinity scan</button>
             <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
@@ -11728,10 +11941,8 @@ def _render_positions_page() -> str:
     function setPosBusy(flag) {
       const el = document.getElementById("posProgress");
       const scanBtn = document.getElementById("posSearchBtn");
-      const infBtn = document.getElementById("posInfinityScanBtn");
       if (el) el.style.display = flag ? "block" : "none";
       if (scanBtn) scanBtn.disabled = !!flag;
-      if (infBtn) infBtn.disabled = !!flag;
     }
     function updatePosSearchButton() {
       const btn = document.getElementById("posSearchBtn");
@@ -11985,8 +12196,6 @@ def _render_positions_page() -> str:
       const dbgTimings = (dbg && typeof dbg.timings === "object" && dbg.timings) ? dbg.timings : {};
       let dbgHtml = "";
       if (dbgSummary.length || Object.keys(dbgTimings).length) {
-        const infoText = infos.map((x) => String(x || "")).join(" | ").toLowerCase();
-        const infinityMode = infoText.includes("infinity scan mode");
         const summaryFiltered = dbgSummary.filter((x) => String(x?.query_mode || "") !== "hard_scan_required_for_live_discovery");
         const cacheHits = summaryFiltered
           .filter((x) => String(x?.query_mode || "") === "ownership_cache")
@@ -11997,7 +12206,7 @@ def _render_positions_page() -> str:
           .filter((x) => String(x?.status || "") === "ok")
           .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
         const v4Errors = v4Rows.filter((x) => String(x?.status || "") !== "ok").length;
-        const modeText = infinityMode ? "infinity" : "fast";
+        const modeText = "fast";
         const stageExplorerMs = summaryFiltered
           .filter((x) => String(x?.query_mode || "").endsWith(":explorer#elapsed_ms"))
           .reduce((acc, x) => acc + Math.max(0, Number(x?.count || 0)), 0);
@@ -12065,37 +12274,23 @@ def _render_positions_page() -> str:
           + `invalid=${Number(v3Scan.invalid_positions || 0)}`
         );
         timingLines.push(stageSplitLine);
-        if (!infinityMode) {
-          const compactLines = summaryFiltered
-            .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")}: ${Number(x.count || 0)}`);
-          const explorerLines = compactLines.filter((l) => String(l).includes(":explorer:"));
-          const onchainLines = compactLines.filter((l) => String(l).includes(":onchain:"));
-          const otherLines = compactLines.filter(
-            (l) => !String(l).includes(":explorer:") && !String(l).includes(":onchain:")
-          );
-          const body = []
-            .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
-            .concat([`v4: attempted=${v4Attempted} found=${v4Found} errors=${v4Errors}`])
-            .concat(timingLines.length ? [`time: ${timingLines.join(" | ")}`] : [])
-            .concat(explorerLines.length ? [`Explorer:`].concat(explorerLines) : [])
-            .concat(onchainLines.length ? [`On-chain:`].concat(onchainLines) : [])
-            .concat(otherLines.length ? otherLines : [])
-            .join("\\n");
-          if (body.trim()) {
-            dbgHtml = `<div class='info-box'><details><summary>Debug scan (compact)</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
-          }
-        } else {
-          const detailedLines = summaryFiltered
-            .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")} [${esc(x.status || "?")}]: ${Number(x.count || 0)}`);
-          const body = []
-            .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
-            .concat([`v4: attempted=${v4Attempted} found=${v4Found} errors=${v4Errors}`])
-            .concat(timingLines.length ? [`time: ${timingLines.join(" | ")}`] : [])
-            .concat(detailedLines.length ? detailedLines : [])
-            .join("\\n");
-          if (body.trim()) {
-            dbgHtml = `<div class='info-box'><details><summary>Debug scan details</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
-          }
+        const compactLines = summaryFiltered
+          .map((x) => `${esc(x.chain || "?")}/${esc(x.version || "?")} ${esc(x.query_mode || "?")}: ${Number(x.count || 0)}`);
+        const explorerLines = compactLines.filter((l) => String(l).includes(":explorer:"));
+        const onchainLines = compactLines.filter((l) => String(l).includes(":onchain:"));
+        const otherLines = compactLines.filter(
+          (l) => !String(l).includes(":explorer:") && !String(l).includes(":onchain:")
+        );
+        const body = []
+          .concat([`mode=${modeText} | cache_hits=${cacheHits}`])
+          .concat([`v4: attempted=${v4Attempted} found=${v4Found} errors=${v4Errors}`])
+          .concat(timingLines.length ? [`time: ${timingLines.join(" | ")}`] : [])
+          .concat(explorerLines.length ? [`Explorer:`].concat(explorerLines) : [])
+          .concat(onchainLines.length ? [`On-chain:`].concat(onchainLines) : [])
+          .concat(otherLines.length ? otherLines : [])
+          .join("\\n");
+        if (body.trim()) {
+          dbgHtml = `<div class='info-box'><details><summary>Debug scan (compact)</summary><pre style='margin:8px 0 0;white-space:pre-wrap'>${body}</pre></details></div>`;
         }
       }
       const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
@@ -12435,13 +12630,10 @@ def _render_positions_page() -> str:
         await new Promise((resolve) => setTimeout(resolve, 1200));
       }
     }
-    async function scanPositions(targetSection = "all", opts = {}) {
+    async function scanPositions(targetSection = "all") {
       let handoffToBackground = false;
-      const options = (typeof opts === "boolean") ? {infinityScan: !!opts} : (opts || {});
-      const infinityScan = !!options.infinityScan;
-      const modeLabel = infinityScan ? "Infinity scan" : "scan";
       if (posHasScannedOnce) {
-        const ok = window.confirm(`Run ${modeLabel} again and replace current results?`);
+        const ok = window.confirm("Run scan again and replace current results?");
         if (!ok) return;
       }
       if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
@@ -12467,8 +12659,6 @@ def _render_positions_page() -> str:
             include_lending: false,
             include_rewards: false,
             hard_scan: false,
-            deep_infinity_scan: false,
-            infinity_scan: !!infinityScan,
           }),
         });
         const startData = await startRes.json().catch(() => ({}));
@@ -12479,7 +12669,7 @@ def _render_positions_page() -> str:
         const data = await pollPosJob(jobId, true);
         if (data && data.__partial) {
           handoffToBackground = true;
-          setPosStatus(`Base results loaded (${modeLabel}). Hard-like enrich continues in background...`, false);
+          setPosStatus("Base results loaded (scan). Hard-like enrich continues in background...", false);
           setTimeout(() => { resumePosJobIfAny(); }, 300);
           return;
         }
@@ -14505,8 +14695,6 @@ def _scan_positions_evm_components(
     scan_rewards: bool,
     include_creation_dates: bool,
     hard_scan: bool,
-    deep_infinity_scan: bool,
-    infinity_scan: bool,
 ) -> tuple[
     list[dict[str, Any]],
     list[str],
@@ -14520,7 +14708,8 @@ def _scan_positions_evm_components(
     timings: dict[str, Any] = {}
     if scan_pools:
         t_enqueue = time.monotonic()
-        _enqueue_positions_ownership_refresh_for_addresses(selected_chain_ids, evm_addresses)
+        if not POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
+            _enqueue_positions_ownership_refresh_for_addresses(selected_chain_ids, evm_addresses)
         timings["enqueue_refresh_sec"] = round(max(0.0, time.monotonic() - t_enqueue), 3)
     if scan_pools:
         t_pool = time.monotonic()
@@ -14530,12 +14719,7 @@ def _scan_positions_evm_components(
             include_creation_dates=include_creation_dates,
             pre_enqueued_ownership_refresh=bool(POSITIONS_OWNERSHIP_INDEX_ENABLED),
             hard_scan=hard_scan,
-            deep_infinity_scan=deep_infinity_scan,
         )
-        if infinity_scan:
-            pool_rows = [
-                r for r in pool_rows if str((r or {}).get("protocol") or "").strip().lower().startswith("pancake_infinity_")
-            ]
         timings["pool_scan_sec"] = round(max(0.0, time.monotonic() - t_pool), 3)
         if isinstance(pool_timings, dict):
             timings["pool"] = pool_timings
@@ -14589,19 +14773,16 @@ def _prepare_positions_scan_request(
 def _build_positions_info_notes(
     solana_addresses: list[str],
     tron_addresses: list[str],
-    *,
-    scan_pools: bool,
-    include_creation_dates: bool,
-    deep_infinity_scan: bool,
-    infinity_scan: bool,
 ) -> list[str]:
     info_notes: list[str] = []
     if solana_addresses:
         info_notes.append("Solana scanning is not available yet in this build.")
     if tron_addresses:
         info_notes.append("TRON scanning is not available yet in this build.")
-    if infinity_scan:
-        info_notes.append("Infinity scan mode: showing only Pancake Infinity positions.")
+    if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
+        info_notes.append(
+            "Explorer NFT catalog: tokennfttx per chain/address; rows and SQLite cache use explorer fields only."
+        )
     if POSITIONS_CONTRACT_ONLY_ENABLED:
         info_notes.append("Contract-only mode: Pair/Fee/In position/Unclaimed are from on-chain contract calls only.")
     return info_notes
@@ -14793,8 +14974,6 @@ def _scan_positions_core(
     debug_timings: dict[str, Any] = {}
     t_prepare = time.monotonic()
     hard_scan_enabled = bool(getattr(req, "hard_scan", False))
-    infinity_scan_enabled = bool(req.infinity_scan)
-    deep_infinity_enabled = bool(getattr(req, "deep_infinity_scan", False))
     (
         evm_addresses,
         solana_addresses,
@@ -14827,8 +15006,6 @@ def _scan_positions_core(
             scan_rewards=scan_rewards,
             include_creation_dates=include_creation_dates,
             hard_scan=hard_scan_enabled,
-            deep_infinity_scan=deep_infinity_enabled,
-            infinity_scan=infinity_scan_enabled,
         )
         debug_timings["evm_components_sec"] = round(max(0.0, time.monotonic() - t_evm), 3)
         if isinstance(evm_timings, dict):
@@ -14842,10 +15019,6 @@ def _scan_positions_core(
     info_notes = _build_positions_info_notes(
         solana_addresses,
         tron_addresses,
-        scan_pools=scan_pools_effective,
-        include_creation_dates=include_creation_dates,
-        deep_infinity_scan=deep_infinity_enabled,
-        infinity_scan=infinity_scan_enabled,
     )
 
     t_sort = time.monotonic()
@@ -14922,12 +15095,11 @@ def _scan_positions_core(
 
 def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: str) -> None:
     hard_scan_enabled = False
-    infinity_scan_enabled = bool(req.infinity_scan)
     if _update_pos_job(
         job_id,
         status="running",
         stage="scan",
-        stage_label=("Infinity scan: scanning positions" if infinity_scan_enabled else "Scanning positions"),
+        stage_label="Scanning positions",
         progress=15,
         started_at=time.time(),
     ) is None:
@@ -14938,7 +15110,7 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
             job_id,
             result=result,
             stage="enrich_dates",
-            stage_label=("Infinity scan: finalizing" if infinity_scan_enabled else "Fast mode: finalizing"),
+            stage_label="Fast mode: finalizing",
             progress=65,
         ) is None:
             return
