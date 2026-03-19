@@ -5261,9 +5261,14 @@ def _is_suspected_spam_pair(
         exp_symbol_spam = _is_probably_spam_symbol(exp_symbol) if exp_symbol else False
         if not exp_name_spam and not exp_symbol_spam:
             return False
-    # If pair tokens are not from curated list, mark clearly suspicious symbols.
+    # In contract-only mode token meta should be treated as untrusted:
+    # we confirm token/position details via contract calls, so explorer
+    # branding/name heuristics often cause false positives.
     spam_meta_symbol = _is_probably_spam_symbol(exp_symbol) if exp_symbol else False
     spam_meta_name = _is_probably_spam_name(exp_name) if exp_name else False
+    if POSITIONS_CONTRACT_ONLY_ENABLED:
+        spam_meta_symbol = False
+        spam_meta_name = False
     if spam0 or spam1 or spam_meta_symbol:
         return True
     if spam_meta_name:
