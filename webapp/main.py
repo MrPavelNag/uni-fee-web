@@ -8533,7 +8533,22 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
 
 
 def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_dates: bool) -> None:
-    return
+    if not include_creation_dates or not rows:
+        return
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            cid = int(r.get("chain_id") or 0)
+        except Exception:
+            cid = 0
+        proto = str(r.get("protocol") or "").strip().lower()
+        pid = str(r.get("position_id") or "").strip()
+        if cid <= 0 or not proto or not pid:
+            r["position_created_date"] = str(r.get("position_created_date") or "-")
+            continue
+        d = _position_creation_date_peek(cid, proto, pid)
+        r["position_created_date"] = d if d else "-"
 
 
 def _run_pool_chain_scan(
@@ -11617,7 +11632,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Created</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
@@ -14528,7 +14543,7 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
     ) is None:
         return
     try:
-        result = _scan_positions_core(req, sid=session_id, include_creation_dates=False)
+        result = _scan_positions_core(req, sid=session_id, include_creation_dates=True)
         if _update_pos_job(
             job_id,
             result=result,
