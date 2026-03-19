@@ -12599,16 +12599,18 @@ def _render_positions_page() -> str:
       const list = rows || [];
       const visible = [];
       const hiddenRows = [];
+      let spamHiddenCount = 0;
       for (let i = 0; i < list.length; i++) {
         const r0 = list[i];
         const row = Object.assign({_src_idx: i}, r0 || {});
         row._row_key = poolRowKey(row);
         const trusted = trustedSpamKeys.has(row._row_key);
         const manual = manualHiddenKeys.has(row._row_key);
-        const suspected = Boolean(row && row.suspected_spam);
+        const suspected = Boolean(row && (row.suspected_spam || row.spam_skipped));
         row._is_trusted_spam = trusted;
         row._is_manual_hidden = manual;
         row._is_suspected_spam = suspected;
+        if (suspected && !trusted) spamHiddenCount += 1;
         if (manual || (suspected && !trusted)) {
           hiddenRows.push(row);
           continue;
@@ -12664,7 +12666,10 @@ def _render_positions_page() -> str:
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
-        html += `<tr><td colspan='13'><details id='posHiddenDetails'${openAttr}><summary>Hidden positions (${hiddenRows.length})</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+        const hiddenSummary = (spamHiddenCount > 0)
+          ? `Hidden positions (${hiddenRows.length}; spam=${spamHiddenCount})`
+          : `Hidden positions (${hiddenRows.length})`;
+        html += `<tr><td colspan='13'><details id='posHiddenDetails'${openAttr}><summary>${hiddenSummary}</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
       const detailsEl = document.getElementById("posHiddenDetails");
