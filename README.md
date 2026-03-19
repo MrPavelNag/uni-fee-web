@@ -105,6 +105,27 @@ export RENDER_HEALTHCHECK_URL="https://uni-fee-web.onrender.com/healthz"
 
 Если `RENDER_DEPLOY_HOOK_URL` не задан, скрипт только коммитит+пушит.
 
+### Sync из Cursor worktree
+
+Если работаете в Cursor worktree и хотите синхронизировать изменения в основной репозиторий:
+
+```bash
+chmod +x scripts/deploy_sync.sh
+./scripts/deploy_sync.sh "sync latest changes"
+```
+
+Без commit/push (только скопировать и застейджить):
+
+```bash
+SYNC_ONLY=1 ./scripts/deploy_sync.sh
+```
+
+С commit, но без push:
+
+```bash
+NO_PUSH=1 ./scripts/deploy_sync.sh "sync without push"
+```
+
 ### Шаги
 
 1. Запушьте проект в GitHub (если еще не там).
