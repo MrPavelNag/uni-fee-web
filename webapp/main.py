@@ -4833,6 +4833,19 @@ def _fetch_erc20_symbol_onchain(chain_id: int, token_address: str) -> str | None
     return sym or None
 
 
+def _fetch_erc20_decimals_onchain(chain_id: int, token_address: str) -> int:
+    addr = str(token_address or "").strip().lower()
+    if not _is_eth_address(addr):
+        return 18
+    try:
+        dec = _decode_uint_eth_call(_eth_call_hex(int(chain_id), addr, "0x313ce567"))
+        if dec < 0 or dec > 36:
+            return 18
+        return int(dec)
+    except Exception:
+        return 18
+
+
 def _token_display_symbol_with_source(chain_id: int, chain_key: str, token_obj: dict[str, Any]) -> tuple[str, str]:
     sym = str((token_obj or {}).get("symbol") or "").strip()
     if sym:
@@ -6116,10 +6129,24 @@ def _scan_uniswap_v4_positions_onchain(
                     {"to": pm, "data": sel_liq + _encode_uint_word(int(token_id))},
                 ],
             )
-            p_words = _hex_words(batch[0] or "")
+            info_hex = str(batch[0] or "").strip().lower() if isinstance(batch, list) and len(batch) > 0 else ""
+            liq_hex = str(batch[1] or "").strip().lower() if isinstance(batch, list) and len(batch) > 1 else ""
+            # Some RPC providers on Unichain intermittently drop batch eth_call responses.
+            # Fallback to single calls for this token to avoid false-negative filtering.
+            if not info_hex.startswith("0x") or len(info_hex) <= 2:
+                try:
+                    info_hex = _eth_call_hex(cid, pm, sel_pool_and_info + _encode_uint_word(int(token_id)))
+                except Exception:
+                    info_hex = ""
+            if not liq_hex.startswith("0x") or len(liq_hex) <= 2:
+                try:
+                    liq_hex = _eth_call_hex(cid, pm, sel_liq + _encode_uint_word(int(token_id)))
+                except Exception:
+                    liq_hex = "0x0"
+            p_words = _hex_words(info_hex or "")
             if len(p_words) < 6:
                 continue
-            liq = _decode_uint_eth_call(batch[1] or "0x0")
+            liq = _decode_uint_eth_call(liq_hex or "0x0")
             if int(liq) <= 0:
                 if not force_visible:
                     _mark_auto_hidden_closed_position(int(cid), "uniswap_v4", int(token_id))
