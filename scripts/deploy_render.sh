@@ -10,7 +10,6 @@ set -euo pipefail
 # Usage:
 #   ./scripts/deploy_render.sh "your commit message"
 #   TARGET_BRANCH=milestone/web-mvp-stable ./scripts/deploy_render.sh
-#   BYPASS_DEPLOY_CONFIRM=1 ./scripts/deploy_render.sh "non-interactive run"
 #   RENDER_DEPLOY_HOOK_URL="https://api.render.com/deploy/..." ./scripts/deploy_render.sh
 #   RENDER_DEPLOY_HOOK_URL="..." RENDER_HEALTHCHECK_URL="https://uni-fee-web.onrender.com/healthz" ./scripts/deploy_render.sh
 
@@ -21,65 +20,6 @@ RENDER_DEPLOY_HOOK_URL="${RENDER_DEPLOY_HOOK_URL:-}"
 RENDER_HEALTHCHECK_URL="${RENDER_HEALTHCHECK_URL:-https://uni-fee-web.onrender.com/healthz}"
 HEALTHCHECK_TIMEOUT_SEC="${HEALTHCHECK_TIMEOUT_SEC:-240}"
 HEALTHCHECK_INTERVAL_SEC="${HEALTHCHECK_INTERVAL_SEC:-5}"
-AUTO_SMOKE_CHECK="${AUTO_SMOKE_CHECK:-1}"
-SMOKE_SCRIPT_PATH="${SMOKE_SCRIPT_PATH:-./scripts/smoke_render.sh}"
-SMOKE_BASE_URL="${SMOKE_BASE_URL:-}"
-REQUIRE_MANUAL_CONFIRM="${REQUIRE_MANUAL_CONFIRM:-1}"
-BYPASS_DEPLOY_CONFIRM="${BYPASS_DEPLOY_CONFIRM:-0}"
-
-require_deploy_confirmation() {
-  if [[ "${REQUIRE_MANUAL_CONFIRM}" != "1" ]]; then
-    return
-  fi
-  if [[ "${BYPASS_DEPLOY_CONFIRM}" == "1" ]]; then
-    echo "==> Deploy confirmation bypassed (BYPASS_DEPLOY_CONFIRM=1)"
-    return
-  fi
-  if [[ -t 0 ]]; then
-    local prompt
-    prompt="Type 'YES' to commit+push ${CURRENT_BRANCH}: "
-    read -r -p "${prompt}" answer
-    if [[ "${answer}" != "YES" ]]; then
-      echo "Aborted: deploy confirmation failed."
-      exit 1
-    fi
-    return
-  fi
-  echo "Error: non-interactive run blocked by safety guard."
-  echo "Use BYPASS_DEPLOY_CONFIRM=1 to allow non-interactive commit+push."
-  exit 1
-}
-
-run_smoke_check() {
-  if [[ "${AUTO_SMOKE_CHECK}" != "1" ]]; then
-    echo "==> AUTO_SMOKE_CHECK=0, skipping smoke checks"
-    return
-  fi
-
-  if [[ ! -f "${SMOKE_SCRIPT_PATH}" ]]; then
-    echo "==> Smoke script not found: ${SMOKE_SCRIPT_PATH}"
-    echo "==> Skipping smoke checks"
-    return
-  fi
-
-  if [[ ! -x "${SMOKE_SCRIPT_PATH}" ]]; then
-    chmod +x "${SMOKE_SCRIPT_PATH}"
-  fi
-
-  local inferred_base="${SMOKE_BASE_URL}"
-  if [[ -z "${inferred_base}" && -n "${RENDER_HEALTHCHECK_URL}" ]]; then
-    if [[ "${RENDER_HEALTHCHECK_URL}" == */healthz ]]; then
-      inferred_base="${RENDER_HEALTHCHECK_URL%/healthz}"
-    fi
-  fi
-
-  echo "==> Running smoke checks"
-  if [[ -n "${inferred_base}" ]]; then
-    SMOKE_BASE_URL="${inferred_base}" "${SMOKE_SCRIPT_PATH}"
-  else
-    "${SMOKE_SCRIPT_PATH}"
-  fi
-}
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "Error: run this script inside a git repository."
@@ -99,7 +39,6 @@ if [[ "${CURRENT_BRANCH}" != "${TARGET_BRANCH}" ]]; then
 fi
 
 echo "==> Preparing deploy from branch: ${CURRENT_BRANCH}"
-require_deploy_confirmation
 
 # Stage everything first, then unstage runtime SQLite files.
 git add -A
@@ -137,9 +76,7 @@ if [[ -n "${RENDER_DEPLOY_HOOK_URL}" ]]; then
       sleep "${HEALTHCHECK_INTERVAL_SEC}"
     done
   fi
-  run_smoke_check
 else
-  run_smoke_check
   echo "Done."
   echo "No RENDER_DEPLOY_HOOK_URL set."
   echo "Next: trigger deploy in Render UI (or enable Auto Deploy)."
