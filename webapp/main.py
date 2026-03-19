@@ -495,6 +495,7 @@ PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID: dict[int, str] = {
 UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID: dict[int, str] = {
     # Uniswap v4 deployments: https://docs.uniswap.org/contracts/v4/deployments
     130: "0x4529a01c7a0410167c5740c487a8de60232617bf",  # Unichain
+    1301: "0xd88f38f930b7952f2db2432cb002e7abbf3dd869",  # Unichain Sepolia (positions NFT)
 }
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
@@ -3343,6 +3344,7 @@ def _explorer_v2_chainid(chain_id: int) -> str:
         10: "10",
         56: "56",
         130: "130",
+        1301: "1301",
         137: "137",
         8453: "8453",
         42161: "42161",
@@ -3365,7 +3367,7 @@ def _explorer_v2_api_keys(chain_id: int) -> list[str]:
         raw.append(base_key)
     if cid == 42161 and arb_key:
         raw.append(arb_key)
-    if cid == 130 and uni_key:
+    if cid in {130, 1301} and uni_key:
         raw.append(uni_key)
     out: list[str] = []
     seen: set[str] = set()
@@ -4212,7 +4214,7 @@ def _explorer_nfttx_rows(
                 f"&address={owner_addr}&page=1&offset={offset}&sort=desc&apikey={arb_key}",
                 False,
             ))
-        elif cid == 130 and uni_key:
+        elif cid in {130, 1301} and uni_key:
             uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
             urls.append((
                 f"{uniscan_api}?module=account&action=tokennfttx&contractaddress={c}"
@@ -4288,7 +4290,7 @@ def _explorer_nfttx_rows(
             f"?module=account&action=tokennfttx&contractaddress={c}"
             f"&page={{page}}&offset={offset}&sort=desc&apikey={arb_key}"
         )
-    elif cid == 130 and uni_key:
+    elif cid in {130, 1301} and uni_key:
         uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
         contract_urls.append(
             f"{uniscan_api}?module=account&action=tokennfttx&contractaddress={c}"
@@ -4534,7 +4536,7 @@ def _explorer_owner_nfttx_rows(
             "https://api.arbiscan.io/api"
             f"?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={arb_key}"
         )
-    elif cid == 130 and uni_key:
+    elif cid in {130, 1301} and uni_key:
         uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
         url_templates.append(
             f"{uniscan_api}?module=account&action=tokennfttx&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={uni_key}"
@@ -4624,6 +4626,7 @@ def _scan_v4_position_ids_by_explorer_any_contract(
         return {}
     by_contract: dict[str, list[int]] = {}
     seen_by_contract: dict[str, set[int]] = {}
+    v4_name_hint_by_contract: dict[str, bool] = {}
     owner_candidates = _position_owner_allowlist(cid, "uniswap_v4", owner_addr)
     if not owner_candidates:
         owner_candidates = {owner_addr}
@@ -4655,6 +4658,10 @@ def _scan_v4_position_ids_by_explorer_any_contract(
         from_addr = str(r.get("from") or "").strip().lower()
         if to_addr not in owner_candidates and from_addr not in owner_candidates:
             continue
+        tname = str(r.get("tokenName") or r.get("tokenname") or "").strip().lower()
+        tsym = str(r.get("tokenSymbol") or r.get("tokensymbol") or "").strip().lower()
+        if ("uniswap v4" in tname and "position" in tname) or ("v4" in tsym and "uni" in tsym):
+            v4_name_hint_by_contract[str(caddr)] = True
         block_n = _parse_int_like(r.get("blockNumber") or 0)
         ts_n = _parse_int_like(r.get("timeStamp") or 0)
         key_evt = (str(caddr), int(tid))
@@ -4681,20 +4688,26 @@ def _scan_v4_position_ids_by_explorer_any_contract(
                 owned_tids.append(int(tid))
         if not owned_tids:
             continue
+        has_name_hint = bool(v4_name_hint_by_contract.get(str(caddr), False))
         try:
             code = _eth_get_code(cid, caddr, "latest")
-            if code in {"0x", "0x0"}:
+            if code in {"0x", "0x0"} and not has_name_hint:
                 continue
         except Exception:
-            continue
+            if not has_name_hint:
+                continue
         sample_id = int(owned_tids[0])
         try:
             info_hex = _eth_call_hex(cid, caddr, sel_info + _encode_uint_word(sample_id))
             liq_hex = _eth_call_hex(cid, caddr, sel_liq + _encode_uint_word(sample_id))
             if len(_hex_words(info_hex or "")) < 6:
+                if has_name_hint:
+                    out[caddr] = list(owned_tids[: int(max_ids)])
                 continue
             _decode_uint_eth_call(liq_hex or "0x0")
         except Exception:
+            if has_name_hint:
+                out[caddr] = list(owned_tids[: int(max_ids)])
             continue
         out[caddr] = list(owned_tids[: int(max_ids)])
     return out
@@ -4857,7 +4870,7 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
             "https://api.arbiscan.io/api"
             f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={arb_key}"
         )
-    elif cid == 130 and uni_key:
+    elif cid in {130, 1301} and uni_key:
         uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
         urls.append(
             f"{uniscan_api}?module=account&action=txlist"
