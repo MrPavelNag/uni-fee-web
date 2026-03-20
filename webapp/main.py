@@ -91,7 +91,8 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-APP_VERSION = "0.0.2"
+APP_VERSION = "0.0.3"
+APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
 
@@ -592,7 +593,7 @@ POSITIONS_EXPLORER_GRAPH_ID_UNION = os.environ.get("POSITIONS_EXPLORER_GRAPH_ID_
     "yes",
     "on",
 )
-# NFT catalog (tokennfttx): оставить в выдаче только позиции с liquidity>0 на известном PM (Multicall3).
+# NFT catalog: Multicall3 open-liquidity pass для вкладок «открытые / закрытые» (liquidity==0 → закрытые). При 0 — не вызывать multiclassификацию (все строки в одной вкладке).
 POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER = os.environ.get(
     "POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
@@ -2546,7 +2547,7 @@ def _fetch_token_prices_usd_coingecko(chain_id: int, token_addresses: list[str])
                 f"https://api.coingecko.com/api/v3/simple/token_price/{platform}"
                 f"?contract_addresses={','.join(chunk)}&vs_currencies=usd"
             )
-            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
             with urlopen(req, timeout=12) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             if not isinstance(payload, dict):
@@ -2571,7 +2572,7 @@ def _fetch_token_price_usd_dexscreener(chain_id: int, token_address: str) -> flo
         return None
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{addr}"
-        req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+        req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
         with urlopen(req, timeout=10) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         pairs = payload.get("pairs") or []
@@ -2635,7 +2636,7 @@ def _get_token_prices_usd(chain_id: int, token_addresses: list[str]) -> dict[str
             return float(cached[1])
         try:
             url = f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd"
-            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
             with urlopen(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             px = float(((payload or {}).get(cid) or {}).get("usd") or 0.0)
@@ -2738,7 +2739,7 @@ def _json_rpc_call(
             req = UrlRequest(
                 rpc_url,
                 data=body,
-                headers={"Content-Type": "application/json", "User-Agent": "uni-fee-web/0.0.2"},
+                headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
             )
             timeout_s = float(POSITIONS_ONCHAIN_TIMEOUT_SEC)
             if timeout_sec is not None:
@@ -2791,7 +2792,7 @@ def _json_rpc_batch_call(
                 req = UrlRequest(
                     rpc_url,
                     data=body,
-                    headers={"Content-Type": "application/json", "User-Agent": "uni-fee-web/0.0.2"},
+                    headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
                 )
                 timeout_s = max(8, POSITIONS_ONCHAIN_TIMEOUT_SEC * 3)
                 if deadline_ts is not None:
@@ -3714,7 +3715,7 @@ def _explorer_contract_creation_block(chain_id: int, contract_address: str) -> i
         )
     for url in urls:
         try:
-            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
             with urlopen(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             rows = (payload or {}).get("result")
@@ -4564,7 +4565,7 @@ def _explorer_nfttx_rows(
         return []
     def _fetch_rows(url: str) -> list[dict[str, Any]]:
         try:
-            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
             with urlopen(req, timeout=float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             result_rows = _etherscan_api_coerce_result_rows((payload or {}).get("result"))
@@ -5008,7 +5009,7 @@ def _explorer_owner_nfttx_rows(
         def _fetch_page(page_num: int) -> tuple[int, dict[str, Any] | None]:
             try:
                 url = str(tmpl).replace("{page}", str(page_num))
-                req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+                req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
                 with urlopen(req, timeout=http_timeout) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 pl = payload if isinstance(payload, dict) else {}
@@ -5397,7 +5398,7 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
         return []
     for url in urls:
         try:
-            req = UrlRequest(url, headers={"User-Agent": "uni-fee-web/0.0.2"})
+            req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
             with urlopen(req, timeout=12) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             rows = (payload or {}).get("result")
@@ -10419,6 +10420,69 @@ def _explorer_nft_contract_pm_kind(chain_id: int, contract: str) -> str:
     return ""
 
 
+def _nft_catalog_row_enrich_protocol(row: dict[str, Any]) -> str:
+    """Внутренний ключ протокола для on-chain positions() / quotes (строка NFT-каталога)."""
+    if not isinstance(row, dict):
+        return ""
+    cid = int(row.get("chain_id") or 0) or int(_chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
+    pool = str(row.get("pool_id") or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(pool):
+        return ""
+    pmk = _explorer_nft_contract_pm_kind(cid, pool)
+    if pmk == "v3npm":
+        return str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(cid, "uniswap_v3") or "uniswap_v3").strip().lower()
+    if pmk == "v4pm":
+        return "uniswap_v4"
+    if pmk == "infinity_cl":
+        return "pancake_infinity_cl"
+    return ""
+
+
+def _enrich_nft_catalog_rows_from_chain(
+    rows: list[dict[str, Any]],
+    *,
+    max_seconds: float = 24.0,
+    max_rows: int = 220,
+) -> tuple[int, int]:
+    """Для NFT-каталога: pair / fee / in position / liquidity из контракта PM (Multicall/RPC)."""
+    start = time.monotonic()
+    ok_n = 0
+    fail_n = 0
+    for row in rows or []:
+        if time.monotonic() - start >= float(max_seconds):
+            break
+        if ok_n >= int(max_rows):
+            break
+        if not isinstance(row, dict):
+            continue
+        if bool(row.get("unsupported_protocol")):
+            continue
+        proto = _nft_catalog_row_enrich_protocol(row)
+        if not proto:
+            continue
+        chain_id = int(row.get("chain_id") or 0) or int(_chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
+        token_id = _position_token_id_from_raw(row.get("position_id"))
+        owner = str(row.get("address") or "").strip().lower()
+        if chain_id <= 0 or token_id <= 0:
+            continue
+        seg = str(row.get("catalog_segment") or "").strip().lower()
+        # On-chain pair / fee / in-position только для открытых (и unknown); закрытые — отдельная вкладка без тяжёлого enrich.
+        if seg == "closed":
+            continue
+        try:
+            snap = _fetch_v3_position_contract_snapshot(chain_id, proto, int(token_id), owner)
+            if not isinstance(snap, dict):
+                fail_n += 1
+                continue
+            updates = _build_row_updates_from_snapshot(row, snap, chain_id)
+            row.update(updates)
+            ok_n += 1
+        except Exception:
+            fail_n += 1
+            continue
+    return ok_n, fail_n
+
+
 def _nft_catalog_compute_open_liquidity_allowed(
     fetch_results: list[dict[str, Any]],
     *,
@@ -10749,16 +10813,12 @@ def _scan_pool_positions_explorer_nft_catalog(
                         created = ""
                 supported = _explorer_nft_catalog_is_uniswap_or_pancake(token_name, token_symbol)
                 unsupported_protocol = not supported
-                if (
-                    nft_open_allowed is not None
-                    and supported
-                    and POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER
-                ):
-                    pmk = _explorer_nft_contract_pm_kind(int(cid), str(contract))
-                    if pmk:
-                        _olk = (int(cid), str(contract).strip().lower(), int(tid))
-                        if _olk not in nft_open_allowed:
-                            continue
+                pmk = _explorer_nft_contract_pm_kind(int(cid), str(contract))
+                _olk = (int(cid), str(contract).strip().lower(), int(tid))
+                catalog_segment = "unknown"
+                if supported and pmk:
+                    if nft_open_allowed is not None:
+                        catalog_segment = "open" if _olk in nft_open_allowed else "closed"
                 blob = f"{token_name} {token_symbol}".lower()
                 if "uniswap" in blob:
                     proto_col = (token_symbol or "Uniswap").strip()[:24] or "Uniswap"
@@ -10806,7 +10866,8 @@ def _scan_pool_positions_explorer_nft_catalog(
                     "position_ids": [str(tid)],
                     "fee_tier": "-",
                     "fee_tier_raw": "",
-                    "position_status": "explorer",
+                    "catalog_segment": str(catalog_segment),
+                    "position_status": ("hidden" if catalog_segment == "closed" else "explorer"),
                     "liquidity_display": "-",
                     "liquidity": "0",
                     "pool_liquidity": "0",
@@ -13088,6 +13149,13 @@ def _render_positions_page() -> str:
     }
     .status-dot.active { background:#7d9f89; border-color:#6f8e7a; }
     .status-dot.inactive { background:#ab8787; border-color:#987676; }
+    .status-dot.hidden { background:#94a3b8; border-color:#64748b; }
+    .pos-catalog-tabs { display: none; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .pos-tab-btn {
+      border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
+      padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+    }
+    .pos-tab-btn.active { background: #1e3a8a; color: #fff; border-color: #1e3a8a; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     @media (max-width: 1100px) {
@@ -13152,6 +13220,10 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posPoolsBody" class="section-body">
+          <div id="posPoolsTabBar" class="pos-catalog-tabs" aria-label="Pool position tabs">
+            <button type="button" class="pos-tab-btn" id="posCatalogTabOpen" onclick="setPosCatalogTab('open')">Открытые позиции</button>
+            <button type="button" class="pos-tab-btn" id="posCatalogTabClosed" onclick="setPosCatalogTab('closed')">Закрытые позиции</button>
+          </div>
           <div class="table-wrap"><table id="posPoolsTable"></table></div>
           <div id="posErrors"></div>
         </div>
@@ -13251,6 +13323,12 @@ def _render_positions_page() -> str:
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_HIDDEN_EXPANDED_KEY = "positions_hidden_expanded_v1";
     const POS_UNSUPPORTED_EXPANDED_KEY = "positions_unsupported_protocols_expanded_v1";
+    const POS_CATALOG_TAB_KEY = "positions_catalog_tab_v1";
+    function setPosCatalogTab(tab) {
+      const t = String(tab || "open").toLowerCase() === "closed" ? "closed" : "open";
+      try { localStorage.setItem(POS_CATALOG_TAB_KEY, t); } catch (_) {}
+      renderPools(posCache.pools || []);
+    }
     let posHasScannedOnce = false;
     let posScanTicker = null;
     let posScanStartedAt = 0;
@@ -13764,6 +13842,9 @@ def _render_positions_page() -> str:
     }
     function statusDot(status) {
       const s = String(status || "").trim().toLowerCase();
+      if (s === "hidden") {
+        return `<span class="status-dot hidden" title="Скрытая / закрытая позиция (нулевая ликвидность)"></span>`;
+      }
       const isActive = s === "active";
       const cls = isActive ? "active" : "inactive";
       const title = isActive ? "active" : "inactive";
@@ -13774,13 +13855,42 @@ def _render_positions_page() -> str:
     }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
+      const tabBar = document.getElementById("posPoolsTabBar");
+      const btnOpen = document.getElementById("posCatalogTabOpen");
+      const btnClosed = document.getElementById("posCatalogTabClosed");
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
       const unsupportedExpanded = localStorage.getItem(POS_UNSUPPORTED_EXPANDED_KEY) === "1";
       const totalCols = 13;
       let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
-      const list = rows || [];
+      const listAll = rows || [];
+      const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
+      let closedCount = 0;
+      for (let ci = 0; ci < listAll.length; ci++) {
+        const seg = String((listAll[ci] || {}).catalog_segment || "").toLowerCase();
+        if (seg === "closed") closedCount += 1;
+      }
+      const catalogTab = String(localStorage.getItem(POS_CATALOG_TAB_KEY) || "open").toLowerCase() === "closed" ? "closed" : "open";
+      if (tabBar && btnOpen && btnClosed) {
+        if (hasCatalogSegments && closedCount > 0) {
+          tabBar.style.display = "flex";
+          btnOpen.textContent = "Открытые позиции";
+          btnClosed.textContent = `Закрытые позиции (${closedCount})`;
+          btnOpen.classList.toggle("active", catalogTab === "open");
+          btnClosed.classList.toggle("active", catalogTab === "closed");
+        } else {
+          tabBar.style.display = "none";
+        }
+      }
+      const list = (hasCatalogSegments && closedCount > 0)
+        ? listAll.filter((r0) => {
+            const seg = String((r0 || {}).catalog_segment || "").toLowerCase();
+            if (!seg) return catalogTab === "open";
+            if (catalogTab === "closed") return seg === "closed";
+            return seg !== "closed";
+          })
+        : listAll;
       const visible = [];
       const hiddenRows = [];
       const unsupportedRows = [];
@@ -16458,6 +16568,17 @@ def _scan_positions_core(
     _sort_positions_scan_rows(pool_rows, lending_rows, reward_rows)
     debug_timings["sort_rows_sec"] = round(max(0.0, time.monotonic() - t_sort), 3)
 
+    t_nft_enrich = time.monotonic()
+    if POSITIONS_EXPLORER_NFT_CATALOG_SCAN and pool_rows:
+        ne_ok, ne_fail = _enrich_nft_catalog_rows_from_chain(pool_rows, max_seconds=26.0, max_rows=240)
+        debug_timings["nft_catalog_onchain_enrich_sec"] = round(max(0.0, time.monotonic() - t_nft_enrich), 3)
+        debug_timings["nft_catalog_onchain_enrich_ok"] = int(ne_ok)
+        debug_timings["nft_catalog_onchain_enrich_fail"] = int(ne_fail)
+        if ne_ok or ne_fail:
+            info_notes.append(
+                f"NFT catalog on-chain enrich: ok={int(ne_ok)}, fail={int(ne_fail)} "
+                f"(pair/fee/in-position for open positions only; closed tab uses explorer metadata)."
+            )
     t_debug = time.monotonic()
     debug_summary_rows = _build_pool_debug_summary_rows(pool_debug_rows)
     cache_hits, cache_misses, skip_live, legacy_disabled, row_live_enrich_disabled = _extract_index_scan_counters(
@@ -16643,8 +16764,12 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     token_id = _position_token_id_from_raw(pos_id)
     if chain_id <= 0 or token_id <= 0:
         return {"ok": False, "reason": "invalid_row"}
+    if protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked", "uniswap_v4", "pancake_infinity_cl"}:
+        mapped = _nft_catalog_row_enrich_protocol(row)
+        if mapped:
+            protocol = mapped
     _unhide_auto_hidden_closed_position(int(chain_id), protocol, int(token_id))
-    if protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+    if protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked", "uniswap_v4", "pancake_infinity_cl"}:
         return {"ok": False, "reason": "unsupported_protocol"}
     snap = _fetch_v3_position_contract_snapshot(int(chain_id), protocol, int(token_id), owner)
     if not isinstance(snap, dict):
