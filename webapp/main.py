@@ -4564,6 +4564,47 @@ def _eth_rpc_log_block_number_u256(lg: Any) -> int:
         return 0
 
 
+def _eth_get_logs_nonempty_range_pm_transfer(
+    chain_id: int,
+    pm_contract_lc: str,
+    topic_transfer: str,
+    topic_tid: str,
+    lo: int,
+    hi: int,
+    *,
+    deadline_ts: float | None = None,
+) -> bool:
+    """
+    True, если в [lo,hi] есть хотя бы один ERC-721 Transfer на PM с данным tokenId (topic4).
+    При ошибке RPC на широком диапазоне — делим пополам (Base/publicnode режут getLogs).
+    """
+    cid = int(chain_id)
+    c = str(pm_contract_lc or "").strip().lower()
+    lo_i, hi_i = int(lo), int(hi)
+    if cid <= 0 or not _is_eth_address(c) or lo_i > hi_i:
+        return False
+    if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+        return False
+    chunk: dict[str, Any] = {
+        "address": c,
+        "fromBlock": hex(lo_i),
+        "toBlock": hex(hi_i),
+        "topics": [topic_transfer, None, None, topic_tid],
+    }
+    try:
+        logs = _eth_get_logs(cid, chunk, deadline_ts=deadline_ts, max_attempts=2)
+        return bool(logs)
+    except Exception:
+        if lo_i >= hi_i:
+            return False
+        mid = (lo_i + hi_i) // 2
+        return _eth_get_logs_nonempty_range_pm_transfer(
+            cid, c, topic_transfer, topic_tid, lo_i, mid, deadline_ts=deadline_ts
+        ) or _eth_get_logs_nonempty_range_pm_transfer(
+            cid, c, topic_transfer, topic_tid, mid + 1, hi_i, deadline_ts=deadline_ts
+        )
+
+
 def _position_mint_block_erc721_transfer_on_pm(
     chain_id: int,
     pm_contract_lc: str,
@@ -4573,7 +4614,8 @@ def _position_mint_block_erc721_transfer_on_pm(
 ) -> int:
     """
     Номер блока первого Transfer(tokenId) на PM (mint). Сначала один запрос 0..latest;
-    если RPC режет диапазон (часто Base/publicnode) — по окнам от генезиса; первое окно с Transfer(tokenId) даёт mint.
+    если RPC режет диапазон — бинарный поиск по высоте: минимальный блок, где уже есть Transfer
+    (линейный скан «первого непустого чанка с начала» неверен: в чанке может быть только поздний transfer).
     """
     cid = int(chain_id)
     c = str(pm_contract_lc or "").strip().lower()
@@ -4607,37 +4649,58 @@ def _position_mint_block_erc721_transfer_on_pm(
     except Exception:
         pass
 
-    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
-    if int(cid) in _CREATION_DATE_L2_CHAIN_IDS:
-        step = min(step, int(POSITIONS_CREATION_DATE_LOG_STEP_L2))
-    start_b = 0
-    while start_b <= int(latest):
-        if deadline_ts is not None and time.monotonic() >= deadline_ts:
-            break
-        end_b = min(int(latest), int(start_b) + step - 1)
-        chunk: dict[str, Any] = {
-            "address": c,
-            "fromBlock": hex(int(start_b)),
-            "toBlock": hex(int(end_b)),
-            "topics": [topic_transfer, None, None, topic_tid],
-        }
-        try:
-            logs = _eth_get_logs(cid, chunk, deadline_ts=deadline_ts, max_attempts=2)
-        except Exception:
-            if step > 5000:
-                step = max(5000, step // 2)
-                continue
-            logs = []
-        if logs:
-            best = 0
-            for lg in logs:
-                bn = _eth_rpc_log_block_number_u256(lg)
-                if bn > 0 and (best <= 0 or bn < best):
-                    best = bn
-            if best > 0:
-                return best
-        start_b = int(end_b) + 1
-    return 0
+    if not _eth_get_logs_nonempty_range_pm_transfer(
+        cid, c, topic_transfer, topic_tid, 0, int(latest), deadline_ts=deadline_ts
+    ):
+        return 0
+
+    lo_b, hi_b = 0, int(latest)
+    while lo_b < hi_b:
+        if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+            return 0
+        mid = (lo_b + hi_b) // 2
+        if _eth_get_logs_nonempty_range_pm_transfer(
+            cid, c, topic_transfer, topic_tid, 0, mid, deadline_ts=deadline_ts
+        ):
+            hi_b = mid
+        else:
+            lo_b = mid + 1
+
+    blk = int(lo_b)
+    fin: dict[str, Any] = {
+        "address": c,
+        "fromBlock": hex(blk),
+        "toBlock": hex(blk),
+        "topics": [topic_transfer, None, None, topic_tid],
+    }
+    try:
+        logs_fin = _eth_get_logs(cid, fin, deadline_ts=deadline_ts, max_attempts=2)
+    except Exception:
+        logs_fin = []
+    best_blk = 0
+    for lg in logs_fin or []:
+        bn = _eth_rpc_log_block_number_u256(lg)
+        if bn > 0 and (best_blk <= 0 or bn < best_blk):
+            best_blk = bn
+    if best_blk <= 0:
+        lo2 = max(0, blk - 3)
+        hi2 = min(int(latest), blk + 3)
+        if lo2 <= hi2 and (lo2, hi2) != (blk, blk):
+            fin2: dict[str, Any] = {
+                "address": c,
+                "fromBlock": hex(lo2),
+                "toBlock": hex(hi2),
+                "topics": [topic_transfer, None, None, topic_tid],
+            }
+            try:
+                logs2 = _eth_get_logs(cid, fin2, deadline_ts=deadline_ts, max_attempts=2)
+            except Exception:
+                logs2 = []
+            for lg in logs2 or []:
+                bn2 = _eth_rpc_log_block_number_u256(lg)
+                if bn2 > 0 and (best_blk <= 0 or bn2 < best_blk):
+                    best_blk = bn2
+    return int(best_blk)
 
 
 def _position_creation_date_ymd(chain_id: int, protocol: str, position_id: Any) -> str:
@@ -4766,9 +4829,9 @@ def _position_creation_date_keys_for_row(row: dict[str, Any]) -> list[str]:
     disp = str(row.get("protocol") or "").strip().lower()
     if disp in _CREATION_DATE_INTERNAL_PROTOCOLS:
         _add(disp)
-    elif disp in ("uni-v3", "univ3"):
+    elif disp in ("uni-v3", "univ3", "uni_v3"):
         _add("uniswap_v3")
-    elif disp in ("uni-v4", "univ4"):
+    elif disp in ("uni-v4", "univ4", "uni_v4"):
         _add("uniswap_v4")
     elif disp == "uniswap":
         _add("uniswap_v3")
