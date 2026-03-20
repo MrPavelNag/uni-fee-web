@@ -75,8 +75,14 @@ except Exception:
     CATALOG_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
+MAJOR_TOKENS_CACHE_PATH = CATALOG_DIR / "major_tokens_by_chain.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
 TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000000"))
+# Расширение карты адресов (config.TOKEN_ADDRESSES): топ-N токенов по totalValueLockedUSD из сабграфа v3/v4
+# на каждую поддерживаемую сеть, мержится с curated-списком. 0 = только config.
+# Дефолт 500: единый каталог «крупных» токенов на сайте; кэш на диске, раз в сутки обновление, без refetch при деплое.
+TOKENS_MAJOR_TOP_N = max(0, min(1000, int(os.environ.get("TOKENS_MAJOR_TOP_N", "500"))))
+TOKENS_MAJOR_TOP_MIN_TVL_USD = max(0.0, float(os.environ.get("TOKENS_MAJOR_TOP_MIN_TVL_USD", "0")))
 CHAIN_ID_TO_NAME = {
     1: "ethereum",
     10: "optimism",
@@ -98,6 +104,7 @@ app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
 @app.on_event("startup")
 def _on_startup() -> None:
+    _prime_major_tokens_from_disk()
     _start_catalog_auto_refresh()
     _start_analytics()
     _start_positions_index_workers()
@@ -144,6 +151,8 @@ RUN_HISTORY_LIMIT = 10
 SESSION_COOKIE_NAME = "uni_fee_sid"
 SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", str(30 * 24 * 60 * 60)))
 CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
+# Максимальный возраст major_tokens_by_chain.json до принудительного обновления (сек).
+MAJOR_TOKENS_CACHE_MAX_AGE_SEC = max(300, int(os.environ.get("MAJOR_TOKENS_CACHE_MAX_AGE_SEC", str(24 * 60 * 60))))
 CATALOG_REFRESH_ON_STARTUP = os.environ.get("CATALOG_REFRESH_ON_STARTUP", "0").strip().lower() in ("1", "true", "yes", "on")
 CATALOG_REFRESH_STOP = threading.Event()
 CATALOG_REFRESH_THREAD: threading.Thread | None = None
@@ -608,7 +617,7 @@ POSITIONS_EXPLORER_GRAPH_ID_UNION = os.environ.get("POSITIONS_EXPLORER_GRAPH_ID_
     "yes",
     "on",
 )
-# NFT catalog: Multicall3 open-liquidity pass для вкладок «открытые / закрытые» (liquidity==0 → закрытые). При 0 — не вызывать multiclassификацию (все строки в одной вкладке).
+# NFT catalog: Multicall3 open/closed split (liquidity==0 → catalog_segment closed). 0 = skip multiclassify (single list).
 POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER = os.environ.get(
     "POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
@@ -626,7 +635,8 @@ DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
 
 # Адреса крупных активов по сети (TOKEN_ADDRESSES / импорт каталога) — те же, что для «Find the best fee on Uniswap»
 # и соседних сценариев. Whitelist в NFT-каталоге (neither-major), сопоставление тикеров и часть анти-спама
-# опираются на этот же набор: подозрительные тикеры + отсутствие major в паре согласованы с фокусом на ликвидных токенах.
+# опираются на этот же набор; при TOKENS_MAJOR_TOP_N>0 добавляется топ-N по TVL (файл data/major_tokens_by_chain.json).
+# При TOKENS_MAJOR_TOP_N=0 legacy: token_catalog по символам с порогом TOKENS_MIN_TVL_USD (дефолт $1M).
 _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN: dict[str, dict[str, str]] = {}
 for _ck, _per_chain in TOKEN_ADDRESSES.items():
     addr_map: dict[str, str] = {}
@@ -644,6 +654,9 @@ for _ck, _per_chain in TOKEN_ADDRESSES.items():
                 continue
             addr_map[a] = s
     _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN[str(_ck).strip().lower()] = addr_map
+
+_MERGED_TOKEN_ADDR_BY_CHAIN: dict[str, dict[str, str]] | None = None
+_MERGED_TOKEN_ADDR_LOCK = threading.Lock()
 
 
 def _analytics_conn() -> sqlite3.Connection:
@@ -2617,7 +2630,7 @@ def _fetch_token_price_usd_dexscreener(chain_id: int, token_address: str) -> flo
 def _get_token_prices_usd(chain_id: int, token_addresses: list[str]) -> dict[str, float]:
     def _symbol_for_addr(addr: str) -> str:
         chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
-        from_cfg = (_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key).lower(), {}) or {}).get(addr)
+        from_cfg = _token_addr_symbol_map_for_chain(str(chain_key).lower()).get(addr)
         if from_cfg:
             return str(from_cfg).upper()
         onchain = _fetch_erc20_symbol_onchain(int(chain_id), addr)
@@ -3208,6 +3221,40 @@ def _nfpm_owner_of_calldata(token_id: int) -> bytes:
     return bytes.fromhex("6352211e") + int(token_id).to_bytes(32, "big")
 
 
+def _erc721_owner_of_address_lower(chain_id: int, nft_contract: str, token_id: int) -> str:
+    """ownerOf(uint256) on ERC-721; lowercase 0x address or ''."""
+    c = str(nft_contract or "").strip().lower()
+    tid = int(token_id)
+    if not _is_eth_address(c) or tid <= 0:
+        return ""
+    try:
+        hx = _eth_call_hex(int(chain_id), c, "0x6352211e" + _encode_uint_word(int(tid)))
+        words = _hex_words(hx)
+        if not words:
+            return ""
+        return str(_decode_address_from_word(words[0]) or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _explorer_nft_token_id_field_is_canonical_string(s: str) -> bool:
+    """
+    True only if explorer tokenID looks like a plain id, not prose/labels.
+    Strings like "tokenId 1043" must be rejected — regex extraction can pick a wrong number
+    and produce a ghost position that passes transfer-based ownership logic.
+    """
+    t = str(s or "").strip()
+    if not t:
+        return False
+    if re.fullmatch(r"\d+", t):
+        return True
+    if re.fullmatch(r"#\d+", t):
+        return True
+    if re.fullmatch(r"(?i)0x[0-9a-f]+", t):
+        return True
+    return False
+
+
 def _nfpm_positions_calldata(token_id: int) -> bytes:
     return bytes.fromhex("99fbab88") + int(token_id).to_bytes(32, "big")
 
@@ -3466,8 +3513,24 @@ def _explorer_nfttx_row_token_id_str(row: dict[str, Any]) -> str:
         return ""
     for k in ("tokenID", "tokenId", "token_id", "TokenId"):
         v = row.get(k)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
+        if v is None:
+            continue
+        # bool is a subclass of int in Python — never treat as token id.
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            iv = int(v)
+            if iv <= 0:
+                continue
+            return str(iv)
+        s = str(v).strip()
+        if not s or not _explorer_nft_token_id_field_is_canonical_string(s):
+            continue
+        if s.startswith("#"):
+            s = s[1:].strip()
+        tid = _position_token_id_from_raw(s)
+        if tid > 0:
+            return str(tid)
     return ""
 
 
@@ -3823,7 +3886,31 @@ def _position_token_id_from_raw(position_id: Any) -> int:
         return 0
     if ":" in raw:
         raw = raw.split(":", 1)[1].strip()
-    return _parse_int_like(raw)
+    n = _parse_int_like(raw)
+    if n > 0:
+        return n
+    # Some explorers return a label in the JSON field, e.g. "tokenId 1043" instead of "1043".
+    m = re.search(r"(?i)token[_\s]*id\D*(\d+)", raw)
+    if m:
+        try:
+            v = int(m.group(1), 10)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return 0
+
+
+def _canonical_position_id_str(raw: Any) -> str:
+    """If id looks like 'tokenId 1043', return '1043'; else original (subgraph ids unchanged)."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if re.search(r"(?i)token[_\s]*id\D*\d+", s):
+        tid = _position_token_id_from_raw(s)
+        if tid > 0:
+            return str(tid)
+    return s
 
 
 def _closed_position_key(chain_id: int, protocol: str, position_id: Any) -> tuple[int, str, int] | None:
@@ -3996,7 +4083,10 @@ def _explorer_nft_meta_cache_upsert_rows(
         ).strip().lower()
         if not _is_eth_address(caddr):
             continue
-        tid = _position_token_id_from_raw(_explorer_nfttx_row_token_id_str(r) or r.get("tokenID"))
+        tid_str = _explorer_nfttx_row_token_id_str(r)
+        if not tid_str:
+            continue
+        tid = _parse_int_like(tid_str)
         if tid <= 0:
             continue
         ts = _parse_int_like(r.get("timeStamp") or 0)
@@ -4145,8 +4235,8 @@ def _enrich_pair_symbols_background(rows: list[dict[str, Any]], max_seconds: int
         if not needs_refresh:
             continue
         chain_key = str(r.get("chain") or CHAIN_ID_TO_KEY.get(cid, "")).strip().lower()
-        sym0 = (_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(chain_key, {}) or {}).get(token0) or _fetch_erc20_symbol_onchain(cid, token0) or token0[:8]
-        sym1 = (_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(chain_key, {}) or {}).get(token1) or _fetch_erc20_symbol_onchain(cid, token1) or token1[:8]
+        sym0 = _token_addr_symbol_map_for_chain(chain_key).get(token0) or _fetch_erc20_symbol_onchain(cid, token0) or token0[:8]
+        sym1 = _token_addr_symbol_map_for_chain(chain_key).get(token1) or _fetch_erc20_symbol_onchain(cid, token1) or token1[:8]
         r["pair"] = f"{str(sym0).upper()}/{str(sym1).upper()}"
 
 
@@ -4714,16 +4804,10 @@ def _scan_erc721_token_ids_by_explorer_api(
     proto = str(protocol or "").strip().lower()
     min_ts_by_tid: dict[int, int] = {}
     for r in rows:
-        tid_raw = str(r.get("tokenID") or "").strip()
-        if not tid_raw:
+        tid_str = _explorer_nfttx_row_token_id_str(r)
+        if not tid_str:
             continue
-        try:
-            tid = int(tid_raw, 10)
-        except Exception:
-            try:
-                tid = int(tid_raw, 16) if tid_raw.lower().startswith("0x") else int(tid_raw)
-            except Exception:
-                continue
+        tid = _parse_int_like(tid_str)
         if tid <= 0 or tid in seen:
             pass
         else:
@@ -4791,16 +4875,10 @@ def _scan_erc721_token_ids_from_explorer_rows(
         from_addr = str(r.get("from") or "").strip().lower()
         if to_addr not in owner_candidates and from_addr not in owner_candidates:
             continue
-        tid_raw = str(r.get("tokenID") or "").strip()
-        if not tid_raw:
+        tid_str = _explorer_nfttx_row_token_id_str(r)
+        if not tid_str:
             continue
-        try:
-            tid = int(tid_raw, 10)
-        except Exception:
-            try:
-                tid = int(tid_raw, 16) if tid_raw.lower().startswith("0x") else int(tid_raw)
-            except Exception:
-                continue
+        tid = _parse_int_like(tid_str)
         if tid <= 0:
             continue
         block_n = _parse_int_like(r.get("blockNumber") or 0)
@@ -5168,16 +5246,10 @@ def _scan_v4_position_ids_by_explorer_any_contract(
         ).strip().lower()
         if not _is_eth_address(caddr):
             continue
-        tid_raw = str(r.get("tokenID") or "").strip()
-        if not tid_raw:
+        tid_str = _explorer_nfttx_row_token_id_str(r)
+        if not tid_str:
             continue
-        try:
-            tid = int(tid_raw, 10)
-        except Exception:
-            try:
-                tid = int(tid_raw, 16) if tid_raw.lower().startswith("0x") else int(tid_raw)
-            except Exception:
-                continue
+        tid = _parse_int_like(tid_str)
         if tid <= 0:
             continue
         to_addr = str(r.get("to") or "").strip().lower()
@@ -5288,7 +5360,9 @@ def _collect_explorer_rows_for_owner_contracts(
                 or r.get("tokenAddress")
                 or ""
             ).strip().lower()
-            tid = str(r.get("tokenID") or "").strip().lower()
+            tid = str(_explorer_nfttx_row_token_id_str(r) or "").strip().lower()
+            if not tid:
+                continue
             txh = str(r.get("hash") or "").strip().lower()
             logi = str(r.get("logIndex") or "").strip().lower()
             k = "|".join([txh, logi, caddr, tid])
@@ -5919,7 +5993,7 @@ def _token_display_symbol_with_source(chain_id: int, chain_key: str, token_obj: 
     addr = str((token_obj or {}).get("id") or "").strip().lower()
     if not addr:
         return "?", "missing"
-    cfg_sym = (_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}).get(addr)
+    cfg_sym = _token_addr_symbol_map_for_chain(str(chain_key or "").strip().lower()).get(addr)
     if cfg_sym:
         return cfg_sym, "curated_map"
     onchain = _fetch_erc20_symbol_onchain(int(chain_id), addr)
@@ -6075,7 +6149,7 @@ def _is_suspected_spam_pair(
     eff_spam = POSITIONS_FILTER_SPAM_TOKENS if spam_filter_enabled is None else bool(spam_filter_enabled)
     if not eff_spam:
         return False
-    chain_addr_map = _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}
+    chain_addr_map = _token_addr_symbol_map_for_chain(str(chain_key or "").strip().lower())
     a0 = str((token0_obj or {}).get("id") or "").strip().lower()
     a1 = str((token1_obj or {}).get("id") or "").strip().lower()
     both_curated = (a0 in chain_addr_map) and (a1 in chain_addr_map)
@@ -6164,8 +6238,13 @@ def _apply_nft_catalog_spam_heuristics(rows: list[dict[str, Any]]) -> int:
             continue
         if bool(row.get("unsupported_protocol")):
             continue
+        if bool(row.get("_nft_catalog_owner_mismatch")):
+            row["suspected_spam"] = True
+            row["spam_skipped"] = True
+            flagged += 1
+            continue
         chain_key = str(row.get("chain") or "").strip().lower()
-        chain_addr_map = _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(chain_key, {}) or {}
+        chain_addr_map = _token_addr_symbol_map_for_chain(chain_key)
         t0 = str(row.get("token0_id") or "").strip().lower()
         t1 = str(row.get("token1_id") or "").strip().lower()
         s0 = str(row.get("position_symbol0") or "").strip()
@@ -6667,7 +6746,7 @@ def _normalize_infinity_currency(chain_id: int, token: str) -> tuple[str, str, i
     if _is_eth_address(t) and t != "0x0000000000000000000000000000000000000000":
         return t, (_fetch_erc20_symbol_onchain(int(chain_id), t) or t[:8]).upper(), _fetch_erc20_decimals_onchain(int(chain_id), t)
     chain_key = CHAIN_ID_TO_KEY.get(int(chain_id), "")
-    wrapped = ((_TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(chain_key, {}) or {}).items())
+    wrapped = _token_addr_symbol_map_for_chain(chain_key).items()
     # Prefer wrapped native aliases from config when Infinity uses native currency address(0).
     for addr, sym in wrapped:
         us = str(sym or "").upper()
@@ -9361,7 +9440,7 @@ def _scan_pool_positions_chain(
             fee_disp = fee_raw or "-"
         t0_obj = pool.get("token0") or {}
         t1_obj = pool.get("token1") or {}
-        chain_addr_map = _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}
+        chain_addr_map = _token_addr_symbol_map_for_chain(str(chain_key or "").strip().lower())
 
         def _token_symbol_hint(token_obj: dict[str, Any]) -> tuple[str, str]:
             sym = str((token_obj or {}).get("symbol") or "").strip()
@@ -9477,9 +9556,11 @@ def _scan_pool_positions_chain(
                 "pair": f"{t0}/{t1}",
                 "token0_id": str((pool.get("token0") or {}).get("id") or ""),
                 "token1_id": str((pool.get("token1") or {}).get("id") or ""),
-                "position_id": str(p.get("id") or ""),
+                "position_id": _canonical_position_id_str(p.get("id")),
                 **explorer_fields,
-                "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
+                "position_ids": (
+                    [_canonical_position_id_str(p.get("id"))] if str(p.get("id") or "").strip() else []
+                ),
                 "fee_tier": "-",
                 "fee_tier_raw": "",
                 "position_status": "inactive",
@@ -9622,9 +9703,11 @@ def _scan_pool_positions_chain(
                 "pair": f"{t0}/{t1}",
                 "token0_id": str((pool.get("token0") or {}).get("id") or ""),
                 "token1_id": str((pool.get("token1") or {}).get("id") or ""),
-                "position_id": str(p.get("id") or ""),
+                "position_id": _canonical_position_id_str(p.get("id")),
                 **explorer_fields,
-                "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
+                "position_ids": (
+                    [_canonical_position_id_str(p.get("id"))] if str(p.get("id") or "").strip() else []
+                ),
                 "fee_tier": "-",
                 "fee_tier_raw": "",
                 "position_status": "inactive",
@@ -9807,9 +9890,11 @@ def _scan_pool_positions_chain(
             "pair": f"{t0}/{t1}",
             "token0_id": str((pool.get("token0") or {}).get("id") or ""),
             "token1_id": str((pool.get("token1") or {}).get("id") or ""),
-            "position_id": str(p.get("id") or ""),
+            "position_id": _canonical_position_id_str(p.get("id")),
             **explorer_fields,
-            "position_ids": [str(p.get("id") or "")] if str(p.get("id") or "").strip() else [],
+            "position_ids": (
+                [_canonical_position_id_str(p.get("id"))] if str(p.get("id") or "").strip() else []
+            ),
             "fee_tier": fee_disp,
             "fee_tier_raw": fee_raw,
             "position_status": position_status,
@@ -10484,7 +10569,11 @@ def _explorer_tokennfttx_currently_owned_contract_token_ids(
     rows: list[dict[str, Any]],
     owner: str,
 ) -> list[tuple[str, int]]:
-    """From Etherscan-like tokennfttx rows, return (contract, tokenId) the wallet currently holds."""
+    """From Etherscan-like tokennfttx rows, return (contract, tokenId) the wallet currently holds.
+
+    Rows whose tokenID field is not a plain integer string (e.g. prose 'tokenId 123') are ignored —
+    heuristic digit extraction can attach the wrong id to a transfer.
+    """
     o = str(owner or "").strip().lower()
     if not _is_eth_address(o):
         return []
@@ -10538,6 +10627,19 @@ def _explorer_nft_catalog_is_uniswap_or_pancake(token_name: str, token_symbol: s
     """True if explorer token name/symbol indicates Uniswap or Pancake (case-insensitive)."""
     blob = f"{token_name} {token_symbol}".lower()
     return "uniswap" in blob or "pancake" in blob
+
+
+def _nft_catalog_protocol_display(token_symbol: str | None, fallback: str) -> str:
+    """Колонка protocol в NFT-каталоге: символ из explorer; UNI-V3-POS -> UNI-V3 для UI."""
+    s = str(token_symbol or "").strip()
+    fb = str(fallback or "").strip() or "nft"
+    if not s:
+        return (fb[:24] if fb else "nft") or "nft"
+    sup = s.upper().replace("_", "-").replace(" ", "")
+    if sup in ("UNI-V3-POS", "UNI-V3POS"):
+        return "UNI-V3"
+    out = s[:24] or fb
+    return out
 
 
 def _explorer_nft_contract_pm_kind(chain_id: int, contract: str) -> str:
@@ -10601,8 +10703,22 @@ def _enrich_nft_catalog_rows_from_chain(
         if chain_id <= 0 or token_id <= 0:
             continue
         seg = str(row.get("catalog_segment") or "").strip().lower()
-        # On-chain pair / fee / in-position только для открытых (и unknown); закрытые — отдельная вкладка без тяжёлого enrich.
+        # On-chain pair / fee / in-position for open (and unknown) only; closed rows use light path (UI: collapsed section).
         if seg == "closed":
+            continue
+        nft_contract = str(row.get("pool_id") or "").strip().lower()
+        cur_owner = _erc721_owner_of_address_lower(chain_id, nft_contract, int(token_id))
+        if not _is_eth_address(cur_owner) or cur_owner == "0x0000000000000000000000000000000000000000":
+            row["_nft_catalog_owner_mismatch"] = True
+            row["suspected_spam"] = True
+            row["spam_skipped"] = True
+            fail_n += 1
+            continue
+        if cur_owner != owner and not _owner_matches_wallet_or_custody(chain_id, proto, owner, cur_owner):
+            row["_nft_catalog_owner_mismatch"] = True
+            row["suspected_spam"] = True
+            row["spam_skipped"] = True
+            fail_n += 1
             continue
         try:
             snap = _fetch_v3_position_contract_snapshot(chain_id, proto, int(token_id), owner)
@@ -10956,7 +11072,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                         catalog_segment = "open" if _olk in nft_open_allowed else "closed"
                 blob = f"{token_name} {token_symbol}".lower()
                 if "uniswap" in blob:
-                    proto_col = (token_symbol or "Uniswap").strip()[:24] or "Uniswap"
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "Uniswap")
                 elif "pancake" in blob:
                     proto_col = (token_symbol or "Pancake").strip()[:24] or "Pancake"
                 else:
@@ -11827,6 +11943,221 @@ def _fetch_tokens_by_tvl_endpoint(endpoint: str, min_tvl_usd: float) -> set[str]
     return out
 
 
+def _fetch_top_token_addrs_by_tvl_graph(
+    endpoint: str,
+    *,
+    limit: int,
+    min_tvl_usd: float,
+) -> dict[str, str]:
+    """Топ `limit` токенов по TVL на одном subgraph endpoint → {address_lc: SYMBOL}."""
+    lim = max(1, min(int(limit), 1000))
+    if min_tvl_usd > 0:
+        query = """
+        query MajorTokens($first: Int!, $minTvl: BigDecimal!) {
+          tokens(
+            first: $first,
+            orderBy: totalValueLockedUSD,
+            orderDirection: desc,
+            where: { totalValueLockedUSD_gte: $minTvl }
+          ) {
+            id
+            symbol
+          }
+        }
+        """
+        variables: dict[str, Any] = {"first": lim, "minTvl": str(min_tvl_usd)}
+    else:
+        query = """
+        query MajorTokens($first: Int!) {
+          tokens(first: $first, orderBy: totalValueLockedUSD, orderDirection: desc) {
+            id
+            symbol
+          }
+        }
+        """
+        variables = {"first": lim}
+    data = graphql_query(endpoint, query, variables, retries=1)
+    rows = (data.get("data") or {}).get("tokens") or []
+    out: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        tid = str(row.get("id") or "").strip().lower()
+        sym = str(row.get("symbol") or "").strip()
+        if not _is_eth_address(tid) or not _is_clean_symbol(sym):
+            continue
+        out[tid] = sym.upper()
+    return out
+
+
+def _merge_static_token_addr_maps(overlay_by_chain: dict[str, dict[str, str]] | None) -> dict[str, dict[str, str]]:
+    """config.TOKEN_ADDRESSES + overlay (адреса из сабграфа top-N по сети)."""
+    merged: dict[str, dict[str, str]] = {
+        str(k).strip().lower(): dict(v) for k, v in _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.items()
+    }
+    if not overlay_by_chain:
+        return merged
+    for ck, mp in overlay_by_chain.items():
+        if not isinstance(mp, dict):
+            continue
+        bucket = merged.setdefault(str(ck).strip().lower(), {})
+        for addr, sym in mp.items():
+            a = str(addr).strip().lower()
+            if not _is_eth_address(a):
+                continue
+            s = str(sym or "").strip().upper()
+            if s:
+                bucket[a] = s
+    return merged
+
+
+def _fetch_major_tokens_overlay_from_graph() -> dict[str, dict[str, str]]:
+    """Только данные сабграфа (без merge с config), по одной сети — объединение v3+v4."""
+    lim = max(1, min(int(TOKENS_MAJOR_TOP_N), 1000))
+    min_tvl = float(TOKENS_MAJOR_TOP_MIN_TVL_USD or 0.0)
+    out: dict[str, dict[str, str]] = {}
+    for chain in _supported_chains():
+        ck = str(chain).strip().lower()
+        bucket: dict[str, str] = {}
+        for version in ("v3", "v4"):
+            ep = get_graph_endpoint(chain, version)
+            if not ep:
+                continue
+            try:
+                part = _fetch_top_token_addrs_by_tvl_graph(ep, limit=lim, min_tvl_usd=min_tvl)
+                bucket.update(part)
+            except Exception:
+                continue
+        if bucket:
+            out[ck] = bucket
+    return out
+
+
+def _major_tokens_cache_meta_ok(raw: dict[str, Any] | None) -> bool:
+    if not raw or not isinstance(raw.get("by_chain"), dict):
+        return False
+    try:
+        if int(raw.get("top_n") or 0) != int(TOKENS_MAJOR_TOP_N):
+            return False
+        if abs(float(raw.get("min_tvl_usd") or 0) - float(TOKENS_MAJOR_TOP_MIN_TVL_USD)) > 1e-9:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _overlay_dict_from_major_cache_raw(raw: dict[str, Any]) -> dict[str, dict[str, str]]:
+    overlay: dict[str, dict[str, str]] = {}
+    by_chain = raw.get("by_chain") if isinstance(raw, dict) else None
+    if not isinstance(by_chain, dict):
+        return overlay
+    for ck, obj in by_chain.items():
+        if not isinstance(obj, dict):
+            continue
+        d: dict[str, str] = {}
+        for ad, sym in obj.items():
+            a = str(ad).strip().lower()
+            if _is_eth_address(a):
+                d[a] = str(sym or "").strip().upper()
+        overlay[str(ck).strip().lower()] = d
+    return overlay
+
+
+def _prime_major_tokens_from_disk() -> bool:
+    """Загрузить major_tokens_by_chain.json в память (без сети). False если файла нет или мета не совпала."""
+    global _MERGED_TOKEN_ADDR_BY_CHAIN
+    if int(TOKENS_MAJOR_TOP_N or 0) <= 0:
+        with _MERGED_TOKEN_ADDR_LOCK:
+            _MERGED_TOKEN_ADDR_BY_CHAIN = None
+        return True
+    raw = _read_json(MAJOR_TOKENS_CACHE_PATH)
+    if not _major_tokens_cache_meta_ok(raw):
+        return False
+    overlay = _overlay_dict_from_major_cache_raw(raw)
+    with _MERGED_TOKEN_ADDR_LOCK:
+        _MERGED_TOKEN_ADDR_BY_CHAIN = _merge_static_token_addr_maps(overlay)
+    return True
+
+
+def _refresh_major_tokens_cache(*, force: bool = False) -> dict[str, Any]:
+    """Обновить сабграф → major_tokens_by_chain.json + in-memory merge. При force=False и свежем файле — только prime."""
+    global _MERGED_TOKEN_ADDR_BY_CHAIN
+    if int(TOKENS_MAJOR_TOP_N or 0) <= 0:
+        with _MERGED_TOKEN_ADDR_LOCK:
+            _MERGED_TOKEN_ADDR_BY_CHAIN = None
+        return {"ok": True, "skipped": "top_n_disabled"}
+    if not force and MAJOR_TOKENS_CACHE_PATH.is_file():
+        if not _catalog_stale(MAJOR_TOKENS_CACHE_PATH, MAJOR_TOKENS_CACHE_MAX_AGE_SEC):
+            if _prime_major_tokens_from_disk():
+                return {"ok": True, "skipped": "disk_cache_fresh"}
+    try:
+        overlay = _fetch_major_tokens_overlay_from_graph()
+    except Exception as e:
+        print(f"[catalog-refresh] major tokens subgraph fetch failed: {e}")
+        if _prime_major_tokens_from_disk():
+            return {"ok": True, "skipped": "fetch_failed_kept_disk", "error": str(e)[:200]}
+        return {"ok": False, "error": str(e)[:400]}
+    payload: dict[str, Any] = {
+        "updated_at": _iso_now(),
+        "top_n": int(TOKENS_MAJOR_TOP_N),
+        "min_tvl_usd": float(TOKENS_MAJOR_TOP_MIN_TVL_USD),
+        "by_chain": overlay,
+        "source": "subgraph_v3_v4_top_n",
+    }
+    try:
+        _write_json(MAJOR_TOKENS_CACHE_PATH, payload)
+    except Exception as e:
+        print(f"[catalog-refresh] major tokens write failed: {e}")
+    with _MERGED_TOKEN_ADDR_LOCK:
+        _MERGED_TOKEN_ADDR_BY_CHAIN = _merge_static_token_addr_maps(overlay)
+    n_addr = sum(len(v) for v in overlay.values())
+    return {"ok": True, "chains": len(overlay), "addresses": int(n_addr)}
+
+
+def _get_merged_token_addr_to_symbol_by_chain() -> dict[str, dict[str, str]]:
+    """Слой из файла/памяти + config; cold start без файла — один принудительный fetch."""
+    global _MERGED_TOKEN_ADDR_BY_CHAIN
+    if int(TOKENS_MAJOR_TOP_N or 0) <= 0:
+        return _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN
+    with _MERGED_TOKEN_ADDR_LOCK:
+        if _MERGED_TOKEN_ADDR_BY_CHAIN is not None:
+            return _MERGED_TOKEN_ADDR_BY_CHAIN
+    if _prime_major_tokens_from_disk():
+        with _MERGED_TOKEN_ADDR_LOCK:
+            if _MERGED_TOKEN_ADDR_BY_CHAIN is not None:
+                return _MERGED_TOKEN_ADDR_BY_CHAIN
+    _refresh_major_tokens_cache(force=True)
+    with _MERGED_TOKEN_ADDR_LOCK:
+        if _MERGED_TOKEN_ADDR_BY_CHAIN is not None:
+            return _MERGED_TOKEN_ADDR_BY_CHAIN
+    return _merge_static_token_addr_maps({})
+
+
+def _token_addr_symbol_map_for_chain(chain_key: str) -> dict[str, str]:
+    maps = _get_merged_token_addr_to_symbol_by_chain()
+    return dict((maps.get(str(chain_key or "").strip().lower(), {}) or {}))
+
+
+def _build_token_catalog_from_merged_major(merged: dict[str, dict[str, str]], updated_at: str) -> dict[str, Any]:
+    """Единый token_catalog.json из той же мапы адресов, что и везде на сайте."""
+    by_chain_syms: dict[str, list[str]] = {}
+    all_syms: set[str] = set()
+    for ck, addr_map in merged.items():
+        syms = sorted({str(s).strip().lower() for s in (addr_map or {}).values() if str(s).strip()})
+        by_chain_syms[str(ck).strip().lower()] = syms
+        all_syms.update(syms)
+    return {
+        "updated_at": updated_at,
+        "count": len(all_syms),
+        "items": sorted(all_syms),
+        "by_chain": by_chain_syms,
+        "source": "major_tokens_top_n_merged",
+        "min_tvl_usd": 0.0,
+        "major_top_n": int(TOKENS_MAJOR_TOP_N),
+        "major_min_tvl_usd": float(TOKENS_MAJOR_TOP_MIN_TVL_USD),
+    }
+
+
 def _fetch_tokens_by_chain_tvl(min_tvl_usd: float) -> tuple[set[str], dict[str, list[str]]]:
     all_tokens: set[str] = set()
     by_chain: dict[str, set[str]] = {}
@@ -11847,14 +12178,30 @@ def _fetch_tokens_by_chain_tvl(min_tvl_usd: float) -> tuple[set[str], dict[str, 
 
 
 def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
+    """Каталог символов для UI: при TOKENS_MAJOR_TOP_N>0 — та же мапа, что и major_tokens (топ по TVL + config)."""
+    if int(TOKENS_MAJOR_TOP_N or 0) > 0:
+        cached = _read_json(TOKEN_CATALOG_PATH)
+        if not refresh and cached and isinstance(cached.get("items"), list):
+            try:
+                if int(cached.get("major_top_n") or 0) == int(TOKENS_MAJOR_TOP_N):
+                    if abs(float(cached.get("major_min_tvl_usd") or 0) - float(TOKENS_MAJOR_TOP_MIN_TVL_USD)) < 1e-9:
+                        return cached
+            except (TypeError, ValueError):
+                pass
+        merged = _get_merged_token_addr_to_symbol_by_chain()
+        mt = _read_json(MAJOR_TOKENS_CACHE_PATH) or {}
+        ts = str(mt.get("updated_at") or _iso_now())
+        out = _build_token_catalog_from_merged_major(merged, ts)
+        _write_json(TOKEN_CATALOG_PATH, out)
+        return out
+
     cached = _read_json(TOKEN_CATALOG_PATH)
     if not refresh and cached and isinstance(cached.get("items"), list):
         try:
             cached_min_tvl = float(cached.get("min_tvl_usd") or 0)
         except (TypeError, ValueError):
             cached_min_tvl = 0.0
-        # Rebuild cache automatically when threshold changed (e.g. 10k -> 1M).
-        if abs(cached_min_tvl - TOKENS_MIN_TVL_USD) < 1e-9:
+        if abs(cached_min_tvl - TOKENS_MIN_TVL_USD) < 1e-9 and not cached.get("major_top_n"):
             return cached
 
     by_chain: dict[str, list[str]] = {}
@@ -11879,11 +12226,9 @@ def _load_token_catalog(refresh: bool = False) -> dict[str, Any]:
     except Exception as e:
         print(f"[catalog-refresh] active pools tokens fetch failed: {e}")
 
-    # If live refresh fails, keep previously cached catalog (avoid shrinking to tiny fallback sets).
     if not all_tokens and cached and isinstance(cached.get("items"), list):
         return cached
 
-    # Last-resort fallback.
     if not all_tokens:
         source = "local-config-fallback"
         all_tokens.update(_supported_tokens())
@@ -11905,6 +12250,13 @@ def _refresh_catalogs_once() -> None:
         _load_chain_catalog(refresh=True)
     except Exception as e:
         print(f"[catalog-refresh] chains refresh failed: {e}")
+    try:
+        if int(TOKENS_MAJOR_TOP_N or 0) > 0:
+            # force=False: не дергать сабграф чаще MAJOR_TOKENS_CACHE_MAX_AGE_SEC (дефолт 24ч),
+            # даже если интервал общего catalog-refresh меньше.
+            _refresh_major_tokens_cache(force=False)
+    except Exception as e:
+        print(f"[catalog-refresh] major tokens refresh failed: {e}")
     try:
         _load_token_catalog(refresh=True)
     except Exception as e:
@@ -11929,9 +12281,12 @@ def _catalog_stale(path: Path, max_age_sec: int) -> bool:
 
 
 def _catalog_refresh_loop(interval_sec: int, run_on_startup: bool) -> None:
-    # Optional refresh on startup, but avoid refetch on each deploy when cache exists.
-    # Startup refresh runs only when cache files are missing.
-    if run_on_startup and (not TOKEN_CATALOG_PATH.is_file() or not CHAIN_CATALOG_PATH.is_file()):
+    # Не дергать сабграф при каждом деплое: при наличии кэшей на диске стартуем без сети.
+    if run_on_startup and (
+        not CHAIN_CATALOG_PATH.is_file()
+        or (int(TOKENS_MAJOR_TOP_N or 0) > 0 and not MAJOR_TOKENS_CACHE_PATH.is_file())
+        or not TOKEN_CATALOG_PATH.is_file()
+    ):
         _refresh_catalogs_once()
     while not CATALOG_REFRESH_STOP.wait(interval_sec):
         _refresh_catalogs_once()
@@ -12288,6 +12643,11 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
 
     logs: list[str] = []
     env = os.environ.copy()
+    # Агенты резолвят символы через тот же кэш топ-N, что и каталог сайта.
+    try:
+        env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH.resolve())
+    except Exception:
+        env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH)
     env["TOKEN_PAIRS"] = token_pairs
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
@@ -13285,12 +13645,6 @@ def _render_positions_page() -> str:
     .status-dot.active { background:#7d9f89; border-color:#6f8e7a; }
     .status-dot.inactive { background:#ab8787; border-color:#987676; }
     .status-dot.hidden { background:#94a3b8; border-color:#64748b; }
-    .pos-catalog-tabs { display: none; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
-    .pos-tab-btn {
-      border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
-      padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
-    }
-    .pos-tab-btn.active { background: #1e3a8a; color: #fff; border-color: #1e3a8a; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     @media (max-width: 1100px) {
@@ -13355,10 +13709,6 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posPoolsBody" class="section-body">
-          <div id="posPoolsTabBar" class="pos-catalog-tabs" aria-label="Pool position tabs">
-            <button type="button" class="pos-tab-btn" id="posCatalogTabOpen" onclick="setPosCatalogTab('open')">Открытые позиции</button>
-            <button type="button" class="pos-tab-btn" id="posCatalogTabClosed" onclick="setPosCatalogTab('closed')">Закрытые позиции</button>
-          </div>
           <div class="table-wrap"><table id="posPoolsTable"></table></div>
           <div id="posErrors"></div>
         </div>
@@ -13458,12 +13808,7 @@ def _render_positions_page() -> str:
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_HIDDEN_EXPANDED_KEY = "positions_hidden_expanded_v1";
     const POS_UNSUPPORTED_EXPANDED_KEY = "positions_unsupported_protocols_expanded_v1";
-    const POS_CATALOG_TAB_KEY = "positions_catalog_tab_v1";
-    function setPosCatalogTab(tab) {
-      const t = String(tab || "open").toLowerCase() === "closed" ? "closed" : "open";
-      try { localStorage.setItem(POS_CATALOG_TAB_KEY, t); } catch (_) {}
-      renderPools(posCache.pools || []);
-    }
+    const POS_CLOSED_EXPANDED_KEY = "positions_closed_positions_expanded_v1";
     let posHasScannedOnce = false;
     let posScanTicker = null;
     let posScanStartedAt = 0;
@@ -13968,17 +14313,20 @@ def _render_positions_page() -> str:
       return `Pair=${String(r?.pair || "-")} | Position symbols=${String(r?.position_symbol0 || "-")}/${String(r?.position_symbol1 || "-")}`;
     }
     function shortProtocol(v) {
-      const p = String(v || "").trim().toLowerCase();
-      if (!p) return "";
+      const raw = String(v || "").trim();
+      if (!raw) return "";
+      const hyp = raw.toLowerCase().replace(/_/g, "-").replace(/\s+/g, "");
+      if (hyp === "uni-v3-pos" || hyp === "uni-v3pos") return "UNI-V3";
+      const p = raw.toLowerCase();
       if (p === "uniswap_v3") return "UNI_V3";
       if (p === "uniswap_v4") return "UNI_V4";
       if (p === "pancake_v3" || p === "pancake_v3_staked") return "PanC_V3";
-      return String(v || "");
+      return raw;
     }
     function statusDot(status) {
       const s = String(status || "").trim().toLowerCase();
       if (s === "hidden") {
-        return `<span class="status-dot hidden" title="Скрытая / закрытая позиция (нулевая ликвидность)"></span>`;
+        return `<span class="status-dot hidden" title="Hidden or closed position (zero liquidity)"></span>`;
       }
       const isActive = s === "active";
       const cls = isActive ? "active" : "inactive";
@@ -13990,48 +14338,22 @@ def _render_positions_page() -> str:
     }
     function renderPools(rows) {
       const table = document.getElementById("posPoolsTable");
-      const tabBar = document.getElementById("posPoolsTabBar");
-      const btnOpen = document.getElementById("posCatalogTabOpen");
-      const btnClosed = document.getElementById("posCatalogTabClosed");
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const hiddenExpanded = localStorage.getItem(POS_HIDDEN_EXPANDED_KEY) === "1";
       const unsupportedExpanded = localStorage.getItem(POS_UNSUPPORTED_EXPANDED_KEY) === "1";
+      const closedExpanded = localStorage.getItem(POS_CLOSED_EXPANDED_KEY) === "1";
       const totalCols = 13;
       let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const listAll = rows || [];
       const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
-      let closedCount = 0;
-      for (let ci = 0; ci < listAll.length; ci++) {
-        const seg = String((listAll[ci] || {}).catalog_segment || "").toLowerCase();
-        if (seg === "closed") closedCount += 1;
-      }
-      const catalogTab = String(localStorage.getItem(POS_CATALOG_TAB_KEY) || "open").toLowerCase() === "closed" ? "closed" : "open";
-      if (tabBar && btnOpen && btnClosed) {
-        if (hasCatalogSegments && closedCount > 0) {
-          tabBar.style.display = "flex";
-          btnOpen.textContent = "Открытые позиции";
-          btnClosed.textContent = `Закрытые позиции (${closedCount})`;
-          btnOpen.classList.toggle("active", catalogTab === "open");
-          btnClosed.classList.toggle("active", catalogTab === "closed");
-        } else {
-          tabBar.style.display = "none";
-        }
-      }
-      const list = (hasCatalogSegments && closedCount > 0)
-        ? listAll.filter((r0) => {
-            const seg = String((r0 || {}).catalog_segment || "").toLowerCase();
-            if (!seg) return catalogTab === "open";
-            if (catalogTab === "closed") return seg === "closed";
-            return seg !== "closed";
-          })
-        : listAll;
       const visible = [];
+      const closedRows = [];
       const hiddenRows = [];
       const unsupportedRows = [];
       let spamHiddenCount = 0;
-      for (let i = 0; i < list.length; i++) {
-        const r0 = list[i];
+      for (let i = 0; i < listAll.length; i++) {
+        const r0 = listAll[i];
         const row = Object.assign({_src_idx: i}, r0 || {});
         row._row_key = poolRowKey(row);
         const trusted = trustedSpamKeys.has(row._row_key);
@@ -14039,12 +14361,18 @@ def _render_positions_page() -> str:
         const suspected = Boolean(row && (row.suspected_spam || row.spam_skipped));
         const up = row && row.unsupported_protocol;
         const unsupported = up === true || up === 1 || up === "true";
+        const seg = String((row || {}).catalog_segment || "").toLowerCase();
+        const isClosed = hasCatalogSegments && seg === "closed";
         row._is_trusted_spam = trusted;
         row._is_manual_hidden = manual;
         row._is_suspected_spam = suspected;
         row._is_unsupported_protocol = unsupported;
         if (unsupported) {
           unsupportedRows.push(row);
+          continue;
+        }
+        if (isClosed) {
+          closedRows.push(row);
           continue;
         }
         if (suspected && !trusted) spamHiddenCount += 1;
@@ -14106,6 +14434,27 @@ def _render_positions_page() -> str:
         const unsupOpen = unsupportedExpanded ? " open" : "";
         html += `<tr><td colspan='${totalCols}' class='pos-pools-details-cell'><details id='posUnsupportedDetails' class='pos-collapsed-section'${unsupOpen}><summary>Unsupported protocols (${unsupportedRows.length})</summary><div style='margin-top:8px;max-height:280px;overflow:auto'>${unsupInner}</div></details></td></tr>`;
       }
+      if (hasCatalogSegments && closedRows.length) {
+        let closedInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
+        closedInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Position ID</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
+        for (let ci = 0; ci < closedRows.length; ci++) {
+          const r = closedRows[ci];
+          const mismatch = hasPairMismatch(r);
+          const mismatchStyle = mismatch ? "background:#f1f5f9;color:#475569;font-weight:600;" : "";
+          const pairTrace = String(r.pair_symbol_source || "").trim();
+          const pairTitleRaw = mismatch
+            ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`
+            : (pairTrace ? `source: ${pairTrace}` : "");
+          const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
+          const rowKey = String(r._row_key || "");
+          const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
+          const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
+          closedInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' title='Chart may be limited for closed positions' /></td></tr>`;
+        }
+        closedInner += "</table>";
+        const closedOpenAttr = closedExpanded ? " open" : "";
+        html += `<tr><td colspan='${totalCols}' class='pos-pools-details-cell'><details id='posClosedDetails' class='pos-collapsed-section'${closedOpenAttr}><summary>Closed positions (${closedRows.length})</summary><div style='margin-top:8px;max-height:280px;overflow:auto'>${closedInner}</div></details></td></tr>`;
+      }
       if (hiddenRows.length) {
         let hiddenInner = "<table style='width:100%;border-collapse:collapse;font-size:12px'>";
         hiddenInner += "<tr><th style='text-align:left;padding:4px 6px'>Address</th><th style='text-align:left;padding:4px 6px'>Position ID</th><th style='text-align:left;padding:4px 6px'>Chain</th><th style='text-align:left;padding:4px 6px'>Protocol</th><th style='text-align:left;padding:4px 6px'>Pair</th><th style='text-align:left;padding:4px 6px'>Fee tier</th><th style='text-align:left;padding:4px 6px'>Status</th><th style='text-align:left;padding:4px 6px'>In position</th><th style='text-align:left;padding:4px 6px'>Liquidity</th><th style='text-align:left;padding:4px 6px'>Unclaimed fees</th><th style='text-align:left;padding:4px 6px'>Hide</th><th style='text-align:left;padding:4px 6px'>History</th></tr>";
@@ -14131,6 +14480,12 @@ def _render_positions_page() -> str:
         html += `<tr><td colspan='${totalCols}' class='pos-pools-details-cell'><details id='posHiddenDetails' class='pos-collapsed-section'${openAttr}><summary>${hiddenSummary}</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
       table.innerHTML = html;
+      const closedEl = document.getElementById("posClosedDetails");
+      if (closedEl) {
+        closedEl.addEventListener("toggle", () => {
+          localStorage.setItem(POS_CLOSED_EXPANDED_KEY, closedEl.open ? "1" : "0");
+        });
+      }
       const unsupEl = document.getElementById("posUnsupportedDetails");
       if (unsupEl) {
         unsupEl.addEventListener("toggle", () => {
@@ -17305,6 +17660,8 @@ def meta() -> dict[str, Any]:
             "updated_at": token_catalog.get("updated_at"),
             "source": token_catalog.get("source", ""),
             "min_tvl_usd": token_catalog.get("min_tvl_usd", TOKENS_MIN_TVL_USD),
+            "major_top_n": token_catalog.get("major_top_n"),
+            "major_min_tvl_usd": token_catalog.get("major_min_tvl_usd"),
         },
         "chain_catalog": {
             "count": chain_catalog.get("count", 0),
@@ -17315,6 +17672,8 @@ def meta() -> dict[str, Any]:
 
 @app.post("/api/catalog/tokens/review")
 def review_tokens() -> dict[str, Any]:
+    if int(TOKENS_MAJOR_TOP_N or 0) > 0:
+        _refresh_major_tokens_cache(force=True)
     data = _load_token_catalog(refresh=True)
     return {
         "ok": True,
@@ -18064,8 +18423,8 @@ HTML_PAGE = """
               <div class="top-line">
                 <button class="small-btn" onclick="addPairRow()">+ pair</button>
                 <button class="small-btn" id="removePairBtn" onclick="removePairRow()">- pair</button>
-                <span class="meta-badge" id="tokensMeta">popular tokens: -</span>
-                <span class="info-chip">Popular list only - manual token input supported</span>
+                <span class="meta-badge" id="tokensMeta">Top 500 tokens · …</span>
+                <span class="info-chip">Top-500 by token TVL (same as pool lookup) — manual symbols still work</span>
               </div>
               <div class="pair-row" id="pairRows">
                 <div class="pair-item" id="pairRow1">
@@ -19036,8 +19395,16 @@ HTML_PAGE = """
         const meta = await r.json();
         const tokenHints = document.getElementById("tokenHints");
         tokenHints.innerHTML = (meta.tokens || []).map(t => `<option value="${t}"></option>`).join("");
+        const topN = Number(meta.token_catalog?.major_top_n || 0);
         const minTvl = Number(meta.token_catalog?.min_tvl_usd || 10000);
-        document.getElementById("tokensMeta").textContent = `popular tokens (TVL>${formatUsdShort(minTvl)}): ${meta.token_catalog?.count || 0}, updated: ${meta.token_catalog?.updated_at || "-"}`;
+        const symCount = Number(meta.token_catalog?.count || 0);
+        if (topN > 0) {
+          document.getElementById("tokensMeta").textContent =
+            `Top ${topN} tokens · updated: ${meta.token_catalog?.updated_at || "-"}`;
+        } else {
+          document.getElementById("tokensMeta").textContent =
+            `Popular tokens (TVL>${formatUsdShort(minTvl)}): ${symCount}, updated: ${meta.token_catalog?.updated_at || "-"}`;
+        }
 
         availableChains = meta.chains || [];
         document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;

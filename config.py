@@ -5,7 +5,7 @@ Token pairs are specified as comma-separated: "fluid,eth" or "fluid,usdc"
 
 import os
 
-# Minimum TVL in USD to include a pool. Override via env: MIN_TVL=0 for all pools
+# Minimum TVL in USD to include a pool (агент fee / пулы). Override via env: MIN_TVL=0 for all pools
 MIN_TVL_USD = 100
 
 # LP allocation size for fee calculation (USD)
@@ -21,7 +21,8 @@ OUTPUT_CHART = "data/fee_chart.pdf"
 # Token pairs to search. Override via TOKEN_PAIRS env. INST = FLUID (same token).
 DEFAULT_TOKEN_PAIRS = "fluid,eth;eth,fluid;inst,eth;eth,inst;eth,uni;uni,eth"
 
-# Token addresses by chain (lowercase for matching)
+# Token addresses by chain (lowercase for matching) — фиксированный curated-список, без порога USD.
+# В webapp к этой мапе можно добавить топ-N по TVL из сабграфа: TOKENS_MAJOR_TOP_N (см. webapp/main.py).
 # FLUID = INST (same token). Ethereum has different address than other EVM chains.
 TOKEN_ADDRESSES = {
     "ethereum": {

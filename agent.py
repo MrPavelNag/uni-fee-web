@@ -21,7 +21,6 @@ from config import (
     FEE_DAYS,
     LP_ALLOCATION_USD,
     MIN_TVL_USD,
-    TOKEN_ADDRESSES,
     UNISWAP_V3_SUBGRAPHS,
     UNISWAP_V4_SUBGRAPHS,
 )
@@ -38,6 +37,7 @@ def _min_tvl(cli_value: Optional[float] = None) -> float:
         except ValueError:
             pass
     return MIN_TVL_USD
+from agent_common import get_token_addresses
 from uniswap_client import (
     get_graph_endpoint,
     query_pool_day_data,
@@ -94,29 +94,6 @@ def pairs_to_filename_suffix(token_pairs_str: str) -> str:
     parts = [f"{a}_{b}" for a, b in pairs]
     unique = list(dict.fromkeys(parts))
     return "_".join(unique) or "fluid_eth"
-
-
-def get_token_addresses(
-    chain: str,
-    token_symbol: str,
-    dynamic_tokens: Optional[dict] = None,
-) -> list[str]:
-    """Get token address from config (preferred) and/or dynamic_tokens. For eth, also weth."""
-    cfg = TOKEN_ADDRESSES.get(chain, {})
-    dyn = (dynamic_tokens or {}).get(chain, {})
-    sym = token_symbol.lower()
-    addrs = []
-    a = cfg.get(sym) or cfg.get(token_symbol)
-    if a and a.lower() != ZERO_ADDRESS:
-        addrs.append(a)
-    if token_symbol.lower() == "eth":
-        a = cfg.get("weth")
-        if a and a.lower() != ZERO_ADDRESS and a not in addrs:
-            addrs.append(a)
-    a = dyn.get(sym)
-    if a and a.lower() != ZERO_ADDRESS and a not in addrs:
-        addrs.append(a)
-    return addrs
 
 
 def discover_pools(

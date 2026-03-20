@@ -12,6 +12,53 @@ from config import FEE_DAYS, LP_ALLOCATION_USD, TOKEN_ADDRESSES
 DYNAMIC_TOKENS_PATH = "data/dynamic_tokens.json"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
+# Webapp writes top-N-by-TVL token addresses here; agents read via get_token_addresses.
+# Override absolute path when spawned from webapp: MAJOR_TOKENS_CACHE_PATH
+_MAJOR_SYM_BY_CHAIN: dict[str, dict[str, list[str]]] | None = None
+
+
+def _major_tokens_cache_path() -> str:
+    return os.environ.get("MAJOR_TOKENS_CACHE_PATH") or os.path.join("data", "major_tokens_by_chain.json")
+
+
+def _load_major_symbol_by_chain() -> dict[str, dict[str, list[str]]]:
+    """chain -> symbol(lower) -> [addresses] из major_tokens_by_chain.json (by_chain: addr -> SYMBOL)."""
+    path = _major_tokens_cache_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    by_chain = raw.get("by_chain")
+    if not isinstance(by_chain, dict):
+        return {}
+    out: dict[str, dict[str, list[str]]] = {}
+    for ck, addr_map in by_chain.items():
+        if not isinstance(addr_map, dict):
+            continue
+        ckey = str(ck).strip().lower()
+        sym_bucket: dict[str, list[str]] = {}
+        for addr, sym in addr_map.items():
+            a = str(addr).strip().lower()
+            s = str(sym or "").strip().lower()
+            if not a or not s or a == ZERO_ADDRESS:
+                continue
+            sym_bucket.setdefault(s, []).append(a)
+        for s, lst in sym_bucket.items():
+            sym_bucket[s] = sorted(set(lst))
+        if sym_bucket:
+            out[ckey] = sym_bucket
+    return out
+
+
+def _major_symbol_index() -> dict[str, dict[str, list[str]]]:
+    global _MAJOR_SYM_BY_CHAIN
+    if _MAJOR_SYM_BY_CHAIN is None:
+        _MAJOR_SYM_BY_CHAIN = _load_major_symbol_by_chain()
+    return _MAJOR_SYM_BY_CHAIN
+
 
 def parse_token_pairs(s: str) -> list[tuple[str, str]]:
     """Parse 'fluid,eth' or 'fluid,eth;fluid,usdc' into [(fluid,eth), (fluid,usdc)]."""
@@ -64,7 +111,7 @@ def get_token_addresses(
     token_symbol: str,
     dynamic_tokens: Optional[dict] = None,
 ) -> list[str]:
-    """Get token address from config and/or dynamic_tokens."""
+    """Get token address: curated config → top-N cache (same as web catalog) → dynamic_tokens."""
     cfg = TOKEN_ADDRESSES.get(chain, {})
     dyn = (dynamic_tokens or {}).get(chain, {})
     sym = token_symbol.lower()
@@ -76,6 +123,11 @@ def get_token_addresses(
         a = cfg.get("weth")
         if a and a.lower() != ZERO_ADDRESS and a not in addrs:
             addrs.append(a)
+    ck = str(chain or "").strip().lower()
+    major = _major_symbol_index().get(ck, {})
+    for addr in major.get(sym, []):
+        if addr and addr.lower() != ZERO_ADDRESS and addr not in addrs:
+            addrs.append(addr)
     a = dyn.get(sym)
     if a and a.lower() != ZERO_ADDRESS and a not in addrs:
         addrs.append(a)
