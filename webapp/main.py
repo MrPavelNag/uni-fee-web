@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import base64
+import contextlib
 import hashlib
 import json
 import re
@@ -234,6 +235,8 @@ POSITIONS_SCAN_MAX_SECONDS = max(30, int(os.environ.get("POSITIONS_SCAN_MAX_SECO
 POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = max(
     30, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY", str(POSITIONS_SCAN_MAX_SECONDS)))
 )
+# Multi-chain pool scans: higher-priority chains first (subset [:3] = Unichain, BSC, Base for legacy path).
+POSITIONS_SCAN_CHAIN_PRIORITY: list[int] = [130, 56, 8453, 1, 42161, 137, 10]
 POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "8")))
 POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "8")))
 POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(20, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
@@ -8460,6 +8463,31 @@ def _endpoint_supports_pool_liquidity(endpoint: str) -> bool:
     return ok
 
 
+def _owner_scan_attempt(
+    owner: str,
+    owner_type: str,
+    query_mode: str,
+    *,
+    count: int = 0,
+    ok: bool = True,
+    error: Any = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Single debug row for `owner_attempts` in pool position scans (stable keys for UI/debug)."""
+    row: dict[str, Any] = {
+        "owner_value": owner,
+        "owner_type": owner_type,
+        "query_mode": query_mode,
+        "count": int(count),
+        "ok": bool(ok),
+    }
+    if error is not None:
+        row["error"] = str(error)[:220]
+    if extra:
+        row.update(extra)
+    return row
+
+
 def _scan_pool_positions_chain(
     chain_id: int,
     addresses: list[str],
@@ -8750,13 +8778,7 @@ def _scan_pool_positions_chain(
                     source_tag="onchain_prefetch",
                 )
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_v3_prefetch",
-                        "count": len(onchain_prefetch),
-                        "ok": True,
-                    }
+                    _owner_scan_attempt(owner, "onchain", "onchain_v3_prefetch", count=len(onchain_prefetch)),
                 )
                 if onchain_prefetch:
                     positions = onchain_prefetch
@@ -8818,39 +8840,29 @@ def _scan_pool_positions_chain(
                                     seen_m.add(rid)
                                     positions.append(row)
                                 owner_attempts.append(
-                                    {
-                                        "owner_value": owner,
-                                        "owner_type": "graph",
-                                        "query_mode": "v3_prefetch_graph_id_union",
-                                        "count": len(extra_rows),
-                                        "ok": True,
-                                        "elapsed_ms": int(
-                                            round(max(0.0, time.monotonic() - t_union) * 1000.0)
-                                        ),
-                                        "graph_extra_ids_requested": int(len(extra_ids)),
-                                    }
+                                    _owner_scan_attempt(
+                                        owner,
+                                        "graph",
+                                        "v3_prefetch_graph_id_union",
+                                        count=len(extra_rows),
+                                        elapsed_ms=int(round(max(0.0, time.monotonic() - t_union) * 1000.0)),
+                                        graph_extra_ids_requested=int(len(extra_ids)),
+                                    ),
                                 )
                         except Exception as ex:
                             owner_attempts.append(
-                                {
-                                    "owner_value": owner,
-                                    "owner_type": "graph",
-                                    "query_mode": "v3_prefetch_graph_id_union",
-                                    "count": 0,
-                                    "ok": False,
-                                    "error": str(ex)[:220],
-                                }
+                                _owner_scan_attempt(
+                                    owner,
+                                    "graph",
+                                    "v3_prefetch_graph_id_union",
+                                    count=0,
+                                    ok=False,
+                                    error=ex,
+                                ),
                             )
             except Exception as e:
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_v3_prefetch",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                    }
+                    _owner_scan_attempt(owner, "onchain", "onchain_v3_prefetch", count=0, ok=False, error=e),
                 )
 
         # Pancake v3 farming positions are often staked in MasterChefV3 and
@@ -8863,13 +8875,12 @@ def _scan_pool_positions_chain(
                     deadline_ts=deadline_ts,
                 )
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_masterchef_v3",
-                        "count": len(farm_positions),
-                        "ok": True,
-                    }
+                    _owner_scan_attempt(
+                        owner,
+                        "onchain",
+                        "onchain_pancake_masterchef_v3",
+                        count=len(farm_positions),
+                    ),
                 )
                 if farm_positions:
                     seen = {str(x.get("id") or "") for x in positions if isinstance(x, dict)}
@@ -8882,26 +8893,20 @@ def _scan_pool_positions_chain(
                         positions.append(p)
             except Exception as e:
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "onchain_pancake_masterchef_v3",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                    }
+                    _owner_scan_attempt(
+                        owner,
+                        "onchain",
+                        "onchain_pancake_masterchef_v3",
+                        count=0,
+                        ok=False,
+                        error=e,
+                    ),
                 )
 
         if endpoint and not positions:
             if version == "v3" and not owner_has_nft:
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "onchain",
-                        "query_mode": "graph_skipped_no_nft_balance",
-                        "count": 0,
-                        "ok": True,
-                    }
+                    _owner_scan_attempt(owner, "onchain", "graph_skipped_no_nft_balance", count=0),
                 )
             else:
                 try:
@@ -8934,14 +8939,7 @@ def _scan_pool_positions_chain(
                     graph_failed = True
                     owner_errors.append(f"Pool scan failed [{chain_key}/{version}] for {owner}: {e}")
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "fallback",
-                            "query_mode": "graph_exception",
-                            "count": 0,
-                            "ok": False,
-                            "error": str(e)[:220],
-                        }
+                        _owner_scan_attempt(owner, "fallback", "graph_exception", count=0, ok=False, error=e),
                     )
         if version == "v3" and (graph_failed or not positions) and not POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK:
             if time.monotonic() < deadline_ts:
@@ -8955,26 +8953,13 @@ def _scan_pool_positions_chain(
                         source_tag="onchain_fallback",
                     )
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "onchain",
-                            "query_mode": "onchain_v3_npm",
-                            "count": len(onchain_positions),
-                            "ok": True,
-                        }
+                        _owner_scan_attempt(owner, "onchain", "onchain_v3_npm", count=len(onchain_positions)),
                     )
                     if onchain_positions:
                         positions = onchain_positions
                 except Exception as e:
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "onchain",
-                            "query_mode": "onchain_v3_npm",
-                            "count": 0,
-                            "ok": False,
-                            "error": str(e)[:220],
-                        }
+                        _owner_scan_attempt(owner, "onchain", "onchain_v3_npm", count=0, ok=False, error=e),
                     )
         return positions
 
@@ -9117,13 +9102,7 @@ def _scan_pool_positions_chain(
         can_use_live_discovery = bool(POSITIONS_LEGACY_DISCOVERY_ENABLED and not skip_live_discovery)
         if hard_scan and not can_use_live_discovery and not positions:
             owner_attempts.append(
-                {
-                    "owner_value": owner,
-                    "owner_type": "legacy",
-                    "query_mode": "legacy_discovery_disabled",
-                    "count": 0,
-                    "ok": True,
-                }
+                _owner_scan_attempt(owner, "legacy", "legacy_discovery_disabled", count=0),
             )
         return can_use_live_discovery
 
@@ -9200,35 +9179,21 @@ def _scan_pool_positions_chain(
                 if cached_positions:
                     index_cache_hit = True
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "index",
-                        "query_mode": "ownership_cache",
-                        "count": len(cached_positions),
-                        "ok": True,
-                    }
+                    _owner_scan_attempt(owner, "index", "ownership_cache", count=len(cached_positions)),
                 )
                 if hard_scan and POSITIONS_INDEX_FIRST_STRICT and index_cache_hit:
                     skip_live_discovery = True
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "index",
-                            "query_mode": "index_first_skip_live",
-                            "count": len(cached_positions),
-                            "ok": True,
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "index",
+                            "index_first_skip_live",
+                            count=len(cached_positions),
+                        ),
                     )
             except Exception as e:
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "index",
-                        "query_mode": "ownership_cache",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                    }
+                    _owner_scan_attempt(owner, "index", "ownership_cache", count=0, ok=False, error=e),
                 )
         return cached_positions, index_cache_hit, skip_live_discovery
 
@@ -9277,27 +9242,25 @@ def _scan_pool_positions_chain(
                 try:
                     v3_proto = str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(int(chain_id), "uniswap_v3") or "uniswap_v3").strip().lower()
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "explorer",
-                            "query_mode": "contract_only_explorer_owner_rows",
-                            "count": len(owner_explorer_rows),
-                            "ok": True,
-                            "elapsed_ms": int(prefetch.get("owner_rows_elapsed_ms") or 0),
-                            "owner_rows_debug": (prefetch.get("owner_rows_debug") or {}),
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "explorer",
+                            "contract_only_explorer_owner_rows",
+                            count=len(owner_explorer_rows),
+                            elapsed_ms=int(prefetch.get("owner_rows_elapsed_ms") or 0),
+                            owner_rows_debug=(prefetch.get("owner_rows_debug") or {}),
+                        ),
                     )
                     if bool(prefetch.get("fallback_used")):
                         owner_attempts.append(
-                            {
-                                "owner_value": owner,
-                                "owner_type": "explorer",
-                                "query_mode": "contract_only_explorer_contract_rows_fallback",
-                                "count": len(owner_explorer_rows),
-                                "ok": True,
-                                "elapsed_ms": int(prefetch.get("fallback_elapsed_ms") or 0),
-                                "fallback_debug": (prefetch.get("fallback_debug") or {}),
-                            }
+                            _owner_scan_attempt(
+                                owner,
+                                "explorer",
+                                "contract_only_explorer_contract_rows_fallback",
+                                count=len(owner_explorer_rows),
+                                elapsed_ms=int(prefetch.get("fallback_elapsed_ms") or 0),
+                                fallback_debug=(prefetch.get("fallback_debug") or {}),
+                            ),
                         )
                     _set_chain_progress("call_contract_only_onchain_v3_npm", version=version, owner=str(owner))
                     v3_dbg: dict[str, Any] = {}
@@ -9310,7 +9273,7 @@ def _scan_pool_positions_chain(
                         and _endpoint_supports_uniswap_positions(str(endpoint).strip())
                         and time.monotonic() < deadline_ts
                     ):
-                        try:
+                        with contextlib.suppress(Exception):
                             g_ids = _graph_collect_owner_position_ids(
                                 str(endpoint).strip(),
                                 owner,
@@ -9329,19 +9292,16 @@ def _scan_pool_positions_chain(
                                 graph_v3_extra += 1
                                 if len(v3_scan_ids) >= int(POSITIONS_GRAPH_ID_UNION_CAP):
                                     break
-                        except Exception:
-                            pass
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "explorer",
-                            "query_mode": "contract_only_explorer_v3_ids",
-                            "count": int(prefetch.get("v3_ids_count") or len(explorer_v3_ids)),
-                            "ok": True,
-                            "elapsed_ms": int(prefetch.get("v3_ids_elapsed_ms") or 0),
-                            "graph_id_union_extra": int(graph_v3_extra),
-                            "v3_scan_ids_total": int(len(v3_scan_ids)),
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "explorer",
+                            "contract_only_explorer_v3_ids",
+                            count=int(prefetch.get("v3_ids_count") or len(explorer_v3_ids)),
+                            elapsed_ms=int(prefetch.get("v3_ids_elapsed_ms") or 0),
+                            graph_id_union_extra=int(graph_v3_extra),
+                            v3_scan_ids_total=int(len(v3_scan_ids)),
+                        ),
                     )
                     t_call = time.monotonic()
                     v3_rows = _scan_v3_positions_onchain(
@@ -9355,29 +9315,28 @@ def _scan_pool_positions_chain(
                         token_ids_override=v3_scan_ids,
                     )
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "onchain",
-                            "query_mode": "contract_only_onchain_v3_npm",
-                            "count": len(v3_rows),
-                            "ok": True,
-                            "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
-                            "v3_debug": v3_dbg,
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "onchain",
+                            "contract_only_onchain_v3_npm",
+                            count=len(v3_rows),
+                            elapsed_ms=int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
+                            v3_debug=v3_dbg,
+                        ),
                     )
                     _merge_positions(v3_rows)
                 except Exception as e:
                     elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "onchain",
-                            "query_mode": "contract_only_onchain_v3_npm",
-                            "count": 0,
-                            "ok": False,
-                            "elapsed_ms": int(elapsed_ms),
-                            "error": str(e)[:220],
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "onchain",
+                            "contract_only_onchain_v3_npm",
+                            count=0,
+                            ok=False,
+                            elapsed_ms=int(elapsed_ms),
+                            error=e,
+                        ),
                     )
 
                 if int(chain_id) in PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID and time.monotonic() < deadline_ts:
@@ -9392,29 +9351,28 @@ def _scan_pool_positions_chain(
                             debug_out=pc_dbg,
                         )
                         owner_attempts.append(
-                            {
-                                "owner_value": owner,
-                                "owner_type": "onchain",
-                                "query_mode": "contract_only_onchain_pancake_masterchef_v3",
-                                "count": len(staked_rows),
-                                "ok": True,
-                                "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
-                                "pancake_v3_debug": pc_dbg,
-                            }
+                            _owner_scan_attempt(
+                                owner,
+                                "onchain",
+                                "contract_only_onchain_pancake_masterchef_v3",
+                                count=len(staked_rows),
+                                elapsed_ms=int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
+                                pancake_v3_debug=pc_dbg,
+                            ),
                         )
                         _merge_positions(staked_rows)
                     except Exception as e:
                         elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                         owner_attempts.append(
-                            {
-                                "owner_value": owner,
-                                "owner_type": "onchain",
-                                "query_mode": "contract_only_onchain_pancake_masterchef_v3",
-                                "count": 0,
-                                "ok": False,
-                                "elapsed_ms": int(elapsed_ms),
-                                "error": str(e)[:220],
-                            }
+                            _owner_scan_attempt(
+                                owner,
+                                "onchain",
+                                "contract_only_onchain_pancake_masterchef_v3",
+                                count=0,
+                                ok=False,
+                                elapsed_ms=int(elapsed_ms),
+                                error=e,
+                            ),
                         )
 
             if version == "v4" and time.monotonic() < deadline_ts:
@@ -9436,7 +9394,7 @@ def _scan_pool_positions_chain(
                         and _is_eth_address(v4_pm)
                         and time.monotonic() < deadline_ts
                     ):
-                        try:
+                        with contextlib.suppress(Exception):
                             ep_v4 = get_graph_endpoint(chain_key, version="v4")
                             if str(ep_v4 or "").strip():
                                 g4 = _graph_collect_owner_position_ids(
@@ -9459,41 +9417,36 @@ def _scan_pool_positions_chain(
                                         break
                                 if lst0:
                                     v4_contract_to_ids[v4_pm] = lst0
-                        except Exception:
-                            pass
                     if bool(prefetch.get("fallback_used")):
                         owner_attempts.append(
-                            {
-                                "owner_value": owner,
-                                "owner_type": "explorer",
-                                "query_mode": "contract_only_explorer_contract_rows_fallback",
-                                "count": len(owner_explorer_rows),
-                                "ok": True,
-                                "elapsed_ms": int(prefetch.get("fallback_elapsed_ms") or 0),
-                                "fallback_debug": (prefetch.get("fallback_debug") or {}),
-                            }
+                            _owner_scan_attempt(
+                                owner,
+                                "explorer",
+                                "contract_only_explorer_contract_rows_fallback",
+                                count=len(owner_explorer_rows),
+                                elapsed_ms=int(prefetch.get("fallback_elapsed_ms") or 0),
+                                fallback_debug=(prefetch.get("fallback_debug") or {}),
+                            ),
                         )
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "explorer",
-                            "query_mode": "contract_only_explorer_v4_ids",
-                            "count": int(prefetch.get("v4_primary_ids_count") or len(v4_contract_to_ids.get(v4_pm, []))),
-                            "ok": True,
-                            "elapsed_ms": int(prefetch.get("v4_ids_elapsed_ms") or 0),
-                            "nft_contract": v4_pm,
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "explorer",
+                            "contract_only_explorer_v4_ids",
+                            count=int(prefetch.get("v4_primary_ids_count") or len(v4_contract_to_ids.get(v4_pm, []))),
+                            elapsed_ms=int(prefetch.get("v4_ids_elapsed_ms") or 0),
+                            nft_contract=v4_pm,
+                        ),
                     )
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "explorer",
-                            "query_mode": "contract_only_explorer_v4_ids_any_contracts",
-                            "count": int(prefetch.get("v4_any_ids_count") or 0),
-                            "ok": True,
-                            "elapsed_ms": int(prefetch.get("v4_ids_elapsed_ms") or 0),
-                            "contracts": int(prefetch.get("v4_any_contracts") or 0),
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "explorer",
+                            "contract_only_explorer_v4_ids_any_contracts",
+                            count=int(prefetch.get("v4_any_ids_count") or 0),
+                            elapsed_ms=int(prefetch.get("v4_ids_elapsed_ms") or 0),
+                            contracts=int(prefetch.get("v4_any_contracts") or 0),
+                        ),
                     )
                     pm_scan_items = [
                         (str(pm_a).strip().lower(), list(pids or []))
@@ -9542,28 +9495,27 @@ def _scan_pool_positions_chain(
                             pm_a, v4_rows, elapsed_ms, err_s = _contract_only_scan_v4_pm(pm_addr, pm_ids)
                             if err_s:
                                 owner_attempts.append(
-                                    {
-                                        "owner_value": owner,
-                                        "owner_type": "onchain",
-                                        "query_mode": "contract_only_onchain_uniswap_v4_pm",
-                                        "count": 0,
-                                        "ok": False,
-                                        "elapsed_ms": int(elapsed_ms),
-                                        "error": str(err_s)[:220],
-                                        "nft_contract": str(pm_a),
-                                    }
+                                    _owner_scan_attempt(
+                                        owner,
+                                        "onchain",
+                                        "contract_only_onchain_uniswap_v4_pm",
+                                        count=0,
+                                        ok=False,
+                                        elapsed_ms=int(elapsed_ms),
+                                        error=err_s,
+                                        nft_contract=str(pm_a),
+                                    ),
                                 )
                             else:
                                 owner_attempts.append(
-                                    {
-                                        "owner_value": owner,
-                                        "owner_type": "onchain",
-                                        "query_mode": "contract_only_onchain_uniswap_v4_pm",
-                                        "count": len(v4_rows),
-                                        "ok": True,
-                                        "elapsed_ms": int(elapsed_ms),
-                                        "nft_contract": str(pm_a),
-                                    }
+                                    _owner_scan_attempt(
+                                        owner,
+                                        "onchain",
+                                        "contract_only_onchain_uniswap_v4_pm",
+                                        count=len(v4_rows),
+                                        elapsed_ms=int(elapsed_ms),
+                                        nft_contract=str(pm_a),
+                                    ),
                                 )
                             _merge_positions(v4_rows)
                     else:
@@ -9583,57 +9535,56 @@ def _scan_pool_positions_chain(
                                     pm_a, v4_rows, elapsed_ms, err_s = v4_fut.result()
                                 except Exception as ex:
                                     owner_attempts.append(
-                                        {
-                                            "owner_value": owner,
-                                            "owner_type": "onchain",
-                                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
-                                            "count": 0,
-                                            "ok": False,
-                                            "elapsed_ms": 0,
-                                            "error": str(ex)[:220],
-                                            "nft_contract": "",
-                                        }
+                                        _owner_scan_attempt(
+                                            owner,
+                                            "onchain",
+                                            "contract_only_onchain_uniswap_v4_pm",
+                                            count=0,
+                                            ok=False,
+                                            elapsed_ms=0,
+                                            error=ex,
+                                            nft_contract="",
+                                        ),
                                     )
                                     continue
                                 if err_s:
                                     owner_attempts.append(
-                                        {
-                                            "owner_value": owner,
-                                            "owner_type": "onchain",
-                                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
-                                            "count": 0,
-                                            "ok": False,
-                                            "elapsed_ms": int(elapsed_ms),
-                                            "error": str(err_s)[:220],
-                                            "nft_contract": str(pm_a),
-                                        }
+                                        _owner_scan_attempt(
+                                            owner,
+                                            "onchain",
+                                            "contract_only_onchain_uniswap_v4_pm",
+                                            count=0,
+                                            ok=False,
+                                            elapsed_ms=int(elapsed_ms),
+                                            error=err_s,
+                                            nft_contract=str(pm_a),
+                                        ),
                                     )
                                 else:
                                     owner_attempts.append(
-                                        {
-                                            "owner_value": owner,
-                                            "owner_type": "onchain",
-                                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
-                                            "count": len(v4_rows),
-                                            "ok": True,
-                                            "elapsed_ms": int(elapsed_ms),
-                                            "nft_contract": str(pm_a),
-                                        }
+                                        _owner_scan_attempt(
+                                            owner,
+                                            "onchain",
+                                            "contract_only_onchain_uniswap_v4_pm",
+                                            count=len(v4_rows),
+                                            elapsed_ms=int(elapsed_ms),
+                                            nft_contract=str(pm_a),
+                                        ),
                                     )
                                 _merge_positions(v4_rows)
                 except Exception as e:
                     elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "onchain",
-                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
-                            "count": 0,
-                            "ok": False,
-                            "elapsed_ms": int(elapsed_ms),
-                            "error": str(e)[:220],
-                            "nft_contract": str(v4_pm if "v4_pm" in locals() else ""),
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "onchain",
+                            "contract_only_onchain_uniswap_v4_pm",
+                            count=0,
+                            ok=False,
+                            elapsed_ms=int(elapsed_ms),
+                            error=e,
+                            nft_contract=str(v4_pm if "v4_pm" in locals() else ""),
+                        ),
                     )
 
             return positions, False
@@ -9684,13 +9635,12 @@ def _scan_pool_positions_chain(
                         deadline_ts=fast_deadline,
                     )
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "fast",
-                            "query_mode": "fast_onchain_pancake_masterchef_v3",
-                            "count": len(fallback_positions),
-                            "ok": True,
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "fast",
+                            "fast_onchain_pancake_masterchef_v3",
+                            count=len(fallback_positions),
+                        ),
                     )
                     if fallback_positions:
                         seen_keys: set[str] = set()
@@ -9709,14 +9659,14 @@ def _scan_pool_positions_chain(
                             positions.append(fp)
                 except Exception as e:
                     owner_attempts.append(
-                        {
-                            "owner_value": owner,
-                            "owner_type": "fast",
-                            "query_mode": "fast_onchain_pancake_masterchef_v3",
-                            "count": 0,
-                            "ok": False,
-                            "error": str(e)[:220],
-                        }
+                        _owner_scan_attempt(
+                            owner,
+                            "fast",
+                            "fast_onchain_pancake_masterchef_v3",
+                            count=0,
+                            ok=False,
+                            error=e,
+                        ),
                     )
         # Cold-cache safety: when strict index-first disables live discovery and cache is empty,
         # do one bounded synchronous warmup for this owner/chain to avoid empty first response.
@@ -9743,27 +9693,19 @@ def _scan_pool_positions_chain(
                 if cached_positions:
                     positions = cached_positions
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "index",
-                        "query_mode": "index_sync_warmup",
-                        "count": len(cached_positions),
-                        "ok": True,
-                        "reason": "infinity_gap" if needs_infinity_gap_warmup else "cold_cache",
-                        "cached": int(warm_stats.get("cached") or 0),
-                        "ownership_upserted": int(warm_stats.get("ownership_upserted") or 0),
-                    }
+                    _owner_scan_attempt(
+                        owner,
+                        "index",
+                        "index_sync_warmup",
+                        count=len(cached_positions),
+                        reason="infinity_gap" if needs_infinity_gap_warmup else "cold_cache",
+                        cached=int(warm_stats.get("cached") or 0),
+                        ownership_upserted=int(warm_stats.get("ownership_upserted") or 0),
+                    ),
                 )
             except Exception as e:
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "index",
-                        "query_mode": "index_sync_warmup",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                    }
+                    _owner_scan_attempt(owner, "index", "index_sync_warmup", count=0, ok=False, error=e),
                 )
         # Strict index-first fallback for non-infinity paths: allow one lightweight graph read
         # on cache miss so broad-chain scans do not return empty while keeping legacy paths disabled.
@@ -9794,44 +9736,24 @@ def _scan_pool_positions_chain(
                 if graph_positions:
                     positions = graph_positions
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "index",
-                        "query_mode": "index_graph_fallback",
-                        "count": len(graph_positions or []),
-                        "ok": True,
-                    }
+                    _owner_scan_attempt(
+                        owner,
+                        "index",
+                        "index_graph_fallback",
+                        count=len(graph_positions or []),
+                    ),
                 )
             except Exception as e:
                 owner_attempts.append(
-                    {
-                        "owner_value": owner,
-                        "owner_type": "index",
-                        "query_mode": "index_graph_fallback",
-                        "count": 0,
-                        "ok": False,
-                        "error": str(e)[:220],
-                    }
+                    _owner_scan_attempt(owner, "index", "index_graph_fallback", count=0, ok=False, error=e),
                 )
         if version == "v4" and not str(endpoint or "").strip():
             owner_attempts.append(
-                {
-                    "owner_value": owner,
-                    "owner_type": "index",
-                    "query_mode": "v4_no_endpoint_cache_only",
-                    "count": len(positions),
-                    "ok": True,
-                }
+                _owner_scan_attempt(owner, "index", "v4_no_endpoint_cache_only", count=len(positions)),
             )
         if hard_scan and positions and not can_use_live_discovery:
             owner_attempts.append(
-                {
-                    "owner_value": owner,
-                    "owner_type": "index",
-                    "query_mode": "row_live_enrich_disabled",
-                    "count": len(positions),
-                    "ok": True,
-                }
+                _owner_scan_attempt(owner, "index", "row_live_enrich_disabled", count=len(positions)),
             )
         if can_use_live_discovery:
             positions = _run_owner_legacy_core_discovery(
@@ -10478,13 +10400,12 @@ def _scan_pool_positions_chain(
         owner_has_nft = bool(owner_has_nft_balance.get(owner_key, True))
         if hard_scan and int(chain_id) in (56, 8453):
             owner_attempts.append(
-                {
-                    "owner_value": owner,
-                    "owner_type": "onchain",
-                    "query_mode": "owner_nft_balance_precheck",
-                    "count": 1 if owner_has_nft else 0,
-                    "ok": True,
-                }
+                _owner_scan_attempt(
+                    owner,
+                    "onchain",
+                    "owner_nft_balance_precheck",
+                    count=1 if owner_has_nft else 0,
+                ),
             )
         if hard_scan and version == "v3" and not owner_has_nft:
             owner_debug = _make_no_nft_owner_debug(owner, version, owner_attempts)
@@ -10500,14 +10421,12 @@ def _scan_pool_positions_chain(
             owner_errors=owner_errors,
             deadline_ts=deadline_ts,
         )
-        try:
+        with contextlib.suppress(Exception):
             _persist_positions_to_ownership_index(
                 owner,
                 version=version,
                 positions=positions,
             )
-        except Exception:
-            pass
         owner_debug = _make_owner_debug(owner, version, positions, owner_attempts)
         owner_rows, owner_timed_out = _build_owner_rows_from_positions(
             positions,
@@ -11783,12 +11702,18 @@ def _scan_pool_positions_explorer_nft_catalog(
     hard_scan: bool = False,
     pos_job_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
-    """tokennfttx: parallel across chains only; wallets on the same chain run sequentially (one HTTP stream per chain)."""
-    _ = (pre_enqueued_ownership_refresh, hard_scan)
+    """tokennfttx: parallel across chains only; wallets on the same chain run sequentially (one HTTP stream per chain).
+
+    pre_enqueued_ownership_refresh / hard_scan mirror _scan_pool_positions() and are recorded in timings for debugging.
+    """
     rows_out: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
-    timings: dict[str, Any] = {"mode": "explorer_nft_catalog"}
+    timings: dict[str, Any] = {
+        "mode": "explorer_nft_catalog",
+        "pre_enqueued_ownership_refresh": bool(pre_enqueued_ownership_refresh),
+        "hard_scan": bool(hard_scan),
+    }
     scan_started = time.monotonic()
     deadline_ts = time.monotonic() + float(int(POSITIONS_SCAN_MAX_SECONDS))
     max_rows = int(POSITIONS_EXPLORER_NFT_CATALOG_MAX_ROWS)
@@ -11816,8 +11741,7 @@ def _scan_pool_positions_explorer_nft_catalog(
             )
         return [], errors, debug_rows, timings
 
-    priority_chain_ids = [130, 56, 8453, 1, 42161, 137, 10]
-    ordered_chain_ids = _order_chain_ids_for_pool_scan(raw_ids, priority_chain_ids)
+    ordered_chain_ids = _order_chain_ids_for_pool_scan(raw_ids, POSITIONS_SCAN_CHAIN_PRIORITY)
     timings["chains_total"] = len(ordered_chain_ids)
     all_contracts_by_owner: dict[tuple[int, str], set[str]] = {}
 
@@ -12184,7 +12108,7 @@ def _scan_pool_positions(
     if not valid_chain_ids:
         timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
         return [], [], [], timings
-    priority_chain_ids = [130, 56, 8453]  # Prioritize Unichain, then BSC/Base
+    priority_chain_ids = list(POSITIONS_SCAN_CHAIN_PRIORITY[:3])  # Unichain, BSC, Base first
     ordered_chain_ids = _order_chain_ids_for_pool_scan(valid_chain_ids, priority_chain_ids)
     max_workers = 1 if POSITIONS_DISABLE_PARALLELISM else max(1, min(int(POSITIONS_PARALLEL_WORKERS), len(ordered_chain_ids)))
     run_all_chains_parallel = bool(POSITIONS_CONTRACT_ONLY_ENABLED and (not hard_scan))
@@ -14707,21 +14631,19 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posPoolsBody" class="section-body">
-          <div class="pos-pools-tab-bar" id="posPoolsTabBar" style="flex-wrap:wrap;gap:4px" title="Tab order: main → spam → protocol → closed → pair → owner mismatch → other issues → hidden.">
-            <button type="button" class="pos-tab-btn active" data-pos-tab="main" onclick="switchPosPoolsTab('main')" title="Valid positions: not closed, owner mismatch, hidden, or routed to Spam / Protocol / Pair / Other issues.">Positions</button>
+          <div class="pos-pools-tab-bar" id="posPoolsTabBar" style="flex-wrap:wrap;gap:4px" title="Tab order: main → spam → protocol → closed → owner mismatch → other issues → hidden.">
+            <button type="button" class="pos-tab-btn active" data-pos-tab="main" onclick="switchPosPoolsTab('main')" title="Valid positions: not closed, owner mismatch, hidden, or routed to Spam / Protocol / Other issues.">Positions <span id="posMainTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="spam" onclick="switchPosPoolsTab('spam')" title="Heuristic spam / exotic pair (trust to manage).">Spam <span id="posSpamTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="protocol" onclick="switchPosPoolsTab('protocol')">Protocol filter <span id="posProtocolTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="closed" onclick="switchPosPoolsTab('closed')" title="Zero open liquidity on PM (catalog).">Closed <span id="posClosedTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="pair" onclick="switchPosPoolsTab('pair')" title="Displayed pair string does not match position_symbol0/1.">Pair mismatch <span id="posPairTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="mismatch" onclick="switchPosPoolsTab('mismatch')" title="Light owner check: explorer / subgraph vs ownerOf on PM.">Owner mismatch <span id="posMismatchTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="other" onclick="switchPosPoolsTab('other')" title="Phishing-style metadata and PM snapshot read failures (e.g. v4 vs v3 decoder) — not owner mismatch.">Other issues <span id="posOtherTabCount"></span></button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="other" onclick="switchPosPoolsTab('other')" title="Phishing metadata, pair string vs on-chain symbols, PM read failures — see Issue column; not owner mismatch.">Other issues <span id="posOtherTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="hidden" onclick="switchPosPoolsTab('hidden')" title="Rows you marked with Hide on the main list.">Hidden <span id="posHiddenTabCount"></span></button>
           </div>
           <div class="table-wrap" id="posPoolsTableMainWrap"><table id="posPoolsTable"></table></div>
           <div class="table-wrap" id="posPoolsTableSpamWrap" style="display:none"><table id="posPoolsSpamTable"></table></div>
           <div class="table-wrap" id="posPoolsTableProtocolWrap" style="display:none"><table id="posPoolsProtocolTable"></table></div>
           <div class="table-wrap" id="posPoolsTableClosedWrap" style="display:none"><table id="posPoolsClosedTable"></table></div>
-          <div class="table-wrap" id="posPoolsTablePairWrap" style="display:none"><table id="posPoolsPairMismatchTable"></table></div>
           <div class="table-wrap mismatch-table-wrap" id="posPoolsTableMismatchWrap" style="display:none"><table id="posPoolsMismatchTable"></table></div>
           <div class="table-wrap" id="posPoolsTableOtherWrap" style="display:none"><table id="posPoolsOtherTable"></table></div>
           <div class="table-wrap" id="posPoolsTableHiddenWrap" style="display:none"><table id="posPoolsHiddenTable"></table></div>
@@ -14853,7 +14775,7 @@ def _render_positions_page() -> str:
     }
     function normalizePosPoolsTabKey(raw) {
       const t = String(raw || "").toLowerCase();
-      if (t === "phishing") return "other";
+      if (t === "phishing" || t === "pair") return "other";
       return t;
     }
     function switchPosPoolsTab(name, silent) {
@@ -14861,7 +14783,6 @@ def _render_positions_page() -> str:
       const prW = document.getElementById("posPoolsTableProtocolWrap");
       const mmW = document.getElementById("posPoolsTableMismatchWrap");
       const clW = document.getElementById("posPoolsTableClosedWrap");
-      const pairW = document.getElementById("posPoolsTablePairWrap");
       const spW = document.getElementById("posPoolsTableSpamWrap");
       const otW = document.getElementById("posPoolsTableOtherWrap");
       const hidW = document.getElementById("posPoolsTableHiddenWrap");
@@ -14872,7 +14793,6 @@ def _render_positions_page() -> str:
         ["spam", spW],
         ["protocol", prW],
         ["closed", clW],
-        ["pair", pairW],
         ["mismatch", mmW],
         ["other", otW],
         ["hidden", hidW],
@@ -14887,7 +14807,7 @@ def _render_positions_page() -> str:
       });
       if (!silent) {
         try {
-          const allowed = new Set(["main", "spam", "protocol", "closed", "pair", "mismatch", "other", "hidden"]);
+          const allowed = new Set(["main", "spam", "protocol", "closed", "mismatch", "other", "hidden"]);
           localStorage.setItem(POS_POOLS_TAB_KEY, allowed.has(tab) ? tab : "main");
         } catch (_) {}
       }
@@ -15477,7 +15397,6 @@ def _render_positions_page() -> str:
       const closedTabRows = [];
       const spamRows = [];
       const mismatchRows = [];
-      const pairMismatchRows = [];
       const otherRows = [];
       function rowTrustSpamParam(r) {
         const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
@@ -15521,7 +15440,12 @@ def _render_positions_page() -> str:
           continue;
         }
         if (hasPairMismatch(row)) {
-          pairMismatchRows.push(row);
+          otherRows.push(
+            Object.assign({}, row, {
+              _other_issue_label: "Pair mismatch",
+              _other_issue_detail: mismatchHint(row),
+            }),
+          );
           continue;
         }
         if (suspected && !trusted) {
@@ -15564,7 +15488,7 @@ def _render_positions_page() -> str:
       }
       if (!visible.length) {
         html += listAll.length
-          ? `<tr><td colspan='${totalCols}'>No pool positions in the main list — rows that matched a filter are on the other tabs (spam, protocol, closed, pair mismatch, owner mismatch, other issues, hidden).</td></tr>`
+          ? `<tr><td colspan='${totalCols}'>No pool positions in the main list — rows that matched a filter are on the other tabs (spam, protocol, closed, owner mismatch, other issues, hidden).</td></tr>`
           : `<tr><td colspan='${totalCols}'>No pool positions found.</td></tr>`;
       }
       const otCols = 15;
@@ -15607,7 +15531,7 @@ def _render_positions_page() -> str:
         otHtml += "</tr>";
       }
       if (!otherRows.length) {
-        otHtml += `<tr><td colspan='${otCols}' style='white-space:normal;color:#64748b'>No rows here: phishing-style collection metadata and PM snapshot read failures (e.g. v4 position NFT vs v3 decoder) land on this tab. Spam, protocol gate, and pair mismatch stay on their own tabs.</td></tr>`;
+        otHtml += `<tr><td colspan='${otCols}' style='white-space:normal;color:#64748b'>No rows here: phishing-style collection metadata, pair string vs on-chain symbols (Issue: Pair mismatch), and PM snapshot read failures land on this tab. Spam, protocol gate, and closed positions stay on their own tabs.</td></tr>`;
       }
       const mmCols = 14;
       let mmHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th title="NFT collection scan: explorer tokennfttx row vs on-chain owner / PM read">Scan issue</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
@@ -15733,31 +15657,6 @@ def _render_positions_page() -> str:
       if (!spamRows.length) {
         spamHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No spam heuristics: TVL/symbol rules did not flag supported rows (phase 6). Trust a row via Hide to re-run enrich.</td></tr>`;
       }
-      let pairHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th title="pair string vs position_symbol0/1">Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
-      for (let pi = 0; pi < pairMismatchRows.length; pi++) {
-        const r = pairMismatchRows[pi];
-        const pairTrace = String(r.pair_symbol_source || "").trim();
-        const pairTitleRaw = `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`;
-        const pairTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
-        const pmStyle = " style='background:#fff7ed;color:#9a3412;font-weight:600'";
-        const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const feeRawP = String(r.fee_tier_raw || "").trim();
-        const feeTipP = feeRawP ? ` title="raw: ${esc(feeRawP)}"` : "";
-        const checkedP = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-        pairHtml += "<tr>";
-        pairHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
-        pairHtml += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
-        pairHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
-        pairHtml += `<td${pmStyle}${pairTitle}>${esc(r.pair || "")} ⚠</td><td${feeTipP}>${esc(r.fee_tier || "")}</td>`;
-        pairHtml += `<td>${esc(r.position_created_date || "-")}</td><td>${statusDot(r.position_status || "-")}</td>`;
-        pairHtml += `<td${pmStyle}${pairTitle}>${esc(r.position_amounts_display || "-")}</td>`;
-        pairHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${pmStyle}${pairTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        pairHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        pairHtml += `<td><input type='checkbox' ${checkedP} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
-      }
-      if (!pairMismatchRows.length) {
-        pairHtml += `<tr><td colspan='${totalCols}' style='white-space:normal;color:#64748b'>No pair mismatch: displayed pair matches position_symbol0/1 (after normalizing wrapped natives).</td></tr>`;
-      }
       let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       for (let hi = 0; hi < hiddenRows.length; hi++) {
         const r = hiddenRows[hi];
@@ -15790,8 +15689,6 @@ def _render_positions_page() -> str:
       if (prTable) prTable.innerHTML = protHtml;
       const clTable = document.getElementById("posPoolsClosedTable");
       if (clTable) clTable.innerHTML = closedHtml;
-      const pairTable = document.getElementById("posPoolsPairMismatchTable");
-      if (pairTable) pairTable.innerHTML = pairHtml;
       const spTable = document.getElementById("posPoolsSpamTable");
       if (spTable) spTable.innerHTML = spamHtml;
       const otTable = document.getElementById("posPoolsOtherTable");
@@ -15801,10 +15698,10 @@ def _render_positions_page() -> str:
       const mmTable = document.getElementById("posPoolsMismatchTable");
       if (mmTable) mmTable.innerHTML = mmHtml;
       const tabBar = document.getElementById("posPoolsTabBar");
+      const cntMainEl = document.getElementById("posMainTabCount");
       const cntPrEl = document.getElementById("posProtocolTabCount");
       const cntEl = document.getElementById("posMismatchTabCount");
       const cntClEl = document.getElementById("posClosedTabCount");
-      const cntPairEl = document.getElementById("posPairTabCount");
       const cntSpEl = document.getElementById("posSpamTabCount");
       const cntOtEl = document.getElementById("posOtherTabCount");
       const cntHidEl = document.getElementById("posHiddenTabCount");
@@ -15813,21 +15710,20 @@ def _render_positions_page() -> str:
         || protocolRows.length > 0
         || mismatchRows.length > 0
         || closedTabRows.length > 0
-        || pairMismatchRows.length > 0
         || spamRows.length > 0
         || otherRows.length > 0
         || hiddenRows.length > 0;
       if (tabBar) tabBar.style.display = hasSubTabs ? "flex" : "none";
+      if (cntMainEl) cntMainEl.textContent = visible.length ? `(${visible.length})` : "";
       if (cntPrEl) cntPrEl.textContent = protocolRows.length ? `(${protocolRows.length})` : "";
       if (cntEl) cntEl.textContent = mismatchRows.length ? `(${mismatchRows.length})` : "";
       if (cntClEl) cntClEl.textContent = closedTabRows.length ? `(${closedTabRows.length})` : "";
-      if (cntPairEl) cntPairEl.textContent = pairMismatchRows.length ? `(${pairMismatchRows.length})` : "";
       if (cntSpEl) cntSpEl.textContent = spamRows.length ? `(${spamRows.length})` : "";
       if (cntOtEl) cntOtEl.textContent = otherRows.length ? `(${otherRows.length})` : "";
       if (cntHidEl) cntHidEl.textContent = hiddenRows.length ? `(${hiddenRows.length})` : "";
       let savedPoolsTab = "";
       try { savedPoolsTab = String(localStorage.getItem(POS_POOLS_TAB_KEY) || ""); } catch (_) { savedPoolsTab = ""; }
-      const allowedTabs = new Set(["main", "spam", "protocol", "closed", "pair", "mismatch", "other", "hidden"]);
+      const allowedTabs = new Set(["main", "spam", "protocol", "closed", "mismatch", "other", "hidden"]);
       const savNorm = normalizePosPoolsTabKey(savedPoolsTab);
       if (allowedTabs.has(savNorm)) switchPosPoolsTab(savNorm, true);
       else switchPosPoolsTab("main", true);
