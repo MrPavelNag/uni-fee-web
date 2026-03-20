@@ -330,13 +330,12 @@ POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS = max(
     1, min(12, int(os.environ.get("POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS", "4")))
 )
 # When several URL templates are used (v2 + Blockscout + native), fetch page 1 of each in parallel.
-# Default off: with high wallet×chain parallelism it spikes Etherscan and often *slows* total time (rate limits).
+# Default off: extra concurrent explorer calls often hit rate limits and slow the scan.
 POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1 = os.environ.get(
     "POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
-# All tokennfttx HTTP (all chains; each chain uses one worker with serial pages) shares this cap.
-# Default scales with POSITIONS_NFT_PARALLEL_WORKERS: with workers=8 and page_workers=4, a global cap of 6
-# serializes most in-flight requests (long parallel_fetch). Lower this env if you see rate-limit api_errors.
+# Shared semaphore for all tokennfttx HTTP (many chains in parallel; each chain serializes its own requests).
+# Default ~2× POSITIONS_NFT_PARALLEL_WORKERS (max parallel chains). Lower if you see rate-limit api_errors.
 _DEFAULT_TOKENNFTTX_GLOBAL = max(8, min(32, int(POSITIONS_NFT_PARALLEL_WORKERS) * 2))
 POSITIONS_EXPLORER_NFTTX_GLOBAL_CONCURRENCY = max(
     1,
@@ -354,11 +353,11 @@ POSITIONS_EXPLORER_NFTTX_V2_FIRST = os.environ.get("POSITIONS_EXPLORER_NFTTX_V2_
     "yes",
     "on",
 )
-# Бесплатный api.etherscan.io/v2 часто не покрывает BSC/Base/OP — используем Blockscout tokennfttx (без ключа).
+# Free api.etherscan.io/v2 often omits BSC/Base/OP tokennfttx — optional Blockscout fallback (no key).
 POSITIONS_BLOCKSCOUT_TOKENNFTTX_FALLBACK = os.environ.get(
     "POSITIONS_BLOCKSCOUT_TOKENNFTTX_FALLBACK", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
-# PM enumeration при пустом HTTP: "*" = все chain_id, где в конфиге есть V3 NPM или V4 PM; иначе список id через запятую (напр. 56,8453).
+# When explorer HTTP fails: "*" = any chain with V3 NPM/V4 PM in config; else comma-separated chain ids (e.g. 56,8453).
 _POSITIONS_NFT_RPC_PM_FB_RAW = os.environ.get("POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS", "*").strip().lower()
 POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS_ALL = _POSITIONS_NFT_RPC_PM_FB_RAW in ("*", "all", "")
 POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS: set[int] = set()
@@ -371,7 +370,7 @@ if not POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS_ALL:
             POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS.add(int(_x))
         except ValueError:
             continue
-# Доп. NFT при пустом explorer: перечисление ERC721 balanceOf+tokenOfOwnerByIndex на NPM/V4 PM (O(N) RPC, без скана блоков).
+# Extra NFTs when explorer empty: ERC721 balanceOf + tokenOfOwnerByIndex on PM contracts (O(N) RPC).
 POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK = os.environ.get(
     "POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
@@ -10698,6 +10697,9 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
         acc["nft_catalog_scan_mismatch"] = bool(acc.get("nft_catalog_scan_mismatch")) or bool(
             row.get("nft_catalog_scan_mismatch")
         )
+        acc["nft_catalog_explorer_row"] = bool(acc.get("nft_catalog_explorer_row")) or bool(
+            row.get("nft_catalog_explorer_row")
+        )
         mr_acc = str(acc.get("nft_catalog_mismatch_reason") or "").strip()
         mr_row = str(row.get("nft_catalog_mismatch_reason") or "").strip()
         if mr_row:
@@ -11197,8 +11199,11 @@ def _nft_catalog_row_enrich_protocol(row: dict[str, Any]) -> str:
 
 
 def _nft_catalog_row_is_explorer_tokennfttx(row: dict[str, Any]) -> bool:
-    """Строка из сканирования NFT-коллекции (Etherscan tokennfttx → explorer catalog)."""
-    return str((row or {}).get("pair_symbol_source") or "").strip() == "explorer:tokennfttx"
+    """Row from explorer tokennfttx NFT catalog (stable after PM snapshot overwrites pair_symbol_source)."""
+    r = row or {}
+    if bool(r.get("nft_catalog_explorer_row")):
+        return True
+    return str(r.get("pair_symbol_source") or "").strip() == "explorer:tokennfttx"
 
 
 # --- NFT_CATALOG_DEFERRED_OWNER_RECONCILIATION (структурный раздел конвейера, без реализации) ---
@@ -11555,6 +11560,39 @@ def _nft_catalog_compute_open_liquidity_allowed(
     return allowed
 
 
+def _explorer_nft_catalog_fetch_telemetry(
+    fetch_results: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
+    """Single pass over explorer fetch results: probe traces + row counts + failure totals."""
+    probe_by_chain: list[dict[str, Any]] = []
+    seen_probe_cid: set[int] = set()
+    nft_rows_total = 0
+    owned_total = 0
+    tasks_failed = 0
+    api_err_total = 0
+    for fr in fetch_results:
+        if not isinstance(fr, dict):
+            continue
+        nft_rows = fr.get("nft_rows")
+        if isinstance(nft_rows, list):
+            nft_rows_total += len(nft_rows)
+        owned = fr.get("owned")
+        if isinstance(owned, list):
+            owned_total += len(owned)
+        if str(fr.get("error") or "").strip():
+            tasks_failed += 1
+        dbg = fr.get("debug")
+        if isinstance(dbg, dict):
+            api_err_total += int(_explorer_debug_count_request_failures(dbg))
+            cid_fr = int(fr.get("chain_id") or 0)
+            if cid_fr > 0 and cid_fr not in seen_probe_cid:
+                tt = dbg.get("template_traces")
+                if isinstance(tt, list) and tt:
+                    seen_probe_cid.add(cid_fr)
+                    probe_by_chain.append({"chain_id": cid_fr, "template_traces": tt[:10]})
+    return probe_by_chain, nft_rows_total, owned_total, tasks_failed, api_err_total
+
+
 def _explorer_nft_catalog_owner_chain_scan(
     cid: int,
     ok: str,
@@ -11636,7 +11674,7 @@ def _scan_pool_positions_explorer_nft_catalog(
     timings["chains_total"] = len(ordered_chain_ids)
     all_contracts_by_owner: dict[tuple[int, str], set[str]] = {}
 
-    tasks: list[tuple[int, str]] = []
+    owners_by_chain: dict[int, list[str]] = {}
     for cid in ordered_chain_ids:
         chain_key = str(CHAIN_ID_TO_KEY.get(int(cid), "") or "").strip().lower()
         if not chain_key or not _explorer_v2_chainid(int(cid)):
@@ -11645,27 +11683,19 @@ def _scan_pool_positions_explorer_nft_catalog(
             o = str(owner or "").strip()
             if not _is_eth_address(o):
                 continue
-            ok = str(o).strip().lower()
-            tasks.append((int(cid), ok))
+            owners_by_chain.setdefault(int(cid), []).append(str(o).strip().lower())
 
-    owners_by_chain: dict[int, list[str]] = {}
-    for cid, ok in tasks:
-        owners_by_chain.setdefault(int(cid), []).append(str(ok).strip().lower())
-    chain_batches: list[tuple[int, list[str]]] = []
-    for cid in ordered_chain_ids:
-        ows = owners_by_chain.get(int(cid))
-        if ows:
-            chain_batches.append((int(cid), ows))
+    chain_batches: list[tuple[int, list[str]]] = [
+        (int(cid), owners_by_chain[int(cid)]) for cid in ordered_chain_ids if int(cid) in owners_by_chain
+    ]
+    n_tasks = sum(len(ows) for _, ows in chain_batches)
 
-    # NFT catalog: parallelize only across chains (POSITIONS_NFT_PARALLEL_WORKERS = max concurrent chains).
     workers = max(1, min(int(POSITIONS_NFT_PARALLEL_WORKERS), len(chain_batches)))
     timings["parallel_workers"] = int(workers)
     timings["nft_parallel_workers_cap"] = int(POSITIONS_NFT_PARALLEL_WORKERS)
     timings["nft_fetch_parallelism"] = "by_chain"
     timings["nft_parallel_chain_count"] = int(len(chain_batches))
-    timings["owner_chain_tasks"] = int(len(tasks))
-
-    n_tasks = int(len(tasks))
+    timings["owner_chain_tasks"] = int(n_tasks)
 
     def _nft_parallel_job_progress(done: int, total: int) -> float:
         if total <= 0:
@@ -11673,7 +11703,7 @@ def _scan_pool_positions_explorer_nft_catalog(
         return 15.0 + (49.0 * float(done) / float(total))
 
     fetch_results: list[dict[str, Any]] = []
-    if not tasks:
+    if n_tasks <= 0:
         if pos_job_id:
             _update_pos_job(
                 pos_job_id,
@@ -11685,7 +11715,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                 nft_scan_task_errors=0,
                 nft_scan_api_errors=0,
             )
-    elif tasks:
+    else:
         t_parallel0 = time.monotonic()
         prog_lock = threading.Lock()
         prog: dict[str, int] = {"done": 0, "rows": 0, "task_err": 0, "api_err": 0}
@@ -11715,8 +11745,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                         pos_job_id,
                         progress=float(_nft_parallel_job_progress(done_ct, n_tasks)),
                         stage_label=(
-                            f"Scanning NFT collections — {pct:.1f}% "
-                            f"({done_ct}/{n_tasks} wallet×chain, parallel chains)"
+                            f"Scanning NFT collections — {pct:.1f}% ({done_ct}/{n_tasks} wallet×chain)"
                         ),
                         nft_scan_tasks_total=int(n_tasks),
                         nft_scan_tasks_done=int(done_ct),
@@ -11910,6 +11939,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                     "spam_skipped": False,
                     "nft_catalog_scan_mismatch": False,
                     "nft_catalog_mismatch_reason": "",
+                    "nft_catalog_explorer_row": True,
                     "liquidity_usd": None,
                     "position_created_date": created if created else "-",
                     "unsupported_protocol": bool(unsupported_protocol),
@@ -11938,44 +11968,18 @@ def _scan_pool_positions_explorer_nft_catalog(
 
     timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
     timings["rows"] = len(rows_out)
-    probe_by_chain: list[dict[str, Any]] = []
-    seen_probe_cid: set[int] = set()
-    for fr in fetch_results:
-        if not isinstance(fr, dict):
-            continue
-        cid_fr = int(fr.get("chain_id") or 0)
-        if cid_fr <= 0 or cid_fr in seen_probe_cid:
-            continue
-        dbg = fr.get("debug")
-        if not isinstance(dbg, dict):
-            continue
-        tt = dbg.get("template_traces")
-        if not isinstance(tt, list) or not tt:
-            continue
-        seen_probe_cid.add(cid_fr)
-        probe_by_chain.append({"chain_id": cid_fr, "template_traces": tt[:10]})
+    probe_by_chain, nft_rows_total, owned_total, tasks_failed_final, api_err_total_final = (
+        _explorer_nft_catalog_fetch_telemetry(fetch_results)
+    )
     timings["nft_probe_by_chain"] = probe_by_chain
-
-    nft_rows_total = sum(
-        len(fr.get("nft_rows")) if isinstance(fr.get("nft_rows"), list) else 0 for fr in fetch_results
-    )
-    owned_total = sum(
-        len(fr.get("owned")) if isinstance(fr.get("owned"), list) else 0 for fr in fetch_results
-    )
-    tasks_failed_final = sum(1 for fr in fetch_results if str(fr.get("error") or "").strip())
-    api_err_total_final = 0
-    for fr in fetch_results:
-        d = fr.get("debug")
-        if isinstance(d, dict):
-            api_err_total_final += int(_explorer_debug_count_request_failures(d))
     timings["nft_tokennfttx_rows_scanned"] = int(nft_rows_total)
     timings["nft_owned_positions_total"] = int(owned_total)
-    timings["nft_owner_chain_tasks_planned"] = int(len(tasks))
+    timings["nft_owner_chain_tasks_planned"] = int(n_tasks)
     timings["nft_owner_chain_tasks_failed"] = int(tasks_failed_final)
     timings["nft_explorer_api_request_failures"] = int(api_err_total_final)
     timings["nft_missing_or_error_events"] = int(tasks_failed_final + api_err_total_final)
     timings["nft_aggregate_merge_sec"] = round(max(0.0, time.monotonic() - t_merge0), 3)
-    if pos_job_id and int(len(tasks)) > 0:
+    if pos_job_id and n_tasks > 0:
         _update_pos_job(
             pos_job_id,
             nft_scan_rows_total=int(nft_rows_total),
@@ -15229,9 +15233,11 @@ def _render_positions_page() -> str:
       let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const listAll = rows || [];
       const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
-      const hasExplorerNftCatalog = listAll.some(
-        (x) => String((x || {}).pair_symbol_source || "").trim() === "explorer:tokennfttx"
-      );
+      const hasExplorerNftCatalog = listAll.some((x) => {
+        if (!x) return false;
+        if (x.nft_catalog_explorer_row === true || x.nft_catalog_explorer_row === 1) return true;
+        return String(x.pair_symbol_source || "").trim() === "explorer:tokennfttx";
+      });
       const visible = [];
       const hiddenRows = [];
       const protocolRows = [];
@@ -17948,6 +17954,8 @@ def _build_positions_scan_response(
             "parallel_fetch_sec": float(pool_t.get("nft_parallel_fetch_sec") or 0.0),
             "aggregate_merge_sec": float(pool_t.get("nft_aggregate_merge_sec") or 0.0),
             "parallel_workers": int(pool_t.get("parallel_workers") or 0),
+            "owner_mismatch_checked": int((debug_timings or {}).get("nft_catalog_owner_mismatch_checked") or 0),
+            "owner_mismatch_rows": int((debug_timings or {}).get("nft_catalog_owner_mismatch_rows") or 0),
         }
     return {
         "pool_positions": pool_rows,
@@ -18169,15 +18177,14 @@ def _scan_positions_core(
         debug_timings["nft_catalog_owner_mismatch_scan_sec"] = round(max(0.0, time.monotonic() - t_own), 3)
         debug_timings["nft_catalog_owner_mismatch_rows"] = int(own_mm_n)
         debug_timings["nft_catalog_owner_mismatch_checked"] = int(own_chk_n)
+        info_notes.append(
+            f"Light owner scan: checked={int(own_chk_n)}, mismatches={int(own_mm_n)} "
+            "(explorer NFT ownerOf vs wallet + optional subgraph v3 PM; tab «Owner mismatch»)."
+        )
         ne_ok, ne_fail = _enrich_nft_catalog_rows_from_chain(pool_rows, max_seconds=26.0, max_rows=240)
         debug_timings["nft_catalog_onchain_enrich_sec"] = round(max(0.0, time.monotonic() - t_nft_enrich), 3)
         debug_timings["nft_catalog_onchain_enrich_ok"] = int(ne_ok)
         debug_timings["nft_catalog_onchain_enrich_fail"] = int(ne_fail)
-        if own_mm_n > 0:
-            info_notes.append(
-                f"Light owner scan: mismatches={int(own_mm_n)}, checked={int(own_chk_n)} "
-                "(explorer NFT rows + subgraph v3 ownerOf on PM vs wallet when enabled; includes unsupported explorer rows; tab «Owner mismatch»)."
-            )
         if ne_ok or ne_fail:
             info_notes.append(
                 f"NFT catalog on-chain enrich: ok={int(ne_ok)}, fail={int(ne_fail)} "
