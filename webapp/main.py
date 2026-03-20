@@ -13282,15 +13282,49 @@ def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int
 def _normalize_chain_key_slug(chain_key: str) -> str:
     """Canonical UI/config slug (legacy token: arbitrum-one → arbitrum)."""
     k = str(chain_key or "").strip().lower()
-    return "arbitrum" if k == "arbitrum-one" else k
+    if k.startswith("eip155:"):
+        k = k.split(":", 2)[-1].strip().lower()
+    if k == "arbitrum-one":
+        return "arbitrum"
+    # WalletConnect / explorer human names → CHAIN_ID_TO_KEY slug
+    aliases = {
+        "binance-smart-chain": "bsc",
+        "bnb chain": "bsc",
+        "bnb smart chain": "bsc",
+        "bnb smart chain mainnet": "bsc",
+        "base mainnet": "base",
+        "base-mainnet": "base",
+        "base chain": "base",
+    }
+    return aliases.get(k, k)
 
 
 def _chain_id_by_chain_key(chain_key: str) -> int:
     key = _normalize_chain_key_slug(chain_key)
+    if key.isdigit():
+        cid = int(key)
+        if int(cid) in CHAIN_ID_TO_KEY:
+            return int(cid)
     for cid, ck in CHAIN_ID_TO_KEY.items():
         if str(ck).strip().lower() == key:
             return int(cid)
     return 0
+
+
+def _resolve_chain_id_and_key_for_positions(chain: str, chain_id_hint: int = 0) -> tuple[int, str]:
+    """
+    Resolve (chain_id, canonical_chain_key) for positions charts/fees/enrich.
+    Accepts slug (``base``), numeric id string (``8453``), ``eip155:8453``, or a numeric ``chain_id`` hint from the row.
+    """
+    slug = _normalize_chain_key_slug(str(chain or ""))
+    cid = _chain_id_by_chain_key(slug)
+    if cid > 0:
+        ck = str(CHAIN_ID_TO_KEY.get(int(cid), "") or "").strip().lower()
+        return int(cid), (ck or slug)
+    hint = int(chain_id_hint or 0)
+    if hint > 0 and int(hint) in CHAIN_ID_TO_KEY:
+        return int(hint), str(CHAIN_ID_TO_KEY[int(hint)]).strip().lower()
+    return 0, slug
 
 
 def _fetch_position_snapshot_series_exact(
@@ -13538,11 +13572,21 @@ def _fee_collect_log_chunk_blocks(chain_id: int) -> int:
     cid = int(chain_id)
     if cid == 1:
         return max(2000, min(50_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_ETH", "8000"))))
+    # Base public RPCs often reject or time out wide eth_getLogs ranges — smaller chunks by default.
+    if cid == 8453:
+        return max(2000, min(120_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_BASE", "12000"))))
     return max(4000, min(200_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_L2", "45000"))))
 
 
-def _fee_collect_log_max_chunks() -> int:
-    return max(10, min(500, int(os.environ.get("POSITIONS_FEE_LOG_MAX_CHUNKS", "220"))))
+def _fee_collect_log_max_chunks(chain_id: int = 0) -> int:
+    """Cap getLogs range iterations; Base uses smaller block chunks — allow more steps by default."""
+    base = max(10, min(500, int(os.environ.get("POSITIONS_FEE_LOG_MAX_CHUNKS", "220"))))
+    cid = int(chain_id)
+    if cid == 8453:
+        extra = int(os.environ.get("POSITIONS_FEE_LOG_MAX_CHUNKS_BASE", "380") or 0)
+        if extra > 0:
+            return max(base, min(500, extra))
+    return base
 
 
 def _minimal_pool_dict_for_fee_usd(token0: str, token1: str, dec0: int, dec1: int) -> dict[str, Any]:
@@ -13621,7 +13665,7 @@ def _fetch_v3_position_fees_by_collect_logs(
         return {}, empty_meta
 
     chunk = _fee_collect_log_chunk_blocks(cid)
-    max_chunks = _fee_collect_log_max_chunks()
+    max_chunks = _fee_collect_log_max_chunks(cid)
     topics_or = topic0s if len(topic0s) > 1 else topic0s[0]
 
     raw_events: list[tuple[int, int, int, int]] = []
@@ -15021,7 +15065,6 @@ class PositionsScanRequest(BaseModel):
 
 
 class PositionPoolSeriesRequest(BaseModel):
-    chain: str
     protocol: str
     pool_id: str
     address: str
@@ -15034,6 +15077,9 @@ class PositionPoolSeriesRequest(BaseModel):
     token1_id: str = ""
     # When true, NPM Collect log series uses CoinGecko historical prices at each event (stables $1).
     fee_usd_historical: bool = False
+    chain: str = ""
+    # Backup when *chain* is empty, wrong, or numeric-only (e.g. WalletConnect / CAIP ``eip155:8453``).
+    chain_id: int = 0
 
 
 def _normalize_positions_series_protocol(raw: str, *, for_fees: bool = False) -> str:
@@ -15899,6 +15945,7 @@ def _render_positions_page() -> str:
     .status-dot.explorer { background:#93b4d4; border-color:#6b93b8; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
+    #evmAddrHint { font-size: 11px; line-height: 1.35; margin: 6px 0 0; min-height: 1.2em; color: #64748b; }
     #posFeeDebugPanel details summary { cursor: pointer; font-weight: 700; user-select: none; }
     #posFeeDebugPanel pre { margin: 8px 0 0; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 11px; color: #334155; }
     @media (max-width: 1100px) {
@@ -15931,9 +15978,12 @@ def _render_positions_page() -> str:
         <div class="address-columns">
           <div class="addr-box">
             <div class="addr-input-row">
-              <input id="evmInput" placeholder="0x… EVM address" />
+              <input id="evmInput" type="text" placeholder="0x… EVM address" autocomplete="off" spellcheck="false"
+                title="Paste full address; spaces and line breaks are stripped. 40 hex digits after 0x."
+                onkeydown="if(event.key==='Enter'){ event.preventDefault(); addAddress('evm'); }" />
               <button class="btn btn-plus" type="button" onclick="addAddress('evm')" aria-label="Add EVM address">+</button>
             </div>
+            <p id="evmAddrHint" aria-live="polite"></p>
             <div class="chips" id="evmChips"></div>
           </div>
           <div class="addr-box" style="border-style:dashed">
@@ -16040,11 +16090,29 @@ def _render_positions_page() -> str:
     function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
     const posState = { evm: [] };
     const POS_STORAGE_KEY = "positions_form_v2";
+    /** Strip whitespace; accept 0x + 40 hex or plain 40 hex → lowercase 0x… */
+    function normalizeEvmAddressInput(raw) {
+      let t = String(raw || "").replace(/[\s\u00a0\u200b\uFEFF]+/g, "").trim();
+      if (!t) return "";
+      if (/^0x/i.test(t)) {
+        const hex = t.slice(2).replace(/[^a-fA-F0-9]/g, "");
+        if (hex.length !== 40) return "";
+        return "0x" + hex.toLowerCase();
+      }
+      const hex = t.replace(/[^a-fA-F0-9]/g, "");
+      if (hex.length !== 40) return "";
+      return "0x" + hex.toLowerCase();
+    }
+    function setEvmAddrHint(msg, isErr) {
+      const h = document.getElementById("evmAddrHint");
+      if (!h) return;
+      h.textContent = String(msg || "");
+      h.style.color = isErr ? "#b91c1c" : "#64748b";
+    }
     function validAddress(kind, value) {
+      if (kind === "evm") return !!normalizeEvmAddressInput(value);
       const v = String(value || "").trim();
-      if (!v) return false;
-      if (kind === "evm") return /^0x[a-fA-F0-9]{40}$/.test(v);
-      return false;
+      return !!v;
     }
     function inputId(kind) {
       return "evmInput";
@@ -16080,22 +16148,38 @@ def _render_positions_page() -> str:
     }
     function addAddress(kind) {
       const el = document.getElementById(inputId(kind));
-      const addrRaw = String(el?.value || "").trim();
-      if (!validAddress(kind, addrRaw)) {
-        setPosStatus(`Invalid ${kind.toUpperCase()} address format.`, true);
-        return;
+      const addrRaw = String(el?.value || "");
+      let addr = "";
+      if (kind === "evm") {
+        addr = normalizeEvmAddressInput(addrRaw);
+        if (!addr) {
+          setEvmAddrHint("Invalid address: need 40 hex digits (with or without 0x). Remove extra characters / check length.", true);
+          setPosStatus("Invalid EVM address — see hint under the field.", true);
+          return;
+        }
+      } else {
+        addr = addrRaw.trim();
+        if (!addr) return;
       }
-      const addr = addrRaw;
+      setEvmAddrHint("");
       const dup = (posState[kind] || []).some((x) => kind === "evm" ? String(x).toLowerCase() === addr.toLowerCase() : String(x) === addr);
       if (dup) {
+        setEvmAddrHint("This address is already in the list.", true);
         setPosStatus("Address already added.", true);
         return;
       }
       posState[kind].push(addr);
+      try {
+        savePosState();
+      } catch (e) {
+        posState[kind].pop();
+        setEvmAddrHint("Could not save (storage blocked or full). Check site permissions / free disk.", true);
+        setPosStatus("Save failed — browser storage.", true);
+        return;
+      }
       if (el) el.value = "";
-      savePosState();
       renderChips(kind);
-      setPosStatus("Address added.", false);
+      setPosStatus(kind === "evm" ? "Address added." : "Added.", false);
       if (kind === "evm") scheduleBackgroundWarmup("add");
     }
     function removeAddress(kind, idx) {
@@ -16805,6 +16889,7 @@ def _render_positions_page() -> str:
           if (row.unsupported_protocol) continue;
           const payload = {
             chain: row.chain,
+            chain_id: Number(row.chain_id) || 0,
             protocol: row.protocol,
             pool_id: row.pool_id,
             address: row.address,
@@ -16923,6 +17008,7 @@ def _render_positions_page() -> str:
           }
           const payload = {
             chain: row.chain,
+            chain_id: Number(row.chain_id) || 0,
             protocol: row.protocol,
             pool_id: row.pool_id,
             address: row.address,
@@ -20382,11 +20468,14 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     row = dict(req.row or {})
     if bool(row.get("unsupported_protocol")):
         return {"ok": False, "reason": "unsupported_protocol"}
-    chain_key = str(row.get("chain") or "").strip().lower()
+    try:
+        chain_hint = int(row.get("chain_id") or 0)
+    except Exception:
+        chain_hint = 0
+    chain_id, chain_key = _resolve_chain_id_and_key_for_positions(str(row.get("chain") or ""), chain_hint)
     protocol = str(row.get("protocol") or "").strip().lower()
     owner = str(row.get("address") or "").strip().lower()
     pos_id = str(row.get("position_id") or "").strip()
-    chain_id = _chain_id_by_chain_key(chain_key)
     token_id = _position_token_id_from_raw(pos_id)
     if chain_id <= 0 or token_id <= 0:
         return {"ok": False, "reason": "invalid_row"}
@@ -20448,11 +20537,14 @@ def debug_heavy_protocol_enrich(limit: int = 50) -> dict[str, Any]:
 
 @app.post("/api/positions/pool-value-series")
 def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
-    chain_key = str(req.chain or "").strip().lower()
+    chain_id, chain_key = _resolve_chain_id_and_key_for_positions(
+        str(req.chain or ""),
+        int(getattr(req, "chain_id", 0) or 0),
+    )
     protocol = _normalize_positions_series_protocol(str(req.protocol or ""), for_fees=False)
     pool_id = str(req.pool_id or "").strip().lower()
-    if not chain_key or not pool_id:
-        raise HTTPException(status_code=400, detail="chain and pool_id are required.")
+    if chain_id <= 0 or not chain_key or not pool_id:
+        raise HTTPException(status_code=400, detail="chain (or chain_id) and pool_id are required.")
     if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3"}:
         raise HTTPException(
             status_code=400,
@@ -20463,7 +20555,6 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
     now_ts = int(time.time())
     since_ts = now_ts - int(days) * 86400
 
-    chain_id = _chain_id_by_chain_key(chain_key)
     endpoint = get_graph_endpoint(chain_key, version=version)
     position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
 
@@ -20520,10 +20611,11 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
 @app.post("/api/positions/position-fee-series")
 def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
     """Cumulative fees: subgraph positionSnapshots when reliable; else NPM Collect logs (eth_getLogs)."""
-    chain_key = str(req.chain or "").strip().lower()
+    chain_id, chain_key = _resolve_chain_id_and_key_for_positions(
+        str(req.chain or ""),
+        int(getattr(req, "chain_id", 0) or 0),
+    )
     protocol = _normalize_positions_series_protocol(str(req.protocol or ""), for_fees=True)
-    if not chain_key:
-        raise HTTPException(status_code=400, detail="chain is required.")
     if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3", "pancake_v3_staked"}:
         raise HTTPException(
             status_code=400,
@@ -20534,8 +20626,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     now_ts = int(time.time())
     since_ts = now_ts - int(days) * 86400
 
-    chain_id = _chain_id_by_chain_key(chain_key)
-    if chain_id <= 0:
+    if chain_id <= 0 or not chain_key:
         return {
             "items": [],
             "count": 0,
@@ -20544,8 +20635,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "note": "unknown chain",
             "debug": {
                 "reason": "unknown_chain",
-                "chain_key": chain_key,
+                "chain_key": str(req.chain or "").strip(),
+                "chain_key_resolved": chain_key,
                 "chain_id": 0,
+                "chain_id_hint": int(getattr(req, "chain_id", 0) or 0),
                 "protocol_raw": str(req.protocol or "").strip(),
                 "protocol_normalized": protocol,
             },
@@ -20620,6 +20713,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             and _is_eth_address(token0)
             and _is_eth_address(token1)
         )
+        pm_collect = str(_position_manager_for_protocol(int(chain_id), protocol) or "").strip().lower()
         out: dict[str, Any] = {
             "chain_key": chain_key,
             "chain_id": int(chain_id),
@@ -20635,6 +20729,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "token1_ok": bool(_is_eth_address(token1)),
             "rpc_fallback_eligible": bool(rpc_ok),
             "rpc_fallback_enabled_env": bool(_position_fee_rpc_fallback_enabled()),
+            "npm_address_for_collect": pm_collect if _is_eth_address(pm_collect) else "",
+            "fee_log_chunk_blocks": int(_fee_collect_log_chunk_blocks(int(chain_id))),
+            "fee_log_max_chunks": int(_fee_collect_log_max_chunks(int(chain_id))),
             "subgraph_aggregated_days": int(len(exact_by_day)),
             "subgraph_max_abs_usd": float(sub_max),
             "rpc_aggregated_days": int(len(rpc_by_day)),
