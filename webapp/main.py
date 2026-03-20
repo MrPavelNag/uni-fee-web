@@ -383,6 +383,12 @@ POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK = os.environ.get(
 POSITIONS_NFT_CATALOG_PM_BALANCE_GAP_FILL = os.environ.get(
     "POSITIONS_NFT_CATALOG_PM_BALANCE_GAP_FILL", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
+# Last-resort: eth_getLogs Transfer(to=wallet) on PM when explorer + tokenOfOwnerByIndex miss ids.
+POSITIONS_NFT_GAP_LOG_CHUNK_BLOCKS = max(
+    10_000,
+    min(2_000_000, int(os.environ.get("POSITIONS_NFT_GAP_LOG_CHUNK_BLOCKS", "200000"))),
+)
+POSITIONS_NFT_GAP_LOG_MAX_CHUNKS = max(1, min(120, int(os.environ.get("POSITIONS_NFT_GAP_LOG_MAX_CHUNKS", "40"))))
 POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS = max(
     4,
     min(60, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS", "18"))),
@@ -6057,6 +6063,7 @@ def _position_manager_contracts_for_chain(chain_id: int) -> list[str]:
     out: list[str] = []
     contracts = [
         UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid, ""),
+        UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid, ""),
         PANCAKE_MASTERCHEF_V3_BY_CHAIN_ID.get(cid, ""),
     ]
     if POSITIONS_ENABLE_INFINITY:
@@ -11022,6 +11029,102 @@ def _explorer_tokennfttx_currently_owned_contract_token_ids(
     return out
 
 
+_TRANSFER_TOPIC0_ERC721 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def _erc721_token_id_from_transfer_log_entry(lg: dict[str, Any]) -> int:
+    """tokenId from ERC-721 Transfer log (indexed or only in data)."""
+    topics = lg.get("topics") if isinstance(lg.get("topics"), list) else []
+    if len(topics) >= 4:
+        t3 = str(topics[3] or "").strip().lower()
+        try:
+            return int(t3, 16) if t3.startswith("0x") else int(t3, 10)
+        except Exception:
+            return 0
+    d = str(lg.get("data") or "").strip().lower().replace("0x", "")
+    if len(d) >= 64:
+        try:
+            return int(d[:64], 16)
+        except Exception:
+            return 0
+    return 0
+
+
+def _nft_pm_token_ids_via_transfer_logs_to_owner(
+    chain_id: int,
+    pm_contract: str,
+    owner_lower: str,
+    *,
+    deadline_ts: float | None,
+    max_ids: int,
+    debug_piece: dict[str, Any] | None = None,
+) -> list[int]:
+    """
+    Находит tokenId, которым в логах Transfer назначен `to = owner` (и проверяет ownerOf).
+    Используется, когда tokennfttx и tokenOfOwnerByIndex не дали id при ненулевом balanceOf.
+    """
+    cid = int(chain_id)
+    pm = str(pm_contract or "").strip().lower()
+    o = str(owner_lower or "").strip().lower()
+    if not _is_eth_address(pm) or not _is_eth_address(o):
+        return []
+    need = max(1, min(256, int(max_ids)))
+    try:
+        topic_to = "0x" + _encode_address_word(o if o.startswith("0x") else f"0x{o}")
+    except Exception:
+        return []
+    latest = max(0, int(_eth_block_number(cid)))
+    chunk = int(POSITIONS_NFT_GAP_LOG_CHUNK_BLOCKS)
+    max_chunks = int(POSITIONS_NFT_GAP_LOG_MAX_CHUNKS)
+    candidates: set[int] = set()
+    chunks_ok = 0
+    log_total = 0
+    for ci in range(max_chunks):
+        if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+            break
+        hi = latest - ci * chunk
+        lo = max(0, hi - chunk + 1)
+        if hi < lo:
+            break
+        params = {
+            "fromBlock": hex(int(lo)),
+            "toBlock": hex(int(hi)),
+            "address": pm,
+            "topics": [_TRANSFER_TOPIC0_ERC721, None, topic_to],
+        }
+        try:
+            logs = _eth_get_logs(cid, params, deadline_ts=deadline_ts, max_attempts=2)
+        except Exception:
+            logs = []
+        chunks_ok += 1
+        if not logs:
+            continue
+        for lg in logs:
+            if not isinstance(lg, dict):
+                continue
+            tid = _erc721_token_id_from_transfer_log_entry(lg)
+            if tid > 0:
+                candidates.add(int(tid))
+        log_total += len(logs)
+        if len(candidates) >= need * 8:
+            break
+    verified: list[int] = []
+    for tid in sorted(candidates, reverse=True):
+        if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+            break
+        if len(verified) >= need:
+            break
+        cur = _erc721_owner_of_address_lower(cid, pm, int(tid))
+        if cur == o:
+            verified.append(int(tid))
+    if isinstance(debug_piece, dict):
+        debug_piece["transfer_logs_chunks"] = int(chunks_ok)
+        debug_piece["transfer_logs_entries"] = int(log_total)
+        debug_piece["transfer_logs_candidates"] = int(len(candidates))
+        debug_piece["transfer_logs_verified"] = int(len(verified))
+    return verified
+
+
 def _nft_catalog_fill_pm_owned_gaps_from_balance(
     chain_id: int,
     owner: str,
@@ -11105,17 +11208,39 @@ def _nft_catalog_fill_pm_owned_gaps_from_balance(
             added += 1
             if sum(1 for c, _t in owned_set if c == pm) >= bal_onchain:
                 break
+        have_mid = sum(1 for c, _t in owned_set if c == pm)
+        log_piece: dict[str, Any] = {}
+        if have_mid < bal_onchain and str(proto or "").strip().lower() == "uniswap_v4":
+            need_log = int(bal_onchain) - int(have_mid)
+            extra_ids = _nft_pm_token_ids_via_transfer_logs_to_owner(
+                cid,
+                pm,
+                o,
+                deadline_ts=deadline_ts,
+                max_ids=max(need_log * 3, 48),
+                debug_piece=log_piece,
+            )
+            for tv in extra_ids:
+                if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+                    break
+                if (pm, int(tv)) in owned_set:
+                    continue
+                owned_set.add((pm, int(tv)))
+                added += 1
+                if sum(1 for c, _t in owned_set if c == pm) >= bal_onchain:
+                    break
         have1 = sum(1 for c, _t in owned_set if c == pm)
-        gap_rows.append(
-            {
-                "pm": pm,
-                "balance": bal_onchain,
-                "owned_before": have0,
-                "owned_after": have1,
-                "explorer_candidates": len(cand or []),
-                "added": int(added),
-            }
-        )
+        row_dbg: dict[str, Any] = {
+            "pm": pm,
+            "balance": bal_onchain,
+            "owned_before": have0,
+            "owned_after": have1,
+            "explorer_candidates": len(cand or []),
+            "added": int(added),
+        }
+        if log_piece:
+            row_dbg["transfer_logs"] = log_piece
+        gap_rows.append(row_dbg)
     if isinstance(debug_out, dict) and gap_rows:
         debug_out["nft_pm_balance_gap_fill"] = gap_rows
     return sorted(owned_set, key=lambda x: (x[0], x[1]))
