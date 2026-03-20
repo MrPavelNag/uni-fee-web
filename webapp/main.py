@@ -234,11 +234,24 @@ POSITIONS_SCAN_MAX_SECONDS = max(30, int(os.environ.get("POSITIONS_SCAN_MAX_SECO
 POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY = max(
     30, int(os.environ.get("POSITIONS_SCAN_MAX_SECONDS_CONTRACT_ONLY", str(POSITIONS_SCAN_MAX_SECONDS)))
 )
-POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "6")))
-POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "6")))
-POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "8"))))
+POSITIONS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_PARALLEL_WORKERS", "8")))
+POSITIONS_ADDRESS_PARALLEL_WORKERS = max(1, int(os.environ.get("POSITIONS_ADDRESS_PARALLEL_WORKERS", "8")))
+POSITIONS_NFT_PARALLEL_WORKERS = max(1, min(20, int(os.environ.get("POSITIONS_NFT_PARALLEL_WORKERS", "12"))))
+# Max seconds to block on ThreadPoolExecutor.wait while collecting results (lower = snappier handoff).
+POSITIONS_FUTURES_WAIT_MAX_SEC = max(
+    0.02, min(2.0, float(os.environ.get("POSITIONS_FUTURES_WAIT_MAX_SEC", "0.1")))
+)
+# Parallel Uniswap v4 PM contracts per owner in contract-only mode (multiple manager addresses).
+POSITIONS_V4_PM_PARALLEL_WORKERS = max(1, min(12, int(os.environ.get("POSITIONS_V4_PM_PARALLEL_WORKERS", "5"))))
+# Run explorer-row v3 id extraction and v4 id extraction concurrently in prefetch.
+POSITIONS_PREFETCH_V3_V4_PARALLEL = os.environ.get("POSITIONS_PREFETCH_V3_V4_PARALLEL", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 POSITIONS_CONTRACT_ONLY_ENABLED = os.environ.get("POSITIONS_CONTRACT_ONLY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
-POSITIONS_DISABLE_PARALLELISM = os.environ.get("POSITIONS_DISABLE_PARALLELISM", "1").strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_DISABLE_PARALLELISM = os.environ.get("POSITIONS_DISABLE_PARALLELISM", "0").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_FAST_REMAINING_BUDGET_SEC = max(30, int(os.environ.get("POSITIONS_FAST_REMAINING_BUDGET_SEC", "120")))
 POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC = max(1, int(os.environ.get("POSITIONS_FAST_PER_CHAIN_TIMEOUT_SEC", "2")))
 POSITIONS_FAST_CONTRACT_ONLY_REMAINING_BUDGET_SEC = max(
@@ -340,7 +353,7 @@ POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_RECEIPTS = max(
 )
 POSITIONS_INFINITY_BATCH_SIZE = max(50, min(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_SIZE", "1000"))))
 POSITIONS_INFINITY_BATCH_MAX_CHECKS = max(1000, int(os.environ.get("POSITIONS_INFINITY_BATCH_MAX_CHECKS", "800000")))
-POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(8, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "4"))))
+POSITIONS_INFINITY_BATCH_WORKERS = max(1, min(12, int(os.environ.get("POSITIONS_INFINITY_BATCH_WORKERS", "6"))))
 POSITIONS_RPC_BATCH_MAX_ITEMS = max(10, min(200, int(os.environ.get("POSITIONS_RPC_BATCH_MAX_ITEMS", "80"))))
 POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK = os.environ.get("POSITIONS_INFINITY_DEEP_OWNER_SCAN_FALLBACK", "0").strip().lower() in (
     "1",
@@ -397,6 +410,14 @@ POSITIONS_CUSTODY_OWNER_ALLOWLIST_RAW = str(os.environ.get("POSITIONS_CUSTODY_OW
 POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN_RAW = str(
     os.environ.get("POSITIONS_CUSTODY_OWNER_ALLOWLIST_BY_CHAIN", "")
 ).strip()
+
+
+def _positions_executor_wait_timeout(deadline_ts: float) -> float:
+    """Short interval for ThreadPoolExecutor.wait(FIRST_COMPLETED) during position scans."""
+    now = time.monotonic()
+    if float(deadline_ts) <= now:
+        return 0.01
+    return max(0.01, min(float(POSITIONS_FUTURES_WAIT_MAX_SEC), float(deadline_ts) - now))
 
 
 def _parse_csv_int_set(raw: str) -> set[int]:
@@ -8372,71 +8393,95 @@ def _scan_pool_positions_chain(
         except Exception:
             out["rows"] = owner_rows
 
-        try:
-            t_v3 = time.monotonic()
-            explorer_v3_ids: list[int] = []
-            if _is_eth_address(npm):
-                explorer_v3_ids = _scan_erc721_token_ids_from_explorer_rows(
-                    out.get("rows") or [],
-                    chain_id=int(chain_id),
-                    contract=npm,
-                    owner=owner,
-                    max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
-                    protocol=v3_proto,
-                    only_current_owner=False,
-                )
-            out["v3_ids"] = list(explorer_v3_ids or [])
-            out["v3_ids_count"] = len(explorer_v3_ids)
-            out["v3_ids_elapsed_ms"] = int(round(max(0.0, time.monotonic() - t_v3) * 1000.0))
-        except Exception:
-            pass
+        rows_for_id_scan = list(out.get("rows") or [])
 
-        try:
-            t_v4 = time.monotonic()
-            v4_contract_to_ids: dict[str, list[int]] = {}
-            if _is_eth_address(v4_pm):
-                explorer_v4_ids = _scan_erc721_token_ids_from_explorer_rows(
-                    out.get("rows") or [],
-                    chain_id=int(chain_id),
-                    contract=v4_pm,
-                    owner=owner,
+        def _prefetch_slice_v3_ids() -> dict[str, Any]:
+            piece: dict[str, Any] = {}
+            try:
+                t_v3 = time.monotonic()
+                explorer_v3_ids: list[int] = []
+                if _is_eth_address(npm):
+                    explorer_v3_ids = _scan_erc721_token_ids_from_explorer_rows(
+                        rows_for_id_scan,
+                        chain_id=int(chain_id),
+                        contract=npm,
+                        owner=owner,
+                        max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
+                        protocol=v3_proto,
+                        only_current_owner=False,
+                    )
+                piece["v3_ids"] = list(explorer_v3_ids or [])
+                piece["v3_ids_count"] = len(explorer_v3_ids)
+                piece["v3_ids_elapsed_ms"] = int(round(max(0.0, time.monotonic() - t_v3) * 1000.0))
+            except Exception:
+                piece["v3_ids"] = []
+                piece["v3_ids_count"] = 0
+                piece["v3_ids_elapsed_ms"] = 0
+            return piece
+
+        def _prefetch_slice_v4_ids() -> dict[str, Any]:
+            piece: dict[str, Any] = {}
+            try:
+                t_v4 = time.monotonic()
+                v4_contract_to_ids: dict[str, list[int]] = {}
+                if _is_eth_address(v4_pm):
+                    explorer_v4_ids = _scan_erc721_token_ids_from_explorer_rows(
+                        rows_for_id_scan,
+                        chain_id=int(chain_id),
+                        contract=v4_pm,
+                        owner=owner,
+                        max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
+                        protocol="uniswap_v4",
+                        only_current_owner=True,
+                    )
+                    if explorer_v4_ids:
+                        v4_contract_to_ids[v4_pm] = list(explorer_v4_ids)
+                any_v4 = _scan_v4_position_ids_by_explorer_any_contract(
+                    int(chain_id),
+                    owner,
                     max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
-                    protocol="uniswap_v4",
-                    only_current_owner=True,
+                    owner_rows=rows_for_id_scan,
                 )
-                if explorer_v4_ids:
-                    v4_contract_to_ids[v4_pm] = list(explorer_v4_ids)
-            any_v4 = _scan_v4_position_ids_by_explorer_any_contract(
-                int(chain_id),
-                owner,
-                max_ids=max(20, int(POSITIONS_ONCHAIN_MAX_NFTS)),
-                owner_rows=(out.get("rows") or []),
-            )
-            extra_contracts = 0
-            extra_ids = 0
-            for caddr, ids in (any_v4 or {}).items():
-                if not _is_eth_address(caddr) or not ids:
-                    continue
-                if caddr in v4_contract_to_ids:
-                    seen = set(v4_contract_to_ids[caddr])
-                    for tid in ids:
-                        tv = _parse_int_like(tid)
-                        if tv <= 0 or tv in seen:
-                            continue
-                        seen.add(int(tv))
-                        v4_contract_to_ids[caddr].append(int(tv))
-                    continue
-                v4_contract_to_ids[caddr] = [int(_parse_int_like(t)) for t in ids if _parse_int_like(t) > 0]
-                if v4_contract_to_ids[caddr]:
-                    extra_contracts += 1
-                    extra_ids += len(v4_contract_to_ids[caddr])
-            out["v4_contract_to_ids"] = v4_contract_to_ids
-            out["v4_primary_ids_count"] = len(v4_contract_to_ids.get(v4_pm, [])) if _is_eth_address(v4_pm) else 0
-            out["v4_any_ids_count"] = int(extra_ids)
-            out["v4_any_contracts"] = int(extra_contracts)
-            out["v4_ids_elapsed_ms"] = int(round(max(0.0, time.monotonic() - t_v4) * 1000.0))
-        except Exception:
-            pass
+                extra_contracts = 0
+                extra_ids = 0
+                for caddr, ids in (any_v4 or {}).items():
+                    if not _is_eth_address(caddr) or not ids:
+                        continue
+                    if caddr in v4_contract_to_ids:
+                        seen = set(v4_contract_to_ids[caddr])
+                        for tid in ids:
+                            tv = _parse_int_like(tid)
+                            if tv <= 0 or tv in seen:
+                                continue
+                            seen.add(int(tv))
+                            v4_contract_to_ids[caddr].append(int(tv))
+                        continue
+                    v4_contract_to_ids[caddr] = [int(_parse_int_like(t)) for t in ids if _parse_int_like(t) > 0]
+                    if v4_contract_to_ids[caddr]:
+                        extra_contracts += 1
+                        extra_ids += len(v4_contract_to_ids[caddr])
+                piece["v4_contract_to_ids"] = v4_contract_to_ids
+                piece["v4_primary_ids_count"] = len(v4_contract_to_ids.get(v4_pm, [])) if _is_eth_address(v4_pm) else 0
+                piece["v4_any_ids_count"] = int(extra_ids)
+                piece["v4_any_contracts"] = int(extra_contracts)
+                piece["v4_ids_elapsed_ms"] = int(round(max(0.0, time.monotonic() - t_v4) * 1000.0))
+            except Exception:
+                piece["v4_contract_to_ids"] = {}
+                piece["v4_primary_ids_count"] = 0
+                piece["v4_any_ids_count"] = 0
+                piece["v4_any_contracts"] = 0
+                piece["v4_ids_elapsed_ms"] = 0
+            return piece
+
+        if POSITIONS_PREFETCH_V3_V4_PARALLEL and (not POSITIONS_DISABLE_PARALLELISM):
+            with ThreadPoolExecutor(max_workers=2) as _prefetch_ex:
+                _f_v3 = _prefetch_ex.submit(_prefetch_slice_v3_ids)
+                _f_v4 = _prefetch_ex.submit(_prefetch_slice_v4_ids)
+                out.update(_f_v3.result())
+                out.update(_f_v4.result())
+        else:
+            out.update(_prefetch_slice_v3_ids())
+            out.update(_prefetch_slice_v4_ids())
         with contract_only_explorer_prefetch_lock:
             contract_only_explorer_prefetch_cache[owner_key] = dict(out)
         return dict(out)
@@ -9136,37 +9181,132 @@ def _scan_pool_positions_chain(
                             "contracts": int(prefetch.get("v4_any_contracts") or 0),
                         }
                     )
-                    for pm_addr, pm_ids in list(v4_contract_to_ids.items()):
-                        if time.monotonic() >= deadline_ts:
-                            break
-                        if not _is_eth_address(pm_addr):
-                            continue
-                        t_call = time.monotonic()
+                    pm_scan_items = [
+                        (str(pm_a).strip().lower(), list(pids or []))
+                        for pm_a, pids in list(v4_contract_to_ids.items())
+                        if _is_eth_address(str(pm_a).strip().lower()) and (pids or [])
+                    ]
+
+                    def _contract_only_scan_v4_pm(pm_a: str, pids: list[int]) -> tuple[str, list[dict[str, Any]], int, str]:
+                        t0 = time.monotonic()
+                        if time.monotonic() >= float(deadline_ts):
+                            return pm_a, [], int(round(max(0.0, time.monotonic() - t0) * 1000.0)), ""
+                        try:
+                            rows = _scan_uniswap_v4_positions_onchain(
+                                owner,
+                                int(chain_id),
+                                deadline_ts=deadline_ts,
+                                token_ids_override=list(pids or []),
+                                position_manager=str(pm_a),
+                            )
+                            return (
+                                pm_a,
+                                list(rows or []),
+                                int(round(max(0.0, time.monotonic() - t0) * 1000.0)),
+                                "",
+                            )
+                        except Exception as ex:
+                            return pm_a, [], int(round(max(0.0, time.monotonic() - t0) * 1000.0)), str(ex)[:220]
+
+                    v4_workers = 1
+                    if (
+                        (not POSITIONS_DISABLE_PARALLELISM)
+                        and len(pm_scan_items) > 1
+                        and int(POSITIONS_V4_PM_PARALLEL_WORKERS) > 1
+                    ):
+                        v4_workers = max(1, min(len(pm_scan_items), int(POSITIONS_V4_PM_PARALLEL_WORKERS)))
+                    if v4_workers <= 1:
+                        for pm_addr, pm_ids in pm_scan_items:
+                            if time.monotonic() >= deadline_ts:
+                                break
+                            _set_chain_progress(
+                                "call_contract_only_onchain_uniswap_v4_pm",
+                                version=version,
+                                owner=str(owner),
+                                nft_contract=str(pm_addr),
+                            )
+                            pm_a, v4_rows, elapsed_ms, err_s = _contract_only_scan_v4_pm(pm_addr, pm_ids)
+                            if err_s:
+                                owner_attempts.append(
+                                    {
+                                        "owner_value": owner,
+                                        "owner_type": "onchain",
+                                        "query_mode": "contract_only_onchain_uniswap_v4_pm",
+                                        "count": 0,
+                                        "ok": False,
+                                        "elapsed_ms": int(elapsed_ms),
+                                        "error": str(err_s)[:220],
+                                        "nft_contract": str(pm_a),
+                                    }
+                                )
+                            else:
+                                owner_attempts.append(
+                                    {
+                                        "owner_value": owner,
+                                        "owner_type": "onchain",
+                                        "query_mode": "contract_only_onchain_uniswap_v4_pm",
+                                        "count": len(v4_rows),
+                                        "ok": True,
+                                        "elapsed_ms": int(elapsed_ms),
+                                        "nft_contract": str(pm_a),
+                                    }
+                                )
+                            _merge_positions(v4_rows)
+                    else:
                         _set_chain_progress(
-                            "call_contract_only_onchain_uniswap_v4_pm",
+                            "call_contract_only_onchain_uniswap_v4_pm_parallel",
                             version=version,
                             owner=str(owner),
-                            nft_contract=str(pm_addr),
+                            v4_pm_contracts=int(len(pm_scan_items)),
+                            v4_pm_workers=int(v4_workers),
                         )
-                        v4_rows = _scan_uniswap_v4_positions_onchain(
-                            owner,
-                            int(chain_id),
-                            deadline_ts=deadline_ts,
-                            token_ids_override=list(pm_ids or []),
-                            position_manager=str(pm_addr),
-                        )
-                        owner_attempts.append(
-                            {
-                                "owner_value": owner,
-                                "owner_type": "onchain",
-                                "query_mode": "contract_only_onchain_uniswap_v4_pm",
-                                "count": len(v4_rows),
-                                "ok": True,
-                                "elapsed_ms": int(round(max(0.0, time.monotonic() - t_call) * 1000.0)),
-                                "nft_contract": str(pm_addr),
-                            }
-                        )
-                        _merge_positions(v4_rows)
+                        with ThreadPoolExecutor(max_workers=int(v4_workers)) as v4_pm_ex:
+                            v4_futs = [v4_pm_ex.submit(_contract_only_scan_v4_pm, a, ids) for a, ids in pm_scan_items]
+                            for v4_fut in as_completed(v4_futs):
+                                if time.monotonic() >= deadline_ts:
+                                    break
+                                try:
+                                    pm_a, v4_rows, elapsed_ms, err_s = v4_fut.result()
+                                except Exception as ex:
+                                    owner_attempts.append(
+                                        {
+                                            "owner_value": owner,
+                                            "owner_type": "onchain",
+                                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
+                                            "count": 0,
+                                            "ok": False,
+                                            "elapsed_ms": 0,
+                                            "error": str(ex)[:220],
+                                            "nft_contract": "",
+                                        }
+                                    )
+                                    continue
+                                if err_s:
+                                    owner_attempts.append(
+                                        {
+                                            "owner_value": owner,
+                                            "owner_type": "onchain",
+                                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
+                                            "count": 0,
+                                            "ok": False,
+                                            "elapsed_ms": int(elapsed_ms),
+                                            "error": str(err_s)[:220],
+                                            "nft_contract": str(pm_a),
+                                        }
+                                    )
+                                else:
+                                    owner_attempts.append(
+                                        {
+                                            "owner_value": owner,
+                                            "owner_type": "onchain",
+                                            "query_mode": "contract_only_onchain_uniswap_v4_pm",
+                                            "count": len(v4_rows),
+                                            "ok": True,
+                                            "elapsed_ms": int(elapsed_ms),
+                                            "nft_contract": str(pm_a),
+                                        }
+                                    )
+                                _merge_positions(v4_rows)
                 except Exception as e:
                     elapsed_ms = int(round(max(0.0, time.monotonic() - t_call) * 1000.0)) if "t_call" in locals() else 0
                     owner_attempts.append(
@@ -9974,7 +10114,7 @@ def _scan_pool_positions_chain(
                     owner_timed_out = True
                     aborted = True
                     break
-                timeout = min(0.25, max(0.01, deadline_ts - now))
+                timeout = _positions_executor_wait_timeout(float(deadline_ts))
                 done, not_done = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
                 if not done:
                     pending = set(not_done)
@@ -10131,7 +10271,7 @@ def _scan_pool_positions_chain(
                         v_timed_out = True
                         aborted = True
                         break
-                    timeout = min(0.25, max(0.01, deadline_ts - now))
+                    timeout = _positions_executor_wait_timeout(float(deadline_ts))
                     done, not_done = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
                     if not done:
                         pending = set(not_done)
@@ -10472,7 +10612,7 @@ def _run_pool_chain_batch_parallel(
                 timed_out = True
                 aborted = True
                 break
-            timeout = min(0.25, max(0.01, deadline_ts - now))
+            timeout = _positions_executor_wait_timeout(float(deadline_ts))
             done, not_done = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
             if not done:
                 continue
