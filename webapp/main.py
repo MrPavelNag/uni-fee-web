@@ -3358,6 +3358,7 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
     keep_v3_if_unclaimed_fees: bool = False,
     v3_position_manager: str | None = None,
     v4_position_manager: str | None = None,
+    nft_catalog_trust_v4_pm_ids: bool = False,
 ) -> dict[str, Any]:
     """
     Быстрый отсев сгоревших NFT и позиций с liquidity==0 (Multicall3 aggregate3).
@@ -3367,6 +3368,10 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
     V4 getPositionLiquidity().
 
     v3_position_manager / v4_position_manager — опционально (иначе из мап по chain_id).
+
+    nft_catalog_trust_v4_pm_ids: если True, все token_ids считаются NFT именно на переданном
+    v4 PM (батч из explorer NFT catalog). Тогда пропускаем ownerOf на V4 и не помечаем сбои
+    Multicall как burned/closed — иначе RPC даёт «мигающие» пропажи v4 в UI.
 
     Возвращает dict: open_v3, open_v4, burned, closed_zero_liquidity, unknown, multicall_roundtrips.
     """
@@ -3414,18 +3419,22 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
     need_v4 = [t for t in ids if t not in v3_nft]
     # --- Phase 1b: ownerOf on V4 (candidates not on V3 PM) ---
     if _is_eth_address(v4_pm) and need_v4:
-        for group in _chunks(need_v4):
-            if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                out["unknown"].extend(int(t) for t in group)
-                continue
-            calls = [(v4_pm, True, _nfpm_owner_of_calldata(t)) for t in group]
-            res = _multicall3_aggregate3(cid, calls, deadline_ts=deadline_ts)
-            rounds += 1
-            for tid, (ok, data) in zip(group, res):
-                if ok and len(data) >= 32:
-                    v4_nft.add(int(tid))
-                else:
-                    burned.add(int(tid))
+        if nft_catalog_trust_v4_pm_ids:
+            # Catalog already paired (pm_contract, tokenId); do not infer "burned" from RPC noise.
+            v4_nft.update(int(t) for t in need_v4)
+        else:
+            for group in _chunks(need_v4):
+                if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                    out["unknown"].extend(int(t) for t in group)
+                    continue
+                calls = [(v4_pm, True, _nfpm_owner_of_calldata(t)) for t in group]
+                res = _multicall3_aggregate3(cid, calls, deadline_ts=deadline_ts)
+                rounds += 1
+                for tid, (ok, data) in zip(group, res):
+                    if ok and len(data) >= 32:
+                        v4_nft.add(int(tid))
+                    else:
+                        burned.add(int(tid))
     elif need_v4:
         # Нет адреса V4 PM в мапе — не помечаем как burned, оставляем unknown.
         out["unknown"].extend(int(t) for t in need_v4)
@@ -3460,20 +3469,28 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
     if _is_eth_address(v4_pm) and v4_check:
         for group in _chunks(v4_check):
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                out["unknown"].extend(t for t in group)
+                if nft_catalog_trust_v4_pm_ids:
+                    open_v4.extend(int(t) for t in group)
+                else:
+                    out["unknown"].extend(t for t in group)
                 continue
             calls = [(v4_pm, True, _v4pm_get_liquidity_calldata(t)) for t in group]
             res = _multicall3_aggregate3(cid, calls, deadline_ts=deadline_ts)
             rounds += 1
             for tid, (ok, data) in zip(group, res):
                 if not ok or len(data) < 32:
-                    closed_z.add(int(tid))
+                    if nft_catalog_trust_v4_pm_ids:
+                        open_v4.append(int(tid))
+                    else:
+                        closed_z.add(int(tid))
                     continue
                 try:
                     liq = int.from_bytes(data[-32:], "big", signed=False)
                 except Exception:
                     liq = 0
                 if liq > 0:
+                    open_v4.append(int(tid))
+                elif nft_catalog_trust_v4_pm_ids:
                     open_v4.append(int(tid))
                 else:
                     closed_z.add(int(tid))
@@ -4203,6 +4220,101 @@ def _position_creation_date_cache_set(chain_id: int, protocol: str, position_id:
         POSITION_CREATION_DATE_CACHE[(cid, proto, int(tid))] = d
 
 
+def _position_creation_date_keys_for_row(row: dict[str, Any]) -> list[str]:
+    """
+    Ключи protocol для POSITION_CREATION_DATE_CACHE (порядок важен: сначала explorer_nft, затем on-chain PM).
+    UI-колонка `protocol` (UNI-V3, uniswap_v3, …) не совпадает с внутренними ключами — нормализуем здесь.
+    """
+    keys: list[str] = []
+
+    def _add(k: str) -> None:
+        s = str(k or "").strip().lower()
+        if s and s not in keys:
+            keys.append(s)
+
+    lab = str(row.get("_protocol_label") or "").strip().lower()
+    if lab:
+        _add(lab)
+    try:
+        cid = int(row.get("chain_id") or 0)
+    except Exception:
+        cid = 0
+    pool_lc = str(row.get("pool_id") or "").strip().lower()
+    if cid > 0 and _is_eth_address(pool_lc):
+        npm_u = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        npm_p = str(PANCAKE_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        v4pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        inf_cl = str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        inf_bin = str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        if pool_lc == npm_u:
+            _add("uniswap_v3")
+        if pool_lc == npm_p:
+            _add("pancake_v3")
+        if pool_lc == v4pm:
+            _add("uniswap_v4")
+        if pool_lc == inf_cl:
+            _add("pancake_infinity_cl")
+        if pool_lc == inf_bin:
+            _add("pancake_infinity_bin")
+
+    disp = str(row.get("protocol") or "").strip().lower()
+    if disp in (
+        "uniswap_v3",
+        "uniswap_v4",
+        "pancake_v3",
+        "pancake_v3_staked",
+        "pancake_infinity_cl",
+        "pancake_infinity_bin",
+        "explorer_nft",
+    ):
+        _add(disp)
+    elif disp in ("uni-v3", "univ3"):
+        _add("uniswap_v3")
+    elif disp in ("uni-v4", "univ4"):
+        _add("uniswap_v4")
+    elif disp == "uniswap":
+        _add("uniswap_v3")
+    elif disp.startswith("panc-") or disp.startswith("pancake"):
+        _add("pancake_v3")
+    return keys
+
+
+def _position_creation_date_peek_for_row(row: dict[str, Any]) -> str:
+    try:
+        cid = int(row.get("chain_id") or 0)
+    except Exception:
+        cid = 0
+    pid = str(row.get("position_id") or "").strip()
+    if cid <= 0 or not pid:
+        return ""
+    for proto in _position_creation_date_keys_for_row(row):
+        d = _position_creation_date_peek(cid, proto, pid)
+        if d:
+            return d
+    return ""
+
+
+def _position_creation_date_ymd_for_row(row: dict[str, Any]) -> str:
+    """Первая успешная дата mint по любому подходящему ключу protocol."""
+    try:
+        cid = int(row.get("chain_id") or 0)
+    except Exception:
+        cid = 0
+    pid = str(row.get("position_id") or "").strip()
+    if cid <= 0 or not pid:
+        return ""
+    hit = _position_creation_date_peek_for_row(row)
+    if hit:
+        return hit
+    for proto in _position_creation_date_keys_for_row(row):
+        if not _position_manager_for_protocol(cid, proto):
+            continue
+        d = _position_creation_date_ymd(cid, proto, pid)
+        if d:
+            return d
+    return ""
+
+
 def _explorer_nft_meta_cache_upsert_rows(
     chain_id: int,
     rows: list[dict[str, Any]],
@@ -4296,34 +4408,42 @@ def _explorer_nft_meta_get(chain_id: int, contract: str, position_id: Any) -> di
 def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    keys: list[tuple[int, str, str]] = []
+    work: list[tuple[dict[str, Any], int, str, str]] = []
     seen: set[tuple[int, str, str]] = set()
     for r in rows:
+        if not isinstance(r, dict):
+            continue
         try:
             cid = int(r.get("chain_id") or 0)
         except Exception:
             cid = 0
-        proto = str(r.get("protocol") or "").strip().lower()
         pid = str(r.get("position_id") or "").strip()
-        if cid <= 0 or not proto or not pid:
+        if cid <= 0 or not pid:
             continue
-        k = (cid, proto, pid)
+        protos = _position_creation_date_keys_for_row(r)
+        if not protos:
+            continue
+        k = (cid, "|".join(protos), pid)
         if k in seen:
             continue
         seen.add(k)
-        keys.append(k)
-    if not keys:
+        work.append((r, cid, "|".join(protos), pid))
+    if not work:
         return
     deadline = time.monotonic() + float(POSITIONS_CREATION_DATE_MAX_SECONDS)
-    workers = max(1, min(int(POSITIONS_CREATION_DATE_WORKERS), len(keys)))
+    workers = max(1, min(int(POSITIONS_CREATION_DATE_WORKERS), len(work)))
+
+    def _warm_one(rr: dict[str, Any]) -> None:
+        _position_creation_date_ymd_for_row(rr)
+
     if workers <= 1:
-        for cid, proto, pid in keys:
+        for r0, _c, _pjoin, _pid in work:
             if time.monotonic() >= deadline:
                 break
-            _position_creation_date_ymd(cid, proto, pid)
+            _warm_one(r0)
     else:
         ex = ThreadPoolExecutor(max_workers=workers)
-        futures = [ex.submit(_position_creation_date_ymd, cid, proto, pid) for cid, proto, pid in keys]
+        futures = [ex.submit(_warm_one, r0) for r0, _c, _pjoin, _pid in work]
         aborted = False
         try:
             pending = set(futures)
@@ -4341,15 +4461,9 @@ def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
         finally:
             ex.shutdown(wait=not aborted, cancel_futures=aborted)
     for r in rows:
-        try:
-            cid = int(r.get("chain_id") or 0)
-        except Exception:
-            cid = 0
-        proto = str(r.get("protocol") or "").strip().lower()
-        pid = str(r.get("position_id") or "").strip()
-        if cid <= 0 or not proto or not pid:
+        if not isinstance(r, dict):
             continue
-        d = _position_creation_date_peek(cid, proto, pid)
+        d = _position_creation_date_peek_for_row(r)
         if d:
             r["position_created_date"] = d
 
@@ -4448,11 +4562,10 @@ def _enrich_missing_creation_dates(rows: list[dict[str, Any]], max_seconds: int 
             cid = int(r.get("chain_id") or 0)
         except Exception:
             cid = 0
-        proto = str(r.get("protocol") or "").strip().lower()
         pid = str(r.get("position_id") or "").strip()
-        if cid <= 0 or not proto or not pid:
+        if cid <= 0 or not pid or not _position_creation_date_keys_for_row(r):
             continue
-        d = _position_creation_date_ymd(cid, proto, pid)
+        d = _position_creation_date_ymd_for_row(r)
         if d:
             r["position_created_date"] = d
         checked += 1
@@ -10260,9 +10373,11 @@ def _scan_pool_positions_chain(
         if int(pos_token_id) in POSITIONS_NOT_SPAM_POSITION_IDS:
             suspected_spam = False
 
+        proto_lbl = str(p.get("_protocol_label") or f"uniswap_{version}")
         return {
             "address": owner,
-            "protocol": str(p.get("_protocol_label") or f"uniswap_{version}"),
+            "protocol": proto_lbl,
+            "_protocol_label": proto_lbl,
             "chain": chain_key,
             "chain_id": int(chain_id),
             "kind": "pool",
@@ -10625,6 +10740,8 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
         acc["nft_catalog_explorer_row"] = bool(acc.get("nft_catalog_explorer_row")) or bool(
             row.get("nft_catalog_explorer_row")
         )
+        if not str(acc.get("_protocol_label") or "").strip() and str(row.get("_protocol_label") or "").strip():
+            acc["_protocol_label"] = str(row.get("_protocol_label") or "").strip()
         if row.get("nft_catalog_pm_snapshot_ok") is False:
             acc["nft_catalog_pm_snapshot_ok"] = False
         elif acc.get("nft_catalog_pm_snapshot_ok") is not False and row.get("nft_catalog_pm_snapshot_ok") is True:
@@ -10697,13 +10814,20 @@ def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_
             cid = int(r.get("chain_id") or 0)
         except Exception:
             cid = 0
-        proto = str(r.get("protocol") or "").strip().lower()
         pid = str(r.get("position_id") or "").strip()
-        if cid <= 0 or not proto or not pid:
-            r["position_created_date"] = str(r.get("position_created_date") or "-")
+        existing = str(r.get("position_created_date") or "").strip()
+        if cid <= 0 or not pid or not _position_creation_date_keys_for_row(r):
+            r["position_created_date"] = existing or "-"
             continue
-        d = _position_creation_date_peek(cid, proto, pid)
-        r["position_created_date"] = d if d else "-"
+        d = _position_creation_date_peek_for_row(r)
+        if not d and bool(r.get("nft_catalog_explorer_row")):
+            d = _position_creation_date_ymd_for_row(r)
+        if d:
+            r["position_created_date"] = d
+        elif existing and existing != "-":
+            r["position_created_date"] = existing
+        else:
+            r["position_created_date"] = "-"
 
 
 def _run_pool_chain_scan(
@@ -11493,6 +11617,7 @@ def _nft_catalog_compute_open_liquidity_allowed(
                 deadline_ts=deadline_ts,
                 v3_position_manager=npm if _is_eth_address(npm) else "",
                 v4_position_manager=pm_c,
+                nft_catalog_trust_v4_pm_ids=True,
             )
             for t in frf.get("open_v4") or []:
                 allowed.add((int(cid), pm_c, int(t)))
@@ -11948,15 +12073,15 @@ def _scan_pool_positions_explorer_nft_catalog(
                 if pmk == "v4pm":
                     proto_col = "UNI-V4"
                 elif pmk == "v3npm":
-                    proto_col = _nft_catalog_protocol_display(token_symbol, "Uniswap")
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "UNI-V3")
                 elif pmk == "pancake_v3npm":
-                    proto_col = _nft_catalog_protocol_display(token_symbol, "Pancake")
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "PanC-V3")
                 elif pmk == "infinity_cl":
-                    proto_col = _nft_catalog_protocol_display(token_symbol, "Pancake")
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "PanC-V3")
                 elif "uniswap" in blob:
-                    proto_col = _nft_catalog_protocol_display(token_symbol, "Uniswap")
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "UNI-V3")
                 elif "pancake" in blob:
-                    proto_col = _nft_catalog_protocol_display(token_symbol, "Pancake")
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "PanC-V3")
                 else:
                     proto_col = (token_symbol or "nft").strip()[:24] or "nft"
                 if supported:
@@ -12023,6 +12148,9 @@ def _scan_pool_positions_explorer_nft_catalog(
                     "liquidity_usd": None,
                     "position_created_date": created if created else "-",
                     "unsupported_protocol": bool(unsupported_protocol),
+                    "_protocol_label": (
+                        _EXPLORER_NFT_CATALOG_PROTOCOL if supported else ""
+                    ),
                 }
                 rows_out.append(row)
             if contracts_here:

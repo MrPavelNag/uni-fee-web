@@ -19,6 +19,9 @@
 3. **Префильтр open/closed:** `getPositionLiquidity` через Multicall3: при **`ok=false`/коротком `data`** нельзя считать позицию закрытой.  
    **Идея:** множество **`v4_uncertain`** `(chain_id, pm, token_id)` → в UI сегмент **`unknown`**, затем PM snapshot и финализация сегмента по факту.
 
+3b. **Стабильность v4 в каталоге:** в `filter_uniswap_v3_v4_open_liquidity_token_ids` при сбое `ownerOf` на V4 id попадал в **`burned`**, при сбое liquidity — в **`closed`**, хотя explorer уже привязал `(pm, tokenId)` → строки **мигали**.  
+   **Сделано:** флаг **`nft_catalog_trust_v4_pm_ids=True`** только для батча v4 PM в `_nft_catalog_compute_open_liquidity_allowed` — без ownerOf на V4, при ошибках RPC / `liq==0` id остаётся в **`open_v4`** для allowlist (как `from_explorer_ids` в on-chain scan).
+
 4. **`POSITIONS_NFT_CATALOG_V4_SKIP_CLOSED_PREFILTER=1`** для всех v4 не в whitelist → сегмент **`unknown`** → **все «закрытые» v4 сыплются в основной список**.  
    **Идея:** по умолчанию **выкл.**; закрытые по префильтру снова `closed`; после успешного snapshot для explorer v4 — **`_finalize_v4_catalog_segment`**: пусто → `closed`, иначе `open`.
 
