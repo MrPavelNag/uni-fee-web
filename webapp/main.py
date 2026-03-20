@@ -11614,6 +11614,119 @@ def _explorer_nft_catalog_fetch_telemetry(
     return probe_by_chain, nft_rows_total, owned_total, tasks_failed, api_err_total
 
 
+def _explorer_nft_catalog_balance_vs_explorer_owned_debug(
+    fetch_results: list[dict[str, Any]],
+    *,
+    deadline_ts: float,
+    max_contract_checks: int = 56,
+    max_wall_sec: float = 8.0,
+    max_sample_rows: int = 28,
+) -> dict[str, Any]:
+    """
+    Debug-only: per (chain, wallet, NFT contract) compare ERC-721 balanceOf(wallet) to the number of
+    distinct tokenIds we infer as currently held from tokennfttx rows (same heuristic as catalog).
+
+    If balanceOf > explorer_distinct_ids, explorer pagination / gaps likely missed some NFTs for that contract.
+    Capped by count and wall time so the scan stays bounded.
+    """
+    start = time.monotonic()
+    groups: dict[tuple[int, str, str], set[int]] = {}
+    for fr in fetch_results or []:
+        if not isinstance(fr, dict):
+            continue
+        cid = int(fr.get("chain_id") or 0)
+        owner = str(fr.get("owner") or "").strip().lower()
+        if cid <= 0 or not _is_eth_address(owner):
+            continue
+        owned = fr.get("owned")
+        if not isinstance(owned, list):
+            continue
+        for item in owned:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                caddr = str(item[0] or "").strip().lower()
+                try:
+                    tid = int(item[1])
+                except Exception:
+                    continue
+            else:
+                continue
+            if not _is_eth_address(caddr) or tid <= 0:
+                continue
+            key = (cid, owner, caddr)
+            groups.setdefault(key, set()).add(int(tid))
+
+    keys_sorted = sorted(groups.keys(), key=lambda k: (k[0], k[1], k[2]))
+    summary = {
+        "contracts_checked": 0,
+        "match": 0,
+        "explorer_incomplete": 0,
+        "explorer_excess": 0,
+        "rpc_fail": 0,
+        "skipped_cap": 0,
+        "skipped_time": 0,
+    }
+    samples: list[dict[str, Any]] = []
+    checked = 0
+    for key in keys_sorted:
+        if checked >= int(max_contract_checks):
+            summary["skipped_cap"] = int(len(keys_sorted) - checked)
+            break
+        if time.monotonic() - start >= float(max_wall_sec):
+            summary["skipped_time"] = int(len(keys_sorted) - checked)
+            break
+        if time.monotonic() >= float(deadline_ts):
+            summary["skipped_time"] = int(len(keys_sorted) - checked)
+            break
+        cid, owner, caddr = key
+        ex_n = len(groups[key])
+        bal = _erc721_balance_of(int(cid), caddr, owner)
+        checked += 1
+        summary["contracts_checked"] = int(checked)
+        st = "rpc_fail"
+        delta: int | None = None
+        if bal is None:
+            summary["rpc_fail"] += 1
+        else:
+            b = int(bal)
+            delta = int(b - ex_n)
+            if b == ex_n:
+                st = "match"
+                summary["match"] += 1
+            elif b > ex_n:
+                st = "explorer_incomplete"
+                summary["explorer_incomplete"] += 1
+            else:
+                st = "explorer_excess"
+                summary["explorer_excess"] += 1
+        if len(samples) < int(max_sample_rows):
+            samples.append(
+                {
+                    "chain_id": int(cid),
+                    "contract": caddr,
+                    "owner": owner,
+                    "explorer_distinct_token_ids": int(ex_n),
+                    "balance_of": (int(bal) if bal is not None else None),
+                    "delta": delta,
+                    "status": st,
+                }
+            )
+
+    if checked < len(keys_sorted) and not summary["skipped_cap"] and not summary["skipped_time"]:
+        summary["skipped_cap"] = int(len(keys_sorted) - checked)
+
+    return {
+        "note": (
+            "ERC-721 balanceOf(wallet) vs distinct tokenIds from tokennfttx-derived current ownership "
+            f"(cap={int(max_contract_checks)} contracts, max {float(max_wall_sec)}s). "
+            "explorer_incomplete => chain balance higher than explorer-derived id set (possible API/pagination gaps)."
+        ),
+        "contracts_unique": int(len(keys_sorted)),
+        "elapsed_sec": round(max(0.0, time.monotonic() - start), 3),
+        "summary": summary,
+        "samples": samples,
+    }
+
+
 def _explorer_nft_catalog_owner_chain_scan(
     cid: int,
     ok: str,
@@ -11987,7 +12100,6 @@ def _scan_pool_positions_explorer_nft_catalog(
                 source="explorer_nft_catalog",
             )
 
-    timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
     timings["rows"] = len(rows_out)
     probe_by_chain, nft_rows_total, owned_total, tasks_failed_final, api_err_total_final = (
         _explorer_nft_catalog_fetch_telemetry(fetch_results)
@@ -12000,6 +12112,13 @@ def _scan_pool_positions_explorer_nft_catalog(
     timings["nft_explorer_api_request_failures"] = int(api_err_total_final)
     timings["nft_missing_or_error_events"] = int(tasks_failed_final + api_err_total_final)
     timings["nft_aggregate_merge_sec"] = round(max(0.0, time.monotonic() - t_merge0), 3)
+    t_bal_dbg = time.monotonic()
+    timings["nft_balance_vs_explorer_catalog"] = _explorer_nft_catalog_balance_vs_explorer_owned_debug(
+        fetch_results,
+        deadline_ts=float(deadline_ts),
+    )
+    timings["nft_balance_vs_explorer_debug_sec"] = round(max(0.0, time.monotonic() - t_bal_dbg), 3)
+    timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
     if pos_job_id and n_tasks > 0:
         _update_pos_job(
             pos_job_id,
@@ -15078,6 +15197,18 @@ def _render_positions_page() -> str:
               `owner_light: explorer_eligible=${oe} ownerOf_done=${oc}${os > 0 ? ` unchecked=${os}` : ""} mismatches=${omm}`
             );
           }
+          const bal = (nftDbg && typeof nftDbg.balance_vs_explorer === "object") ? nftDbg.balance_vs_explorer : {};
+          const bs = (bal && typeof bal.summary === "object") ? bal.summary : {};
+          const bchk = Number(bs.contracts_checked || 0);
+          if (bchk > 0 || Number(bal.contracts_unique || 0) > 0) {
+            timingLines.push(
+              `NFT_balance_audit: unique_contracts=${Number(bal.contracts_unique || 0)} checked=${bchk} ` +
+              `match=${Number(bs.match || 0)} explorer_incomplete=${Number(bs.explorer_incomplete || 0)} ` +
+              `excess=${Number(bs.explorer_excess || 0)} rpc_fail=${Number(bs.rpc_fail || 0)} ` +
+              `skip_cap=${Number(bs.skipped_cap || 0)} skip_time=${Number(bs.skipped_time || 0)} ` +
+              `t=${Number(bal.debug_phase_sec || 0).toFixed(2)}s`
+            );
+          }
           const probe = Array.isArray(pool.nft_probe_by_chain) ? pool.nft_probe_by_chain : [];
           if (probe.length) {
             const bits = probe.slice(0, 6).map((p) => {
@@ -18050,6 +18181,28 @@ def _build_positions_scan_response(
                 (debug_timings or {}).get("nft_catalog_owner_light_explorer_unchecked") or 0
             ),
         }
+        bal_raw = pool_t.get("nft_balance_vs_explorer_catalog")
+        if isinstance(bal_raw, dict):
+            sum_b = bal_raw.get("summary") if isinstance(bal_raw.get("summary"), dict) else {}
+            debug_payload["nft_scan"]["balance_vs_explorer"] = {
+                "contracts_unique": int(bal_raw.get("contracts_unique") or 0),
+                "elapsed_sec": float(bal_raw.get("elapsed_sec") or 0.0),
+                "debug_phase_sec": float(pool_t.get("nft_balance_vs_explorer_debug_sec") or 0.0),
+                "summary": {
+                    "contracts_checked": int(sum_b.get("contracts_checked") or 0),
+                    "match": int(sum_b.get("match") or 0),
+                    "explorer_incomplete": int(sum_b.get("explorer_incomplete") or 0),
+                    "explorer_excess": int(sum_b.get("explorer_excess") or 0),
+                    "rpc_fail": int(sum_b.get("rpc_fail") or 0),
+                    "skipped_cap": int(sum_b.get("skipped_cap") or 0),
+                    "skipped_time": int(sum_b.get("skipped_time") or 0),
+                },
+            }
+            if include_debug_details:
+                debug_payload["nft_scan"]["balance_vs_explorer"]["note"] = str(bal_raw.get("note") or "")
+                samp = bal_raw.get("samples")
+                if isinstance(samp, list):
+                    debug_payload["nft_scan"]["balance_vs_explorer"]["samples"] = samp[:40]
     return {
         "pool_positions": pool_rows,
         "lending_positions": lending_rows,
