@@ -98,7 +98,7 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-APP_VERSION = "0.0.3"
+APP_VERSION = "0.1.4"
 APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
@@ -11237,6 +11237,11 @@ def _explorer_nft_catalog_is_uniswap_or_pancake(token_name: str, token_symbol: s
     return "uniswap" in blob or "pancake" in blob
 
 
+# NFT rows: explorer tokenName/tokenSymbol are often missing on tokennfttx; still treat as DEX LP if
+# the contract matches our v3 NPM / v4 PM registry for that chain_id.
+_NFT_CATALOG_KNOWN_PM_KINDS: frozenset[str] = frozenset({"v3npm", "pancake_v3npm", "v4pm", "infinity_cl"})
+
+
 def _nft_catalog_v3_pos_symbol_compact(token_symbol: str) -> str | None:
     """
     Общее правило для explorer-символов вида *V3*POS / *V3POS (любой DEX-префикс).
@@ -11438,12 +11443,15 @@ def _nft_catalog_compute_open_liquidity_allowed(
                 continue
             if tid_i <= 0 or not _is_eth_address(c):
                 continue
+            kind = _explorer_nft_contract_pm_kind(cid, c)
             meta = _explorer_nft_meta_get(cid, c, tid_i)
             tn = str(meta.get("token_name") or "")
             tsym = str(meta.get("token_symbol") or "")
-            if not _explorer_nft_catalog_is_uniswap_or_pancake(tn, tsym):
+            meta_dex = _explorer_nft_catalog_is_uniswap_or_pancake(tn, tsym)
+            # Without this, v4/v3 PM NFTs with empty tokenName on Arbiscan never enter liquidity multicall
+            # and look "missing" or land only on unsupported/closed heuristics.
+            if kind not in _NFT_CATALOG_KNOWN_PM_KINDS and not meta_dex:
                 continue
-            kind = _explorer_nft_contract_pm_kind(cid, c)
             if kind in ("v3npm", "pancake_v3npm"):
                 v3_batches[(cid, c)].append(tid_i)
             elif kind in ("v4pm", "infinity_cl"):
@@ -11918,21 +11926,34 @@ def _scan_pool_positions_explorer_nft_catalog(
                         created = datetime.fromtimestamp(ts_first, tz=timezone.utc).date().isoformat()
                     except Exception:
                         created = ""
+                pmk = _explorer_nft_contract_pm_kind(int(cid), str(contract))
+                if (not token_name) and (not token_symbol) and pmk == "v4pm":
+                    pair_disp = f"Uniswap v4 position #{tid}"
+                elif (not token_name) and (not token_symbol) and pmk == "v3npm":
+                    pair_disp = f"Uniswap v3 position #{tid}"
                 # Scam NFTs often put "PancakeSwap" / "CAKE" in metadata; reject before treating as DEX catalog row.
                 is_phishing_meta = bool(_explorer_nft_metadata_obvious_phishing(token_name, token_symbol))
                 if is_phishing_meta:
                     supported = False
                 else:
-                    supported = _explorer_nft_catalog_is_uniswap_or_pancake(token_name, token_symbol)
+                    meta_dex = _explorer_nft_catalog_is_uniswap_or_pancake(token_name, token_symbol)
+                    supported = bool(meta_dex or (pmk in _NFT_CATALOG_KNOWN_PM_KINDS))
                 unsupported_protocol = not supported
-                pmk = _explorer_nft_contract_pm_kind(int(cid), str(contract))
                 _olk = (int(cid), str(contract).strip().lower(), int(tid))
                 catalog_segment = "unknown"
                 if supported and pmk:
                     if nft_open_allowed is not None:
                         catalog_segment = "open" if _olk in nft_open_allowed else "closed"
                 blob = f"{token_name} {token_symbol}".lower()
-                if "uniswap" in blob:
+                if pmk == "v4pm":
+                    proto_col = "UNI-V4"
+                elif pmk == "v3npm":
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "Uniswap")
+                elif pmk == "pancake_v3npm":
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "Pancake")
+                elif pmk == "infinity_cl":
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "Pancake")
+                elif "uniswap" in blob:
                     proto_col = _nft_catalog_protocol_display(token_symbol, "Uniswap")
                 elif "pancake" in blob:
                     proto_col = _nft_catalog_protocol_display(token_symbol, "Pancake")
@@ -14044,6 +14065,15 @@ def _render_placeholder_page(
       color: #475569;
       margin: 0;
     }}
+    .app-footer {{
+      margin-top: 20px;
+      padding-top: 14px;
+      border-top: 1px solid #dbe3ef;
+      text-align: center;
+      font-size: 12px;
+      color: #64748b;
+      letter-spacing: 0.02em;
+    }}
     {extra_css}
   </style>
 </head>
@@ -14064,6 +14094,7 @@ def _render_placeholder_page(
     </div>
     {intro_html}
     {extra_html}
+    <footer class="app-footer">Uni Fee v{APP_VERSION}</footer>
   </div>
   <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
     <div class="wallet-modal">
@@ -16266,6 +16297,7 @@ def _render_admin_page() -> str:
       .ticket-reply-block {{ grid-template-columns: 1fr; }}
       .ticket-actions {{ flex-direction: row; flex-wrap: wrap; }}
     }}
+    .app-footer {{ margin-top: 20px; padding-top: 14px; border-top: 1px solid #dbe3ef; text-align: center; font-size: 12px; color: #64748b; letter-spacing: 0.02em; }}
   </style>
 </head>
 <body>
@@ -16387,6 +16419,7 @@ def _render_admin_page() -> str:
         </div>
       </section>
     </div>
+    <footer class="app-footer">Uni Fee v{APP_VERSION}</footer>
   </div>
   <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
     <div class="wallet-modal">
@@ -16974,6 +17007,7 @@ def _render_help_page() -> str:
     .wallet-item.disabled {{ opacity: 0.6; cursor: not-allowed; }}
     .wallet-note {{ color: #64748b; font-size: 12px; margin-top: 8px; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} .compose-row {{ grid-template-columns: 1fr; }} .compose-row .btn {{ width: 100%; }} }}
+    .app-footer {{ margin-top: 20px; padding-top: 14px; border-top: 1px solid #dbe3ef; text-align: center; font-size: 12px; color: #64748b; letter-spacing: 0.02em; }}
   </style>
 </head>
 <body>
@@ -17020,6 +17054,7 @@ def _render_help_page() -> str:
         <div id="myTickets">Loading tickets...</div>
       </section>
     </div>
+    <footer class="app-footer">Uni Fee v{APP_VERSION}</footer>
   </div>
   <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
     <div class="wallet-modal">
@@ -17241,7 +17276,10 @@ def _render_help_page() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
-    html = HTML_PAGE.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+    html = (
+        HTML_PAGE.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+        .replace("__APP_VERSION__", APP_VERSION)
+    )
     resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
     _analytics_log_event(session_id=sid, event_type="page_view", path="/")
@@ -19553,6 +19591,15 @@ HTML_PAGE = """
       .summary-strip { gap: 6px; }
       .summary-box { min-width: 150px; }
     }
+    .app-footer {
+      margin-top: 20px;
+      padding-top: 14px;
+      border-top: 1px solid #dbe3ef;
+      text-align: center;
+      font-size: 12px;
+      color: #64748b;
+      letter-spacing: 0.02em;
+    }
   </style>
 </head>
 <body>
@@ -19693,6 +19740,7 @@ HTML_PAGE = """
         </div>
       </section>
     </div>
+    <footer class="app-footer">Uni Fee v__APP_VERSION__</footer>
   </div>
 
   <div id="walletModalBackdrop" class="wallet-modal-backdrop" onclick="closeWalletModal(event)">
