@@ -341,6 +341,9 @@ POSITIONS_HEAVY_ENRICH_DEBUG_HTTP = os.environ.get("POSITIONS_HEAVY_ENRICH_DEBUG
 _NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS: frozenset[str] = frozenset(
     {"uniswap_v4", "pancake_infinity_cl", "pancake_infinity_bin"}
 )
+# Разделение сканера: только NPM Uniswap/Pancake v3 vs Uniswap v4 + Pancake Infinity.
+_POOL_SCAN_PROFILE_V3_PM_KINDS: frozenset[str] = frozenset({"v3npm", "pancake_v3npm"})
+_POOL_SCAN_PROFILE_HEAVY_PM_KINDS: frozenset[str] = frozenset({"v4pm", "infinity_cl", "infinity_bin"})
 _HEAVY_ENRICH_DEBUG_LOCK = threading.Lock()
 # HTTP read timeout per explorer tokennfttx request (slow indexers / large pages).
 POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC = max(
@@ -11761,6 +11764,59 @@ def _explorer_nft_contract_pm_kind(chain_id: int, contract: str) -> str:
     return ""
 
 
+def _normalize_pool_scan_profile(raw: Any) -> str:
+    s = str(raw or "v3").strip().lower()
+    return s if s in ("v3", "heavy") else "v3"
+
+
+def _nft_catalog_pmk_matches_pool_scan_profile(pmk: str, profile: str) -> bool:
+    p = _normalize_pool_scan_profile(profile)
+    k = str(pmk or "").strip().lower()
+    if p == "v3":
+        return k in _POOL_SCAN_PROFILE_V3_PM_KINDS
+    if p == "heavy":
+        return k in _POOL_SCAN_PROFILE_HEAVY_PM_KINDS
+    return True
+
+
+def _pool_row_matches_scan_profile(row: dict[str, Any], profile: str) -> bool:
+    """Строка пула после aggregate/graph: отнести к профилю v3 или heavy."""
+    p = _normalize_pool_scan_profile(profile)
+    if not isinstance(row, dict):
+        return False
+    cid = int(row.get("chain_id") or 0) or int(_chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
+    pool = str(row.get("pool_id") or "").strip().lower()
+    if cid > 0 and _is_eth_address(pool):
+        pmk = _explorer_nft_contract_pm_kind(cid, pool)
+        if pmk:
+            return _nft_catalog_pmk_matches_pool_scan_profile(pmk, p)
+    proto = str(row.get("protocol") or "").strip().lower()
+    lbl = str(row.get("_protocol_label") or "").strip().lower()
+    if p == "v3":
+        return proto in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"} or lbl in {
+            "uniswap_v3",
+            "pancake_v3",
+            "pancake_v3_staked",
+        }
+    return proto in _NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS or lbl in _NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS or (
+        lbl.startswith("pancake_infinity_")
+    )
+
+
+def _filter_pool_rows_for_scan_profile(rows: list[dict[str, Any]], profile: str) -> list[dict[str, Any]]:
+    prof = _normalize_pool_scan_profile(profile)
+    return [r for r in (rows or []) if isinstance(r, dict) and _pool_row_matches_scan_profile(r, prof)]
+
+
+def _positions_scan_request_with_updates(req: PositionsScanRequest, **updates: Any) -> PositionsScanRequest:
+    """Pydantic v1/v2: копия запроса с подменой полей."""
+    if hasattr(req, "model_copy"):
+        return req.model_copy(update=updates)
+    base = req.dict() if hasattr(req, "dict") else dict(req)
+    base.update(updates)
+    return PositionsScanRequest(**base)
+
+
 def _nft_catalog_row_enrich_protocol(row: dict[str, Any]) -> str:
     """Внутренний ключ протокола для on-chain positions() / quotes (строка NFT-каталога)."""
     if not isinstance(row, dict):
@@ -11952,27 +12008,34 @@ def _enrich_nft_catalog_rows_from_chain(
     max_rows: int = 220,
     pos_job_id: str | None = None,
     session_id: str = "",
+    nft_enrich_profile: str = "all",
 ) -> tuple[int, int, dict[str, Any]]:
-    """NFT-каталог: (1) тяжёлые v4/Infinity — отдельный бюджет; (2) лёгкий v3 через positions().
+    """NFT-каталог: heavy (v4/Infinity) и/или light (v3 positions()).
 
-    Раньше лёгкая фаза шла первой и часто съедала весь max_seconds (~26s), после чего
-    t_left < 1s и параллельный v4-snapshot не запускался — строки оставались explorer/brown.
+    nft_enrich_profile: ``all`` (оба), ``v3`` (только NPM v3), ``heavy`` (только v4/Infinity PM snapshot).
     """
+    ep = str(nft_enrich_profile or "all").strip().lower()
+    if ep not in ("all", "v3", "heavy"):
+        ep = "all"
     start = time.monotonic()
     ok_n = 0
     fail_n = 0
     heavy_stats: dict[str, Any] = {"heavy_ok": 0, "heavy_fail": 0, "heavy_pipeline": bool(POSITIONS_NFT_HEAVY_PIPELINE)}
     ms = float(max_seconds)
+    run_heavy = ep in ("all", "heavy") and POSITIONS_NFT_HEAVY_PIPELINE
+    run_light = ep in ("all", "v3")
 
-    if POSITIONS_NFT_HEAVY_PIPELINE:
+    if run_heavy:
         heavy_candidates = _nft_catalog_heavy_enrich_candidate_rows(rows)
         if heavy_candidates:
-            # Доля окна под heavy + верхний предел из env; оставляем ≥2s на лёгкий проход.
-            heavy_budget = min(
-                float(POSITIONS_NFT_HEAVY_MAX_SECONDS),
-                max(6.0, ms * 0.5),
-                max(0.0, ms - 2.0),
-            )
+            if ep == "heavy":
+                heavy_budget = min(float(POSITIONS_NFT_HEAVY_MAX_SECONDS), max(1.5, ms - 0.5))
+            else:
+                heavy_budget = min(
+                    float(POSITIONS_NFT_HEAVY_MAX_SECONDS),
+                    max(6.0, ms * 0.5),
+                    max(0.0, ms - 2.0),
+                )
             if heavy_budget >= 1.5:
                 h_ok, h_fail = _enrich_nft_catalog_heavy_rows_parallel(
                     rows,
@@ -11985,49 +12048,50 @@ def _enrich_nft_catalog_rows_from_chain(
                 heavy_stats["heavy_ok"] = int(h_ok)
                 heavy_stats["heavy_fail"] = int(h_fail)
 
-    for row in rows or []:
-        if time.monotonic() - start >= ms:
-            break
-        if ok_n >= int(max_rows):
-            break
-        if not isinstance(row, dict):
-            continue
-        if bool(row.get("unsupported_protocol")):
-            continue
-        proto = _nft_catalog_row_enrich_protocol(row)
-        if not proto:
-            continue
-        if _nft_catalog_row_is_heavy_enrich_protocol(proto):
-            continue
-        chain_id = int(row.get("chain_id") or 0) or int(_chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
-        token_id = _position_token_id_from_raw(row.get("position_id"))
-        owner = str(row.get("address") or "").strip().lower()
-        if chain_id <= 0 or token_id <= 0:
-            continue
-        seg = str(row.get("catalog_segment") or "").strip().lower()
-        is_ex_nft = _nft_catalog_row_is_explorer_tokennfttx(row)
-        if seg == "closed":
-            continue
-        try:
-            snap = _fetch_v3_position_contract_snapshot(chain_id, proto, int(token_id), owner)
-            if not isinstance(snap, dict):
+    if run_light:
+        for row in rows or []:
+            if time.monotonic() - start >= ms:
+                break
+            if ok_n >= int(max_rows):
+                break
+            if not isinstance(row, dict):
+                continue
+            if bool(row.get("unsupported_protocol")):
+                continue
+            proto = _nft_catalog_row_enrich_protocol(row)
+            if not proto:
+                continue
+            if _nft_catalog_row_is_heavy_enrich_protocol(proto):
+                continue
+            chain_id = int(row.get("chain_id") or 0) or int(_chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
+            token_id = _position_token_id_from_raw(row.get("position_id"))
+            owner = str(row.get("address") or "").strip().lower()
+            if chain_id <= 0 or token_id <= 0:
+                continue
+            seg = str(row.get("catalog_segment") or "").strip().lower()
+            is_ex_nft = _nft_catalog_row_is_explorer_tokennfttx(row)
+            if seg == "closed":
+                continue
+            try:
+                snap = _fetch_v3_position_contract_snapshot(chain_id, proto, int(token_id), owner)
+                if not isinstance(snap, dict):
+                    if is_ex_nft:
+                        row["nft_catalog_pm_snapshot_ok"] = False
+                        row["nft_catalog_pm_snapshot_reason"] = "position_snapshot_unavailable"
+                    fail_n += 1
+                    continue
+                updates = _build_row_updates_from_snapshot(row, snap, chain_id)
+                row.update(updates)
+                if is_ex_nft:
+                    row["nft_catalog_pm_snapshot_ok"] = True
+                    row["nft_catalog_pm_snapshot_reason"] = ""
+                ok_n += 1
+            except Exception:
                 if is_ex_nft:
                     row["nft_catalog_pm_snapshot_ok"] = False
                     row["nft_catalog_pm_snapshot_reason"] = "position_snapshot_unavailable"
                 fail_n += 1
                 continue
-            updates = _build_row_updates_from_snapshot(row, snap, chain_id)
-            row.update(updates)
-            if is_ex_nft:
-                row["nft_catalog_pm_snapshot_ok"] = True
-                row["nft_catalog_pm_snapshot_reason"] = ""
-            ok_n += 1
-        except Exception:
-            if is_ex_nft:
-                row["nft_catalog_pm_snapshot_ok"] = False
-                row["nft_catalog_pm_snapshot_reason"] = "position_snapshot_unavailable"
-            fail_n += 1
-            continue
 
     return ok_n, fail_n, heavy_stats
 
@@ -12317,16 +12381,19 @@ def _scan_pool_positions_explorer_nft_catalog(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     pos_job_id: str | None = None,
+    pool_scan_profile: str = "v3",
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
     """tokennfttx: parallel across chains only; wallets on the same chain run sequentially (one HTTP stream per chain).
 
     pre_enqueued_ownership_refresh / hard_scan mirror _scan_pool_positions() and are recorded in timings for debugging.
     """
+    prof = _normalize_pool_scan_profile(pool_scan_profile)
     rows_out: list[dict[str, Any]] = []
     errors: list[str] = []
     debug_rows: list[dict[str, Any]] = []
     timings: dict[str, Any] = {
         "mode": "explorer_nft_catalog",
+        "pool_scan_profile": prof,
         "pre_enqueued_ownership_refresh": bool(pre_enqueued_ownership_refresh),
         "hard_scan": bool(hard_scan),
     }
@@ -12547,6 +12614,8 @@ def _scan_pool_positions_explorer_nft_catalog(
                     except Exception:
                         created = ""
                 pmk = _explorer_nft_contract_pm_kind(int(cid), str(contract))
+                if not _nft_catalog_pmk_matches_pool_scan_profile(pmk, prof):
+                    continue
                 if (not token_name) and (not token_symbol) and pmk == "v4pm":
                     pair_disp = f"Uniswap v4 position #{tid}"
                 elif (not token_name) and (not token_symbol) and pmk == "v3npm":
@@ -12711,6 +12780,7 @@ def _scan_pool_positions(
     pre_enqueued_ownership_refresh: bool = False,
     hard_scan: bool = False,
     pos_job_id: str | None = None,
+    pool_scan_profile: str = "v3",
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         return _scan_pool_positions_explorer_nft_catalog(
@@ -12720,6 +12790,7 @@ def _scan_pool_positions(
             pre_enqueued_ownership_refresh=pre_enqueued_ownership_refresh,
             hard_scan=hard_scan,
             pos_job_id=pos_job_id,
+            pool_scan_profile=pool_scan_profile,
         )
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -12857,6 +12928,8 @@ def _scan_pool_positions(
     rows_before_aggregate = len(rows)
     t_agg = time.monotonic()
     uniq_rows = _aggregate_pool_rows_by_owner_protocol_pool(rows)
+    uniq_rows = _filter_pool_rows_for_scan_profile(uniq_rows, pool_scan_profile)
+    timings["pool_scan_profile"] = _normalize_pool_scan_profile(pool_scan_profile)
     timings["aggregate_rows_sec"] = round(max(0.0, time.monotonic() - t_agg), 3)
     t_liq = time.monotonic()
     _enrich_rows_liquidity_usd(uniq_rows, max_seconds=4 if not hard_scan else 10)
@@ -14363,9 +14436,11 @@ class PositionsScanRequest(BaseModel):
     solana_addresses: list[str] = Field(default_factory=list)
     tron_addresses: list[str] = Field(default_factory=list)
     include_pools: bool = True
-    include_lending: bool = True
-    include_rewards: bool = True
+    include_lending: bool = False
+    include_rewards: bool = False
     hard_scan: bool = False
+    # v3 = только Uniswap/Pancake v3 NPM; heavy = Uniswap v4 + Pancake Infinity.
+    pool_scan_profile: str = Field(default="v3")
     # Backward-compatible fields from the previous UI version.
     addresses: list[str] = Field(default_factory=list)
     chain_ids: list[int] = Field(default_factory=list)
@@ -15113,7 +15188,8 @@ def _render_positions_page() -> str:
     }
     .positions-form h3, .result-card h3 { margin:0; font-size:17px; color:#1f3a8a; }
     .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; min-width:0; }
-    .address-columns { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+    .address-columns { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
+    .stables-address-columns { grid-template-columns:repeat(3, minmax(0, 1fr)); }
     .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
     .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
     .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; }
@@ -15165,6 +15241,8 @@ def _render_positions_page() -> str:
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
     #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
+    #posHeavyPoolsTable { min-width: 1100px; table-layout: auto; }
+    #posHeavyPoolsTable th, #posHeavyPoolsTable td { white-space: nowrap; }
     .pos-pools-tab-bar { display: none; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
     .pos-tab-btn {
       border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
@@ -15221,30 +15299,24 @@ def _render_positions_page() -> str:
         <div class="address-columns">
           <div class="addr-box">
             <div class="addr-input-row">
-              <input id="evmInput" placeholder="0x..." />
+              <input id="evmInput" placeholder="0x… EVM address" />
               <button class="btn btn-plus" type="button" onclick="addAddress('evm')" aria-label="Add EVM address">+</button>
             </div>
             <div class="chips" id="evmChips"></div>
           </div>
-          <div class="addr-box">
-            <div class="addr-input-row">
-              <input id="solanaInput" placeholder="Solana address" />
-              <button class="btn btn-plus" type="button" onclick="addAddress('solana')" aria-label="Add Solana address">+</button>
-            </div>
-            <div class="chips" id="solanaChips"></div>
-          </div>
-          <div class="addr-box">
-            <div class="addr-input-row">
-              <input id="tronInput" placeholder="TRON address" />
-              <button class="btn btn-plus" type="button" onclick="addAddress('tron')" aria-label="Add TRON address">+</button>
-            </div>
-            <div class="chips" id="tronChips"></div>
+          <div class="addr-box" style="border-style:dashed">
+            <h4 style="margin:0 0 6px;font-size:14px;color:#1e3a8a">Как это устроено</h4>
+            <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.45;color:#334155">
+              <li><b>V3 (первая таблица)</b> — только Uniswap v3 и PancakeSwap v3 через NPM (включая staked в MasterChef).</li>
+              <li><b>V4 / Infinity (вторая таблица)</b> — отдельный скан: NFT из обозревателя + Position Manager Uniswap v4 и Pancake Infinity (CL/Bin).</li>
+              <li><b>Solana и TRON</b> здесь не поддерживаются; нужны только EVM-кошельки 0x…</li>
+            </ul>
           </div>
         </div>
       </section>
       <section class="result-card">
         <div class="section-head">
-          <h3>Pool positions</h3>
+          <h3>Uniswap v3 / PancakeSwap v3</h3>
           <div class="section-actions">
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
@@ -15272,6 +15344,21 @@ def _render_positions_page() -> str:
       </section>
       <section class="result-card">
         <div class="section-head">
+          <h3>Uniswap v4 / Pancake Infinity</h3>
+          <div class="section-actions">
+            <div id="posHeavyProgress" class="pos-progress"><div class="bar"></div></div>
+            <span class="pos-status" id="posHeavyStatus">Готово</span>
+            <button id="posHeavySearchBtn" class="search-link-btn" type="button" onclick="scanHeavyPositions()">Скан v4 / Infinity</button>
+          </div>
+        </div>
+        <div id="posHeavyPoolsBody" class="section-body">
+          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Используются те же EVM-адреса. Запуск независим от таблицы v3.</p>
+          <div class="table-wrap"><table id="posHeavyPoolsTable"></table></div>
+          <div id="posHeavyErrors"></div>
+        </div>
+      </section>
+      <section class="result-card">
+        <div class="section-head">
           <h3>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:72px;margin-left:6px"/></h3>
           <div class="section-actions">
             <span class="pos-status" id="posHistoryStatus">Select pools and click Search</span>
@@ -15284,25 +15371,19 @@ def _render_positions_page() -> str:
     """
     extra_script = """
     function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
-    const posState = { evm: [], solana: [], tron: [] };
+    const posState = { evm: [] };
     const POS_STORAGE_KEY = "positions_form_v2";
     function validAddress(kind, value) {
       const v = String(value || "").trim();
       if (!v) return false;
       if (kind === "evm") return /^0x[a-fA-F0-9]{40}$/.test(v);
-      if (kind === "solana") return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
-      if (kind === "tron") return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(v);
       return false;
     }
     function inputId(kind) {
-      if (kind === "evm") return "evmInput";
-      if (kind === "solana") return "solanaInput";
-      return "tronInput";
+      return "evmInput";
     }
     function chipsId(kind) {
-      if (kind === "evm") return "evmChips";
-      if (kind === "solana") return "solanaChips";
-      return "tronChips";
+      return "evmChips";
     }
     function savePosState() {
       localStorage.setItem(POS_STORAGE_KEY, JSON.stringify(posState));
@@ -15312,7 +15393,7 @@ def _render_positions_page() -> str:
         const raw = localStorage.getItem(POS_STORAGE_KEY);
         if (!raw) return;
         const parsed = JSON.parse(raw);
-        for (const k of ["evm", "solana", "tron"]) {
+        for (const k of ["evm"]) {
           if (Array.isArray(parsed[k])) posState[k] = parsed[k].map((x) => String(x || "").trim()).filter(Boolean);
         }
       } catch (_) {}
@@ -15329,8 +15410,6 @@ def _render_positions_page() -> str:
     }
     function renderAllChips() {
       renderChips("evm");
-      renderChips("solana");
-      renderChips("tron");
     }
     function addAddress(kind) {
       const el = document.getElementById(inputId(kind));
@@ -15361,6 +15440,12 @@ def _render_positions_page() -> str:
     }
     const posSectionState = {pools: false};
     const posCache = {pools: [], debug: null};
+    const posHeavyCache = {pools: [], debug: null};
+    const POS_HEAVY_RESULTS_STORAGE_KEY = "positions_heavy_scan_results_v1";
+    const POS_ACTIVE_HEAVY_JOB_KEY = "positions_active_heavy_job_v1";
+    let posHeavyHasScannedOnce = false;
+    let posHeavyLastStatusText = "";
+    let posHeavyLastStatusErr = false;
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
@@ -15434,10 +15519,52 @@ def _render_positions_page() -> str:
       if (el) el.style.display = flag ? "block" : "none";
       if (scanBtn) scanBtn.disabled = !!flag;
     }
+    function setHeavyStatus(text, isErr) {
+      const el = document.getElementById("posHeavyStatus");
+      if (!el) return;
+      const nextText = String(text || "");
+      const nextErr = !!isErr;
+      if (nextText === posHeavyLastStatusText && nextErr === posHeavyLastStatusErr) return;
+      posHeavyLastStatusText = nextText;
+      posHeavyLastStatusErr = nextErr;
+      el.textContent = nextText;
+      el.style.color = nextErr ? "#b91c1c" : "#475569";
+    }
+    function setHeavyBusy(flag) {
+      const el = document.getElementById("posHeavyProgress");
+      const scanBtn = document.getElementById("posHeavySearchBtn");
+      if (el) el.style.display = flag ? "block" : "none";
+      if (scanBtn) scanBtn.disabled = !!flag;
+    }
+    function saveActiveHeavyPosJob(jobId) {
+      try {
+        if (jobId) localStorage.setItem(POS_ACTIVE_HEAVY_JOB_KEY, String(jobId));
+        else localStorage.removeItem(POS_ACTIVE_HEAVY_JOB_KEY);
+      } catch (_) {}
+    }
+    function loadActiveHeavyPosJob() {
+      try { return String(localStorage.getItem(POS_ACTIVE_HEAVY_JOB_KEY) || "").trim(); } catch (_) { return ""; }
+    }
+    function saveHeavyPosResults(payload) {
+      try { localStorage.setItem(POS_HEAVY_RESULTS_STORAGE_KEY, JSON.stringify(payload)); } catch (_) {}
+    }
+    function loadHeavyPosResults() {
+      try {
+        const raw = localStorage.getItem(POS_HEAVY_RESULTS_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (_) {
+        return null;
+      }
+    }
     function updatePosSearchButton() {
       const btn = document.getElementById("posSearchBtn");
       if (!btn) return;
       btn.textContent = posHasScannedOnce ? "Scan again" : "Scan";
+    }
+    function updateHeavySearchButton() {
+      const btn = document.getElementById("posHeavySearchBtn");
+      if (!btn) return;
+      btn.textContent = posHeavyHasScannedOnce ? "Скан снова (v4 / Infinity)" : "Скан v4 / Infinity";
     }
     function setPosHistoryStatus(text, isErr) {
       const el = document.getElementById("posHistoryStatus");
@@ -15457,8 +15584,6 @@ def _render_positions_page() -> str:
           headers: {"Content-Type":"application/json"},
           body: JSON.stringify({
             evm_addresses: posState.evm,
-            solana_addresses: posState.solana,
-            tron_addresses: posState.tron,
             include_pools: true,
             include_lending: false,
             include_rewards: false,
@@ -15573,6 +15698,7 @@ def _render_positions_page() -> str:
       trusted.add(String(key || ""));
       setTrustedSpamKeys(trusted);
       renderPools(posCache.pools || []);
+      renderHeavyPools(posHeavyCache.pools || []);
       setPosStatus("Spam mark removed for this position.", false);
     }
     function untrustSpamRow(key) {
@@ -15580,6 +15706,7 @@ def _render_positions_page() -> str:
       trusted.delete(String(key || ""));
       setTrustedSpamKeys(trusted);
       renderPools(posCache.pools || []);
+      renderHeavyPools(posHeavyCache.pools || []);
       setPosStatus("Position moved back to suspected spam.", false);
     }
     async function enrichTrustedSpamRow(key) {
@@ -15620,6 +15747,7 @@ def _render_positions_page() -> str:
       setManualHiddenKeys(manual);
       setTrustedSpamKeys(trusted);
       renderPools(posCache.pools || []);
+      renderHeavyPools(posHeavyCache.pools || []);
       setPosStatus(hidden ? "Position hidden." : "Position shown.", false);
       if (!hidden && suspected) {
         enrichTrustedSpamRow(rowKey);
@@ -15676,8 +15804,8 @@ def _render_positions_page() -> str:
         return null;
       }
     }
-    function renderScanMessages(data) {
-      const errWrap = document.getElementById("posErrors");
+    function renderScanMessages(data, errWrapId) {
+      const errWrap = document.getElementById(errWrapId || "posErrors");
       if (!errWrap) return;
       const errs = data?.errors || [];
       const infos = data?.infos || [];
@@ -16261,9 +16389,14 @@ def _render_positions_page() -> str:
     function loadActivePosJob() {
       try { return String(localStorage.getItem(POS_ACTIVE_JOB_KEY) || "").trim(); } catch (_) { return ""; }
     }
-    async function pollPosJob(jobId, allowPartialReturn = false) {
+    async function pollPosJob(jobId, allowPartialReturn = false, scanKind = "v3") {
       const jid = String(jobId || "").trim();
       if (!jid) throw new Error("Missing job id");
+      const isHeavy = String(scanKind || "v3") === "heavy";
+      const statusSink = (txt, err) => (isHeavy ? setHeavyStatus(txt, err) : setPosStatus(txt, err));
+      const cacheBox = isHeavy ? posHeavyCache : posCache;
+      const renderTable = isHeavy ? renderHeavyPools : renderPools;
+      const errDom = isHeavy ? "posHeavyErrors" : "posErrors";
       let partialRendered = false;
       function statusTailFromPayload(payload) {
         const errs = Array.isArray(payload?.errors) ? payload.errors : [];
@@ -16351,10 +16484,10 @@ def _render_positions_page() -> str:
         const elapsedSec = startedAt > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - startedAt)) : 0;
         const partial = data.result || {};
         if (partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length) {
-          posCache.pools = partial.pool_positions || [];
-          posCache.debug = partial.debug || null;
-          renderPools(posCache.pools);
-          renderScanMessages(partial);
+          cacheBox.pools = partial.pool_positions || [];
+          cacheBox.debug = partial.debug || null;
+          renderTable(cacheBox.pools);
+          renderScanMessages(partial, errDom);
           partialRendered = true;
         }
         if (st === "done") return data.result || {};
@@ -16388,8 +16521,142 @@ def _render_positions_page() -> str:
           : "";
         const liveTag = partialRendered ? " | live" : "";
         const eventTxt = nftProgressMode ? "" : stageEventTextFromPartial(partial, stageLabel);
-        setPosStatus(`${sLabel}${elapsedTxt} | ${uiProgress}%${nftTail}${metrics}${liveTag}${eventTxt}${statusTail}`, false);
+        statusSink(`${sLabel}${elapsedTxt} | ${uiProgress}%${nftTail}${metrics}${liveTag}${eventTxt}${statusTail}`, false);
         await new Promise((resolve) => setTimeout(resolve, 1200));
+      }
+    }
+    function renderHeavyPools(rows) {
+      const table = document.getElementById("posHeavyPoolsTable");
+      if (!table) return;
+      const manualHiddenKeys = getManualHiddenKeys();
+      const listAll = rows || [];
+      function heavyTrustSpamParam(r) {
+        const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
+        return Boolean(r && (r.suspected_spam || r.spam_skipped || ph));
+      }
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th></tr>`;
+      if (!listAll.length) {
+        html += `<tr><td colspan='12' style='white-space:normal;color:#64748b'>Нет строк. Запустите «Скан v4 / Infinity» или проверьте, что на кошельке есть NFT Uniswap v4 / Pancake Infinity на поддерживаемых сетях.</td></tr>`;
+        table.innerHTML = html;
+        return;
+      }
+      let anyRow = false;
+      for (let i = 0; i < listAll.length; i++) {
+        const r0 = listAll[i];
+        const r = Object.assign({_src_idx: i}, r0 || {});
+        r._row_key = poolRowKey(r);
+        if (manualHiddenKeys.has(r._row_key)) continue;
+        anyRow = true;
+        const pairTrace = String(r.pair_symbol_source || "").trim();
+        const pairTitleRaw = pairTrace ? `source: ${pairTrace}` : "";
+        const pairTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
+        const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
+        html += "<tr>";
+        html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy'>⧉</button></td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy'>⧉</button></td>`;
+        html += `<td>${esc(r.chain || "")}</td>`;
+        html += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
+        html += `<td${pairTitle}>${esc(r.pair || "")}</td>`;
+        html += `<td>${esc(r.fee_tier || "")}</td>`;
+        html += `<td>${esc(r.position_created_date || "-")}</td>`;
+        html += `<td>${statusDot(r.position_status || "-")}</td>`;
+        html += `<td${pairTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
+        html += `<td${pairTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${heavyTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        html += "</tr>";
+      }
+      if (!anyRow) {
+        html += `<tr><td colspan='12' style='white-space:normal;color:#64748b'>Все строки скрыты вручную (Hide) — снимите скрытие в общей таблице v3 или очистите скрытые ключи.</td></tr>`;
+      }
+      table.innerHTML = html;
+    }
+    async function scanHeavyPositions() {
+      let handoffToBackground = false;
+      if (posHeavyHasScannedOnce) {
+        const ok = window.confirm("Запустить скан v4 / Infinity снова и заменить текущие результаты?");
+        if (!ok) return;
+      }
+      if (!posState.evm.length) {
+        setHeavyStatus("Добавьте хотя бы один EVM-адрес (0x…).", true);
+        return;
+      }
+      try {
+        setHeavyBusy(true);
+        const startRes = await fetch("/api/positions/scan/v4-infinity/start", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({
+            evm_addresses: posState.evm,
+            include_pools: true,
+            include_lending: false,
+            include_rewards: false,
+            hard_scan: false,
+          }),
+        });
+        const startData = await startRes.json().catch(() => ({}));
+        if (!startRes.ok) throw new Error(startData.detail || "Не удалось запустить скан");
+        const jobId = String(startData.job_id || "").trim();
+        if (!jobId) throw new Error("Invalid job id");
+        saveActiveHeavyPosJob(jobId);
+        const data = await pollPosJob(jobId, true, "heavy");
+        if (data && data.__partial) {
+          handoffToBackground = true;
+          setHeavyStatus("Часть результатов загружена; обогащение продолжается в фоне…", false);
+          setTimeout(() => { resumeHeavyPosJobIfAny(); }, 300);
+          return;
+        }
+        saveActiveHeavyPosJob("");
+        posHeavyCache.pools = data.pool_positions || [];
+        posHeavyCache.debug = data.debug || null;
+        renderHeavyPools(posHeavyCache.pools);
+        renderScanMessages(data, "posHeavyErrors");
+        saveHeavyPosResults({
+          saved_at: Date.now(),
+          pool_positions: data.pool_positions || [],
+          errors: data.errors || [],
+          infos: data.infos || [],
+          debug: data.debug || {},
+        });
+        posHeavyHasScannedOnce = true;
+        updateHeavySearchButton();
+        const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
+        const n = (data.pool_positions || []).length;
+        setHeavyStatus(`Готово. Строк: ${n}${errCount ? ` | предупреждений: ${errCount}` : ""}`, false);
+      } catch (e) {
+        saveActiveHeavyPosJob("");
+        setHeavyStatus("Скан v4/Infinity: " + (e?.message || "ошибка"), true);
+      } finally {
+        if (!handoffToBackground) setHeavyBusy(false);
+      }
+    }
+    async function resumeHeavyPosJobIfAny() {
+      const jobId = loadActiveHeavyPosJob();
+      if (!jobId) return;
+      try {
+        setHeavyBusy(true);
+        const data = await pollPosJob(jobId, false, "heavy");
+        saveActiveHeavyPosJob("");
+        posHeavyCache.pools = data.pool_positions || [];
+        posHeavyCache.debug = data.debug || null;
+        renderHeavyPools(posHeavyCache.pools);
+        renderScanMessages(data, "posHeavyErrors");
+        saveHeavyPosResults({
+          saved_at: Date.now(),
+          pool_positions: data.pool_positions || [],
+          errors: data.errors || [],
+          infos: data.infos || [],
+          debug: data.debug || {},
+        });
+        posHeavyHasScannedOnce = true;
+        updateHeavySearchButton();
+        const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
+        setHeavyStatus(`Готово. Строк: ${(data.pool_positions || []).length}${errCount ? ` | предупреждений: ${errCount}` : ""}`, false);
+      } catch (e) {
+        saveActiveHeavyPosJob("");
+        setHeavyStatus("Фоновый скан v4/Infinity: " + (e?.message || "ошибка"), true);
+      } finally {
+        setHeavyBusy(false);
       }
     }
     async function scanPositions(targetSection = "all") {
@@ -16398,8 +16665,8 @@ def _render_positions_page() -> str:
         const ok = window.confirm("Run scan again and replace current results?");
         if (!ok) return;
       }
-      if (!posState.evm.length && !posState.solana.length && !posState.tron.length) {
-        setPosStatus("Add at least one address first.", true);
+      if (!posState.evm.length) {
+        setPosStatus("Добавьте хотя бы один EVM-адрес (0x…).", true);
         return;
       }
       // Search should also reveal the requested section when cache is empty/collapsed.
@@ -16415,8 +16682,6 @@ def _render_positions_page() -> str:
           headers: {"Content-Type":"application/json"},
           body: JSON.stringify({
             evm_addresses: posState.evm,
-            solana_addresses: posState.solana,
-            tron_addresses: posState.tron,
             include_pools: true,
             include_lending: false,
             include_rewards: false,
@@ -16428,7 +16693,7 @@ def _render_positions_page() -> str:
         const jobId = String(startData.job_id || "").trim();
         if (!jobId) throw new Error("Invalid job id");
         saveActivePosJob(jobId);
-        const data = await pollPosJob(jobId, true);
+        const data = await pollPosJob(jobId, true, "v3");
         if (data && data.__partial) {
           handoffToBackground = true;
           setPosStatus("Base results loaded (scan). Hard-like enrich continues in background...", false);
@@ -16471,7 +16736,7 @@ def _render_positions_page() -> str:
       if (!jobId) return;
       try {
         setPosBusy(true);
-        const data = await pollPosJob(jobId);
+        const data = await pollPosJob(jobId, false, "v3");
         saveActivePosJob("");
         posCache.pools = data.pool_positions || [];
         renderPools(posCache.pools);
@@ -16518,13 +16783,27 @@ def _render_positions_page() -> str:
       setPosHistoryStatus("Select pools and click Search", false);
     }
     resumePosJobIfAny();
+    const savedHeavy = loadHeavyPosResults();
+    if (savedHeavy && Array.isArray(savedHeavy.pool_positions) && savedHeavy.pool_positions.length) {
+      posHeavyCache.pools = savedHeavy.pool_positions;
+      posHeavyCache.debug = savedHeavy.debug || null;
+      renderHeavyPools(posHeavyCache.pools);
+      renderScanMessages(savedHeavy, "posHeavyErrors");
+      posHeavyHasScannedOnce = true;
+      updateHeavySearchButton();
+      setHeavyStatus(`Кэш: ${savedHeavy.pool_positions.length} строк (v4 / Infinity)`, false);
+    } else {
+      updateHeavySearchButton();
+      setHeavyStatus("Готово", false);
+    }
+    resumeHeavyPosJobIfAny();
     if ((posState.evm || []).length && !loadActivePosJob()) {
       scheduleBackgroundWarmup("silent");
     }
     """
     return _render_placeholder_page(
         "DeFi Positions",
-        "Find where wallet funds are in pools and lending protocols.",
+        "EVM: Uniswap/Pancake v3 и отдельно Uniswap v4 / Pancake Infinity.",
         "/positions",
         extra_css=extra_css,
         extra_html=extra_html,
@@ -16547,7 +16826,8 @@ def _render_stables_page() -> str:
     }
     .positions-form h3, .result-card h3 { margin:0; font-size:17px; color:#1f3a8a; }
     .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; min-width:0; }
-    .address-columns { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+    .address-columns { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
+    .stables-address-columns { grid-template-columns:repeat(3, minmax(0, 1fr)); }
     .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
     .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
     .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; }
@@ -16610,7 +16890,7 @@ def _render_stables_page() -> str:
     <div class="positions-grid">
       <section class="positions-form">
         <div class="section-head"><h3>Lending Stablecoin</h3></div>
-        <div class="address-columns">
+        <div class="address-columns stables-address-columns">
           <div class="addr-box">
             <div class="addr-input-row">
               <input id="evmInput" placeholder="0x..." />
@@ -18495,6 +18775,7 @@ def _scan_positions_evm_components(
     include_creation_dates: bool,
     hard_scan: bool,
     pos_job_id: str | None = None,
+    pool_scan_profile: str = "v3",
 ) -> tuple[
     list[dict[str, Any]],
     list[str],
@@ -18520,6 +18801,7 @@ def _scan_positions_evm_components(
             pre_enqueued_ownership_refresh=bool(POSITIONS_OWNERSHIP_INDEX_ENABLED),
             hard_scan=hard_scan,
             pos_job_id=pos_job_id,
+            pool_scan_profile=pool_scan_profile,
         )
         timings["pool_scan_sec"] = round(max(0.0, time.monotonic() - t_pool), 3)
         if isinstance(pool_timings, dict):
@@ -18549,10 +18831,10 @@ def _prepare_positions_scan_request(
 ) -> tuple[list[str], list[str], list[str], list[int], bool, bool, bool]:
     evm_raw = list(req.evm_addresses or []) + list(req.addresses or [])
     evm_addresses = _parse_positions_addresses(evm_raw)
+    if not evm_addresses:
+        raise HTTPException(status_code=400, detail="Provide at least one valid EVM address (0x…).")
     solana_addresses = _parse_solana_addresses(req.solana_addresses or [])
     tron_addresses = _parse_tron_addresses(req.tron_addresses or [])
-    if not evm_addresses and not solana_addresses and not tron_addresses:
-        raise HTTPException(status_code=400, detail="Provide at least one valid address.")
     if len(evm_addresses) > 20:
         raise HTTPException(status_code=400, detail="Too many addresses. Max 20.")
     scan_pools = bool(req.include_pools)
@@ -18574,12 +18856,17 @@ def _prepare_positions_scan_request(
 def _build_positions_info_notes(
     solana_addresses: list[str],
     tron_addresses: list[str],
+    *,
+    pool_scan_profile: str = "v3",
 ) -> list[str]:
     info_notes: list[str] = []
-    if solana_addresses:
-        info_notes.append("Solana scanning is not available yet in this build.")
-    if tron_addresses:
-        info_notes.append("TRON scanning is not available yet in this build.")
+    prof = _normalize_pool_scan_profile(pool_scan_profile)
+    if prof == "heavy":
+        info_notes.append("Скан: Uniswap v4 и Pancake Infinity (отдельный профиль от NPM v3).")
+    else:
+        info_notes.append("Скан: только Uniswap v3 и PancakeSwap v3 (включая staked в MasterChef).")
+    if solana_addresses or tron_addresses:
+        info_notes.append("Solana/TRON в запросе проигнорированы — на странице описано, что поддерживается только EVM.")
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         info_notes.append(
             "Explorer NFT catalog: tokennfttx only; "
@@ -18825,6 +19112,7 @@ def _scan_positions_core(
     debug_timings: dict[str, Any] = {}
     t_prepare = time.monotonic()
     hard_scan_enabled = bool(getattr(req, "hard_scan", False))
+    pool_prof = _normalize_pool_scan_profile(getattr(req, "pool_scan_profile", None))
     (
         evm_addresses,
         solana_addresses,
@@ -18835,6 +19123,7 @@ def _scan_positions_core(
         scan_rewards,
     ) = _prepare_positions_scan_request(req)
     debug_timings["prepare_request_sec"] = round(max(0.0, time.monotonic() - t_prepare), 3)
+    debug_timings["pool_scan_profile"] = pool_prof
     scan_pools_effective = bool(scan_pools and evm_addresses)
     pool_debug_rows: list[dict[str, Any]] = []
     evm_timings: dict[str, Any] = {}
@@ -18858,6 +19147,7 @@ def _scan_positions_core(
             include_creation_dates=include_creation_dates,
             hard_scan=hard_scan_enabled,
             pos_job_id=pos_job_id,
+            pool_scan_profile=pool_prof,
         )
         debug_timings["evm_components_sec"] = round(max(0.0, time.monotonic() - t_evm), 3)
         if isinstance(evm_timings, dict):
@@ -18871,6 +19161,7 @@ def _scan_positions_core(
     info_notes = _build_positions_info_notes(
         solana_addresses,
         tron_addresses,
+        pool_scan_profile=pool_prof,
     )
 
     t_sort = time.monotonic()
@@ -18885,6 +19176,7 @@ def _scan_positions_core(
             max_rows=240,
             pos_job_id=pos_job_id,
             session_id=str(sid or ""),
+            nft_enrich_profile=("heavy" if pool_prof == "heavy" else "v3"),
         )
         debug_timings["nft_catalog_onchain_enrich_sec"] = round(max(0.0, time.monotonic() - t_nft_enrich), 3)
         debug_timings["nft_catalog_onchain_enrich_ok"] = int(ne_ok)
@@ -19085,7 +19377,19 @@ def _create_positions_job() -> str:
 def scan_positions_start(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
     sid = _ensure_session_cookie(request, response)
     job_id = _create_positions_job()
-    t = threading.Thread(target=_run_positions_scan_job, args=(job_id, req, sid), daemon=True)
+    v3_req = _positions_scan_request_with_updates(req, pool_scan_profile="v3")
+    t = threading.Thread(target=_run_positions_scan_job, args=(job_id, v3_req, sid), daemon=True)
+    t.start()
+    return {"job_id": job_id}
+
+
+@app.post("/api/positions/scan/v4-infinity/start")
+def scan_positions_v4_infinity_start(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
+    """Отдельный job: только Uniswap v4 + Pancake Infinity (NFT-каталог + heavy PM snapshot)."""
+    sid = _ensure_session_cookie(request, response)
+    job_id = _create_positions_job()
+    heavy_req = _positions_scan_request_with_updates(req, pool_scan_profile="heavy")
+    t = threading.Thread(target=_run_positions_scan_job, args=(job_id, heavy_req, sid), daemon=True)
     t.start()
     return {"job_id": job_id}
 
