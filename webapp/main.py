@@ -13,7 +13,6 @@ import os
 import base64
 import contextlib
 import hashlib
-import html
 import json
 import re
 import secrets
@@ -13283,49 +13282,15 @@ def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int
 def _normalize_chain_key_slug(chain_key: str) -> str:
     """Canonical UI/config slug (legacy token: arbitrum-one → arbitrum)."""
     k = str(chain_key or "").strip().lower()
-    if k.startswith("eip155:"):
-        k = k.split(":", 2)[-1].strip().lower()
-    if k == "arbitrum-one":
-        return "arbitrum"
-    # WalletConnect / explorer human names → CHAIN_ID_TO_KEY slug
-    aliases = {
-        "binance-smart-chain": "bsc",
-        "bnb chain": "bsc",
-        "bnb smart chain": "bsc",
-        "bnb smart chain mainnet": "bsc",
-        "base mainnet": "base",
-        "base-mainnet": "base",
-        "base chain": "base",
-    }
-    return aliases.get(k, k)
+    return "arbitrum" if k == "arbitrum-one" else k
 
 
 def _chain_id_by_chain_key(chain_key: str) -> int:
     key = _normalize_chain_key_slug(chain_key)
-    if key.isdigit():
-        cid = int(key)
-        if int(cid) in CHAIN_ID_TO_KEY:
-            return int(cid)
     for cid, ck in CHAIN_ID_TO_KEY.items():
         if str(ck).strip().lower() == key:
             return int(cid)
     return 0
-
-
-def _resolve_chain_id_and_key_for_positions(chain: str, chain_id_hint: int = 0) -> tuple[int, str]:
-    """
-    Resolve (chain_id, canonical_chain_key) for positions charts/fees/enrich.
-    Accepts slug (``base``), numeric id string (``8453``), ``eip155:8453``, or a numeric ``chain_id`` hint from the row.
-    """
-    slug = _normalize_chain_key_slug(str(chain or ""))
-    cid = _chain_id_by_chain_key(slug)
-    if cid > 0:
-        ck = str(CHAIN_ID_TO_KEY.get(int(cid), "") or "").strip().lower()
-        return int(cid), (ck or slug)
-    hint = int(chain_id_hint or 0)
-    if hint > 0 and int(hint) in CHAIN_ID_TO_KEY:
-        return int(hint), str(CHAIN_ID_TO_KEY[int(hint)]).strip().lower()
-    return 0, slug
 
 
 def _fetch_position_snapshot_series_exact(
@@ -13573,21 +13538,11 @@ def _fee_collect_log_chunk_blocks(chain_id: int) -> int:
     cid = int(chain_id)
     if cid == 1:
         return max(2000, min(50_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_ETH", "8000"))))
-    # Base public RPCs often reject or time out wide eth_getLogs ranges — smaller chunks by default.
-    if cid == 8453:
-        return max(2000, min(120_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_BASE", "12000"))))
     return max(4000, min(200_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_L2", "45000"))))
 
 
-def _fee_collect_log_max_chunks(chain_id: int = 0) -> int:
-    """Cap getLogs range iterations; Base uses smaller block chunks — allow more steps by default."""
-    base = max(10, min(500, int(os.environ.get("POSITIONS_FEE_LOG_MAX_CHUNKS", "220"))))
-    cid = int(chain_id)
-    if cid == 8453:
-        extra = int(os.environ.get("POSITIONS_FEE_LOG_MAX_CHUNKS_BASE", "380") or 0)
-        if extra > 0:
-            return max(base, min(500, extra))
-    return base
+def _fee_collect_log_max_chunks() -> int:
+    return max(10, min(500, int(os.environ.get("POSITIONS_FEE_LOG_MAX_CHUNKS", "220"))))
 
 
 def _minimal_pool_dict_for_fee_usd(token0: str, token1: str, dec0: int, dec1: int) -> dict[str, Any]:
@@ -13666,7 +13621,7 @@ def _fetch_v3_position_fees_by_collect_logs(
         return {}, empty_meta
 
     chunk = _fee_collect_log_chunk_blocks(cid)
-    max_chunks = _fee_collect_log_max_chunks(cid)
+    max_chunks = _fee_collect_log_max_chunks()
     topics_or = topic0s if len(topic0s) > 1 else topic0s[0]
 
     raw_events: list[tuple[int, int, int, int]] = []
@@ -15066,6 +15021,7 @@ class PositionsScanRequest(BaseModel):
 
 
 class PositionPoolSeriesRequest(BaseModel):
+    chain: str
     protocol: str
     pool_id: str
     address: str
@@ -15078,9 +15034,6 @@ class PositionPoolSeriesRequest(BaseModel):
     token1_id: str = ""
     # When true, NPM Collect log series uses CoinGecko historical prices at each event (stables $1).
     fee_usd_historical: bool = False
-    chain: str = ""
-    # Backup when *chain* is empty, wrong, or numeric-only (e.g. WalletConnect / CAIP ``eip155:8453``).
-    chain_id: int = 0
 
 
 def _normalize_positions_series_protocol(raw: str, *, for_fees: bool = False) -> str:
@@ -15276,8 +15229,8 @@ def _render_placeholder_page(
     intro_html = (
         f"""
     <section class="card">
-      <h2>{html.escape(page_title)}</h2>
-      <p class="hint">{html.escape(subtitle)}</p>
+      <h2>{page_title}</h2>
+      <p class="hint">{subtitle}</p>
     </section>
 """
         if show_intro
@@ -15533,7 +15486,6 @@ def _render_placeholder_page(
       }}
       const btn = document.getElementById("intentMenuBtn");
       const list = document.getElementById("intentMenuList");
-      if (!btn || !list) return;
       const options = Array.from(sel.options || []);
       const selected = options.find((o) => o.selected) || options[0];
       btn.textContent = selected ? selected.textContent : "Select";
@@ -15872,7 +15824,7 @@ def _render_positions_page() -> str:
     .pos-fee-hist-label input { margin:0; width:15px; height:15px; accent-color:#2563eb; flex-shrink:0; }
     .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
-    .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:11px; padding:0 0 0 2px; }
+    .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:12px; padding:0 0 0 4px; }
     .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; position: relative; }
     .pos-progress .bar { height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); width: 0%; transition: width 0.35s ease-out; }
     .pos-progress.pos-progress-indeterminate .bar { width: 40%; animation: posLoad 1s linear infinite; }
@@ -15902,25 +15854,14 @@ def _render_positions_page() -> str:
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:860px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; font-size:12px; font-weight:700; padding:6px 6px; }
-    /* Denser columns on Positions page tables only */
-    .positions-grid .table-wrap table { font-size: 11px; min-width: 820px; }
-    .positions-grid .table-wrap table th,
-    .positions-grid .table-wrap table td { padding: 3px 5px; vertical-align: middle; }
-    .positions-grid .table-wrap table th { padding: 4px 5px; font-size: 11px; }
-    .positions-grid .table-wrap .mono { font-size: 10px; }
-    #posPoolsTable { min-width: 1080px; table-layout: auto; }
+    #posPoolsTable { min-width: 1200px; table-layout: auto; }
     #posPoolsTable th, #posPoolsTable td { white-space: nowrap; }
     #posPoolsTable th:nth-child(1), #posPoolsTable td:nth-child(1) {
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
     #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
-    #posHeavyPoolsTable, #posHeavyPoolsSpamTable, #posHeavyPoolsProtocolTable, #posHeavyPoolsClosedTable, #posHeavyPoolsOtherTable, #posHeavyPoolsHiddenTable { min-width: 1000px; table-layout: auto; }
-    #posHeavyPoolsTable th, #posHeavyPoolsTable td,
-    #posHeavyPoolsSpamTable th, #posHeavyPoolsSpamTable td,
-    #posHeavyPoolsProtocolTable th, #posHeavyPoolsProtocolTable td,
-    #posHeavyPoolsClosedTable th, #posHeavyPoolsClosedTable td,
-    #posHeavyPoolsOtherTable th, #posHeavyPoolsOtherTable td,
-    #posHeavyPoolsHiddenTable th, #posHeavyPoolsHiddenTable td { white-space: nowrap; }
+    #posHeavyPoolsTable { min-width: 1100px; table-layout: auto; }
+    #posHeavyPoolsTable th, #posHeavyPoolsTable td { white-space: nowrap; }
     .pos-pools-tab-bar { display: none; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
     .pos-tab-btn {
       border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
@@ -15947,9 +15888,6 @@ def _render_positions_page() -> str:
     .status-dot.explorer { background:#93b4d4; border-color:#6b93b8; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
-    #evmAddrHint { font-size: 11px; line-height: 1.35; margin: 6px 0 0; min-height: 1.2em; color: #64748b; }
-    #posFeeDebugPanel details summary { cursor: pointer; font-weight: 700; user-select: none; }
-    #posFeeDebugPanel pre { margin: 8px 0 0; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 11px; color: #334155; }
     @media (max-width: 1100px) {
       .address-columns { grid-template-columns:1fr; }
       .positions-form, .result-card { padding: 12px; }
@@ -15980,18 +15918,15 @@ def _render_positions_page() -> str:
         <div class="address-columns">
           <div class="addr-box">
             <div class="addr-input-row">
-              <input id="evmInput" type="text" placeholder="0x… EVM address" autocomplete="off" spellcheck="false"
-                title="Paste full address; spaces and line breaks are stripped. 40 hex digits after 0x."
-                onkeydown="if(event.key==='Enter'){ event.preventDefault(); addAddress('evm'); }" />
+              <input id="evmInput" placeholder="0x… EVM address" />
               <button class="btn btn-plus" type="button" onclick="addAddress('evm')" aria-label="Add EVM address">+</button>
             </div>
-            <p id="evmAddrHint" aria-live="polite"></p>
             <div class="chips" id="evmChips"></div>
           </div>
           <div class="addr-box" style="border-style:dashed">
             <h4 style="margin:0 0 6px;font-size:14px;color:#1e3a8a">How it works</h4>
             <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.45;color:#334155">
-              <li><b>V3 (first table)</b> — Uniswap v3 and Pancake v3 via NPM only (including staked in MasterChef).</li>
+              <li><b>V3 (first table)</b> — Uniswap v3 and PancakeSwap v3 via NPM only (including staked in MasterChef).</li>
               <li><b>V4 / Infinity (second table)</b> — separate scan: explorer NFT index + Uniswap v4 and Pancake V3 Farming / Infinity position managers (CL/Bin).</li>
             </ul>
           </div>
@@ -15999,7 +15934,7 @@ def _render_positions_page() -> str:
       </section>
       <section class="result-card">
         <div class="section-head" style="flex-wrap:nowrap;align-items:center">
-          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / Pancake v3</h3>
+          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / PancakeSwap v3</h3>
           <div class="section-actions">
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
@@ -16036,40 +15971,24 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posHeavyPoolsBody" class="section-body">
-          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same EVM addresses. Run independently of the v3 table. Same tab filters as V3: main list vs spam, protocol gate, closed (catalog), other issues, hidden.</p>
-          <div class="pos-pools-tab-bar" id="posHeavyPoolsTabBar" style="flex-wrap:wrap;gap:4px" title="Same routing as V3 table: main → spam → protocol → closed → other issues → hidden.">
-            <button type="button" class="pos-tab-btn active" data-pos-tab="main" onclick="switchPosHeavyPoolsTab('main')" title="Valid positions: not closed, hidden, or routed to Spam / Protocol / Other issues.">Positions <span id="posHeavyMainTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="spam" onclick="switchPosHeavyPoolsTab('spam')" title="Heuristic spam / exotic pair (trust to manage).">Spam <span id="posHeavySpamTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="protocol" onclick="switchPosHeavyPoolsTab('protocol')">Protocol filter <span id="posHeavyProtocolTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="closed" onclick="switchPosHeavyPoolsTab('closed')" title="Zero open liquidity on PM (catalog).">Closed <span id="posHeavyClosedTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="other" onclick="switchPosHeavyPoolsTab('other')" title="Phishing metadata, pair mismatch, PM read failures — see Issue column.">Other issues <span id="posHeavyOtherTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="hidden" onclick="switchPosHeavyPoolsTab('hidden')" title="Rows you marked with Hide on the main list.">Hidden <span id="posHeavyHiddenTabCount"></span></button>
-          </div>
-          <div class="table-wrap" id="posHeavyPoolsTableMainWrap"><table id="posHeavyPoolsTable"></table></div>
-          <div class="table-wrap" id="posHeavyPoolsTableSpamWrap" style="display:none"><table id="posHeavyPoolsSpamTable"></table></div>
-          <div class="table-wrap" id="posHeavyPoolsTableProtocolWrap" style="display:none"><table id="posHeavyPoolsProtocolTable"></table></div>
-          <div class="table-wrap" id="posHeavyPoolsTableClosedWrap" style="display:none"><table id="posHeavyPoolsClosedTable"></table></div>
-          <div class="table-wrap" id="posHeavyPoolsTableOtherWrap" style="display:none"><table id="posHeavyPoolsOtherTable"></table></div>
-          <div class="table-wrap" id="posHeavyPoolsTableHiddenWrap" style="display:none"><table id="posHeavyPoolsHiddenTable"></table></div>
+          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same EVM addresses. Run independently of the v3 table.</p>
+          <div class="table-wrap"><table id="posHeavyPoolsTable"></table></div>
           <div id="posHeavyErrors"></div>
         </div>
       </section>
       <section class="result-card">
-        <div class="section-head" style="flex-wrap:nowrap;align-items:center">
-          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:72px;margin-left:6px"/></h3>
+        <div class="section-head">
+          <h3>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:72px;margin-left:6px"/></h3>
           <div class="section-actions">
             <span class="pos-status" id="posHistoryStatus">Select pools and click Search</span>
             <button class="search-link-btn" type="button" onclick="showSelectedPoolSeries()">Search</button>
-            <button class="collapse-btn" id="toggleHistoryBtn" type="button" onclick="togglePosSection('history')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <div id="posHistoryBody" class="section-body">
-          <div id="posPoolChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
-        </div>
+        <div id="posPoolChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
       </section>
       <section class="result-card">
-        <div class="section-head" style="flex-wrap:nowrap;align-items:center">
-          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Fee calculation</h3>
+        <div class="section-head">
+          <h3>Fee calculation</h3>
           <div class="section-actions">
             <span class="pos-status" id="posFeeStatus">Select History checkboxes, then click Scan</span>
             <label class="pos-fee-hist-label" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
@@ -16077,14 +15996,10 @@ def _render_positions_page() -> str:
               <span>Historical USD</span>
             </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Scan</button>
-            <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <div id="posFeeBody" class="section-body">
-          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
-          <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
-          <div id="posFeeDebugPanel" style="display:none;margin-top:10px;border:1px dashed #bfdbfe;background:#f8fbff;border-radius:10px;padding:10px 12px;font-size:11px;line-height:1.45;color:#1e3a8a"></div>
-        </div>
+        <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
+        <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
       </section>
     </div>
     """
@@ -16092,29 +16007,11 @@ def _render_positions_page() -> str:
     function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
     const posState = { evm: [] };
     const POS_STORAGE_KEY = "positions_form_v2";
-    /** Strip whitespace; accept 0x + 40 hex or plain 40 hex → lowercase 0x… */
-    function normalizeEvmAddressInput(raw) {
-      let t = String(raw || "").replace(/[\s\u00a0\u200b\uFEFF]+/g, "").trim();
-      if (!t) return "";
-      if (/^0x/i.test(t)) {
-        const hex = t.slice(2).replace(/[^a-fA-F0-9]/g, "");
-        if (hex.length !== 40) return "";
-        return "0x" + hex.toLowerCase();
-      }
-      const hex = t.replace(/[^a-fA-F0-9]/g, "");
-      if (hex.length !== 40) return "";
-      return "0x" + hex.toLowerCase();
-    }
-    function setEvmAddrHint(msg, isErr) {
-      const h = document.getElementById("evmAddrHint");
-      if (!h) return;
-      h.textContent = String(msg || "");
-      h.style.color = isErr ? "#b91c1c" : "#64748b";
-    }
     function validAddress(kind, value) {
-      if (kind === "evm") return !!normalizeEvmAddressInput(value);
       const v = String(value || "").trim();
-      return !!v;
+      if (!v) return false;
+      if (kind === "evm") return /^0x[a-fA-F0-9]{40}$/.test(v);
+      return false;
     }
     function inputId(kind) {
       return "evmInput";
@@ -16150,38 +16047,22 @@ def _render_positions_page() -> str:
     }
     function addAddress(kind) {
       const el = document.getElementById(inputId(kind));
-      const addrRaw = String(el?.value || "");
-      let addr = "";
-      if (kind === "evm") {
-        addr = normalizeEvmAddressInput(addrRaw);
-        if (!addr) {
-          setEvmAddrHint("Invalid address: need 40 hex digits (with or without 0x). Remove extra characters / check length.", true);
-          setPosStatus("Invalid EVM address — see hint under the field.", true);
-          return;
-        }
-      } else {
-        addr = addrRaw.trim();
-        if (!addr) return;
+      const addrRaw = String(el?.value || "").trim();
+      if (!validAddress(kind, addrRaw)) {
+        setPosStatus(`Invalid ${kind.toUpperCase()} address format.`, true);
+        return;
       }
-      setEvmAddrHint("");
+      const addr = addrRaw;
       const dup = (posState[kind] || []).some((x) => kind === "evm" ? String(x).toLowerCase() === addr.toLowerCase() : String(x) === addr);
       if (dup) {
-        setEvmAddrHint("This address is already in the list.", true);
         setPosStatus("Address already added.", true);
         return;
       }
       posState[kind].push(addr);
-      try {
-        savePosState();
-      } catch (e) {
-        posState[kind].pop();
-        setEvmAddrHint("Could not save (storage blocked or full). Check site permissions / free disk.", true);
-        setPosStatus("Save failed — browser storage.", true);
-        return;
-      }
       if (el) el.value = "";
+      savePosState();
       renderChips(kind);
-      setPosStatus(kind === "evm" ? "Address added." : "Added.", false);
+      setPosStatus("Address added.", false);
       if (kind === "evm") scheduleBackgroundWarmup("add");
     }
     function removeAddress(kind, idx) {
@@ -16191,7 +16072,7 @@ def _render_positions_page() -> str:
       renderChips(kind);
       if (kind === "evm" && (posState.evm || []).length) scheduleBackgroundWarmup("remove");
     }
-    const posSectionState = {pools: false, heavy: false, history: false, fees: false};
+    const posSectionState = {pools: false, heavy: false};
     const posCache = {pools: [], debug: null};
     const posHeavyCache = {pools: [], debug: null};
     const POS_HEAVY_RESULTS_STORAGE_KEY = "positions_heavy_scan_results_v1";
@@ -16202,7 +16083,6 @@ def _render_positions_page() -> str:
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
-    const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
       position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder).",
     };
@@ -16248,88 +16128,6 @@ def _render_positions_page() -> str:
         } catch (_) {}
       }
     }
-    function switchPosHeavyPoolsTab(name, silent) {
-      const mainW = document.getElementById("posHeavyPoolsTableMainWrap");
-      const prW = document.getElementById("posHeavyPoolsTableProtocolWrap");
-      const clW = document.getElementById("posHeavyPoolsTableClosedWrap");
-      const spW = document.getElementById("posHeavyPoolsTableSpamWrap");
-      const otW = document.getElementById("posHeavyPoolsTableOtherWrap");
-      const hidW = document.getElementById("posHeavyPoolsTableHiddenWrap");
-      if (!mainW) return;
-      const tab = normalizePosPoolsTabKey(name);
-      const wraps = [
-        ["main", mainW],
-        ["spam", spW],
-        ["protocol", prW],
-        ["closed", clW],
-        ["other", otW],
-        ["hidden", hidW],
-      ];
-      for (const [k, el] of wraps) {
-        if (!el) continue;
-        el.style.display = k === tab ? "block" : "none";
-      }
-      document.querySelectorAll("#posHeavyPoolsTabBar [data-pos-tab]").forEach((b) => {
-        const t = b.getAttribute("data-pos-tab") || "";
-        b.classList.toggle("active", t === tab);
-      });
-      if (!silent) {
-        try {
-          const allowed = new Set(["main", "spam", "protocol", "closed", "other", "hidden"]);
-          localStorage.setItem(POS_HEAVY_POOLS_TAB_KEY, allowed.has(tab) ? tab : "main");
-        } catch (_) {}
-      }
-    }
-    const V3_POOL_CFG = {
-      scope: "v",
-      tables: {
-        main: "posPoolsTable",
-        protocol: "posPoolsProtocolTable",
-        closed: "posPoolsClosedTable",
-        spam: "posPoolsSpamTable",
-        other: "posPoolsOtherTable",
-        hidden: "posPoolsHiddenTable",
-      },
-      tabBar: "posPoolsTabBar",
-      counts: {
-        main: "posMainTabCount",
-        spam: "posSpamTabCount",
-        protocol: "posProtocolTabCount",
-        closed: "posClosedTabCount",
-        other: "posOtherTabCount",
-        hidden: "posHiddenTabCount",
-      },
-      tabStorageKey: POS_POOLS_TAB_KEY,
-      switchTab: switchPosPoolsTab,
-      ui: {},
-    };
-    const HEAVY_POOL_CFG = {
-      scope: "h",
-      tables: {
-        main: "posHeavyPoolsTable",
-        protocol: "posHeavyPoolsProtocolTable",
-        closed: "posHeavyPoolsClosedTable",
-        spam: "posHeavyPoolsSpamTable",
-        other: "posHeavyPoolsOtherTable",
-        hidden: "posHeavyPoolsHiddenTable",
-      },
-      tabBar: "posHeavyPoolsTabBar",
-      counts: {
-        main: "posHeavyMainTabCount",
-        spam: "posHeavySpamTabCount",
-        protocol: "posHeavyProtocolTabCount",
-        closed: "posHeavyClosedTabCount",
-        other: "posHeavyOtherTabCount",
-        hidden: "posHeavyHiddenTabCount",
-      },
-      tabStorageKey: POS_HEAVY_POOLS_TAB_KEY,
-      switchTab: switchPosHeavyPoolsTab,
-      ui: {
-        emptyNoRows: "No rows. Run \u0022Scan v4 / Infinity\u0022 or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.",
-        emptyFiltered: "No positions in the main list — filtered rows are on the other tabs (spam, protocol, closed, other issues, hidden).",
-        hiddenHint: "No manually hidden rows. Use Hide on the Positions tab above to move a row here.",
-      },
-    };
     let posHasScannedOnce = false;
     let posScanTicker = null;
     let posScanStartedAt = 0;
@@ -16622,18 +16420,8 @@ def _render_positions_page() -> str:
       }
     }
     function setSectionCollapsed(key, collapsed) {
-      const bodyMap = {
-        pools: "posPoolsBody",
-        heavy: "posHeavyPoolsBody",
-        history: "posHistoryBody",
-        fees: "posFeeBody",
-      };
-      const btnMap = {
-        pools: "togglePoolsBtn",
-        heavy: "toggleHeavyPoolsBtn",
-        history: "toggleHistoryBtn",
-        fees: "toggleFeeBtn",
-      };
+      const bodyMap = {pools: "posPoolsBody", heavy: "posHeavyPoolsBody"};
+      const btnMap = {pools: "togglePoolsBtn", heavy: "toggleHeavyPoolsBtn"};
       const body = document.getElementById(bodyMap[key]);
       const btn = document.getElementById(btnMap[key]);
       if (!body || !btn) return;
@@ -16647,21 +16435,6 @@ def _render_positions_page() -> str:
       if (!next) {
         if (key === "pools") renderPools(posCache.pools || []);
         if (key === "heavy") renderHeavyPools(posHeavyCache.pools || []);
-        if (key === "history" || key === "fees") {
-          requestAnimationFrame(() => {
-            try {
-              if (window.Plotly && typeof Plotly.Plots.resize === "function") {
-                if (key === "history") {
-                  const g = document.getElementById("posPoolChart");
-                  if (g) Plotly.Plots.resize(g);
-                } else {
-                  const g = document.getElementById("posFeeChart");
-                  if (g) Plotly.Plots.resize(g);
-                }
-              }
-            } catch (_) {}
-          });
-        }
       }
     }
     async function ensurePlotly() {
@@ -16891,7 +16664,6 @@ def _render_positions_page() -> str:
           if (row.unsupported_protocol) continue;
           const payload = {
             chain: row.chain,
-            chain_id: Number(row.chain_id) || 0,
             protocol: row.protocol,
             pool_id: row.pool_id,
             address: row.address,
@@ -16939,46 +16711,9 @@ def _render_positions_page() -> str:
         setPosHistoryStatus("History load failed", true);
       }
     }
-    function posFeeDebugPanelShow(html) {
-      const p = document.getElementById("posFeeDebugPanel");
-      if (!p) return;
-      p.style.display = "block";
-      p.innerHTML = html;
-    }
-    function posFeeDebugPanelHide() {
-      const p = document.getElementById("posFeeDebugPanel");
-      if (!p) return;
-      p.style.display = "none";
-      p.innerHTML = "";
-    }
-    function pickFeeWhyShort(attempts) {
-      const EMPTY_REASON_HINT = {
-        missing_token0_or_token1_for_rpc_collect: "Missing token0/token1 — run V3 Scan (on-chain enrich).",
-        rpc_fallback_disabled_env: "RPC fee fallback disabled (server env).",
-        no_subgraph_and_no_rpc_data: "No subgraph fee series and no RPC Collect data.",
-        v4_no_snapshot_series_or_empty_subgraph: "v4 / subgraph: no fee snapshot series.",
-        protocol_without_collect_fallback: "Protocol has no NPM Collect fallback for fees.",
-      };
-      for (const a of attempts) {
-        if (a.skip) continue;
-        if (a.http != null) continue;
-        const er = a.debug && a.debug.empty_reason;
-        if (er && EMPTY_REASON_HINT[er]) return EMPTY_REASON_HINT[er];
-        const dr = a.debug && a.debug.reason;
-        if (dr === "unknown_chain") return "Unknown chain — check row.chain.";
-        if (dr === "no_position_ids") return "No position IDs on row.";
-        if (a.note && String(a.note).trim()) return String(a.note).trim().slice(0, 140);
-      }
-      if (attempts.some((a) => a.skip === "unsupported_protocol")) return "Some rows skipped (unsupported protocol for fees).";
-      if (attempts.some((a) => a.skip === "missing_row")) return "Stale row index — refresh table / re-select History.";
-      if (attempts.some((a) => a.skip)) return "Some rows skipped (missing row data).";
-      if (attempts.length && attempts.every((a) => a.http != null)) return "All requests failed — open debug below.";
-      return "Subgraph empty, unsupported protocol, or RPC fallback needs enriched tokens.";
-    }
     async function showSelectedPositionFees() {
       const chartEl = document.getElementById("posFeeChart");
       if (!chartEl) return;
-      posFeeDebugPanelHide();
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
         setPosFeeStatus("Tick at least one History checkbox in the V3 or v4 / Pancake V3 Farming / Infinity table (same as for TVL).", true);
@@ -16991,7 +16726,6 @@ def _render_positions_page() -> str:
         const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
-        const attempts = [];
         let lastFeePricing = "";
         for (let i = 0; i < selected.length; i++) {
           const hk = parseHistoryKey(selected[i]);
@@ -16999,18 +16733,10 @@ def _render_positions_page() -> str:
           const row = hk.scope === "h"
             ? (posHeavyCache.pools || [])[idx]
             : (posCache.pools || [])[idx];
-          const label = row ? String(row.pair || row.pool_id || `row ${idx}`) : `row #${idx}`;
-          if (!row) {
-            attempts.push({ label, skip: "missing_row" });
-            continue;
-          }
-          if (row.unsupported_protocol) {
-            attempts.push({ label, skip: "unsupported_protocol", protocol: row.protocol });
-            continue;
-          }
+          if (!row) continue;
+          if (row.unsupported_protocol) continue;
           const payload = {
             chain: row.chain,
-            chain_id: Number(row.chain_id) || 0,
             protocol: row.protocol,
             pool_id: row.pool_id,
             address: row.address,
@@ -17029,26 +16755,12 @@ def _render_positions_page() -> str:
           });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) {
-            const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : String(res.status);
+            const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
             console.warn("position-fee-series failed", row.pair || row.pool_id, det);
-            attempts.push({
-              label,
-              http: res.status,
-              error: det.slice(0, 800),
-              debug: data.debug || null,
-            });
             continue;
           }
           const items = Array.isArray(data.items) ? data.items : [];
-          if (!items.length) {
-            attempts.push({
-              label,
-              note: String(data.note || ""),
-              mode: String(data.mode || ""),
-              debug: data.debug || null,
-            });
-            continue;
-          }
+          if (!items.length) continue;
           const fp = String(data.fee_pricing || "").trim();
           if (fp) lastFeePricing = fp;
           traces.push({
@@ -17061,24 +16773,10 @@ def _render_positions_page() -> str:
           });
         }
         if (!traces.length) {
-          const why = pickFeeWhyShort(attempts);
-          chartEl.innerHTML = "<div class='hint'><b>No fee data.</b> " + esc(why) + "</div>";
-          setPosFeeStatus("No fee data — " + why, false);
-          let blob;
-          try {
-            blob = JSON.stringify(attempts, null, 2);
-          } catch (e2) {
-            blob = String(e2 && e2.message ? e2.message : e2);
-          }
-          posFeeDebugPanelShow(
-            "<details open><summary>Why? — debug (" + attempts.length + " row attempt(s))</summary>"
-            + "<pre>" + esc(blob) + "</pre>"
-            + "<p class='hint' style='margin:8px 0 0'>Tip: if <code>empty_reason</code> is <code>missing_token0_or_token1_for_rpc_collect</code>, run <b>Scan</b> on the V3 table first.</p>"
-            + "</details>"
-          );
+          chartEl.innerHTML = "<div class='hint'>No fee data for the selected rows (subgraph empty, protocol unsupported, or NPM Collect fallback needs token0/token1 after on-chain enrich — run Scan on the table first).</div>";
+          setPosFeeStatus("No fee data", false);
           return;
         }
-        posFeeDebugPanelHide();
         const titleSuffix = histUsd ? " — historical USD (CoinGecko at each Collect)" : " — spot USD";
         Plotly.newPlot("posFeeChart", traces, {
           title: "Cumulative collected fees (USD)" + titleSuffix,
@@ -17095,9 +16793,6 @@ def _render_positions_page() -> str:
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Error: ${esc(e?.message || "unknown")}</div>`;
         setPosFeeStatus("Failed to build chart", true);
-        posFeeDebugPanelShow(
-          "<details open><summary>Why? — debug (client error)</summary><pre>" + esc(String(e && e.stack ? e.stack : e)) + "</pre></details>"
-        );
       }
     }
     function normPosSym(v) {
@@ -17171,9 +16866,13 @@ def _render_positions_page() -> str:
     function escAttr(v) {
       return esc(v).replace(/"/g, "&quot;");
     }
-    function partitionPositionTableRows(listAll) {
+    function renderPools(rows) {
+      const table = document.getElementById("posPoolsTable");
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
+      const totalCols = 13;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      const listAll = rows || [];
       const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
       const hasExplorerNftCatalog = listAll.some((x) => {
         if (!x) return false;
@@ -17244,40 +16943,6 @@ def _render_positions_page() -> str:
         }
         visible.push(row);
       }
-      return {
-        visible,
-        hiddenRows,
-        protocolRows,
-        closedTabRows,
-        spamRows,
-        otherRows,
-        hasCatalogSegments,
-        hasExplorerNftCatalog,
-        rowTrustSpamParam,
-      };
-    }
-    function renderPoolTableUI(listAll, cfg) {
-      const table = document.getElementById(cfg.tables.main);
-      if (!table) return;
-      const totalCols = 13;
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>History</th></tr>`;
-      const ui = Object.assign({
-        emptyNoRows: "No pool positions found.",
-        emptyFiltered: "No pool positions in the main list — rows that matched a filter are on the other tabs (spam, protocol, closed, other issues, hidden).",
-        hiddenHint: "No manually hidden rows. Use Hide on the Positions tab to move a row here.",
-      }, cfg.ui || {});
-      const {
-        visible,
-        hiddenRows,
-        protocolRows,
-        closedTabRows,
-        spamRows,
-        otherRows,
-        hasCatalogSegments,
-        hasExplorerNftCatalog,
-        rowTrustSpamParam,
-      } = partitionPositionTableRows(listAll);
-      const sc = cfg.scope;
       for (let i = 0; i < visible.length; i++) {
         const r = visible[i];
         const pairTrace = String(r.pair_symbol_source || "").trim();
@@ -17295,21 +16960,21 @@ def _render_positions_page() -> str:
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
         html += `<td>${esc(r.position_created_date || "-")}</td>`;
         html += `<td>${statusDot(r.position_status || "-")}</td>`;
-        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         html += `<td${pairTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         html += `<td${pairTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        const checked = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
-        html += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
+        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
+        html += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
         html += "</tr>";
       }
       if (!visible.length) {
         html += listAll.length
-          ? `<tr><td colspan='${totalCols}'>${esc(ui.emptyFiltered)}</td></tr>`
-          : `<tr><td colspan='${totalCols}'>${esc(ui.emptyNoRows)}</td></tr>`;
+          ? `<tr><td colspan='${totalCols}'>No pool positions in the main list — rows that matched a filter are on the other tabs (spam, protocol, closed, other issues, hidden).</td></tr>`
+          : `<tr><td colspan='${totalCols}'>No pool positions found.</td></tr>`;
       }
       const otCols = 15;
-      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>History</th></tr>`;
+      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       for (let oi = 0; oi < otherRows.length; oi++) {
         const r = otherRows[oi];
         const issue = String(r._other_issue_label || "Other");
@@ -17339,19 +17004,19 @@ def _render_positions_page() -> str:
         otHtml += `<td${feeTipOt}>${esc(r.fee_tier || "")}</td>`;
         otHtml += `<td>${esc(r.position_created_date || "-")}</td>`;
         otHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
-        otHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscOt}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         otHtml += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         otHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         otHtml += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        const checkedOt = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
-        otHtml += `<td><input type='checkbox' ${checkedOt} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
+        otHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscOt}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        const checkedOt = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
+        otHtml += `<td><input type='checkbox' ${checkedOt} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
         otHtml += "</tr>";
       }
       if (!otherRows.length) {
         otHtml += `<tr><td colspan='${otCols}' style='white-space:normal;color:#64748b'>No rows here: phishing-style collection metadata, pair string vs on-chain symbols (Issue: Pair mismatch), and PM snapshot read failures land on this tab. Spam, protocol gate, and closed positions stay on their own tabs.</td></tr>`;
       }
       const stCols = 12;
-      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
+      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       for (let pi = 0; pi < protocolRows.length; pi++) {
         const r = protocolRows[pi];
         const mismatch = hasPairMismatch(r);
@@ -17360,21 +17025,20 @@ def _render_positions_page() -> str:
         const pairTitleRaw = mismatch ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}` : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checked = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
+        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
         protHtml += "<tr>";
         protHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         protHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         protHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td>${esc(r.fee_tier || "")}</td>`;
-        protHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
-        protHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        protHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        protHtml += `<td>${statusDot(r.position_status || "-")}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         protHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        protHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
+        protHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        protHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!protocolRows.length) {
         protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate (collection name/symbol must suggest Uniswap or Pancake before on-chain PM work).</td></tr>`;
       }
-      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
+      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       for (let ci = 0; ci < closedTabRows.length; ci++) {
         const r = closedTabRows[ci];
         const mismatch = hasPairMismatch(r);
@@ -17383,21 +17047,20 @@ def _render_positions_page() -> str:
         const pairTitleRaw = mismatch ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}` : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checked = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
+        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
         closedHtml += "<tr>";
         closedHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         closedHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         closedHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td>${esc(r.fee_tier || "")}</td>`;
-        closedHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
-        closedHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        closedHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        closedHtml += `<td>${statusDot(r.position_status || "-")}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         closedHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        closedHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" title='Closed on-chain (zero open liquidity on PM)' /></td></tr>`;
+        closedHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        closedHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" title='Closed on-chain (zero open liquidity on PM)' /></td></tr>`;
       }
       if (!closedTabRows.length) {
         closedHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No closed positions: on-chain open-liquidity check marked these as zero liquidity on the position manager (catalog_segment=closed).</td></tr>`;
       }
-      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
+      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       for (let si = 0; si < spamRows.length; si++) {
         const r = spamRows[si];
         const mismatch = hasPairMismatch(r);
@@ -17406,21 +17069,20 @@ def _render_positions_page() -> str:
         const pairTitleRaw = mismatch ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}` : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checked = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
+        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
         spamHtml += "<tr>";
         spamHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         spamHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         spamHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td>${esc(r.fee_tier || "")}</td>`;
-        spamHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
-        spamHtml += `<td><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        spamHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        spamHtml += `<td>${statusDot(r.position_status || "-")}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         spamHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        spamHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
+        spamHtml += `<td><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        spamHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!spamRows.length) {
         spamHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No spam heuristics: TVL/symbol rules did not flag supported rows (phase 6). Trust a row via Hide to re-run enrich.</td></tr>`;
       }
-      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
+      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       for (let hi = 0; hi < hiddenRows.length; hi++) {
         const r = hiddenRows[hi];
         const mismatch = hasPairMismatch(r);
@@ -17431,7 +17093,7 @@ def _render_positions_page() -> str:
           : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checkedH = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
+        const checkedH = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
         const feeRawH = String(r.fee_tier_raw || "").trim();
         const feeTipH = feeRawH ? ` title="raw: ${esc(feeRawH)}"` : "";
         hiddenHtml += "<tr>";
@@ -17439,32 +17101,32 @@ def _render_positions_page() -> str:
         hiddenHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         hiddenHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td${feeTipH}>${esc(r.fee_tier || "")}</td>`;
         hiddenHtml += `<td>${esc(r.position_created_date || "-")}</td><td>${statusDot(r.position_status || "-")}</td>`;
-        hiddenHtml += `<td><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         hiddenHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         hiddenHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        hiddenHtml += `<td><input type='checkbox' ${checkedH} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
+        hiddenHtml += `<td><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        hiddenHtml += `<td><input type='checkbox' ${checkedH} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!hiddenRows.length) {
-        hiddenHtml += `<tr><td colspan='${totalCols}' style='white-space:normal;color:#64748b'>${esc(ui.hiddenHint)}</td></tr>`;
+        hiddenHtml += `<tr><td colspan='${totalCols}' style='white-space:normal;color:#64748b'>No manually hidden rows. Use Hide on the Positions tab to move a row here.</td></tr>`;
       }
       table.innerHTML = html;
-      const prTable = document.getElementById(cfg.tables.protocol);
+      const prTable = document.getElementById("posPoolsProtocolTable");
       if (prTable) prTable.innerHTML = protHtml;
-      const clTable = document.getElementById(cfg.tables.closed);
+      const clTable = document.getElementById("posPoolsClosedTable");
       if (clTable) clTable.innerHTML = closedHtml;
-      const spTable = document.getElementById(cfg.tables.spam);
+      const spTable = document.getElementById("posPoolsSpamTable");
       if (spTable) spTable.innerHTML = spamHtml;
-      const otTable = document.getElementById(cfg.tables.other);
+      const otTable = document.getElementById("posPoolsOtherTable");
       if (otTable) otTable.innerHTML = otHtml;
-      const hidTable = document.getElementById(cfg.tables.hidden);
+      const hidTable = document.getElementById("posPoolsHiddenTable");
       if (hidTable) hidTable.innerHTML = hiddenHtml;
-      const tabBar = document.getElementById(cfg.tabBar);
-      const cntMainEl = document.getElementById(cfg.counts.main);
-      const cntPrEl = document.getElementById(cfg.counts.protocol);
-      const cntClEl = document.getElementById(cfg.counts.closed);
-      const cntSpEl = document.getElementById(cfg.counts.spam);
-      const cntOtEl = document.getElementById(cfg.counts.other);
-      const cntHidEl = document.getElementById(cfg.counts.hidden);
+      const tabBar = document.getElementById("posPoolsTabBar");
+      const cntMainEl = document.getElementById("posMainTabCount");
+      const cntPrEl = document.getElementById("posProtocolTabCount");
+      const cntClEl = document.getElementById("posClosedTabCount");
+      const cntSpEl = document.getElementById("posSpamTabCount");
+      const cntOtEl = document.getElementById("posOtherTabCount");
+      const cntHidEl = document.getElementById("posHiddenTabCount");
       const hasSubTabs =
         hasExplorerNftCatalog
         || protocolRows.length > 0
@@ -17480,14 +17142,11 @@ def _render_positions_page() -> str:
       if (cntOtEl) cntOtEl.textContent = otherRows.length ? `(${otherRows.length})` : "";
       if (cntHidEl) cntHidEl.textContent = hiddenRows.length ? `(${hiddenRows.length})` : "";
       let savedPoolsTab = "";
-      try { savedPoolsTab = String(localStorage.getItem(cfg.tabStorageKey) || ""); } catch (_) { savedPoolsTab = ""; }
+      try { savedPoolsTab = String(localStorage.getItem(POS_POOLS_TAB_KEY) || ""); } catch (_) { savedPoolsTab = ""; }
       const allowedTabs = new Set(["main", "spam", "protocol", "closed", "other", "hidden"]);
       const savNorm = normalizePosPoolsTabKey(savedPoolsTab);
-      if (allowedTabs.has(savNorm)) cfg.switchTab(savNorm, true);
-      else cfg.switchTab("main", true);
-    }
-    function renderPools(rows) {
-      renderPoolTableUI(rows || [], V3_POOL_CFG);
+      if (allowedTabs.has(savNorm)) switchPosPoolsTab(savNorm, true);
+      else switchPosPoolsTab("main", true);
     }
     const POS_ACTIVE_JOB_KEY = "positions_active_job_v1";
     function saveActivePosJob(jobId) {
@@ -17639,7 +17298,52 @@ def _render_positions_page() -> str:
       }
     }
     function renderHeavyPools(rows) {
-      renderPoolTableUI(rows || [], HEAVY_POOL_CFG);
+      const table = document.getElementById("posHeavyPoolsTable");
+      if (!table) return;
+      const manualHiddenKeys = getManualHiddenKeys();
+      const listAll = rows || [];
+      function heavyTrustSpamParam(r) {
+        const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
+        return Boolean(r && (r.suspected_spam || r.spam_skipped || ph));
+      }
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      if (!listAll.length) {
+        html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.</td></tr>`;
+        table.innerHTML = html;
+        return;
+      }
+      let anyRow = false;
+      for (let i = 0; i < listAll.length; i++) {
+        const r0 = listAll[i];
+        const r = Object.assign({_src_idx: i}, r0 || {});
+        r._row_key = poolRowKey(r);
+        if (manualHiddenKeys.has(r._row_key)) continue;
+        anyRow = true;
+        const pairTrace = String(r.pair_symbol_source || "").trim();
+        const pairTitleRaw = pairTrace ? `source: ${pairTrace}` : "";
+        const pairTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
+        const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
+        html += "<tr>";
+        html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy'>⧉</button></td>`;
+        html += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy'>⧉</button></td>`;
+        html += `<td>${esc(r.chain || "")}</td>`;
+        html += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
+        html += `<td${pairTitle}>${esc(r.pair || "")}</td>`;
+        html += `<td>${esc(r.fee_tier || "")}</td>`;
+        html += `<td>${esc(r.position_created_date || "-")}</td>`;
+        html += `<td>${statusDot(r.position_status || "-")}</td>`;
+        html += `<td${pairTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
+        html += `<td${pairTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${heavyTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        const hChecked = posHistorySelected.has(historyKey("h", r._src_idx)) ? "checked" : "";
+        html += `<td><input type='checkbox' ${hChecked} onchange="setHistorySelected('h', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
+        html += "</tr>";
+      }
+      if (!anyRow) {
+        html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>All rows hidden via Hide — unhide from the v3 table or clear manual hidden keys in local storage.</td></tr>`;
+      }
+      table.innerHTML = html;
     }
     async function scanHeavyPositions() {
       let handoffToBackground = false;
@@ -20470,14 +20174,11 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     row = dict(req.row or {})
     if bool(row.get("unsupported_protocol")):
         return {"ok": False, "reason": "unsupported_protocol"}
-    try:
-        chain_hint = int(row.get("chain_id") or 0)
-    except Exception:
-        chain_hint = 0
-    chain_id, chain_key = _resolve_chain_id_and_key_for_positions(str(row.get("chain") or ""), chain_hint)
+    chain_key = str(row.get("chain") or "").strip().lower()
     protocol = str(row.get("protocol") or "").strip().lower()
     owner = str(row.get("address") or "").strip().lower()
     pos_id = str(row.get("position_id") or "").strip()
+    chain_id = _chain_id_by_chain_key(chain_key)
     token_id = _position_token_id_from_raw(pos_id)
     if chain_id <= 0 or token_id <= 0:
         return {"ok": False, "reason": "invalid_row"}
@@ -20539,14 +20240,11 @@ def debug_heavy_protocol_enrich(limit: int = 50) -> dict[str, Any]:
 
 @app.post("/api/positions/pool-value-series")
 def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
-    chain_id, chain_key = _resolve_chain_id_and_key_for_positions(
-        str(req.chain or ""),
-        int(getattr(req, "chain_id", 0) or 0),
-    )
+    chain_key = str(req.chain or "").strip().lower()
     protocol = _normalize_positions_series_protocol(str(req.protocol or ""), for_fees=False)
     pool_id = str(req.pool_id or "").strip().lower()
-    if chain_id <= 0 or not chain_key or not pool_id:
-        raise HTTPException(status_code=400, detail="chain (or chain_id) and pool_id are required.")
+    if not chain_key or not pool_id:
+        raise HTTPException(status_code=400, detail="chain and pool_id are required.")
     if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3"}:
         raise HTTPException(
             status_code=400,
@@ -20557,6 +20255,7 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
     now_ts = int(time.time())
     since_ts = now_ts - int(days) * 86400
 
+    chain_id = _chain_id_by_chain_key(chain_key)
     endpoint = get_graph_endpoint(chain_key, version=version)
     position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
 
@@ -20613,11 +20312,10 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
 @app.post("/api/positions/position-fee-series")
 def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
     """Cumulative fees: subgraph positionSnapshots when reliable; else NPM Collect logs (eth_getLogs)."""
-    chain_id, chain_key = _resolve_chain_id_and_key_for_positions(
-        str(req.chain or ""),
-        int(getattr(req, "chain_id", 0) or 0),
-    )
+    chain_key = str(req.chain or "").strip().lower()
     protocol = _normalize_positions_series_protocol(str(req.protocol or ""), for_fees=True)
+    if not chain_key:
+        raise HTTPException(status_code=400, detail="chain is required.")
     if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3", "pancake_v3_staked"}:
         raise HTTPException(
             status_code=400,
@@ -20628,22 +20326,14 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     now_ts = int(time.time())
     since_ts = now_ts - int(days) * 86400
 
-    if chain_id <= 0 or not chain_key:
+    chain_id = _chain_id_by_chain_key(chain_key)
+    if chain_id <= 0:
         return {
             "items": [],
             "count": 0,
             "mode": "unavailable",
             "fee_pricing": "none",
             "note": "unknown chain",
-            "debug": {
-                "reason": "unknown_chain",
-                "chain_key": str(req.chain or "").strip(),
-                "chain_key_resolved": chain_key,
-                "chain_id": 0,
-                "chain_id_hint": int(getattr(req, "chain_id", 0) or 0),
-                "protocol_raw": str(req.protocol or "").strip(),
-                "protocol_normalized": protocol,
-            },
         }
 
     position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
@@ -20654,12 +20344,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "unavailable",
             "fee_pricing": "none",
             "note": "no position ids",
-            "debug": {
-                "reason": "no_position_ids",
-                "chain_key": chain_key,
-                "chain_id": int(chain_id),
-                "protocol_normalized": protocol,
-            },
         }
 
     token0 = str(req.token0_id or "").strip().lower()
@@ -20708,44 +20392,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     rpc_detail = str((rpc_meta or {}).get("detail") or "").strip()
     rpc_pricing = str((rpc_meta or {}).get("pricing") or "none").strip()
 
-    def _fee_series_debug(**extra: Any) -> dict[str, Any]:
-        rpc_ok = (
-            protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
-            and _position_fee_rpc_fallback_enabled()
-            and _is_eth_address(token0)
-            and _is_eth_address(token1)
-        )
-        pm_collect = str(_position_manager_for_protocol(int(chain_id), protocol) or "").strip().lower()
-        out: dict[str, Any] = {
-            "chain_key": chain_key,
-            "chain_id": int(chain_id),
-            "protocol_raw": str(req.protocol or "").strip(),
-            "protocol_normalized": protocol,
-            "graph_version": version,
-            "days_requested": int(days),
-            "since_ts": int(since_ts),
-            "subgraph_configured": bool(endpoint),
-            "position_ids_count": len(position_ids),
-            "position_ids_head": [str(x) for x in position_ids[:4]],
-            "token0_ok": bool(_is_eth_address(token0)),
-            "token1_ok": bool(_is_eth_address(token1)),
-            "rpc_fallback_eligible": bool(rpc_ok),
-            "rpc_fallback_enabled_env": bool(_position_fee_rpc_fallback_enabled()),
-            "npm_address_for_collect": pm_collect if _is_eth_address(pm_collect) else "",
-            "fee_log_chunk_blocks": int(_fee_collect_log_chunk_blocks(int(chain_id))),
-            "fee_log_max_chunks": int(_fee_collect_log_max_chunks(int(chain_id))),
-            "subgraph_aggregated_days": int(len(exact_by_day)),
-            "subgraph_max_abs_usd": float(sub_max),
-            "rpc_aggregated_days": int(len(rpc_by_day)),
-            "rpc_pricing": rpc_pricing,
-            "rpc_detail": rpc_detail[:400],
-            "POSITIONS_FEE_RPC_FORCE": bool(force_rpc),
-            "historical_usd_requested": bool(want_hist_usd),
-            "v4_subgraph_only": bool(protocol == "uniswap_v4"),
-        }
-        out.update(extra)
-        return out
-
     def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
         return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
 
@@ -20756,7 +20402,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
             "note": "POSITIONS_FEE_RPC_FORCE: " + (rpc_detail or "NPM Collect logs."),
-            "debug": _fee_series_debug(result="onchain_collect_forced"),
         }
 
     if exact_by_day and sub_max >= 1e-6 and not force_rpc:
@@ -20769,7 +20414,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
             "note": snap_note,
-            "debug": _fee_series_debug(result="subgraph_snapshots_primary"),
         }
 
     if rpc_by_day:
@@ -20779,7 +20423,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
             "note": "Subgraph fee field empty/zero — " + (rpc_detail or "NPM Collect logs."),
-            "debug": _fee_series_debug(result="onchain_collect_fallback"),
         }
 
     if exact_by_day:
@@ -20792,18 +20435,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
             "note": low_note,
-            "debug": _fee_series_debug(result="subgraph_low_signal"),
         }
-
-    empty_reason = "no_subgraph_and_no_rpc_data"
-    if protocol == "uniswap_v4":
-        empty_reason = "v4_no_snapshot_series_or_empty_subgraph"
-    elif not _is_eth_address(token0) or not _is_eth_address(token1):
-        empty_reason = "missing_token0_or_token1_for_rpc_collect"
-    elif not _position_fee_rpc_fallback_enabled():
-        empty_reason = "rpc_fallback_disabled_env"
-    elif protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
-        empty_reason = "protocol_without_collect_fallback"
 
     return {
         "items": [],
@@ -20811,7 +20443,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         "mode": "unavailable",
         "fee_pricing": "none",
         "note": "No fee data: subgraph empty and on-chain Collect logs missing, or token0_id/token1_id needed for RPC fallback.",
-        "debug": _fee_series_debug(result="empty", empty_reason=empty_reason),
     }
 
 
@@ -22131,7 +21762,6 @@ HTML_PAGE = """
       }
       const btn = document.getElementById("intentMenuBtn");
       const list = document.getElementById("intentMenuList");
-      if (!btn || !list) return;
       const options = Array.from(sel.options || []);
       const selected = options.find((o) => o.selected) || options[0];
       btn.textContent = selected ? selected.textContent : "Select";
