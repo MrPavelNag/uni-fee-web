@@ -15899,6 +15899,8 @@ def _render_positions_page() -> str:
     .status-dot.explorer { background:#93b4d4; border-color:#6b93b8; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
+    #posFeeDebugPanel details summary { cursor: pointer; font-weight: 700; user-select: none; }
+    #posFeeDebugPanel pre { margin: 8px 0 0; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 11px; color: #334155; }
     @media (max-width: 1100px) {
       .address-columns { grid-template-columns:1fr; }
       .positions-form, .result-card { padding: 12px; }
@@ -16029,6 +16031,7 @@ def _render_positions_page() -> str:
         <div id="posFeeBody" class="section-body">
           <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
           <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+          <div id="posFeeDebugPanel" style="display:none;margin-top:10px;border:1px dashed #bfdbfe;background:#f8fbff;border-radius:10px;padding:10px 12px;font-size:11px;line-height:1.45;color:#1e3a8a"></div>
         </div>
       </section>
     </div>
@@ -16849,9 +16852,46 @@ def _render_positions_page() -> str:
         setPosHistoryStatus("History load failed", true);
       }
     }
+    function posFeeDebugPanelShow(html) {
+      const p = document.getElementById("posFeeDebugPanel");
+      if (!p) return;
+      p.style.display = "block";
+      p.innerHTML = html;
+    }
+    function posFeeDebugPanelHide() {
+      const p = document.getElementById("posFeeDebugPanel");
+      if (!p) return;
+      p.style.display = "none";
+      p.innerHTML = "";
+    }
+    function pickFeeWhyShort(attempts) {
+      const EMPTY_REASON_HINT = {
+        missing_token0_or_token1_for_rpc_collect: "Missing token0/token1 — run V3 Scan (on-chain enrich).",
+        rpc_fallback_disabled_env: "RPC fee fallback disabled (server env).",
+        no_subgraph_and_no_rpc_data: "No subgraph fee series and no RPC Collect data.",
+        v4_no_snapshot_series_or_empty_subgraph: "v4 / subgraph: no fee snapshot series.",
+        protocol_without_collect_fallback: "Protocol has no NPM Collect fallback for fees.",
+      };
+      for (const a of attempts) {
+        if (a.skip) continue;
+        if (a.http != null) continue;
+        const er = a.debug && a.debug.empty_reason;
+        if (er && EMPTY_REASON_HINT[er]) return EMPTY_REASON_HINT[er];
+        const dr = a.debug && a.debug.reason;
+        if (dr === "unknown_chain") return "Unknown chain — check row.chain.";
+        if (dr === "no_position_ids") return "No position IDs on row.";
+        if (a.note && String(a.note).trim()) return String(a.note).trim().slice(0, 140);
+      }
+      if (attempts.some((a) => a.skip === "unsupported_protocol")) return "Some rows skipped (unsupported protocol for fees).";
+      if (attempts.some((a) => a.skip === "missing_row")) return "Stale row index — refresh table / re-select History.";
+      if (attempts.some((a) => a.skip)) return "Some rows skipped (missing row data).";
+      if (attempts.length && attempts.every((a) => a.http != null)) return "All requests failed — open debug below.";
+      return "Subgraph empty, unsupported protocol, or RPC fallback needs enriched tokens.";
+    }
     async function showSelectedPositionFees() {
       const chartEl = document.getElementById("posFeeChart");
       if (!chartEl) return;
+      posFeeDebugPanelHide();
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
         setPosFeeStatus("Tick at least one History checkbox in the V3 or v4 / Pancake V3 Farming / Infinity table (same as for TVL).", true);
@@ -16864,6 +16904,7 @@ def _render_positions_page() -> str:
         const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
+        const attempts = [];
         let lastFeePricing = "";
         for (let i = 0; i < selected.length; i++) {
           const hk = parseHistoryKey(selected[i]);
@@ -16871,8 +16912,15 @@ def _render_positions_page() -> str:
           const row = hk.scope === "h"
             ? (posHeavyCache.pools || [])[idx]
             : (posCache.pools || [])[idx];
-          if (!row) continue;
-          if (row.unsupported_protocol) continue;
+          const label = row ? String(row.pair || row.pool_id || `row ${idx}`) : `row #${idx}`;
+          if (!row) {
+            attempts.push({ label, skip: "missing_row" });
+            continue;
+          }
+          if (row.unsupported_protocol) {
+            attempts.push({ label, skip: "unsupported_protocol", protocol: row.protocol });
+            continue;
+          }
           const payload = {
             chain: row.chain,
             protocol: row.protocol,
@@ -16893,12 +16941,26 @@ def _render_positions_page() -> str:
           });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) {
-            const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
+            const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : String(res.status);
             console.warn("position-fee-series failed", row.pair || row.pool_id, det);
+            attempts.push({
+              label,
+              http: res.status,
+              error: det.slice(0, 800),
+              debug: data.debug || null,
+            });
             continue;
           }
           const items = Array.isArray(data.items) ? data.items : [];
-          if (!items.length) continue;
+          if (!items.length) {
+            attempts.push({
+              label,
+              note: String(data.note || ""),
+              mode: String(data.mode || ""),
+              debug: data.debug || null,
+            });
+            continue;
+          }
           const fp = String(data.fee_pricing || "").trim();
           if (fp) lastFeePricing = fp;
           traces.push({
@@ -16911,10 +16973,24 @@ def _render_positions_page() -> str:
           });
         }
         if (!traces.length) {
-          chartEl.innerHTML = "<div class='hint'>No fee data for the selected rows (subgraph empty, protocol unsupported, or NPM Collect fallback needs token0/token1 after on-chain enrich — run Scan on the table first).</div>";
-          setPosFeeStatus("No fee data", false);
+          const why = pickFeeWhyShort(attempts);
+          chartEl.innerHTML = "<div class='hint'><b>No fee data.</b> " + esc(why) + "</div>";
+          setPosFeeStatus("No fee data — " + why, false);
+          let blob;
+          try {
+            blob = JSON.stringify(attempts, null, 2);
+          } catch (e2) {
+            blob = String(e2 && e2.message ? e2.message : e2);
+          }
+          posFeeDebugPanelShow(
+            "<details open><summary>Why? — debug (" + attempts.length + " row attempt(s))</summary>"
+            + "<pre>" + esc(blob) + "</pre>"
+            + "<p class='hint' style='margin:8px 0 0'>Tip: if <code>empty_reason</code> is <code>missing_token0_or_token1_for_rpc_collect</code>, run <b>Scan</b> on the V3 table first.</p>"
+            + "</details>"
+          );
           return;
         }
+        posFeeDebugPanelHide();
         const titleSuffix = histUsd ? " — historical USD (CoinGecko at each Collect)" : " — spot USD";
         Plotly.newPlot("posFeeChart", traces, {
           title: "Cumulative collected fees (USD)" + titleSuffix,
@@ -16931,6 +17007,9 @@ def _render_positions_page() -> str:
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Error: ${esc(e?.message || "unknown")}</div>`;
         setPosFeeStatus("Failed to build chart", true);
+        posFeeDebugPanelShow(
+          "<details open><summary>Why? — debug (client error)</summary><pre>" + esc(String(e && e.stack ? e.stack : e)) + "</pre></details>"
+        );
       }
     }
     function normPosSym(v) {
@@ -20463,6 +20542,13 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "unavailable",
             "fee_pricing": "none",
             "note": "unknown chain",
+            "debug": {
+                "reason": "unknown_chain",
+                "chain_key": chain_key,
+                "chain_id": 0,
+                "protocol_raw": str(req.protocol or "").strip(),
+                "protocol_normalized": protocol,
+            },
         }
 
     position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
@@ -20473,6 +20559,12 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "unavailable",
             "fee_pricing": "none",
             "note": "no position ids",
+            "debug": {
+                "reason": "no_position_ids",
+                "chain_key": chain_key,
+                "chain_id": int(chain_id),
+                "protocol_normalized": protocol,
+            },
         }
 
     token0 = str(req.token0_id or "").strip().lower()
@@ -20521,6 +20613,40 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     rpc_detail = str((rpc_meta or {}).get("detail") or "").strip()
     rpc_pricing = str((rpc_meta or {}).get("pricing") or "none").strip()
 
+    def _fee_series_debug(**extra: Any) -> dict[str, Any]:
+        rpc_ok = (
+            protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
+            and _position_fee_rpc_fallback_enabled()
+            and _is_eth_address(token0)
+            and _is_eth_address(token1)
+        )
+        out: dict[str, Any] = {
+            "chain_key": chain_key,
+            "chain_id": int(chain_id),
+            "protocol_raw": str(req.protocol or "").strip(),
+            "protocol_normalized": protocol,
+            "graph_version": version,
+            "days_requested": int(days),
+            "since_ts": int(since_ts),
+            "subgraph_configured": bool(endpoint),
+            "position_ids_count": len(position_ids),
+            "position_ids_head": [str(x) for x in position_ids[:4]],
+            "token0_ok": bool(_is_eth_address(token0)),
+            "token1_ok": bool(_is_eth_address(token1)),
+            "rpc_fallback_eligible": bool(rpc_ok),
+            "rpc_fallback_enabled_env": bool(_position_fee_rpc_fallback_enabled()),
+            "subgraph_aggregated_days": int(len(exact_by_day)),
+            "subgraph_max_abs_usd": float(sub_max),
+            "rpc_aggregated_days": int(len(rpc_by_day)),
+            "rpc_pricing": rpc_pricing,
+            "rpc_detail": rpc_detail[:400],
+            "POSITIONS_FEE_RPC_FORCE": bool(force_rpc),
+            "historical_usd_requested": bool(want_hist_usd),
+            "v4_subgraph_only": bool(protocol == "uniswap_v4"),
+        }
+        out.update(extra)
+        return out
+
     def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
         return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
 
@@ -20531,6 +20657,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
             "note": "POSITIONS_FEE_RPC_FORCE: " + (rpc_detail or "NPM Collect logs."),
+            "debug": _fee_series_debug(result="onchain_collect_forced"),
         }
 
     if exact_by_day and sub_max >= 1e-6 and not force_rpc:
@@ -20543,6 +20670,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
             "note": snap_note,
+            "debug": _fee_series_debug(result="subgraph_snapshots_primary"),
         }
 
     if rpc_by_day:
@@ -20552,6 +20680,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
             "note": "Subgraph fee field empty/zero — " + (rpc_detail or "NPM Collect logs."),
+            "debug": _fee_series_debug(result="onchain_collect_fallback"),
         }
 
     if exact_by_day:
@@ -20564,7 +20693,18 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
             "note": low_note,
+            "debug": _fee_series_debug(result="subgraph_low_signal"),
         }
+
+    empty_reason = "no_subgraph_and_no_rpc_data"
+    if protocol == "uniswap_v4":
+        empty_reason = "v4_no_snapshot_series_or_empty_subgraph"
+    elif not _is_eth_address(token0) or not _is_eth_address(token1):
+        empty_reason = "missing_token0_or_token1_for_rpc_collect"
+    elif not _position_fee_rpc_fallback_enabled():
+        empty_reason = "rpc_fallback_disabled_env"
+    elif protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+        empty_reason = "protocol_without_collect_fallback"
 
     return {
         "items": [],
@@ -20572,6 +20712,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         "mode": "unavailable",
         "fee_pricing": "none",
         "note": "No fee data: subgraph empty and on-chain Collect logs missing, or token0_id/token1_id needed for RPC fallback.",
+        "debug": _fee_series_debug(result="empty", empty_reason=empty_reason),
     }
 
 
