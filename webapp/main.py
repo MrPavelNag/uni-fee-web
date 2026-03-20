@@ -13,6 +13,7 @@ import os
 import base64
 import contextlib
 import hashlib
+import html
 import json
 import re
 import secrets
@@ -15275,8 +15276,8 @@ def _render_placeholder_page(
     intro_html = (
         f"""
     <section class="card">
-      <h2>{page_title}</h2>
-      <p class="hint">{subtitle}</p>
+      <h2>{html.escape(page_title)}</h2>
+      <p class="hint">{html.escape(subtitle)}</p>
     </section>
 """
         if show_intro
@@ -15532,6 +15533,7 @@ def _render_placeholder_page(
       }}
       const btn = document.getElementById("intentMenuBtn");
       const list = document.getElementById("intentMenuList");
+      if (!btn || !list) return;
       const options = Array.from(sel.options || []);
       const selected = options.find((o) => o.selected) || options[0];
       btn.textContent = selected ? selected.textContent : "Select";
@@ -22129,6 +22131,7 @@ HTML_PAGE = """
       }
       const btn = document.getElementById("intentMenuBtn");
       const list = document.getElementById("intentMenuList");
+      if (!btn || !list) return;
       const options = Array.from(sel.options || []);
       const selected = options.find((o) => o.selected) || options[0];
       btn.textContent = selected ? selected.textContent : "Select";
