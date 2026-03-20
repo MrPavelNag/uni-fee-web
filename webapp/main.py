@@ -13282,6 +13282,10 @@ def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int
 def _normalize_chain_key_slug(chain_key: str) -> str:
     """Canonical UI/config slug (legacy token: arbitrum-one → arbitrum)."""
     k = str(chain_key or "").strip().lower()
+    if k.startswith("eip155:"):
+        k = k.split(":", 2)[-1].strip().lower()
+    if k.isdigit() and int(k) in CHAIN_ID_TO_KEY:
+        return str(CHAIN_ID_TO_KEY[int(k)]).strip().lower()
     return "arbitrum" if k == "arbitrum-one" else k
 
 
@@ -14273,6 +14277,36 @@ def _token_addr_symbol_map_for_chain(chain_key: str) -> dict[str, str]:
     return dict((maps.get(k, {}) or {}))
 
 
+def _normalize_token_symbol_for_lookup(sym: str) -> str:
+    s = str(sym or "").strip().upper()
+    if not s:
+        return ""
+    alias = {
+        "WETH": "ETH",
+        "WETH.E": "ETH",
+        "WETH9": "ETH",
+        "WBNB": "BNB",
+        "WMATIC": "POL",
+        "MATIC": "POL",
+        "WPOL": "POL",
+        "WAVAX": "AVAX",
+        "WFTM": "FTM",
+        "WCELO": "CELO",
+    }
+    return alias.get(s, s)
+
+
+def _token_addr_by_symbol_for_chain(chain_key: str, symbol: str) -> str:
+    want = _normalize_token_symbol_for_lookup(symbol)
+    if not want:
+        return ""
+    addr_map = _token_addr_symbol_map_for_chain(chain_key)
+    for addr, sym in addr_map.items():
+        if _normalize_token_symbol_for_lookup(sym) == want and _is_eth_address(addr):
+            return str(addr).strip().lower()
+    return ""
+
+
 def _build_token_catalog_from_merged_major(merged: dict[str, dict[str, str]], updated_at: str) -> dict[str, Any]:
     """Единый token_catalog.json из той же мапы адресов, что и везде на сайте."""
     by_chain_syms: dict[str, list[str]] = {}
@@ -15021,7 +15055,8 @@ class PositionsScanRequest(BaseModel):
 
 
 class PositionPoolSeriesRequest(BaseModel):
-    chain: str
+    chain: str = ""
+    chain_id: int = 0
     protocol: str
     pool_id: str
     address: str
@@ -15032,6 +15067,8 @@ class PositionPoolSeriesRequest(BaseModel):
     # For on-chain Collect-log fee fallback (same as row.token0_id / token1_id in UI).
     token0_id: str = ""
     token1_id: str = ""
+    token0_symbol: str = ""
+    token1_symbol: str = ""
     # When true, NPM Collect log series uses CoinGecko historical prices at each event (stables $1).
     fee_usd_historical: bool = False
 
@@ -16664,6 +16701,7 @@ def _render_positions_page() -> str:
           if (row.unsupported_protocol) continue;
           const payload = {
             chain: row.chain,
+            chain_id: Number(row.chain_id) || 0,
             protocol: row.protocol,
             pool_id: row.pool_id,
             address: row.address,
@@ -16737,6 +16775,7 @@ def _render_positions_page() -> str:
           if (row.unsupported_protocol) continue;
           const payload = {
             chain: row.chain,
+            chain_id: Number(row.chain_id) || 0,
             protocol: row.protocol,
             pool_id: row.pool_id,
             address: row.address,
@@ -16746,6 +16785,8 @@ def _render_positions_page() -> str:
             days: getHistoryDays(),
             token0_id: row.token0_id || "",
             token1_id: row.token1_id || "",
+            token0_symbol: row.position_symbol0 || "",
+            token1_symbol: row.position_symbol1 || "",
             fee_usd_historical: histUsd,
           };
           const res = await fetch("/api/positions/position-fee-series", {
@@ -20241,6 +20282,9 @@ def debug_heavy_protocol_enrich(limit: int = 50) -> dict[str, Any]:
 @app.post("/api/positions/pool-value-series")
 def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
     chain_key = str(req.chain or "").strip().lower()
+    chain_id_hint = int(getattr(req, "chain_id", 0) or 0)
+    if not chain_key and chain_id_hint > 0 and chain_id_hint in CHAIN_ID_TO_KEY:
+        chain_key = str(CHAIN_ID_TO_KEY[int(chain_id_hint)]).strip().lower()
     protocol = _normalize_positions_series_protocol(str(req.protocol or ""), for_fees=False)
     pool_id = str(req.pool_id or "").strip().lower()
     if not chain_key or not pool_id:
@@ -20256,6 +20300,9 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
     since_ts = now_ts - int(days) * 86400
 
     chain_id = _chain_id_by_chain_key(chain_key)
+    if chain_id <= 0 and chain_id_hint > 0 and chain_id_hint in CHAIN_ID_TO_KEY:
+        chain_id = int(chain_id_hint)
+        chain_key = str(CHAIN_ID_TO_KEY[int(chain_id)]).strip().lower()
     endpoint = get_graph_endpoint(chain_key, version=version)
     position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
 
@@ -20313,6 +20360,9 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
 def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
     """Cumulative fees: subgraph positionSnapshots when reliable; else NPM Collect logs (eth_getLogs)."""
     chain_key = str(req.chain or "").strip().lower()
+    chain_id_hint = int(getattr(req, "chain_id", 0) or 0)
+    if not chain_key and chain_id_hint > 0 and chain_id_hint in CHAIN_ID_TO_KEY:
+        chain_key = str(CHAIN_ID_TO_KEY[int(chain_id_hint)]).strip().lower()
     protocol = _normalize_positions_series_protocol(str(req.protocol or ""), for_fees=True)
     if not chain_key:
         raise HTTPException(status_code=400, detail="chain is required.")
@@ -20327,6 +20377,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     since_ts = now_ts - int(days) * 86400
 
     chain_id = _chain_id_by_chain_key(chain_key)
+    if chain_id <= 0 and chain_id_hint > 0 and chain_id_hint in CHAIN_ID_TO_KEY:
+        chain_id = int(chain_id_hint)
+        chain_key = str(CHAIN_ID_TO_KEY[int(chain_id)]).strip().lower()
     if chain_id <= 0:
         return {
             "items": [],
@@ -20348,6 +20401,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     token0 = str(req.token0_id or "").strip().lower()
     token1 = str(req.token1_id or "").strip().lower()
+    if not _is_eth_address(token0):
+        token0 = _token_addr_by_symbol_for_chain(chain_key, str(getattr(req, "token0_symbol", "") or ""))
+    if not _is_eth_address(token1):
+        token1 = _token_addr_by_symbol_for_chain(chain_key, str(getattr(req, "token1_symbol", "") or ""))
     want_hist_usd = bool(getattr(req, "fee_usd_historical", False))
     endpoint = get_graph_endpoint(chain_key, version=version)
 
