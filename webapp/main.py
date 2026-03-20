@@ -4147,6 +4147,87 @@ def _owner_matches_wallet_or_custody(chain_id: int, protocol: str, wallet_owner:
     return cur in _position_owner_allowlist(int(chain_id), protocol, wallet_owner)
 
 
+def _eth_rpc_log_block_number_u256(lg: Any) -> int:
+    try:
+        return int(str((lg or {}).get("blockNumber") or "0x0"), 16)
+    except Exception:
+        return 0
+
+
+def _position_mint_block_erc721_transfer_on_pm(
+    chain_id: int,
+    pm_contract_lc: str,
+    token_id: int,
+    *,
+    deadline_ts: float | None = None,
+) -> int:
+    """
+    Номер блока первого Transfer(tokenId) на PM (mint). Сначала один запрос 0..latest;
+    если RPC режет диапазон (часто Base/publicnode) — по окнам от генезиса; первое окно с Transfer(tokenId) даёт mint.
+    """
+    cid = int(chain_id)
+    c = str(pm_contract_lc or "").strip().lower()
+    tid = int(token_id)
+    if cid <= 0 or not _is_eth_address(c) or tid <= 0:
+        return 0
+    topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    topic_tid = "0x" + _encode_uint_word(tid)
+    wide: dict[str, Any] = {
+        "address": c,
+        "fromBlock": "0x0",
+        "toBlock": "latest",
+        "topics": [topic_transfer, None, None, topic_tid],
+    }
+    try:
+        latest = _eth_block_number(cid)
+    except Exception:
+        return 0
+    if latest <= 0:
+        return 0
+
+    try:
+        logs_wide = _eth_get_logs(cid, wide, deadline_ts=deadline_ts, max_attempts=2)
+        best = 0
+        for lg in logs_wide or []:
+            bn = _eth_rpc_log_block_number_u256(lg)
+            if bn > 0 and (best <= 0 or bn < best):
+                best = bn
+        if best > 0:
+            return best
+    except Exception:
+        pass
+
+    step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
+    start_b = 0
+    while start_b <= int(latest):
+        if deadline_ts is not None and time.monotonic() >= deadline_ts:
+            break
+        end_b = min(int(latest), int(start_b) + step - 1)
+        chunk: dict[str, Any] = {
+            "address": c,
+            "fromBlock": hex(int(start_b)),
+            "toBlock": hex(int(end_b)),
+            "topics": [topic_transfer, None, None, topic_tid],
+        }
+        try:
+            logs = _eth_get_logs(cid, chunk, deadline_ts=deadline_ts, max_attempts=2)
+        except Exception:
+            if step > 5000:
+                step = max(5000, step // 2)
+                continue
+            logs = []
+        if logs:
+            best = 0
+            for lg in logs:
+                bn = _eth_rpc_log_block_number_u256(lg)
+                if bn > 0 and (best <= 0 or bn < best):
+                    best = bn
+            if best > 0:
+                return best
+        start_b = int(end_b) + 1
+    return 0
+
+
 def _position_creation_date_ymd(chain_id: int, protocol: str, position_id: Any) -> str:
     cid = int(chain_id)
     proto = str(protocol or "").strip().lower()
@@ -4163,33 +4244,12 @@ def _position_creation_date_ymd(chain_id: int, protocol: str, position_id: Any) 
         with POSITION_CREATION_DATE_CACHE_LOCK:
             POSITION_CREATION_DATE_CACHE[key] = ""
         return ""
+    first_block = _position_mint_block_erc721_transfer_on_pm(cid, pm, int(tid), deadline_ts=None)
     date_str = ""
-    try:
-        topic_transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-        topic_tid = "0x" + _encode_uint_word(int(tid))
-        logs = _eth_get_logs(
-            cid,
-            {
-                "address": pm,
-                "fromBlock": "0x0",
-                "toBlock": "latest",
-                "topics": [topic_transfer, None, None, topic_tid],
-            },
-        )
-        first_block = 0
-        for lg in (logs or []):
-            try:
-                bn = int(str((lg or {}).get("blockNumber") or "0x0"), 16)
-            except Exception:
-                bn = 0
-            if bn > 0 and (first_block <= 0 or bn < first_block):
-                first_block = bn
-        if first_block > 0:
-            ts = _eth_get_block_timestamp(cid, first_block)
-            if ts > 0:
-                date_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
-    except Exception:
-        date_str = ""
+    if first_block > 0:
+        ts = _eth_get_block_timestamp(cid, first_block)
+        if ts > 0:
+            date_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
     with POSITION_CREATION_DATE_CACHE_LOCK:
         POSITION_CREATION_DATE_CACHE[key] = date_str
     return date_str
@@ -4237,6 +4297,19 @@ _CREATION_DATE_PM_REGS: tuple[tuple[str, dict[int, str]], ...] = (
     ("pancake_infinity_cl", PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID),
     ("pancake_infinity_bin", PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID),
 )
+
+
+def _pool_id_matches_known_position_manager(chain_id: int, pool_id_lc: str) -> bool:
+    """True если pool_id строки — адрес известного PM (как в NFT-каталоге), а не id пула из сабграфа."""
+    cid = int(chain_id)
+    pl = str(pool_id_lc or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(pl):
+        return False
+    for _proto, reg in _CREATION_DATE_PM_REGS:
+        a = str(reg.get(cid) or "").strip().lower()
+        if a and pl == a:
+            return True
+    return False
 
 
 def _row_chain_id_position_id(row: dict[str, Any]) -> tuple[int, str]:
@@ -10807,7 +10880,11 @@ def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_
             r["position_created_date"] = existing or "-"
             continue
         d = _position_creation_date_peek_for_row(r)
-        if not d and bool(r.get("nft_catalog_explorer_row")):
+        pool_lc = str(r.get("pool_id") or "").strip().lower()
+        if not d and (
+            bool(r.get("nft_catalog_explorer_row"))
+            or _pool_id_matches_known_position_manager(cid, pool_lc)
+        ):
             d = _position_creation_date_ymd_for_row(r)
         if d:
             r["position_created_date"] = d
