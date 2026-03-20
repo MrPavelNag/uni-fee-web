@@ -142,6 +142,23 @@ INDEXER_ACTIVITY: dict[str, Any] = {
 POS_JOBS: dict[str, dict[str, Any]] = {}
 POS_JOB_LOCK = threading.Lock()
 POS_JOB_TTL_SEC = 60 * 60
+
+
+def _positions_job_public_dict(job: dict[str, Any]) -> dict[str, Any]:
+    """Job copy for API with ``elapsed_sec`` (wall clock since ``started_at``, or since ``created_at`` if queued)."""
+    out = dict(job)
+    now = time.time()
+    started = float(out.get("started_at") or 0.0)
+    created = float(out.get("created_at") or 0.0)
+    if started > 0:
+        finished = float(out.get("finished_at") or 0.0)
+        end = finished if finished > 0 else now
+        out["elapsed_sec"] = round(max(0.0, end - started), 2)
+    elif created > 0:
+        out["elapsed_sec"] = round(max(0.0, now - created), 2)
+    else:
+        out["elapsed_sec"] = 0.0
+    return out
 POSITIONS_INDEX_QUEUE: Queue[tuple[int, str]] = Queue()
 POSITIONS_INDEX_INFLIGHT: set[tuple[int, str]] = set()
 POSITIONS_INDEX_INFLIGHT_LOCK = threading.Lock()
@@ -15736,8 +15753,9 @@ def _render_positions_page() -> str:
     .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
     .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:12px; padding:0 0 0 4px; }
-    .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
-    .pos-progress .bar { width: 40%; height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); animation: posLoad 1s linear infinite; }
+    .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; position: relative; }
+    .pos-progress .bar { height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); width: 0%; transition: width 0.35s ease-out; }
+    .pos-progress.pos-progress-indeterminate .bar { width: 40%; animation: posLoad 1s linear infinite; }
     @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
     .pos-status {
       color:#475569;
@@ -15745,10 +15763,10 @@ def _render_positions_page() -> str:
       display:inline-block;
       min-width: 0;
       flex: 1 1 160px;
-      max-width: min(520px, 100%);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      max-width: min(720px, 100%);
+      white-space: normal;
+      overflow: visible;
+      line-height: 1.35;
       vertical-align: middle;
     }
     .table-wrap {
@@ -16057,11 +16075,35 @@ def _render_positions_page() -> str:
       el.textContent = nextText;
       el.style.color = nextErr ? "#b91c1c" : "#475569";
     }
+    function formatScanDuration(sec) {
+      const s = Math.max(0, Number(sec) || 0);
+      if (!Number.isFinite(s) || s <= 0) return "";
+      if (s < 60) return (s >= 10 ? s.toFixed(0) : s.toFixed(1)) + "s";
+      const m = Math.floor(s / 60);
+      const r = Math.floor(s - m * 60);
+      return m + "m " + (r < 10 ? "0" : "") + r + "s";
+    }
+    function setPosProgressBar(wrapId, pct, indeterminate) {
+      const wrap = document.getElementById(wrapId);
+      if (!wrap) return;
+      const bar = wrap.querySelector(".bar");
+      if (!bar) return;
+      const ind = !!indeterminate;
+      wrap.classList.toggle("pos-progress-indeterminate", ind);
+      if (ind) {
+        bar.style.width = "";
+        return;
+      }
+      const p = Math.min(100, Math.max(0, Number(pct) || 0));
+      bar.style.width = p + "%";
+    }
     function setPosBusy(flag) {
       const el = document.getElementById("posProgress");
       const scanBtn = document.getElementById("posSearchBtn");
       if (el) el.style.display = flag ? "block" : "none";
       if (scanBtn) scanBtn.disabled = !!flag;
+      if (flag) setPosProgressBar("posProgress", 0, true);
+      else setPosProgressBar("posProgress", 0, false);
     }
     function setHeavyStatus(text, isErr) {
       const el = document.getElementById("posHeavyStatus");
@@ -16079,6 +16121,8 @@ def _render_positions_page() -> str:
       const scanBtn = document.getElementById("posHeavySearchBtn");
       if (el) el.style.display = flag ? "block" : "none";
       if (scanBtn) scanBtn.disabled = !!flag;
+      if (flag) setPosProgressBar("posHeavyProgress", 0, true);
+      else setPosProgressBar("posHeavyProgress", 0, false);
     }
     function saveActiveHeavyPosJob(jobId) {
       try {
@@ -17090,10 +17134,28 @@ def _render_positions_page() -> str:
       if (!jid) throw new Error("Missing job id");
       const isHeavy = String(scanKind || "v3") === "heavy";
       const statusSink = (txt, err) => (isHeavy ? setHeavyStatus(txt, err) : setPosStatus(txt, err));
+      const progId = isHeavy ? "posHeavyProgress" : "posProgress";
       const cacheBox = isHeavy ? posHeavyCache : posCache;
       const renderTable = isHeavy ? renderHeavyPools : renderPools;
       const errDom = isHeavy ? "posHeavyErrors" : "posErrors";
       let partialRendered = false;
+      let tickTimer = null;
+      let lastPollWall = Date.now();
+      let anchorServerElapsed = 0;
+      let lastPayload = null;
+      function smoothElapsedSec() {
+        return anchorServerElapsed + (Date.now() - lastPollWall) / 1000;
+      }
+      function formatJobStatusLine(d) {
+        const pct = Math.round(Math.min(100, Math.max(0, Number(d.progress || 0))));
+        const lab = String(d.stage_label || d.stage || "").trim() || "…";
+        const stg = String(d.stage || "").trim();
+        const showStg = stg && !["done", "failed", "queued"].includes(stg);
+        const stagePart = showStg ? (" · Stage: " + stg) : "";
+        const t = formatScanDuration(smoothElapsedSec());
+        const timePart = t ? (" · ⏱ " + t) : "";
+        return pct + "% · " + lab + stagePart + timePart;
+      }
       function statusFallbackLabel(raw, st, partial) {
         const s = String(raw || "").trim().toLowerCase();
         if (s.includes("fail")) return "Scan failed";
@@ -17101,41 +17163,62 @@ def _render_positions_page() -> str:
         if (partial) return "Finishing in background";
         return "Working…";
       }
-      while (true) {
-        const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
-        const data = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          const detail = typeof data?.detail === "string" ? data.detail.trim() : "";
-          const err = new Error(detail || "Job polling failed");
-          if (r.status === 404) err._posJobTerminal = true;
-          throw err;
+      try {
+        tickTimer = setInterval(() => {
+          if (!lastPayload) return;
+          statusSink(formatJobStatusLine(lastPayload), false);
+        }, 500);
+        while (true) {
+          const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            const detail = typeof data?.detail === "string" ? data.detail.trim() : "";
+            const err = new Error(detail || "Job polling failed");
+            if (r.status === 404) err._posJobTerminal = true;
+            throw err;
+          }
+          const st = String(data.status || "");
+          const stageLabel = String(data.stage_label || data.stage || "");
+          const progress = Number(data.progress || 0);
+          const partial = data.result || {};
+          lastPayload = data;
+          lastPollWall = Date.now();
+          anchorServerElapsed = Number(data.elapsed_sec || 0);
+          if (st === "queued") {
+            setPosProgressBar(progId, 0, true);
+          } else {
+            setPosProgressBar(progId, progress, false);
+          }
+          if (partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length) {
+            cacheBox.pools = partial.pool_positions || [];
+            cacheBox.debug = partial.debug || null;
+            renderTable(cacheBox.pools);
+            renderScanMessages(partial, errDom);
+            partialRendered = true;
+          }
+          if (st === "done") return data.result || {};
+          if (st === "failed") {
+            const err = new Error(String(data.error || "Scan failed"));
+            err._posJobTerminal = true;
+            throw err;
+          }
+          const stageKey = String(data.stage || "");
+          const backgroundPhase = stageKey.startsWith("enrich_") || stageKey === "finalize" || progress >= 65;
+          if (allowPartialReturn && partialRendered && backgroundPhase) {
+            return Object.assign({__partial: true}, partial);
+          }
+          const backendLbl = String(data.stage_label || "").trim();
+          if (!backendLbl) {
+            lastPayload = Object.assign({}, data, {
+              stage_label: statusFallbackLabel(stageLabel, st, partialRendered),
+            });
+          }
+          statusSink(formatJobStatusLine(lastPayload), false);
+          await new Promise((resolve) => setTimeout(resolve, 1200));
         }
-        const st = String(data.status || "");
-        const stageLabel = String(data.stage_label || data.stage || "");
-        const progress = Number(data.progress || 0);
-        const partial = data.result || {};
-        if (partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length) {
-          cacheBox.pools = partial.pool_positions || [];
-          cacheBox.debug = partial.debug || null;
-          renderTable(cacheBox.pools);
-          renderScanMessages(partial, errDom);
-          partialRendered = true;
-        }
-        if (st === "done") return data.result || {};
-        if (st === "failed") {
-          const err = new Error(String(data.error || "Scan failed"));
-          err._posJobTerminal = true;
-          throw err;
-        }
-        const stageKey = String(data.stage || "");
-        const backgroundPhase = stageKey.startsWith("enrich_") || stageKey === "finalize" || progress >= 65;
-        if (allowPartialReturn && partialRendered && backgroundPhase) {
-          return Object.assign({__partial: true}, partial);
-        }
-        const backendLbl = String(data.stage_label || "").trim();
-        const sLabel = backendLbl || statusFallbackLabel(stageLabel, st, partialRendered);
-        statusSink(sLabel, false);
-        await new Promise((resolve) => setTimeout(resolve, 1200));
+      } finally {
+        if (tickTimer) clearInterval(tickTimer);
+        lastPayload = null;
       }
     }
     function renderHeavyPools(rows) {
@@ -17237,7 +17320,9 @@ def _render_positions_page() -> str:
         updateHeavySearchButton();
         const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
         const n = (data.pool_positions || []).length;
-        setHeavyStatus(`Done. Rows: ${n}${errCount ? ` | warnings: ${errCount}` : ""}`, false);
+        const _durH = formatScanDuration(data.scan_duration_sec);
+        const durH = _durH ? (" · " + _durH + " total") : "";
+        setHeavyStatus(`Done${durH}. Rows: ${n}${errCount ? ` | warnings: ${errCount}` : ""}`, false);
       } catch (e) {
         handleActivePosJobError(e, "heavy", false);
       } finally {
@@ -17265,7 +17350,9 @@ def _render_positions_page() -> str:
         posHeavyHasScannedOnce = true;
         updateHeavySearchButton();
         const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
-        setHeavyStatus(`Done. Rows: ${(data.pool_positions || []).length}${errCount ? ` | warnings: ${errCount}` : ""}`, false);
+        const _durHr = formatScanDuration(data.scan_duration_sec);
+        const durHr = _durHr ? (" · " + _durHr + " total") : "";
+        setHeavyStatus(`Done${durHr}. Rows: ${(data.pool_positions || []).length}${errCount ? ` | warnings: ${errCount}` : ""}`, false);
       } catch (e) {
         handleActivePosJobError(e, "heavy", true);
       } finally {
@@ -17331,8 +17418,10 @@ def _render_positions_page() -> str:
         const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
         const infoCount = Array.isArray(data?.infos) ? data.infos.length : 0;
         const firstInfo = infoCount ? String(data.infos[0] || "") : "";
+        const _durDone = formatScanDuration(data.scan_duration_sec);
+        const durPart = _durDone ? (" · " + _durDone + " total") : "";
         setPosStatus(
-          `Done. Pools: ${(data.pool_positions || []).length}${finishedChecks ? ` | Owner-chain checks: ${finishedChecks}` : ""}${errCount ? ` | warnings: ${errCount}` : ""}${firstInfo ? ` | ${firstInfo}` : ""}`,
+          `Done${durPart}. Pools: ${(data.pool_positions || []).length}${finishedChecks ? ` | Owner-chain checks: ${finishedChecks}` : ""}${errCount ? ` | warnings: ${errCount}` : ""}${firstInfo ? ` | ${firstInfo}` : ""}`,
           false
         );
       } catch (e) {
@@ -17365,8 +17454,10 @@ def _render_positions_page() -> str:
         updatePosSearchButton();
         const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
         const firstInfo = Array.isArray(data?.infos) && data.infos.length ? String(data.infos[0] || "") : "";
+        const _durRes = formatScanDuration(data.scan_duration_sec);
+        const durPartR = _durRes ? (" · " + _durRes + " total") : "";
         setPosStatus(
-          `Done. Pools: ${(data.pool_positions || []).length}${errCount ? ` | warnings: ${errCount}` : ""}${firstInfo ? ` | ${firstInfo}` : ""}`,
+          `Done${durPartR}. Pools: ${(data.pool_positions || []).length}${errCount ? ` | warnings: ${errCount}` : ""}${firstInfo ? ` | ${firstInfo}` : ""}`,
           false
         );
       } catch (e) {
@@ -19913,6 +20004,12 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
         ) is None:
             return
         _run_positions_scan_enrich_phases(job_id, result, hard_scan=hard_scan_enabled)
+        with POS_JOB_LOCK:
+            _j = POS_JOBS.get(job_id) or {}
+            _st = float(_j.get("started_at") or 0)
+        _dur = round(time.time() - _st, 2) if _st > 0 else 0.0
+        result = dict(result) if isinstance(result, dict) else {}
+        result["scan_duration_sec"] = _dur
         _update_pos_job(
             job_id,
             status="done",
@@ -19983,7 +20080,7 @@ def scan_positions_job(job_id: str) -> dict[str, Any]:
         job = POS_JOBS.get(str(job_id))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return dict(job)
+    return _positions_job_public_dict(job)
 
 
 @app.post("/api/positions/scan")
