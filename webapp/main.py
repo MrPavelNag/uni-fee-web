@@ -349,7 +349,8 @@ POSITIONS_EXPLORER_NFTTX_GLOBAL_CONCURRENCY = max(
 )
 _TOKENNFTTX_HTTP_SEM = threading.BoundedSemaphore(int(POSITIONS_EXPLORER_NFTTX_GLOBAL_CONCURRENCY))
 # True: call api.etherscan.io/v2 (chainid) before bscscan/basescan/optimistic. Same ETHERSCAN_API_KEY
-# usually works on v2 for all mapped chains; native hosts often return Invalid API Key for that key.
+# works on v2 for mapped chains. For native hosts: BSC/Base may reject a pure Etherscan key; Arbitrum
+# Arbiscan accepts the same multi-chain Etherscan key — we fall back ARBISCAN_API_KEY → ETHERSCAN_API_KEY.
 POSITIONS_EXPLORER_NFTTX_V2_FIRST = os.environ.get("POSITIONS_EXPLORER_NFTTX_V2_FIRST", "1").strip().lower() in (
     "1",
     "true",
@@ -4717,15 +4718,15 @@ def _explorer_nfttx_rows(
     if not chainid_for_v2:
         return []
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
-    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
-    base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
-    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip() or eth_key
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
+    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip() or eth_key
     optimistic_key = (
         os.environ.get("OPTIMISTIC_ETHERSCAN_API_KEY", "").strip()
         or os.environ.get("OPTIMISM_ETHERSCAN_API_KEY", "").strip()
         or eth_key
     )
-    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
+    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip() or eth_key
     urls: list[tuple[str, bool]] = []
     offset = max(20, min(1000, int(max_rows)))
     for owner_addr in owner_candidates:
@@ -5109,7 +5110,7 @@ def _explorer_owner_nfttx_rows(
             f"&address={o}&page={{page}}&offset={offset}&sort=desc&apikey={eth_key}"
         )
     native_templates: list[str] = []
-    # Chain-native explorers (dedicated API keys). ETHERSCAN_API_KEY alone is often rejected here.
+    # Chain-native explorers. Optional per-chain keys; unset slots reuse ETHERSCAN_API_KEY (Arbitrum: OK).
     if cid == 56 and bsc_key:
         native_templates.append(
             "https://api.bscscan.com/api"
@@ -5653,15 +5654,15 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     if not chainid_for_v2:
         return []
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
-    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip()
-    base_key = os.environ.get("BASESCAN_API_KEY", "").strip()
-    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip() or eth_key
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
+    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip() or eth_key
     optimistic_key = (
         os.environ.get("OPTIMISTIC_ETHERSCAN_API_KEY", "").strip()
         or os.environ.get("OPTIMISM_ETHERSCAN_API_KEY", "").strip()
         or eth_key
     )
-    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip()
+    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip() or eth_key
     urls: list[str] = []
     offset = max(50, int(max_items))
     if eth_key:
