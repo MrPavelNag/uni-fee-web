@@ -309,10 +309,6 @@ POSITIONS_EXPLORER_NFTTX_MAX_PAGES = max(
     int(os.environ.get("POSITIONS_EXPLORER_NFTTX_MAX_PAGES", "80")),
 )
 # One-pass scan: account tokennfttx only → SQLite cache + UI rows (explorer columns only).
-# Subgraph / standard v3 pool rows: optional ownerOf(NPM, tokenId) vs wallet (same tab as explorer owner mismatch).
-POSITIONS_SUBGRAPH_V3_OWNEROF_LIGHT_CHECK = os.environ.get(
-    "POSITIONS_SUBGRAPH_V3_OWNEROF_LIGHT_CHECK", "1"
-).strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_EXPLORER_NFT_CATALOG_SCAN = os.environ.get("POSITIONS_EXPLORER_NFT_CATALOG_SCAN", "1").strip().lower() in (
     "1",
     "true",
@@ -588,9 +584,6 @@ TOKEN_SYMBOL_CACHE: dict[tuple[int, str], str] = {}
 TOKEN_SYMBOL_CACHE_LOCK = threading.Lock()
 CONTRACT_CREATION_DATE_CACHE: dict[tuple[int, str], str] = {}
 CONTRACT_CREATION_DATE_CACHE_LOCK = threading.Lock()
-# Etherscan v2 getcontractcreation → contractCreator (lowercase 0x…), cached per (chain_id, contract).
-CONTRACT_CREATOR_ADDR_CACHE: dict[tuple[int, str], str] = {}
-CONTRACT_CREATOR_ADDR_CACHE_LOCK = threading.Lock()
 POSITION_CREATION_DATE_CACHE: dict[tuple[int, str, int], str] = {}
 POSITION_CREATION_DATE_CACHE_LOCK = threading.Lock()
 EXPLORER_NFT_META_CACHE: dict[tuple[int, str, int], dict[str, Any]] = {}
@@ -698,17 +691,6 @@ POSITIONS_EXPLORER_GRAPH_ID_UNION = os.environ.get("POSITIONS_EXPLORER_GRAPH_ID_
 POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER = os.environ.get(
     "POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
-# Explorer NFT rows: flag when contract deployer (marketplace «Creator») ≠ ERC-721 ownerOf(tokenId).
-# Official PM contracts almost always have deployer ≠ holder — scope to unknown contracts unless INCLUDE_KNOWN_PM.
-POSITIONS_NFT_CREATOR_VS_OWNER_MISMATCH = os.environ.get(
-    "POSITIONS_NFT_CREATOR_VS_OWNER_MISMATCH", "1"
-).strip().lower() in ("1", "true", "yes", "on")
-POSITIONS_NFT_CREATOR_VS_OWNER_INCLUDE_KNOWN_PM = os.environ.get(
-    "POSITIONS_NFT_CREATOR_VS_OWNER_INCLUDE_KNOWN_PM", "0"
-).strip().lower() in ("1", "true", "yes", "on")
-POSITIONS_NFT_CREATOR_VS_OWNER_MAX_FETCHES = max(
-    0, min(500, int(os.environ.get("POSITIONS_NFT_CREATOR_VS_OWNER_MAX_FETCHES", "80")))
-)
 
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
@@ -3965,62 +3947,6 @@ def _explorer_contract_creation_block(chain_id: int, contract_address: str) -> i
         except Exception:
             continue
     return 0
-
-
-def _explorer_contract_creator_address_lower(
-    chain_id: int,
-    contract_address: str,
-    *,
-    fetch_budget: list[int] | None = None,
-) -> str:
-    """
-    Etherscan v2 getcontractcreation: contractCreator (deployer), lowercased.
-    Cached; optional fetch_budget[0] decrements only on a network fetch (cache miss).
-    """
-    cid = int(chain_id)
-    addr = str(contract_address or "").strip().lower()
-    if not _is_eth_address(addr):
-        return ""
-    key = (cid, addr)
-    with CONTRACT_CREATOR_ADDR_CACHE_LOCK:
-        cached = CONTRACT_CREATOR_ADDR_CACHE.get(key)
-    if cached is not None:
-        return str(cached or "")
-
-    if fetch_budget is not None:
-        if int(fetch_budget[0]) <= 0:
-            return ""
-        fetch_budget[0] -= 1
-
-    chainid_for_v2 = _explorer_v2_chainid(cid)
-    api_keys = _explorer_v2_api_keys(cid)
-    creator_lc = ""
-    for apikey in api_keys:
-        if not chainid_for_v2:
-            continue
-        url = (
-            "https://api.etherscan.io/v2/api"
-            f"?chainid={chainid_for_v2}&module=contract&action=getcontractcreation"
-            f"&contractaddresses={addr}&apikey={apikey}"
-        )
-        try:
-            req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
-            with urlopen(req, timeout=10) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            rows = (payload or {}).get("result")
-            if not isinstance(rows, list) or not rows:
-                continue
-            first = rows[0] if isinstance(rows[0], dict) else {}
-            cr = str(first.get("contractCreator") or "").strip().lower()
-            if _is_eth_address(cr):
-                creator_lc = cr
-                break
-        except Exception:
-            continue
-
-    with CONTRACT_CREATOR_ADDR_CACHE_LOCK:
-        CONTRACT_CREATOR_ADDR_CACHE[key] = creator_lc
-    return creator_lc
 
 
 def _contract_creation_date_ymd(chain_id: int, contract_address: str) -> str:
@@ -10696,13 +10622,9 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
         # Keep spam mark sticky across merged rows.
         acc["suspected_spam"] = bool(acc.get("suspected_spam")) or bool(row.get("suspected_spam"))
         acc["spam_skipped"] = bool(acc.get("spam_skipped")) or bool(row.get("spam_skipped"))
-        acc["nft_catalog_scan_mismatch"] = bool(acc.get("nft_catalog_scan_mismatch")) or bool(
-            row.get("nft_catalog_scan_mismatch")
-        )
         acc["nft_catalog_explorer_row"] = bool(acc.get("nft_catalog_explorer_row")) or bool(
             row.get("nft_catalog_explorer_row")
         )
-        # PM snapshot failure is not owner mismatch; sticky OR across merged rows.
         if row.get("nft_catalog_pm_snapshot_ok") is False:
             acc["nft_catalog_pm_snapshot_ok"] = False
         elif acc.get("nft_catalog_pm_snapshot_ok") is not False and row.get("nft_catalog_pm_snapshot_ok") is True:
@@ -10714,13 +10636,6 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
                 acc["nft_catalog_pm_snapshot_reason"] = ps_row
             elif ps_row != ps_acc and ps_row not in ps_acc:
                 acc["nft_catalog_pm_snapshot_reason"] = f"{ps_acc} | {ps_row}"
-        mr_acc = str(acc.get("nft_catalog_mismatch_reason") or "").strip()
-        mr_row = str(row.get("nft_catalog_mismatch_reason") or "").strip()
-        if mr_row:
-            if not mr_acc:
-                acc["nft_catalog_mismatch_reason"] = mr_row
-            elif mr_row != mr_acc and mr_row not in mr_acc:
-                acc["nft_catalog_mismatch_reason"] = f"{mr_acc} | {mr_row}"
         acc_ids = [str(x) for x in (acc.get("position_ids") or []) if str(x).strip()]
         row_ids = [str(x) for x in (row.get("position_ids") or []) if str(x).strip()]
         if row_ids:
@@ -11437,278 +11352,9 @@ def _nft_catalog_row_is_explorer_tokennfttx(row: dict[str, Any]) -> bool:
     return str(r.get("pair_symbol_source") or "").strip() == "explorer:tokennfttx"
 
 
-def _nft_catalog_row_eligible_for_explorer_owner_light(row: dict[str, Any] | None) -> bool:
-    """Same gates as the explorer branch of _nft_catalog_apply_explorer_owner_mismatch_scan (before RPC)."""
-    if not isinstance(row, dict):
-        return False
-    if not _nft_catalog_row_is_explorer_tokennfttx(row):
-        return False
-    chain_id = int(row.get("chain_id") or 0) or int(
-        _chain_id_by_chain_key(str(row.get("chain") or "")) or 0
-    )
-    token_id = _position_token_id_from_raw(row.get("position_id"))
-    owner = str(row.get("address") or "").strip().lower()
-    return bool(chain_id > 0 and token_id > 0 and _is_eth_address(owner))
-
-
 # --- NFT_CATALOG_DEFERRED_OWNER_RECONCILIATION (структурный раздел конвейера, без реализации) ---
-# Зарезервировано под тяжёлую пост-обработку «ложных» owner mismatch:
-#   - тонкости Uniswap V3 (обёртки, делегирование, нестандартные PM);
-#   - Pancake Infinity и смежные схемы;
-#   - V3 farming / staking / кастодиальные контракты вне текущего allowlist.
-# Ожидаемый режим: поздняя фаза скана и/или фоновые задания (RPC, индексаторы, пакетные вызовы).
-# Вкладка «Owner mismatch»: ownerOf + custody allowlist и (опц.) сигнал маркетплейса Creator ≠ Owner
-# (deployer контракта NFT vs ownerOf(tokenId); для известных PM по умолчанию выключено — см. env).
+# Зарезервировано под тяжёлую пост-обработку владения позицией (V3 edge cases, Infinity, farming / custody).
 # -----------------------------------------------------------------------------------------------
-
-
-def _erc721_owner_mismatch_vs_wallet_reason(
-    chain_id: int,
-    protocol: str,
-    nft_contract: str,
-    token_id: int,
-    wallet_owner: str,
-) -> str:
-    """
-    ownerOf(erc721) vs wallet + custody allowlist. Used for explorer NFT rows and subgraph v3 rows.
-    """
-    o = str(wallet_owner or "").strip().lower()
-    if not _is_eth_address(o):
-        return ""
-    c = str(nft_contract or "").strip().lower()
-    tid = int(token_id)
-    if not _is_eth_address(c) or tid <= 0:
-        return ""
-    proto = str(protocol or "").strip().lower()
-    cur_owner = _erc721_owner_of_address_lower(int(chain_id), c, int(tid))
-    if not _is_eth_address(cur_owner) or cur_owner == "0x0000000000000000000000000000000000000000":
-        return "owner_burned_or_unknown"
-    if cur_owner != o and not _owner_matches_wallet_or_custody(int(chain_id), proto, o, cur_owner):
-        return "owner_not_wallet_or_custody_explorer_claim"
-    return ""
-
-
-def _nft_catalog_scan_owner_mismatch_reason(
-    chain_id: int,
-    protocol: str,
-    row: dict[str, Any],
-    token_id: int,
-    wallet_owner: str,
-) -> str:
-    """
-    Лёгкая фаза: сверка «explorer transfer list» с ownerOf(NFT).
-
-    Это не полная семантика «владения позицией»: отсутствие совпадения часто отражает
-    не спам, а неполную обработку Uniswap V3, Pancake Infinity, V3 farming / staking —
-    там нужны тяжёлые запросы (доп. контракты, индексаторы, обход делегирования).
-    Такая **отложенная тяжёлая сверка** вынесена в отдельный зарезервированный этап конвейера
-    (см. комментарий NFT_CATALOG_DEFERRED_OWNER_RECONCILIATION); здесь только allowlist custody.
-
-    V4 Uniswap, Pancake v3 в фарминге, Pancake Infinity — когда on-chain owner = custody из allowlist,
-    возвращается пустая строка (несовпадения нет).
-    """
-    if not _nft_catalog_row_is_explorer_tokennfttx(row):
-        return ""
-    nft_contract = str(row.get("pool_id") or "").strip().lower()
-    return _erc721_owner_mismatch_vs_wallet_reason(
-        int(chain_id), str(protocol or ""), nft_contract, int(token_id), str(wallet_owner or "")
-    )
-
-
-def _nft_catalog_creator_vs_owner_mismatch_reason(
-    chain_id: int,
-    row: dict[str, Any],
-    token_id: int,
-    fetch_budget: list[int] | None,
-) -> str:
-    """
-    Маркетплейс-семантика: «Creator» (deployer NFT-контракта) vs текущий holder ownerOf(tokenId).
-    Официальные PM почти всегда deployer ≠ holder — по умолчанию правило только для неизвестных pool_id.
-    """
-    if not POSITIONS_NFT_CREATOR_VS_OWNER_MISMATCH:
-        if isinstance(row, dict):
-            row.pop("explorer_nft_contract_creator", None)
-        return ""
-    if not isinstance(row, dict) or not _nft_catalog_row_is_explorer_tokennfttx(row):
-        return ""
-    row.pop("explorer_nft_contract_creator", None)
-    nft_contract = str(row.get("pool_id") or "").strip().lower()
-    tid = int(token_id)
-    if not _is_eth_address(nft_contract) or tid <= 0:
-        return ""
-    pmk = _explorer_nft_contract_pm_kind(int(chain_id), nft_contract)
-    if pmk and not POSITIONS_NFT_CREATOR_VS_OWNER_INCLUDE_KNOWN_PM:
-        return ""
-    creator = _explorer_contract_creator_address_lower(
-        int(chain_id), nft_contract, fetch_budget=fetch_budget
-    )
-    if not _is_eth_address(creator) or creator == "0x0000000000000000000000000000000000000000":
-        return ""
-    holder = _erc721_owner_of_address_lower(int(chain_id), nft_contract, tid)
-    if not _is_eth_address(holder) or holder == "0x0000000000000000000000000000000000000000":
-        return ""
-    if creator != holder:
-        row["explorer_nft_contract_creator"] = creator
-        return "nft_contract_creator_differs_from_owner_of"
-    return ""
-
-
-def _subgraph_v3_row_eligible_for_ownerof_light_check(row: dict[str, Any]) -> bool:
-    if not isinstance(row, dict):
-        return False
-    if _nft_catalog_row_is_explorer_tokennfttx(row):
-        return False
-    if bool(row.get("unsupported_protocol")):
-        return False
-    proto = str(row.get("protocol") or "").strip().lower()
-    if proto not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
-        return False
-    return True
-
-
-def _subgraph_v3_row_npm_contract_for_ownerof(chain_id: int, row: dict[str, Any]) -> str:
-    ex = str(row.get("_nft_contract") or "").strip().lower()
-    if _is_eth_address(ex):
-        return ex
-    proto = str(row.get("protocol") or "").strip().lower()
-    return str(_position_manager_for_protocol(int(chain_id), proto) or "").strip().lower()
-
-
-# Reasons from _nft_catalog_scan_owner_mismatch_reason — must not be cleared by PM snapshot enrich
-# (positions(tokenId) does not prove the wallet owns the NFT; explorer list vs ownerOf does).
-_NFT_CATALOG_OWNER_LAYER_MISMATCH_REASONS = frozenset(
-    {
-        "owner_burned_or_unknown",
-        "owner_not_wallet_or_custody_explorer_claim",
-        "nft_contract_creator_differs_from_owner_of",
-    }
-)
-
-
-def _nft_catalog_row_has_owner_layer_mismatch(row: dict[str, Any] | None) -> bool:
-    if not isinstance(row, dict) or not bool(row.get("nft_catalog_scan_mismatch")):
-        return False
-    rsn = str(row.get("nft_catalog_mismatch_reason") or "").strip()
-    if not rsn:
-        return False
-    for part in rsn.split("|"):
-        if str(part or "").strip() in _NFT_CATALOG_OWNER_LAYER_MISMATCH_REASONS:
-            return True
-    return False
-
-
-def _apply_subgraph_v3_ownerof_light_scan_phase(
-    rows: list[dict[str, Any]],
-    *,
-    start: float,
-    max_seconds: float,
-    max_rows: int,
-    checked_start: int = 0,
-) -> tuple[int, int]:
-    """
-    ownerOf на V3 NPM для строк subgraph (не explorer:tokennfttx).
-    Возвращает (число новых mismatch, итоговый checked).
-    """
-    mismatch_added = 0
-    checked = int(checked_start)
-    for row in rows or []:
-        if time.monotonic() - start >= float(max_seconds):
-            break
-        if checked >= int(max_rows):
-            break
-        if not isinstance(row, dict):
-            continue
-        if not _subgraph_v3_row_eligible_for_ownerof_light_check(row):
-            continue
-        chain_id = int(row.get("chain_id") or 0) or int(
-            _chain_id_by_chain_key(str(row.get("chain") or "")) or 0
-        )
-        token_id = _position_token_id_from_raw(row.get("position_id"))
-        owner = str(row.get("address") or "").strip().lower()
-        if chain_id <= 0 or token_id <= 0 or not _is_eth_address(owner):
-            continue
-        proto = str(row.get("protocol") or "").strip().lower()
-        nft_c = _subgraph_v3_row_npm_contract_for_ownerof(chain_id, row)
-        om = _erc721_owner_mismatch_vs_wallet_reason(
-            chain_id, proto, nft_c, int(token_id), owner
-        )
-        if om:
-            row["nft_catalog_scan_mismatch"] = True
-            row["nft_catalog_mismatch_reason"] = str(om)
-            mismatch_added += 1
-        else:
-            row["nft_catalog_scan_mismatch"] = False
-            row["nft_catalog_mismatch_reason"] = ""
-        checked += 1
-    return int(mismatch_added), int(checked)
-
-
-def _nft_catalog_apply_explorer_owner_mismatch_scan(
-    rows: list[dict[str, Any]],
-    *,
-    max_seconds: float = 22.0,
-    max_subgraph_seconds: float | None = None,
-    max_rows: int = 900,
-) -> tuple[int, int, int]:
-    """
-    Лёгкая фаза конвейера: ownerOf(NFT) vs кошелёк скана.
-
-    (1) Строки explorer tokennfttx (в т.ч. unsupported): pool_id = контракт NFT.
-    (2) При POSITIONS_SUBGRAPH_V3_OWNEROF_LIGHT_CHECK — обычные v3-строки из subgraph: ownerOf на NPM
-    из _nft_contract или position manager по протоколу (The Graph может отставать или врать по owner).
-
-    Нарратив «сначала владелец»: ownerOf + custody allowlist; для explorer-строк дополнительно
-    (по env) Creator ≠ Owner; тяжёлая фаза — отдельно (NFT_CATALOG_DEFERRED_OWNER_RECONCILIATION).
-
-    Важно: бюджет времени для (1) и (2) разделён (отдельные monotonic «старт»), иначе при большом
-    числе NFT фаза (1) съедает весь лимит и subgraph не успевает; раньше обе фазы делили один start,
-    из‑за чего часть explorer-строк могла не получить ownerOf при лимите ~24s — вкладка
-    «Owner mismatch» оставалась пустой, хотя проверка была неполной (строки оставались с mismatch=False).
-    """
-    start = time.monotonic()
-    mismatch_n = 0
-    checked = 0
-    creator_fetch_budget = [int(POSITIONS_NFT_CREATOR_VS_OWNER_MAX_FETCHES)]
-    for row in rows or []:
-        if time.monotonic() - start >= float(max_seconds):
-            break
-        if checked >= int(max_rows):
-            break
-        if not isinstance(row, dict):
-            continue
-        if not _nft_catalog_row_eligible_for_explorer_owner_light(row):
-            continue
-        chain_id = int(row.get("chain_id") or 0) or int(_chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
-        token_id = _position_token_id_from_raw(row.get("position_id"))
-        owner = str(row.get("address") or "").strip().lower()
-        proto = _nft_catalog_row_enrich_protocol(row)
-        om = _nft_catalog_scan_owner_mismatch_reason(chain_id, proto, row, int(token_id), owner)
-        cv = _nft_catalog_creator_vs_owner_mismatch_reason(
-            chain_id, row, int(token_id), creator_fetch_budget
-        )
-        parts = [p for p in (str(om or "").strip(), str(cv or "").strip()) if p]
-        if parts:
-            row["nft_catalog_scan_mismatch"] = True
-            row["nft_catalog_mismatch_reason"] = " | ".join(parts)
-            mismatch_n += 1
-        else:
-            row["nft_catalog_scan_mismatch"] = False
-            row["nft_catalog_mismatch_reason"] = ""
-        checked += 1
-
-    explorer_owner_rpc_calls = int(checked)
-    sg_budget = float(max_subgraph_seconds) if max_subgraph_seconds is not None else float(max_seconds)
-    start_sg = time.monotonic()
-    if POSITIONS_SUBGRAPH_V3_OWNEROF_LIGHT_CHECK:
-        add_m, checked = _apply_subgraph_v3_ownerof_light_scan_phase(
-            rows,
-            start=start_sg,
-            max_seconds=float(sg_budget),
-            max_rows=int(max_rows),
-            checked_start=int(checked),
-        )
-        mismatch_n += int(add_m)
-    return int(mismatch_n), int(checked), int(explorer_owner_rpc_calls)
 
 
 def _enrich_nft_catalog_rows_from_chain(
@@ -11740,17 +11386,12 @@ def _enrich_nft_catalog_rows_from_chain(
             continue
         seg = str(row.get("catalog_segment") or "").strip().lower()
         is_ex_nft = _nft_catalog_row_is_explorer_tokennfttx(row)
-        # Closed: ownerOf уже в _nft_catalog_apply_explorer_owner_mismatch_scan.
         if seg == "closed":
-            continue
-        # Реальное несовпадение владельца (ownerOf vs кошелёк) — не перетираем PM-снимком.
-        if is_ex_nft and _nft_catalog_row_has_owner_layer_mismatch(row):
             continue
         try:
             snap = _fetch_v3_position_contract_snapshot(chain_id, proto, int(token_id), owner)
             if not isinstance(snap, dict):
                 if is_ex_nft:
-                    # Не смешивать с «Owner mismatch»: это сбой чтения PM / ABI (часто v4), а не ownerOf.
                     row["nft_catalog_pm_snapshot_ok"] = False
                     row["nft_catalog_pm_snapshot_reason"] = "position_snapshot_unavailable"
                 fail_n += 1
@@ -11760,11 +11401,6 @@ def _enrich_nft_catalog_rows_from_chain(
             if is_ex_nft:
                 row["nft_catalog_pm_snapshot_ok"] = True
                 row["nft_catalog_pm_snapshot_reason"] = ""
-                # Successful PM read must not erase explorer vs ownerOf findings: the snapshot is keyed
-                # only by tokenId and does not re-validate NFT ownership for the scanned wallet.
-                if not _nft_catalog_row_has_owner_layer_mismatch(row):
-                    row["nft_catalog_scan_mismatch"] = False
-                    row["nft_catalog_mismatch_reason"] = ""
             ok_n += 1
         except Exception:
             if is_ex_nft:
@@ -12360,8 +11996,6 @@ def _scan_pool_positions_explorer_nft_catalog(
                     "fees_owed_display": "-",
                     "suspected_spam": False,
                     "spam_skipped": False,
-                    "nft_catalog_scan_mismatch": False,
-                    "nft_catalog_mismatch_reason": "",
                     "nft_catalog_pm_snapshot_ok": None,
                     "nft_catalog_pm_snapshot_reason": "",
                     "nft_catalog_explorer_row": True,
@@ -14855,47 +14489,6 @@ def _render_positions_page() -> str:
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
     #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
-    /* Owner mismatch: avoid 1300px+ min-width — keep within card; wrap text */
-    .mismatch-table-wrap table#posPoolsMismatchTable {
-      min-width: 0;
-      width: 100%;
-      max-width: 100%;
-      table-layout: fixed;
-    }
-    .mismatch-table-wrap #posPoolsMismatchTable th,
-    .mismatch-table-wrap #posPoolsMismatchTable td {
-      white-space: normal;
-      word-break: break-word;
-      vertical-align: top;
-      font-size: 11px;
-      padding: 5px 6px;
-    }
-    .mismatch-table-wrap #posPoolsMismatchTable td.mono {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      min-width: 0;
-    }
-    .mismatch-table-wrap #posPoolsMismatchTable th:nth-child(1),
-    .mismatch-table-wrap #posPoolsMismatchTable td:nth-child(1) {
-      position: sticky;
-      left: 0;
-      z-index: 4;
-      background: #f8fbff;
-      width: 11%;
-    }
-    .mismatch-table-wrap #posPoolsMismatchTable th:nth-child(1) { background: #fff7ed; z-index: 5; }
-    .mismatch-table-wrap #posPoolsMismatchTable th:nth-child(5),
-    .mismatch-table-wrap #posPoolsMismatchTable td:nth-child(5) {
-      width: 22%;
-      line-height: 1.35;
-    }
-    .mismatch-table-wrap tr.pos-mm-empty td {
-      border-bottom: none;
-      padding: 14px 16px !important;
-      font-size: 12px !important;
-      line-height: 1.45;
-    }
     .pos-pools-tab-bar { display: none; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
     .pos-tab-btn {
       border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
@@ -14983,20 +14576,18 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posPoolsBody" class="section-body">
-          <div class="pos-pools-tab-bar" id="posPoolsTabBar" style="flex-wrap:wrap;gap:4px" title="Tab order: main → spam → protocol → closed → owner mismatch → other issues → hidden.">
-            <button type="button" class="pos-tab-btn active" data-pos-tab="main" onclick="switchPosPoolsTab('main')" title="Valid positions: not closed, owner mismatch, hidden, or routed to Spam / Protocol / Other issues.">Positions <span id="posMainTabCount"></span></button>
+          <div class="pos-pools-tab-bar" id="posPoolsTabBar" style="flex-wrap:wrap;gap:4px" title="Tab order: main → spam → protocol → closed → other issues → hidden.">
+            <button type="button" class="pos-tab-btn active" data-pos-tab="main" onclick="switchPosPoolsTab('main')" title="Valid positions: not closed, hidden, or routed to Spam / Protocol / Other issues.">Positions <span id="posMainTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="spam" onclick="switchPosPoolsTab('spam')" title="Heuristic spam / exotic pair (trust to manage).">Spam <span id="posSpamTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="protocol" onclick="switchPosPoolsTab('protocol')">Protocol filter <span id="posProtocolTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="closed" onclick="switchPosPoolsTab('closed')" title="Zero open liquidity on PM (catalog).">Closed <span id="posClosedTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="mismatch" onclick="switchPosPoolsTab('mismatch')" title="Wallet vs ownerOf (+ custody); explorer rows: optional NFT contract deployer (marketplace Creator) vs ownerOf for unknown contracts. Known PM: set POSITIONS_NFT_CREATOR_VS_OWNER_INCLUDE_KNOWN_PM=1 to apply the same rule.">Owner mismatch <span id="posMismatchTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="other" onclick="switchPosPoolsTab('other')" title="Phishing metadata, pair string vs on-chain symbols, PM read failures — see Issue column; not owner mismatch.">Other issues <span id="posOtherTabCount"></span></button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="other" onclick="switchPosPoolsTab('other')" title="Phishing metadata, pair string vs on-chain symbols, PM read failures — see Issue column.">Other issues <span id="posOtherTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="hidden" onclick="switchPosPoolsTab('hidden')" title="Rows you marked with Hide on the main list.">Hidden <span id="posHiddenTabCount"></span></button>
           </div>
           <div class="table-wrap" id="posPoolsTableMainWrap"><table id="posPoolsTable"></table></div>
           <div class="table-wrap" id="posPoolsTableSpamWrap" style="display:none"><table id="posPoolsSpamTable"></table></div>
           <div class="table-wrap" id="posPoolsTableProtocolWrap" style="display:none"><table id="posPoolsProtocolTable"></table></div>
           <div class="table-wrap" id="posPoolsTableClosedWrap" style="display:none"><table id="posPoolsClosedTable"></table></div>
-          <div class="table-wrap mismatch-table-wrap" id="posPoolsTableMismatchWrap" style="display:none"><table id="posPoolsMismatchTable"></table></div>
           <div class="table-wrap" id="posPoolsTableOtherWrap" style="display:none"><table id="posPoolsOtherTable"></table></div>
           <div class="table-wrap" id="posPoolsTableHiddenWrap" style="display:none"><table id="posPoolsHiddenTable"></table></div>
           <div id="posErrors"></div>
@@ -15096,57 +14687,33 @@ def _render_positions_page() -> str:
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
-    const NFT_CATALOG_MISMATCH_LABELS = {
-      owner_burned_or_unknown: "Burned or no on-chain owner (explorer row may not match this token id)",
-      owner_not_wallet_or_custody_explorer_claim: "Owner on chain is not your wallet and not a known custody contract",
-      nft_contract_creator_differs_from_owner_of: "NFT contract deployer (Explorer Creator) ≠ ERC-721 ownerOf(holder) — marketplace-style signal; normal for official PM unless INCLUDE_KNOWN_PM",
-    };
     const NFT_PM_SNAPSHOT_LABELS = {
-      position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder). Not owner mismatch.",
+      position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder).",
     };
     function nftCatalogPmSnapshotLabel(code) {
       const c = String(code || "").trim();
       return NFT_PM_SNAPSHOT_LABELS[c] || (c ? c : "—");
     }
-    function nftCatalogMismatchLabel(code) {
-      const c = String(code || "").trim();
-      if (c.includes(" | ")) {
-        return c.split(" | ").map((x) => nftCatalogMismatchLabel(x.trim())).join(" | ");
-      }
-      return NFT_CATALOG_MISMATCH_LABELS[c] || (c ? c : "—");
-    }
-    /** Tab «Owner mismatch»: only ownerOf-vs-wallet layer, not PM read failures (legacy cache may still flag snapshot under mismatch). */
-    function rowIsNftCatalogOwnerMismatchTab(row) {
-      const mm = !!(row && (row.nft_catalog_scan_mismatch === true || row.nft_catalog_scan_mismatch === 1 || String(row.nft_catalog_scan_mismatch).toLowerCase() === "true"));
-      if (!mm) return false;
-      const rsn = String(row?.nft_catalog_mismatch_reason || "").trim();
-      if (!rsn) return true;
-      const parts = rsn.split("|").map((x) => String(x || "").trim()).filter(Boolean);
-      if (!parts.length) return true;
-      const snapOnly = parts.every((p) => p === "position_snapshot_unavailable");
-      return !snapOnly;
-    }
     function normalizePosPoolsTabKey(raw) {
       const t = String(raw || "").toLowerCase();
       if (t === "phishing" || t === "pair") return "other";
+      if (t === "mismatch") return "main";
       return t;
     }
     function switchPosPoolsTab(name, silent) {
       const mainW = document.getElementById("posPoolsTableMainWrap");
       const prW = document.getElementById("posPoolsTableProtocolWrap");
-      const mmW = document.getElementById("posPoolsTableMismatchWrap");
       const clW = document.getElementById("posPoolsTableClosedWrap");
       const spW = document.getElementById("posPoolsTableSpamWrap");
       const otW = document.getElementById("posPoolsTableOtherWrap");
       const hidW = document.getElementById("posPoolsTableHiddenWrap");
-      if (!mainW || !mmW) return;
+      if (!mainW) return;
       const tab = normalizePosPoolsTabKey(name);
       const wraps = [
         ["main", mainW],
         ["spam", spW],
         ["protocol", prW],
         ["closed", clW],
-        ["mismatch", mmW],
         ["other", otW],
         ["hidden", hidW],
       ];
@@ -15160,7 +14727,7 @@ def _render_positions_page() -> str:
       });
       if (!silent) {
         try {
-          const allowed = new Set(["main", "spam", "protocol", "closed", "mismatch", "other", "hidden"]);
+          const allowed = new Set(["main", "spam", "protocol", "closed", "other", "hidden"]);
           localStorage.setItem(POS_POOLS_TAB_KEY, allowed.has(tab) ? tab : "main");
         } catch (_) {}
       }
@@ -15498,15 +15065,6 @@ def _render_positions_page() -> str:
           if (fetchS > 0 || mergeS > 0) {
             timingLines.push(`NFT_time: parallel_fetch=${fetchS}s merge=${mergeS}s workers=${pw}`);
           }
-          const oe = Number(nftDbg.owner_light_explorer_eligible || 0);
-          const oc = Number(nftDbg.owner_light_explorer_checked || 0);
-          const os = Number(nftDbg.owner_light_explorer_unchecked || 0);
-          const omm = Number(nftDbg.owner_mismatch_rows || 0);
-          if (oe > 0 || oc > 0) {
-            timingLines.push(
-              `owner_light: explorer_eligible=${oe} ownerOf_done=${oc}${os > 0 ? ` unchecked=${os}` : ""} mismatches=${omm}`
-            );
-          }
           const bal = (nftDbg && typeof nftDbg.balance_vs_explorer === "object") ? nftDbg.balance_vs_explorer : {};
           const bs = (bal && typeof bal.summary === "object") ? bal.summary : {};
           const bchk = Number(bs.contracts_checked || 0);
@@ -15749,7 +15307,6 @@ def _render_positions_page() -> str:
       const protocolRows = [];
       const closedTabRows = [];
       const spamRows = [];
-      const mismatchRows = [];
       const otherRows = [];
       function rowTrustSpamParam(r) {
         const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
@@ -15771,11 +15328,6 @@ def _render_positions_page() -> str:
         row._is_manual_hidden = manual;
         row._is_suspected_spam = suspected;
         row._is_unsupported_protocol = unsupported;
-        // Owner mismatch: ownerOf vs wallet only (not PM snapshot / v3 ABI on v4 PM).
-        if (rowIsNftCatalogOwnerMismatchTab(row)) {
-          mismatchRows.push(row);
-          continue;
-        }
         if (metaPhish && !trusted) {
           otherRows.push(Object.assign({}, row, { _other_issue_label: "Phishing / scam" }));
           continue;
@@ -15841,7 +15393,7 @@ def _render_positions_page() -> str:
       }
       if (!visible.length) {
         html += listAll.length
-          ? `<tr><td colspan='${totalCols}'>No pool positions in the main list — rows that matched a filter are on the other tabs (spam, protocol, closed, owner mismatch, other issues, hidden).</td></tr>`
+          ? `<tr><td colspan='${totalCols}'>No pool positions in the main list — rows that matched a filter are on the other tabs (spam, protocol, closed, other issues, hidden).</td></tr>`
           : `<tr><td colspan='${totalCols}'>No pool positions found.</td></tr>`;
       }
       const otCols = 15;
@@ -15885,63 +15437,6 @@ def _render_positions_page() -> str:
       }
       if (!otherRows.length) {
         otHtml += `<tr><td colspan='${otCols}' style='white-space:normal;color:#64748b'>No rows here: phishing-style collection metadata, pair string vs on-chain symbols (Issue: Pair mismatch), and PM snapshot read failures land on this tab. Spam, protocol gate, and closed positions stay on their own tabs.</td></tr>`;
-      }
-      const mmCols = 14;
-      let mmHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th title="NFT collection scan: explorer tokennfttx row vs on-chain owner / PM read">Scan issue</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
-      for (let mi = 0; mi < mismatchRows.length; mi++) {
-        const r = mismatchRows[mi];
-        const pm = hasPairMismatch(r);
-        const pmStyle = pm ? " style='background:#fff7ed;color:#9a3412;font-weight:600'" : "";
-        const pairTrace = String(r.pair_symbol_source || "").trim();
-        const pairTitleRaw = pm
-          ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`
-          : (pairTrace ? `source: ${pairTrace}` : "");
-        const pmTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
-        const reasonCode = String(r.nft_catalog_mismatch_reason || "").trim();
-        const issueLabel = nftCatalogMismatchLabel(reasonCode);
-        const issueTitle = ` title="${escAttr(reasonCode || issueLabel)}"`;
-        mmHtml += "<tr>";
-        mmHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
-        mmHtml += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
-        mmHtml += `<td>${esc(r.chain || "")}</td>`;
-        mmHtml += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
-        mmHtml += `<td${issueTitle}>${esc(issueLabel)}</td>`;
-        const rowKeyEscMm = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        mmHtml += `<td${pmStyle}${pmTitle}>${esc(r.pair || "")}${pm ? " ⚠" : ""}</td>`;
-        const feeRawMm = String(r.fee_tier_raw || "").trim();
-        const feeTipMm = feeRawMm ? ` title="raw: ${esc(feeRawMm)}"` : "";
-        mmHtml += `<td${feeTipMm}>${esc(r.fee_tier || "")}</td>`;
-        mmHtml += `<td>${esc(r.position_created_date || "-")}</td>`;
-        mmHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
-        mmHtml += `<td${pmStyle}${pmTitle}>${esc(r.position_amounts_display || "-")}</td>`;
-        mmHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
-        mmHtml += `<td${pmStyle}${pmTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        mmHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscMm}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        const checkedMm = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-        mmHtml += `<td><input type='checkbox' ${checkedMm} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
-        mmHtml += "</tr>";
-      }
-      if (!mismatchRows.length) {
-        const nftDbg = (posCache.debug && typeof posCache.debug === "object" && posCache.debug.nft_scan && typeof posCache.debug.nft_scan === "object")
-          ? posCache.debug.nft_scan
-          : {};
-        const elig = Number(nftDbg.owner_light_explorer_eligible || 0);
-        const exChk = Number(nftDbg.owner_light_explorer_checked || 0);
-        const exSkip = Number(nftDbg.owner_light_explorer_unchecked || 0);
-        const mmRows = Number(nftDbg.owner_mismatch_rows || 0);
-        const dbgLine = (elig > 0 || exChk > 0)
-          ? ` Debug: explorer owner-light eligible=${elig}, ownerOf calls done=${exChk}${exSkip > 0 ? `, skipped=${exSkip} (time/row budget — re-scan or raise limits)` : ""}; mismatch rows=${mmRows}.`
-          : "";
-        const mmEmpty = hasExplorerNftCatalog
-          ? ("This tab lists only rows that failed the light owner check (explorer NFT vs on-chain ownerOf / known custody). "
-            + "If every checked row matches your wallet (or allowlisted custody), the tab is empty — that is expected. "
-            + "PM read errors (v4 ABI, RPC) are not listed here — see tab «Other issues»."
-            + dbgLine
-            + " Heavier reconciliation (V3 edge cases / Infinity / farming) is not in this build yet.")
-          : ("This tab is empty: no row failed the server light owner check. "
-            + "For subgraph-only scans ownerOf on the V3 PM may still run when enabled."
-            + dbgLine);
-        mmHtml += `<tr class="pos-mm-empty"><td colspan='${mmCols}' style='white-space:normal;color:#64748b'>${mmEmpty}</td></tr>`;
       }
       const stCols = 12;
       let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
@@ -16048,12 +15543,9 @@ def _render_positions_page() -> str:
       if (otTable) otTable.innerHTML = otHtml;
       const hidTable = document.getElementById("posPoolsHiddenTable");
       if (hidTable) hidTable.innerHTML = hiddenHtml;
-      const mmTable = document.getElementById("posPoolsMismatchTable");
-      if (mmTable) mmTable.innerHTML = mmHtml;
       const tabBar = document.getElementById("posPoolsTabBar");
       const cntMainEl = document.getElementById("posMainTabCount");
       const cntPrEl = document.getElementById("posProtocolTabCount");
-      const cntEl = document.getElementById("posMismatchTabCount");
       const cntClEl = document.getElementById("posClosedTabCount");
       const cntSpEl = document.getElementById("posSpamTabCount");
       const cntOtEl = document.getElementById("posOtherTabCount");
@@ -16061,7 +15553,6 @@ def _render_positions_page() -> str:
       const hasSubTabs =
         hasExplorerNftCatalog
         || protocolRows.length > 0
-        || mismatchRows.length > 0
         || closedTabRows.length > 0
         || spamRows.length > 0
         || otherRows.length > 0
@@ -16069,14 +15560,13 @@ def _render_positions_page() -> str:
       if (tabBar) tabBar.style.display = hasSubTabs ? "flex" : "none";
       if (cntMainEl) cntMainEl.textContent = visible.length ? `(${visible.length})` : "";
       if (cntPrEl) cntPrEl.textContent = protocolRows.length ? `(${protocolRows.length})` : "";
-      if (cntEl) cntEl.textContent = mismatchRows.length ? `(${mismatchRows.length})` : "";
       if (cntClEl) cntClEl.textContent = closedTabRows.length ? `(${closedTabRows.length})` : "";
       if (cntSpEl) cntSpEl.textContent = spamRows.length ? `(${spamRows.length})` : "";
       if (cntOtEl) cntOtEl.textContent = otherRows.length ? `(${otherRows.length})` : "";
       if (cntHidEl) cntHidEl.textContent = hiddenRows.length ? `(${hiddenRows.length})` : "";
       let savedPoolsTab = "";
       try { savedPoolsTab = String(localStorage.getItem(POS_POOLS_TAB_KEY) || ""); } catch (_) { savedPoolsTab = ""; }
-      const allowedTabs = new Set(["main", "spam", "protocol", "closed", "mismatch", "other", "hidden"]);
+      const allowedTabs = new Set(["main", "spam", "protocol", "closed", "other", "hidden"]);
       const savNorm = normalizePosPoolsTabKey(savedPoolsTab);
       if (allowedTabs.has(savNorm)) switchPosPoolsTab(savNorm, true);
       else switchPosPoolsTab("main", true);
@@ -18466,17 +17956,6 @@ def _build_positions_scan_response(
             "parallel_fetch_sec": float(pool_t.get("nft_parallel_fetch_sec") or 0.0),
             "aggregate_merge_sec": float(pool_t.get("nft_aggregate_merge_sec") or 0.0),
             "parallel_workers": int(pool_t.get("parallel_workers") or 0),
-            "owner_mismatch_checked": int((debug_timings or {}).get("nft_catalog_owner_mismatch_checked") or 0),
-            "owner_mismatch_rows": int((debug_timings or {}).get("nft_catalog_owner_mismatch_rows") or 0),
-            "owner_light_explorer_eligible": int(
-                (debug_timings or {}).get("nft_catalog_owner_light_explorer_eligible") or 0
-            ),
-            "owner_light_explorer_checked": int(
-                (debug_timings or {}).get("nft_catalog_owner_light_explorer_checked") or 0
-            ),
-            "owner_light_explorer_unchecked": int(
-                (debug_timings or {}).get("nft_catalog_owner_light_explorer_unchecked") or 0
-            ),
         }
         bal_raw = pool_t.get("nft_balance_vs_explorer_catalog")
         if isinstance(bal_raw, dict):
@@ -18713,30 +18192,6 @@ def _scan_positions_core(
 
     t_nft_enrich = time.monotonic()
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN and pool_rows:
-        t_own = time.monotonic()
-        own_expl_eligible = sum(1 for r in pool_rows if _nft_catalog_row_eligible_for_explorer_owner_light(r))
-        own_mm_n, own_chk_n, own_expl_checked = _nft_catalog_apply_explorer_owner_mismatch_scan(
-            pool_rows,
-            max_seconds=55.0,
-            max_subgraph_seconds=28.0,
-            max_rows=900,
-        )
-        debug_timings["nft_catalog_owner_mismatch_scan_sec"] = round(max(0.0, time.monotonic() - t_own), 3)
-        debug_timings["nft_catalog_owner_mismatch_rows"] = int(own_mm_n)
-        debug_timings["nft_catalog_owner_mismatch_checked"] = int(own_chk_n)
-        debug_timings["nft_catalog_owner_light_explorer_eligible"] = int(own_expl_eligible)
-        debug_timings["nft_catalog_owner_light_explorer_checked"] = int(own_expl_checked)
-        own_expl_skipped = max(0, int(own_expl_eligible) - int(own_expl_checked))
-        debug_timings["nft_catalog_owner_light_explorer_unchecked"] = int(own_expl_skipped)
-        info_tail = (
-            f"explorer NFT ownerOf: {int(own_expl_checked)}/{int(own_expl_eligible)} rows"
-            + (f" ({int(own_expl_skipped)} not checked — time/row cap)" if own_expl_skipped else "")
-            + "; total RPC passes (incl. optional subgraph v3 PM)"
-        )
-        info_notes.append(
-            f"Light owner scan: mismatches={int(own_mm_n)}, checked_total={int(own_chk_n)} ({info_tail}; "
-            f"tab «Owner mismatch» lists mismatch rows only)."
-        )
         ne_ok, ne_fail = _enrich_nft_catalog_rows_from_chain(pool_rows, max_seconds=26.0, max_rows=240)
         debug_timings["nft_catalog_onchain_enrich_sec"] = round(max(0.0, time.monotonic() - t_nft_enrich), 3)
         debug_timings["nft_catalog_onchain_enrich_ok"] = int(ne_ok)
@@ -18764,39 +18219,18 @@ def _scan_positions_core(
         info_notes.append(
             "NFT scan pipeline: (1) Explorer tokennfttx per chain×wallet; "
             "(2) Protocol gate + on-chain open/closed liquidity when assembling rows (tabs: Protocol filter, Closed); "
-            "(3) ownerOf vs wallet — explorer NFT + optional subgraph v3 PM (tab: Owner mismatch); "
-            "(4) PM snapshot for open rows (pair/fee/amounts); "
-            "(5) Liquidity USD; "
-            "(6) Phishing metadata — sync from explorer name/symbol (Web UI: tab «Other issues»), before spam; "
-            "(7) Spam heuristics — только реальные позиции с подозрительной парой/TVL (tab: Spam); "
-            "(8) Reserved — deferred heavy owner reconciliation (V3 / Infinity / farming; not implemented; late or background)."
+            "(3) PM snapshot for open rows (pair/fee/amounts); "
+            "(4) Liquidity USD; "
+            "(5) Phishing metadata — sync from explorer name/symbol (Web UI: tab «Other issues»), before spam; "
+            "(6) Spam heuristics — только реальные позиции с подозрительной парой/TVL (tab: Spam); "
+            "(7) Reserved — deferred heavy owner reconciliation (V3 / Infinity / farming; not implemented)."
         )
         info_notes.append(
-            "NFT catalog — deferred phase (planned only): deep owner/position reconciliation for likely false "
-            "positives on tab «Owner mismatch» (Uniswap V3 edge cases, Pancake Infinity, V3 farming/staking beyond "
-            "today’s allowlist). Requires heavy RPC/indexer work; intended after the light ownerOf pass, optionally "
-            "in background — no concrete implementation in this build. "
-            "Web UI: ownerOf-vs-wallet mismatches → tab «Owner mismatch». Phishing metadata + PM snapshot failures "
-            "(nft_catalog_pm_snapshot_ok=false, e.g. v4 vs v3 decoder) → tab «Other issues» — not owner mismatch."
+            "NFT catalog — deferred phase (planned only): deep owner/position reconciliation (Uniswap V3 edge cases, "
+            "Pancake Infinity, V3 farming/staking). Requires heavy RPC/indexer work; not implemented in this build. "
+            "Web UI: phishing metadata + PM snapshot failures (nft_catalog_pm_snapshot_ok=false) → tab «Other issues»."
         )
         debug_timings["nft_catalog_deferred_owner_reconciliation"] = "reserved_not_implemented"
-    elif pool_rows and POSITIONS_SUBGRAPH_V3_OWNEROF_LIGHT_CHECK:
-        t_sg = time.monotonic()
-        sg_mm, sg_chk = _apply_subgraph_v3_ownerof_light_scan_phase(
-            pool_rows,
-            start=t_sg,
-            max_seconds=24.0,
-            max_rows=800,
-            checked_start=0,
-        )
-        debug_timings["subgraph_v3_ownerof_light_sec"] = round(max(0.0, time.monotonic() - t_sg), 3)
-        debug_timings["subgraph_v3_ownerof_mismatch_rows"] = int(sg_mm)
-        debug_timings["subgraph_v3_ownerof_checked"] = int(sg_chk)
-        if sg_mm > 0:
-            info_notes.append(
-                f"Subgraph v3 ownerOf check: mismatches={int(sg_mm)}, checked={int(sg_chk)} "
-                "(ownerOf on PM vs wallet; tab «Owner mismatch»). Disable: POSITIONS_SUBGRAPH_V3_OWNEROF_LIGHT_CHECK=0."
-            )
     if pool_rows and not POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         t_phish = time.monotonic()
         phish_n = _nft_catalog_sync_phishing_metadata(pool_rows)
