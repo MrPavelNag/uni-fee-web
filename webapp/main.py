@@ -3369,9 +3369,7 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
 
     v3_position_manager / v4_position_manager — опционально (иначе из мап по chain_id).
 
-    nft_catalog_trust_v4_pm_ids: если True, все token_ids считаются NFT именно на переданном
-    v4 PM (батч из explorer NFT catalog). Тогда пропускаем ownerOf на V4 и не помечаем сбои
-    Multicall как burned/closed — иначе RPC даёт «мигающие» пропажи v4 в UI.
+    nft_catalog_trust_v4_pm_ids: батч NFT-каталога на v4 PM — без ownerOf на V4; сбои RPC не считаем burned/closed.
 
     Возвращает dict: open_v3, open_v4, burned, closed_zero_liquidity, unknown, multicall_roundtrips.
     """
@@ -4220,11 +4218,39 @@ def _position_creation_date_cache_set(chain_id: int, protocol: str, position_id:
         POSITION_CREATION_DATE_CACHE[(cid, proto, int(tid))] = d
 
 
+# Внутренние ключи POSITION_CREATION_DATE_CACHE + UI-алиасы (колонка protocol).
+_CREATION_DATE_INTERNAL_PROTOCOLS: frozenset[str] = frozenset(
+    {
+        "uniswap_v3",
+        "uniswap_v4",
+        "pancake_v3",
+        "pancake_v3_staked",
+        "pancake_infinity_cl",
+        "pancake_infinity_bin",
+        "explorer_nft",
+    }
+)
+_CREATION_DATE_PM_REGS: tuple[tuple[str, dict[int, str]], ...] = (
+    ("uniswap_v3", UNISWAP_V3_NPM_BY_CHAIN_ID),
+    ("pancake_v3", PANCAKE_V3_NPM_BY_CHAIN_ID),
+    ("uniswap_v4", UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID),
+    ("pancake_infinity_cl", PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID),
+    ("pancake_infinity_bin", PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID),
+)
+
+
+def _row_chain_id_position_id(row: dict[str, Any]) -> tuple[int, str]:
+    if not isinstance(row, dict):
+        return 0, ""
+    try:
+        cid = int(row.get("chain_id") or 0)
+    except Exception:
+        cid = 0
+    return cid, str(row.get("position_id") or "").strip()
+
+
 def _position_creation_date_keys_for_row(row: dict[str, Any]) -> list[str]:
-    """
-    Ключи protocol для POSITION_CREATION_DATE_CACHE (порядок важен: сначала explorer_nft, затем on-chain PM).
-    UI-колонка `protocol` (UNI-V3, uniswap_v3, …) не совпадает с внутренними ключами — нормализуем здесь.
-    """
+    """Ключи кеша даты mint: сначала _protocol_label, затем PM по pool_id, затем нормализация UI protocol."""
     keys: list[str] = []
 
     def _add(k: str) -> None:
@@ -4235,38 +4261,16 @@ def _position_creation_date_keys_for_row(row: dict[str, Any]) -> list[str]:
     lab = str(row.get("_protocol_label") or "").strip().lower()
     if lab:
         _add(lab)
-    try:
-        cid = int(row.get("chain_id") or 0)
-    except Exception:
-        cid = 0
+    cid, _ = _row_chain_id_position_id(row)
     pool_lc = str(row.get("pool_id") or "").strip().lower()
     if cid > 0 and _is_eth_address(pool_lc):
-        npm_u = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
-        npm_p = str(PANCAKE_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
-        v4pm = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
-        inf_cl = str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
-        inf_bin = str(PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
-        if pool_lc == npm_u:
-            _add("uniswap_v3")
-        if pool_lc == npm_p:
-            _add("pancake_v3")
-        if pool_lc == v4pm:
-            _add("uniswap_v4")
-        if pool_lc == inf_cl:
-            _add("pancake_infinity_cl")
-        if pool_lc == inf_bin:
-            _add("pancake_infinity_bin")
+        for proto, reg in _CREATION_DATE_PM_REGS:
+            a = str(reg.get(cid) or "").strip().lower()
+            if a and pool_lc == a:
+                _add(proto)
 
     disp = str(row.get("protocol") or "").strip().lower()
-    if disp in (
-        "uniswap_v3",
-        "uniswap_v4",
-        "pancake_v3",
-        "pancake_v3_staked",
-        "pancake_infinity_cl",
-        "pancake_infinity_bin",
-        "explorer_nft",
-    ):
+    if disp in _CREATION_DATE_INTERNAL_PROTOCOLS:
         _add(disp)
     elif disp in ("uni-v3", "univ3"):
         _add("uniswap_v3")
@@ -4280,11 +4284,7 @@ def _position_creation_date_keys_for_row(row: dict[str, Any]) -> list[str]:
 
 
 def _position_creation_date_peek_for_row(row: dict[str, Any]) -> str:
-    try:
-        cid = int(row.get("chain_id") or 0)
-    except Exception:
-        cid = 0
-    pid = str(row.get("position_id") or "").strip()
+    cid, pid = _row_chain_id_position_id(row)
     if cid <= 0 or not pid:
         return ""
     for proto in _position_creation_date_keys_for_row(row):
@@ -4295,12 +4295,7 @@ def _position_creation_date_peek_for_row(row: dict[str, Any]) -> str:
 
 
 def _position_creation_date_ymd_for_row(row: dict[str, Any]) -> str:
-    """Первая успешная дата mint по любому подходящему ключу protocol."""
-    try:
-        cid = int(row.get("chain_id") or 0)
-    except Exception:
-        cid = 0
-    pid = str(row.get("position_id") or "").strip()
+    cid, pid = _row_chain_id_position_id(row)
     if cid <= 0 or not pid:
         return ""
     hit = _position_creation_date_peek_for_row(row)
@@ -4408,26 +4403,22 @@ def _explorer_nft_meta_get(chain_id: int, contract: str, position_id: Any) -> di
 def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    work: list[tuple[dict[str, Any], int, str, str]] = []
-    seen: set[tuple[int, str, str]] = set()
+    work: list[dict[str, Any]] = []
+    seen: set[tuple[int, tuple[str, ...], str]] = set()
     for r in rows:
         if not isinstance(r, dict):
             continue
-        try:
-            cid = int(r.get("chain_id") or 0)
-        except Exception:
-            cid = 0
-        pid = str(r.get("position_id") or "").strip()
+        cid, pid = _row_chain_id_position_id(r)
         if cid <= 0 or not pid:
             continue
         protos = _position_creation_date_keys_for_row(r)
         if not protos:
             continue
-        k = (cid, "|".join(protos), pid)
+        k = (cid, tuple(protos), pid)
         if k in seen:
             continue
         seen.add(k)
-        work.append((r, cid, "|".join(protos), pid))
+        work.append(r)
     if not work:
         return
     deadline = time.monotonic() + float(POSITIONS_CREATION_DATE_MAX_SECONDS)
@@ -4437,13 +4428,13 @@ def _populate_creation_dates_parallel(rows: list[dict[str, Any]]) -> None:
         _position_creation_date_ymd_for_row(rr)
 
     if workers <= 1:
-        for r0, _c, _pjoin, _pid in work:
+        for r0 in work:
             if time.monotonic() >= deadline:
                 break
             _warm_one(r0)
     else:
         ex = ThreadPoolExecutor(max_workers=workers)
-        futures = [ex.submit(_warm_one, r0) for r0, _c, _pjoin, _pid in work]
+        futures = [ex.submit(_warm_one, r0) for r0 in work]
         aborted = False
         try:
             pending = set(futures)
@@ -10810,11 +10801,7 @@ def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_
     for r in rows:
         if not isinstance(r, dict):
             continue
-        try:
-            cid = int(r.get("chain_id") or 0)
-        except Exception:
-            cid = 0
-        pid = str(r.get("position_id") or "").strip()
+        cid, pid = _row_chain_id_position_id(r)
         existing = str(r.get("position_created_date") or "").strip()
         if cid <= 0 or not pid or not _position_creation_date_keys_for_row(r):
             r["position_created_date"] = existing or "-"
@@ -12148,9 +12135,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                     "liquidity_usd": None,
                     "position_created_date": created if created else "-",
                     "unsupported_protocol": bool(unsupported_protocol),
-                    "_protocol_label": (
-                        _EXPLORER_NFT_CATALOG_PROTOCOL if supported else ""
-                    ),
+                    "_protocol_label": _EXPLORER_NFT_CATALOG_PROTOCOL if supported else "",
                 }
                 rows_out.append(row)
             if contracts_here:
