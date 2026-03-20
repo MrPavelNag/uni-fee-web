@@ -15824,7 +15824,7 @@ def _render_positions_page() -> str:
     .pos-fee-hist-label input { margin:0; width:15px; height:15px; accent-color:#2563eb; flex-shrink:0; }
     .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
-    .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:12px; padding:0 0 0 4px; }
+    .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:11px; padding:0 0 0 2px; }
     .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; position: relative; }
     .pos-progress .bar { height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); width: 0%; transition: width 0.35s ease-out; }
     .pos-progress.pos-progress-indeterminate .bar { width: 40%; animation: posLoad 1s linear infinite; }
@@ -15854,14 +15854,25 @@ def _render_positions_page() -> str:
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:860px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; font-size:12px; font-weight:700; padding:6px 6px; }
-    #posPoolsTable { min-width: 1200px; table-layout: auto; }
+    /* Denser columns on Positions page tables only */
+    .positions-grid .table-wrap table { font-size: 11px; min-width: 820px; }
+    .positions-grid .table-wrap table th,
+    .positions-grid .table-wrap table td { padding: 3px 5px; vertical-align: middle; }
+    .positions-grid .table-wrap table th { padding: 4px 5px; font-size: 11px; }
+    .positions-grid .table-wrap .mono { font-size: 10px; }
+    #posPoolsTable { min-width: 1080px; table-layout: auto; }
     #posPoolsTable th, #posPoolsTable td { white-space: nowrap; }
     #posPoolsTable th:nth-child(1), #posPoolsTable td:nth-child(1) {
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
     #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
-    #posHeavyPoolsTable { min-width: 1100px; table-layout: auto; }
-    #posHeavyPoolsTable th, #posHeavyPoolsTable td { white-space: nowrap; }
+    #posHeavyPoolsTable, #posHeavyPoolsSpamTable, #posHeavyPoolsProtocolTable, #posHeavyPoolsClosedTable, #posHeavyPoolsOtherTable, #posHeavyPoolsHiddenTable { min-width: 1000px; table-layout: auto; }
+    #posHeavyPoolsTable th, #posHeavyPoolsTable td,
+    #posHeavyPoolsSpamTable th, #posHeavyPoolsSpamTable td,
+    #posHeavyPoolsProtocolTable th, #posHeavyPoolsProtocolTable td,
+    #posHeavyPoolsClosedTable th, #posHeavyPoolsClosedTable td,
+    #posHeavyPoolsOtherTable th, #posHeavyPoolsOtherTable td,
+    #posHeavyPoolsHiddenTable th, #posHeavyPoolsHiddenTable td { white-space: nowrap; }
     .pos-pools-tab-bar { display: none; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
     .pos-tab-btn {
       border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
@@ -15926,7 +15937,7 @@ def _render_positions_page() -> str:
           <div class="addr-box" style="border-style:dashed">
             <h4 style="margin:0 0 6px;font-size:14px;color:#1e3a8a">How it works</h4>
             <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.45;color:#334155">
-              <li><b>V3 (first table)</b> — Uniswap v3 and PancakeSwap v3 via NPM only (including staked in MasterChef).</li>
+              <li><b>V3 (first table)</b> — Uniswap v3 and Pancake v3 via NPM only (including staked in MasterChef).</li>
               <li><b>V4 / Infinity (second table)</b> — separate scan: explorer NFT index + Uniswap v4 and Pancake V3 Farming / Infinity position managers (CL/Bin).</li>
             </ul>
           </div>
@@ -15934,7 +15945,7 @@ def _render_positions_page() -> str:
       </section>
       <section class="result-card">
         <div class="section-head" style="flex-wrap:nowrap;align-items:center">
-          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / PancakeSwap v3</h3>
+          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / Pancake v3</h3>
           <div class="section-actions">
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
@@ -15971,24 +15982,40 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posHeavyPoolsBody" class="section-body">
-          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same EVM addresses. Run independently of the v3 table.</p>
-          <div class="table-wrap"><table id="posHeavyPoolsTable"></table></div>
+          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same EVM addresses. Run independently of the v3 table. Same tab filters as V3: main list vs spam, protocol gate, closed (catalog), other issues, hidden.</p>
+          <div class="pos-pools-tab-bar" id="posHeavyPoolsTabBar" style="flex-wrap:wrap;gap:4px" title="Same routing as V3 table: main → spam → protocol → closed → other issues → hidden.">
+            <button type="button" class="pos-tab-btn active" data-pos-tab="main" onclick="switchPosHeavyPoolsTab('main')" title="Valid positions: not closed, hidden, or routed to Spam / Protocol / Other issues.">Positions <span id="posHeavyMainTabCount"></span></button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="spam" onclick="switchPosHeavyPoolsTab('spam')" title="Heuristic spam / exotic pair (trust to manage).">Spam <span id="posHeavySpamTabCount"></span></button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="protocol" onclick="switchPosHeavyPoolsTab('protocol')">Protocol filter <span id="posHeavyProtocolTabCount"></span></button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="closed" onclick="switchPosHeavyPoolsTab('closed')" title="Zero open liquidity on PM (catalog).">Closed <span id="posHeavyClosedTabCount"></span></button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="other" onclick="switchPosHeavyPoolsTab('other')" title="Phishing metadata, pair mismatch, PM read failures — see Issue column.">Other issues <span id="posHeavyOtherTabCount"></span></button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="hidden" onclick="switchPosHeavyPoolsTab('hidden')" title="Rows you marked with Hide on the main list.">Hidden <span id="posHeavyHiddenTabCount"></span></button>
+          </div>
+          <div class="table-wrap" id="posHeavyPoolsTableMainWrap"><table id="posHeavyPoolsTable"></table></div>
+          <div class="table-wrap" id="posHeavyPoolsTableSpamWrap" style="display:none"><table id="posHeavyPoolsSpamTable"></table></div>
+          <div class="table-wrap" id="posHeavyPoolsTableProtocolWrap" style="display:none"><table id="posHeavyPoolsProtocolTable"></table></div>
+          <div class="table-wrap" id="posHeavyPoolsTableClosedWrap" style="display:none"><table id="posHeavyPoolsClosedTable"></table></div>
+          <div class="table-wrap" id="posHeavyPoolsTableOtherWrap" style="display:none"><table id="posHeavyPoolsOtherTable"></table></div>
+          <div class="table-wrap" id="posHeavyPoolsTableHiddenWrap" style="display:none"><table id="posHeavyPoolsHiddenTable"></table></div>
           <div id="posHeavyErrors"></div>
         </div>
       </section>
       <section class="result-card">
-        <div class="section-head">
-          <h3>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:72px;margin-left:6px"/></h3>
+        <div class="section-head" style="flex-wrap:nowrap;align-items:center">
+          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:72px;margin-left:6px"/></h3>
           <div class="section-actions">
             <span class="pos-status" id="posHistoryStatus">Select pools and click Search</span>
             <button class="search-link-btn" type="button" onclick="showSelectedPoolSeries()">Search</button>
+            <button class="collapse-btn" id="toggleHistoryBtn" type="button" onclick="togglePosSection('history')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <div id="posPoolChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+        <div id="posHistoryBody" class="section-body">
+          <div id="posPoolChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+        </div>
       </section>
       <section class="result-card">
-        <div class="section-head">
-          <h3>Fee calculation</h3>
+        <div class="section-head" style="flex-wrap:nowrap;align-items:center">
+          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Fee calculation</h3>
           <div class="section-actions">
             <span class="pos-status" id="posFeeStatus">Select History checkboxes, then click Scan</span>
             <label class="pos-fee-hist-label" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
@@ -15996,10 +16023,13 @@ def _render_positions_page() -> str:
               <span>Historical USD</span>
             </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Scan</button>
+            <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
-        <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+        <div id="posFeeBody" class="section-body">
+          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
+          <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+        </div>
       </section>
     </div>
     """
@@ -16072,7 +16102,7 @@ def _render_positions_page() -> str:
       renderChips(kind);
       if (kind === "evm" && (posState.evm || []).length) scheduleBackgroundWarmup("remove");
     }
-    const posSectionState = {pools: false, heavy: false};
+    const posSectionState = {pools: false, heavy: false, history: false, fees: false};
     const posCache = {pools: [], debug: null};
     const posHeavyCache = {pools: [], debug: null};
     const POS_HEAVY_RESULTS_STORAGE_KEY = "positions_heavy_scan_results_v1";
@@ -16083,6 +16113,7 @@ def _render_positions_page() -> str:
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
+    const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
       position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder).",
     };
@@ -16128,6 +16159,88 @@ def _render_positions_page() -> str:
         } catch (_) {}
       }
     }
+    function switchPosHeavyPoolsTab(name, silent) {
+      const mainW = document.getElementById("posHeavyPoolsTableMainWrap");
+      const prW = document.getElementById("posHeavyPoolsTableProtocolWrap");
+      const clW = document.getElementById("posHeavyPoolsTableClosedWrap");
+      const spW = document.getElementById("posHeavyPoolsTableSpamWrap");
+      const otW = document.getElementById("posHeavyPoolsTableOtherWrap");
+      const hidW = document.getElementById("posHeavyPoolsTableHiddenWrap");
+      if (!mainW) return;
+      const tab = normalizePosPoolsTabKey(name);
+      const wraps = [
+        ["main", mainW],
+        ["spam", spW],
+        ["protocol", prW],
+        ["closed", clW],
+        ["other", otW],
+        ["hidden", hidW],
+      ];
+      for (const [k, el] of wraps) {
+        if (!el) continue;
+        el.style.display = k === tab ? "block" : "none";
+      }
+      document.querySelectorAll("#posHeavyPoolsTabBar [data-pos-tab]").forEach((b) => {
+        const t = b.getAttribute("data-pos-tab") || "";
+        b.classList.toggle("active", t === tab);
+      });
+      if (!silent) {
+        try {
+          const allowed = new Set(["main", "spam", "protocol", "closed", "other", "hidden"]);
+          localStorage.setItem(POS_HEAVY_POOLS_TAB_KEY, allowed.has(tab) ? tab : "main");
+        } catch (_) {}
+      }
+    }
+    const V3_POOL_CFG = {
+      scope: "v",
+      tables: {
+        main: "posPoolsTable",
+        protocol: "posPoolsProtocolTable",
+        closed: "posPoolsClosedTable",
+        spam: "posPoolsSpamTable",
+        other: "posPoolsOtherTable",
+        hidden: "posPoolsHiddenTable",
+      },
+      tabBar: "posPoolsTabBar",
+      counts: {
+        main: "posMainTabCount",
+        spam: "posSpamTabCount",
+        protocol: "posProtocolTabCount",
+        closed: "posClosedTabCount",
+        other: "posOtherTabCount",
+        hidden: "posHiddenTabCount",
+      },
+      tabStorageKey: POS_POOLS_TAB_KEY,
+      switchTab: switchPosPoolsTab,
+      ui: {},
+    };
+    const HEAVY_POOL_CFG = {
+      scope: "h",
+      tables: {
+        main: "posHeavyPoolsTable",
+        protocol: "posHeavyPoolsProtocolTable",
+        closed: "posHeavyPoolsClosedTable",
+        spam: "posHeavyPoolsSpamTable",
+        other: "posHeavyPoolsOtherTable",
+        hidden: "posHeavyPoolsHiddenTable",
+      },
+      tabBar: "posHeavyPoolsTabBar",
+      counts: {
+        main: "posHeavyMainTabCount",
+        spam: "posHeavySpamTabCount",
+        protocol: "posHeavyProtocolTabCount",
+        closed: "posHeavyClosedTabCount",
+        other: "posHeavyOtherTabCount",
+        hidden: "posHeavyHiddenTabCount",
+      },
+      tabStorageKey: POS_HEAVY_POOLS_TAB_KEY,
+      switchTab: switchPosHeavyPoolsTab,
+      ui: {
+        emptyNoRows: "No rows. Run \u0022Scan v4 / Infinity\u0022 or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.",
+        emptyFiltered: "No positions in the main list — filtered rows are on the other tabs (spam, protocol, closed, other issues, hidden).",
+        hiddenHint: "No manually hidden rows. Use Hide on the Positions tab above to move a row here.",
+      },
+    };
     let posHasScannedOnce = false;
     let posScanTicker = null;
     let posScanStartedAt = 0;
@@ -16420,8 +16533,18 @@ def _render_positions_page() -> str:
       }
     }
     function setSectionCollapsed(key, collapsed) {
-      const bodyMap = {pools: "posPoolsBody", heavy: "posHeavyPoolsBody"};
-      const btnMap = {pools: "togglePoolsBtn", heavy: "toggleHeavyPoolsBtn"};
+      const bodyMap = {
+        pools: "posPoolsBody",
+        heavy: "posHeavyPoolsBody",
+        history: "posHistoryBody",
+        fees: "posFeeBody",
+      };
+      const btnMap = {
+        pools: "togglePoolsBtn",
+        heavy: "toggleHeavyPoolsBtn",
+        history: "toggleHistoryBtn",
+        fees: "toggleFeeBtn",
+      };
       const body = document.getElementById(bodyMap[key]);
       const btn = document.getElementById(btnMap[key]);
       if (!body || !btn) return;
@@ -16435,6 +16558,21 @@ def _render_positions_page() -> str:
       if (!next) {
         if (key === "pools") renderPools(posCache.pools || []);
         if (key === "heavy") renderHeavyPools(posHeavyCache.pools || []);
+        if (key === "history" || key === "fees") {
+          requestAnimationFrame(() => {
+            try {
+              if (window.Plotly && typeof Plotly.Plots.resize === "function") {
+                if (key === "history") {
+                  const g = document.getElementById("posPoolChart");
+                  if (g) Plotly.Plots.resize(g);
+                } else {
+                  const g = document.getElementById("posFeeChart");
+                  if (g) Plotly.Plots.resize(g);
+                }
+              }
+            } catch (_) {}
+          });
+        }
       }
     }
     async function ensurePlotly() {
@@ -16866,13 +17004,9 @@ def _render_positions_page() -> str:
     function escAttr(v) {
       return esc(v).replace(/"/g, "&quot;");
     }
-    function renderPools(rows) {
-      const table = document.getElementById("posPoolsTable");
+    function partitionPositionTableRows(listAll) {
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
-      const totalCols = 13;
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
-      const listAll = rows || [];
       const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
       const hasExplorerNftCatalog = listAll.some((x) => {
         if (!x) return false;
@@ -16943,6 +17077,40 @@ def _render_positions_page() -> str:
         }
         visible.push(row);
       }
+      return {
+        visible,
+        hiddenRows,
+        protocolRows,
+        closedTabRows,
+        spamRows,
+        otherRows,
+        hasCatalogSegments,
+        hasExplorerNftCatalog,
+        rowTrustSpamParam,
+      };
+    }
+    function renderPoolTableUI(listAll, cfg) {
+      const table = document.getElementById(cfg.tables.main);
+      if (!table) return;
+      const totalCols = 13;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>History</th></tr>`;
+      const ui = Object.assign({
+        emptyNoRows: "No pool positions found.",
+        emptyFiltered: "No pool positions in the main list — rows that matched a filter are on the other tabs (spam, protocol, closed, other issues, hidden).",
+        hiddenHint: "No manually hidden rows. Use Hide on the Positions tab to move a row here.",
+      }, cfg.ui || {});
+      const {
+        visible,
+        hiddenRows,
+        protocolRows,
+        closedTabRows,
+        spamRows,
+        otherRows,
+        hasCatalogSegments,
+        hasExplorerNftCatalog,
+        rowTrustSpamParam,
+      } = partitionPositionTableRows(listAll);
+      const sc = cfg.scope;
       for (let i = 0; i < visible.length; i++) {
         const r = visible[i];
         const pairTrace = String(r.pair_symbol_source || "").trim();
@@ -16960,21 +17128,21 @@ def _render_positions_page() -> str:
         html += `<td${feeTip}>${esc(r.fee_tier || "")}</td>`;
         html += `<td>${esc(r.position_created_date || "-")}</td>`;
         html += `<td>${statusDot(r.position_status || "-")}</td>`;
+        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         html += `<td${pairTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         html += `<td${pairTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
-        html += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
+        const checked = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
+        html += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
         html += "</tr>";
       }
       if (!visible.length) {
         html += listAll.length
-          ? `<tr><td colspan='${totalCols}'>No pool positions in the main list — rows that matched a filter are on the other tabs (spam, protocol, closed, other issues, hidden).</td></tr>`
-          : `<tr><td colspan='${totalCols}'>No pool positions found.</td></tr>`;
+          ? `<tr><td colspan='${totalCols}'>${esc(ui.emptyFiltered)}</td></tr>`
+          : `<tr><td colspan='${totalCols}'>${esc(ui.emptyNoRows)}</td></tr>`;
       }
       const otCols = 15;
-      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>History</th></tr>`;
       for (let oi = 0; oi < otherRows.length; oi++) {
         const r = otherRows[oi];
         const issue = String(r._other_issue_label || "Other");
@@ -17004,19 +17172,19 @@ def _render_positions_page() -> str:
         otHtml += `<td${feeTipOt}>${esc(r.fee_tier || "")}</td>`;
         otHtml += `<td>${esc(r.position_created_date || "-")}</td>`;
         otHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
+        otHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscOt}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         otHtml += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         otHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         otHtml += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        otHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscOt}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        const checkedOt = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
-        otHtml += `<td><input type='checkbox' ${checkedOt} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
+        const checkedOt = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
+        otHtml += `<td><input type='checkbox' ${checkedOt} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
         otHtml += "</tr>";
       }
       if (!otherRows.length) {
         otHtml += `<tr><td colspan='${otCols}' style='white-space:normal;color:#64748b'>No rows here: phishing-style collection metadata, pair string vs on-chain symbols (Issue: Pair mismatch), and PM snapshot read failures land on this tab. Spam, protocol gate, and closed positions stay on their own tabs.</td></tr>`;
       }
       const stCols = 12;
-      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
       for (let pi = 0; pi < protocolRows.length; pi++) {
         const r = protocolRows[pi];
         const mismatch = hasPairMismatch(r);
@@ -17025,20 +17193,21 @@ def _render_positions_page() -> str:
         const pairTitleRaw = mismatch ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}` : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
+        const checked = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
         protHtml += "<tr>";
         protHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         protHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         protHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td>${esc(r.fee_tier || "")}</td>`;
-        protHtml += `<td>${statusDot(r.position_status || "-")}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
-        protHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        protHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
         protHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        protHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
+        protHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        protHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        protHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!protocolRows.length) {
         protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate (collection name/symbol must suggest Uniswap or Pancake before on-chain PM work).</td></tr>`;
       }
-      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
       for (let ci = 0; ci < closedTabRows.length; ci++) {
         const r = closedTabRows[ci];
         const mismatch = hasPairMismatch(r);
@@ -17047,20 +17216,21 @@ def _render_positions_page() -> str:
         const pairTitleRaw = mismatch ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}` : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
+        const checked = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
         closedHtml += "<tr>";
         closedHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         closedHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         closedHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td>${esc(r.fee_tier || "")}</td>`;
-        closedHtml += `<td>${statusDot(r.position_status || "-")}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
-        closedHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        closedHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
         closedHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        closedHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" title='Closed on-chain (zero open liquidity on PM)' /></td></tr>`;
+        closedHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        closedHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        closedHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" title='Closed on-chain (zero open liquidity on PM)' /></td></tr>`;
       }
       if (!closedTabRows.length) {
         closedHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No closed positions: on-chain open-liquidity check marked these as zero liquidity on the position manager (catalog_segment=closed).</td></tr>`;
       }
-      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
       for (let si = 0; si < spamRows.length; si++) {
         const r = spamRows[si];
         const mismatch = hasPairMismatch(r);
@@ -17069,20 +17239,21 @@ def _render_positions_page() -> str:
         const pairTitleRaw = mismatch ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}` : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
+        const checked = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
         spamHtml += "<tr>";
         spamHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         spamHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         spamHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td>${esc(r.fee_tier || "")}</td>`;
-        spamHtml += `<td>${statusDot(r.position_status || "-")}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
-        spamHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        spamHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
         spamHtml += `<td><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        spamHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
+        spamHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        spamHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        spamHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!spamRows.length) {
         spamHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No spam heuristics: TVL/symbol rules did not flag supported rows (phase 6). Trust a row via Hide to re-run enrich.</td></tr>`;
       }
-      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
       for (let hi = 0; hi < hiddenRows.length; hi++) {
         const r = hiddenRows[hi];
         const mismatch = hasPairMismatch(r);
@@ -17093,7 +17264,7 @@ def _render_positions_page() -> str:
           : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checkedH = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
+        const checkedH = posHistorySelected.has(historyKey(sc, r._src_idx)) ? "checked" : "";
         const feeRawH = String(r.fee_tier_raw || "").trim();
         const feeTipH = feeRawH ? ` title="raw: ${esc(feeRawH)}"` : "";
         hiddenHtml += "<tr>";
@@ -17101,32 +17272,32 @@ def _render_positions_page() -> str:
         hiddenHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         hiddenHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td${feeTipH}>${esc(r.fee_tier || "")}</td>`;
         hiddenHtml += `<td>${esc(r.position_created_date || "-")}</td><td>${statusDot(r.position_status || "-")}</td>`;
+        hiddenHtml += `<td><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         hiddenHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         hiddenHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        hiddenHtml += `<td><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        hiddenHtml += `<td><input type='checkbox' ${checkedH} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
+        hiddenHtml += `<td><input type='checkbox' ${checkedH} onchange="setHistorySelected('${sc}', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!hiddenRows.length) {
-        hiddenHtml += `<tr><td colspan='${totalCols}' style='white-space:normal;color:#64748b'>No manually hidden rows. Use Hide on the Positions tab to move a row here.</td></tr>`;
+        hiddenHtml += `<tr><td colspan='${totalCols}' style='white-space:normal;color:#64748b'>${esc(ui.hiddenHint)}</td></tr>`;
       }
       table.innerHTML = html;
-      const prTable = document.getElementById("posPoolsProtocolTable");
+      const prTable = document.getElementById(cfg.tables.protocol);
       if (prTable) prTable.innerHTML = protHtml;
-      const clTable = document.getElementById("posPoolsClosedTable");
+      const clTable = document.getElementById(cfg.tables.closed);
       if (clTable) clTable.innerHTML = closedHtml;
-      const spTable = document.getElementById("posPoolsSpamTable");
+      const spTable = document.getElementById(cfg.tables.spam);
       if (spTable) spTable.innerHTML = spamHtml;
-      const otTable = document.getElementById("posPoolsOtherTable");
+      const otTable = document.getElementById(cfg.tables.other);
       if (otTable) otTable.innerHTML = otHtml;
-      const hidTable = document.getElementById("posPoolsHiddenTable");
+      const hidTable = document.getElementById(cfg.tables.hidden);
       if (hidTable) hidTable.innerHTML = hiddenHtml;
-      const tabBar = document.getElementById("posPoolsTabBar");
-      const cntMainEl = document.getElementById("posMainTabCount");
-      const cntPrEl = document.getElementById("posProtocolTabCount");
-      const cntClEl = document.getElementById("posClosedTabCount");
-      const cntSpEl = document.getElementById("posSpamTabCount");
-      const cntOtEl = document.getElementById("posOtherTabCount");
-      const cntHidEl = document.getElementById("posHiddenTabCount");
+      const tabBar = document.getElementById(cfg.tabBar);
+      const cntMainEl = document.getElementById(cfg.counts.main);
+      const cntPrEl = document.getElementById(cfg.counts.protocol);
+      const cntClEl = document.getElementById(cfg.counts.closed);
+      const cntSpEl = document.getElementById(cfg.counts.spam);
+      const cntOtEl = document.getElementById(cfg.counts.other);
+      const cntHidEl = document.getElementById(cfg.counts.hidden);
       const hasSubTabs =
         hasExplorerNftCatalog
         || protocolRows.length > 0
@@ -17142,11 +17313,14 @@ def _render_positions_page() -> str:
       if (cntOtEl) cntOtEl.textContent = otherRows.length ? `(${otherRows.length})` : "";
       if (cntHidEl) cntHidEl.textContent = hiddenRows.length ? `(${hiddenRows.length})` : "";
       let savedPoolsTab = "";
-      try { savedPoolsTab = String(localStorage.getItem(POS_POOLS_TAB_KEY) || ""); } catch (_) { savedPoolsTab = ""; }
+      try { savedPoolsTab = String(localStorage.getItem(cfg.tabStorageKey) || ""); } catch (_) { savedPoolsTab = ""; }
       const allowedTabs = new Set(["main", "spam", "protocol", "closed", "other", "hidden"]);
       const savNorm = normalizePosPoolsTabKey(savedPoolsTab);
-      if (allowedTabs.has(savNorm)) switchPosPoolsTab(savNorm, true);
-      else switchPosPoolsTab("main", true);
+      if (allowedTabs.has(savNorm)) cfg.switchTab(savNorm, true);
+      else cfg.switchTab("main", true);
+    }
+    function renderPools(rows) {
+      renderPoolTableUI(rows || [], V3_POOL_CFG);
     }
     const POS_ACTIVE_JOB_KEY = "positions_active_job_v1";
     function saveActivePosJob(jobId) {
@@ -17298,52 +17472,7 @@ def _render_positions_page() -> str:
       }
     }
     function renderHeavyPools(rows) {
-      const table = document.getElementById("posHeavyPoolsTable");
-      if (!table) return;
-      const manualHiddenKeys = getManualHiddenKeys();
-      const listAll = rows || [];
-      function heavyTrustSpamParam(r) {
-        const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
-        return Boolean(r && (r.suspected_spam || r.spam_skipped || ph));
-      }
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
-      if (!listAll.length) {
-        html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.</td></tr>`;
-        table.innerHTML = html;
-        return;
-      }
-      let anyRow = false;
-      for (let i = 0; i < listAll.length; i++) {
-        const r0 = listAll[i];
-        const r = Object.assign({_src_idx: i}, r0 || {});
-        r._row_key = poolRowKey(r);
-        if (manualHiddenKeys.has(r._row_key)) continue;
-        anyRow = true;
-        const pairTrace = String(r.pair_symbol_source || "").trim();
-        const pairTitleRaw = pairTrace ? `source: ${pairTrace}` : "";
-        const pairTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
-        const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        html += "<tr>";
-        html += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy'>⧉</button></td>`;
-        html += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy'>⧉</button></td>`;
-        html += `<td>${esc(r.chain || "")}</td>`;
-        html += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
-        html += `<td${pairTitle}>${esc(r.pair || "")}</td>`;
-        html += `<td>${esc(r.fee_tier || "")}</td>`;
-        html += `<td>${esc(r.position_created_date || "-")}</td>`;
-        html += `<td>${statusDot(r.position_status || "-")}</td>`;
-        html += `<td${pairTitle}>${esc(r.position_amounts_display || "-")}</td>`;
-        html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
-        html += `<td${pairTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${heavyTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        const hChecked = posHistorySelected.has(historyKey("h", r._src_idx)) ? "checked" : "";
-        html += `<td><input type='checkbox' ${hChecked} onchange="setHistorySelected('h', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
-        html += "</tr>";
-      }
-      if (!anyRow) {
-        html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>All rows hidden via Hide — unhide from the v3 table or clear manual hidden keys in local storage.</td></tr>`;
-      }
-      table.innerHTML = html;
+      renderPoolTableUI(rows || [], HEAVY_POOL_CFG);
     }
     async function scanHeavyPositions() {
       let handoffToBackground = false;
