@@ -162,8 +162,9 @@ _V4_CHAINS_RAW = [c.strip() for c in os.environ.get("V4_CHAINS", "ethereum,arbit
 V4_CHAINS = [_normalize_v4_chain_slug(c) for c in _V4_CHAINS_RAW]
 
 # Goldsky public endpoints (no API key, rate limited) - alternative to The Graph
+# Base: use ``prod`` tag — ``1.0.0`` is a stale snapshot and breaks pool/position data for scans.
 GOLDSKY_ENDPOINTS = {
-    "base": "https://api.goldsky.com/api/public/project_cl8ylkiw00krx0hvza0qw17vn/subgraphs/uniswap-v3-base/1.0.0/gn",
+    "base": "https://api.goldsky.com/api/public/project_cl8ylkiw00krx0hvza0qw17vn/subgraphs/uniswap-v3-base/prod/gn",
 }
 
 # v4 alternative: set env V4_OVERRIDE_BASE, V4_OVERRIDE_UNICHAIN etc. to use Ormi/other

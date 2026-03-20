@@ -738,7 +738,11 @@ DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     130: ["https://unichain-rpc.publicnode.com", "https://mainnet.unichain.org"],
     1301: ["https://sepolia.unichain.org"],
     137: ["https://polygon-bor-rpc.publicnode.com"],
-    8453: ["https://base-rpc.publicnode.com"],
+    8453: [
+        "https://base-rpc.publicnode.com",
+        "https://mainnet.base.org",
+        "https://1rpc.io/base",
+    ],
     42161: ["https://arbitrum-one-rpc.publicnode.com"],
 }
 
@@ -2837,6 +2841,49 @@ def _estimate_position_tvl_usd_from_detail_external(
         return None
 
 
+def _value_usd_from_token_amounts(
+    amount0: float, amount1: float, pool: dict[str, Any], chain_id: int
+) -> float | None:
+    """Convert token0/token1 human amounts to USD (same pricing path as position TVL)."""
+    try:
+        a0 = float(amount0 or 0.0)
+        a1 = float(amount1 or 0.0)
+        if abs(a0) < 1e-30 and abs(a1) < 1e-30:
+            return 0.0
+        t0 = pool.get("token0") or {}
+        t1 = pool.get("token1") or {}
+        token0 = str(t0.get("id") or "").strip().lower()
+        token1 = str(t1.get("id") or "").strip().lower()
+        if not token0 or not token1:
+            return None
+        prices = _get_token_prices_usd(int(chain_id), [token0, token1])
+        p0 = prices.get(token0)
+        p1 = prices.get(token1)
+        token0_price_in_token1 = _safe_float(pool.get("token0Price"))
+        ratio_ok = (
+            token0_price_in_token1 > 0
+            and token0_price_in_token1 >= (1.0 / POSITIONS_MAX_TOKEN_PRICE_RATIO)
+            and token0_price_in_token1 <= POSITIONS_MAX_TOKEN_PRICE_RATIO
+        )
+        if p0 is None and p1 is not None and ratio_ok:
+            p0 = p1 * token0_price_in_token1
+        if p1 is None and p0 is not None and ratio_ok:
+            p1 = p0 / token0_price_in_token1
+        if p0 is None and p1 is None:
+            return None
+        value = Decimal(0)
+        if p0 is not None:
+            value += Decimal(str(a0)) * Decimal(str(p0))
+        if p1 is not None:
+            value += Decimal(str(a1)) * Decimal(str(p1))
+        v = float(value)
+        if v < 0:
+            return None
+        return v
+    except Exception:
+        return None
+
+
 def _coingecko_platform_for_chain_id(chain_id: int) -> str:
     mapping: dict[int, str] = {
         1: "ethereum",
@@ -2851,6 +2898,95 @@ def _coingecko_platform_for_chain_id(chain_id: int) -> str:
         81457: "blast",
     }
     return mapping.get(int(chain_id), "")
+
+
+def _fetch_coingecko_contract_prices_range(
+    chain_id: int,
+    contract_address: str,
+    from_ts: int,
+    to_ts: int,
+) -> list[tuple[int, float]]:
+    """Sorted (unix_sec, usd_price) from CoinGecko ``/coins/{platform}/contract/.../market_chart/range``."""
+    platform = _coingecko_platform_for_chain_id(int(chain_id))
+    addr = str(contract_address or "").strip().lower()
+    if not platform or not _is_eth_address(addr):
+        return []
+    fr = max(0, int(from_ts) - 86_400)
+    to = int(to_ts) + 86_400
+    if to <= fr:
+        return []
+    try:
+        url = (
+            f"https://api.coingecko.com/api/v3/coins/{platform}/contract/{addr}/market_chart/range"
+            f"?vs_currency=usd&from={fr}&to={to}"
+        )
+        req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+        with urlopen(req, timeout=22) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        prices = (payload or {}).get("prices") or []
+        out: list[tuple[int, float]] = []
+        for row in prices:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            try:
+                t_ms = int(row[0])
+                p = float(row[1])
+            except (TypeError, ValueError):
+                continue
+            if p > 0:
+                out.append((t_ms // 1000, p))
+        out.sort(key=lambda x: x[0])
+        return out
+    except Exception:
+        return []
+
+
+def _price_usd_at_or_before_series(series: list[tuple[int, float]], ts: int) -> float | None:
+    """Last price in *series* with timestamp <= *ts* (seconds)."""
+    if not series or ts <= 0:
+        return None
+    lo, hi = 0, len(series) - 1
+    best: float | None = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        t_mid, p_mid = series[mid]
+        if t_mid <= ts:
+            best = float(p_mid)
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is not None:
+        return best
+    if series[0][0] > ts:
+        return float(series[0][1])
+    return None
+
+
+def _fee_position_token_stable_usd_assumption(chain_id: int, token_address: str) -> float | None:
+    """Return 1.0 for common stable symbols; else None."""
+    addr = str(token_address or "").strip().lower()
+    if not _is_eth_address(addr):
+        return None
+    try:
+        sym = (_fetch_erc20_symbol_onchain(int(chain_id), addr) or "").strip().upper()
+    except Exception:
+        sym = ""
+    if sym in {
+        "USDC",
+        "USDT",
+        "DAI",
+        "USDE",
+        "FDUSD",
+        "BUSD",
+        "TUSD",
+        "USDP",
+        "USDBC",
+        "USDC.E",
+        "USDT0",
+        "USD₮",
+    }:
+        return 1.0
+    return None
 
 
 def _dexscreener_chain_for_chain_id(chain_id: int) -> str:
@@ -3814,6 +3950,26 @@ def _eth_get_block_timestamp(chain_id: int, block_number: int) -> int:
         return int(ts_hex, 16) if ts_hex.startswith("0x") else int(ts_hex or "0")
     except Exception:
         return 0
+
+
+def _eth_first_block_at_or_after_ts(chain_id: int, target_ts: int) -> int:
+    """Smallest block number whose timestamp is >= target_ts (binary search)."""
+    cid = int(chain_id)
+    t = int(target_ts)
+    latest = _eth_block_number(cid)
+    if latest <= 0:
+        return 0
+    lo, hi = 0, int(latest)
+    ans = int(latest)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        ts_mid = _eth_get_block_timestamp(cid, mid)
+        if ts_mid >= t:
+            ans = mid
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return int(ans)
 
 
 def _explorer_v2_chainid(chain_id: int) -> str:
@@ -12035,7 +12191,7 @@ def _enrich_nft_catalog_rows_from_chain(
 
     if job_s and (run_heavy or run_light):
         if ep == "heavy":
-            start_msg = "Loading v4 and Infinity positions"
+            start_msg = "Loading v4 and Pancake V3 Farming / Infinity positions"
         elif ep == "all":
             start_msg = "Fetching on-chain data"
         else:
@@ -13192,6 +13348,351 @@ def _fetch_position_snapshot_series_exact(
     out = [(day_ts, val) for day_ts, (_real_ts, val) in by_day.items()]
     out.sort(key=lambda x: x[0])
     return out
+
+
+def _fetch_position_fee_series_exact(
+    endpoint: str,
+    position_id: str,
+    *,
+    since_ts: int,
+    chain_id: int,
+) -> list[tuple[int, float]]:
+    """Cumulative collected fees in USD from subgraph positionSnapshots (one point per calendar day)."""
+    pid = str(position_id or "").strip()
+    if not pid:
+        return []
+    queries = [
+        (
+            "ID",
+            """
+            query FeeSnaps($pid: ID!, $since: Int!) {
+              positionSnapshots(
+                first: 500,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { position: $pid, timestamp_gte: $since }
+              ) {
+                timestamp
+                collectedFeesToken0
+                collectedFeesToken1
+                pool { sqrtPrice token0Price token0 { id decimals } token1 { id decimals } }
+              }
+            }
+            """,
+        ),
+        (
+            "String",
+            """
+            query FeeSnaps($pid: String!, $since: Int!) {
+              positionSnapshots(
+                first: 500,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { position: $pid, timestamp_gte: $since }
+              ) {
+                timestamp
+                collectedFeesToken0
+                collectedFeesToken1
+                pool { sqrtPrice token0Price token0 { id decimals } token1 { id decimals } }
+              }
+            }
+            """,
+        ),
+        (
+            "ID",
+            """
+            query FeeSnaps($pid: ID!, $since: Int!) {
+              positionSnapshots(
+                first: 500,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { position_: { id: $pid }, timestamp_gte: $since }
+              ) {
+                timestamp
+                collectedFeesToken0
+                collectedFeesToken1
+                pool { sqrtPrice token0Price token0 { id decimals } token1 { id decimals } }
+              }
+            }
+            """,
+        ),
+    ]
+    rows: list[dict[str, Any]] = []
+    for _typ, q in queries:
+        try:
+            data = graphql_query(endpoint, q, {"pid": pid, "since": int(since_ts)}, retries=1)
+            rows = ((data.get("data") or {}).get("positionSnapshots") or [])
+            if rows:
+                break
+        except Exception:
+            continue
+    if not rows:
+        return []
+
+    by_day: dict[int, tuple[int, float]] = {}
+    for s in rows:
+        try:
+            ts = int((s or {}).get("timestamp") or 0)
+            if ts <= 0:
+                continue
+            pool = (s or {}).get("pool") or {}
+            cf0 = _safe_float((s or {}).get("collectedFeesToken0"))
+            cf1 = _safe_float((s or {}).get("collectedFeesToken1"))
+            val = _value_usd_from_token_amounts(cf0, cf1, pool, int(chain_id))
+            if val is None:
+                continue
+            day_ts = (ts // 86400) * 86400
+            prev = by_day.get(day_ts)
+            if prev is None or ts > prev[0]:
+                by_day[day_ts] = (ts, float(val))
+        except Exception:
+            continue
+    out = [(day_ts, fee_usd) for day_ts, (_real_ts, fee_usd) in by_day.items()]
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _position_fee_rpc_fallback_enabled() -> bool:
+    return os.environ.get("POSITIONS_FEE_RPC_FALLBACK", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _position_fee_rpc_force_onchain() -> bool:
+    return os.environ.get("POSITIONS_FEE_RPC_FORCE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _v3_npm_collect_topic0_variants() -> list[str]:
+    out: list[str] = []
+    for sig in (
+        b"Collect(uint256,address,uint128,uint128)",
+        b"Collect(uint256,address,uint256,uint256)",
+    ):
+        h = _keccak256_hex(sig)
+        if h and h not in out:
+            out.append(h)
+    return out
+
+
+def _fee_collect_log_chunk_blocks(chain_id: int) -> int:
+    cid = int(chain_id)
+    if cid == 1:
+        return max(2000, min(50_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_ETH", "8000"))))
+    return max(4000, min(200_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_L2", "45000"))))
+
+
+def _fee_collect_log_max_chunks() -> int:
+    return max(10, min(500, int(os.environ.get("POSITIONS_FEE_LOG_MAX_CHUNKS", "220"))))
+
+
+def _minimal_pool_dict_for_fee_usd(token0: str, token1: str, dec0: int, dec1: int) -> dict[str, Any]:
+    return {
+        "token0": {"id": str(token0).strip().lower(), "decimals": str(int(dec0))},
+        "token1": {"id": str(token1).strip().lower(), "decimals": str(int(dec1))},
+        "token0Price": None,
+    }
+
+
+def _eth_uint_from_rpc_field(val: Any) -> int:
+    if isinstance(val, int):
+        return int(val)
+    s = str(val or "").strip().lower()
+    if not s:
+        return 0
+    if s.startswith("0x"):
+        return int(s, 16)
+    try:
+        return int(s)
+    except ValueError:
+        return 0
+
+
+def _decode_v3_npm_collect_log_amounts_raw(data_hex: str) -> tuple[int, int]:
+    words = _hex_words(str(data_hex or ""))
+    if len(words) < 2:
+        return 0, 0
+    return _decode_uint_from_word(words[0]), _decode_uint_from_word(words[1])
+
+
+def _fetch_v3_position_fees_by_collect_logs(
+    chain_id: int,
+    protocol: str,
+    position_ids: list[str],
+    *,
+    since_ts: int,
+    token0_addr: str,
+    token1_addr: str,
+    use_historical_usd: bool = False,
+) -> tuple[dict[int, float], dict[str, str]]:
+    """
+    Cumulative collected fees (USD) from NPM Collect events via eth_getLogs.
+
+    * ``use_historical_usd=False`` — mark cumulative token fees at **current** spot (CoinGecko / ratio).
+    * ``use_historical_usd=True`` — add each Collect increment at **CoinGecko historical** (contract
+      ``market_chart/range``) price at event time; stables assumed $1; gaps fall back to spot for that leg.
+    """
+    empty_meta: dict[str, str] = {"pricing": "none", "detail": ""}
+    if os.environ.get("POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return {}, empty_meta
+    cid = int(chain_id)
+    t0 = str(token0_addr or "").strip().lower()
+    t1 = str(token1_addr or "").strip().lower()
+    if not _is_eth_address(t0) or not _is_eth_address(t1):
+        return {}, empty_meta
+    pm = _position_manager_for_protocol(cid, protocol)
+    if not _is_eth_address(pm):
+        return {}, empty_meta
+    topic0s = _v3_npm_collect_topic0_variants()
+    if not topic0s:
+        return {}, empty_meta
+
+    dec0 = _fetch_erc20_decimals_onchain(cid, t0)
+    dec1 = _fetch_erc20_decimals_onchain(cid, t1)
+    pool_min = _minimal_pool_dict_for_fee_usd(t0, t1, dec0, dec1)
+
+    from_block = _eth_first_block_at_or_after_ts(cid, int(since_ts))
+    latest = _eth_block_number(cid)
+    if from_block <= 0 or latest <= 0 or from_block > latest:
+        return {}, empty_meta
+
+    chunk = _fee_collect_log_chunk_blocks(cid)
+    max_chunks = _fee_collect_log_max_chunks()
+    topics_or = topic0s if len(topic0s) > 1 else topic0s[0]
+
+    raw_events: list[tuple[int, int, int, int]] = []
+    for pid in position_ids:
+        tid = _position_token_id_from_raw(pid)
+        if tid <= 0:
+            continue
+        topic1 = "0x" + _encode_uint_word(int(tid))
+        cur = int(from_block)
+        chunks_used = 0
+        while cur <= int(latest) and chunks_used < max_chunks:
+            to_b = min(cur + int(chunk) - 1, int(latest))
+            params: dict[str, Any] = {
+                "fromBlock": hex(int(cur)),
+                "toBlock": hex(int(to_b)),
+                "address": pm,
+                "topics": [topics_or, topic1],
+            }
+            try:
+                logs = _eth_get_logs(cid, params, timeout_sec=max(20.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 5.0))
+            except Exception:
+                logs = []
+            for lg in logs or []:
+                if not isinstance(lg, dict):
+                    continue
+                data_hex = str(lg.get("data") or "")
+                r0, r1 = _decode_v3_npm_collect_log_amounts_raw(data_hex)
+                blk = _eth_uint_from_rpc_field(lg.get("blockNumber"))
+                lix = _eth_uint_from_rpc_field(lg.get("logIndex"))
+                raw_events.append((int(blk), int(lix), int(r0), int(r1)))
+            cur = int(to_b) + 1
+            chunks_used += 1
+
+    if not raw_events:
+        return {}, empty_meta
+
+    raw_events.sort(key=lambda x: (x[0], x[1]))
+    block_ts_cache: dict[int, int] = {}
+    d0e = max(0, min(36, int(dec0)))
+    d1e = max(0, min(36, int(dec1)))
+
+    evs: list[tuple[int, float, float]] = []
+    for blk, _lix, amt0_raw, amt1_raw in raw_events:
+        if blk <= 0:
+            continue
+        ts = block_ts_cache.get(blk)
+        if ts is None:
+            ts = int(_eth_get_block_timestamp(cid, blk) or 0)
+            block_ts_cache[blk] = ts
+        if ts <= 0 or ts < int(since_ts):
+            continue
+        dh0 = float(Decimal(int(amt0_raw)) / (Decimal(10) ** d0e))
+        dh1 = float(Decimal(int(amt1_raw)) / (Decimal(10) ** d1e))
+        evs.append((int(ts), dh0, dh1))
+
+    if not evs:
+        return {}, empty_meta
+
+    by_day: dict[int, tuple[int, float]] = {}
+
+    if use_historical_usd:
+        t_lo = min(t for t, _, _ in evs)
+        t_hi = max(t for t, _, _ in evs)
+        stable0 = _fee_position_token_stable_usd_assumption(cid, t0) is not None
+        stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
+        hist0 = [] if stable0 else _fetch_coingecko_contract_prices_range(cid, t0, t_lo, t_hi)
+        hist1 = [] if stable1 else _fetch_coingecko_contract_prices_range(cid, t1, t_lo, t_hi)
+        spot_map = _get_token_prices_usd(cid, [t0, t1])
+        sp0 = spot_map.get(t0)
+        sp1 = spot_map.get(t1)
+        partial0 = not stable0 and not hist0
+        partial1 = not stable1 and not hist1
+        cum_usd = 0.0
+        for ts, dh0, dh1 in evs:
+            if stable0:
+                p0 = 1.0
+            else:
+                p0 = _price_usd_at_or_before_series(hist0, ts) if hist0 else None
+                if p0 is None or p0 <= 0:
+                    p0 = sp0
+            if stable1:
+                p1 = 1.0
+            else:
+                p1 = _price_usd_at_or_before_series(hist1, ts) if hist1 else None
+                if p1 is None or p1 <= 0:
+                    p1 = sp1
+            if p0 is None or p1 is None or p0 <= 0 or p1 <= 0:
+                continue
+            cum_usd += float(dh0) * float(p0) + float(dh1) * float(p1)
+            day_ts = (int(ts) // 86400) * 86400
+            prev = by_day.get(day_ts)
+            if prev is None or ts > prev[0]:
+                by_day[day_ts] = (int(ts), float(cum_usd))
+        pricing = "onchain_historical"
+        if partial0 or partial1:
+            pricing = "onchain_historical_mixed"
+        detail = (
+            "Collect logs: USD per event via CoinGecko contract historical range; "
+            "stables=$1; missing historical series uses spot for that token."
+        )
+        if partial0 or partial1:
+            detail += " Some tokens had no CG history — spot used for those legs."
+        return {int(d): float(v) for d, (_ts, v) in by_day.items()}, {"pricing": pricing, "detail": detail}
+
+    cum0 = Decimal(0)
+    cum1 = Decimal(0)
+    for ts, dh0, dh1 in evs:
+        cum0 += Decimal(str(dh0))
+        cum1 += Decimal(str(dh1))
+        usd = _value_usd_from_token_amounts(float(cum0), float(cum1), pool_min, cid)
+        if usd is None:
+            continue
+        day_ts = (int(ts) // 86400) * 86400
+        prev = by_day.get(day_ts)
+        if prev is None or ts > prev[0]:
+            by_day[day_ts] = (int(ts), float(usd))
+
+    out = {int(d): float(v) for d, (_ts, v) in by_day.items()}
+    meta = {
+        "pricing": "onchain_spot",
+        "detail": "Collect logs: cumulative fees marked at current spot USD (CoinGecko / ratio).",
+    }
+    return out, meta
 
 
 def _aave_markets_for_chains(chain_ids: list[int]) -> list[dict[str, Any]]:
@@ -14476,6 +14977,11 @@ class PositionPoolSeriesRequest(BaseModel):
     position_liquidity: str = "0"
     pool_liquidity: str = "0"
     days: int = 30
+    # For on-chain Collect-log fee fallback (same as row.token0_id / token1_id in UI).
+    token0_id: str = ""
+    token1_id: str = ""
+    # When true, NPM Collect log series uses CoinGecko historical prices at each event (stables $1).
+    fee_usd_historical: bool = False
 
 
 class PositionsRowEnrichRequest(BaseModel):
@@ -15225,6 +15731,8 @@ def _render_positions_page() -> str:
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
     .section-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; min-width:0; flex:1 1 auto; }
     .section-head .section-actions { margin-left: auto; justify-content: flex-end; }
+    .pos-fee-hist-label { display:inline-flex; align-items:center; gap:6px; font-size:13px; font-weight:600; color:#475569; margin:0; cursor:pointer; user-select:none; flex-shrink:0; white-space:nowrap; }
+    .pos-fee-hist-label input { margin:0; width:15px; height:15px; accent-color:#2563eb; flex-shrink:0; }
     .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
     .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:12px; padding:0 0 0 4px; }
@@ -15329,7 +15837,7 @@ def _render_positions_page() -> str:
             <h4 style="margin:0 0 6px;font-size:14px;color:#1e3a8a">How it works</h4>
             <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.45;color:#334155">
               <li><b>V3 (first table)</b> — Uniswap v3 and PancakeSwap v3 via NPM only (including staked in MasterChef).</li>
-              <li><b>V4 / Infinity (second table)</b> — separate scan: explorer NFT index + Uniswap v4 and Pancake Infinity position managers (CL/Bin).</li>
+              <li><b>V4 / Infinity (second table)</b> — separate scan: explorer NFT index + Uniswap v4 and Pancake V3 Farming / Infinity position managers (CL/Bin).</li>
             </ul>
           </div>
         </div>
@@ -15364,7 +15872,7 @@ def _render_positions_page() -> str:
       </section>
       <section class="result-card">
         <div class="section-head" style="flex-wrap:nowrap;align-items:center">
-          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v4 / Pancake Infinity</h3>
+          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v4 / Pancake V3 Farming / Infinity</h3>
           <div class="section-actions">
             <div id="posHeavyProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posHeavyStatus">Ready</span>
@@ -15387,6 +15895,21 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posPoolChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+      </section>
+      <section class="result-card">
+        <div class="section-head">
+          <h3>Расчет комиссий</h3>
+          <div class="section-actions">
+            <span class="pos-status" id="posFeeStatus">Отметьте History и нажмите Scan</span>
+            <label class="pos-fee-hist-label" title="Для ряда по логам Collect: USD на момент каждого события (CoinGecko). Субграф без изменений.">
+              <input type="checkbox" id="posFeeHistoricalUsd" />
+              <span>Исторические USD</span>
+            </label>
+            <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Scan</button>
+          </div>
+        </div>
+        <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Те же строки и чекбоксы History, что и для графика TVL; период — дней из блока «Show history». Если в субграфе комиссии пустые/нулевые, для Uniswap/Pancake v3 подставляются события Collect с NPM по RPC. Чекбокс «Исторические USD» задаёт оценку по CoinGecko на дату каждого Collect (иначе — по текущим ценам). Для данных с субграфа переключатель не меняет расчёт.</p>
+        <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
       </section>
     </div>
     """
@@ -15586,6 +16109,12 @@ def _render_positions_page() -> str:
       const btn = document.getElementById("posHeavySearchBtn");
       if (!btn) return;
       btn.textContent = posHeavyHasScannedOnce ? "Scan again (v4 / Infinity)" : "Scan v4 / Infinity";
+    }
+    function setPosFeeStatus(text, isErr) {
+      const el = document.getElementById("posFeeStatus");
+      if (!el) return;
+      el.textContent = String(text || "");
+      el.style.color = isErr ? "#b91c1c" : "#475569";
     }
     function setPosHistoryStatus(text, isErr) {
       const el = document.getElementById("posHistoryStatus");
@@ -16000,7 +16529,7 @@ def _render_positions_page() -> str:
       if (!chartEl) return;
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
-        setPosHistoryStatus("Select at least one History checkbox in the V3 or v4/Infinity table.", true);
+        setPosHistoryStatus("Select at least one History checkbox in the V3 or v4 / Pancake V3 Farming / Infinity table.", true);
         return;
       }
       try {
@@ -16064,6 +16593,86 @@ def _render_positions_page() -> str:
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Failed to load chart: ${esc(e?.message || "unknown")}</div>`;
         setPosHistoryStatus("History load failed", true);
+      }
+    }
+    async function showSelectedPositionFees() {
+      const chartEl = document.getElementById("posFeeChart");
+      if (!chartEl) return;
+      const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
+      if (!selected.length) {
+        setPosFeeStatus("Отметьте хотя бы один чекбокс History в таблице v3 или v4 / Pancake V3 Farming / Infinity.", true);
+        return;
+      }
+      try {
+        setPosFeeStatus("Загрузка комиссий...", false);
+        const ok = await ensurePlotly();
+        if (!ok) throw new Error("Не удалось загрузить библиотеку графиков");
+        const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
+        const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
+        const traces = [];
+        let lastFeePricing = "";
+        for (let i = 0; i < selected.length; i++) {
+          const hk = parseHistoryKey(selected[i]);
+          const idx = hk.idx;
+          const row = hk.scope === "h"
+            ? (posHeavyCache.pools || [])[idx]
+            : (posCache.pools || [])[idx];
+          if (!row) continue;
+          if (row.unsupported_protocol) continue;
+          const payload = {
+            chain: row.chain,
+            protocol: row.protocol,
+            pool_id: row.pool_id,
+            address: row.address,
+            position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
+            position_liquidity: row.liquidity,
+            pool_liquidity: row.pool_liquidity,
+            days: getHistoryDays(),
+            token0_id: row.token0_id || "",
+            token1_id: row.token1_id || "",
+            fee_usd_historical: histUsd,
+          };
+          const res = await fetch("/api/positions/position-fee-series", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) continue;
+          const items = Array.isArray(data.items) ? data.items : [];
+          if (!items.length) continue;
+          const fp = String(data.fee_pricing || "").trim();
+          if (fp) lastFeePricing = fp;
+          traces.push({
+            x: items.map((x) => new Date(Number(x.ts || 0) * 1000)),
+            y: items.map((x) => Number(x.fees_usd || 0)),
+            mode: "lines",
+            line: {color: palette[i % palette.length], width: 2},
+            name: String(row.pair || row.pool_id || `Позиция ${i + 1}`),
+            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+          });
+        }
+        if (!traces.length) {
+          chartEl.innerHTML = "<div class='hint'>Нет данных по комиссиям для выбранных строк (субграф или протокол).</div>";
+          setPosFeeStatus("Нет данных по комиссиям", false);
+          return;
+        }
+        const titleSuffix = histUsd ? " — истор. USD (CoinGecko по Collect)" : " — текущие USD";
+        Plotly.newPlot("posFeeChart", traces, {
+          title: "Накопленные полученные комиссии (USD)" + titleSuffix,
+          paper_bgcolor: "#ffffff",
+          plot_bgcolor: "#f8fbff",
+          margin: {t: 34, b: 42, l: 54, r: 12},
+          xaxis: {showgrid: true, gridcolor: "#d9e2f0"},
+          yaxis: {showgrid: true, gridcolor: "#d9e2f0", tickprefix: "$"},
+          showlegend: true,
+          legend: {orientation: "h", y: -0.2},
+        }, {displaylogo: false, responsive: true});
+        const pr = lastFeePricing ? ` · ${lastFeePricing}` : "";
+        setPosFeeStatus(`Готово: ${traces.length} поз.${pr}`, false);
+      } catch (e) {
+        chartEl.innerHTML = `<div class='hint'>Ошибка: ${esc(e?.message || "unknown")}</div>`;
+        setPosFeeStatus("Не удалось построить график", true);
       }
     }
     function normPosSym(v) {
@@ -16540,7 +17149,7 @@ def _render_positions_page() -> str:
       }
       let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       if (!listAll.length) {
-        html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake Infinity NFTs on supported chains.</td></tr>`;
+        html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.</td></tr>`;
         table.innerHTML = html;
         return;
       }
@@ -16779,10 +17388,12 @@ def _render_positions_page() -> str:
       updatePosSearchButton();
       setPosStatus(`Restored cached results. Pools: ${saved.pool_positions.length}`, false);
       setPosHistoryStatus("Cached results restored.", false);
+      setPosFeeStatus("Кэш восстановлен — можно нажать Scan для комиссий.", false);
     } else {
       updatePosSearchButton();
       setPosStatus("Ready", false);
       setPosHistoryStatus("Select pools and click Search", false);
+      setPosFeeStatus("Отметьте History и нажмите Scan", false);
     }
     resumePosJobIfAny();
     const savedHeavy = loadHeavyPosResults();
@@ -16805,7 +17416,7 @@ def _render_positions_page() -> str:
     """
     return _render_placeholder_page(
         "DeFi Positions",
-        "EVM: Uniswap / Pancake v3 (NPM) and separately Uniswap v4 / Pancake Infinity.",
+        "EVM: Uniswap / Pancake v3 (NPM) and separately Uniswap v4 / Pancake V3 Farming / Infinity.",
         "/positions",
         extra_css=extra_css,
         extra_html=extra_html,
@@ -18858,21 +19469,10 @@ def _prepare_positions_scan_request(
 def _build_positions_info_notes(
     solana_addresses: list[str],
     tron_addresses: list[str],
-    *,
-    pool_scan_profile: str = "v3",
 ) -> list[str]:
     info_notes: list[str] = []
-    prof = _normalize_pool_scan_profile(pool_scan_profile)
-    if prof == "heavy":
-        info_notes.append("Scan profile: Uniswap v4 and Pancake Infinity (separate from NPM v3).")
-    else:
-        info_notes.append("Scan profile: Uniswap v3 and PancakeSwap v3 only (including staked in MasterChef).")
     if solana_addresses or tron_addresses:
         info_notes.append("Solana/TRON in the request were ignored — only EVM is supported on this page.")
-    if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
-        info_notes.append("NFT positions use the block explorer index (token transfers) where enabled.")
-    if POSITIONS_CONTRACT_ONLY_ENABLED:
-        info_notes.append("Contract-only mode: Pair/Fee/In position/Unclaimed are from on-chain contract calls only.")
     return info_notes
 
 
@@ -19161,11 +19761,7 @@ def _scan_positions_core(
         reward_rows, reward_errs = [], []
         pool_debug_rows = []
 
-    info_notes = _build_positions_info_notes(
-        solana_addresses,
-        tron_addresses,
-        pool_scan_profile=pool_prof,
-    )
+    info_notes = _build_positions_info_notes(solana_addresses, tron_addresses)
 
     t_sort = time.monotonic()
     _sort_positions_scan_rows(pool_rows, lending_rows, reward_rows)
@@ -19372,7 +19968,7 @@ def scan_positions_start(req: PositionsScanRequest, request: Request, response: 
 
 @app.post("/api/positions/scan/v4-infinity/start")
 def scan_positions_v4_infinity_start(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
-    """Separate async job: Uniswap v4 + Pancake Infinity only (NFT catalog + heavy PM snapshot)."""
+    """Separate async job: Uniswap v4 + Pancake V3 Farming / Infinity only (NFT catalog + heavy PM snapshot)."""
     sid = _ensure_session_cookie(request, response)
     job_id = _create_positions_job()
     heavy_req = _positions_scan_request_with_updates(req, pool_scan_profile="heavy")
@@ -19534,6 +20130,143 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
         "share": share,
         "mode": "estimated-share",
         "note": "fallback: snapshots missing/incomplete",
+    }
+
+
+@app.post("/api/positions/position-fee-series")
+def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
+    """Cumulative fees: subgraph positionSnapshots when reliable; else NPM Collect logs (eth_getLogs)."""
+    chain_key = str(req.chain or "").strip().lower()
+    protocol = str(req.protocol or "").strip().lower()
+    if not chain_key:
+        raise HTTPException(status_code=400, detail="chain is required.")
+    if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3", "pancake_v3_staked"}:
+        raise HTTPException(
+            status_code=400,
+            detail="protocol must be uniswap_v3, uniswap_v4, pancake_v3 or pancake_v3_staked.",
+        )
+    version = "v4" if protocol.endswith("_v4") else "v3"
+    days = max(1, min(3650, int(req.days or 30)))
+    now_ts = int(time.time())
+    since_ts = now_ts - int(days) * 86400
+
+    chain_id = _chain_id_by_chain_key(chain_key)
+    if chain_id <= 0:
+        return {
+            "items": [],
+            "count": 0,
+            "mode": "unavailable",
+            "fee_pricing": "none",
+            "note": "unknown chain",
+        }
+
+    position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
+    if not position_ids:
+        return {
+            "items": [],
+            "count": 0,
+            "mode": "unavailable",
+            "fee_pricing": "none",
+            "note": "no position ids",
+        }
+
+    token0 = str(req.token0_id or "").strip().lower()
+    token1 = str(req.token1_id or "").strip().lower()
+    want_hist_usd = bool(getattr(req, "fee_usd_historical", False))
+    endpoint = get_graph_endpoint(chain_key, version=version)
+
+    exact_by_day: dict[int, float] = {}
+    if endpoint:
+        for pid in position_ids[:20]:
+            try:
+                series = _fetch_position_fee_series_exact(
+                    endpoint,
+                    pid,
+                    since_ts=since_ts,
+                    chain_id=chain_id,
+                )
+                for ts, value in series:
+                    exact_by_day[int(ts)] = float(exact_by_day.get(int(ts), 0.0) + float(value))
+            except Exception:
+                continue
+
+    sub_max = max(exact_by_day.values()) if exact_by_day else 0.0
+    rpc_by_day: dict[int, float] = {}
+    rpc_meta: dict[str, str] = {"pricing": "none", "detail": ""}
+    if (
+        protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
+        and _position_fee_rpc_fallback_enabled()
+        and _is_eth_address(token0)
+        and _is_eth_address(token1)
+    ):
+        try:
+            rpc_by_day, rpc_meta = _fetch_v3_position_fees_by_collect_logs(
+                chain_id,
+                protocol,
+                position_ids[:20],
+                since_ts=since_ts,
+                token0_addr=token0,
+                token1_addr=token1,
+                use_historical_usd=want_hist_usd,
+            )
+        except Exception:
+            rpc_by_day, rpc_meta = {}, {"pricing": "none", "detail": ""}
+
+    force_rpc = _position_fee_rpc_force_onchain()
+    rpc_detail = str((rpc_meta or {}).get("detail") or "").strip()
+    rpc_pricing = str((rpc_meta or {}).get("pricing") or "none").strip()
+
+    def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
+        return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
+
+    if force_rpc and rpc_by_day:
+        return {
+            "items": _pack_fee_items(rpc_by_day),
+            "count": len(rpc_by_day),
+            "mode": "onchain-collect-logs",
+            "fee_pricing": rpc_pricing,
+            "note": "POSITIONS_FEE_RPC_FORCE: " + (rpc_detail or "NPM Collect logs."),
+        }
+
+    if exact_by_day and sub_max >= 1e-6 and not force_rpc:
+        snap_note = "Subgraph positionSnapshots collectedFees, valued in USD."
+        if want_hist_usd:
+            snap_note += " (Исторические USD — только для ряда по логам Collect; субграф как раньше.)"
+        return {
+            "items": _pack_fee_items(exact_by_day),
+            "count": len(exact_by_day),
+            "mode": "exact-snapshots",
+            "fee_pricing": "subgraph_snapshot",
+            "note": snap_note,
+        }
+
+    if rpc_by_day:
+        return {
+            "items": _pack_fee_items(rpc_by_day),
+            "count": len(rpc_by_day),
+            "mode": "onchain-collect-logs",
+            "fee_pricing": rpc_pricing,
+            "note": "Subgraph fee field empty/zero — " + (rpc_detail or "NPM Collect logs."),
+        }
+
+    if exact_by_day:
+        low_note = "Subgraph collectedFees (USD); may be incomplete where subgraph indexing is wrong."
+        if want_hist_usd:
+            low_note += " (Исторические USD — только для ряда по логам Collect.)"
+        return {
+            "items": _pack_fee_items(exact_by_day),
+            "count": len(exact_by_day),
+            "mode": "exact-snapshots",
+            "fee_pricing": "subgraph_snapshot",
+            "note": low_note,
+        }
+
+    return {
+        "items": [],
+        "count": 0,
+        "mode": "unavailable",
+        "fee_pricing": "none",
+        "note": "No fee data: subgraph empty and on-chain Collect logs missing, or token0_id/token1_id needed for RPC fallback.",
     }
 
 
