@@ -377,6 +377,11 @@ if not POSITIONS_NFT_RPC_PM_FALLBACK_CHAIN_IDS_ALL:
 POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK = os.environ.get(
     "POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
+# NFT catalog: if PM balanceOf(wallet) > # of (pm,tokenId) pairs from tokennfttx+enumeration, backfill ids
+# via contract-scoped explorer tokennfttx + ownerOf (fixes partial global tokennfttx / non-enumerable PM gaps).
+POSITIONS_NFT_CATALOG_PM_BALANCE_GAP_FILL = os.environ.get(
+    "POSITIONS_NFT_CATALOG_PM_BALANCE_GAP_FILL", "1"
+).strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS = max(
     4,
     min(60, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS", "18"))),
@@ -11016,6 +11021,105 @@ def _explorer_tokennfttx_currently_owned_contract_token_ids(
     return out
 
 
+def _nft_catalog_fill_pm_owned_gaps_from_balance(
+    chain_id: int,
+    owner: str,
+    owned: list[tuple[str, int]],
+    *,
+    deadline_ts: float,
+    debug_out: dict[str, Any] | None = None,
+) -> list[tuple[str, int]]:
+    """
+    Добивает список «текущих» NFT на известных v3/v4 PM, если on-chain balanceOf выше числа пар,
+    восстановленных из глобального tokennfttx (+ синтетические строки перечисления).
+
+    Типичный кейс: индексатор отдал неполную историю transfer'ов или PM без стабильного
+    tokenOfOwnerByIndex — глобальный tokennfttx не знает про tokenId, хотя NFT у кошелька есть.
+    """
+    if not POSITIONS_NFT_CATALOG_PM_BALANCE_GAP_FILL or not POSITIONS_NFT_RPC_PM_TRANSFER_FALLBACK:
+        return list(owned)
+    cid = int(chain_id)
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(o):
+        return list(owned)
+    if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+        return list(owned)
+    owned_set: set[tuple[str, int]] = set()
+    for c_raw, tid in owned or []:
+        ca = str(c_raw or "").strip().lower()
+        try:
+            tv = int(tid)
+        except Exception:
+            continue
+        if not _is_eth_address(ca) or tv <= 0:
+            continue
+        owned_set.add((ca, tv))
+    pm_specs: list[tuple[str, str]] = []
+    v3a = str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    if _is_eth_address(v3a):
+        pm_specs.append((v3a, str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(cid, "uniswap_v3") or "uniswap_v3").strip().lower()))
+    v4a = str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
+    if _is_eth_address(v4a):
+        pm_specs.append((v4a, "uniswap_v4"))
+    gap_rows: list[dict[str, Any]] = []
+    for pm, proto in pm_specs:
+        if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+            break
+        try:
+            bal_data = "0x70a08231" + _encode_address_word(o)
+            bal_onchain = int(_decode_uint_eth_call(_eth_call_hex(cid, pm, bal_data)))
+        except Exception:
+            bal_onchain = 0
+        bal_onchain = max(0, int(bal_onchain))
+        have0 = sum(1 for c, _t in owned_set if c == pm)
+        if bal_onchain <= have0:
+            gap_rows.append({"pm": pm, "balance": bal_onchain, "owned_before": have0, "added": 0})
+            continue
+        added = 0
+        try:
+            cand = _scan_erc721_token_ids_by_explorer_api(
+                cid,
+                pm,
+                o,
+                max_ids=max(80, bal_onchain * 6, int(POSITIONS_ONCHAIN_MAX_NFTS)),
+                protocol=proto,
+            )
+        except Exception:
+            cand = []
+        for tid in cand or []:
+            if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+                break
+            try:
+                tv = int(tid)
+            except Exception:
+                continue
+            if tv <= 0 or (pm, tv) in owned_set:
+                continue
+            cur = _erc721_owner_of_address_lower(cid, pm, int(tv))
+            if not _is_eth_address(cur) or cur == "0x0000000000000000000000000000000000000000":
+                continue
+            if not _owner_matches_wallet_or_custody(cid, proto, o, cur):
+                continue
+            owned_set.add((pm, int(tv)))
+            added += 1
+            if sum(1 for c, _t in owned_set if c == pm) >= bal_onchain:
+                break
+        have1 = sum(1 for c, _t in owned_set if c == pm)
+        gap_rows.append(
+            {
+                "pm": pm,
+                "balance": bal_onchain,
+                "owned_before": have0,
+                "owned_after": have1,
+                "explorer_candidates": len(cand or []),
+                "added": int(added),
+            }
+        )
+    if isinstance(debug_out, dict) and gap_rows:
+        debug_out["nft_pm_balance_gap_fill"] = gap_rows
+    return sorted(owned_set, key=lambda x: (x[0], x[1]))
+
+
 def _explorer_nft_catalog_is_uniswap_or_pancake(token_name: str, token_symbol: str) -> bool:
     """True if explorer token name/symbol indicates Uniswap or Pancake (case-insensitive)."""
     blob = f"{token_name} {token_symbol}".lower()
@@ -11681,6 +11785,13 @@ def _explorer_nft_catalog_owner_chain_scan(
             nft_catalog_serial_http=True,
         )
         owned = _explorer_tokennfttx_currently_owned_contract_token_ids(nft_rows, ok)
+        owned = _nft_catalog_fill_pm_owned_gaps_from_balance(
+            int(cid),
+            ok,
+            owned,
+            deadline_ts=float(deadline_ts),
+            debug_out=dbg,
+        )
     except Exception as e:
         err = str(e)[:400]
     return {
