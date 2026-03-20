@@ -1460,7 +1460,7 @@
     "fee_pct": 0.05,
     "raw_fee_tier": 500,
     "pair": "WETH/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xc6962004f452be9203591991d15f6b388e09e8d0": {
@@ -2192,7 +2192,7 @@
     "fee_pct": 0.05,
     "raw_fee_tier": 500,
     "pair": "WETH/USDC",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xc473e2aee3441bf9240be85eb122abb059a3b57c": {
@@ -2924,7 +2924,7 @@
     "fee_pct": 0.3,
     "raw_fee_tier": 3000,
     "pair": "WETH/USDC",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x1fb3cf6e48f1e7b10213e7b6d87d4c073c7fdb7b": {

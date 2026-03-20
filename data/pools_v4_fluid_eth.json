@@ -687,7 +687,7 @@
     "pool_id": "0xf8a05200a0a9308212de0605628a5e266ca8b3539e03d76ef694cc1d30bb9689",
     "fee_pct": 1.0,
     "pair": "ETH/FLUID",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   }
 }

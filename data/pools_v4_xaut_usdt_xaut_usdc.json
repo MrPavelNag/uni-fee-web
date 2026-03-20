@@ -2652,7 +2652,7 @@
     "fee_pct": 0.6,
     "raw_fee_tier": 6000,
     "pair": "XAUt0/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   }
 }

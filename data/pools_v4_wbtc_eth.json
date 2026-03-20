@@ -2189,7 +2189,7 @@
     "pool_id": "0x8b3781471ab98774c59775df9cc505ce20b36afffd297aef2dc17daafce3b140",
     "fee_pct": 0.05,
     "pair": "ETH/WBTC",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   }
 }

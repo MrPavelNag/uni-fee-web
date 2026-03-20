@@ -728,7 +728,7 @@
     "fee_pct": 0.3,
     "raw_fee_tier": 3000,
     "pair": "LINK/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xbbe36e6f0331c6a36ab44bc8421e28e1a1871c1e": {
@@ -1460,7 +1460,7 @@
     "fee_pct": 0.3,
     "raw_fee_tier": 3000,
     "pair": "USDC/LINK",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x655c1607f8c2e73d5b4ddabce9ba8792b87592b6": {
@@ -2016,7 +2016,7 @@
     "fee_pct": 0.05,
     "raw_fee_tier": 500,
     "pair": "USDC/LINK",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xd5c134a1c8fe2cc66312ff8a4d45087ce8be5315": {

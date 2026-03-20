@@ -2875,7 +2875,7 @@
     "pool_id": "0xbe3ad6a5669dc0b8b12febc03608860c31e2eef6",
     "fee_pct": 0.01,
     "pair": "USDC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xbce73c2e5a623054b0e8e2428e956f4b9d0412a5": {
@@ -3606,7 +3606,7 @@
     "pool_id": "0xbce73c2e5a623054b0e8e2428e956f4b9d0412a5",
     "fee_pct": 0.05,
     "pair": "USDC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xd7e7ad63359e2aa9e841f6e1326fb7e69479a50b": {
@@ -4057,7 +4057,7 @@
     "pool_id": "0xd7e7ad63359e2aa9e841f6e1326fb7e69479a50b",
     "fee_pct": 1.0,
     "pair": "USDC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x9957ab69651efe39b17c778e1435258f6a2cd314": {
@@ -4532,7 +4532,7 @@
     "pool_id": "0x9957ab69651efe39b17c778e1435258f6a2cd314",
     "fee_pct": 0.3,
     "pair": "USDC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xa73c628eaf6e283e26a7b1f8001cf186aa4c0e8e": {

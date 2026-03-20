@@ -112,8 +112,17 @@ def get_token_addresses(
     dynamic_tokens: Optional[dict] = None,
 ) -> list[str]:
     """Get token address: curated config → top-N cache (same as web catalog) → dynamic_tokens."""
+    chain = str(chain or "").strip().lower()
+    if chain == "arbitrum-one":
+        chain = "arbitrum"
     cfg = TOKEN_ADDRESSES.get(chain, {})
-    dyn = (dynamic_tokens or {}).get(chain, {})
+    dyn_all = dynamic_tokens or {}
+    dyn = dict(dyn_all.get(chain, {}) or {})
+    if chain == "arbitrum":
+        legacy = dyn_all.get("arbitrum-one", {})
+        if isinstance(legacy, dict):
+            for ks, va in legacy.items():
+                dyn.setdefault(ks, va)
     sym = token_symbol.lower()
     addrs = []
     a = cfg.get(sym) or cfg.get(token_symbol)

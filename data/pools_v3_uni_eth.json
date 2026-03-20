@@ -727,7 +727,7 @@
     "pool_id": "0xc24f7d8e51a64dc1238880bd00bb961d54cbeb29",
     "fee_pct": 0.3,
     "pair": "WETH/UNI",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x929fcf81102c5577243ee614c2c455acd6681f1a": {
@@ -1434,7 +1434,7 @@
     "pool_id": "0x929fcf81102c5577243ee614c2c455acd6681f1a",
     "fee_pct": 1.0,
     "pair": "WETH/UNI",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xff96d42dc8e2700abab1f1f82ecf699caa1a2056": {
@@ -2157,7 +2157,7 @@
     "pool_id": "0xff96d42dc8e2700abab1f1f82ecf699caa1a2056",
     "fee_pct": 0.05,
     "pair": "WETH/UNI",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801": {

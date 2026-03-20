@@ -2357,7 +2357,7 @@
     "pool_id": "0x41b1e6b28a39199365f5348a2bf71d0f785167e920d05254b3f2efd1b9487db5",
     "fee_pct": 0.05,
     "pair": "WBTC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   },
   "0x1e5bc06befed2b29a7b1074cfabe8fe59da21779ad2dcd7bb62b5bc45ba9ca64": {
@@ -3088,7 +3088,7 @@
     "pool_id": "0x1e5bc06befed2b29a7b1074cfabe8fe59da21779ad2dcd7bb62b5bc45ba9ca64",
     "fee_pct": 0.3,
     "pair": "WBTC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   },
   "0x6653243f2cc1881dcd12fe2d1b6544ba3050ce3bbbe1cf26887784688ed570e7": {
@@ -3097,7 +3097,7 @@
     "pool_id": "0x6653243f2cc1881dcd12fe2d1b6544ba3050ce3bbbe1cf26887784688ed570e7",
     "fee_pct": 50.0,
     "pair": "WBTC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   },
   "0x121bc0414c1f266c6f9ccb1d14f64711114288c49cc86151824ef78707282ca6": {
@@ -3652,7 +3652,7 @@
     "pool_id": "0x121bc0414c1f266c6f9ccb1d14f64711114288c49cc86151824ef78707282ca6",
     "fee_pct": 1.0,
     "pair": "WBTC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   },
   "0x673ae36c26ea8e0908be8c523618c90032c343cdb966bd25e763277e944afe9a": {
@@ -3661,7 +3661,7 @@
     "pool_id": "0x673ae36c26ea8e0908be8c523618c90032c343cdb966bd25e763277e944afe9a",
     "fee_pct": 99.0,
     "pair": "WBTC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   },
   "0xebc6eba1c4392ad3b9e9c07cc7a21cafa70b19d269b1496bcca5de0e5b2d9f9a": {

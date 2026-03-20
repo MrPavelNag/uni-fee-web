@@ -2109,7 +2109,7 @@
     "pool_id": "0xd9f6d67f109e67b9b28117dcf4aafbc874fbd89f92bdca1a66901a3965582748",
     "fee_pct": 0.3,
     "pair": "ETH/UNI",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   },
   "0xb2f3bbaf23e0197ec2e6f9ab730d00aaf26a9119ecd583bbb9ef3146b4afa248": {

@@ -14,7 +14,7 @@ from uniswap_client import get_graph_endpoint, graphql_query
 
 # v3 pool Arbitrum FLUID/ETH
 POOL_ID = "0x6cE19e5b05C0a0416FeB963bcd754C8d99C02248"
-CHAIN = "arbitrum-one"
+CHAIN = "arbitrum"
 VERSION = "v3"
 
 def main():

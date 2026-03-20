@@ -728,7 +728,7 @@
     "fee_pct": 0.3,
     "raw_fee_tier": 3000,
     "pair": "LINK/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xbbe36e6f0331c6a36ab44bc8421e28e1a1871c1e": {
@@ -1460,7 +1460,7 @@
     "fee_pct": 0.3,
     "raw_fee_tier": 3000,
     "pair": "USDC/LINK",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x655c1607f8c2e73d5b4ddabce9ba8792b87592b6": {
@@ -2016,7 +2016,7 @@
     "fee_pct": 0.05,
     "raw_fee_tier": 500,
     "pair": "USDC/LINK",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x468b88941e7cc0b88c1869d68ab6b570bcef62ff": {
@@ -2748,7 +2748,7 @@
     "fee_pct": 0.3,
     "raw_fee_tier": 3000,
     "pair": "WETH/LINK",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x91308bc9ce8ca2db82aa30c65619856cc939d907": {
@@ -3480,7 +3480,7 @@
     "fee_pct": 0.05,
     "raw_fee_tier": 500,
     "pair": "WETH/LINK",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x22127577d772c4098c160b49a8e5cae3012c5824": {
@@ -3868,7 +3868,7 @@
     "fee_pct": 1.0,
     "raw_fee_tier": 10000,
     "pair": "WETH/LINK",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x19ea026886cbb7a900ecb2458636d72b5cae223b": {

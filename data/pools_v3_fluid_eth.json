@@ -719,7 +719,7 @@
     "pool_id": "0x6ce19e5b05c0a0416feb963bcd754c8d99c02248",
     "fee_pct": 1.0,
     "pair": "FLUID/WETH",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0xc1cd3d0913f4633b43fcddbcd7342bc9b71c676f": {

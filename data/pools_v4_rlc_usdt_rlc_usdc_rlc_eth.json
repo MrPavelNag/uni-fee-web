@@ -70,7 +70,7 @@
     "pool_id": "0xda4022806d0fef7eb29f953f8a63c2759eda999773a52455d78f7f92f51f28b4",
     "fee_pct": 88.0,
     "pair": "USDC/RLC",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   },
   "0xb12cfd0c97628ed5fc8dc9d1bdb07bdbd716a0a178718e7b610ddc150451d213": {
@@ -89,7 +89,7 @@
     "pool_id": "0xb12cfd0c97628ed5fc8dc9d1bdb07bdbd716a0a178718e7b610ddc150451d213",
     "fee_pct": 95.0,
     "pair": "ETH/RLC",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   }
 }

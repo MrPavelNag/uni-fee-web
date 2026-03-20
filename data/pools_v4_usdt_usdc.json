@@ -2189,7 +2189,7 @@
     "pool_id": "0xab05003a63d2f34ac7eec4670bca3319f0e3d2f62af5c2b9cbd69d03fd804fd2",
     "fee_pct": 0.0008,
     "pair": "USDC/USDT",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v4"
   }
 }

@@ -38,7 +38,7 @@ TOKEN_ADDRESSES = {
         "paxg": "0x45804880de22913dafe09f4980848ece6ecbaf78",  # Paxos Gold
         "xaut": "0x68749665ff8d2d112fa859aa293f07a622782f38",  # Tether Gold (XAUt)
     },
-    "arbitrum-one": {
+    "arbitrum": {
         "fluid": "0x61e030a56d33e8260fdd81f03b162a79fe3449cd",
         "inst": "0x61e030a56d33e8260fdd81f03b162a79fe3449cd",
         "uni": "0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0",
@@ -131,7 +131,7 @@ TOKEN_ADDRESSES = {
 # Uniswap v3 subgraph IDs (from docs.uniswap.org)
 UNISWAP_V3_SUBGRAPHS = {
     "ethereum": "5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV",
-    "arbitrum-one": "FbCGRftH4a3yZugY7TnbYgPJVEv2LvMT6oF1fxPe9aJM",
+    "arbitrum": "FbCGRftH4a3yZugY7TnbYgPJVEv2LvMT6oF1fxPe9aJM",
     "base": "43Hwfi3dJSoGpyas9VwNoDAv55yjgGrPpNSmbQZArzMG",
     "optimism": "Cghf4LfVqPiFw6fp6Y5X5Ubc8UpmUhSfJL82zwiBFLaj",
     "polygon": "3hCPRGf4z88VC5rsBKU5AA9FBBq5nF3jbKJG7VZCbhjm",
@@ -144,14 +144,22 @@ UNISWAP_V3_SUBGRAPHS = {
 # Uniswap v4 subgraph IDs (from The Graph Explorer, docs.uniswap.org)
 UNISWAP_V4_SUBGRAPHS = {
     "ethereum": "DiYPVdygkfjDWhbxGSqAQxwBKmfKnkWQojqeM2rkLb3G",
-    "arbitrum-one": "G5TsTKNi8yhPSV7kycaE23oWbqv9zzNqR49FoEQjzq1r",
+    "arbitrum": "G5TsTKNi8yhPSV7kycaE23oWbqv9zzNqR49FoEQjzq1r",
     "base": "6UjxSFHTUa98Y4Uh4Tb6suPVyYxgPHpPEPfmFNihzTHp",
     "unichain": "EoCvJ5tyMLMJcTnLQwWpjAtPdn74PcrZgzfcT5bYxNBH",
     "polygon": "CwpebM66AH5uqS5sreKij8yEkkPcHvmyEs7EwFtdM5ND",
 }
 
 # Сети для v4 (base исключён — bad indexers)
-V4_CHAINS = [c.strip() for c in os.environ.get("V4_CHAINS", "ethereum,arbitrum-one,unichain,polygon").split(",") if c.strip()]
+def _normalize_v4_chain_slug(raw: str) -> str:
+    s = (raw or "").strip()
+    if s == "arbitrum-one":
+        return "arbitrum"
+    return s
+
+
+_V4_CHAINS_RAW = [c.strip() for c in os.environ.get("V4_CHAINS", "ethereum,arbitrum,unichain,polygon").split(",") if c.strip()]
+V4_CHAINS = [_normalize_v4_chain_slug(c) for c in _V4_CHAINS_RAW]
 
 # Goldsky public endpoints (no API key, rate limited) - alternative to The Graph
 GOLDSKY_ENDPOINTS = {

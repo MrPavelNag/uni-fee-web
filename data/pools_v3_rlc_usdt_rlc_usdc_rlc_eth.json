@@ -2054,7 +2054,7 @@
     "pool_id": "0x0eb43b37539a4261aa1860f9476094bb2c00a894",
     "fee_pct": 0.3,
     "pair": "WETH/RLC",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   }
 }

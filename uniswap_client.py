@@ -10,8 +10,16 @@ from typing import Optional
 import requests
 
 
+def _canonical_graph_chain(chain: str) -> str:
+    c = (chain or "").strip().lower()
+    if c == "arbitrum-one":
+        return "arbitrum"
+    return c
+
+
 def get_graph_endpoint(chain: str, version: str = "v3") -> Optional[str]:
     """Build GraphQL endpoint URL for a chain and protocol version (v3 or v4)."""
+    chain = _canonical_graph_chain(chain)
     api_key = os.environ.get("THE_GRAPH_API_KEY")
     if not api_key:
         if version == "v4":
@@ -25,7 +33,10 @@ def get_graph_endpoint(chain: str, version: str = "v3") -> Optional[str]:
     from config import GOLDSKY_ENDPOINTS, UNISWAP_V3_SUBGRAPHS, UNISWAP_V4_SUBGRAPHS
 
     if version == "v4":
-        override = os.environ.get(f"V4_OVERRIDE_{chain.upper().replace('-', '_')}")
+        cu = chain.upper().replace("-", "_")
+        override = os.environ.get(f"V4_OVERRIDE_{cu}")
+        if not override and chain == "arbitrum":
+            override = os.environ.get("V4_OVERRIDE_ARBITRUM_ONE")
         if override:
             return override
         if chain in UNISWAP_V4_SUBGRAPHS:

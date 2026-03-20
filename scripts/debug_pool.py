@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from uniswap_client import get_graph_endpoint, graphql_query
 
 POOL_ID = "0xf8a05200a0a9308212de0605628a5e266ca8b3539e03d76ef694cc1d30bb9689"
-CHAIN = "arbitrum-one"
+CHAIN = "arbitrum"
 
 def main():
     ep = get_graph_endpoint(CHAIN, "v4")

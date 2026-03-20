@@ -93,7 +93,7 @@ CHAIN_ID_TO_NAME = {
     137: "polygon",
     324: "zksync",
     8453: "base",
-    42161: "arbitrum-one",
+    42161: "arbitrum",
     43114: "avalanche",
     81457: "blast",
 }
@@ -200,7 +200,7 @@ CHAIN_ID_TO_KEY: dict[int, str] = {
     137: "polygon",
     324: "zksync",
     8453: "base",
-    42161: "arbitrum-one",
+    42161: "arbitrum",
     43114: "avalanche",
     81457: "blast",
 }
@@ -220,7 +220,7 @@ AAVE_CHAIN_ID_TO_NAME: dict[int, str] = {
     8453: "base",
     9745: "plasma",
     59144: "linea",
-    42161: "arbitrum-one",
+    42161: "arbitrum",
     534352: "scroll",
     57073: "ink",
 }
@@ -12030,6 +12030,17 @@ def _enrich_nft_catalog_rows_from_chain(
     ms = float(max_seconds)
     run_heavy = ep in ("all", "heavy") and POSITIONS_NFT_HEAVY_PIPELINE
     run_light = ep in ("all", "v3")
+    job_s = str(pos_job_id or "").strip()
+    ran_heavy_parallel = False
+
+    if job_s and (run_heavy or run_light):
+        if ep == "heavy":
+            start_msg = "Loading v4 and Infinity positions"
+        elif ep == "all":
+            start_msg = "Fetching on-chain data"
+        else:
+            start_msg = "Loading Uniswap v3 position details"
+        _update_pos_job(job_s, stage="enrich_onchain", stage_label=start_msg, progress=65.0)
 
     if run_heavy:
         heavy_candidates = _nft_catalog_heavy_enrich_candidate_rows(rows)
@@ -12053,6 +12064,23 @@ def _enrich_nft_catalog_rows_from_chain(
                 )
                 heavy_stats["heavy_ok"] = int(h_ok)
                 heavy_stats["heavy_fail"] = int(h_fail)
+                ran_heavy_parallel = True
+
+    if job_s and ran_heavy_parallel:
+        if run_light:
+            _update_pos_job(
+                job_s,
+                stage="enrich_onchain",
+                stage_label="Loading Uniswap v3 position details",
+                progress=68.0,
+            )
+        else:
+            _update_pos_job(
+                job_s,
+                stage="enrich_onchain",
+                stage_label="Finalizing results",
+                progress=70.0,
+            )
 
     if run_light:
         for row in rows or []:
@@ -12092,6 +12120,14 @@ def _enrich_nft_catalog_rows_from_chain(
                     row["nft_catalog_pm_snapshot_ok"] = True
                     row["nft_catalog_pm_snapshot_reason"] = ""
                 ok_n += 1
+                if job_s and ok_n > 0 and (ok_n % 20 == 0):
+                    cap = max(1, int(max_rows))
+                    _update_pos_job(
+                        job_s,
+                        stage="enrich_onchain",
+                        stage_label="Loading Uniswap v3 position details",
+                        progress=min(72.0, 68.0 + (float(ok_n) / float(cap)) * 4.0),
+                    )
             except Exception:
                 if is_ex_nft:
                     row["nft_catalog_pm_snapshot_ok"] = False
@@ -12418,16 +12454,7 @@ def _scan_pool_positions_explorer_nft_catalog(
         timings["nft_explorer_api_request_failures"] = 0
         timings["nft_missing_or_error_events"] = 0
         if pos_job_id:
-            _update_pos_job(
-                pos_job_id,
-                stage_label="Scanning NFT collections — skipped (no chains or addresses)",
-                progress=25.0,
-                nft_scan_tasks_total=0,
-                nft_scan_tasks_done=0,
-                nft_scan_rows_total=0,
-                nft_scan_task_errors=0,
-                nft_scan_api_errors=0,
-            )
+            _update_pos_job(pos_job_id, stage_label="Preparing scan", progress=25.0)
         return [], errors, debug_rows, timings
 
     ordered_chain_ids = _order_chain_ids_for_pool_scan(raw_ids, POSITIONS_SCAN_CHAIN_PRIORITY)
@@ -12465,16 +12492,7 @@ def _scan_pool_positions_explorer_nft_catalog(
     fetch_results: list[dict[str, Any]] = []
     if n_tasks <= 0:
         if pos_job_id:
-            _update_pos_job(
-                pos_job_id,
-                stage_label="Scanning NFT collections — 100% (no wallet×chain tasks)",
-                progress=30.0,
-                nft_scan_tasks_total=0,
-                nft_scan_tasks_done=0,
-                nft_scan_rows_total=0,
-                nft_scan_task_errors=0,
-                nft_scan_api_errors=0,
-            )
+            _update_pos_job(pos_job_id, stage_label="Scanning NFT collections", progress=30.0)
     else:
         t_parallel0 = time.monotonic()
         prog_lock = threading.Lock()
@@ -12500,18 +12518,10 @@ def _scan_pool_positions_explorer_nft_catalog(
                     task_err_ct = int(prog["task_err"])
                     api_err_sum = int(prog["api_err"])
                 if pos_job_id:
-                    pct = (100.0 * float(done_ct) / float(n_tasks)) if n_tasks else 100.0
                     _update_pos_job(
                         pos_job_id,
                         progress=float(_nft_parallel_job_progress(done_ct, n_tasks)),
-                        stage_label=(
-                            f"Scanning NFT collections — {pct:.1f}% ({done_ct}/{n_tasks} wallet×chain)"
-                        ),
-                        nft_scan_tasks_total=int(n_tasks),
-                        nft_scan_tasks_done=int(done_ct),
-                        nft_scan_rows_total=int(rows_sum),
-                        nft_scan_task_errors=int(task_err_ct),
-                        nft_scan_api_errors=int(api_err_sum),
+                        stage_label="Scanning NFT collections",
                     )
             return chunk
 
@@ -12547,12 +12557,7 @@ def _scan_pool_positions_explorer_nft_catalog(
             _update_pos_job(
                 pos_job_id,
                 progress=61.0,
-                stage_label="Aggregating NFT catalog…",
-                nft_scan_tasks_total=int(n_tasks),
-                nft_scan_tasks_done=int(n_tasks),
-                nft_scan_rows_total=int(rows_sum),
-                nft_scan_task_errors=int(task_err_ct),
-                nft_scan_api_errors=int(api_err_sum),
+                stage_label="Merging NFT catalog",
             )
     if "nft_parallel_fetch_sec" not in timings:
         timings["nft_parallel_fetch_sec"] = 0.0
@@ -12768,17 +12773,12 @@ def _scan_pool_positions_explorer_nft_catalog(
     timings["nft_balance_vs_explorer_debug_sec"] = round(max(0.0, time.monotonic() - t_bal_dbg), 3)
     timings["total_sec"] = round(max(0.0, time.monotonic() - scan_started), 3)
     if pos_job_id and n_tasks > 0:
-        _update_pos_job(
-            pos_job_id,
-            nft_scan_rows_total=int(nft_rows_total),
-            nft_scan_task_errors=int(tasks_failed_final),
-            nft_scan_api_errors=int(api_err_total_final),
-            progress=64.0,
-            stage_label=(
-                f"NFT catalog done — scanned {int(nft_rows_total)} tokennfttx rows, "
-                f"{int(tasks_failed_final)} task error(s), {int(api_err_total_final)} API failure(s)"
-            ),
+        lbl = (
+            "Filtering closed positions"
+            if POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER
+            else "Building position list"
         )
+        _update_pos_job(pos_job_id, progress=64.0, stage_label=lbl)
     return rows_out, errors, debug_rows, timings
 
 
@@ -13071,8 +13071,14 @@ def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int
     return []
 
 
+def _normalize_chain_key_slug(chain_key: str) -> str:
+    """Canonical UI/config slug (legacy token: arbitrum-one → arbitrum)."""
+    k = str(chain_key or "").strip().lower()
+    return "arbitrum" if k == "arbitrum-one" else k
+
+
 def _chain_id_by_chain_key(chain_key: str) -> int:
-    key = str(chain_key or "").strip().lower()
+    key = _normalize_chain_key_slug(chain_key)
     for cid, ck in CHAIN_ID_TO_KEY.items():
         if str(ck).strip().lower() == key:
             return int(cid)
@@ -13571,7 +13577,7 @@ def _merge_static_token_addr_maps(overlay_by_chain: dict[str, dict[str, str]] | 
     for ck, mp in overlay_by_chain.items():
         if not isinstance(mp, dict):
             continue
-        bucket = merged.setdefault(str(ck).strip().lower(), {})
+        bucket = merged.setdefault(_normalize_chain_key_slug(str(ck)), {})
         for addr, sym in mp.items():
             a = str(addr).strip().lower()
             if not _is_eth_address(a):
@@ -13630,7 +13636,11 @@ def _overlay_dict_from_major_cache_raw(raw: dict[str, Any]) -> dict[str, dict[st
             a = str(ad).strip().lower()
             if _is_eth_address(a):
                 d[a] = str(sym or "").strip().upper()
-        overlay[str(ck).strip().lower()] = d
+        nk = _normalize_chain_key_slug(str(ck))
+        if nk in overlay:
+            overlay[nk].update(d)
+        else:
+            overlay[nk] = dict(d)
     return overlay
 
 
@@ -13706,7 +13716,8 @@ def _get_merged_token_addr_to_symbol_by_chain() -> dict[str, dict[str, str]]:
 
 def _token_addr_symbol_map_for_chain(chain_key: str) -> dict[str, str]:
     maps = _get_merged_token_addr_to_symbol_by_chain()
-    return dict((maps.get(str(chain_key or "").strip().lower(), {}) or {}))
+    k = _normalize_chain_key_slug(str(chain_key or ""))
+    return dict((maps.get(k, {}) or {}))
 
 
 def _build_token_catalog_from_merged_major(merged: dict[str, dict[str, str]], updated_at: str) -> dict[str, Any]:
@@ -15209,7 +15220,7 @@ def _render_positions_page() -> str:
     .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
     .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; }
     .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
-    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:13px; font-weight:700; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
+    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:17px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
     .section-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; min-width:0; flex:1 1 auto; }
@@ -15284,7 +15295,7 @@ def _render_positions_page() -> str:
       .positions-form, .result-card { padding: 12px; }
       .section-head { flex-wrap: wrap; align-items: center; }
       .section-head h3 { font-size: 16px; }
-      .search-link-btn { font-size: 12px; }
+      .search-link-btn { font-size: 15px; }
     }
     @media (max-width: 720px) {
       .positions-grid { gap: 10px; }
@@ -15352,12 +15363,13 @@ def _render_positions_page() -> str:
         </div>
       </section>
       <section class="result-card">
-        <div class="section-head">
-          <h3>Uniswap v4 / Pancake Infinity</h3>
+        <div class="section-head" style="flex-wrap:nowrap;align-items:center">
+          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v4 / Pancake Infinity</h3>
           <div class="section-actions">
             <div id="posHeavyProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posHeavyStatus">Ready</span>
             <button id="posHeavySearchBtn" class="search-link-btn" type="button" onclick="scanHeavyPositions()">Scan v4 / Infinity</button>
+            <button class="collapse-btn" id="toggleHeavyPoolsBtn" type="button" onclick="togglePosSection('heavy')" title="Collapse/expand">▾</button>
           </div>
         </div>
         <div id="posHeavyPoolsBody" class="section-body">
@@ -15447,7 +15459,7 @@ def _render_positions_page() -> str:
       renderChips(kind);
       if (kind === "evm" && (posState.evm || []).length) scheduleBackgroundWarmup("remove");
     }
-    const posSectionState = {pools: false};
+    const posSectionState = {pools: false, heavy: false};
     const posCache = {pools: [], debug: null};
     const posHeavyCache = {pools: [], debug: null};
     const POS_HEAVY_RESULTS_STORAGE_KEY = "positions_heavy_scan_results_v1";
@@ -15763,8 +15775,8 @@ def _render_positions_page() -> str:
       }
     }
     function setSectionCollapsed(key, collapsed) {
-      const bodyMap = {pools: "posPoolsBody"};
-      const btnMap = {pools: "togglePoolsBtn"};
+      const bodyMap = {pools: "posPoolsBody", heavy: "posHeavyPoolsBody"};
+      const btnMap = {pools: "togglePoolsBtn", heavy: "toggleHeavyPoolsBtn"};
       const body = document.getElementById(bodyMap[key]);
       const btn = document.getElementById(btnMap[key]);
       if (!body || !btn) return;
@@ -15777,6 +15789,7 @@ def _render_positions_page() -> str:
       setSectionCollapsed(key, next);
       if (!next) {
         if (key === "pools") renderPools(posCache.pools || []);
+        if (key === "heavy") renderHeavyPools(posHeavyCache.pools || []);
       }
     }
     async function ensurePlotly() {
@@ -15822,7 +15835,8 @@ def _render_positions_page() -> str:
       const dbgSummary = Array.isArray(dbg.summary) ? dbg.summary : [];
       const dbgTimings = (dbg && typeof dbg.timings === "object" && dbg.timings) ? dbg.timings : {};
       let dbgHtml = "";
-      if (dbgSummary.length || Object.keys(dbgTimings).length) {
+      const showCompactDebug = !!dbg.positions_ui_compact_debug;
+      if (showCompactDebug && (dbgSummary.length || Object.keys(dbgTimings).length)) {
         const summaryFiltered = dbgSummary.filter((x) => String(x?.query_mode || "") !== "hard_scan_required_for_live_discovery");
         const cacheHits = summaryFiltered
           .filter((x) => String(x?.query_mode || "") === "ownership_cache")
@@ -16415,6 +16429,53 @@ def _render_positions_page() -> str:
     function loadActivePosJob() {
       try { return String(localStorage.getItem(POS_ACTIVE_JOB_KEY) || "").trim(); } catch (_) { return ""; }
     }
+    function isLikelyTransientClientNetworkError(e) {
+      const name = String(e?.name || "");
+      if (name === "AbortError") return true;
+      const msg = String(e?.message || e || "").toLowerCase();
+      return (
+        msg.includes("failed to fetch")
+        || msg.includes("networkerror")
+        || msg.includes("load failed")
+        || msg.includes("network request failed")
+        || msg.includes("fetch failed")
+        || msg.includes("aborted")
+        || msg.includes("terminated")
+      );
+    }
+    /** Do not drop active job id on transient errors (tab closed / navigation aborts fetch). */
+    function handleActivePosJobError(e, scanKind, resume) {
+      const isHeavy = String(scanKind || "v3") === "heavy";
+      const save = isHeavy ? saveActiveHeavyPosJob : saveActivePosJob;
+      const loadFn = isHeavy ? loadActiveHeavyPosJob : loadActivePosJob;
+      const setSt = isHeavy ? setHeavyStatus : setPosStatus;
+      if (e && e._posJobTerminal) {
+        save("");
+        setSt(
+          resume
+            ? ((isHeavy ? "Background v4 / Infinity: " : "Background scan: ") + (e?.message || "unknown"))
+            : ((isHeavy ? "v4 / Infinity scan: " : "Scan failed: ") + (e?.message || "unknown")),
+          true
+        );
+        return;
+      }
+      const transient = isLikelyTransientClientNetworkError(e);
+      if (transient && loadFn()) {
+        setSt(
+          resume
+            ? "Could not reach server; the scan may still be running. Refresh this page to retry."
+            : "Scan continues on the server. Open Positions again to load results.",
+          false
+        );
+        return;
+      }
+      setSt(
+        resume
+          ? ((isHeavy ? "Background v4 / Infinity: " : "Background scan: ") + (e?.message || "unknown"))
+          : ((isHeavy ? "v4 / Infinity scan: " : "Scan failed: ") + (e?.message || "unknown")),
+        true
+      );
+    }
     async function pollPosJob(jobId, allowPartialReturn = false, scanKind = "v3") {
       const jid = String(jobId || "").trim();
       if (!jid) throw new Error("Missing job id");
@@ -16424,90 +16485,25 @@ def _render_positions_page() -> str:
       const renderTable = isHeavy ? renderHeavyPools : renderPools;
       const errDom = isHeavy ? "posHeavyErrors" : "posErrors";
       let partialRendered = false;
-      function statusTailFromPayload(payload) {
-        const errs = Array.isArray(payload?.errors) ? payload.errors : [];
-        const infos = Array.isArray(payload?.infos) ? payload.infos : [];
-        const maxTail = 52;
-        const cut = (v) => {
-          const s = String(v || "").replace(/\s+/g, " ").trim();
-          if (!s) return "";
-          return s.length > maxTail ? (s.slice(0, maxTail - 1) + "…") : s;
-        };
-        if (errs.length) return ` | ${cut(errs[0] || "")}`;
-        if (infos.length) return ` | ${cut(infos[0] || "")}`;
-        return "";
+      function statusFallbackLabel(raw, st, partial) {
+        const s = String(raw || "").trim().toLowerCase();
+        if (s.includes("fail")) return "Scan failed";
+        if (String(st || "") === "queued") return "Queued";
+        if (partial) return "Finishing in background";
+        return "Working…";
       }
-      function statusMetrics(payload) {
-        const pools = Array.isArray(payload?.pool_positions) ? payload.pool_positions.length : 0;
-        let cacheHits = 0;
-        const sum = Array.isArray(payload?.debug?.summary) ? payload.debug.summary : [];
-        for (const s of sum) {
-          if (String(s?.query_mode || "") === "ownership_cache") {
-            cacheHits += Math.max(0, Number(s?.count || 0));
-          }
-        }
-        return ` | p=${pools}${cacheHits ? ` c=${cacheHits}` : ""}`;
-      }
-      function statusStageLabel(raw, st, partialRendered) {
-        const src = String(raw || "").trim().toLowerCase();
-        if (src.includes("enrich")) return "Background enrich";
-        if (src.includes("finaliz")) return "Finalizing";
-        if (src.includes("scan")) return partialRendered ? "Background scan" : "Scanning";
-        if (String(st || "") === "running") return partialRendered ? "Background scan" : "Scanning";
-        return partialRendered ? "Background scan" : "Scanning";
-      }
-    const POS_STAGE_EVENT_LABELS = {
-      init: "Initialize chain scan",
-      version_start: "Start protocol pass",
-      version_owner_loop: "Owner loop",
-      version_owner_parallel: "Owner parallel workers",
-      owner_scan_start: "Start owner scan",
-      owner_scan_done: "Owner scan done",
-      owner_scan_timeout: "Owner scan timeout",
-      call_contract_only_explorer_owner_rows: "Explorer owner rows",
-      call_contract_only_explorer_contract_rows_fallback: "Explorer contract fallback",
-      call_contract_only_explorer_v4_ids: "Explorer v4 ids",
-      call_contract_only_onchain_v3_npm: "On-chain v3 positions()",
-      call_contract_only_onchain_pancake_masterchef_v3: "On-chain Pancake MasterChefV3",
-      call_contract_only_onchain_uniswap_v4_pm: "On-chain Uniswap v4 PM",
-      done: "Chain complete",
-      timed_out: "Chain timed out",
-    };
-    function stageEventTextFromPartial(partial, fallbackStageLabel) {
-      const poolTimings = (partial?.debug?.timings?.pool && typeof partial.debug.timings.pool === "object")
-        ? partial.debug.timings.pool
-        : {};
-      const inflight = (poolTimings?.unfinished_chain_progress && typeof poolTimings.unfinished_chain_progress === "object")
-        ? poolTimings.unfinished_chain_progress
-        : {};
-      const entries = Object.entries(inflight);
-      if (!entries.length) {
-        const fb = String(fallbackStageLabel || "").trim();
-        return fb ? ` | event: ${fb}` : "";
-      }
-      entries.sort((a, b) => Number((b?.[1] || {}).running_for_sec || 0) - Number((a?.[1] || {}).running_for_sec || 0));
-      const [chainKey, payload] = entries[0];
-      const d = (payload && typeof payload === "object") ? payload : {};
-      const stageKey = String(d.stage || "").trim();
-      const stageLabel = POS_STAGE_EVENT_LABELS[stageKey] || stageKey.replace(/_/g, " ").trim() || "Running";
-      const ver = String(d.version || "").trim();
-      const owner = String(d.owner || "").trim();
-      const sec = Math.max(0, Math.floor(Number(d.running_for_sec || 0)));
-      const chainTxt = String(chainKey || "").trim();
-      const verTxt = ver ? ` ${ver.toUpperCase()}` : "";
-      const ownerTxt = owner ? ` owner=${shortAddr4(owner)}` : "";
-      const secTxt = sec > 0 ? ` ${sec}s` : "";
-      return ` | event: ${chainTxt}${verTxt} - ${stageLabel}${ownerTxt}${secTxt}`;
-    }
       while (true) {
         const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
         const data = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(data.detail || "Job polling failed");
+        if (!r.ok) {
+          const detail = typeof data?.detail === "string" ? data.detail.trim() : "";
+          const err = new Error(detail || "Job polling failed");
+          if (r.status === 404) err._posJobTerminal = true;
+          throw err;
+        }
         const st = String(data.status || "");
         const stageLabel = String(data.stage_label || data.stage || "");
         const progress = Number(data.progress || 0);
-        const startedAt = Number(data.started_at || 0);
-        const elapsedSec = startedAt > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - startedAt)) : 0;
         const partial = data.result || {};
         if (partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length) {
           cacheBox.pools = partial.pool_positions || [];
@@ -16517,37 +16513,19 @@ def _render_positions_page() -> str:
           partialRendered = true;
         }
         if (st === "done") return data.result || {};
-        if (st === "failed") throw new Error(data.error || "Scan failed");
-        // Handoff as soon as base table is ready; continue heavier enrich in background.
+        if (st === "failed") {
+          const err = new Error(String(data.error || "Scan failed"));
+          err._posJobTerminal = true;
+          throw err;
+        }
         const stageKey = String(data.stage || "");
         const backgroundPhase = stageKey.startsWith("enrich_") || stageKey === "finalize" || progress >= 65;
         if (allowPartialReturn && partialRendered && backgroundPhase) {
           return Object.assign({__partial: true}, partial);
         }
-        const statusTail = statusTailFromPayload(partial);
-        const metrics = statusMetrics(partial);
-        const elapsedTxt = elapsedSec > 0 ? ` ${elapsedSec}s` : "";
-        let uiProgress = Math.round(Number(progress || 0));
         const backendLbl = String(data.stage_label || "").trim();
-        const nftProgressMode = Number(data.nft_scan_tasks_total || 0) > 0 || /nft|tokennfttx/i.test(backendLbl);
-        if (st === "running" && uiProgress <= 5 && !nftProgressMode) {
-          // Backend can stay low during some scans; show a smooth front-end estimate meanwhile.
-          uiProgress = Math.min(94, 5 + Math.floor(elapsedSec * 2.2));
-        }
-        const sLabel = (nftProgressMode && backendLbl)
-          ? backendLbl
-          : statusStageLabel(stageLabel, st, partialRendered);
-        const nftTail = (typeof data.nft_scan_tasks_total === "number")
-          ? (
-            ` | NFT rows=${Number(data.nft_scan_rows_total || 0)} `
-            + `task_err=${Number(data.nft_scan_task_errors || 0)} `
-            + `api_err=${Number(data.nft_scan_api_errors || 0)} `
-            + `(${Number(data.nft_scan_tasks_done || 0)}/${Number(data.nft_scan_tasks_total || 0)})`
-          )
-          : "";
-        const liveTag = partialRendered ? " | live" : "";
-        const eventTxt = nftProgressMode ? "" : stageEventTextFromPartial(partial, stageLabel);
-        statusSink(`${sLabel}${elapsedTxt} | ${uiProgress}%${nftTail}${metrics}${liveTag}${eventTxt}${statusTail}`, false);
+        const sLabel = backendLbl || statusFallbackLabel(stageLabel, st, partialRendered);
+        statusSink(sLabel, false);
         await new Promise((resolve) => setTimeout(resolve, 1200));
       }
     }
@@ -16652,8 +16630,7 @@ def _render_positions_page() -> str:
         const n = (data.pool_positions || []).length;
         setHeavyStatus(`Done. Rows: ${n}${errCount ? ` | warnings: ${errCount}` : ""}`, false);
       } catch (e) {
-        saveActiveHeavyPosJob("");
-        setHeavyStatus("v4 / Infinity scan: " + (e?.message || "error"), true);
+        handleActivePosJobError(e, "heavy", false);
       } finally {
         if (!handoffToBackground) setHeavyBusy(false);
       }
@@ -16681,8 +16658,7 @@ def _render_positions_page() -> str:
         const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
         setHeavyStatus(`Done. Rows: ${(data.pool_positions || []).length}${errCount ? ` | warnings: ${errCount}` : ""}`, false);
       } catch (e) {
-        saveActiveHeavyPosJob("");
-        setHeavyStatus("Background v4 / Infinity scan: " + (e?.message || "error"), true);
+        handleActivePosJobError(e, "heavy", true);
       } finally {
         setHeavyBusy(false);
       }
@@ -16724,7 +16700,7 @@ def _render_positions_page() -> str:
         const data = await pollPosJob(jobId, true, "v3");
         if (data && data.__partial) {
           handoffToBackground = true;
-          setPosStatus("Base results loaded (scan). Hard-like enrich continues in background...", false);
+          setPosStatus("Table updated from server. Background enrich and finalize still running…", false);
           setTimeout(() => { resumePosJobIfAny(); }, 300);
           return;
         }
@@ -16751,8 +16727,7 @@ def _render_positions_page() -> str:
           false
         );
       } catch (e) {
-        saveActivePosJob("");
-        setPosStatus("Scan failed: " + (e?.message || "unknown"), true);
+        handleActivePosJobError(e, "v3", false);
       } finally {
         if (!handoffToBackground) {
           setPosBusy(false);
@@ -16786,8 +16761,7 @@ def _render_positions_page() -> str:
           false
         );
       } catch (e) {
-        saveActivePosJob("");
-        setPosStatus("Background scan failed: " + (e?.message || "unknown"), true);
+        handleActivePosJobError(e, "v3", true);
       } finally {
         setPosBusy(false);
       }
@@ -16831,7 +16805,7 @@ def _render_positions_page() -> str:
     """
     return _render_placeholder_page(
         "DeFi Positions",
-        "EVM: Uniswap/Pancake v3 и отдельно Uniswap v4 / Pancake Infinity.",
+        "EVM: Uniswap / Pancake v3 (NPM) and separately Uniswap v4 / Pancake Infinity.",
         "/positions",
         extra_css=extra_css,
         extra_html=extra_html,
@@ -16865,7 +16839,7 @@ def _render_stables_page() -> str:
     .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
     .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; }
     .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
-    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:13px; font-weight:700; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
+    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:17px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
     .section-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; min-width:0; flex:1 1 auto; }
@@ -16896,7 +16870,7 @@ def _render_stables_page() -> str:
       .positions-form, .result-card { padding: 12px; }
       .section-head { flex-wrap: wrap; align-items: center; }
       .section-head h3 { font-size: 16px; }
-      .search-link-btn { font-size: 12px; }
+      .search-link-btn { font-size: 15px; }
     }
     @media (max-width: 720px) {
       .positions-grid { gap: 10px; }
@@ -18896,17 +18870,7 @@ def _build_positions_info_notes(
     if solana_addresses or tron_addresses:
         info_notes.append("Solana/TRON in the request were ignored — only EVM is supported on this page.")
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
-        info_notes.append(
-            "Explorer NFT catalog: tokennfttx only; "
-            f"parallel chains only (cap={POSITIONS_NFT_PARALLEL_WORKERS} ThreadPool workers), "
-            f"wallets per chain sequential + serial tokennfttx pages; "
-            f"tokennfttx_http_concurrency={POSITIONS_EXPLORER_NFTTX_GLOBAL_CONCURRENCY} (global), "
-            f"page_workers={POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS}, "
-            f"parallel_template_page1={int(bool(POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1))}, "
-            f"scan_budget={POSITIONS_SCAN_MAX_SECONDS}s, http_timeout={POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC}s, "
-            f"tokennfttx_page_retries={POSITIONS_EXPLORER_NFTTX_FETCH_RETRIES}; "
-            "non-Uniswap/Pancake NFTs are listed as unsupported only."
-        )
+        info_notes.append("NFT positions use the block explorer index (token transfers) where enabled.")
     if POSITIONS_CONTRACT_ONLY_ENABLED:
         info_notes.append("Contract-only mode: Pair/Fee/In position/Unclaimed are from on-chain contract calls only.")
     return info_notes
@@ -18940,14 +18904,15 @@ def _build_positions_scan_response(
     else:
         summary_limit = 20
         pool_scan_limit = 0
-    debug_payload = {
+    debug_payload: dict[str, Any] = {
         "pool_scan": pool_debug_rows[:pool_scan_limit],
         "summary": debug_summary_rows[:summary_limit],
         "timings": debug_timings if isinstance(debug_timings, dict) else {},
+        "positions_ui_compact_debug": bool(include_debug_details),
     }
     evm_dbg = debug_timings.get("evm") if isinstance(debug_timings, dict) else None
     pool_t = evm_dbg.get("pool") if isinstance(evm_dbg, dict) else None
-    if isinstance(pool_t, dict) and str(pool_t.get("mode") or "") == "explorer_nft_catalog":
+    if include_debug_details and isinstance(pool_t, dict) and str(pool_t.get("mode") or "") == "explorer_nft_catalog":
         debug_payload["nft_scan"] = {
             "tokennfttx_rows_scanned": int(pool_t.get("nft_tokennfttx_rows_scanned") or 0),
             "owned_nft_positions": int(pool_t.get("nft_owned_positions_total") or 0),
@@ -18976,11 +18941,10 @@ def _build_positions_scan_response(
                     "skipped_time": int(sum_b.get("skipped_time") or 0),
                 },
             }
-            if include_debug_details:
-                debug_payload["nft_scan"]["balance_vs_explorer"]["note"] = str(bal_raw.get("note") or "")
-                samp = bal_raw.get("samples")
-                if isinstance(samp, list):
-                    debug_payload["nft_scan"]["balance_vs_explorer"]["samples"] = samp[:40]
+            debug_payload["nft_scan"]["balance_vs_explorer"]["note"] = str(bal_raw.get("note") or "")
+            samp = bal_raw.get("samples")
+            if isinstance(samp, list):
+                debug_payload["nft_scan"]["balance_vs_explorer"]["samples"] = samp[:40]
     return {
         "pool_positions": pool_rows,
         "lending_positions": lending_rows,
@@ -19053,7 +19017,7 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
         job_id,
         result=result,
         stage="enrich_anomalies",
-        stage_label="Background: enriching symbol anomalies (UNK)",
+        stage_label="Refining token symbols",
         progress=74,
     ) is None:
         return
@@ -19115,14 +19079,14 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
     _enrich_rows_liquidity_usd(pool_rows, max_seconds=4)
     infos = result.get("infos") if isinstance(result.get("infos"), list) else []
     infos = list(infos)
-    infos.append(f"Background anomaly enrich: checked={checked}, updated={updated}.")
+    if hard_scan and (checked or updated):
+        infos.append("Background pass (debug): refreshed some token labels from chain.")
     result["infos"] = infos[:20]
-    rows_count = int(len(pool_rows))
     if _update_pos_job(
         job_id,
         result=result,
         stage="finalize",
-        stage_label=f"Finalizing after anomaly enrich ({rows_count} rows)",
+        stage_label="Almost done",
         progress=92,
     ) is None:
         return
@@ -19153,6 +19117,17 @@ def _scan_positions_core(
     debug_timings["prepare_request_sec"] = round(max(0.0, time.monotonic() - t_prepare), 3)
     debug_timings["pool_scan_profile"] = pool_prof
     scan_pools_effective = bool(scan_pools and evm_addresses)
+    if pos_job_id and scan_pools_effective and evm_addresses:
+        _update_pos_job(
+            str(pos_job_id),
+            stage="scan",
+            stage_label=(
+                "Preparing scan"
+                if POSITIONS_EXPLORER_NFT_CATALOG_SCAN
+                else "Loading indexed positions"
+            ),
+            progress=17.0,
+        )
     pool_debug_rows: list[dict[str, Any]] = []
     evm_timings: dict[str, Any] = {}
     if evm_addresses:
@@ -19213,16 +19188,17 @@ def _scan_positions_core(
             debug_timings["nft_catalog_heavy_parallel_ok"] = int(ne_heavy.get("heavy_ok") or 0)
             debug_timings["nft_catalog_heavy_parallel_fail"] = int(ne_heavy.get("heavy_fail") or 0)
             debug_timings["nft_catalog_heavy_pipeline"] = bool(ne_heavy.get("heavy_pipeline"))
-        if ne_ok or ne_fail:
+        if hard_scan_enabled and (ne_ok or ne_fail):
             info_notes.append(
-                f"NFT catalog on-chain enrich: ok={int(ne_ok)}, fail={int(ne_fail)} "
-                f"(pair/fee/in-position for open positions only; see tab «Closed» for zero on-chain liquidity)."
+                f"On-chain enrich (debug): ok={int(ne_ok)}, fail={int(ne_fail)}. "
+                "Closed-tab rows have zero open liquidity on the position manager."
             )
-        if isinstance(ne_heavy, dict) and int(ne_heavy.get("heavy_ok") or 0) + int(ne_heavy.get("heavy_fail") or 0) > 0:
-            info_notes.append(
-                f"Heavy protocol parallel pipeline (v4 / Infinity): ok={int(ne_heavy.get('heavy_ok') or 0)}, "
-                f"fail={int(ne_heavy.get('heavy_fail') or 0)} — debug rows in SQLite table heavy_protocol_enrich_debug."
-            )
+        if hard_scan_enabled and isinstance(ne_heavy, dict):
+            if int(ne_heavy.get("heavy_ok") or 0) + int(ne_heavy.get("heavy_fail") or 0) > 0:
+                info_notes.append(
+                    f"Heavy PM pipeline (debug): ok={int(ne_heavy.get('heavy_ok') or 0)}, "
+                    f"fail={int(ne_heavy.get('heavy_fail') or 0)}."
+                )
         t_usd = time.monotonic()
         _enrich_rows_liquidity_usd(pool_rows, max_seconds=6)
         debug_timings["nft_catalog_liquidity_usd_sec"] = round(max(0.0, time.monotonic() - t_usd), 3)
@@ -19232,25 +19208,8 @@ def _scan_positions_core(
         debug_timings["nft_catalog_phishing_sync_sec"] = round(max(0.0, time.monotonic() - t_phish), 3)
         spam_n = _apply_nft_catalog_spam_heuristics(pool_rows)
         debug_timings["nft_catalog_spam_flagged"] = int(spam_n)
-        if spam_n > 0:
-            info_notes.append(
-                f"NFT catalog spam filter: flagged {int(spam_n)} row(s) "
-                f"(neither-major+low-TVL rule, symbol heuristics; "
-                f"POSITIONS_NFT_CATALOG_SPAM_FILTER=0 / NEITHER_MAJOR=0 / raise NEITHER_MAJOR_MAX_USD)."
-            )
-        info_notes.append(
-            "NFT scan pipeline: (1) Explorer tokennfttx per chain×wallet; "
-            "(2) Protocol gate + on-chain open/closed liquidity when assembling rows (tabs: Protocol filter, Closed); "
-            "(3) PM snapshot: parallel heavy queue first (v4 / Infinity), then light (v3 positions()); "
-            "(4) Liquidity USD; "
-            "(5) Phishing metadata — sync from explorer name/symbol (Web UI: tab «Other issues»), before spam; "
-            "(6) Spam heuristics — real PM positions with suspicious pair/TVL only (tab: Spam); "
-            "(7) Optional: POSITIONS_NFT_HEAVY_PIPELINE=0 to disable parallel heavy enrich."
-        )
-        info_notes.append(
-            "Heavy enrich debug: SQLite table heavy_protocol_enrich_debug (analytics DB). "
-            "Optional API: GET /api/debug/heavy-protocol-enrich?limit=50 when POSITIONS_HEAVY_ENRICH_DEBUG_HTTP=1."
-        )
+        if hard_scan_enabled and spam_n > 0:
+            info_notes.append(f"Spam heuristics (debug): flagged {int(spam_n)} row(s).")
         debug_timings["nft_catalog_deferred_owner_reconciliation"] = "heavy_parallel_v4_infinity"
     if pool_rows and not POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         t_phish = time.monotonic()
@@ -19281,9 +19240,9 @@ def _scan_positions_core(
             rpc_logs_first_fail += int(inf_dbg.get("rpc_getlogs_first_try_fail") or 0)
             rpc_logs_retry_ok += int(inf_dbg.get("rpc_getlogs_retry_success") or 0)
             rpc_logs_ms += int(inf_dbg.get("rpc_getlogs_ms") or 0)
-    if rpc_logs_req > 0:
+    if hard_scan_enabled and rpc_logs_req > 0:
         info_notes.append(
-            "RPC getLogs debug: "
+            "RPC getLogs (debug): "
             f"requests={rpc_logs_req}, attempts={rpc_logs_attempts}, "
             f"first_try_fail={rpc_logs_first_fail}, retry_success={rpc_logs_retry_ok}, total_ms={rpc_logs_ms}."
         )
@@ -19328,10 +19287,10 @@ def _scan_positions_core(
 def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: str) -> None:
     hard_scan_enabled = False
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
-        start_label = "Scanning NFT collections — starting…"
+        start_label = "Scanning NFT collections"
         start_progress = 12.0
     else:
-        start_label = "Scanning positions"
+        start_label = "Loading indexed positions"
         start_progress = 15.0
     if _update_pos_job(
         job_id,
@@ -19353,7 +19312,7 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
             job_id,
             result=result,
             stage="enrich_dates",
-            stage_label="Fast mode: finalizing",
+            stage_label="Finalizing results",
             progress=65,
         ) is None:
             return
@@ -19362,7 +19321,7 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
             job_id,
             status="done",
             stage="done",
-            stage_label="Completed",
+            stage_label="Done",
             progress=100,
             finished_at=time.time(),
             result=result,
@@ -19372,7 +19331,7 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
             job_id,
             status="failed",
             stage="failed",
-            stage_label="Failed",
+            stage_label="Scan failed",
             progress=100,
             finished_at=time.time(),
             error=str(e)[:400],
@@ -20343,8 +20302,9 @@ HTML_PAGE = """
       border: none;
       background: transparent;
       color: #1d4ed8;
-      font-size: 13px;
-      font-weight: 700;
+      font-size: 17px;
+      font-weight: 800;
+      line-height: 1.25;
       cursor: pointer;
       padding: 0;
       text-decoration: underline;
@@ -20626,6 +20586,7 @@ HTML_PAGE = """
       .inline-grid { grid-template-columns: 1fr 1fr; }
       .summary-strip { gap: 6px; }
       .summary-box { min-width: 150px; }
+      .search-link-btn { font-size: 15px; }
     }
     .app-footer {
       margin-top: 20px;

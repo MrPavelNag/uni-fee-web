@@ -727,7 +727,7 @@
     "pool_id": "0x2f5e87c9312fa29aed5c179e456625d79015299c",
     "fee_pct": 0.05,
     "pair": "WBTC/WETH",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x149e36e72726e0bcea5c59d40df2c43f60f5a22d": {
@@ -1458,7 +1458,7 @@
     "pool_id": "0x149e36e72726e0bcea5c59d40df2c43f60f5a22d",
     "fee_pct": 0.3,
     "pair": "WBTC/WETH",
-    "chain": "arbitrum-one",
+    "chain": "arbitrum",
     "version": "v3"
   },
   "0x3fb2623567e21f8c50f0ae86f54ef4849b4eb47b": {
