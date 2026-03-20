@@ -408,10 +408,6 @@ POSITIONS_STRICT_ZERO_BALANCE_FILTER = os.environ.get("POSITIONS_STRICT_ZERO_BAL
 POSITIONS_LIGHT_GRAPH_QUERIES = os.environ.get("POSITIONS_LIGHT_GRAPH_QUERIES", "1").strip().lower() in ("1", "true", "yes", "on")
 POSITIONS_CREATION_DATE_WORKERS = max(1, min(16, int(os.environ.get("POSITIONS_CREATION_DATE_WORKERS", "6"))))
 POSITIONS_CREATION_DATE_MAX_SECONDS = max(1, int(os.environ.get("POSITIONS_CREATION_DATE_MAX_SECONDS", "20")))
-# Если в кеше нет даты минта: сколько строк за один скан могут дернуть eth_getLogs (0 = только peek, как раньше).
-POSITIONS_CREATION_DATE_ONMISS_MAX = max(
-    0, min(1200, int(os.environ.get("POSITIONS_CREATION_DATE_ONMISS_MAX", "360")))
-)
 POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK = os.environ.get("POSITIONS_DISABLE_V3_ONCHAIN_FALLBACK", "0").strip().lower() in (
     "1",
     "true",
@@ -2425,115 +2421,6 @@ def _quote_v3_collect_fees_amounts(
     return None, None
 
 
-def _fetch_uniswap_v4_position_contract_snapshot(
-    chain_id: int,
-    token_id: int,
-    owner_hint: str,
-    pm_contract: str,
-    *,
-    include_quotes: bool = True,
-) -> dict[str, Any] | None:
-    """
-    V4 PositionManager: не V3 positions(uint256). Снимок через getPoolAndPositionInfo + getPositionLiquidity
-    (иначе enrich для UNI-V4 даёт None → «In position» / Liquidity остаются «-»).
-    """
-    cid = int(chain_id)
-    tid = int(token_id)
-    owner_addr = str(owner_hint or "").strip().lower()
-    pm = str(pm_contract or "").strip().lower()
-    if tid <= 0 or not _is_eth_address(pm) or not _is_eth_address(owner_addr):
-        return None
-    try:
-        owner_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(tid)))
-        owner_words = _hex_words(owner_hex)
-        if not owner_words:
-            return None
-        owner_word = _encode_address_word(owner_addr)[-40:]
-        if owner_words[0][-40:].lower() != owner_word:
-            return None
-    except Exception:
-        return None
-    sel_pool_and_info = "0x7ba03aad"
-    sel_liq = "0x1efeed33"
-    try:
-        batch = _eth_call_hex_batch(
-            cid,
-            [
-                {"to": pm, "data": sel_pool_and_info + _encode_uint_word(int(tid))},
-                {"to": pm, "data": sel_liq + _encode_uint_word(int(tid))},
-            ],
-        )
-        info_hex = str(batch[0] or "").strip().lower() if isinstance(batch, list) and len(batch) > 0 else ""
-        liq_hex = str(batch[1] or "").strip().lower() if isinstance(batch, list) and len(batch) > 1 else ""
-        if not info_hex.startswith("0x") or len(info_hex) <= 2:
-            try:
-                info_hex = _eth_call_hex(cid, pm, sel_pool_and_info + _encode_uint_word(int(tid)))
-            except Exception:
-                info_hex = ""
-        if not liq_hex.startswith("0x") or len(liq_hex) <= 2:
-            try:
-                liq_hex = _eth_call_hex(cid, pm, sel_liq + _encode_uint_word(int(tid)))
-            except Exception:
-                liq_hex = "0x0"
-        p_words = _hex_words(info_hex or "")
-        if len(p_words) < 6:
-            return None
-        liq = max(0, int(_decode_uint_eth_call(liq_hex or "0x0")))
-        raw0 = _decode_address_from_word(p_words[0])
-        raw1 = _decode_address_from_word(p_words[1])
-        fee = _decode_uint_from_word(p_words[2])
-        info_val = int(p_words[5], 16)
-        tick_upper = _decode_signed_int24_from_packed_word(info_val, 32)
-        tick_lower = _decode_signed_int24_from_packed_word(info_val, 8)
-        token0, sym0, dec0 = _normalize_infinity_currency(cid, raw0)
-        token1, sym1, dec1 = _normalize_infinity_currency(cid, raw1)
-        token0 = str(token0 or "").strip().lower()
-        token1 = str(token1 or "").strip().lower()
-        sym0 = _normalize_display_symbol(str(sym0 or ""))
-        sym1 = _normalize_display_symbol(str(sym1 or ""))
-        if not sym0:
-            sym0 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token0) or "")
-        if not sym1:
-            sym1 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token1) or "")
-        q_amount0: float | None = None
-        q_amount1: float | None = None
-        q_fee0: float | None = None
-        q_fee1: float | None = None
-        proto = "uniswap_v4"
-        if bool(include_quotes) and liq > 0:
-            q_amount0, q_amount1 = _quote_v3_decrease_liquidity_amounts(
-                cid, proto, tid, liq, owner_addr, dec0, dec1
-            )
-            q_fee0, q_fee1 = _quote_v3_collect_fees_amounts(cid, proto, tid, owner_addr, dec0, dec1)
-        return {
-            "chain_id": cid,
-            "protocol": proto,
-            "position_manager": pm,
-            "token_id": tid,
-            "owner_hint": owner_addr,
-            "nonce": 0,
-            "operator": "",
-            "token0": token0,
-            "token1": token1,
-            "fee": int(fee),
-            "tick_lower": int(tick_lower),
-            "tick_upper": int(tick_upper),
-            "liquidity": int(liq),
-            "tokens_owed0_raw": 0,
-            "tokens_owed1_raw": 0,
-            "token0_decimals": int(dec0),
-            "token1_decimals": int(dec1),
-            "token0_symbol": str(sym0 or ""),
-            "token1_symbol": str(sym1 or ""),
-            "quote_amount0": q_amount0,
-            "quote_amount1": q_amount1,
-            "quote_fee0": q_fee0,
-            "quote_fee1": q_fee1,
-        }
-    except Exception:
-        return None
-
-
 def _fetch_v3_position_contract_snapshot(
     chain_id: int,
     protocol: str,
@@ -2558,15 +2445,6 @@ def _fetch_v3_position_contract_snapshot(
             return dict(payload or {})
     pm = _position_manager_for_protocol(cid, proto)
     if not _is_eth_address(pm):
-        return None
-    if proto == "uniswap_v4":
-        snap = _fetch_uniswap_v4_position_contract_snapshot(
-            cid, tid, owner_addr, pm, include_quotes=bool(include_quotes)
-        )
-        if isinstance(snap, dict):
-            with POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK:
-                POSITION_CONTRACT_SNAPSHOT_CACHE[cache_key] = (now, snap)
-            return snap
         return None
     try:
         pos_data = "0x99fbab88" + _encode_uint_word(int(tid))
@@ -10809,38 +10687,9 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
     return list(uniq.values())
 
 
-def _protocol_key_for_position_creation_date(row: dict[str, Any], chain_id: int) -> str:
-    """Ключ для PM / кеша даты минта: колонка protocol может быть укороченной для UI."""
-    p = str(row.get("protocol") or "").strip().lower()
-    cid = int(chain_id)
-    if p in (
-        "uniswap_v3",
-        "uniswap_v4",
-        "pancake_v3",
-        "pancake_v3_staked",
-        "pancake_infinity_cl",
-        "pancake_infinity_bin",
-    ):
-        return p
-    if p == "uniswap":
-        return str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(cid, "uniswap_v3") or "uniswap_v3").strip().lower()
-    pool = str(row.get("pool_id") or "").strip().lower()
-    if cid > 0 and _is_eth_address(pool):
-        pmk = _explorer_nft_contract_pm_kind(cid, pool)
-        if pmk == "v4pm":
-            return "uniswap_v4"
-        if pmk == "v3npm":
-            return str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(cid, "uniswap_v3") or "uniswap_v3").strip().lower()
-        if pmk == "pancake_v3npm":
-            return "pancake_v3"
-    return p
-
-
 def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_dates: bool) -> None:
     if not include_creation_dates or not rows:
         return
-    onmiss_max = int(POSITIONS_CREATION_DATE_ONMISS_MAX)
-    fetched = 0
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -10848,18 +10697,12 @@ def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_
             cid = int(r.get("chain_id") or 0)
         except Exception:
             cid = 0
-        proto_raw = str(r.get("protocol") or "").strip().lower()
+        proto = str(r.get("protocol") or "").strip().lower()
         pid = str(r.get("position_id") or "").strip()
-        if cid <= 0 or not proto_raw or not pid:
+        if cid <= 0 or not proto or not pid:
             r["position_created_date"] = str(r.get("position_created_date") or "-")
             continue
-        proto_key = _protocol_key_for_position_creation_date(r, cid)
-        d = _position_creation_date_peek(cid, proto_key, pid)
-        if not d and onmiss_max > 0 and fetched < onmiss_max:
-            ex = str(r.get("position_created_date") or "").strip()
-            if ex in {"", "-"}:
-                d = _position_creation_date_ymd(cid, proto_key, pid)
-                fetched += 1
+        d = _position_creation_date_peek(cid, proto, pid)
         r["position_created_date"] = d if d else "-"
 
 
