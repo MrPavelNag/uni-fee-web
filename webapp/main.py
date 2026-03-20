@@ -10867,22 +10867,8 @@ def _scan_pool_positions_chain(
             if fees1_val is None:
                 fees1_val = None
 
-        def _fmt_amt(v: float | None, *, zero_if_missing: bool = False) -> str:
-            if v is None:
-                return "0" if zero_if_missing else "-"
-            av = abs(float(v))
-            if av >= 1000:
-                s = f"{float(v):,.1f}"
-            elif av >= 1:
-                s = f"{float(v):,.2f}"
-            elif av >= 0.01:
-                s = f"{float(v):,.3f}"
-            else:
-                s = f"{float(v):,.4f}"
-            return s.rstrip("0").rstrip(".")
-
-        position_amounts_display = f"{_fmt_amt(amount0_val)} / {_fmt_amt(amount1_val)}"
-        fees_owed_display = f"{_fmt_amt(fees0_val, zero_if_missing=True)} / {_fmt_amt(fees1_val, zero_if_missing=True)}"
+        position_amounts_display = f"{_format_position_token_amount_display(amount0_val)} / {_format_position_token_amount_display(amount1_val)}"
+        fees_owed_display = f"{_format_position_token_amount_display(fees0_val, zero_if_missing=True)} / {_format_position_token_amount_display(fees1_val, zero_if_missing=True)}"
         a0_now = max(0.0, float(amount0_val or 0.0))
         a1_now = max(0.0, float(amount1_val or 0.0))
         # Zero-liquidity / 0-0 position rows are auto-hidden and skipped from future scans.
@@ -11255,20 +11241,6 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
         except Exception:
             return None
 
-    def _fmt_amt(v: float | None, *, zero_if_missing: bool = False) -> str:
-        if v is None:
-            return "0" if zero_if_missing else "-"
-        av = abs(float(v))
-        if av >= 1000:
-            s = f"{float(v):,.1f}"
-        elif av >= 1:
-            s = f"{float(v):,.2f}"
-        elif av >= 0.01:
-            s = f"{float(v):,.3f}"
-        else:
-            s = f"{float(v):,.4f}"
-        return s.rstrip("0").rstrip(".")
-
     uniq: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
         key = (str(row.get("address")), str(row.get("protocol")), str(row.get("pool_id")))
@@ -11319,12 +11291,12 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
             else:
                 acc[fld] = float((av or 0.0) + (bv or 0.0))
         acc["position_amounts_display"] = (
-            f"{_fmt_amt(_opt_float(acc.get('position_amount0')))} / "
-            f"{_fmt_amt(_opt_float(acc.get('position_amount1')))}"
+            f"{_format_position_token_amount_display(_opt_float(acc.get('position_amount0')))} / "
+            f"{_format_position_token_amount_display(_opt_float(acc.get('position_amount1')))}"
         )
         acc["fees_owed_display"] = (
-            f"{_fmt_amt(_opt_float(acc.get('fees_owed0')), zero_if_missing=True)} / "
-            f"{_fmt_amt(_opt_float(acc.get('fees_owed1')), zero_if_missing=True)}"
+            f"{_format_position_token_amount_display(_opt_float(acc.get('fees_owed0')), zero_if_missing=True)} / "
+            f"{_format_position_token_amount_display(_opt_float(acc.get('fees_owed1')), zero_if_missing=True)}"
         )
         a0 = max(0.0, float(_opt_float(acc.get("position_amount0")) or 0.0))
         a1 = max(0.0, float(_opt_float(acc.get("position_amount1")) or 0.0))
@@ -15064,6 +15036,27 @@ class PositionPoolSeriesRequest(BaseModel):
     fee_usd_historical: bool = False
 
 
+def _normalize_positions_series_protocol(raw: str, *, for_fees: bool = False) -> str:
+    """
+    Map table/UI labels (e.g. UNI-V3, PanC-V3 from NFT catalog) to internal protocol keys
+    expected by pool-value-series / position-fee-series. Empty if unknown / unsupported.
+    """
+    p = str(raw or "").strip().lower().replace(" ", "_")
+    if not p:
+        return ""
+    if p in ("uniswap_v3", "uniswap_v4", "pancake_v3"):
+        return p
+    if for_fees and p == "pancake_v3_staked":
+        return "pancake_v3_staked"
+    if p in ("uni-v3", "univ3", "uni_v3"):
+        return "uniswap_v3"
+    if p in ("uni-v4", "univ4", "uni_v4"):
+        return "uniswap_v4"
+    if p in ("panc-v3", "panc_v3", "pancake-v3"):
+        return "pancake_v3"
+    return ""
+
+
 class PositionsRowEnrichRequest(BaseModel):
     row: dict[str, Any] = Field(default_factory=dict)
 
@@ -15080,6 +15073,36 @@ def _format_position_liquidity_scalar_compact(liq_raw: int) -> str:
     if x < 1_000_000_000:
         return f"{x / 1_000_000.0:.1f}M".rstrip("0").rstrip(".")
     return f"{x / 1_000_000_000.0:.1f}B".rstrip("0").rstrip(".")
+
+
+def _format_position_token_amount_display(v: float | None, *, zero_if_missing: bool = False) -> str:
+    """Rounded display for In position / Unclaimed fees (comma thousands; fewer trailing digits)."""
+    if v is None:
+        return "0" if zero_if_missing else "-"
+    try:
+        x = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return "0" if zero_if_missing else "-"
+    if x != x or abs(x) == float("inf"):
+        return "0" if zero_if_missing else "-"
+    av = abs(x)
+    if av >= 1000:
+        xr = round(x, 1)
+        s = f"{xr:,.1f}"
+    elif av >= 1:
+        xr = round(x, 2)
+        s = f"{xr:,.2f}"
+    elif av >= 0.01:
+        xr = round(x, 2)
+        s = f"{xr:,.2f}"
+    elif av >= 0.0001:
+        xr = round(x, 4)
+        s = f"{xr:,.4f}"
+    else:
+        xr = round(x, 6)
+        s = f"{xr:.6f}"
+    out = s.rstrip("0").rstrip(".")
+    return out if out else "0"
 
 
 def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], chain_id: int) -> dict[str, Any]:
@@ -15100,20 +15123,6 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
             fee1 = float(Decimal(int(snap.get("tokens_owed1_raw") or 0)) / (Decimal(10) ** dec1))
     except Exception:
         pass
-
-    def _fmt_amt(v: float | None, *, zero_if_missing: bool = False) -> str:
-        if v is None:
-            return "0" if zero_if_missing else "-"
-        av = abs(float(v))
-        if av >= 1000:
-            s = f"{float(v):,.1f}"
-        elif av >= 1:
-            s = f"{float(v):,.2f}"
-        elif av >= 0.01:
-            s = f"{float(v):,.3f}"
-        else:
-            s = f"{float(v):,.4f}"
-        return s.rstrip("0").rstrip(".")
 
     liq_raw = max(0, int(snap.get("liquidity") or 0))
     proto_snap = str(snap.get("protocol") or "").strip().lower()
@@ -15159,8 +15168,8 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
         "fees_owed1": (float(fee1) if fee1 is not None else 0.0),
         "fee_tier_raw": fee_raw,
         "fee_tier": fee_disp,
-        "position_amounts_display": f"{_fmt_amt(amount0)} / {_fmt_amt(amount1)}",
-        "fees_owed_display": f"{_fmt_amt(fee0, zero_if_missing=True)} / {_fmt_amt(fee1, zero_if_missing=True)}",
+        "position_amounts_display": f"{_format_position_token_amount_display(amount0)} / {_format_position_token_amount_display(amount1)}",
+        "fees_owed_display": f"{_format_position_token_amount_display(fee0, zero_if_missing=True)} / {_format_position_token_amount_display(fee1, zero_if_missing=True)}",
         "position_status": status,
         "liquidity": str(liq_raw),
         "liquidity_display": liq_disp,
@@ -15979,17 +15988,17 @@ def _render_positions_page() -> str:
       </section>
       <section class="result-card">
         <div class="section-head">
-          <h3>Расчет комиссий</h3>
+          <h3>Fee calculation</h3>
           <div class="section-actions">
-            <span class="pos-status" id="posFeeStatus">Отметьте History и нажмите Scan</span>
-            <label class="pos-fee-hist-label" title="Для ряда по логам Collect: USD на момент каждого события (CoinGecko). Субграф без изменений.">
+            <span class="pos-status" id="posFeeStatus">Select History checkboxes, then click Scan</span>
+            <label class="pos-fee-hist-label" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
               <input type="checkbox" id="posFeeHistoricalUsd" />
-              <span>Исторические USD</span>
+              <span>Historical USD</span>
             </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Scan</button>
           </div>
         </div>
-        <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Те же строки и чекбоксы History, что и для графика TVL; период — дней из блока «Show history». Если в субграфе комиссии пустые/нулевые, для Uniswap/Pancake v3 подставляются события Collect с NPM по RPC. Чекбокс «Исторические USD» задаёт оценку по CoinGecko на дату каждого Collect (иначе — по текущим ценам). Для данных с субграфа переключатель не меняет расчёт.</p>
+        <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
         <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
       </section>
     </div>
@@ -16707,13 +16716,13 @@ def _render_positions_page() -> str:
       if (!chartEl) return;
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
-        setPosFeeStatus("Отметьте хотя бы один чекбокс History в таблице v3 или v4 / Pancake V3 Farming / Infinity.", true);
+        setPosFeeStatus("Tick at least one History checkbox in the V3 or v4 / Pancake V3 Farming / Infinity table (same as for TVL).", true);
         return;
       }
       try {
-        setPosFeeStatus("Загрузка комиссий...", false);
+        setPosFeeStatus("Loading fees…", false);
         const ok = await ensurePlotly();
-        if (!ok) throw new Error("Не удалось загрузить библиотеку графиков");
+        if (!ok) throw new Error("Failed to load chart library");
         const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
@@ -16745,7 +16754,11 @@ def _render_positions_page() -> str:
             body: JSON.stringify(payload),
           });
           const data = await res.json().catch(() => ({}));
-          if (!res.ok) continue;
+          if (!res.ok) {
+            const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
+            console.warn("position-fee-series failed", row.pair || row.pool_id, det);
+            continue;
+          }
           const items = Array.isArray(data.items) ? data.items : [];
           if (!items.length) continue;
           const fp = String(data.fee_pricing || "").trim();
@@ -16755,18 +16768,18 @@ def _render_positions_page() -> str:
             y: items.map((x) => Number(x.fees_usd || 0)),
             mode: "lines",
             line: {color: palette[i % palette.length], width: 2},
-            name: String(row.pair || row.pool_id || `Позиция ${i + 1}`),
+            name: String(row.pair || row.pool_id || `Position ${i + 1}`),
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
         }
         if (!traces.length) {
-          chartEl.innerHTML = "<div class='hint'>Нет данных по комиссиям для выбранных строк (субграф или протокол).</div>";
-          setPosFeeStatus("Нет данных по комиссиям", false);
+          chartEl.innerHTML = "<div class='hint'>No fee data for the selected rows (subgraph empty, protocol unsupported, or NPM Collect fallback needs token0/token1 after on-chain enrich — run Scan on the table first).</div>";
+          setPosFeeStatus("No fee data", false);
           return;
         }
-        const titleSuffix = histUsd ? " — истор. USD (CoinGecko по Collect)" : " — текущие USD";
+        const titleSuffix = histUsd ? " — historical USD (CoinGecko at each Collect)" : " — spot USD";
         Plotly.newPlot("posFeeChart", traces, {
-          title: "Накопленные полученные комиссии (USD)" + titleSuffix,
+          title: "Cumulative collected fees (USD)" + titleSuffix,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
@@ -16776,10 +16789,10 @@ def _render_positions_page() -> str:
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
         const pr = lastFeePricing ? ` · ${lastFeePricing}` : "";
-        setPosFeeStatus(`Готово: ${traces.length} поз.${pr}`, false);
+        setPosFeeStatus(`Done: ${traces.length} position(s)${pr}`, false);
       } catch (e) {
-        chartEl.innerHTML = `<div class='hint'>Ошибка: ${esc(e?.message || "unknown")}</div>`;
-        setPosFeeStatus("Не удалось построить график", true);
+        chartEl.innerHTML = `<div class='hint'>Error: ${esc(e?.message || "unknown")}</div>`;
+        setPosFeeStatus("Failed to build chart", true);
       }
     }
     function normPosSym(v) {
@@ -16858,7 +16871,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const totalCols = 13;
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       const listAll = rows || [];
       const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
       const hasExplorerNftCatalog = listAll.some((x) => {
@@ -16961,7 +16974,7 @@ def _render_positions_page() -> str:
           : `<tr><td colspan='${totalCols}'>No pool positions found.</td></tr>`;
       }
       const otCols = 15;
-      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       for (let oi = 0; oi < otherRows.length; oi++) {
         const r = otherRows[oi];
         const issue = String(r._other_issue_label || "Other");
@@ -17069,7 +17082,7 @@ def _render_positions_page() -> str:
       if (!spamRows.length) {
         spamHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No spam heuristics: TVL/symbol rules did not flag supported rows (phase 6). Trust a row via Hide to re-run enrich.</td></tr>`;
       }
-      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       for (let hi = 0; hi < hiddenRows.length; hi++) {
         const r = hiddenRows[hi];
         const mismatch = hasPairMismatch(r);
@@ -17293,7 +17306,7 @@ def _render_positions_page() -> str:
         const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
         return Boolean(r && (r.suspected_spam || r.spam_skipped || ph));
       }
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       if (!listAll.length) {
         html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.</td></tr>`;
         table.innerHTML = html;
@@ -17542,12 +17555,12 @@ def _render_positions_page() -> str:
       updatePosSearchButton();
       setPosStatus(`Restored cached results. Pools: ${saved.pool_positions.length}`, false);
       setPosHistoryStatus("Cached results restored.", false);
-      setPosFeeStatus("Кэш восстановлен — можно нажать Scan для комиссий.", false);
+      setPosFeeStatus("Cache restored — you can click Scan under Fee calculation.", false);
     } else {
       updatePosSearchButton();
       setPosStatus("Ready", false);
       setPosHistoryStatus("Select pools and click Search", false);
-      setPosFeeStatus("Отметьте History и нажмите Scan", false);
+      setPosFeeStatus("Select History checkboxes, then click Scan", false);
     }
     resumePosJobIfAny();
     const savedHeavy = loadHeavyPosResults();
@@ -20228,12 +20241,15 @@ def debug_heavy_protocol_enrich(limit: int = 50) -> dict[str, Any]:
 @app.post("/api/positions/pool-value-series")
 def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
     chain_key = str(req.chain or "").strip().lower()
-    protocol = str(req.protocol or "").strip().lower()
+    protocol = _normalize_positions_series_protocol(str(req.protocol or ""), for_fees=False)
     pool_id = str(req.pool_id or "").strip().lower()
     if not chain_key or not pool_id:
         raise HTTPException(status_code=400, detail="chain and pool_id are required.")
     if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3"}:
-        raise HTTPException(status_code=400, detail="protocol must be uniswap_v3, uniswap_v4 or pancake_v3.")
+        raise HTTPException(
+            status_code=400,
+            detail="protocol must be uniswap_v3, uniswap_v4 or pancake_v3 (or a supported UI alias such as UNI-V3).",
+        )
     version = "v4" if protocol.endswith("_v4") else "v3"
     days = max(1, min(3650, int(req.days or 30)))
     now_ts = int(time.time())
@@ -20297,13 +20313,13 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
 def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
     """Cumulative fees: subgraph positionSnapshots when reliable; else NPM Collect logs (eth_getLogs)."""
     chain_key = str(req.chain or "").strip().lower()
-    protocol = str(req.protocol or "").strip().lower()
+    protocol = _normalize_positions_series_protocol(str(req.protocol or ""), for_fees=True)
     if not chain_key:
         raise HTTPException(status_code=400, detail="chain is required.")
     if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3", "pancake_v3_staked"}:
         raise HTTPException(
             status_code=400,
-            detail="protocol must be uniswap_v3, uniswap_v4, pancake_v3 or pancake_v3_staked.",
+            detail="protocol must be uniswap_v3, uniswap_v4, pancake_v3 or pancake_v3_staked (or UI labels like UNI-V3 / PanC-V3).",
         )
     version = "v4" if protocol.endswith("_v4") else "v3"
     days = max(1, min(3650, int(req.days or 30)))
@@ -20391,7 +20407,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     if exact_by_day and sub_max >= 1e-6 and not force_rpc:
         snap_note = "Subgraph positionSnapshots collectedFees, valued in USD."
         if want_hist_usd:
-            snap_note += " (Исторические USD — только для ряда по логам Collect; субграф как раньше.)"
+            snap_note += " (Historical USD applies only to the NPM Collect log series; subgraph series unchanged.)"
         return {
             "items": _pack_fee_items(exact_by_day),
             "count": len(exact_by_day),
@@ -20412,7 +20428,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     if exact_by_day:
         low_note = "Subgraph collectedFees (USD); may be incomplete where subgraph indexing is wrong."
         if want_hist_usd:
-            low_note += " (Исторические USD — только для ряда по логам Collect.)"
+            low_note += " (Historical USD applies only to the NPM Collect log series.)"
         return {
             "items": _pack_fee_items(exact_by_day),
             "count": len(exact_by_day),
