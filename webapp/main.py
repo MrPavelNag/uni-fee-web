@@ -411,6 +411,12 @@ POSITIONS_NFT_GAP_LOG_CHUNK_BLOCKS = max(
     min(2_000_000, int(os.environ.get("POSITIONS_NFT_GAP_LOG_CHUNK_BLOCKS", "200000"))),
 )
 POSITIONS_NFT_GAP_LOG_MAX_CHUNKS = max(1, min(120, int(os.environ.get("POSITIONS_NFT_GAP_LOG_MAX_CHUNKS", "40"))))
+# Меньшие окна getLogs для даты mint на L2 (Base/Arb…), где публичные RPC режут широкие чанки.
+POSITIONS_CREATION_DATE_LOG_STEP_L2 = max(
+    4000,
+    min(80_000, int(os.environ.get("POSITIONS_CREATION_DATE_LOG_STEP_L2", "12000"))),
+)
+_CREATION_DATE_L2_CHAIN_IDS: frozenset[int] = frozenset({8453, 42161, 10, 137, 324, 534352, 130})
 POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS = max(
     4,
     min(60, int(os.environ.get("POSITIONS_EXPLORER_DYNAMIC_FALLBACK_MAX_CONTRACTS", "18"))),
@@ -2661,10 +2667,13 @@ def _uniswap_v4_pm_snapshot_v3shaped(
     try:
         owner_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(tid)))
         owner_words = _hex_words(owner_hex)
-        if not owner_words:
-            return None
-        owner_match = bool(owner_word and owner_words[0][-40:].lower() == owner_word)
-        if not owner_match and not allow_owner_mismatch:
+        owner_match = False
+        if owner_words:
+            owner_match = bool(owner_word and owner_words[0][-40:].lower() == owner_word)
+            if not owner_match and not allow_owner_mismatch:
+                return None
+        elif not allow_owner_mismatch:
+            # Строгий режим: без ownerOf не продолжаем.
             return None
         batch = _eth_call_hex_batch(
             cid,
@@ -4419,6 +4428,8 @@ def _position_mint_block_erc721_transfer_on_pm(
         pass
 
     step = int(POSITIONS_ERC721_LOG_BLOCK_STEP)
+    if int(cid) in _CREATION_DATE_L2_CHAIN_IDS:
+        step = min(step, int(POSITIONS_CREATION_DATE_LOG_STEP_L2))
     start_b = 0
     while start_b <= int(latest):
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
@@ -4458,12 +4469,13 @@ def _position_creation_date_ymd(chain_id: int, protocol: str, position_id: Any) 
     key = (cid, proto, int(tid))
     with POSITION_CREATION_DATE_CACHE_LOCK:
         cached = POSITION_CREATION_DATE_CACHE.get(key)
-    if cached is not None:
-        return str(cached or "")
+        if cached is not None:
+            hit = str(cached or "").strip()
+            if hit:
+                return hit
+            POSITION_CREATION_DATE_CACHE.pop(key, None)
     pm = _position_manager_for_protocol(cid, proto)
     if not _is_eth_address(pm):
-        with POSITION_CREATION_DATE_CACHE_LOCK:
-            POSITION_CREATION_DATE_CACHE[key] = ""
         return ""
     first_block = _position_mint_block_erc721_transfer_on_pm(cid, pm, int(tid), deadline_ts=None)
     date_str = ""
@@ -4472,7 +4484,10 @@ def _position_creation_date_ymd(chain_id: int, protocol: str, position_id: Any) 
         if ts > 0:
             date_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
     with POSITION_CREATION_DATE_CACHE_LOCK:
-        POSITION_CREATION_DATE_CACHE[key] = date_str
+        if date_str:
+            POSITION_CREATION_DATE_CACHE[key] = date_str
+        else:
+            POSITION_CREATION_DATE_CACHE.pop(key, None)
     return date_str
 
 
@@ -4485,7 +4500,12 @@ def _position_creation_date_peek(chain_id: int, protocol: str, position_id: Any)
     key = (cid, proto, int(tid))
     with POSITION_CREATION_DATE_CACHE_LOCK:
         cached = POSITION_CREATION_DATE_CACHE.get(key)
-    return str(cached or "")
+        if cached is not None:
+            hit = str(cached or "").strip()
+            if hit:
+                return hit
+            POSITION_CREATION_DATE_CACHE.pop(key, None)
+    return ""
 
 
 def _position_creation_date_cache_set(chain_id: int, protocol: str, position_id: Any, date_str: str) -> None:
@@ -14352,6 +14372,20 @@ class PositionsRowEnrichRequest(BaseModel):
     row: dict[str, Any] = Field(default_factory=dict)
 
 
+def _format_position_liquidity_scalar_compact(liq_raw: int) -> str:
+    """Человекочитаемый скаляр ликвидности (v4), без USD."""
+    x = max(0, int(liq_raw))
+    if x <= 0:
+        return "-"
+    if x < 1000:
+        return str(x)
+    if x < 1_000_000:
+        return f"{x / 1000.0:.1f}K".rstrip("0").rstrip(".")
+    if x < 1_000_000_000:
+        return f"{x / 1_000_000.0:.1f}M".rstrip("0").rstrip(".")
+    return f"{x / 1_000_000_000.0:.1f}B".rstrip("0").rstrip(".")
+
+
 def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], chain_id: int) -> dict[str, Any]:
     dec0 = _parse_int_like(snap.get("token0_decimals") or 18)
     dec1 = _parse_int_like(snap.get("token1_decimals") or 18)
@@ -14386,9 +14420,15 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
         return s.rstrip("0").rstrip(".")
 
     liq_raw = max(0, int(snap.get("liquidity") or 0))
+    proto_snap = str(snap.get("protocol") or "").strip().lower()
+    is_v4_snap = proto_snap == "uniswap_v4"
     a0_now = max(0.0, float(amount0 or 0.0))
     a1_now = max(0.0, float(amount1 or 0.0))
-    status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
+    if is_v4_snap and liq_raw > 0:
+        # v4: нет v3-quoter для amount0/1 в снимке — позиция с ненулевой on-chain liquidity всё равно «active».
+        status = "active"
+    else:
+        status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
     token0_addr = str(snap.get("token0") or row.get("token0_id") or "").strip().lower()
     token1_addr = str(snap.get("token1") or row.get("token1_id") or "").strip().lower()
     liq_usd = None
@@ -14406,6 +14446,8 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
     except Exception:
         liq_usd = None
     liq_disp = _format_usd_compact(liq_usd)
+    if is_v4_snap and liq_raw > 0 and (liq_usd is None or float(liq_usd) <= 0.0):
+        liq_disp = f"v4 L {_format_position_liquidity_scalar_compact(liq_raw)}"
     fee_raw = str(snap.get("fee") or "").strip()
     fee_disp = fee_raw
     try:
