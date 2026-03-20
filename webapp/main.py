@@ -11206,6 +11206,20 @@ def _nft_catalog_row_is_explorer_tokennfttx(row: dict[str, Any]) -> bool:
     return str(r.get("pair_symbol_source") or "").strip() == "explorer:tokennfttx"
 
 
+def _nft_catalog_row_eligible_for_explorer_owner_light(row: dict[str, Any] | None) -> bool:
+    """Same gates as the explorer branch of _nft_catalog_apply_explorer_owner_mismatch_scan (before RPC)."""
+    if not isinstance(row, dict):
+        return False
+    if not _nft_catalog_row_is_explorer_tokennfttx(row):
+        return False
+    chain_id = int(row.get("chain_id") or 0) or int(
+        _chain_id_by_chain_key(str(row.get("chain") or "")) or 0
+    )
+    token_id = _position_token_id_from_raw(row.get("position_id"))
+    owner = str(row.get("address") or "").strip().lower()
+    return bool(chain_id > 0 and token_id > 0 and _is_eth_address(owner))
+
+
 # --- NFT_CATALOG_DEFERRED_OWNER_RECONCILIATION (структурный раздел конвейера, без реализации) ---
 # Зарезервировано под тяжёлую пост-обработку «ложных» owner mismatch:
 #   - тонкости Uniswap V3 (обёртки, делегирование, нестандартные PM);
@@ -11362,8 +11376,9 @@ def _nft_catalog_apply_explorer_owner_mismatch_scan(
     rows: list[dict[str, Any]],
     *,
     max_seconds: float = 22.0,
+    max_subgraph_seconds: float | None = None,
     max_rows: int = 900,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """
     Лёгкая фаза конвейера: ownerOf(NFT) vs кошелёк скана.
 
@@ -11373,6 +11388,11 @@ def _nft_catalog_apply_explorer_owner_mismatch_scan(
 
     Нарратив «сначала владелец»: только ownerOf + custody allowlist; тяжёлая фаза — отдельно
     (NFT_CATALOG_DEFERRED_OWNER_RECONCILIATION).
+
+    Важно: бюджет времени для (1) и (2) разделён (отдельные monotonic «старт»), иначе при большом
+    числе NFT фаза (1) съедает весь лимит и subgraph не успевает; раньше обе фазы делили один start,
+    из‑за чего часть explorer-строк могла не получить ownerOf при лимите ~24s — вкладка
+    «Owner mismatch» оставалась пустой, хотя проверка была неполной (строки оставались с mismatch=False).
     """
     start = time.monotonic()
     mismatch_n = 0
@@ -11384,13 +11404,11 @@ def _nft_catalog_apply_explorer_owner_mismatch_scan(
             break
         if not isinstance(row, dict):
             continue
-        if not _nft_catalog_row_is_explorer_tokennfttx(row):
+        if not _nft_catalog_row_eligible_for_explorer_owner_light(row):
             continue
         chain_id = int(row.get("chain_id") or 0) or int(_chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
         token_id = _position_token_id_from_raw(row.get("position_id"))
         owner = str(row.get("address") or "").strip().lower()
-        if chain_id <= 0 or token_id <= 0 or not _is_eth_address(owner):
-            continue
         proto = _nft_catalog_row_enrich_protocol(row)
         om = _nft_catalog_scan_owner_mismatch_reason(chain_id, proto, row, int(token_id), owner)
         if om:
@@ -11402,16 +11420,19 @@ def _nft_catalog_apply_explorer_owner_mismatch_scan(
             row["nft_catalog_mismatch_reason"] = ""
         checked += 1
 
+    explorer_owner_rpc_calls = int(checked)
+    sg_budget = float(max_subgraph_seconds) if max_subgraph_seconds is not None else float(max_seconds)
+    start_sg = time.monotonic()
     if POSITIONS_SUBGRAPH_V3_OWNEROF_LIGHT_CHECK:
         add_m, checked = _apply_subgraph_v3_ownerof_light_scan_phase(
             rows,
-            start=start,
-            max_seconds=float(max_seconds),
+            start=start_sg,
+            max_seconds=float(sg_budget),
             max_rows=int(max_rows),
             checked_start=int(checked),
         )
         mismatch_n += int(add_m)
-    return int(mismatch_n), int(checked)
+    return int(mismatch_n), int(checked), int(explorer_owner_rpc_calls)
 
 
 def _enrich_nft_catalog_rows_from_chain(
@@ -14424,12 +14445,47 @@ def _render_positions_page() -> str:
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
     #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
-    #posPoolsMismatchTable { min-width: 1320px; table-layout: auto; }
-    #posPoolsMismatchTable th, #posPoolsMismatchTable td { white-space: nowrap; }
-    #posPoolsMismatchTable th:nth-child(1), #posPoolsMismatchTable td:nth-child(1) {
-      position: sticky; left: 0; z-index: 4; background: #f8fbff;
+    /* Owner mismatch: avoid 1300px+ min-width — keep within card; wrap text */
+    .mismatch-table-wrap table#posPoolsMismatchTable {
+      min-width: 0;
+      width: 100%;
+      max-width: 100%;
+      table-layout: fixed;
     }
-    #posPoolsMismatchTable th:nth-child(1) { background: #fff7ed; z-index: 5; }
+    .mismatch-table-wrap #posPoolsMismatchTable th,
+    .mismatch-table-wrap #posPoolsMismatchTable td {
+      white-space: normal;
+      word-break: break-word;
+      vertical-align: top;
+      font-size: 11px;
+      padding: 5px 6px;
+    }
+    .mismatch-table-wrap #posPoolsMismatchTable td.mono {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+    .mismatch-table-wrap #posPoolsMismatchTable th:nth-child(1),
+    .mismatch-table-wrap #posPoolsMismatchTable td:nth-child(1) {
+      position: sticky;
+      left: 0;
+      z-index: 4;
+      background: #f8fbff;
+      width: 11%;
+    }
+    .mismatch-table-wrap #posPoolsMismatchTable th:nth-child(1) { background: #fff7ed; z-index: 5; }
+    .mismatch-table-wrap #posPoolsMismatchTable th:nth-child(5),
+    .mismatch-table-wrap #posPoolsMismatchTable td:nth-child(5) {
+      width: 22%;
+      line-height: 1.35;
+    }
+    .mismatch-table-wrap tr.pos-mm-empty td {
+      border-bottom: none;
+      padding: 14px 16px !important;
+      font-size: 12px !important;
+      line-height: 1.45;
+    }
     .pos-pools-tab-bar { display: none; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
     .pos-tab-btn {
       border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
@@ -14532,7 +14588,7 @@ def _render_positions_page() -> str:
           <div class="table-wrap" id="posPoolsTableProtocolWrap" style="display:none"><table id="posPoolsProtocolTable"></table></div>
           <div class="table-wrap" id="posPoolsTableClosedWrap" style="display:none"><table id="posPoolsClosedTable"></table></div>
           <div class="table-wrap" id="posPoolsTablePairWrap" style="display:none"><table id="posPoolsPairMismatchTable"></table></div>
-          <div class="table-wrap" id="posPoolsTableMismatchWrap" style="display:none"><table id="posPoolsMismatchTable"></table></div>
+          <div class="table-wrap mismatch-table-wrap" id="posPoolsTableMismatchWrap" style="display:none"><table id="posPoolsMismatchTable"></table></div>
           <div class="table-wrap" id="posPoolsTablePhishingWrap" style="display:none"><table id="posPoolsPhishingTable"></table></div>
           <div class="table-wrap" id="posPoolsTableHiddenWrap" style="display:none"><table id="posPoolsHiddenTable"></table></div>
           <div id="posErrors"></div>
@@ -14628,7 +14684,7 @@ def _render_positions_page() -> str:
       if (kind === "evm" && (posState.evm || []).length) scheduleBackgroundWarmup("remove");
     }
     const posSectionState = {pools: false};
-    const posCache = {pools: []};
+    const posCache = {pools: [], debug: null};
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
@@ -15013,6 +15069,15 @@ def _render_positions_page() -> str:
           if (fetchS > 0 || mergeS > 0) {
             timingLines.push(`NFT_time: parallel_fetch=${fetchS}s merge=${mergeS}s workers=${pw}`);
           }
+          const oe = Number(nftDbg.owner_light_explorer_eligible || 0);
+          const oc = Number(nftDbg.owner_light_explorer_checked || 0);
+          const os = Number(nftDbg.owner_light_explorer_unchecked || 0);
+          const omm = Number(nftDbg.owner_mismatch_rows || 0);
+          if (oe > 0 || oc > 0) {
+            timingLines.push(
+              `owner_light: explorer_eligible=${oe} ownerOf_done=${oc}${os > 0 ? ` unchecked=${os}` : ""} mismatches=${omm}`
+            );
+          }
           const probe = Array.isArray(pool.nft_probe_by_chain) ? pool.nft_probe_by_chain : [];
           if (probe.length) {
             const bits = probe.slice(0, 6).map((p) => {
@@ -15386,7 +15451,7 @@ def _render_positions_page() -> str:
         mmHtml += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
         mmHtml += `<td>${esc(r.chain || "")}</td>`;
         mmHtml += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
-        mmHtml += `<td style='max-width:240px;white-space:normal;font-size:11px;line-height:1.35'${issueTitle}>${esc(issueLabel)}</td>`;
+        mmHtml += `<td${issueTitle}>${esc(issueLabel)}</td>`;
         const rowKeyEscMm = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
         mmHtml += `<td${pmStyle}${pmTitle}>${esc(r.pair || "")}${pm ? " ⚠" : ""}</td>`;
         const feeRawMm = String(r.fee_tier_raw || "").trim();
@@ -15403,10 +15468,25 @@ def _render_positions_page() -> str:
         mmHtml += "</tr>";
       }
       if (!mismatchRows.length) {
+        const nftDbg = (posCache.debug && typeof posCache.debug === "object" && posCache.debug.nft_scan && typeof posCache.debug.nft_scan === "object")
+          ? posCache.debug.nft_scan
+          : {};
+        const elig = Number(nftDbg.owner_light_explorer_eligible || 0);
+        const exChk = Number(nftDbg.owner_light_explorer_checked || 0);
+        const exSkip = Number(nftDbg.owner_light_explorer_unchecked || 0);
+        const mmRows = Number(nftDbg.owner_mismatch_rows || 0);
+        const dbgLine = (elig > 0 || exChk > 0)
+          ? ` Debug: explorer owner-light eligible=${elig}, ownerOf calls done=${exChk}${exSkip > 0 ? `, skipped=${exSkip} (time/row budget — re-scan or raise limits)` : ""}; mismatch rows=${mmRows}.`
+          : "";
         const mmEmpty = hasExplorerNftCatalog
-          ? "This tab is empty for this scan: no NFT catalog row failed the light owner check (explorer listing vs on-chain ownerOf / position manager). When a row does fail, it appears here for review and is not routed to Phishing. A heavier reconciliation pass for tricky cases (V3 / Infinity / farming) is planned — not in this build yet."
-          : "This tab is empty: no row failed the server light owner check. For subgraph-only scans the backend can still run ownerOf on the V3 position manager vs your wallet (when enabled); without explorer NFT rows you will not see catalog-style issues. If everything is filtered elsewhere or checks are disabled in config, this tab stays empty.";
-        mmHtml += `<tr><td colspan='${mmCols}' style='white-space:normal;color:#64748b'>${mmEmpty}</td></tr>`;
+          ? ("This tab lists only rows that failed the light owner check (explorer NFT vs on-chain ownerOf / known custody). "
+            + "If every checked row matches your wallet (or allowlisted custody), the tab is empty — that is expected."
+            + dbgLine
+            + " Heavier reconciliation (V3 edge cases / Infinity / farming) is not in this build yet.")
+          : ("This tab is empty: no row failed the server light owner check. "
+            + "For subgraph-only scans ownerOf on the V3 PM may still run when enabled."
+            + dbgLine);
+        mmHtml += `<tr class="pos-mm-empty"><td colspan='${mmCols}' style='white-space:normal;color:#64748b'>${mmEmpty}</td></tr>`;
       }
       const stCols = 12;
       let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
@@ -15674,6 +15754,7 @@ def _render_positions_page() -> str:
         const partial = data.result || {};
         if (partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length) {
           posCache.pools = partial.pool_positions || [];
+          posCache.debug = partial.debug || null;
           renderPools(posCache.pools);
           renderScanMessages(partial);
           partialRendered = true;
@@ -15758,6 +15839,7 @@ def _render_positions_page() -> str:
         }
         saveActivePosJob("");
         posCache.pools = data.pool_positions || [];
+        posCache.debug = data.debug || null;
         renderPools(posCache.pools);
         renderScanMessages(data);
         const finishedChecks = Array.isArray(data?.debug?.pool_scan) ? data.debug.pool_scan.length : 0;
@@ -15796,6 +15878,7 @@ def _render_positions_page() -> str:
         posCache.pools = data.pool_positions || [];
         renderPools(posCache.pools);
         renderScanMessages(data);
+        posCache.debug = data.debug || null;
         savePosResults({
           saved_at: Date.now(),
           pool_positions: data.pool_positions || [],
@@ -15824,6 +15907,7 @@ def _render_positions_page() -> str:
     const saved = loadPosResults();
     if (saved && Array.isArray(saved.pool_positions) && saved.pool_positions.length) {
       posCache.pools = saved.pool_positions;
+      posCache.debug = saved.debug || null;
       renderPools(posCache.pools);
       renderScanMessages(saved);
       posHasScannedOnce = true;
@@ -17956,6 +18040,15 @@ def _build_positions_scan_response(
             "parallel_workers": int(pool_t.get("parallel_workers") or 0),
             "owner_mismatch_checked": int((debug_timings or {}).get("nft_catalog_owner_mismatch_checked") or 0),
             "owner_mismatch_rows": int((debug_timings or {}).get("nft_catalog_owner_mismatch_rows") or 0),
+            "owner_light_explorer_eligible": int(
+                (debug_timings or {}).get("nft_catalog_owner_light_explorer_eligible") or 0
+            ),
+            "owner_light_explorer_checked": int(
+                (debug_timings or {}).get("nft_catalog_owner_light_explorer_checked") or 0
+            ),
+            "owner_light_explorer_unchecked": int(
+                (debug_timings or {}).get("nft_catalog_owner_light_explorer_unchecked") or 0
+            ),
         }
     return {
         "pool_positions": pool_rows,
@@ -18171,15 +18264,28 @@ def _scan_positions_core(
     t_nft_enrich = time.monotonic()
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN and pool_rows:
         t_own = time.monotonic()
-        own_mm_n, own_chk_n = _nft_catalog_apply_explorer_owner_mismatch_scan(
-            pool_rows, max_seconds=24.0, max_rows=900
+        own_expl_eligible = sum(1 for r in pool_rows if _nft_catalog_row_eligible_for_explorer_owner_light(r))
+        own_mm_n, own_chk_n, own_expl_checked = _nft_catalog_apply_explorer_owner_mismatch_scan(
+            pool_rows,
+            max_seconds=55.0,
+            max_subgraph_seconds=28.0,
+            max_rows=900,
         )
         debug_timings["nft_catalog_owner_mismatch_scan_sec"] = round(max(0.0, time.monotonic() - t_own), 3)
         debug_timings["nft_catalog_owner_mismatch_rows"] = int(own_mm_n)
         debug_timings["nft_catalog_owner_mismatch_checked"] = int(own_chk_n)
+        debug_timings["nft_catalog_owner_light_explorer_eligible"] = int(own_expl_eligible)
+        debug_timings["nft_catalog_owner_light_explorer_checked"] = int(own_expl_checked)
+        own_expl_skipped = max(0, int(own_expl_eligible) - int(own_expl_checked))
+        debug_timings["nft_catalog_owner_light_explorer_unchecked"] = int(own_expl_skipped)
+        info_tail = (
+            f"explorer NFT ownerOf: {int(own_expl_checked)}/{int(own_expl_eligible)} rows"
+            + (f" ({int(own_expl_skipped)} not checked — time/row cap)" if own_expl_skipped else "")
+            + "; total RPC passes (incl. optional subgraph v3 PM)"
+        )
         info_notes.append(
-            f"Light owner scan: checked={int(own_chk_n)}, mismatches={int(own_mm_n)} "
-            "(explorer NFT ownerOf vs wallet + optional subgraph v3 PM; tab «Owner mismatch»)."
+            f"Light owner scan: mismatches={int(own_mm_n)}, checked_total={int(own_chk_n)} ({info_tail}; "
+            f"tab «Owner mismatch» lists mismatch rows only)."
         )
         ne_ok, ne_fail = _enrich_nft_catalog_rows_from_chain(pool_rows, max_seconds=26.0, max_rows=240)
         debug_timings["nft_catalog_onchain_enrich_sec"] = round(max(0.0, time.monotonic() - t_nft_enrich), 3)
