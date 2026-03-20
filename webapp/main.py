@@ -366,6 +366,21 @@ POSITIONS_FILTER_SPAM_TOKENS = os.environ.get("POSITIONS_FILTER_SPAM_TOKENS", "0
     "on",
 )
 POSITIONS_SPAM_MAX_TVL_USD = max(0.0, float(os.environ.get("POSITIONS_SPAM_MAX_TVL_USD", "50")))
+# Режим explorer NFT catalog: отделить спам-пулы от нормальных (после on-chain pair + USD; не зависит от POSITIONS_FILTER_SPAM_TOKENS).
+POSITIONS_NFT_CATALOG_SPAM_FILTER = os.environ.get("POSITIONS_NFT_CATALOG_SPAM_FILTER", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Известный PM ≠ честный пул: спам часто полноценно развёрнут в v3/v4. Если оба токена вне major-каталога
+# и оценка стоимости позиции ниже порога — помечаем как спам (отключается =0).
+POSITIONS_NFT_CATALOG_SPAM_NEITHER_MAJOR = os.environ.get(
+    "POSITIONS_NFT_CATALOG_SPAM_NEITHER_MAJOR", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_NFT_CATALOG_NEITHER_MAJOR_MAX_USD = max(
+    0.0, float(os.environ.get("POSITIONS_NFT_CATALOG_NEITHER_MAJOR_MAX_USD", "250"))
+)
 POSITIONS_MAX_TOKEN_PRICE_USD = max(100.0, float(os.environ.get("POSITIONS_MAX_TOKEN_PRICE_USD", "1000000")))
 POSITIONS_MIN_TOKEN_PRICE_USD = max(0.0, float(os.environ.get("POSITIONS_MIN_TOKEN_PRICE_USD", "0.000000000001")))
 POSITIONS_MAX_TOKEN_PRICE_RATIO = max(10.0, float(os.environ.get("POSITIONS_MAX_TOKEN_PRICE_RATIO", "10000000000")))
@@ -609,6 +624,9 @@ DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     42161: ["https://arbitrum-one-rpc.publicnode.com"],
 }
 
+# Адреса крупных активов по сети (TOKEN_ADDRESSES / импорт каталога) — те же, что для «Find the best fee on Uniswap»
+# и соседних сценариев. Whitelist в NFT-каталоге (neither-major), сопоставление тикеров и часть анти-спама
+# опираются на этот же набор: подозрительные тикеры + отсутствие major в паре согласованы с фокусом на ликвидных токенах.
 _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN: dict[str, dict[str, str]] = {}
 for _ck, _per_chain in TOKEN_ADDRESSES.items():
     addr_map: dict[str, str] = {}
@@ -6052,8 +6070,10 @@ def _is_suspected_spam_pair(
     *,
     explorer_token_name: str = "",
     explorer_token_symbol: str = "",
+    spam_filter_enabled: bool | None = None,
 ) -> bool:
-    if not POSITIONS_FILTER_SPAM_TOKENS:
+    eff_spam = POSITIONS_FILTER_SPAM_TOKENS if spam_filter_enabled is None else bool(spam_filter_enabled)
+    if not eff_spam:
         return False
     chain_addr_map = _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(str(chain_key or "").strip().lower(), {}) or {}
     a0 = str((token0_obj or {}).get("id") or "").strip().lower()
@@ -6087,6 +6107,121 @@ def _is_suspected_spam_pair(
         if not both_curated:
             return True
     return False
+
+
+def _explorer_nft_metadata_obvious_phishing(name: str, symbol: str) -> bool:
+    """
+    Только грубые признаки фишинга в метаданных коллекции NFT из explorer.
+    Не использовать общие эвристики «длинного имени» — у легитимных Uniswap/Pancake названия многословные.
+    """
+    n = str(name or "").strip().lower()
+    s = str(symbol or "").strip().lower()
+    blobs = [x for x in (n, s) if x]
+    needles = (
+        "http://",
+        "https://",
+        "t.me/",
+        "telegram.me/",
+        "discord.gg/",
+        "bit.ly/",
+        "gifts/",
+        "claim airdrop",
+        "airdrop claim",
+        "visit ",
+        "connect wallet",
+        "verify wallet",
+        "drain",
+        "www.",
+        ".xyz/",
+        "free mint",
+    )
+    for b in blobs:
+        if any(x in b for x in needles):
+            return True
+    return False
+
+
+def _apply_nft_catalog_spam_heuristics(rows: list[dict[str, Any]]) -> int:
+    """
+    Отделение спама от нормальных позиций в NFT-каталоге.
+
+    Важно: NFT на официальном Position Manager не гарантирует легитимность — спам-пулы часто полноценно
+    развёрнуты в протоколе с двумя «мусорными» токенами.
+
+    - Whitelist: оба токена в локальном каталоге major по сети → не спам.
+    - Хотя бы один major: правило «ни один не в каталоге» не срабатывает.
+    - Оба вне major + TVL позиции < порога (или не оценён → 0) → спам (см. POSITIONS_NFT_CATALOG_SPAM_NEITHER_MAJOR).
+    - После on-chain enrich: эвристики символов/TVL (_is_suspected_spam_pair).
+    - Без пары из контракта: только явный фишинг в метаданных коллекции explorer.
+    """
+    if not POSITIONS_NFT_CATALOG_SPAM_FILTER:
+        return 0
+    flagged = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if "catalog_segment" not in row:
+            continue
+        if bool(row.get("unsupported_protocol")):
+            continue
+        chain_key = str(row.get("chain") or "").strip().lower()
+        chain_addr_map = _TOKEN_ADDR_TO_SYMBOL_BY_CHAIN.get(chain_key, {}) or {}
+        t0 = str(row.get("token0_id") or "").strip().lower()
+        t1 = str(row.get("token1_id") or "").strip().lower()
+        s0 = str(row.get("position_symbol0") or "").strip()
+        s1 = str(row.get("position_symbol1") or "").strip()
+        en = str(row.get("explorer_token_name") or "")
+        es = str(row.get("explorer_token_symbol") or "")
+        liq_usd = row.get("liquidity_usd")
+        both_curated = _is_eth_address(t0) and _is_eth_address(t1) and (t0 in chain_addr_map) and (t1 in chain_addr_map)
+        if both_curated:
+            row["suspected_spam"] = False
+            row["spam_skipped"] = False
+            continue
+        pair_resolved = bool(
+            s0
+            and s1
+            and s0 not in ("?", "UNK")
+            and s1 not in ("?", "UNK")
+            and _is_eth_address(t0)
+            and _is_eth_address(t1)
+        )
+        is_spam = False
+        if pair_resolved:
+            is_spam = bool(
+                _is_suspected_spam_pair(
+                    chain_key,
+                    {"id": t0},
+                    {"id": t1},
+                    s0,
+                    s1,
+                    liq_usd,
+                    explorer_token_name=en,
+                    explorer_token_symbol=es,
+                    spam_filter_enabled=True,
+                )
+            )
+            if (
+                not is_spam
+                and POSITIONS_NFT_CATALOG_SPAM_NEITHER_MAJOR
+                and _is_eth_address(t0)
+                and _is_eth_address(t1)
+                and (t0 not in chain_addr_map)
+                and (t1 not in chain_addr_map)
+            ):
+                tvl = _safe_float(liq_usd)
+                if tvl < float(POSITIONS_NFT_CATALOG_NEITHER_MAJOR_MAX_USD):
+                    is_spam = True
+        else:
+            is_spam = bool(_explorer_nft_metadata_obvious_phishing(en, es))
+        if is_spam:
+            row["suspected_spam"] = True
+            row["spam_skipped"] = True
+            flagged += 1
+        else:
+            row["suspected_spam"] = False
+            row["spam_skipped"] = False
+    return flagged
 
 
 def _format_usd_compact(value: float | None) -> str:
@@ -16578,6 +16713,17 @@ def _scan_positions_core(
             info_notes.append(
                 f"NFT catalog on-chain enrich: ok={int(ne_ok)}, fail={int(ne_fail)} "
                 f"(pair/fee/in-position for open positions only; closed tab uses explorer metadata)."
+            )
+        t_usd = time.monotonic()
+        _enrich_rows_liquidity_usd(pool_rows, max_seconds=6)
+        debug_timings["nft_catalog_liquidity_usd_sec"] = round(max(0.0, time.monotonic() - t_usd), 3)
+        spam_n = _apply_nft_catalog_spam_heuristics(pool_rows)
+        debug_timings["nft_catalog_spam_flagged"] = int(spam_n)
+        if spam_n > 0:
+            info_notes.append(
+                f"NFT catalog spam filter: flagged {int(spam_n)} row(s) "
+                f"(neither-major+low-TVL rule, symbol heuristics; "
+                f"POSITIONS_NFT_CATALOG_SPAM_FILTER=0 / NEITHER_MAJOR=0 / raise NEITHER_MAJOR_MAX_USD)."
             )
     t_debug = time.monotonic()
     debug_summary_rows = _build_pool_debug_summary_rows(pool_debug_rows)
