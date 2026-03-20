@@ -691,10 +691,6 @@ POSITIONS_EXPLORER_GRAPH_ID_UNION = os.environ.get("POSITIONS_EXPLORER_GRAPH_ID_
 POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER = os.environ.get(
     "POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
-# V4: при 1 — если id нет в whitelist префильтра, не ставить closed (unknown). Ломает чистый список при массе пустых v4.
-POSITIONS_NFT_CATALOG_V4_SKIP_CLOSED_PREFILTER = os.environ.get(
-    "POSITIONS_NFT_CATALOG_V4_SKIP_CLOSED_PREFILTER", "0"
-).strip().lower() in ("1", "true", "yes", "on")
 
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
@@ -2425,115 +2421,6 @@ def _quote_v3_collect_fees_amounts(
     return None, None
 
 
-def _fetch_uniswap_v4_position_contract_snapshot(
-    chain_id: int,
-    token_id: int,
-    owner_hint: str,
-    pm_contract: str,
-    *,
-    include_quotes: bool = True,
-) -> dict[str, Any] | None:
-    """
-    Uniswap v4 PositionManager не использует V3 positions(uint256); снимок через getPoolAndPositionInfo + getPositionLiquidity.
-    Без этого NFT-каталог для v4 не обогащается (всегда None) и ложные «closed» не снимаются.
-    """
-    cid = int(chain_id)
-    tid = int(token_id)
-    owner_addr = str(owner_hint or "").strip().lower()
-    pm = str(pm_contract or "").strip().lower()
-    if tid <= 0 or not _is_eth_address(pm) or not _is_eth_address(owner_addr):
-        return None
-    try:
-        owner_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(tid)))
-        owner_words = _hex_words(owner_hex)
-        if not owner_words:
-            return None
-        owner_word = _encode_address_word(owner_addr)[-40:]
-        if owner_words[0][-40:].lower() != owner_word:
-            return None
-    except Exception:
-        return None
-    sel_pool_and_info = "0x7ba03aad"
-    sel_liq = "0x1efeed33"
-    try:
-        batch = _eth_call_hex_batch(
-            cid,
-            [
-                {"to": pm, "data": sel_pool_and_info + _encode_uint_word(int(tid))},
-                {"to": pm, "data": sel_liq + _encode_uint_word(int(tid))},
-            ],
-        )
-        info_hex = str(batch[0] or "").strip().lower() if isinstance(batch, list) and len(batch) > 0 else ""
-        liq_hex = str(batch[1] or "").strip().lower() if isinstance(batch, list) and len(batch) > 1 else ""
-        if not info_hex.startswith("0x") or len(info_hex) <= 2:
-            try:
-                info_hex = _eth_call_hex(cid, pm, sel_pool_and_info + _encode_uint_word(int(tid)))
-            except Exception:
-                info_hex = ""
-        if not liq_hex.startswith("0x") or len(liq_hex) <= 2:
-            try:
-                liq_hex = _eth_call_hex(cid, pm, sel_liq + _encode_uint_word(int(tid)))
-            except Exception:
-                liq_hex = "0x0"
-        p_words = _hex_words(info_hex or "")
-        if len(p_words) < 6:
-            return None
-        liq = max(0, int(_decode_uint_eth_call(liq_hex or "0x0")))
-        raw0 = _decode_address_from_word(p_words[0])
-        raw1 = _decode_address_from_word(p_words[1])
-        fee = _decode_uint_from_word(p_words[2])
-        info_val = int(p_words[5], 16)
-        tick_upper = _decode_signed_int24_from_packed_word(info_val, 32)
-        tick_lower = _decode_signed_int24_from_packed_word(info_val, 8)
-        token0, sym0, dec0 = _normalize_infinity_currency(cid, raw0)
-        token1, sym1, dec1 = _normalize_infinity_currency(cid, raw1)
-        token0 = str(token0 or "").strip().lower()
-        token1 = str(token1 or "").strip().lower()
-        sym0 = _normalize_display_symbol(str(sym0 or ""))
-        sym1 = _normalize_display_symbol(str(sym1 or ""))
-        if not sym0:
-            sym0 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token0) or "")
-        if not sym1:
-            sym1 = _normalize_display_symbol(_fetch_erc20_symbol_onchain(cid, token1) or "")
-        q_amount0: float | None = None
-        q_amount1: float | None = None
-        q_fee0: float | None = None
-        q_fee1: float | None = None
-        proto = "uniswap_v4"
-        if bool(include_quotes) and liq > 0:
-            q_amount0, q_amount1 = _quote_v3_decrease_liquidity_amounts(
-                cid, proto, tid, liq, owner_addr, dec0, dec1
-            )
-            q_fee0, q_fee1 = _quote_v3_collect_fees_amounts(cid, proto, tid, owner_addr, dec0, dec1)
-        return {
-            "chain_id": cid,
-            "protocol": proto,
-            "position_manager": pm,
-            "token_id": tid,
-            "owner_hint": owner_addr,
-            "nonce": 0,
-            "operator": "",
-            "token0": token0,
-            "token1": token1,
-            "fee": int(fee),
-            "tick_lower": int(tick_lower),
-            "tick_upper": int(tick_upper),
-            "liquidity": int(liq),
-            "tokens_owed0_raw": 0,
-            "tokens_owed1_raw": 0,
-            "token0_decimals": int(dec0),
-            "token1_decimals": int(dec1),
-            "token0_symbol": str(sym0 or ""),
-            "token1_symbol": str(sym1 or ""),
-            "quote_amount0": q_amount0,
-            "quote_amount1": q_amount1,
-            "quote_fee0": q_fee0,
-            "quote_fee1": q_fee1,
-        }
-    except Exception:
-        return None
-
-
 def _fetch_v3_position_contract_snapshot(
     chain_id: int,
     protocol: str,
@@ -2558,15 +2445,6 @@ def _fetch_v3_position_contract_snapshot(
             return dict(payload or {})
     pm = _position_manager_for_protocol(cid, proto)
     if not _is_eth_address(pm):
-        return None
-    if proto == "uniswap_v4":
-        snap = _fetch_uniswap_v4_position_contract_snapshot(
-            cid, tid, owner_addr, pm, include_quotes=bool(include_quotes)
-        )
-        if isinstance(snap, dict):
-            with POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK:
-                POSITION_CONTRACT_SNAPSHOT_CACHE[cache_key] = (now, snap)
-            return snap
         return None
     try:
         pos_data = "0x99fbab88" + _encode_uint_word(int(tid))
@@ -3486,11 +3364,11 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
 
     Для каждого tokenId: ownerOf на Uniswap V3 NFPM; при неуспехе — ownerOf на V4 PM;
     оба неуспешны → сожжённый NFT. Затем только для «живых» NFT: V3 positions() или
-    V4 getPositionLiquidity(). При сбое sub-call id в v4_uncertain (сегмент unknown → PM snapshot), не в open_v4.
+    V4 getPositionLiquidity().
 
     v3_position_manager / v4_position_manager — опционально (иначе из мап по chain_id).
 
-    Возвращает dict: open_v3, open_v4, v4_uncertain, burned, closed_zero_liquidity, unknown, multicall_roundtrips.
+    Возвращает dict: open_v3, open_v4, burned, closed_zero_liquidity, unknown, multicall_roundtrips.
     """
     cid = int(chain_id)
     v3_pm = str(v3_position_manager or UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
@@ -3499,7 +3377,6 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
     out: dict[str, Any] = {
         "open_v3": [],
         "open_v4": [],
-        "v4_uncertain": [],
         "burned": [],
         "closed_zero_liquidity": [],
         "unknown": [],
@@ -3583,20 +3460,19 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
     if _is_eth_address(v4_pm) and v4_check:
         for group in _chunks(v4_check):
             if deadline_ts is not None and time.monotonic() >= deadline_ts:
-                out["v4_uncertain"].extend(int(t) for t in group)
+                out["unknown"].extend(t for t in group)
                 continue
             calls = [(v4_pm, True, _v4pm_get_liquidity_calldata(t)) for t in group]
             res = _multicall3_aggregate3(cid, calls, deadline_ts=deadline_ts)
             rounds += 1
             for tid, (ok, data) in zip(group, res):
                 if not ok or len(data) < 32:
-                    out["v4_uncertain"].append(int(tid))
+                    closed_z.add(int(tid))
                     continue
                 try:
-                    liq = _decode_uint_eth_call("0x" + bytes(data).hex())
+                    liq = int.from_bytes(data[-32:], "big", signed=False)
                 except Exception:
-                    out["v4_uncertain"].append(int(tid))
-                    continue
+                    liq = 0
                 if liq > 0:
                     open_v4.append(int(tid))
                 else:
@@ -3604,7 +3480,6 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
 
     out["open_v3"] = sorted(open_v3)
     out["open_v4"] = sorted(open_v4)
-    out["v4_uncertain"] = sorted({int(x) for x in (out.get("v4_uncertain") or []) if int(x) > 0})
     out["burned"] = sorted(burned)
     out["closed_zero_liquidity"] = sorted(closed_z)
     out["multicall_roundtrips"] = int(rounds)
@@ -11487,33 +11362,6 @@ def _nft_catalog_row_is_explorer_tokennfttx(row: dict[str, Any]) -> bool:
 # -----------------------------------------------------------------------------------------------
 
 
-def _enrich_nft_catalog_row_finalize_v4_catalog_segment(row: dict[str, Any]) -> None:
-    """После успешного PM snapshot для explorer v4: open/closed только по факту (не сыпать пустые v4 в основной список)."""
-    if not isinstance(row, dict):
-        return
-    if not _nft_catalog_row_is_explorer_tokennfttx(row):
-        return
-    if str(_nft_catalog_row_enrich_protocol(row) or "").strip().lower() != "uniswap_v4":
-        return
-    try:
-        liq_r = int(str(row.get("liquidity") or "0").strip() or "0")
-    except Exception:
-        liq_r = 0
-    try:
-        a0 = float(row.get("position_amount0") or 0)
-        a1 = float(row.get("position_amount1") or 0)
-        fo0 = float(row.get("fees_owed0") or 0)
-        fo1 = float(row.get("fees_owed1") or 0)
-    except Exception:
-        a0 = a1 = fo0 = fo1 = 0.0
-    if liq_r > 0 or a0 > 0 or a1 > 0 or fo0 > 0 or fo1 > 0:
-        row["catalog_segment"] = "open"
-        row["position_status"] = "explorer"
-    else:
-        row["catalog_segment"] = "closed"
-        row["position_status"] = "hidden"
-
-
 def _enrich_nft_catalog_rows_from_chain(
     rows: list[dict[str, Any]],
     *,
@@ -11521,35 +11369,16 @@ def _enrich_nft_catalog_rows_from_chain(
     max_rows: int = 220,
 ) -> tuple[int, int]:
     """Для NFT-каталога: pair / fee / in position / liquidity из контракта PM (Multicall/RPC)."""
-
-    def _enrich_catalog_row_sort_key(r: dict[str, Any]) -> tuple[int, int]:
-        """Сначала explorer v4 closed/unknown (префильтр/snapshot), иначе max_rows не добирает."""
-        if not isinstance(r, dict):
-            return (3, 0)
-        if not _nft_catalog_row_is_explorer_tokennfttx(r):
-            return (2, 0)
-        p = str(_nft_catalog_row_enrich_protocol(r) or "").strip().lower()
-        if p != "uniswap_v4":
-            return (2, 0)
-        seg = str(r.get("catalog_segment") or "").strip().lower()
-        if seg == "closed":
-            return (0, 0)
-        if seg == "unknown":
-            return (0, 1)
-        return (1, 0)
-
-    rows_ordered = sorted(
-        (r for r in (rows or []) if isinstance(r, dict)),
-        key=_enrich_catalog_row_sort_key,
-    )
     start = time.monotonic()
     ok_n = 0
     fail_n = 0
-    for row in rows_ordered:
+    for row in rows or []:
         if time.monotonic() - start >= float(max_seconds):
             break
         if ok_n >= int(max_rows):
             break
+        if not isinstance(row, dict):
+            continue
         if bool(row.get("unsupported_protocol")):
             continue
         proto = _nft_catalog_row_enrich_protocol(row)
@@ -11562,10 +11391,7 @@ def _enrich_nft_catalog_rows_from_chain(
             continue
         seg = str(row.get("catalog_segment") or "").strip().lower()
         is_ex_nft = _nft_catalog_row_is_explorer_tokennfttx(row)
-        is_v4_explorer_closed = bool(
-            seg == "closed" and is_ex_nft and str(proto).strip().lower() == "uniswap_v4"
-        )
-        if seg == "closed" and not is_v4_explorer_closed:
+        if seg == "closed":
             continue
         try:
             snap = _fetch_v3_position_contract_snapshot(chain_id, proto, int(token_id), owner)
@@ -11577,8 +11403,6 @@ def _enrich_nft_catalog_rows_from_chain(
                 continue
             updates = _build_row_updates_from_snapshot(row, snap, chain_id)
             row.update(updates)
-            if is_ex_nft and str(proto).strip().lower() == "uniswap_v4":
-                _enrich_nft_catalog_row_finalize_v4_catalog_segment(row)
             if is_ex_nft:
                 row["nft_catalog_pm_snapshot_ok"] = True
                 row["nft_catalog_pm_snapshot_reason"] = ""
@@ -11596,8 +11420,8 @@ def _nft_catalog_compute_open_liquidity_allowed(
     fetch_results: list[dict[str, Any]],
     *,
     deadline_ts: float | None,
-) -> tuple[set[tuple[int, str, int]], set[tuple[int, str, int]]]:
-    """(allowed, v4_uncertain): whitelist открытых по префильтру + v4 с сбоем getPositionLiquidity (нужен snapshot)."""
+) -> set[tuple[int, str, int]]:
+    """Множество (chain_id, contract_lc, token_id) с ненулевой ликвидностью на PM."""
     from collections import defaultdict
 
     v3_batches: dict[tuple[int, str], list[int]] = defaultdict(list)
@@ -11634,7 +11458,6 @@ def _nft_catalog_compute_open_liquidity_allowed(
                 v4_batches[(cid, c)].append(tid_i)
 
     allowed: set[tuple[int, str, int]] = set()
-    v4_uncertain: set[tuple[int, str, int]] = set()
     for (cid, npm_c), tids in v3_batches.items():
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
@@ -11673,12 +11496,10 @@ def _nft_catalog_compute_open_liquidity_allowed(
             )
             for t in frf.get("open_v4") or []:
                 allowed.add((int(cid), pm_c, int(t)))
-            for t in frf.get("v4_uncertain") or []:
-                v4_uncertain.add((int(cid), pm_c, int(t)))
         except Exception:
             for t in tids_u:
-                v4_uncertain.add((int(cid), pm_c, int(t)))
-    return allowed, v4_uncertain
+                allowed.add((int(cid), pm_c, int(t)))
+    return allowed
 
 
 def _explorer_nft_catalog_fetch_telemetry(
@@ -12046,16 +11867,14 @@ def _scan_pool_positions_explorer_nft_catalog(
     fetch_results.sort(key=lambda x: (int(x.get("chain_id") or 0), str(x.get("owner") or "")))
 
     nft_open_allowed: set[tuple[int, str, int]] | None = None
-    nft_open_v4_uncertain: set[tuple[int, str, int]] = set()
     if POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER and time.monotonic() < deadline_ts:
         try:
-            nft_open_allowed, nft_open_v4_uncertain = _nft_catalog_compute_open_liquidity_allowed(
+            nft_open_allowed = _nft_catalog_compute_open_liquidity_allowed(
                 fetch_results,
                 deadline_ts=deadline_ts,
             )
         except Exception:
             nft_open_allowed = None
-            nft_open_v4_uncertain = set()
 
     results_by_chain: dict[int, list[dict[str, Any]]] = {}
     for fr in fetch_results:
@@ -12124,14 +11943,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                 catalog_segment = "unknown"
                 if supported and pmk:
                     if nft_open_allowed is not None:
-                        if _olk in nft_open_allowed:
-                            catalog_segment = "open"
-                        elif pmk == "v4pm" and _olk in nft_open_v4_uncertain:
-                            catalog_segment = "unknown"
-                        elif pmk == "v4pm" and POSITIONS_NFT_CATALOG_V4_SKIP_CLOSED_PREFILTER:
-                            catalog_segment = "unknown"
-                        else:
-                            catalog_segment = "closed"
+                        catalog_segment = "open" if _olk in nft_open_allowed else "closed"
                 blob = f"{token_name} {token_symbol}".lower()
                 if pmk == "v4pm":
                     proto_col = "UNI-V4"
