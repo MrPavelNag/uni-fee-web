@@ -11953,13 +11953,40 @@ def _enrich_nft_catalog_rows_from_chain(
     pos_job_id: str | None = None,
     session_id: str = "",
 ) -> tuple[int, int, dict[str, Any]]:
-    """NFT-каталог: (1) лёгкий enrich v3/v3-подобные через positions(); (2) тяжёлые протоколы — отдельный пул."""
+    """NFT-каталог: (1) тяжёлые v4/Infinity — отдельный бюджет; (2) лёгкий v3 через positions().
+
+    Раньше лёгкая фаза шла первой и часто съедала весь max_seconds (~26s), после чего
+    t_left < 1s и параллельный v4-snapshot не запускался — строки оставались explorer/brown.
+    """
     start = time.monotonic()
     ok_n = 0
     fail_n = 0
     heavy_stats: dict[str, Any] = {"heavy_ok": 0, "heavy_fail": 0, "heavy_pipeline": bool(POSITIONS_NFT_HEAVY_PIPELINE)}
+    ms = float(max_seconds)
+
+    if POSITIONS_NFT_HEAVY_PIPELINE:
+        heavy_candidates = _nft_catalog_heavy_enrich_candidate_rows(rows)
+        if heavy_candidates:
+            # Доля окна под heavy + верхний предел из env; оставляем ≥2s на лёгкий проход.
+            heavy_budget = min(
+                float(POSITIONS_NFT_HEAVY_MAX_SECONDS),
+                max(6.0, ms * 0.5),
+                max(0.0, ms - 2.0),
+            )
+            if heavy_budget >= 1.5:
+                h_ok, h_fail = _enrich_nft_catalog_heavy_rows_parallel(
+                    rows,
+                    pos_job_id=pos_job_id,
+                    session_id=session_id,
+                    max_seconds=heavy_budget,
+                    max_rows=int(POSITIONS_NFT_HEAVY_MAX_ROWS),
+                    workers=int(POSITIONS_NFT_HEAVY_WORKERS),
+                )
+                heavy_stats["heavy_ok"] = int(h_ok)
+                heavy_stats["heavy_fail"] = int(h_fail)
+
     for row in rows or []:
-        if time.monotonic() - start >= float(max_seconds):
+        if time.monotonic() - start >= ms:
             break
         if ok_n >= int(max_rows):
             break
@@ -12002,19 +12029,6 @@ def _enrich_nft_catalog_rows_from_chain(
             fail_n += 1
             continue
 
-    if POSITIONS_NFT_HEAVY_PIPELINE:
-        t_left = float(max_seconds) - (time.monotonic() - start)
-        if t_left > 1.0:
-            h_ok, h_fail = _enrich_nft_catalog_heavy_rows_parallel(
-                rows,
-                pos_job_id=pos_job_id,
-                session_id=session_id,
-                max_seconds=min(float(POSITIONS_NFT_HEAVY_MAX_SECONDS), t_left),
-                max_rows=int(POSITIONS_NFT_HEAVY_MAX_ROWS),
-                workers=int(POSITIONS_NFT_HEAVY_WORKERS),
-            )
-            heavy_stats["heavy_ok"] = int(h_ok)
-            heavy_stats["heavy_fail"] = int(h_fail)
     return ok_n, fail_n, heavy_stats
 
 
@@ -15174,6 +15188,7 @@ def _render_positions_page() -> str:
     .status-dot.active { background:#7d9f89; border-color:#6f8e7a; }
     .status-dot.inactive { background:#ab8787; border-color:#987676; }
     .status-dot.hidden { background:#94a3b8; border-color:#64748b; }
+    .status-dot.explorer { background:#93b4d4; border-color:#6b93b8; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     @media (max-width: 1100px) {
@@ -15942,6 +15957,9 @@ def _render_positions_page() -> str:
       const s = String(status || "").trim().toLowerCase();
       if (s === "hidden") {
         return `<span class="status-dot hidden" title="Hidden or closed position (zero liquidity)"></span>`;
+      }
+      if (s === "explorer") {
+        return `<span class="status-dot explorer" title="NFT catalog — waiting for or without on-chain enrich"></span>`;
       }
       const isActive = s === "active";
       const cls = isActive ? "active" : "inactive";
@@ -18903,7 +18921,7 @@ def _scan_positions_core(
         info_notes.append(
             "NFT scan pipeline: (1) Explorer tokennfttx per chain×wallet; "
             "(2) Protocol gate + on-chain open/closed liquidity when assembling rows (tabs: Protocol filter, Closed); "
-            "(3) PM snapshot: light queue (v3 positions()) then parallel heavy queue (v4 getPoolAndPositionInfo, Infinity); "
+            "(3) PM snapshot: parallel heavy queue first (v4 / Infinity), then light (v3 positions()); "
             "(4) Liquidity USD; "
             "(5) Phishing metadata — sync from explorer name/symbol (Web UI: tab «Other issues»), before spam; "
             "(6) Spam heuristics — только реальные позиции с подозрительной парой/TVL (tab: Spam); "
