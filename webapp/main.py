@@ -321,6 +321,10 @@ POSITIONS_EXPLORER_NFT_CATALOG_MAX_ROWS = max(50, min(10000, int(os.environ.get(
 POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC = max(
     12, min(180, int(os.environ.get("POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC", "55")))
 )
+# Retries per tokennfttx page on HTTP failure or transient explorer JSON (rate limits, etc.).
+POSITIONS_EXPLORER_NFTTX_FETCH_RETRIES = max(
+    1, min(10, int(os.environ.get("POSITIONS_EXPLORER_NFTTX_FETCH_RETRIES", "5")))
+)
 # Parallel tokennfttx pages per owner (same URL template); 1 = sequential.
 POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS = max(
     1, min(12, int(os.environ.get("POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS", "4")))
@@ -330,7 +334,7 @@ POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS = max(
 POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1 = os.environ.get(
     "POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
-# All tokennfttx HTTP (every wallet×chain task) shares this cap — avoids api.etherscan storms.
+# All tokennfttx HTTP (all chains; each chain uses one worker with serial pages) shares this cap.
 # Default scales with POSITIONS_NFT_PARALLEL_WORKERS: with workers=8 and page_workers=4, a global cap of 6
 # serializes most in-flight requests (long parallel_fetch). Lower this env if you see rate-limit api_errors.
 _DEFAULT_TOKENNFTTX_GLOBAL = max(8, min(32, int(POSITIONS_NFT_PARALLEL_WORKERS) * 2))
@@ -3763,6 +3767,8 @@ def _explorer_debug_benign_status0_message(message: str) -> bool:
         "no token transfer",
         "no matching entries",
         "query returned no results",
+        "no token nft tx",
+        "no nft token tx",
     )
     return any(x in m for x in benign)
 
@@ -3789,6 +3795,72 @@ def _etherscan_api_coerce_result_rows(raw: Any) -> list[Any]:
         except Exception:
             return []
     return []
+
+
+def _explorer_tokennfttx_payload_needs_retry(pl: dict[str, Any]) -> bool:
+    """
+    True when the HTTP call succeeded but the body looks like a transient explorer failure
+    (empty rows) — should retry the same page, not treat as end-of-list.
+    """
+    if not isinstance(pl, dict):
+        return False
+    msg = str(pl.get("message") or "").lower()
+    status = str(pl.get("status") or "").strip().lower()
+    rows = _etherscan_api_coerce_result_rows(pl.get("result"))
+    if rows:
+        return False
+    transient = (
+        "rate limit",
+        "max rate",
+        "too many requests",
+        "temporarily unavailable",
+        "timeout",
+        "circuit breaker",
+        "unexpected error",
+        "free api access",
+        "daily request count",
+        "limit reached",
+        "server busy",
+        "try again",
+        "gateway",
+        "bad gateway",
+        "service unavailable",
+    )
+    if any(t in msg for t in transient):
+        return True
+    fatal = (
+        "invalid api key",
+        "missing api key",
+        "missing parameter",
+        "invalid address",
+        "address is invalid",
+    )
+    if any(f in msg for f in fatal):
+        return False
+    if status in ("0", "false"):
+        if _explorer_debug_benign_status0_message(str(pl.get("message") or "")):
+            return False
+        return True
+    return False
+
+
+def _explorer_tokennfttx_payload_end_of_list(pl: dict[str, Any]) -> bool:
+    """True when explorer says there are no tokennfttx rows for this page (normal end of pagination)."""
+    if not isinstance(pl, dict):
+        return False
+    status = str(pl.get("status") or "").strip().lower()
+    msg = str(pl.get("message") or "")
+    rows = _etherscan_api_coerce_result_rows(pl.get("result"))
+    if rows:
+        return False
+    if status in ("1", "true"):
+        return True
+    if status in ("0", "false"):
+        return _explorer_debug_benign_status0_message(msg)
+    mlow = str(msg or "").strip().lower()
+    if not status and not rows and mlow == "ok":
+        return True
+    return False
 
 
 def _explorer_debug_count_request_failures(dbg: dict[str, Any]) -> int:
@@ -4991,6 +5063,7 @@ def _explorer_owner_nfttx_rows(
     debug_out: dict[str, Any] | None = None,
     deadline_ts: float | None = None,
     pm_rpc_fallback: bool = True,
+    nft_catalog_serial_http: bool = False,
 ) -> list[dict[str, Any]]:
     cid = int(chain_id)
     o = str(owner or "").strip().lower()
@@ -5012,6 +5085,7 @@ def _explorer_owner_nfttx_rows(
     uni_key = os.environ.get("UNISCAN_API_KEY", "").strip() or eth_key
     if isinstance(debug_out, dict):
         debug_out["chain_id"] = int(cid)
+        debug_out["nft_catalog_serial_http"] = bool(nft_catalog_serial_http)
         debug_out["has_eth_key"] = bool(eth_key)
         debug_out["has_bsc_key"] = bool(bsc_key)
         debug_out["has_base_key"] = bool(base_key)
@@ -5103,6 +5177,8 @@ def _explorer_owner_nfttx_rows(
     max_pages = int(POSITIONS_EXPLORER_NFTTX_MAX_PAGES)
     http_timeout = float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)
     page_workers = max(1, int(POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS))
+    if nft_catalog_serial_http:
+        page_workers = 1
     if isinstance(debug_out, dict):
         debug_out["requests"] = []
         debug_out["http_timeout_sec"] = round(http_timeout, 3)
@@ -5154,27 +5230,45 @@ def _explorer_owner_nfttx_rows(
     if isinstance(debug_out, dict):
         debug_out["template_traces"] = []
 
-    def _fetch_tmpl_page(tmpl_arg: str, page_num: int) -> tuple[int, dict[str, Any] | None]:
+    _nfttx_retry_delays = (0.28, 0.55, 1.1, 2.2, 4.0, 6.0, 8.0, 10.0, 12.0)
+
+    def _fetch_tmpl_page_once(tmpl_arg: str, page_num: int) -> tuple[int, dict[str, Any] | None]:
         url = str(tmpl_arg).replace("{page}", str(page_num))
         req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
-        for attempt in (0, 1):
-            try:
-                with _TOKENNFTTX_HTTP_SEM:
-                    with urlopen(req, timeout=http_timeout) as resp:
-                        payload = json.loads(resp.read().decode("utf-8"))
-                pl = payload if isinstance(payload, dict) else {}
-                return int(page_num), pl
-            except Exception:
-                if attempt == 0:
-                    time.sleep(0.22)
+        try:
+            with _TOKENNFTTX_HTTP_SEM:
+                with urlopen(req, timeout=http_timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+            pl = payload if isinstance(payload, dict) else {}
+            return int(page_num), pl
+        except Exception:
+            return int(page_num), None
+
+    def _fetch_tmpl_page(tmpl_arg: str, page_num: int) -> tuple[int, dict[str, Any] | None]:
+        n_try = int(POSITIONS_EXPLORER_NFTTX_FETCH_RETRIES)
+        last_pn = int(page_num)
+        last_pl: dict[str, Any] | None = None
+        for attempt in range(n_try):
+            pn, pl = _fetch_tmpl_page_once(tmpl_arg, page_num)
+            last_pn = int(pn)
+            last_pl = pl
+            if pl is None:
+                if attempt < n_try - 1:
+                    time.sleep(_nfttx_retry_delays[min(attempt, len(_nfttx_retry_delays) - 1)])
+                continue
+            if _explorer_tokennfttx_payload_needs_retry(pl):
+                if attempt < n_try - 1:
+                    time.sleep(_nfttx_retry_delays[min(attempt, len(_nfttx_retry_delays) - 1)])
                     continue
-                return int(page_num), None
+            return pn, pl
+        return last_pn, last_pl
 
     tpl_page1_prefetch: dict[int, dict[str, Any] | None] = {}
     if (
         POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1
         and len(url_templates) > 1
         and not _deadline_hit()
+        and not nft_catalog_serial_http
     ):
         if isinstance(debug_out, dict):
             debug_out["parallel_tpl_page1"] = True
@@ -5249,20 +5343,27 @@ def _explorer_owner_nfttx_rows(
                         _dbg_append(pn, url, pl)
 
             stop_tmpl = False
+            tpl_broken = False
             for pn in sorted(page_payloads.keys()):
                 pl = page_payloads.get(pn)
                 if pl is None:
+                    tpl_broken = True
                     continue
                 if isinstance(pl, dict):
                     last_status = str(pl.get("status") or "")
                     last_message = str(pl.get("message") or "")
                 st = _append_from_result(pl.get("result"))
                 if st == "empty":
-                    stop_tmpl = True
-                    break
+                    if isinstance(pl, dict) and _explorer_tokennfttx_payload_end_of_list(pl):
+                        stop_tmpl = True
+                        break
+                    tpl_broken = True
+                    continue
                 if st == "full":
                     return _finalize()
             if stop_tmpl:
+                break
+            if tpl_broken:
                 break
             page = batch_end + 1
 
@@ -11473,6 +11574,7 @@ def _explorer_nft_catalog_owner_chain_scan(
             debug_out=dbg,
             deadline_ts=deadline_ts,
             pm_rpc_fallback=True,
+            nft_catalog_serial_http=True,
         )
         owned = _explorer_tokennfttx_currently_owned_contract_token_ids(nft_rows, ok)
     except Exception as e:
@@ -11496,7 +11598,7 @@ def _scan_pool_positions_explorer_nft_catalog(
     hard_scan: bool = False,
     pos_job_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any]]:
-    """tokennfttx per (chain, owner) in parallel → SQLite (supported DEX only) + UI rows."""
+    """tokennfttx: parallel across chains only; wallets on the same chain run sequentially (one HTTP stream per chain)."""
     _ = (pre_enqueued_ownership_refresh, hard_scan)
     rows_out: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -11546,10 +11648,21 @@ def _scan_pool_positions_explorer_nft_catalog(
             ok = str(o).strip().lower()
             tasks.append((int(cid), ok))
 
-    # NFT catalog: dedicated cap so tuning doesn't affect subgraph / contract-only paths.
-    workers = max(1, min(int(POSITIONS_NFT_PARALLEL_WORKERS), len(tasks)))
+    owners_by_chain: dict[int, list[str]] = {}
+    for cid, ok in tasks:
+        owners_by_chain.setdefault(int(cid), []).append(str(ok).strip().lower())
+    chain_batches: list[tuple[int, list[str]]] = []
+    for cid in ordered_chain_ids:
+        ows = owners_by_chain.get(int(cid))
+        if ows:
+            chain_batches.append((int(cid), ows))
+
+    # NFT catalog: parallelize only across chains (POSITIONS_NFT_PARALLEL_WORKERS = max concurrent chains).
+    workers = max(1, min(int(POSITIONS_NFT_PARALLEL_WORKERS), len(chain_batches)))
     timings["parallel_workers"] = int(workers)
     timings["nft_parallel_workers_cap"] = int(POSITIONS_NFT_PARALLEL_WORKERS)
+    timings["nft_fetch_parallelism"] = "by_chain"
+    timings["nft_parallel_chain_count"] = int(len(chain_batches))
     timings["owner_chain_tasks"] = int(len(tasks))
 
     n_tasks = int(len(tasks))
@@ -11573,40 +11686,29 @@ def _scan_pool_positions_explorer_nft_catalog(
                 nft_scan_api_errors=0,
             )
     elif tasks:
-        done_ct = 0
-        rows_sum = 0
-        task_err_ct = 0
-        api_err_sum = 0
         t_parallel0 = time.monotonic()
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {
-                ex.submit(_explorer_nft_catalog_owner_chain_scan, cid, ok, max_rows, deadline_ts): (cid, ok)
-                for cid, ok in tasks
-            }
-            for fut in as_completed(futs):
-                cid0, ok0 = futs[fut]
-                try:
-                    fr = fut.result()
-                    fetch_results.append(fr)
-                except Exception as e:
-                    err_s = str(e)[:200]
-                    errors.append(f"explorer_nft_catalog wallet={ok0[:10]}… chain={cid0}: {err_s}")
-                    fr = {
-                        "chain_id": int(cid0),
-                        "owner": str(ok0).strip().lower(),
-                        "nft_rows": [],
-                        "owned": [],
-                        "debug": {"error": err_s},
-                        "error": err_s,
-                    }
-                    fetch_results.append(fr)
+        prog_lock = threading.Lock()
+        prog: dict[str, int] = {"done": 0, "rows": 0, "task_err": 0, "api_err": 0}
+
+        def _nft_fetch_chain_batch(cid0: int, owners0: list[str]) -> list[dict[str, Any]]:
+            chunk: list[dict[str, Any]] = []
+            for ok in owners0:
+                fr = _explorer_nft_catalog_owner_chain_scan(cid0, ok, max_rows, deadline_ts)
+                chunk.append(fr)
                 dbg_fr = fr.get("debug") if isinstance(fr.get("debug"), dict) else {}
-                api_err_sum += int(_explorer_debug_count_request_failures(dbg_fr))
-                if str(fr.get("error") or "").strip():
-                    task_err_ct += 1
+                api_inc = int(_explorer_debug_count_request_failures(dbg_fr))
+                te_inc = 1 if str(fr.get("error") or "").strip() else 0
                 nr = fr.get("nft_rows") if isinstance(fr.get("nft_rows"), list) else []
-                rows_sum += int(len(nr))
-                done_ct += 1
+                row_inc = int(len(nr))
+                with prog_lock:
+                    prog["done"] += 1
+                    prog["rows"] += row_inc
+                    prog["task_err"] += te_inc
+                    prog["api_err"] += api_inc
+                    done_ct = int(prog["done"])
+                    rows_sum = int(prog["rows"])
+                    task_err_ct = int(prog["task_err"])
+                    api_err_sum = int(prog["api_err"])
                 if pos_job_id:
                     pct = (100.0 * float(done_ct) / float(n_tasks)) if n_tasks else 100.0
                     _update_pos_job(
@@ -11614,7 +11716,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                         progress=float(_nft_parallel_job_progress(done_ct, n_tasks)),
                         stage_label=(
                             f"Scanning NFT collections — {pct:.1f}% "
-                            f"({done_ct}/{n_tasks} wallet×chain)"
+                            f"({done_ct}/{n_tasks} wallet×chain, parallel chains)"
                         ),
                         nft_scan_tasks_total=int(n_tasks),
                         nft_scan_tasks_done=int(done_ct),
@@ -11622,7 +11724,36 @@ def _scan_pool_positions_explorer_nft_catalog(
                         nft_scan_task_errors=int(task_err_ct),
                         nft_scan_api_errors=int(api_err_sum),
                     )
+            return chunk
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {
+                ex.submit(_nft_fetch_chain_batch, c, ow): int(c)
+                for c, ow in chain_batches
+            }
+            for fut in as_completed(futs):
+                cid_chain = int(futs[fut])
+                try:
+                    fetch_results.extend(fut.result())
+                except Exception as e:
+                    err_s = str(e)[:200]
+                    errors.append(f"explorer_nft_catalog chain={cid_chain}: {err_s}")
+                    ow_failed = next((ow for c, ow in chain_batches if int(c) == cid_chain), [])
+                    for ok in ow_failed:
+                        fetch_results.append(
+                            {
+                                "chain_id": int(cid_chain),
+                                "owner": str(ok).strip().lower(),
+                                "nft_rows": [],
+                                "owned": [],
+                                "debug": {"error": err_s},
+                                "error": err_s,
+                            }
+                        )
         timings["nft_parallel_fetch_sec"] = round(max(0.0, time.monotonic() - t_parallel0), 3)
+        rows_sum = int(prog["rows"])
+        task_err_ct = int(prog["task_err"])
+        api_err_sum = int(prog["api_err"])
         if pos_job_id:
             _update_pos_job(
                 pos_job_id,
@@ -13705,6 +13836,9 @@ def _render_placeholder_page(
       margin: 0 auto;
       padding: 18px;
       min-height: calc(100vh - 36px);
+      width: 100%;
+      min-width: 0;
+      overflow-x: clip;
     }}
     .header {{
       display: flex;
@@ -13712,6 +13846,7 @@ def _render_placeholder_page(
       align-items: center;
       gap: 12px;
       margin-bottom: 14px;
+      min-width: 0;
     }}
     .title {{
       margin: 0;
@@ -14221,16 +14356,18 @@ def _render_placeholder_page(
 
 def _render_positions_page() -> str:
     extra_css = """
-    .positions-grid { display:grid; gap:14px; margin-top:4px; }
+    .positions-grid { display:grid; gap:14px; margin-top:4px; min-width:0; width:100%; max-width:100%; }
     .positions-form, .result-card {
       background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%);
       border: 1px solid #d4deee;
       border-radius: 14px;
       padding: 14px;
       box-shadow: 0 6px 20px rgba(15,23,42,0.06);
+      min-width: 0;
+      max-width: 100%;
     }
     .positions-form h3, .result-card h3 { margin:0; font-size:17px; color:#1f3a8a; }
-    .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }
+    .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; min-width:0; }
     .address-columns { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
     .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
     .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
@@ -14244,9 +14381,9 @@ def _render_positions_page() -> str:
     .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:13px; font-weight:700; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
-    .section-actions { display:flex; align-items:center; gap:10px; }
+    .section-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; min-width:0; flex:1 1 auto; }
     .section-head .section-actions { margin-left: auto; justify-content: flex-end; }
-    .section-body { display:block; }
+    .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
     .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:12px; padding:0 0 0 4px; }
     .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
@@ -14256,14 +14393,24 @@ def _render_positions_page() -> str:
       color:#475569;
       font-size:13px;
       display:inline-block;
-      min-width: 300px;
-      max-width: 520px;
+      min-width: 0;
+      flex: 1 1 160px;
+      max-width: min(520px, 100%);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
       vertical-align: middle;
     }
-    .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
+    .table-wrap {
+      overflow-x:auto;
+      -webkit-overflow-scrolling: touch;
+      border:1px solid #dbe3ef;
+      border-radius:10px;
+      background:#f8fbff;
+      width:100%;
+      max-width:100%;
+      min-width:0;
+    }
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:860px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; font-size:12px; font-weight:700; padding:6px 6px; }
@@ -14319,7 +14466,7 @@ def _render_positions_page() -> str:
       .addr-input-row input { font-size: 12px; padding: 7px; }
       .btn-plus { width: 24px; min-width: 24px; height: 24px; font-size: 20px; }
       .chip { font-size: 11px; padding: 3px 7px; }
-      .pos-status { font-size: 12px; min-width: 180px; max-width: 72vw; }
+      .pos-status { font-size: 12px; min-width: 0; max-width: 100%; flex: 1 1 140px; }
       .table-wrap { border-radius: 8px; }
       table { min-width: 740px; font-size: 11px; }
       th, td { padding: 6px; }
@@ -15700,16 +15847,18 @@ def _render_positions_page() -> str:
 
 def _render_stables_page() -> str:
     extra_css = """
-    .positions-grid { display:grid; gap:14px; margin-top:4px; }
+    .positions-grid { display:grid; gap:14px; margin-top:4px; min-width:0; width:100%; max-width:100%; }
     .positions-form, .result-card {
       background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%);
       border: 1px solid #d4deee;
       border-radius: 14px;
       padding: 14px;
       box-shadow: 0 6px 20px rgba(15,23,42,0.06);
+      min-width: 0;
+      max-width: 100%;
     }
     .positions-form h3, .result-card h3 { margin:0; font-size:17px; color:#1f3a8a; }
-    .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }
+    .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; min-width:0; }
     .address-columns { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
     .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
     .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
@@ -15723,14 +15872,23 @@ def _render_stables_page() -> str:
     .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:13px; font-weight:700; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
-    .section-actions { display:flex; align-items:center; gap:10px; }
-    .section-body { display:block; }
+    .section-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; min-width:0; flex:1 1 auto; }
+    .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
     .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
     .pos-progress .bar { width: 40%; height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); animation: posLoad 1s linear infinite; }
     @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
-    .pos-status { color:#475569; font-size:13px; }
-    .table-wrap { overflow-x:auto; border:1px solid #dbe3ef; border-radius:10px; background:#f8fbff; }
+    .pos-status { color:#475569; font-size:13px; min-width:0; flex:1 1 160px; max-width:min(520px,100%); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .table-wrap {
+      overflow-x:auto;
+      -webkit-overflow-scrolling: touch;
+      border:1px solid #dbe3ef;
+      border-radius:10px;
+      background:#f8fbff;
+      width:100%;
+      max-width:100%;
+      min-width:0;
+    }
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
@@ -15752,7 +15910,7 @@ def _render_stables_page() -> str:
       .addr-input-row input { font-size: 12px; padding: 7px; }
       .btn-plus { width: 24px; min-width: 24px; height: 24px; font-size: 20px; }
       .chip { font-size: 11px; padding: 3px 7px; }
-      .pos-status { font-size: 12px; }
+      .pos-status { font-size: 12px; min-width: 0; max-width: 100%; flex: 1 1 140px; }
       .table-wrap { border-radius: 8px; }
       table { min-width: 740px; font-size: 11px; }
       th, td { padding: 6px; }
@@ -16014,7 +16172,15 @@ def _render_admin_page() -> str:
       min-height: 100vh;
       overflow-x: hidden;
     }}
-    .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; min-height: calc(100vh - 36px); }}
+    .container {{
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 18px;
+      min-height: calc(100vh - 36px);
+      width: 100%;
+      min-width: 0;
+      overflow-x: clip;
+    }}
     .header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }}
     .title {{ margin: 0; font-size: 30px; font-weight: 800; letter-spacing: 0.2px; }}
     .subtitle {{ margin: 4px 0 0; color: #64748b; font-size: 14px; }}
@@ -16745,7 +16911,15 @@ def _render_help_page() -> str:
     html {{ overflow-y: scroll; scrollbar-gutter: stable; overflow-x: hidden; }}
     body {{ margin: 0; font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg, #d9e3f5 0%, #ecf2ff 100%); color: #0f172a; overflow-x: hidden; }}
     body {{ min-height: 100vh; }}
-    .container {{ max-width: 1200px; margin: 0 auto; padding: 18px; min-height: calc(100vh - 36px); }}
+    .container {{
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 18px;
+      min-height: calc(100vh - 36px);
+      width: 100%;
+      min-width: 0;
+      overflow-x: clip;
+    }}
     .header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }}
     .title {{ margin: 0; font-size: 30px; font-weight: 800; letter-spacing: 0.2px; }}
     .subtitle {{ margin: 4px 0 0; color: #64748b; font-size: 14px; }}
@@ -17714,11 +17888,13 @@ def _build_positions_info_notes(
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         info_notes.append(
             "Explorer NFT catalog: tokennfttx only; "
-            f"parallel wallet×chain tasks={POSITIONS_NFT_PARALLEL_WORKERS} (ThreadPool cap), "
+            f"parallel chains only (cap={POSITIONS_NFT_PARALLEL_WORKERS} ThreadPool workers), "
+            f"wallets per chain sequential + serial tokennfttx pages; "
             f"tokennfttx_http_concurrency={POSITIONS_EXPLORER_NFTTX_GLOBAL_CONCURRENCY} (global), "
             f"page_workers={POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS}, "
             f"parallel_template_page1={int(bool(POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1))}, "
-            f"scan_budget={POSITIONS_SCAN_MAX_SECONDS}s, http_timeout={POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC}s; "
+            f"scan_budget={POSITIONS_SCAN_MAX_SECONDS}s, http_timeout={POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC}s, "
+            f"tokennfttx_page_retries={POSITIONS_EXPLORER_NFTTX_FETCH_RETRIES}; "
             "non-Uniswap/Pancake NFTs are listed as unsupported only."
         )
     if POSITIONS_CONTRACT_ONLY_ENABLED:
@@ -18836,6 +19012,9 @@ HTML_PAGE = """
       margin: 0 auto;
       padding: 18px;
       min-height: calc(100vh - 36px);
+      width: 100%;
+      min-width: 0;
+      overflow-x: clip;
     }
     .header {
       display: flex;
@@ -18843,6 +19022,7 @@ HTML_PAGE = """
       align-items: center;
       gap: 12px;
       margin-bottom: 14px;
+      min-width: 0;
     }
     .title {
       margin: 0;
