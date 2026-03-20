@@ -6238,11 +6238,6 @@ def _apply_nft_catalog_spam_heuristics(rows: list[dict[str, Any]]) -> int:
             continue
         if bool(row.get("unsupported_protocol")):
             continue
-        if bool(row.get("_nft_catalog_owner_mismatch")):
-            row["suspected_spam"] = True
-            row["spam_skipped"] = True
-            flagged += 1
-            continue
         chain_key = str(row.get("chain") or "").strip().lower()
         chain_addr_map = _token_addr_symbol_map_for_chain(chain_key)
         t0 = str(row.get("token0_id") or "").strip().lower()
@@ -10245,6 +10240,16 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
         # Keep spam mark sticky across merged rows.
         acc["suspected_spam"] = bool(acc.get("suspected_spam")) or bool(row.get("suspected_spam"))
         acc["spam_skipped"] = bool(acc.get("spam_skipped")) or bool(row.get("spam_skipped"))
+        acc["nft_catalog_scan_mismatch"] = bool(acc.get("nft_catalog_scan_mismatch")) or bool(
+            row.get("nft_catalog_scan_mismatch")
+        )
+        mr_acc = str(acc.get("nft_catalog_mismatch_reason") or "").strip()
+        mr_row = str(row.get("nft_catalog_mismatch_reason") or "").strip()
+        if mr_row:
+            if not mr_acc:
+                acc["nft_catalog_mismatch_reason"] = mr_row
+            elif mr_row != mr_acc and mr_row not in mr_acc:
+                acc["nft_catalog_mismatch_reason"] = f"{mr_acc} | {mr_row}"
         acc_ids = [str(x) for x in (acc.get("position_ids") or []) if str(x).strip()]
         row_ids = [str(x) for x in (row.get("position_ids") or []) if str(x).strip()]
         if row_ids:
@@ -10675,6 +10680,42 @@ def _nft_catalog_row_enrich_protocol(row: dict[str, Any]) -> str:
     return ""
 
 
+def _nft_catalog_row_is_explorer_tokennfttx(row: dict[str, Any]) -> bool:
+    """Строка из сканирования NFT-коллекции (Etherscan tokennfttx → explorer catalog)."""
+    return str((row or {}).get("pair_symbol_source") or "").strip() == "explorer:tokennfttx"
+
+
+def _nft_catalog_scan_owner_mismatch_reason(
+    chain_id: int,
+    protocol: str,
+    row: dict[str, Any],
+    token_id: int,
+    wallet_owner: str,
+) -> str:
+    """
+    Сверка «explorer transfer list» с ownerOf(NFT): не спам.
+
+    V4 Uniswap, Pancake v3 в фарминге, Pancake Infinity — когда on-chain owner = custody из allowlist,
+    возвращается пустая строка (несовпадения нет).
+    """
+    if not _nft_catalog_row_is_explorer_tokennfttx(row):
+        return ""
+    o = str(wallet_owner or "").strip().lower()
+    if not _is_eth_address(o):
+        return ""
+    nft_contract = str(row.get("pool_id") or "").strip().lower()
+    tid = int(token_id)
+    if not _is_eth_address(nft_contract) or tid <= 0:
+        return ""
+    proto = str(protocol or "").strip().lower()
+    cur_owner = _erc721_owner_of_address_lower(int(chain_id), nft_contract, int(tid))
+    if not _is_eth_address(cur_owner) or cur_owner == "0x0000000000000000000000000000000000000000":
+        return "owner_burned_or_unknown"
+    if cur_owner != o and not _owner_matches_wallet_or_custody(int(chain_id), proto, o, cur_owner):
+        return "owner_not_wallet_or_custody_explorer_claim"
+    return ""
+
+
 def _enrich_nft_catalog_rows_from_chain(
     rows: list[dict[str, Any]],
     *,
@@ -10703,32 +10744,45 @@ def _enrich_nft_catalog_rows_from_chain(
         if chain_id <= 0 or token_id <= 0:
             continue
         seg = str(row.get("catalog_segment") or "").strip().lower()
-        # On-chain pair / fee / in-position for open (and unknown) only; closed rows use light path (UI: collapsed section).
+        is_ex_nft = _nft_catalog_row_is_explorer_tokennfttx(row)
+        # Closed: только проверка ownerOf для вкладки «несовпадения скана» (без обогащения PM).
         if seg == "closed":
+            if is_ex_nft:
+                om = _nft_catalog_scan_owner_mismatch_reason(chain_id, proto, row, int(token_id), owner)
+                if om:
+                    row["nft_catalog_scan_mismatch"] = True
+                    row["nft_catalog_mismatch_reason"] = str(om)
+                    fail_n += 1
+                else:
+                    row["nft_catalog_scan_mismatch"] = False
+                    row["nft_catalog_mismatch_reason"] = ""
             continue
-        nft_contract = str(row.get("pool_id") or "").strip().lower()
-        cur_owner = _erc721_owner_of_address_lower(chain_id, nft_contract, int(token_id))
-        if not _is_eth_address(cur_owner) or cur_owner == "0x0000000000000000000000000000000000000000":
-            row["_nft_catalog_owner_mismatch"] = True
-            row["suspected_spam"] = True
-            row["spam_skipped"] = True
-            fail_n += 1
-            continue
-        if cur_owner != owner and not _owner_matches_wallet_or_custody(chain_id, proto, owner, cur_owner):
-            row["_nft_catalog_owner_mismatch"] = True
-            row["suspected_spam"] = True
-            row["spam_skipped"] = True
-            fail_n += 1
-            continue
+        # Open / unknown: ownerOf (с учётом custody) до тяжёлого snapshot.
+        if is_ex_nft:
+            om = _nft_catalog_scan_owner_mismatch_reason(chain_id, proto, row, int(token_id), owner)
+            if om:
+                row["nft_catalog_scan_mismatch"] = True
+                row["nft_catalog_mismatch_reason"] = str(om)
+                fail_n += 1
+                continue
         try:
             snap = _fetch_v3_position_contract_snapshot(chain_id, proto, int(token_id), owner)
             if not isinstance(snap, dict):
+                if is_ex_nft:
+                    row["nft_catalog_scan_mismatch"] = True
+                    row["nft_catalog_mismatch_reason"] = "position_snapshot_unavailable"
                 fail_n += 1
                 continue
             updates = _build_row_updates_from_snapshot(row, snap, chain_id)
             row.update(updates)
+            if is_ex_nft:
+                row["nft_catalog_scan_mismatch"] = False
+                row["nft_catalog_mismatch_reason"] = ""
             ok_n += 1
         except Exception:
+            if is_ex_nft:
+                row["nft_catalog_scan_mismatch"] = True
+                row["nft_catalog_mismatch_reason"] = "position_snapshot_unavailable"
             fail_n += 1
             continue
     return ok_n, fail_n
@@ -11135,6 +11189,8 @@ def _scan_pool_positions_explorer_nft_catalog(
                     "fees_owed_display": "-",
                     "suspected_spam": False,
                     "spam_skipped": False,
+                    "nft_catalog_scan_mismatch": False,
+                    "nft_catalog_mismatch_reason": "",
                     "liquidity_usd": None,
                     "position_created_date": created if created else "-",
                     "unsupported_protocol": bool(unsupported_protocol),
@@ -13629,6 +13685,19 @@ def _render_positions_page() -> str:
       position: sticky; left: 0; z-index: 4; background: #f8fbff;
     }
     #posPoolsTable th:nth-child(1) { background: #eff6ff; z-index: 5; }
+    #posPoolsMismatchTable { min-width: 1320px; table-layout: auto; }
+    #posPoolsMismatchTable th, #posPoolsMismatchTable td { white-space: nowrap; }
+    #posPoolsMismatchTable th:nth-child(1), #posPoolsMismatchTable td:nth-child(1) {
+      position: sticky; left: 0; z-index: 4; background: #f8fbff;
+    }
+    #posPoolsMismatchTable th:nth-child(1) { background: #fff7ed; z-index: 5; }
+    .pos-pools-tab-bar { display: none; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .pos-tab-btn {
+      border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
+      padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+    }
+    .pos-tab-btn:hover { border-color: #93c5fd; color: #1d4ed8; }
+    .pos-tab-btn.active { border-color: #2563eb; background: #eff6ff; color: #1e3a8a; }
     #posPoolsTable td.pos-pools-details-cell { white-space: normal; vertical-align: middle; background: #f1f5f9; }
     #posPoolsTable .pos-collapsed-section summary {
       cursor: pointer; font-weight: 700; color: #1e3a8a; padding: 8px 6px; user-select: none;
@@ -13709,7 +13778,12 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posPoolsBody" class="section-body">
-          <div class="table-wrap"><table id="posPoolsTable"></table></div>
+          <div class="pos-pools-tab-bar" id="posPoolsTabBar" title="NFT collection scan: issues that are not spam (farming / V4 / Infinity use custody allowlist)">
+            <button type="button" class="pos-tab-btn active" data-pos-tab="main" onclick="switchPosPoolsTab('main')">Positions</button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="mismatch" onclick="switchPosPoolsTab('mismatch')">NFT collection issues <span id="posMismatchTabCount"></span></button>
+          </div>
+          <div class="table-wrap" id="posPoolsTableMainWrap"><table id="posPoolsTable"></table></div>
+          <div class="table-wrap" id="posPoolsTableMismatchWrap" style="display:none"><table id="posPoolsMismatchTable"></table></div>
           <div id="posErrors"></div>
         </div>
       </section>
@@ -13809,6 +13883,34 @@ def _render_positions_page() -> str:
     const POS_HIDDEN_EXPANDED_KEY = "positions_hidden_expanded_v1";
     const POS_UNSUPPORTED_EXPANDED_KEY = "positions_unsupported_protocols_expanded_v1";
     const POS_CLOSED_EXPANDED_KEY = "positions_closed_positions_expanded_v1";
+    const POS_POOLS_TAB_KEY = "positions_pools_tab_v1";
+    const NFT_CATALOG_MISMATCH_LABELS = {
+      owner_burned_or_unknown: "Burned or no on-chain owner (explorer row may not match this token id)",
+      owner_not_wallet_or_custody_explorer_claim: "Owner on chain is not your wallet and not a known custody contract",
+      position_snapshot_unavailable: "Could not read position from PM (RPC or invalid token id)",
+    };
+    function nftCatalogMismatchLabel(code) {
+      const c = String(code || "").trim();
+      if (c.includes(" | ")) {
+        return c.split(" | ").map((x) => nftCatalogMismatchLabel(x.trim())).join(" | ");
+      }
+      return NFT_CATALOG_MISMATCH_LABELS[c] || (c ? c : "—");
+    }
+    function switchPosPoolsTab(name, silent) {
+      const mainW = document.getElementById("posPoolsTableMainWrap");
+      const mmW = document.getElementById("posPoolsTableMismatchWrap");
+      if (!mainW || !mmW) return;
+      const wantMm = String(name || "").toLowerCase() === "mismatch";
+      mainW.style.display = wantMm ? "none" : "block";
+      mmW.style.display = wantMm ? "block" : "none";
+      document.querySelectorAll("#posPoolsTabBar [data-pos-tab]").forEach((b) => {
+        const t = b.getAttribute("data-pos-tab") || "";
+        b.classList.toggle("active", wantMm ? t === "mismatch" : t === "main");
+      });
+      if (!silent) {
+        try { localStorage.setItem(POS_POOLS_TAB_KEY, wantMm ? "mismatch" : "main"); } catch (_) {}
+      }
+    }
     let posHasScannedOnce = false;
     let posScanTicker = null;
     let posScanStartedAt = 0;
@@ -14351,6 +14453,7 @@ def _render_positions_page() -> str:
       const closedRows = [];
       const hiddenRows = [];
       const unsupportedRows = [];
+      const mismatchRows = [];
       let spamHiddenCount = 0;
       for (let i = 0; i < listAll.length; i++) {
         const r0 = listAll[i];
@@ -14369,6 +14472,11 @@ def _render_positions_page() -> str:
         row._is_unsupported_protocol = unsupported;
         if (unsupported) {
           unsupportedRows.push(row);
+          continue;
+        }
+        const catScanMm = !!(row && (row.nft_catalog_scan_mismatch === true || row.nft_catalog_scan_mismatch === 1));
+        if (catScanMm) {
+          mismatchRows.push(row);
           continue;
         }
         if (isClosed) {
@@ -14479,7 +14587,55 @@ def _render_positions_page() -> str:
           : `Hidden positions (${hiddenRows.length})`;
         html += `<tr><td colspan='${totalCols}' class='pos-pools-details-cell'><details id='posHiddenDetails' class='pos-collapsed-section'${openAttr}><summary>${hiddenSummary}</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
       }
+      const mmCols = 14;
+      let mmHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th title="NFT collection scan: explorer tokennfttx row vs on-chain owner / PM read">Scan issue</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      for (let mi = 0; mi < mismatchRows.length; mi++) {
+        const r = mismatchRows[mi];
+        const pm = hasPairMismatch(r);
+        const pmStyle = pm ? " style='background:#fff7ed;color:#9a3412;font-weight:600'" : "";
+        const pairTrace = String(r.pair_symbol_source || "").trim();
+        const pairTitleRaw = pm
+          ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`
+          : (pairTrace ? `source: ${pairTrace}` : "");
+        const pmTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
+        const reasonCode = String(r.nft_catalog_mismatch_reason || "").trim();
+        const issueLabel = nftCatalogMismatchLabel(reasonCode);
+        const issueTitle = ` title="${escAttr(reasonCode || issueLabel)}"`;
+        mmHtml += "<tr>";
+        mmHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
+        mmHtml += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
+        mmHtml += `<td>${esc(r.chain || "")}</td>`;
+        mmHtml += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
+        mmHtml += `<td style='max-width:240px;white-space:normal;font-size:11px;line-height:1.35'${issueTitle}>${esc(issueLabel)}</td>`;
+        const rowKeyEscMm = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
+        mmHtml += `<td${pmStyle}${pmTitle}>${esc(r.pair || "")}${pm ? " ⚠" : ""}</td>`;
+        const feeRawMm = String(r.fee_tier_raw || "").trim();
+        const feeTipMm = feeRawMm ? ` title="raw: ${esc(feeRawMm)}"` : "";
+        mmHtml += `<td${feeTipMm}>${esc(r.fee_tier || "")}</td>`;
+        mmHtml += `<td>${esc(r.position_created_date || "-")}</td>`;
+        mmHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
+        mmHtml += `<td${pmStyle}${pmTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        mmHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
+        mmHtml += `<td${pmStyle}${pmTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        mmHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscMm}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
+        const checkedMm = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
+        mmHtml += `<td><input type='checkbox' ${checkedMm} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
+        mmHtml += "</tr>";
+      }
+      if (!mismatchRows.length) {
+        mmHtml += `<tr><td colspan='${mmCols}' style='white-space:normal;color:#64748b'>No NFT collection scan issues. Rows appear when explorer transfer indexing and on-chain owner or PM read disagree. Legitimate custody (Pancake farm, Uniswap V4, Pancake Infinity, etc.) uses the allowlist and is not listed here.</td></tr>`;
+      }
       table.innerHTML = html;
+      const mmTable = document.getElementById("posPoolsMismatchTable");
+      if (mmTable) mmTable.innerHTML = mmHtml;
+      const tabBar = document.getElementById("posPoolsTabBar");
+      const cntEl = document.getElementById("posMismatchTabCount");
+      if (tabBar) tabBar.style.display = mismatchRows.length ? "flex" : "none";
+      if (cntEl) cntEl.textContent = mismatchRows.length ? `(${mismatchRows.length})` : "";
+      let savedPoolsTab = "";
+      try { savedPoolsTab = String(localStorage.getItem(POS_POOLS_TAB_KEY) || ""); } catch (_) { savedPoolsTab = ""; }
+      if (mismatchRows.length && savedPoolsTab === "mismatch") switchPosPoolsTab("mismatch", true);
+      else switchPosPoolsTab("main", true);
       const closedEl = document.getElementById("posClosedDetails");
       if (closedEl) {
         closedEl.addEventListener("toggle", () => {
