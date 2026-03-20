@@ -316,6 +316,32 @@ POSITIONS_EXPLORER_NFT_CATALOG_SCAN = os.environ.get("POSITIONS_EXPLORER_NFT_CAT
     "on",
 )
 POSITIONS_EXPLORER_NFT_CATALOG_MAX_ROWS = max(50, min(10000, int(os.environ.get("POSITIONS_EXPLORER_NFT_CATALOG_MAX_ROWS", "2000"))))
+# После tokennfttx: v4 / Pancake Infinity и др. — отдельный параллельный PM-snapshot (не блокирует лёгкий v3 enrich).
+POSITIONS_NFT_HEAVY_PIPELINE = os.environ.get("POSITIONS_NFT_HEAVY_PIPELINE", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_NFT_HEAVY_WORKERS = max(1, min(32, int(os.environ.get("POSITIONS_NFT_HEAVY_WORKERS", "4"))))
+POSITIONS_NFT_HEAVY_MAX_SECONDS = max(5.0, float(os.environ.get("POSITIONS_NFT_HEAVY_MAX_SECONDS", "48")))
+POSITIONS_NFT_HEAVY_MAX_ROWS = max(1, min(500, int(os.environ.get("POSITIONS_NFT_HEAVY_MAX_ROWS", "120"))))
+POSITIONS_NFT_HEAVY_DEBUG_LOG = os.environ.get("POSITIONS_NFT_HEAVY_DEBUG_LOG", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POSITIONS_HEAVY_ENRICH_DEBUG_HTTP = os.environ.get("POSITIONS_HEAVY_ENRICH_DEBUG_HTTP", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS: frozenset[str] = frozenset(
+    {"uniswap_v4", "pancake_infinity_cl", "pancake_infinity_bin"}
+)
+_HEAVY_ENRICH_DEBUG_LOCK = threading.Lock()
 # HTTP read timeout per explorer tokennfttx request (slow indexers / large pages).
 POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC = max(
     12, min(180, int(os.environ.get("POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC", "55")))
@@ -932,7 +958,74 @@ def _init_analytics_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pos_details_updated ON position_details_cache(updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_erc721_owner_chain ON owner_erc721_contracts(owner, chain_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_erc721_seen ON owner_erc721_contracts(last_seen_ts)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS heavy_protocol_enrich_debug (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts REAL NOT NULL,
+              job_id TEXT NOT NULL DEFAULT '',
+              session_id TEXT NOT NULL DEFAULT '',
+              chain_id INTEGER NOT NULL DEFAULT 0,
+              owner TEXT NOT NULL DEFAULT '',
+              pm_contract TEXT NOT NULL DEFAULT '',
+              position_id TEXT NOT NULL DEFAULT '',
+              internal_protocol TEXT NOT NULL DEFAULT '',
+              phase TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT '',
+              detail TEXT NOT NULL DEFAULT '',
+              duration_ms INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_heavy_enrich_ts ON heavy_protocol_enrich_debug(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_heavy_enrich_job ON heavy_protocol_enrich_debug(job_id)")
         conn.commit()
+
+
+def _log_heavy_protocol_enrich_debug(
+    *,
+    job_id: str,
+    session_id: str,
+    chain_id: int,
+    owner: str,
+    pm_contract: str,
+    position_id: str,
+    internal_protocol: str,
+    phase: str,
+    status: str,
+    detail: str,
+    duration_ms: int,
+) -> None:
+    if not ANALYTICS_ENABLED or not POSITIONS_NFT_HEAVY_DEBUG_LOG:
+        return
+    try:
+        with _HEAVY_ENRICH_DEBUG_LOCK:
+            with _analytics_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO heavy_protocol_enrich_debug(
+                      ts, job_id, session_id, chain_id, owner, pm_contract, position_id,
+                      internal_protocol, phase, status, detail, duration_ms
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        float(time.time()),
+                        str(job_id or "")[:120],
+                        str(session_id or "")[:120],
+                        int(chain_id),
+                        str(owner or "").lower()[:66],
+                        str(pm_contract or "").lower()[:66],
+                        str(position_id or "")[:48],
+                        str(internal_protocol or "")[:40],
+                        str(phase or "")[:48],
+                        str(status or "")[:24],
+                        str(detail or "")[:8000],
+                        int(max(0, int(duration_ms))),
+                    ),
+                )
+                conn.commit()
+    except Exception:
+        pass
 
 
 def _analytics_set_state(key: str, value: str) -> None:
@@ -2532,6 +2625,134 @@ def _fetch_v3_position_contract_snapshot(
         return dict(payload)
     except Exception:
         return None
+
+
+def _uniswap_v4_pm_snapshot_v3shaped(
+    chain_id: int,
+    token_id: int,
+    owner_hint: str,
+    *,
+    allow_owner_mismatch: bool = False,
+) -> dict[str, Any] | None:
+    """
+    Снимок позиции Uniswap v4 PM в формате, совместимом с _build_row_updates_from_snapshot
+    (getPoolAndPositionInfo + getPositionLiquidity; без v3 positions()).
+    """
+    cid = int(chain_id)
+    tid = int(token_id)
+    proto = "uniswap_v4"
+    owner_addr = str(owner_hint or "").strip().lower()
+    if tid <= 0:
+        return None
+    cache_key = (cid, proto, tid)
+    now = time.time()
+    with POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK:
+        cached = POSITION_CONTRACT_SNAPSHOT_CACHE.get(cache_key)
+    if cached:
+        ts, payload = cached
+        if (now - float(ts or 0.0)) <= float(POSITION_CONTRACT_SNAPSHOT_TTL_SEC):
+            return dict(payload or {})
+    pm = _position_manager_for_protocol(cid, proto)
+    if not _is_eth_address(pm):
+        return None
+    owner_word = _encode_address_word(owner_addr)[-40:] if _is_eth_address(owner_addr) else ""
+    sel_pool_and_info = "0x7ba03aad"
+    sel_liq = "0x1efeed33"
+    try:
+        owner_hex = _eth_call_hex(cid, pm, "0x6352211e" + _encode_uint_word(int(tid)))
+        owner_words = _hex_words(owner_hex)
+        if not owner_words:
+            return None
+        owner_match = bool(owner_word and owner_words[0][-40:].lower() == owner_word)
+        if not owner_match and not allow_owner_mismatch:
+            return None
+        batch = _eth_call_hex_batch(
+            cid,
+            [
+                {"to": pm, "data": sel_pool_and_info + _encode_uint_word(int(tid))},
+                {"to": pm, "data": sel_liq + _encode_uint_word(int(tid))},
+            ],
+        )
+        info_hex = str(batch[0] or "").strip().lower() if isinstance(batch, list) and len(batch) > 0 else ""
+        liq_hex = str(batch[1] or "").strip().lower() if isinstance(batch, list) and len(batch) > 1 else ""
+        if not info_hex.startswith("0x") or len(info_hex) <= 2:
+            try:
+                info_hex = _eth_call_hex(cid, pm, sel_pool_and_info + _encode_uint_word(int(tid)))
+            except Exception:
+                info_hex = ""
+        if not liq_hex.startswith("0x") or len(liq_hex) <= 2:
+            try:
+                liq_hex = _eth_call_hex(cid, pm, sel_liq + _encode_uint_word(int(tid)))
+            except Exception:
+                liq_hex = "0x0"
+        p_words = _hex_words(info_hex or "")
+        if len(p_words) < 6:
+            return None
+        liq = int(_decode_uint_eth_call(liq_hex or "0x0"))
+        raw0 = _decode_address_from_word(p_words[0])
+        raw1 = _decode_address_from_word(p_words[1])
+        fee = _decode_uint_from_word(p_words[2])
+        info_val = int(p_words[5], 16)
+        tick_upper = _decode_signed_int24_from_packed_word(info_val, 32)
+        tick_lower = _decode_signed_int24_from_packed_word(info_val, 8)
+        token0_addr, token0_sym, dec0 = _normalize_infinity_currency(cid, raw0)
+        token1_addr, token1_sym, dec1 = _normalize_infinity_currency(cid, raw1)
+        payload: dict[str, Any] = {
+            "chain_id": cid,
+            "protocol": proto,
+            "position_manager": pm,
+            "token_id": tid,
+            "owner_hint": owner_addr,
+            "nonce": 0,
+            "operator": "",
+            "token0": str(token0_addr).lower(),
+            "token1": str(token1_addr).lower(),
+            "fee": int(fee),
+            "tick_lower": int(tick_lower),
+            "tick_upper": int(tick_upper),
+            "liquidity": int(liq),
+            "tokens_owed0_raw": 0,
+            "tokens_owed1_raw": 0,
+            "token0_decimals": int(dec0),
+            "token1_decimals": int(dec1),
+            "token0_symbol": str(token0_sym or ""),
+            "token1_symbol": str(token1_sym or ""),
+            "quote_amount0": None,
+            "quote_amount1": None,
+            "quote_fee0": None,
+            "quote_fee1": None,
+            "_v4_owner_mismatch": bool(not owner_match),
+        }
+        with POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK:
+            POSITION_CONTRACT_SNAPSHOT_CACHE[cache_key] = (now, payload)
+        return dict(payload)
+    except Exception:
+        return None
+
+
+def _fetch_heavy_protocol_nft_snapshot(
+    chain_id: int,
+    protocol: str,
+    token_id: int,
+    owner_hint: str,
+    *,
+    allow_owner_mismatch: bool,
+) -> dict[str, Any] | None:
+    p = str(protocol or "").strip().lower()
+    if p == "uniswap_v4":
+        return _uniswap_v4_pm_snapshot_v3shaped(
+            int(chain_id),
+            int(token_id),
+            owner_hint,
+            allow_owner_mismatch=bool(allow_owner_mismatch),
+        )
+    return _fetch_v3_position_contract_snapshot(
+        int(chain_id),
+        p,
+        int(token_id),
+        owner_hint,
+        include_quotes=True,
+    )
 
 
 def _estimate_position_tvl_usd_from_detail(position: dict[str, Any], pool: dict[str, Any]) -> float | None:
@@ -11427,7 +11648,9 @@ def _explorer_nft_catalog_is_uniswap_or_pancake(token_name: str, token_symbol: s
 
 # NFT rows: explorer tokenName/tokenSymbol are often missing on tokennfttx; still treat as DEX LP if
 # the contract matches our v3 NPM / v4 PM registry for that chain_id.
-_NFT_CATALOG_KNOWN_PM_KINDS: frozenset[str] = frozenset({"v3npm", "pancake_v3npm", "v4pm", "infinity_cl"})
+_NFT_CATALOG_KNOWN_PM_KINDS: frozenset[str] = frozenset(
+    {"v3npm", "pancake_v3npm", "v4pm", "infinity_cl", "infinity_bin"}
+)
 
 
 def _nft_catalog_v3_pos_symbol_compact(token_symbol: str) -> str | None:
@@ -11502,6 +11725,7 @@ def _nft_pm_registry_for_chain(chain_id: int) -> list[tuple[str, str]]:
     _add("pancake_v3npm", PANCAKE_V3_NPM_BY_CHAIN_ID.get(cid))
     _add("v4pm", UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid))
     _add("infinity_cl", PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid))
+    _add("infinity_bin", PANCAKE_INFINITY_BIN_POSITION_MANAGER_BY_CHAIN_ID.get(cid))
     return out
 
 
@@ -11534,7 +11758,158 @@ def _nft_catalog_row_enrich_protocol(row: dict[str, Any]) -> str:
         return "uniswap_v4"
     if pmk == "infinity_cl":
         return "pancake_infinity_cl"
+    if pmk == "infinity_bin":
+        return "pancake_infinity_bin"
     return ""
+
+
+def _nft_catalog_row_is_heavy_enrich_protocol(proto: str) -> bool:
+    return str(proto or "").strip().lower() in _NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS
+
+
+def _nft_catalog_heavy_enrich_candidate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Строки v4 / Infinity: открытые, с валидными id — для второй фазы (параллельный PM snapshot)."""
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if bool(row.get("unsupported_protocol")):
+            continue
+        proto = _nft_catalog_row_enrich_protocol(row)
+        if not proto or not _nft_catalog_row_is_heavy_enrich_protocol(proto):
+            continue
+        chain_id = int(row.get("chain_id") or 0) or int(
+            _chain_id_by_chain_key(str(row.get("chain") or "")) or 0
+        )
+        token_id = _position_token_id_from_raw(row.get("position_id"))
+        if chain_id <= 0 or token_id <= 0:
+            continue
+        if str(row.get("catalog_segment") or "").strip().lower() == "closed":
+            continue
+        out.append(row)
+    return out
+
+
+def _enrich_nft_catalog_heavy_rows_parallel(
+    rows: list[dict[str, Any]],
+    *,
+    pos_job_id: str | None,
+    session_id: str,
+    max_seconds: float,
+    max_rows: int,
+    workers: int,
+) -> tuple[int, int]:
+    """Параллельный PM-snapshot для v4 / Infinity после лёгкого v3 enrich."""
+    candidates = _nft_catalog_heavy_enrich_candidate_rows(rows)
+    if not candidates:
+        return 0, 0
+    start = time.monotonic()
+    ok_n = 0
+    fail_n = 0
+    deadline = start + float(max_seconds)
+    cap = min(int(max_rows), len(candidates))
+    work = candidates[:cap]
+    max_workers = max(1, min(int(workers), len(work)))
+    job_s = str(pos_job_id or "")
+    sid_s = str(session_id or "")
+
+    def _one(row: dict[str, Any]) -> bool:
+        t0 = time.perf_counter()
+        proto = _nft_catalog_row_enrich_protocol(row)
+        chain_id = int(row.get("chain_id") or 0) or int(
+            _chain_id_by_chain_key(str(row.get("chain") or "")) or 0
+        )
+        token_id = _position_token_id_from_raw(row.get("position_id"))
+        owner = str(row.get("address") or "").strip().lower()
+        pm = str(row.get("pool_id") or "").strip().lower()
+        is_ex = _nft_catalog_row_is_explorer_tokennfttx(row)
+        allow_om = bool(is_ex)
+        detail_obj: dict[str, Any] = {"proto": proto}
+        try:
+            snap = _fetch_heavy_protocol_nft_snapshot(
+                chain_id,
+                str(proto),
+                int(token_id),
+                owner,
+                allow_owner_mismatch=allow_om,
+            )
+            ms = int((time.perf_counter() - t0) * 1000.0)
+            if not isinstance(snap, dict):
+                if is_ex:
+                    row["nft_catalog_pm_snapshot_ok"] = False
+                    row["nft_catalog_pm_snapshot_reason"] = "heavy_snapshot_unavailable"
+                _log_heavy_protocol_enrich_debug(
+                    job_id=job_s,
+                    session_id=sid_s,
+                    chain_id=chain_id,
+                    owner=owner,
+                    pm_contract=pm,
+                    position_id=str(token_id),
+                    internal_protocol=str(proto),
+                    phase="heavy_parallel",
+                    status="fail",
+                    detail=json.dumps({**detail_obj, "reason": "no_snapshot"}),
+                    duration_ms=ms,
+                )
+                return False
+            updates = _build_row_updates_from_snapshot(row, snap, chain_id)
+            row.update(updates)
+            if is_ex:
+                row["nft_catalog_pm_snapshot_ok"] = True
+                row["nft_catalog_pm_snapshot_reason"] = ""
+            _log_heavy_protocol_enrich_debug(
+                job_id=job_s,
+                session_id=sid_s,
+                chain_id=chain_id,
+                owner=owner,
+                pm_contract=pm,
+                position_id=str(token_id),
+                internal_protocol=str(proto),
+                phase="heavy_parallel",
+                status="ok",
+                detail=json.dumps(
+                    {
+                        **detail_obj,
+                        "liquidity": str(snap.get("liquidity") or ""),
+                        "v4_owner_mismatch": bool(snap.get("_v4_owner_mismatch")),
+                    }
+                ),
+                duration_ms=ms,
+            )
+            return True
+        except Exception as ex:
+            ms = int((time.perf_counter() - t0) * 1000.0)
+            if is_ex:
+                row["nft_catalog_pm_snapshot_ok"] = False
+                row["nft_catalog_pm_snapshot_reason"] = "heavy_snapshot_error"
+            _log_heavy_protocol_enrich_debug(
+                job_id=job_s,
+                session_id=sid_s,
+                chain_id=chain_id,
+                owner=owner,
+                pm_contract=pm,
+                position_id=str(token_id),
+                internal_protocol=str(proto),
+                phase="heavy_parallel",
+                status="fail",
+                detail=json.dumps({**detail_obj, "error": str(ex)[:500]}),
+                duration_ms=ms,
+            )
+            return False
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = [pool.submit(_one, row) for row in work]
+        for fut in as_completed(futs):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                if fut.result(timeout=2.0):
+                    ok_n += 1
+                else:
+                    fail_n += 1
+            except Exception:
+                fail_n += 1
+    return ok_n, fail_n
 
 
 def _nft_catalog_row_is_explorer_tokennfttx(row: dict[str, Any]) -> bool:
@@ -11555,11 +11930,14 @@ def _enrich_nft_catalog_rows_from_chain(
     *,
     max_seconds: float = 24.0,
     max_rows: int = 220,
-) -> tuple[int, int]:
-    """Для NFT-каталога: pair / fee / in position / liquidity из контракта PM (Multicall/RPC)."""
+    pos_job_id: str | None = None,
+    session_id: str = "",
+) -> tuple[int, int, dict[str, Any]]:
+    """NFT-каталог: (1) лёгкий enrich v3/v3-подобные через positions(); (2) тяжёлые протоколы — отдельный пул."""
     start = time.monotonic()
     ok_n = 0
     fail_n = 0
+    heavy_stats: dict[str, Any] = {"heavy_ok": 0, "heavy_fail": 0, "heavy_pipeline": bool(POSITIONS_NFT_HEAVY_PIPELINE)}
     for row in rows or []:
         if time.monotonic() - start >= float(max_seconds):
             break
@@ -11571,6 +11949,8 @@ def _enrich_nft_catalog_rows_from_chain(
             continue
         proto = _nft_catalog_row_enrich_protocol(row)
         if not proto:
+            continue
+        if _nft_catalog_row_is_heavy_enrich_protocol(proto):
             continue
         chain_id = int(row.get("chain_id") or 0) or int(_chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
         token_id = _position_token_id_from_raw(row.get("position_id"))
@@ -11601,7 +11981,21 @@ def _enrich_nft_catalog_rows_from_chain(
                 row["nft_catalog_pm_snapshot_reason"] = "position_snapshot_unavailable"
             fail_n += 1
             continue
-    return ok_n, fail_n
+
+    if POSITIONS_NFT_HEAVY_PIPELINE:
+        t_left = float(max_seconds) - (time.monotonic() - start)
+        if t_left > 1.0:
+            h_ok, h_fail = _enrich_nft_catalog_heavy_rows_parallel(
+                rows,
+                pos_job_id=pos_job_id,
+                session_id=session_id,
+                max_seconds=min(float(POSITIONS_NFT_HEAVY_MAX_SECONDS), t_left),
+                max_rows=int(POSITIONS_NFT_HEAVY_MAX_ROWS),
+                workers=int(POSITIONS_NFT_HEAVY_WORKERS),
+            )
+            heavy_stats["heavy_ok"] = int(h_ok)
+            heavy_stats["heavy_fail"] = int(h_fail)
+    return ok_n, fail_n, heavy_stats
 
 
 def _nft_catalog_compute_open_liquidity_allowed(
@@ -11614,6 +12008,7 @@ def _nft_catalog_compute_open_liquidity_allowed(
 
     v3_batches: dict[tuple[int, str], list[int]] = defaultdict(list)
     v4_batches: dict[tuple[int, str], list[int]] = defaultdict(list)
+    allowed: set[tuple[int, str, int]] = set()
     for fr in fetch_results or []:
         if not isinstance(fr, dict):
             continue
@@ -11644,8 +12039,10 @@ def _nft_catalog_compute_open_liquidity_allowed(
                 v3_batches[(cid, c)].append(tid_i)
             elif kind in ("v4pm", "infinity_cl"):
                 v4_batches[(cid, c)].append(tid_i)
+            elif kind == "infinity_bin":
+                # Bin PM не проходит v4 getPositionLiquidity multicall — не режем open/closed этим фильтром.
+                allowed.add((int(cid), c, int(tid_i)))
 
-    allowed: set[tuple[int, str, int]] = set()
     for (cid, npm_c), tids in v3_batches.items():
         if deadline_ts is not None and time.monotonic() >= deadline_ts:
             break
@@ -12142,6 +12539,8 @@ def _scan_pool_positions_explorer_nft_catalog(
                     proto_col = _nft_catalog_protocol_display(token_symbol, "PanC-V3")
                 elif pmk == "infinity_cl":
                     proto_col = _nft_catalog_protocol_display(token_symbol, "PanC-V3")
+                elif pmk == "infinity_bin":
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "PanC-Bin")
                 elif "uniswap" in blob:
                     proto_col = _nft_catalog_protocol_display(token_symbol, "UNI-V3")
                 elif "pancake" in blob:
@@ -18420,14 +18819,29 @@ def _scan_positions_core(
 
     t_nft_enrich = time.monotonic()
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN and pool_rows:
-        ne_ok, ne_fail = _enrich_nft_catalog_rows_from_chain(pool_rows, max_seconds=26.0, max_rows=240)
+        ne_ok, ne_fail, ne_heavy = _enrich_nft_catalog_rows_from_chain(
+            pool_rows,
+            max_seconds=26.0,
+            max_rows=240,
+            pos_job_id=pos_job_id,
+            session_id=str(sid or ""),
+        )
         debug_timings["nft_catalog_onchain_enrich_sec"] = round(max(0.0, time.monotonic() - t_nft_enrich), 3)
         debug_timings["nft_catalog_onchain_enrich_ok"] = int(ne_ok)
         debug_timings["nft_catalog_onchain_enrich_fail"] = int(ne_fail)
+        if isinstance(ne_heavy, dict):
+            debug_timings["nft_catalog_heavy_parallel_ok"] = int(ne_heavy.get("heavy_ok") or 0)
+            debug_timings["nft_catalog_heavy_parallel_fail"] = int(ne_heavy.get("heavy_fail") or 0)
+            debug_timings["nft_catalog_heavy_pipeline"] = bool(ne_heavy.get("heavy_pipeline"))
         if ne_ok or ne_fail:
             info_notes.append(
                 f"NFT catalog on-chain enrich: ok={int(ne_ok)}, fail={int(ne_fail)} "
                 f"(pair/fee/in-position for open positions only; see tab «Closed» for zero on-chain liquidity)."
+            )
+        if isinstance(ne_heavy, dict) and int(ne_heavy.get("heavy_ok") or 0) + int(ne_heavy.get("heavy_fail") or 0) > 0:
+            info_notes.append(
+                f"Heavy protocol parallel pipeline (v4 / Infinity): ok={int(ne_heavy.get('heavy_ok') or 0)}, "
+                f"fail={int(ne_heavy.get('heavy_fail') or 0)} — debug rows in SQLite table heavy_protocol_enrich_debug."
             )
         t_usd = time.monotonic()
         _enrich_rows_liquidity_usd(pool_rows, max_seconds=6)
@@ -18447,18 +18861,17 @@ def _scan_positions_core(
         info_notes.append(
             "NFT scan pipeline: (1) Explorer tokennfttx per chain×wallet; "
             "(2) Protocol gate + on-chain open/closed liquidity when assembling rows (tabs: Protocol filter, Closed); "
-            "(3) PM snapshot for open rows (pair/fee/amounts); "
+            "(3) PM snapshot: light queue (v3 positions()) then parallel heavy queue (v4 getPoolAndPositionInfo, Infinity); "
             "(4) Liquidity USD; "
             "(5) Phishing metadata — sync from explorer name/symbol (Web UI: tab «Other issues»), before spam; "
             "(6) Spam heuristics — только реальные позиции с подозрительной парой/TVL (tab: Spam); "
-            "(7) Reserved — deferred heavy owner reconciliation (V3 / Infinity / farming; not implemented)."
+            "(7) Optional: POSITIONS_NFT_HEAVY_PIPELINE=0 to disable parallel heavy enrich."
         )
         info_notes.append(
-            "NFT catalog — deferred phase (planned only): deep owner/position reconciliation (Uniswap V3 edge cases, "
-            "Pancake Infinity, V3 farming/staking). Requires heavy RPC/indexer work; not implemented in this build. "
-            "Web UI: phishing metadata + PM snapshot failures (nft_catalog_pm_snapshot_ok=false) → tab «Other issues»."
+            "Heavy enrich debug: SQLite table heavy_protocol_enrich_debug (analytics DB). "
+            "Optional API: GET /api/debug/heavy-protocol-enrich?limit=50 when POSITIONS_HEAVY_ENRICH_DEBUG_HTTP=1."
         )
-        debug_timings["nft_catalog_deferred_owner_reconciliation"] = "reserved_not_implemented"
+        debug_timings["nft_catalog_deferred_owner_reconciliation"] = "heavy_parallel_v4_infinity"
     if pool_rows and not POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         t_phish = time.monotonic()
         phish_n = _nft_catalog_sync_phishing_metadata(pool_rows)
@@ -18649,19 +19062,60 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     token_id = _position_token_id_from_raw(pos_id)
     if chain_id <= 0 or token_id <= 0:
         return {"ok": False, "reason": "invalid_row"}
-    if protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked", "uniswap_v4", "pancake_infinity_cl"}:
+    if protocol not in {
+        "uniswap_v3",
+        "pancake_v3",
+        "pancake_v3_staked",
+        "uniswap_v4",
+        "pancake_infinity_cl",
+        "pancake_infinity_bin",
+    }:
         mapped = _nft_catalog_row_enrich_protocol(row)
         if mapped:
             protocol = mapped
     _unhide_auto_hidden_closed_position(int(chain_id), protocol, int(token_id))
-    if protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked", "uniswap_v4", "pancake_infinity_cl"}:
+    if protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked", "uniswap_v4", "pancake_infinity_cl", "pancake_infinity_bin"}:
         return {"ok": False, "reason": "unsupported_protocol"}
-    snap = _fetch_v3_position_contract_snapshot(int(chain_id), protocol, int(token_id), owner)
+    allow_om = _nft_catalog_row_is_explorer_tokennfttx(row)
+    snap = _fetch_heavy_protocol_nft_snapshot(
+        int(chain_id),
+        protocol,
+        int(token_id),
+        owner,
+        allow_owner_mismatch=bool(allow_om),
+    )
     if not isinstance(snap, dict):
         return {"ok": False, "reason": "snapshot_unavailable"}
     updates = _build_row_updates_from_snapshot(row, snap, int(chain_id))
     updates["nft_metadata_phishing"] = bool(_row_nft_metadata_phishing_from_explorer(row))
     return {"ok": True, "row_updates": updates}
+
+
+@app.get("/api/debug/heavy-protocol-enrich")
+def debug_heavy_protocol_enrich(limit: int = 50) -> dict[str, Any]:
+    """Последние записи параллельного heavy-enrich (только при POSITIONS_HEAVY_ENRICH_DEBUG_HTTP=1)."""
+    if not POSITIONS_HEAVY_ENRICH_DEBUG_HTTP:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not ANALYTICS_ENABLED:
+        raise HTTPException(status_code=503, detail="Analytics disabled")
+    lim = max(1, min(200, int(limit)))
+    try:
+        with _analytics_conn() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, ts, job_id, session_id, chain_id, owner, pm_contract, position_id,
+                       internal_protocol, phase, status, detail, duration_ms
+                FROM heavy_protocol_enrich_debug
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (lim,),
+            )
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:200]) from e
+    return {"ok": True, "count": len(rows), "rows": rows}
 
 
 @app.post("/api/positions/pool-value-series")
