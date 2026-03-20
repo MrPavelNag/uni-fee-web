@@ -588,6 +588,9 @@ TOKEN_SYMBOL_CACHE: dict[tuple[int, str], str] = {}
 TOKEN_SYMBOL_CACHE_LOCK = threading.Lock()
 CONTRACT_CREATION_DATE_CACHE: dict[tuple[int, str], str] = {}
 CONTRACT_CREATION_DATE_CACHE_LOCK = threading.Lock()
+# Etherscan v2 getcontractcreation → contractCreator (lowercase 0x…), cached per (chain_id, contract).
+CONTRACT_CREATOR_ADDR_CACHE: dict[tuple[int, str], str] = {}
+CONTRACT_CREATOR_ADDR_CACHE_LOCK = threading.Lock()
 POSITION_CREATION_DATE_CACHE: dict[tuple[int, str, int], str] = {}
 POSITION_CREATION_DATE_CACHE_LOCK = threading.Lock()
 EXPLORER_NFT_META_CACHE: dict[tuple[int, str, int], dict[str, Any]] = {}
@@ -695,6 +698,17 @@ POSITIONS_EXPLORER_GRAPH_ID_UNION = os.environ.get("POSITIONS_EXPLORER_GRAPH_ID_
 POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER = os.environ.get(
     "POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
+# Explorer NFT rows: flag when contract deployer (marketplace «Creator») ≠ ERC-721 ownerOf(tokenId).
+# Official PM contracts almost always have deployer ≠ holder — scope to unknown contracts unless INCLUDE_KNOWN_PM.
+POSITIONS_NFT_CREATOR_VS_OWNER_MISMATCH = os.environ.get(
+    "POSITIONS_NFT_CREATOR_VS_OWNER_MISMATCH", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_NFT_CREATOR_VS_OWNER_INCLUDE_KNOWN_PM = os.environ.get(
+    "POSITIONS_NFT_CREATOR_VS_OWNER_INCLUDE_KNOWN_PM", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+POSITIONS_NFT_CREATOR_VS_OWNER_MAX_FETCHES = max(
+    0, min(500, int(os.environ.get("POSITIONS_NFT_CREATOR_VS_OWNER_MAX_FETCHES", "80")))
+)
 
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
@@ -3951,6 +3965,62 @@ def _explorer_contract_creation_block(chain_id: int, contract_address: str) -> i
         except Exception:
             continue
     return 0
+
+
+def _explorer_contract_creator_address_lower(
+    chain_id: int,
+    contract_address: str,
+    *,
+    fetch_budget: list[int] | None = None,
+) -> str:
+    """
+    Etherscan v2 getcontractcreation: contractCreator (deployer), lowercased.
+    Cached; optional fetch_budget[0] decrements only on a network fetch (cache miss).
+    """
+    cid = int(chain_id)
+    addr = str(contract_address or "").strip().lower()
+    if not _is_eth_address(addr):
+        return ""
+    key = (cid, addr)
+    with CONTRACT_CREATOR_ADDR_CACHE_LOCK:
+        cached = CONTRACT_CREATOR_ADDR_CACHE.get(key)
+    if cached is not None:
+        return str(cached or "")
+
+    if fetch_budget is not None:
+        if int(fetch_budget[0]) <= 0:
+            return ""
+        fetch_budget[0] -= 1
+
+    chainid_for_v2 = _explorer_v2_chainid(cid)
+    api_keys = _explorer_v2_api_keys(cid)
+    creator_lc = ""
+    for apikey in api_keys:
+        if not chainid_for_v2:
+            continue
+        url = (
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=contract&action=getcontractcreation"
+            f"&contractaddresses={addr}&apikey={apikey}"
+        )
+        try:
+            req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+            with urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            rows = (payload or {}).get("result")
+            if not isinstance(rows, list) or not rows:
+                continue
+            first = rows[0] if isinstance(rows[0], dict) else {}
+            cr = str(first.get("contractCreator") or "").strip().lower()
+            if _is_eth_address(cr):
+                creator_lc = cr
+                break
+        except Exception:
+            continue
+
+    with CONTRACT_CREATOR_ADDR_CACHE_LOCK:
+        CONTRACT_CREATOR_ADDR_CACHE[key] = creator_lc
+    return creator_lc
 
 
 def _contract_creation_date_ymd(chain_id: int, contract_address: str) -> str:
@@ -11387,7 +11457,8 @@ def _nft_catalog_row_eligible_for_explorer_owner_light(row: dict[str, Any] | Non
 #   - Pancake Infinity и смежные схемы;
 #   - V3 farming / staking / кастодиальные контракты вне текущего allowlist.
 # Ожидаемый режим: поздняя фаза скана и/или фоновые задания (RPC, индексаторы, пакетные вызовы).
-# Текущая вкладка «Owner mismatch» отражает только лёгкий слой ownerOf + allowlist.
+# Вкладка «Owner mismatch»: ownerOf + custody allowlist и (опц.) сигнал маркетплейса Creator ≠ Owner
+# (deployer контракта NFT vs ownerOf(tokenId); для известных PM по умолчанию выключено — см. env).
 # -----------------------------------------------------------------------------------------------
 
 
@@ -11444,6 +11515,44 @@ def _nft_catalog_scan_owner_mismatch_reason(
     )
 
 
+def _nft_catalog_creator_vs_owner_mismatch_reason(
+    chain_id: int,
+    row: dict[str, Any],
+    token_id: int,
+    fetch_budget: list[int] | None,
+) -> str:
+    """
+    Маркетплейс-семантика: «Creator» (deployer NFT-контракта) vs текущий holder ownerOf(tokenId).
+    Официальные PM почти всегда deployer ≠ holder — по умолчанию правило только для неизвестных pool_id.
+    """
+    if not POSITIONS_NFT_CREATOR_VS_OWNER_MISMATCH:
+        if isinstance(row, dict):
+            row.pop("explorer_nft_contract_creator", None)
+        return ""
+    if not isinstance(row, dict) or not _nft_catalog_row_is_explorer_tokennfttx(row):
+        return ""
+    row.pop("explorer_nft_contract_creator", None)
+    nft_contract = str(row.get("pool_id") or "").strip().lower()
+    tid = int(token_id)
+    if not _is_eth_address(nft_contract) or tid <= 0:
+        return ""
+    pmk = _explorer_nft_contract_pm_kind(int(chain_id), nft_contract)
+    if pmk and not POSITIONS_NFT_CREATOR_VS_OWNER_INCLUDE_KNOWN_PM:
+        return ""
+    creator = _explorer_contract_creator_address_lower(
+        int(chain_id), nft_contract, fetch_budget=fetch_budget
+    )
+    if not _is_eth_address(creator) or creator == "0x0000000000000000000000000000000000000000":
+        return ""
+    holder = _erc721_owner_of_address_lower(int(chain_id), nft_contract, tid)
+    if not _is_eth_address(holder) or holder == "0x0000000000000000000000000000000000000000":
+        return ""
+    if creator != holder:
+        row["explorer_nft_contract_creator"] = creator
+        return "nft_contract_creator_differs_from_owner_of"
+    return ""
+
+
 def _subgraph_v3_row_eligible_for_ownerof_light_check(row: dict[str, Any]) -> bool:
     if not isinstance(row, dict):
         return False
@@ -11471,6 +11580,7 @@ _NFT_CATALOG_OWNER_LAYER_MISMATCH_REASONS = frozenset(
     {
         "owner_burned_or_unknown",
         "owner_not_wallet_or_custody_explorer_claim",
+        "nft_contract_creator_differs_from_owner_of",
     }
 )
 
@@ -11547,8 +11657,8 @@ def _nft_catalog_apply_explorer_owner_mismatch_scan(
     (2) При POSITIONS_SUBGRAPH_V3_OWNEROF_LIGHT_CHECK — обычные v3-строки из subgraph: ownerOf на NPM
     из _nft_contract или position manager по протоколу (The Graph может отставать или врать по owner).
 
-    Нарратив «сначала владелец»: только ownerOf + custody allowlist; тяжёлая фаза — отдельно
-    (NFT_CATALOG_DEFERRED_OWNER_RECONCILIATION).
+    Нарратив «сначала владелец»: ownerOf + custody allowlist; для explorer-строк дополнительно
+    (по env) Creator ≠ Owner; тяжёлая фаза — отдельно (NFT_CATALOG_DEFERRED_OWNER_RECONCILIATION).
 
     Важно: бюджет времени для (1) и (2) разделён (отдельные monotonic «старт»), иначе при большом
     числе NFT фаза (1) съедает весь лимит и subgraph не успевает; раньше обе фазы делили один start,
@@ -11558,6 +11668,7 @@ def _nft_catalog_apply_explorer_owner_mismatch_scan(
     start = time.monotonic()
     mismatch_n = 0
     checked = 0
+    creator_fetch_budget = [int(POSITIONS_NFT_CREATOR_VS_OWNER_MAX_FETCHES)]
     for row in rows or []:
         if time.monotonic() - start >= float(max_seconds):
             break
@@ -11572,9 +11683,13 @@ def _nft_catalog_apply_explorer_owner_mismatch_scan(
         owner = str(row.get("address") or "").strip().lower()
         proto = _nft_catalog_row_enrich_protocol(row)
         om = _nft_catalog_scan_owner_mismatch_reason(chain_id, proto, row, int(token_id), owner)
-        if om:
+        cv = _nft_catalog_creator_vs_owner_mismatch_reason(
+            chain_id, row, int(token_id), creator_fetch_budget
+        )
+        parts = [p for p in (str(om or "").strip(), str(cv or "").strip()) if p]
+        if parts:
             row["nft_catalog_scan_mismatch"] = True
-            row["nft_catalog_mismatch_reason"] = str(om)
+            row["nft_catalog_mismatch_reason"] = " | ".join(parts)
             mismatch_n += 1
         else:
             row["nft_catalog_scan_mismatch"] = False
@@ -14873,7 +14988,7 @@ def _render_positions_page() -> str:
             <button type="button" class="pos-tab-btn" data-pos-tab="spam" onclick="switchPosPoolsTab('spam')" title="Heuristic spam / exotic pair (trust to manage).">Spam <span id="posSpamTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="protocol" onclick="switchPosPoolsTab('protocol')">Protocol filter <span id="posProtocolTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="closed" onclick="switchPosPoolsTab('closed')" title="Zero open liquidity on PM (catalog).">Closed <span id="posClosedTabCount"></span></button>
-            <button type="button" class="pos-tab-btn" data-pos-tab="mismatch" onclick="switchPosPoolsTab('mismatch')" title="Light owner check: explorer / subgraph vs ownerOf on PM.">Owner mismatch <span id="posMismatchTabCount"></span></button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="mismatch" onclick="switchPosPoolsTab('mismatch')" title="Wallet vs ownerOf (+ custody); explorer rows: optional NFT contract deployer (marketplace Creator) vs ownerOf for unknown contracts. Known PM: set POSITIONS_NFT_CREATOR_VS_OWNER_INCLUDE_KNOWN_PM=1 to apply the same rule.">Owner mismatch <span id="posMismatchTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="other" onclick="switchPosPoolsTab('other')" title="Phishing metadata, pair string vs on-chain symbols, PM read failures — see Issue column; not owner mismatch.">Other issues <span id="posOtherTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="hidden" onclick="switchPosPoolsTab('hidden')" title="Rows you marked with Hide on the main list.">Hidden <span id="posHiddenTabCount"></span></button>
           </div>
@@ -14984,6 +15099,7 @@ def _render_positions_page() -> str:
     const NFT_CATALOG_MISMATCH_LABELS = {
       owner_burned_or_unknown: "Burned or no on-chain owner (explorer row may not match this token id)",
       owner_not_wallet_or_custody_explorer_claim: "Owner on chain is not your wallet and not a known custody contract",
+      nft_contract_creator_differs_from_owner_of: "NFT contract deployer (Explorer Creator) ≠ ERC-721 ownerOf(holder) — marketplace-style signal; normal for official PM unless INCLUDE_KNOWN_PM",
     };
     const NFT_PM_SNAPSHOT_LABELS = {
       position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder). Not owner mismatch.",
