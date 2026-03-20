@@ -312,8 +312,13 @@ POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC = max(
 )
 # Parallel tokennfttx pages per owner (same URL template); 1 = sequential.
 POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS = max(
-    1, min(12, int(os.environ.get("POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS", "4")))
+    1, min(12, int(os.environ.get("POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS", "6")))
 )
+# When several URL templates are used (v2 + Blockscout + native), fetch page 1 of each in parallel.
+# Major win vs sequential templates (same wallet×chain was often 20–40s of serialized HTTP).
+POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1 = os.environ.get(
+    "POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1", "1"
+).strip().lower() in ("1", "true", "yes", "on")
 # True: call api.etherscan.io/v2 (chainid) before bscscan/basescan/optimistic. Same ETHERSCAN_API_KEY
 # usually works on v2 for all mapped chains; native hosts often return Invalid API Key for that key.
 POSITIONS_EXPLORER_NFTTX_V2_FIRST = os.environ.get("POSITIONS_EXPLORER_NFTTX_V2_FIRST", "1").strip().lower() in (
@@ -577,6 +582,13 @@ UNISWAP_V3_FACTORY_BY_CHAIN_ID: dict[int, str] = {
 }
 V3_PROTOCOL_LABEL_BY_CHAIN_ID: dict[int, str] = {
     56: "pancake_v3",
+}
+# PancakeSwap V3 NonfungiblePositionManager (same periphery on ETH / BSC / Arbitrum / Base per Pancake docs).
+PANCAKE_V3_NPM_BY_CHAIN_ID: dict[int, str] = {
+    1: "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364",
+    56: "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364",
+    42161: "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364",
+    8453: "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364",
 }
 INFINITY_CL_SUBGRAPH_BY_CHAIN_ID: dict[int, str] = {
     56: "https://api.thegraph.com/subgraphs/id/8jFYxwKP8tNGSDisucpHRK1ojUchZd7ELd8zh2ugHGDN",
@@ -3973,7 +3985,10 @@ def _position_manager_for_protocol(chain_id: int, protocol: str) -> str:
     if proto == "uniswap_v3":
         return str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
     if proto in {"pancake_v3", "pancake_v3_staked"}:
-        # Pancake v3 NPM is stored in chain-specific v3 NPM map.
+        # BSC: UNISWAP_V3_NPM map holds Pancake NPM; L2s use dedicated Pancake NPM (Uniswap uses another address).
+        pm_p = str(PANCAKE_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
+        if _is_eth_address(pm_p):
+            return pm_p
         return str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()
     if proto == "uniswap_v4":
         return str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower()
@@ -5116,6 +5131,39 @@ def _explorer_owner_nfttx_rows(
     if isinstance(debug_out, dict):
         debug_out["template_traces"] = []
 
+    def _fetch_tmpl_page(tmpl_arg: str, page_num: int) -> tuple[int, dict[str, Any] | None]:
+        try:
+            url = str(tmpl_arg).replace("{page}", str(page_num))
+            req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+            with urlopen(req, timeout=http_timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            pl = payload if isinstance(payload, dict) else {}
+            return int(page_num), pl
+        except Exception:
+            return int(page_num), None
+
+    tpl_page1_prefetch: dict[int, dict[str, Any] | None] = {}
+    if (
+        POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1
+        and len(url_templates) > 1
+        and not _deadline_hit()
+    ):
+        if isinstance(debug_out, dict):
+            debug_out["parallel_tpl_page1"] = True
+        _tw = max(1, min(8, len(url_templates)))
+        with ThreadPoolExecutor(max_workers=_tw) as _tex:
+            _futs = {
+                _tex.submit(_fetch_tmpl_page, str(url_templates[_ti]), 1): int(_ti)
+                for _ti in range(len(url_templates))
+            }
+            for _fut in as_completed(_futs):
+                _ti0 = int(_futs[_fut])
+                try:
+                    _pn0, _pl0 = _fut.result()
+                    tpl_page1_prefetch[_ti0] = _pl0
+                except Exception:
+                    tpl_page1_prefetch[_ti0] = None
+
     for ti, tmpl in enumerate(url_templates):
         if _deadline_hit():
             break
@@ -5124,17 +5172,10 @@ def _explorer_owner_nfttx_rows(
         last_message = ""
 
         def _fetch_page(page_num: int) -> tuple[int, dict[str, Any] | None]:
-            try:
-                url = str(tmpl).replace("{page}", str(page_num))
-                req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
-                with urlopen(req, timeout=http_timeout) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                pl = payload if isinstance(payload, dict) else {}
-                return int(page_num), pl
-            except Exception:
-                return int(page_num), None
+            return _fetch_tmpl_page(str(tmpl), int(page_num))
 
         page = 1
+        used_tpl_prefetch_p1 = False
         while page <= max_pages and len(out) < int(max_rows):
             if _deadline_hit():
                 return _finalize()
@@ -5145,7 +5186,19 @@ def _explorer_owner_nfttx_rows(
             else:
                 batch_end = min(page + page_workers - 1, max_pages)
             page_payloads: dict[int, dict[str, Any] | None] = {}
-            if page_workers <= 1:
+            if page == 1 and (not used_tpl_prefetch_p1) and ti in tpl_page1_prefetch:
+                used_tpl_prefetch_p1 = True
+                pl_pf = tpl_page1_prefetch.get(ti)
+                url_p1 = str(tmpl).replace("{page}", "1")
+                if pl_pf is None:
+                    _pn1, pl_pf = _fetch_page(1)
+                if pl_pf is None:
+                    _dbg_append(1, url_p1, None, err="request_failed")
+                else:
+                    _dbg_append(1, url_p1, pl_pf)
+                page_payloads[1] = pl_pf
+                batch_end = 1
+            elif page_workers <= 1:
                 pn, pl = _fetch_page(page)
                 url = str(tmpl).replace("{page}", str(pn))
                 if pl is None:
@@ -6206,8 +6259,8 @@ def _is_suspected_spam_pair(
 
 def _explorer_nft_metadata_obvious_phishing(name: str, symbol: str) -> bool:
     """
-    Только грубые признаки фишинга в метаданных коллекции NFT из explorer.
-    Не использовать общие эвристики «длинного имени» — у легитимных Uniswap/Pancake названия многословные.
+    Признаки фишинга в метаданных NFT из explorer: фиксированные фразы + общие шаблоны
+    (короткие ссылки, claim+wallet и т.д.) — одно правило для всех похожих спам-коллекций.
     """
     n = str(name or "").strip().lower()
     s = str(symbol or "").strip().lower()
@@ -6219,6 +6272,9 @@ def _explorer_nft_metadata_obvious_phishing(name: str, symbol: str) -> bool:
         "telegram.me/",
         "discord.gg/",
         "bit.ly/",
+        "t.ly/",
+        "t.co/",
+        "claimcake",
         "gifts/",
         "claim airdrop",
         "airdrop claim",
@@ -6230,10 +6286,31 @@ def _explorer_nft_metadata_obvious_phishing(name: str, symbol: str) -> bool:
         ".xyz/",
         "free mint",
     )
+    # Короткие домены-редиректоры и «псевдо-URL» в name/symbol (t.ly/foo, foo.link/bar, …).
+    _short_link_re = re.compile(
+        r"(?i)(?:^|/|[\s:•·|(-])([a-z0-9-]{1,32}\.)?(ly|link|gd|cc|gl|to|click|rocks)/"
+    )
+    _scam_action_re = re.compile(
+        r"(?i)\b(claim|verify|connect)[-_\s]+(wallet|reward|airdrop|bonus|gift|nft|tokens?)\b"
+    )
+    _scam_connect_re = re.compile(r"(?i)\bconnect\s+your\s+wallet\b")
     for b in blobs:
         if any(x in b for x in needles):
             return True
+        if _short_link_re.search(b):
+            return True
+        if _scam_action_re.search(b) or _scam_connect_re.search(b):
+            return True
     return False
+
+
+def _row_nft_metadata_phishing_from_explorer(row: dict[str, Any] | None) -> bool:
+    """True if explorer NFT collection name/symbol matches obvious phishing heuristics."""
+    if not isinstance(row, dict):
+        return False
+    en = str(row.get("explorer_token_name") or "")
+    es = str(row.get("explorer_token_symbol") or "")
+    return bool(_explorer_nft_metadata_obvious_phishing(en, es))
 
 
 def _apply_nft_catalog_spam_heuristics(rows: list[dict[str, Any]]) -> int:
@@ -6267,6 +6344,7 @@ def _apply_nft_catalog_spam_heuristics(rows: list[dict[str, Any]]) -> int:
         s1 = str(row.get("position_symbol1") or "").strip()
         en = str(row.get("explorer_token_name") or "")
         es = str(row.get("explorer_token_symbol") or "")
+        row["nft_metadata_phishing"] = bool(_explorer_nft_metadata_obvious_phishing(en, es))
         liq_usd = row.get("liquidity_usd")
         both_curated = _is_eth_address(t0) and _is_eth_address(t1) and (t0 in chain_addr_map) and (t1 in chain_addr_map)
         if both_curated:
@@ -9608,6 +9686,7 @@ def _scan_pool_positions_chain(
             "explorer_token_name": str(explorer_meta.get("token_name") or ""),
             "explorer_token_symbol": str(explorer_meta.get("token_symbol") or ""),
         }
+        _nft_expl_phish = _row_nft_metadata_phishing_from_explorer(explorer_fields)
         is_v3_npm_protocol = proto_label in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
         is_infinity_protocol = proto_label.startswith("pancake_infinity_")
         if POSITIONS_CONTRACT_ONLY_ENABLED and not (
@@ -9715,6 +9794,7 @@ def _scan_pool_positions_chain(
                 "fees_owed_display": "0 / 0",
                 "suspected_spam": True,
                 "spam_skipped": True,
+                "nft_metadata_phishing": bool(_nft_expl_phish),
                 "liquidity_usd": None,
             }
         # For non-spam rows, allow on-chain symbol fallback.
@@ -9862,6 +9942,7 @@ def _scan_pool_positions_chain(
                 "fees_owed_display": "0 / 0",
                 "suspected_spam": True,
                 "spam_skipped": True,
+                "nft_metadata_phishing": bool(_nft_expl_phish),
                 "liquidity_usd": None,
             }
 
@@ -10048,6 +10129,7 @@ def _scan_pool_positions_chain(
             "fees_owed1": fees1_val,
             "fees_owed_display": fees_owed_display,
             "suspected_spam": bool(suspected_spam),
+            "nft_metadata_phishing": bool(_nft_expl_phish),
             "liquidity_usd": None,
         }
 
@@ -10370,6 +10452,7 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
         if key not in uniq:
             base = dict(row)
             base["position_count"] = 1
+            base["nft_metadata_phishing"] = bool(base.get("nft_metadata_phishing"))
             if bool(base.get("suspected_spam")) or bool(base.get("spam_skipped")):
                 base["liquidity_usd"] = None
                 base["liquidity_display"] = "-"
@@ -10380,6 +10463,9 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
         # Keep spam mark sticky across merged rows.
         acc["suspected_spam"] = bool(acc.get("suspected_spam")) or bool(row.get("suspected_spam"))
         acc["spam_skipped"] = bool(acc.get("spam_skipped")) or bool(row.get("spam_skipped"))
+        acc["nft_metadata_phishing"] = bool(acc.get("nft_metadata_phishing")) or bool(
+            row.get("nft_metadata_phishing")
+        )
         acc["nft_catalog_scan_mismatch"] = bool(acc.get("nft_catalog_scan_mismatch")) or bool(
             row.get("nft_catalog_scan_mismatch")
         )
@@ -10774,31 +10860,90 @@ def _explorer_nft_catalog_is_uniswap_or_pancake(token_name: str, token_symbol: s
     return "uniswap" in blob or "pancake" in blob
 
 
+def _nft_catalog_v3_pos_symbol_compact(token_symbol: str) -> str | None:
+    """
+    Общее правило для explorer-символов вида *V3*POS / *V3POS (любой DEX-префикс).
+    Возвращает короткий ярлык для колонки Protocol или None, если шаблон не подходит.
+    """
+    s = str(token_symbol or "").strip()
+    if not s:
+        return None
+    u = re.sub(r"[\s_]+", "-", s.upper()).strip("-")
+    u = re.sub(r"-+", "-", u)
+    m = re.match(r"^([A-Z0-9]{2,16})(?:-?V3-?POS|V3POS)$", u)
+    if not m:
+        return None
+    pfx = m.group(1)
+    aliases: dict[str, str] = {
+        "UNI": "UNI-V3",
+        "UNIV3": "UNI-V3",
+        "UNISWAP": "UNI-V3",
+        "PCS": "PanC-V3",
+        "PCSV3": "PanC-V3",
+        "PAN": "PanC-V3",
+        "PANCAKE": "PanC-V3",
+        "SUSHI": "Sushi-V3",
+        "SUSHISWAP": "Sushi-V3",
+        "CAMELOT": "Camelot-V3",
+        "CML": "Camelot-V3",
+        "AERO": "Aero-V3",
+        "AERODROME": "Aero-V3",
+        "VELO": "Velo-V3",
+        "VELODROME": "Velo-V3",
+        "QUICK": "Quick-V3",
+        "QUICKSWAP": "Quick-V3",
+    }
+    if pfx in aliases:
+        return aliases[pfx]
+    if len(pfx) <= 10:
+        return f"{pfx}-V3"
+    return f"{pfx[:8]}-V3"
+
+
 def _nft_catalog_protocol_display(token_symbol: str | None, fallback: str) -> str:
-    """Колонка protocol в NFT-каталоге: символ из explorer; UNI-V3-POS -> UNI-V3 для UI."""
+    """Колонка protocol в NFT-каталоге: общая нормализация *V3*POS, иначе символ explorer."""
     s = str(token_symbol or "").strip()
     fb = str(fallback or "").strip() or "nft"
+    compact = _nft_catalog_v3_pos_symbol_compact(s)
+    if compact:
+        return compact[:24]
     if not s:
         return (fb[:24] if fb else "nft") or "nft"
-    sup = s.upper().replace("_", "-").replace(" ", "")
-    if sup in ("UNI-V3-POS", "UNI-V3POS"):
-        return "UNI-V3"
-    out = s[:24] or fb
+    return s[:24] or fb
+
+
+def _nft_pm_registry_for_chain(chain_id: int) -> list[tuple[str, str]]:
+    """
+    Упорядоченный реестр известных PM по chain_id: (kind, address_lc).
+    Один адрес — одна запись (на BSC Uniswap-карта = Pancake NPM — не дублируем).
+    """
+    cid = int(chain_id)
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+
+    def _add(kind: str, addr_raw: Any) -> None:
+        a = str(addr_raw or "").strip().lower()
+        if not _is_eth_address(a) or a in seen:
+            return
+        seen.add(a)
+        out.append((str(kind or "").strip(), a))
+
+    _add("v3npm", UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid))
+    _add("pancake_v3npm", PANCAKE_V3_NPM_BY_CHAIN_ID.get(cid))
+    _add("v4pm", UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid))
+    _add("infinity_cl", PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid))
     return out
 
 
 def _explorer_nft_contract_pm_kind(chain_id: int, contract: str) -> str:
-    """Известный Position Manager для сети: v3npm | v4pm | infinity_cl | ''."""
+    """Сопоставление контракта NFT с известным PM через общий реестр на chain_id."""
     c = str(contract or "").strip().lower()
     if not _is_eth_address(c):
         return ""
     cid = int(chain_id)
-    if c == str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower():
-        return "v3npm"
-    if c == str(UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower():
-        return "v4pm"
-    if c == str(PANCAKE_INFINITY_CL_POSITION_MANAGER_BY_CHAIN_ID.get(cid) or "").strip().lower():
-        return "infinity_cl"
+    for kind, addr in _nft_pm_registry_for_chain(cid):
+        if c == addr:
+            return str(kind or "")
     return ""
 
 
@@ -10813,6 +10958,8 @@ def _nft_catalog_row_enrich_protocol(row: dict[str, Any]) -> str:
     pmk = _explorer_nft_contract_pm_kind(cid, pool)
     if pmk == "v3npm":
         return str(V3_PROTOCOL_LABEL_BY_CHAIN_ID.get(cid, "uniswap_v3") or "uniswap_v3").strip().lower()
+    if pmk == "pancake_v3npm":
+        return "pancake_v3"
     if pmk == "v4pm":
         return "uniswap_v4"
     if pmk == "infinity_cl":
@@ -10961,7 +11108,7 @@ def _nft_catalog_compute_open_liquidity_allowed(
             if not _explorer_nft_catalog_is_uniswap_or_pancake(tn, tsym):
                 continue
             kind = _explorer_nft_contract_pm_kind(cid, c)
-            if kind == "v3npm":
+            if kind in ("v3npm", "pancake_v3npm"):
                 v3_batches[(cid, c)].append(tid_i)
             elif kind in ("v4pm", "infinity_cl"):
                 v4_batches[(cid, c)].append(tid_i)
@@ -11256,7 +11403,12 @@ def _scan_pool_positions_explorer_nft_catalog(
                         created = datetime.fromtimestamp(ts_first, tz=timezone.utc).date().isoformat()
                     except Exception:
                         created = ""
-                supported = _explorer_nft_catalog_is_uniswap_or_pancake(token_name, token_symbol)
+                # Scam NFTs often put "PancakeSwap" / "CAKE" in metadata; reject before treating as DEX catalog row.
+                is_phishing_meta = bool(_explorer_nft_metadata_obvious_phishing(token_name, token_symbol))
+                if is_phishing_meta:
+                    supported = False
+                else:
+                    supported = _explorer_nft_catalog_is_uniswap_or_pancake(token_name, token_symbol)
                 unsupported_protocol = not supported
                 pmk = _explorer_nft_contract_pm_kind(int(cid), str(contract))
                 _olk = (int(cid), str(contract).strip().lower(), int(tid))
@@ -11268,7 +11420,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                 if "uniswap" in blob:
                     proto_col = _nft_catalog_protocol_display(token_symbol, "Uniswap")
                 elif "pancake" in blob:
-                    proto_col = (token_symbol or "Pancake").strip()[:24] or "Pancake"
+                    proto_col = _nft_catalog_protocol_display(token_symbol, "Pancake")
                 else:
                     proto_col = (token_symbol or "nft").strip()[:24] or "nft"
                 if supported:
@@ -11329,6 +11481,7 @@ def _scan_pool_positions_explorer_nft_catalog(
                     "fees_owed_display": "-",
                     "suspected_spam": False,
                     "spam_skipped": False,
+                    "nft_metadata_phishing": bool(is_phishing_meta),
                     "nft_catalog_scan_mismatch": False,
                     "nft_catalog_mismatch_reason": "",
                     "liquidity_usd": None,
@@ -13182,6 +13335,12 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
         "pair_symbol_source": "0:snapshot_symbol | 1:snapshot_symbol",
         "suspected_spam": False,
         "spam_skipped": False,
+        "nft_metadata_phishing": bool(
+            _explorer_nft_metadata_obvious_phishing(
+                str(row.get("explorer_token_name") or ""),
+                str(row.get("explorer_token_symbol") or ""),
+            )
+        ),
     }
 
 
@@ -13918,11 +14077,13 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posPoolsBody" class="section-body">
-          <div class="pos-pools-tab-bar" id="posPoolsTabBar" title="NFT collection scan: issues that are not spam (farming / V4 / Infinity use custody allowlist)">
+          <div class="pos-pools-tab-bar" id="posPoolsTabBar" title="Separate tabs for scan issues and scam NFT metadata from the explorer">
             <button type="button" class="pos-tab-btn active" data-pos-tab="main" onclick="switchPosPoolsTab('main')">Positions</button>
+            <button type="button" class="pos-tab-btn" data-pos-tab="phishing" onclick="switchPosPoolsTab('phishing')">Phishing metadata <span id="posPhishingTabCount"></span></button>
             <button type="button" class="pos-tab-btn" data-pos-tab="mismatch" onclick="switchPosPoolsTab('mismatch')">NFT collection issues <span id="posMismatchTabCount"></span></button>
           </div>
           <div class="table-wrap" id="posPoolsTableMainWrap"><table id="posPoolsTable"></table></div>
+          <div class="table-wrap" id="posPoolsTablePhishingWrap" style="display:none"><table id="posPoolsPhishingTable"></table></div>
           <div class="table-wrap" id="posPoolsTableMismatchWrap" style="display:none"><table id="posPoolsMismatchTable"></table></div>
           <div id="posErrors"></div>
         </div>
@@ -14038,17 +14199,25 @@ def _render_positions_page() -> str:
     }
     function switchPosPoolsTab(name, silent) {
       const mainW = document.getElementById("posPoolsTableMainWrap");
+      const phW = document.getElementById("posPoolsTablePhishingWrap");
       const mmW = document.getElementById("posPoolsTableMismatchWrap");
       if (!mainW || !mmW) return;
-      const wantMm = String(name || "").toLowerCase() === "mismatch";
-      mainW.style.display = wantMm ? "none" : "block";
+      const tab = String(name || "").toLowerCase();
+      const wantMain = tab === "main";
+      const wantPh = tab === "phishing";
+      const wantMm = tab === "mismatch";
+      mainW.style.display = wantMain ? "block" : "none";
+      if (phW) phW.style.display = wantPh ? "block" : "none";
       mmW.style.display = wantMm ? "block" : "none";
       document.querySelectorAll("#posPoolsTabBar [data-pos-tab]").forEach((b) => {
         const t = b.getAttribute("data-pos-tab") || "";
-        b.classList.toggle("active", wantMm ? t === "mismatch" : t === "main");
+        const on = (wantMain && t === "main") || (wantPh && t === "phishing") || (wantMm && t === "mismatch");
+        b.classList.toggle("active", on);
       });
       if (!silent) {
-        try { localStorage.setItem(POS_POOLS_TAB_KEY, wantMm ? "mismatch" : "main"); } catch (_) {}
+        try {
+          localStorage.setItem(POS_POOLS_TAB_KEY, wantMm ? "mismatch" : wantPh ? "phishing" : "main");
+        } catch (_) {}
       }
     }
     let posHasScannedOnce = false;
@@ -14554,11 +14723,29 @@ def _render_positions_page() -> str:
     function mismatchHint(r) {
       return `Pair=${String(r?.pair || "-")} | Position symbols=${String(r?.position_symbol0 || "-")}/${String(r?.position_symbol1 || "-")}`;
     }
+    function v3PosSymbolCompact(sym) {
+      let u = String(sym || "").trim().toUpperCase().replace(/_/g, "-").replace(/\s+/g, "-");
+      u = u.replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+      const m = u.match(/^([A-Z0-9]{2,16})(?:-?V3-?POS|V3POS)$/);
+      if (!m) return "";
+      const pfx = m[1];
+      const map = {
+        UNI: "UNI-V3", UNIV3: "UNI-V3", UNISWAP: "UNI-V3",
+        PCS: "PanC-V3", PCSV3: "PanC-V3", PAN: "PanC-V3", PANCAKE: "PanC-V3",
+        SUSHI: "Sushi-V3", SUSHISWAP: "Sushi-V3",
+        CAMELOT: "Camelot-V3", CML: "Camelot-V3",
+        AERO: "Aero-V3", AERODROME: "Aero-V3",
+        VELO: "Velo-V3", VELODROME: "Velo-V3",
+        QUICK: "Quick-V3", QUICKSWAP: "Quick-V3",
+      };
+      if (map[pfx]) return map[pfx];
+      return pfx.length <= 10 ? `${pfx}-V3` : `${pfx.slice(0, 8)}-V3`;
+    }
     function shortProtocol(v) {
       const raw = String(v || "").trim();
       if (!raw) return "";
-      const hyp = raw.toLowerCase().replace(/_/g, "-").replace(/\s+/g, "");
-      if (hyp === "uni-v3-pos" || hyp === "uni-v3pos") return "UNI-V3";
+      const c3 = v3PosSymbolCompact(raw);
+      if (c3) return c3;
       const p = raw.toLowerCase();
       if (p === "uniswap_v3") return "UNI_V3";
       if (p === "uniswap_v4") return "UNI_V4";
@@ -14594,7 +14781,12 @@ def _render_positions_page() -> str:
       const hiddenRows = [];
       const unsupportedRows = [];
       const mismatchRows = [];
+      const phishingRows = [];
       let spamHiddenCount = 0;
+      function rowTrustSpamParam(r) {
+        const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
+        return Boolean(r && (r._is_suspected_spam || ph));
+      }
       for (let i = 0; i < listAll.length; i++) {
         const r0 = listAll[i];
         const row = Object.assign({_src_idx: i}, r0 || {});
@@ -14602,6 +14794,7 @@ def _render_positions_page() -> str:
         const trusted = trustedSpamKeys.has(row._row_key);
         const manual = manualHiddenKeys.has(row._row_key);
         const suspected = Boolean(row && (row.suspected_spam || row.spam_skipped));
+        const metaPhish = !!(row && (row.nft_metadata_phishing === true || row.nft_metadata_phishing === 1));
         const up = row && row.unsupported_protocol;
         const unsupported = up === true || up === 1 || up === "true";
         const seg = String((row || {}).catalog_segment || "").toLowerCase();
@@ -14610,6 +14803,10 @@ def _render_positions_page() -> str:
         row._is_manual_hidden = manual;
         row._is_suspected_spam = suspected;
         row._is_unsupported_protocol = unsupported;
+        if (metaPhish && !trusted) {
+          phishingRows.push(row);
+          continue;
+        }
         if (unsupported) {
           unsupportedRows.push(row);
           continue;
@@ -14654,7 +14851,7 @@ def _render_positions_page() -> str:
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         html += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
+        html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
         html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
         html += "</tr>";
@@ -14697,7 +14894,7 @@ def _render_positions_page() -> str:
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          closedInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' title='Chart may be limited for closed positions' /></td></tr>`;
+          closedInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' title='Chart may be limited for closed positions' /></td></tr>`;
         }
         closedInner += "</table>";
         const closedOpenAttr = closedExpanded ? " open" : "";
@@ -14718,7 +14915,7 @@ def _render_positions_page() -> str:
           const rowKey = String(r._row_key || "");
           const rowKeyEsc = esc(rowKey.replace(/'/g, "\\\\'"));
           const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+          hiddenInner += `<tr><td class='mono' style='padding:3px 6px;font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono' style='padding:3px 6px'>${esc(shortAddr4(r.position_id || ""))}</td><td style='padding:3px 6px'>${esc(r.chain || "")}</td><td style='padding:3px 6px'>${esc(shortProtocol(r.protocol || ""))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td style='padding:3px 6px'>${esc(r.fee_tier || "")}</td><td style='padding:3px 6px'>${statusDot(r.position_status || "-")}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td><td style='padding:3px 6px'>${esc(String(r.liquidity_display || "0"))}</td><td style='padding:3px 6px;${mismatchStyle}'${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td><td style='padding:3px 6px'><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td><td style='padding:3px 6px'><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
         }
         hiddenInner += "</table>";
         const openAttr = hiddenExpanded ? " open" : "";
@@ -14726,6 +14923,44 @@ def _render_positions_page() -> str:
           ? `Hidden positions (${hiddenRows.length}; spam=${spamHiddenCount})`
           : `Hidden positions (${hiddenRows.length})`;
         html += `<tr><td colspan='${totalCols}' class='pos-pools-details-cell'><details id='posHiddenDetails' class='pos-collapsed-section'${openAttr}><summary>${hiddenSummary}</summary><div style='margin-top:8px;max-height:220px;overflow:auto'>${hiddenInner}</div></details></td></tr>`;
+      }
+      const phCols = 14;
+      let phHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
+      for (let pi = 0; pi < phishingRows.length; pi++) {
+        const r = phishingRows[pi];
+        const mismatch = hasPairMismatch(r);
+        const mismatchCellStyle = mismatch ? " style='background:#fff7ed;color:#9a3412;font-weight:600'" : "";
+        const pairTrace = String(r.pair_symbol_source || "").trim();
+        const pairTitleRaw = mismatch
+          ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}`
+          : (pairTrace ? `source: ${pairTrace}` : "");
+        const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
+        const en = String(r.explorer_token_name || "").trim();
+        const es = String(r.explorer_token_symbol || "").trim();
+        const metaCell = (en || es) ? `<div style='max-width:280px;white-space:normal;font-size:11px;line-height:1.35'><span style='color:#64748b'>Name:</span> ${esc(en || "—")}<br/><span style='color:#64748b'>Symbol:</span> ${esc(es || "—")}</div>` : `<span style='color:#94a3b8'>—</span>`;
+        phHtml += "<tr>";
+        phHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.address || "").replace(/'/g, "\\\\'"))}')" title='Copy address'>⧉</button></td>`;
+        phHtml += `<td class='mono'>${esc(shortAddr4(r.position_id || ""))}<button class='copy-btn' type='button' onclick="copyText('${esc(String(r.position_id || "").replace(/'/g, "\\\\'"))}')" title='Copy position id'>⧉</button></td>`;
+        phHtml += `<td>${esc(r.chain || "")}</td>`;
+        phHtml += `<td>${esc(shortProtocol(r.protocol || ""))}</td>`;
+        phHtml += `<td style='vertical-align:top'>${metaCell}</td>`;
+        const rowKeyEscPh = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
+        phHtml += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td>`;
+        const feeRawPh = String(r.fee_tier_raw || "").trim();
+        const feeTipPh = feeRawPh ? ` title="raw: ${esc(feeRawPh)}"` : "";
+        phHtml += `<td${feeTipPh}>${esc(r.fee_tier || "")}</td>`;
+        phHtml += `<td>${esc(r.position_created_date || "-")}</td>`;
+        phHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
+        phHtml += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
+        phHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
+        phHtml += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
+        phHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscPh}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        const checkedPh = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
+        phHtml += `<td><input type='checkbox' ${checkedPh} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
+        phHtml += "</tr>";
+      }
+      if (!phishingRows.length) {
+        phHtml += `<tr><td colspan='${phCols}' style='white-space:normal;color:#64748b'>No NFTs with obvious phishing-style collection metadata (short links, fake claims, wallet prompts, etc.). They are excluded from the main list; run a fresh scan if the table was loaded from cache.</td></tr>`;
       }
       const mmCols = 14;
       let mmHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th title="NFT collection scan: explorer tokennfttx row vs on-chain owner / PM read">Scan issue</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
@@ -14757,7 +14992,7 @@ def _render_positions_page() -> str:
         mmHtml += `<td${pmStyle}${pmTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         mmHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         mmHtml += `<td${pmStyle}${pmTitle}>${esc(r.fees_owed_display || "-")}</td>`;
-        mmHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscMm}', this.checked, ${Boolean(r._is_suspected_spam) ? "true" : "false"})" /></td>`;
+        mmHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscMm}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         const checkedMm = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
         mmHtml += `<td><input type='checkbox' ${checkedMm} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
         mmHtml += "</tr>";
@@ -14766,15 +15001,21 @@ def _render_positions_page() -> str:
         mmHtml += `<tr><td colspan='${mmCols}' style='white-space:normal;color:#64748b'>No NFT collection scan issues. Rows appear when explorer transfer indexing and on-chain owner or PM read disagree. Legitimate custody (Pancake farm, Uniswap V4, Pancake Infinity, etc.) uses the allowlist and is not listed here.</td></tr>`;
       }
       table.innerHTML = html;
+      const phTable = document.getElementById("posPoolsPhishingTable");
+      if (phTable) phTable.innerHTML = phHtml;
       const mmTable = document.getElementById("posPoolsMismatchTable");
       if (mmTable) mmTable.innerHTML = mmHtml;
       const tabBar = document.getElementById("posPoolsTabBar");
       const cntEl = document.getElementById("posMismatchTabCount");
-      if (tabBar) tabBar.style.display = mismatchRows.length ? "flex" : "none";
+      const cntPhEl = document.getElementById("posPhishingTabCount");
+      const hasSubTabs = mismatchRows.length > 0 || phishingRows.length > 0;
+      if (tabBar) tabBar.style.display = hasSubTabs ? "flex" : "none";
       if (cntEl) cntEl.textContent = mismatchRows.length ? `(${mismatchRows.length})` : "";
+      if (cntPhEl) cntPhEl.textContent = phishingRows.length ? `(${phishingRows.length})` : "";
       let savedPoolsTab = "";
       try { savedPoolsTab = String(localStorage.getItem(POS_POOLS_TAB_KEY) || ""); } catch (_) { savedPoolsTab = ""; }
-      if (mismatchRows.length && savedPoolsTab === "mismatch") switchPosPoolsTab("mismatch", true);
+      if (phishingRows.length > 0 && savedPoolsTab === "phishing") switchPosPoolsTab("phishing", true);
+      else if (mismatchRows.length > 0 && savedPoolsTab === "mismatch") switchPosPoolsTab("mismatch", true);
       else switchPosPoolsTab("main", true);
       const closedEl = document.getElementById("posClosedDetails");
       if (closedEl) {
@@ -17088,9 +17329,12 @@ def _build_positions_info_notes(
         info_notes.append("TRON scanning is not available yet in this build.")
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         info_notes.append(
-            f"Explorer NFT catalog: tokennfttx only; parallel owner×chain workers={POSITIONS_ADDRESS_PARALLEL_WORKERS}, "
-            f"page_workers={POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS}, scan_budget={POSITIONS_SCAN_MAX_SECONDS}s, "
-            f"http_timeout={POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC}s; non-Uniswap/Pancake NFTs are listed as unsupported only."
+            "Explorer NFT catalog: tokennfttx only; "
+            f"parallel wallet×chain tasks={POSITIONS_NFT_PARALLEL_WORKERS} (ThreadPool cap), "
+            f"page_workers={POSITIONS_EXPLORER_NFTTX_PAGE_WORKERS}, "
+            f"parallel_template_page1={int(bool(POSITIONS_EXPLORER_NFTTX_PARALLEL_TPL_PAGE1))}, "
+            f"scan_budget={POSITIONS_SCAN_MAX_SECONDS}s, http_timeout={POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC}s; "
+            "non-Uniswap/Pancake NFTs are listed as unsupported only."
         )
     if POSITIONS_CONTRACT_ONLY_ENABLED:
         info_notes.append("Contract-only mode: Pair/Fee/In position/Unclaimed are from on-chain contract calls only.")
