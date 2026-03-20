@@ -691,6 +691,11 @@ POSITIONS_EXPLORER_GRAPH_ID_UNION = os.environ.get("POSITIONS_EXPLORER_GRAPH_ID_
 POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER = os.environ.get(
     "POSITIONS_NFT_CATALOG_OPEN_LIQUIDITY_FILTER", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
+# V4: запасной вариант, если префильтр всё ещё даёт ложные closed — не ставить closed по whitelist (unknown).
+# По умолчанию выкл.: основная логика — filter_uniswap_v3_v4_open_liquidity_token_ids (v4: сбой RPC → не closed).
+POSITIONS_NFT_CATALOG_V4_SKIP_CLOSED_PREFILTER = os.environ.get(
+    "POSITIONS_NFT_CATALOG_V4_SKIP_CLOSED_PREFILTER", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 
 DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     1: ["https://ethereum-rpc.publicnode.com"],
@@ -3364,7 +3369,8 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
 
     Для каждого tokenId: ownerOf на Uniswap V3 NFPM; при неуспехе — ownerOf на V4 PM;
     оба неуспешны → сожжённый NFT. Затем только для «живых» NFT: V3 positions() или
-    V4 getPositionLiquidity().
+    V4 getPositionLiquidity(). Для v4: при сбое sub-call (ok=false / короткий return) id попадает в open_v4,
+    а не в closed — иначе ложные «закрытые» без тяжёлого PM enrich по всему каталогу.
 
     v3_position_manager / v4_position_manager — опционально (иначе из мап по chain_id).
 
@@ -3466,13 +3472,15 @@ def filter_uniswap_v3_v4_open_liquidity_token_ids(
             res = _multicall3_aggregate3(cid, calls, deadline_ts=deadline_ts)
             rounds += 1
             for tid, (ok, data) in zip(group, res):
+                # Не считать closed при сбое multicall: иначе живая v4 уходит в Closed и не получает PM snapshot.
                 if not ok or len(data) < 32:
-                    closed_z.add(int(tid))
+                    open_v4.append(int(tid))
                     continue
                 try:
-                    liq = int.from_bytes(data[-32:], "big", signed=False)
+                    liq = _decode_uint_eth_call("0x" + bytes(data).hex())
                 except Exception:
-                    liq = 0
+                    open_v4.append(int(tid))
+                    continue
                 if liq > 0:
                     open_v4.append(int(tid))
                 else:
@@ -11943,7 +11951,12 @@ def _scan_pool_positions_explorer_nft_catalog(
                 catalog_segment = "unknown"
                 if supported and pmk:
                     if nft_open_allowed is not None:
-                        catalog_segment = "open" if _olk in nft_open_allowed else "closed"
+                        if _olk in nft_open_allowed:
+                            catalog_segment = "open"
+                        elif pmk == "v4pm" and POSITIONS_NFT_CATALOG_V4_SKIP_CLOSED_PREFILTER:
+                            catalog_segment = "unknown"
+                        else:
+                            catalog_segment = "closed"
                 blob = f"{token_name} {token_symbol}".lower()
                 if pmk == "v4pm":
                     proto_col = "UNI-V4"
