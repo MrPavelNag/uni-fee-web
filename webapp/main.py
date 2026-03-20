@@ -344,6 +344,10 @@ _NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS: frozenset[str] = frozenset(
 # Разделение сканера: только NPM Uniswap/Pancake v3 vs Uniswap v4 + Pancake Infinity.
 _POOL_SCAN_PROFILE_V3_PM_KINDS: frozenset[str] = frozenset({"v3npm", "pancake_v3npm"})
 _POOL_SCAN_PROFILE_HEAVY_PM_KINDS: frozenset[str] = frozenset({"v4pm", "infinity_cl", "infinity_bin"})
+
+
+def _nft_pm_kind_is_heavy(pmk: str) -> bool:
+    return str(pmk or "").strip().lower() in _POOL_SCAN_PROFILE_HEAVY_PM_KINDS
 _HEAVY_ENRICH_DEBUG_LOCK = threading.Lock()
 # HTTP read timeout per explorer tokennfttx request (slow indexers / large pages).
 POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC = max(
@@ -11780,7 +11784,7 @@ def _nft_catalog_pmk_matches_pool_scan_profile(pmk: str, profile: str) -> bool:
 
 
 def _pool_row_matches_scan_profile(row: dict[str, Any], profile: str) -> bool:
-    """Строка пула после aggregate/graph: отнести к профилю v3 или heavy."""
+    """Строка пула после aggregate/graph: v3-профиль как в v0.1.4 — всё, кроме явных heavy PM/протоколов."""
     p = _normalize_pool_scan_profile(profile)
     if not isinstance(row, dict):
         return False
@@ -11789,15 +11793,17 @@ def _pool_row_matches_scan_profile(row: dict[str, Any], profile: str) -> bool:
     if cid > 0 and _is_eth_address(pool):
         pmk = _explorer_nft_contract_pm_kind(cid, pool)
         if pmk:
-            return _nft_catalog_pmk_matches_pool_scan_profile(pmk, p)
+            if p == "v3":
+                return not _nft_pm_kind_is_heavy(pmk)
+            return _nft_pm_kind_is_heavy(pmk)
     proto = str(row.get("protocol") or "").strip().lower()
     lbl = str(row.get("_protocol_label") or "").strip().lower()
     if p == "v3":
-        return proto in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"} or lbl in {
-            "uniswap_v3",
-            "pancake_v3",
-            "pancake_v3_staked",
-        }
+        if proto in _NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS or lbl in _NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS:
+            return False
+        if lbl.startswith("pancake_infinity_"):
+            return False
+        return True
     return proto in _NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS or lbl in _NFT_CATALOG_HEAVY_ENRICH_PROTOCOLS or (
         lbl.startswith("pancake_infinity_")
     )
@@ -12614,8 +12620,12 @@ def _scan_pool_positions_explorer_nft_catalog(
                     except Exception:
                         created = ""
                 pmk = _explorer_nft_contract_pm_kind(int(cid), str(contract))
-                if not _nft_catalog_pmk_matches_pool_scan_profile(pmk, prof):
-                    continue
+                if prof == "v3":
+                    if _nft_pm_kind_is_heavy(pmk):
+                        continue
+                elif prof == "heavy":
+                    if not _nft_catalog_pmk_matches_pool_scan_profile(pmk, "heavy"):
+                        continue
                 if (not token_name) and (not token_symbol) and pmk == "v4pm":
                     pair_disp = f"Uniswap v4 position #{tid}"
                 elif (not token_name) and (not token_symbol) and pmk == "v3npm":
@@ -15305,22 +15315,21 @@ def _render_positions_page() -> str:
             <div class="chips" id="evmChips"></div>
           </div>
           <div class="addr-box" style="border-style:dashed">
-            <h4 style="margin:0 0 6px;font-size:14px;color:#1e3a8a">Как это устроено</h4>
+            <h4 style="margin:0 0 6px;font-size:14px;color:#1e3a8a">How it works</h4>
             <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.45;color:#334155">
-              <li><b>V3 (первая таблица)</b> — только Uniswap v3 и PancakeSwap v3 через NPM (включая staked в MasterChef).</li>
-              <li><b>V4 / Infinity (вторая таблица)</b> — отдельный скан: NFT из обозревателя + Position Manager Uniswap v4 и Pancake Infinity (CL/Bin).</li>
-              <li><b>Solana и TRON</b> здесь не поддерживаются; нужны только EVM-кошельки 0x…</li>
+              <li><b>V3 (first table)</b> — Uniswap v3 and PancakeSwap v3 via NPM only (including staked in MasterChef).</li>
+              <li><b>V4 / Infinity (second table)</b> — separate scan: explorer NFT index + Uniswap v4 and Pancake Infinity position managers (CL/Bin).</li>
             </ul>
           </div>
         </div>
       </section>
       <section class="result-card">
-        <div class="section-head">
-          <h3>Uniswap v3 / PancakeSwap v3</h3>
+        <div class="section-head" style="flex-wrap:nowrap;align-items:center">
+          <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / PancakeSwap v3</h3>
           <div class="section-actions">
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
-            <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan</button>
+            <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan V3</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
@@ -15347,12 +15356,12 @@ def _render_positions_page() -> str:
           <h3>Uniswap v4 / Pancake Infinity</h3>
           <div class="section-actions">
             <div id="posHeavyProgress" class="pos-progress"><div class="bar"></div></div>
-            <span class="pos-status" id="posHeavyStatus">Готово</span>
-            <button id="posHeavySearchBtn" class="search-link-btn" type="button" onclick="scanHeavyPositions()">Скан v4 / Infinity</button>
+            <span class="pos-status" id="posHeavyStatus">Ready</span>
+            <button id="posHeavySearchBtn" class="search-link-btn" type="button" onclick="scanHeavyPositions()">Scan v4 / Infinity</button>
           </div>
         </div>
         <div id="posHeavyPoolsBody" class="section-body">
-          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Используются те же EVM-адреса. Запуск независим от таблицы v3.</p>
+          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same EVM addresses. Run independently of the v3 table.</p>
           <div class="table-wrap"><table id="posHeavyPoolsTable"></table></div>
           <div id="posHeavyErrors"></div>
         </div>
@@ -15559,12 +15568,12 @@ def _render_positions_page() -> str:
     function updatePosSearchButton() {
       const btn = document.getElementById("posSearchBtn");
       if (!btn) return;
-      btn.textContent = posHasScannedOnce ? "Scan again" : "Scan";
+      btn.textContent = posHasScannedOnce ? "Scan again V3" : "Scan V3";
     }
     function updateHeavySearchButton() {
       const btn = document.getElementById("posHeavySearchBtn");
       if (!btn) return;
-      btn.textContent = posHeavyHasScannedOnce ? "Скан снова (v4 / Infinity)" : "Скан v4 / Infinity";
+      btn.textContent = posHeavyHasScannedOnce ? "Scan again (v4 / Infinity)" : "Scan v4 / Infinity";
     }
     function setPosHistoryStatus(text, isErr) {
       const el = document.getElementById("posHistoryStatus");
@@ -15953,17 +15962,31 @@ def _render_positions_page() -> str:
       const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
       errWrap.innerHTML = errHtml + infoHtml + dbgHtml;
     }
-    function setHistorySelected(idx, checked) {
-      const n = Number(idx) || 0;
-      if (checked) posHistorySelected.add(n);
-      else posHistorySelected.delete(n);
+    function historyKey(scope, idx) {
+      return String(scope || "v") + ":" + (Number(idx) || 0);
+    }
+    function parseHistoryKey(k) {
+      const s = String(k);
+      const i = s.indexOf(":");
+      if (i < 0) return { scope: "v", idx: Number(s) || 0 };
+      return { scope: s.slice(0, i) || "v", idx: Number(s.slice(i + 1)) || 0 };
+    }
+    function cmpHistoryKey(a, b) {
+      const A = parseHistoryKey(a), B = parseHistoryKey(b);
+      if (A.scope !== B.scope) return String(A.scope).localeCompare(String(B.scope));
+      return A.idx - B.idx;
+    }
+    function setHistorySelected(scope, idx, checked) {
+      const k = historyKey(scope, idx);
+      if (checked) posHistorySelected.add(k);
+      else posHistorySelected.delete(k);
     }
     async function showSelectedPoolSeries() {
       const chartEl = document.getElementById("posPoolChart");
       if (!chartEl) return;
-      const selected = Array.from(posHistorySelected).sort((a, b) => a - b).slice(0, 12);
+      const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
-        setPosHistoryStatus("Select at least one checkbox in Pool positions table.", true);
+        setPosHistoryStatus("Select at least one History checkbox in the V3 or v4/Infinity table.", true);
         return;
       }
       try {
@@ -15973,8 +15996,11 @@ def _render_positions_page() -> str:
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
         for (let i = 0; i < selected.length; i++) {
-          const idx = selected[i];
-          const row = (posCache.pools || [])[idx];
+          const hk = parseHistoryKey(selected[i]);
+          const idx = hk.idx;
+          const row = hk.scope === "h"
+            ? (posHeavyCache.pools || [])[idx]
+            : (posCache.pools || [])[idx];
           if (!row) continue;
           if (row.unsupported_protocol) continue;
           const payload = {
@@ -16195,8 +16221,8 @@ def _render_positions_page() -> str:
         html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         html += `<td${pairTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-        html += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
+        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
+        html += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
         html += "</tr>";
       }
       if (!visible.length) {
@@ -16239,8 +16265,8 @@ def _render_positions_page() -> str:
         otHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         otHtml += `<td${mismatchCellStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         otHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEscOt}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        const checkedOt = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
-        otHtml += `<td><input type='checkbox' ${checkedOt} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td>`;
+        const checkedOt = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
+        otHtml += `<td><input type='checkbox' ${checkedOt} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
         otHtml += "</tr>";
       }
       if (!otherRows.length) {
@@ -16256,7 +16282,7 @@ def _render_positions_page() -> str:
         const pairTitleRaw = mismatch ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}` : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
+        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
         protHtml += "<tr>";
         protHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         protHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
@@ -16264,7 +16290,7 @@ def _render_positions_page() -> str:
         protHtml += `<td>${statusDot(r.position_status || "-")}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         protHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         protHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        protHtml += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+        protHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!protocolRows.length) {
         protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate (collection name/symbol must suggest Uniswap or Pancake before on-chain PM work).</td></tr>`;
@@ -16278,7 +16304,7 @@ def _render_positions_page() -> str:
         const pairTitleRaw = mismatch ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}` : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
+        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
         closedHtml += "<tr>";
         closedHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         closedHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
@@ -16286,7 +16312,7 @@ def _render_positions_page() -> str:
         closedHtml += `<td>${statusDot(r.position_status || "-")}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         closedHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         closedHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        closedHtml += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' title='Closed on-chain (zero open liquidity on PM)' /></td></tr>`;
+        closedHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" title='Closed on-chain (zero open liquidity on PM)' /></td></tr>`;
       }
       if (!closedTabRows.length) {
         closedHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No closed positions: on-chain open-liquidity check marked these as zero liquidity on the position manager (catalog_segment=closed).</td></tr>`;
@@ -16300,7 +16326,7 @@ def _render_positions_page() -> str:
         const pairTitleRaw = mismatch ? `${mismatchHint(r)}${pairTrace ? ` | source: ${pairTrace}` : ""}` : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checked = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
+        const checked = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
         spamHtml += "<tr>";
         spamHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         spamHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
@@ -16308,7 +16334,7 @@ def _render_positions_page() -> str:
         spamHtml += `<td>${statusDot(r.position_status || "-")}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         spamHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         spamHtml += `<td><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        spamHtml += `<td><input type='checkbox' ${checked} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+        spamHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!spamRows.length) {
         spamHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No spam heuristics: TVL/symbol rules did not flag supported rows (phase 6). Trust a row via Hide to re-run enrich.</td></tr>`;
@@ -16324,7 +16350,7 @@ def _render_positions_page() -> str:
           : (pairTrace ? `source: ${pairTrace}` : "");
         const mismatchTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
         const rowKeyEsc = esc(String(r._row_key || "").replace(/'/g, "\\\\'"));
-        const checkedH = posHistorySelected.has(Number(r._src_idx) || 0) ? "checked" : "";
+        const checkedH = posHistorySelected.has(historyKey("v", r._src_idx)) ? "checked" : "";
         const feeRawH = String(r.fee_tier_raw || "").trim();
         const feeTipH = feeRawH ? ` title="raw: ${esc(feeRawH)}"` : "";
         hiddenHtml += "<tr>";
@@ -16335,7 +16361,7 @@ def _render_positions_page() -> str:
         hiddenHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         hiddenHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         hiddenHtml += `<td><input type='checkbox' checked onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
-        hiddenHtml += `<td><input type='checkbox' ${checkedH} onchange='setHistorySelected(${Number(r._src_idx) || 0}, this.checked)' /></td></tr>`;
+        hiddenHtml += `<td><input type='checkbox' ${checkedH} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!hiddenRows.length) {
         hiddenHtml += `<tr><td colspan='${totalCols}' style='white-space:normal;color:#64748b'>No manually hidden rows. Use Hide on the Positions tab to move a row here.</td></tr>`;
@@ -16534,9 +16560,9 @@ def _render_positions_page() -> str:
         const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
         return Boolean(r && (r.suspected_spam || r.spam_skipped || ph));
       }
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Creation time</th><th>Status</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>Hide</th><th>History</th></tr>`;
       if (!listAll.length) {
-        html += `<tr><td colspan='12' style='white-space:normal;color:#64748b'>Нет строк. Запустите «Скан v4 / Infinity» или проверьте, что на кошельке есть NFT Uniswap v4 / Pancake Infinity на поддерживаемых сетях.</td></tr>`;
+        html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake Infinity NFTs on supported chains.</td></tr>`;
         table.innerHTML = html;
         return;
       }
@@ -16564,21 +16590,23 @@ def _render_positions_page() -> str:
         html += `<td>${esc(String(r.liquidity_display || "0"))}</td>`;
         html += `<td${pairTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         html += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${heavyTrustSpamParam(r) ? "true" : "false"})" /></td>`;
+        const hChecked = posHistorySelected.has(historyKey("h", r._src_idx)) ? "checked" : "";
+        html += `<td><input type='checkbox' ${hChecked} onchange="setHistorySelected('h', ${Number(r._src_idx) || 0}, this.checked)" /></td>`;
         html += "</tr>";
       }
       if (!anyRow) {
-        html += `<tr><td colspan='12' style='white-space:normal;color:#64748b'>Все строки скрыты вручную (Hide) — снимите скрытие в общей таблице v3 или очистите скрытые ключи.</td></tr>`;
+        html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>All rows hidden via Hide — unhide from the v3 table or clear manual hidden keys in local storage.</td></tr>`;
       }
       table.innerHTML = html;
     }
     async function scanHeavyPositions() {
       let handoffToBackground = false;
       if (posHeavyHasScannedOnce) {
-        const ok = window.confirm("Запустить скан v4 / Infinity снова и заменить текущие результаты?");
+        const ok = window.confirm("Run v4 / Infinity scan again and replace current results?");
         if (!ok) return;
       }
       if (!posState.evm.length) {
-        setHeavyStatus("Добавьте хотя бы один EVM-адрес (0x…).", true);
+        setHeavyStatus("Add at least one EVM address (0x…).", true);
         return;
       }
       try {
@@ -16595,14 +16623,14 @@ def _render_positions_page() -> str:
           }),
         });
         const startData = await startRes.json().catch(() => ({}));
-        if (!startRes.ok) throw new Error(startData.detail || "Не удалось запустить скан");
+        if (!startRes.ok) throw new Error(startData.detail || "Failed to start scan");
         const jobId = String(startData.job_id || "").trim();
         if (!jobId) throw new Error("Invalid job id");
         saveActiveHeavyPosJob(jobId);
         const data = await pollPosJob(jobId, true, "heavy");
         if (data && data.__partial) {
           handoffToBackground = true;
-          setHeavyStatus("Часть результатов загружена; обогащение продолжается в фоне…", false);
+          setHeavyStatus("Partial results loaded; enrich continues in background…", false);
           setTimeout(() => { resumeHeavyPosJobIfAny(); }, 300);
           return;
         }
@@ -16622,10 +16650,10 @@ def _render_positions_page() -> str:
         updateHeavySearchButton();
         const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
         const n = (data.pool_positions || []).length;
-        setHeavyStatus(`Готово. Строк: ${n}${errCount ? ` | предупреждений: ${errCount}` : ""}`, false);
+        setHeavyStatus(`Done. Rows: ${n}${errCount ? ` | warnings: ${errCount}` : ""}`, false);
       } catch (e) {
         saveActiveHeavyPosJob("");
-        setHeavyStatus("Скан v4/Infinity: " + (e?.message || "ошибка"), true);
+        setHeavyStatus("v4 / Infinity scan: " + (e?.message || "error"), true);
       } finally {
         if (!handoffToBackground) setHeavyBusy(false);
       }
@@ -16651,10 +16679,10 @@ def _render_positions_page() -> str:
         posHeavyHasScannedOnce = true;
         updateHeavySearchButton();
         const errCount = Array.isArray(data?.errors) ? data.errors.length : 0;
-        setHeavyStatus(`Готово. Строк: ${(data.pool_positions || []).length}${errCount ? ` | предупреждений: ${errCount}` : ""}`, false);
+        setHeavyStatus(`Done. Rows: ${(data.pool_positions || []).length}${errCount ? ` | warnings: ${errCount}` : ""}`, false);
       } catch (e) {
         saveActiveHeavyPosJob("");
-        setHeavyStatus("Фоновый скан v4/Infinity: " + (e?.message || "ошибка"), true);
+        setHeavyStatus("Background v4 / Infinity scan: " + (e?.message || "error"), true);
       } finally {
         setHeavyBusy(false);
       }
@@ -16666,7 +16694,7 @@ def _render_positions_page() -> str:
         if (!ok) return;
       }
       if (!posState.evm.length) {
-        setPosStatus("Добавьте хотя бы один EVM-адрес (0x…).", true);
+        setPosStatus("Add at least one EVM address (0x…).", true);
         return;
       }
       // Search should also reveal the requested section when cache is empty/collapsed.
@@ -16791,10 +16819,10 @@ def _render_positions_page() -> str:
       renderScanMessages(savedHeavy, "posHeavyErrors");
       posHeavyHasScannedOnce = true;
       updateHeavySearchButton();
-      setHeavyStatus(`Кэш: ${savedHeavy.pool_positions.length} строк (v4 / Infinity)`, false);
+      setHeavyStatus(`Cached: ${savedHeavy.pool_positions.length} rows (v4 / Infinity)`, false);
     } else {
       updateHeavySearchButton();
-      setHeavyStatus("Готово", false);
+      setHeavyStatus("Ready", false);
     }
     resumeHeavyPosJobIfAny();
     if ((posState.evm || []).length && !loadActivePosJob()) {
@@ -18862,11 +18890,11 @@ def _build_positions_info_notes(
     info_notes: list[str] = []
     prof = _normalize_pool_scan_profile(pool_scan_profile)
     if prof == "heavy":
-        info_notes.append("Скан: Uniswap v4 и Pancake Infinity (отдельный профиль от NPM v3).")
+        info_notes.append("Scan profile: Uniswap v4 and Pancake Infinity (separate from NPM v3).")
     else:
-        info_notes.append("Скан: только Uniswap v3 и PancakeSwap v3 (включая staked в MasterChef).")
+        info_notes.append("Scan profile: Uniswap v3 and PancakeSwap v3 only (including staked in MasterChef).")
     if solana_addresses or tron_addresses:
-        info_notes.append("Solana/TRON в запросе проигнорированы — на странице описано, что поддерживается только EVM.")
+        info_notes.append("Solana/TRON in the request were ignored — only EVM is supported on this page.")
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         info_notes.append(
             "Explorer NFT catalog: tokennfttx only; "
@@ -19176,7 +19204,7 @@ def _scan_positions_core(
             max_rows=240,
             pos_job_id=pos_job_id,
             session_id=str(sid or ""),
-            nft_enrich_profile=("heavy" if pool_prof == "heavy" else "v3"),
+            nft_enrich_profile=("heavy" if pool_prof == "heavy" else "all"),
         )
         debug_timings["nft_catalog_onchain_enrich_sec"] = round(max(0.0, time.monotonic() - t_nft_enrich), 3)
         debug_timings["nft_catalog_onchain_enrich_ok"] = int(ne_ok)
@@ -19216,7 +19244,7 @@ def _scan_positions_core(
             "(3) PM snapshot: parallel heavy queue first (v4 / Infinity), then light (v3 positions()); "
             "(4) Liquidity USD; "
             "(5) Phishing metadata — sync from explorer name/symbol (Web UI: tab «Other issues»), before spam; "
-            "(6) Spam heuristics — только реальные позиции с подозрительной парой/TVL (tab: Spam); "
+            "(6) Spam heuristics — real PM positions with suspicious pair/TVL only (tab: Spam); "
             "(7) Optional: POSITIONS_NFT_HEAVY_PIPELINE=0 to disable parallel heavy enrich."
         )
         info_notes.append(
@@ -19385,7 +19413,7 @@ def scan_positions_start(req: PositionsScanRequest, request: Request, response: 
 
 @app.post("/api/positions/scan/v4-infinity/start")
 def scan_positions_v4_infinity_start(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
-    """Отдельный job: только Uniswap v4 + Pancake Infinity (NFT-каталог + heavy PM snapshot)."""
+    """Separate async job: Uniswap v4 + Pancake Infinity only (NFT catalog + heavy PM snapshot)."""
     sid = _ensure_session_cookie(request, response)
     job_id = _create_positions_job()
     heavy_req = _positions_scan_request_with_updates(req, pool_scan_profile="heavy")
