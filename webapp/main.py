@@ -16097,6 +16097,13 @@ def _render_positions_page() -> str:
     .status-dot.explorer { background:#93b4d4; border-color:#6b93b8; }
     .errors-box { margin-top:11px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:11px; padding:9px; font-size:13px; white-space:pre-wrap; }
     .info-box { margin-top:11px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:11px; padding:9px; font-size:13px; white-space:pre-wrap; }
+    .fee-card { border-color:#cfdcf2; background: linear-gradient(180deg, #f6f9ff 0%, #edf3ff 100%); }
+    .fee-card .section-head h3 { font-size:20px; letter-spacing:0.1px; }
+    #posFeeStatus { font-size:15px; font-weight:600; color:#334155; }
+    #posFeeBody .hint { font-size:13px; line-height:1.45; color:#475569; margin:0 0 10px; }
+    #posFeeChart { height:360px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
+    .fee-card .pos-fee-hist-label { font-size:15px; font-weight:700; color:#334155; }
+    .fee-card .search-link-btn { font-size:20px; }
     @media (max-width: 1100px) {
       .address-columns { grid-template-columns:1fr; }
       .positions-form, .result-card { padding: 13px; }
@@ -16141,7 +16148,7 @@ def _render_positions_page() -> str:
           </div>
         </div>
       </section>
-      <section class="result-card">
+      <section class="result-card fee-card">
         <div class="section-head" style="flex-wrap:nowrap;align-items:center">
           <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / PancakeSwap v3</h3>
           <div class="section-actions">
@@ -16225,8 +16232,8 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posFeeBody" class="section-body">
-          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
-          <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+          <p class="hint">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
+          <div id="posFeeChart"></div>
         </div>
       </section>
     </div>
@@ -17010,14 +17017,31 @@ def _render_positions_page() -> str:
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
         let lastFeePricing = "";
+        const diag = {
+          selected: selected.length,
+          missingRow: 0,
+          unsupported: 0,
+          apiFail: 0,
+          emptySeries: 0,
+          missingTokens: 0,
+        };
+        const apiFailTop = [];
         for (let i = 0; i < selected.length; i++) {
           const hk = parseHistoryKey(selected[i]);
           const idx = hk.idx;
           const row = hk.scope === "h"
             ? (posHeavyCache.pools || [])[idx]
             : (posCache.pools || [])[idx];
-          if (!row) continue;
-          if (row.unsupported_protocol) continue;
+          if (!row) {
+            diag.missingRow += 1;
+            continue;
+          }
+          if (row.unsupported_protocol) {
+            diag.unsupported += 1;
+            continue;
+          }
+          const missingTokens = (!String(row.token0_id || "").trim() || !String(row.token1_id || "").trim());
+          if (missingTokens) diag.missingTokens += 1;
           const payload = {
             chain: row.chain,
             chain_id: Number(row.chain_id) || 0,
@@ -17043,10 +17067,17 @@ def _render_positions_page() -> str:
           if (!res.ok) {
             const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
             console.warn("position-fee-series failed", row.pair || row.pool_id, det);
+            diag.apiFail += 1;
+            if (apiFailTop.length < 3) {
+              apiFailTop.push(`${String(row.pair || row.pool_id || "?")}: ${det}`);
+            }
             continue;
           }
           const items = Array.isArray(data.items) ? data.items : [];
-          if (!items.length) continue;
+          if (!items.length) {
+            diag.emptySeries += 1;
+            continue;
+          }
           const fp = String(data.fee_pricing || "").trim();
           if (fp) lastFeePricing = fp;
           traces.push({
@@ -17059,8 +17090,16 @@ def _render_positions_page() -> str:
           });
         }
         if (!traces.length) {
-          chartEl.innerHTML = "<div class='hint'>No fee data for the selected rows (subgraph empty, protocol unsupported, or NPM Collect fallback needs token0/token1 after on-chain enrich — run Scan on the table first).</div>";
-          setPosFeeStatus("No fee data", false);
+          const reasons = [];
+          if (diag.unsupported > 0) reasons.push(`unsupported protocol: ${diag.unsupported}`);
+          if (diag.apiFail > 0) reasons.push(`API errors: ${diag.apiFail}`);
+          if (diag.emptySeries > 0) reasons.push(`empty fee series: ${diag.emptySeries}`);
+          if (diag.missingTokens > 0) reasons.push(`missing token0/token1 for fallback: ${diag.missingTokens}`);
+          if (diag.missingRow > 0) reasons.push(`stale selected row refs: ${diag.missingRow}`);
+          const reasonLine = reasons.length ? reasons.join(" | ") : "all selected rows returned empty fee series";
+          const apiTopHtml = apiFailTop.length ? `<br/>Top API errors: ${esc(apiFailTop.join(" ; "))}` : "";
+          chartEl.innerHTML = `<div class='hint'><b>No fee data</b><br/>${esc(reasonLine)}${apiTopHtml}<br/>Tip: run a fresh table scan first so token ids/symbols are enriched before fee fallback.</div>`;
+          setPosFeeStatus(`No fee data · ${reasonLine}`, true);
           return;
         }
         const titleSuffix = histUsd ? " — historical USD (CoinGecko at each Collect)" : " — spot USD";
