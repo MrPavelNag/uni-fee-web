@@ -15473,6 +15473,12 @@ class PositionPoolSeriesRequest(BaseModel):
     fee_usd_historical: bool = False
 
 
+class PositionsFeeCompareDataRequest(BaseModel):
+    rows: list[PositionPoolSeriesRequest] = Field(default_factory=list)
+    max_rows: int = 20
+    include_aggregate: bool = True
+
+
 def _normalize_positions_series_protocol(raw: str, *, for_fees: bool = False) -> str:
     """
     Map table/UI labels (e.g. UNI-V3, PanC-V3 from NFT catalog) to internal protocol keys
@@ -16532,7 +16538,7 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posFeeBody" class="section-body">
-          <p class="hint">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
+          <p class="hint">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The chart compares <b>collected fee history</b> (subgraph or NPM Collect logs via RPC) with an <b>estimated cumulative fee</b> curve (pool daily fees × your liquidity share). If collected history is missing, only estimate/snapshot is shown. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
           <div id="posFeeChart"></div>
           <div id="posFeeDebug" class="info-box" style="display:none"></div>
         </div>
@@ -17037,26 +17043,19 @@ def _render_positions_page() -> str:
       }
       return Math.max(0, Number(lane.lastDoneSec || 0));
     }
-    function laneEtaSec(lane) {
-      if (!lane || !lane.running) return 0;
-      const elapsed = laneElapsedSec(lane);
-      const p = Math.min(99, Math.max(0, Number(lane.progress || 0)));
-      if (p >= 3) return Math.max(0, elapsed * (100 - p) / p);
-      return Math.max(0, Number(lane.fallbackEtaSec || 0) - elapsed);
-    }
     function laneStatusSuffix(lane) {
       if (!lane) return "";
       if (lane.queued && !lane.running) {
-        return `${lane.label}: queued`;
+        return `${lane.label} queued`;
       }
       if (lane.running) {
         const elapsed = formatScanDuration(laneElapsedSec(lane)) || "0s";
-        const eta = formatScanDuration(laneEtaSec(lane)) || "0s";
-        return `${lane.label}: running for ${elapsed}, ~${eta} left`;
+        const p = Math.max(0, Math.min(99, Number(lane.progress || 0)));
+        return `${lane.label} ${Math.round(p)}% · ${elapsed}`;
       }
       if (lane.doneAtMs > 0 && (Date.now() - lane.doneAtMs) <= 15000) {
         const doneIn = formatScanDuration(Number(lane.lastDoneSec || 0)) || "0s";
-        return `${lane.label}: done in ${doneIn}`;
+        return `${lane.label} done (${doneIn})`;
       }
       return "";
     }
@@ -17807,14 +17806,14 @@ def _render_positions_page() -> str:
         debugEl.innerHTML = parts.join("<br/>");
         debugEl.style.display = "";
       }
-      async function postFeeSeriesWithRetry(payload, maxAttempts = 3) {
+      async function postJsonWithRetry(url, payload, maxAttempts = 3) {
         let lastRes = null;
         let lastData = {};
         let lastErr = null;
         const attempts = Math.max(1, Number(maxAttempts) || 1);
         for (let attempt = 1; attempt <= attempts; attempt++) {
           try {
-            const res = await fetch("/api/positions/position-fee-series", {
+            const res = await fetch(String(url || ""), {
               method: "POST",
               headers: {"Content-Type":"application/json"},
               body: JSON.stringify(payload),
@@ -17849,7 +17848,11 @@ def _render_positions_page() -> str:
         const traces = [];
         let lastFeePricing = "";
         let hasCollectedHistoryTrace = false;
-        let hasEstimateOnlyTrace = false;
+        let hasEstimatedShareTrace = false;
+        let hasSnapshotOnlyTrace = false;
+        let rowsWithCollected = 0;
+        let rowsWithEstimated = 0;
+        let rowsWithSnapshot = 0;
         const diag = {
           selected: selected.length,
           missingRow: 0,
@@ -17861,6 +17864,8 @@ def _render_positions_page() -> str:
         const apiFailTop = [];
         const backendHints = [];
         const rowStatuses = [];
+        const rowsPayload = [];
+        const payloadMeta = [];
         for (let i = 0; i < selected.length; i++) {
           const hk = parseHistoryKey(selected[i]);
           const idx = hk.idx;
@@ -17890,7 +17895,7 @@ def _render_positions_page() -> str:
           }
           const missingTokens = (!String(row.token0_id || "").trim() || !String(row.token1_id || "").trim());
           if (missingTokens) diag.missingTokens += 1;
-          const payload = {
+          rowsPayload.push({
             chain: row.chain,
             chain_id: Number(row.chain_id) || 0,
             protocol: row.protocol,
@@ -17907,82 +17912,119 @@ def _render_positions_page() -> str:
             fees_owed0: Number(row.fees_owed0 || 0),
             fees_owed1: Number(row.fees_owed1 || 0),
             fee_usd_historical: histUsd,
-          };
-          const {res, data} = await postFeeSeriesWithRetry(payload, 3);
-          if (data && data.debug && backendHints.length < 5) {
-            const d = data.debug || {};
-            const mode = String(d.result_mode || data.mode || "");
-            const rpcPts = Number(d.rpc_points || 0);
-            const subPts = Number(d.subgraph_points || 0);
-            const msg = `${String(row.pair || row.pool_id || "?")}: mode=${mode || "-"}, subgraph_points=${subPts}, rpc_points=${rpcPts}`;
-            backendHints.push(msg);
-          }
-          if (!res.ok) {
-            const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
-            console.warn("position-fee-series failed", row.pair || row.pool_id, det);
+          });
+          payloadMeta.push({
+            colorIdx: i,
+            rowLabel,
+            baseName: String(row.pair || row.pool_id || `Position ${i + 1}`),
+            pairOrPool: String(row.pair || row.pool_id || "?"),
+          });
+        }
+        if (!rowsPayload.length) {
+          chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
+          renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints);
+          setPosFeeStatus("No valid selected rows for fee data", true);
+          return;
+        }
+        const compareReq = {
+          rows: rowsPayload,
+          max_rows: rowsPayload.length,
+          include_aggregate: false,
+        };
+        const {res, data} = await postJsonWithRetry("/api/positions/position-fee-compare-data", compareReq, 3);
+        if (!res.ok) {
+          const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
+          chartEl.innerHTML = `<div class='hint'>Failed to load compare data: ${esc(det)}</div>`;
+          setPosFeeStatus(`Failed to load compare data: ${det}`, true);
+          return;
+        }
+        const rowsOut = Array.isArray(data?.rows) ? data.rows : [];
+        let rowsWithAnySeries = 0;
+        for (const outRow of rowsOut) {
+          const pos = Number(outRow?.index || 0);
+          const meta = payloadMeta[pos] || {colorIdx: pos, rowLabel: `row#${pos + 1}`, baseName: `Position ${pos + 1}`, pairOrPool: "?"};
+          if (!outRow?.ok) {
+            const det = String(outRow?.error || "compare data failed");
             diag.apiFail += 1;
-            const d = data && data.debug ? data.debug : {};
             rowStatuses.push({
-              label: rowLabel,
+              label: meta.rowLabel,
               outcome: "api-error",
-              mode: String((d && d.result_mode) || data.mode || "error"),
+              mode: "error",
               detail: det,
             });
-            if (apiFailTop.length < 3) {
-              apiFailTop.push(`${String(row.pair || row.pool_id || "?")}: ${det}`);
-            }
+            if (apiFailTop.length < 3) apiFailTop.push(`${meta.pairOrPool}: ${det}`);
             continue;
           }
-          const items = Array.isArray(data.items) ? data.items : [];
-          const estItems = Array.isArray(data.estimated_items) ? data.estimated_items : [];
-          const d = data && data.debug ? data.debug : {};
-          const mode = String((d && d.result_mode) || data.mode || "");
-          const hasMain = items.length > 0;
-          const hasEst = estItems.length > 0;
-          if (!hasMain && !hasEst) {
+          const mode = String(outRow.mode || "").trim();
+          const feePricing = String(outRow.fee_pricing || "").trim();
+          if (feePricing) lastFeePricing = feePricing;
+          const collectedItems = Array.isArray(outRow.collected_items) ? outRow.collected_items : [];
+          const estimatedItems = Array.isArray(outRow.estimated_items) ? outRow.estimated_items : [];
+          const snapshotItems = Array.isArray(outRow.snapshot_items) ? outRow.snapshot_items : [];
+          const hasCollected = collectedItems.length > 0;
+          const hasEstimated = estimatedItems.length > 0;
+          const hasSnapshot = snapshotItems.length > 0;
+          if (!hasCollected && !hasEstimated && !hasSnapshot) {
             diag.emptySeries += 1;
             rowStatuses.push({
-              label: rowLabel,
+              label: meta.rowLabel,
               outcome: "empty",
               mode: mode || "unavailable",
-              pricing: String(data.fee_pricing || (d && d.rpc_pricing) || ""),
+              pricing: feePricing,
               points: 0,
-              detail: String((d && d.reason) || data.note || "empty fee series"),
+              detail: String(outRow.note || "empty fee series"),
             });
             continue;
           }
-          const fp = String(data.fee_pricing || "").trim();
-          if (fp) lastFeePricing = fp;
+          rowsWithAnySeries += 1;
           rowStatuses.push({
-            label: rowLabel,
-            outcome: (!hasMain && hasEst) ? "estimate-only" : "ok",
+            label: meta.rowLabel,
+            outcome: (!hasCollected && (hasEstimated || hasSnapshot)) ? "estimate-only" : "ok",
             mode: mode || "ok",
-            pricing: fp,
-            points: hasMain ? items.length : estItems.length,
-            detail: String(data.note || ""),
+            pricing: feePricing,
+            points: collectedItems.length + estimatedItems.length + snapshotItems.length,
+            detail: String(outRow.note || ""),
           });
-          if (hasMain) {
-            if (mode === "row-unclaimed-fallback") hasEstimateOnlyTrace = true;
-            else hasCollectedHistoryTrace = true;
+          const d = outRow.debug || {};
+          if (backendHints.length < 5) {
+            const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}`;
+            backendHints.push(msg);
+          }
+          if (hasCollected) {
+            hasCollectedHistoryTrace = true;
+            rowsWithCollected += 1;
             traces.push({
-              x: items.map((x) => new Date(Number(x.ts || 0) * 1000)),
-              y: items.map((x) => Number(x.fees_usd || 0)),
-              mode: items.length <= 1 ? "lines+markers" : "lines",
-              line: {color: palette[i % palette.length], width: 2},
-              marker: {size: items.length <= 1 ? 7 : 0},
-              name: String(row.pair || row.pool_id || `Position ${i + 1}`),
+              x: collectedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
+              y: collectedItems.map((x) => Number(x.fees_usd || 0)),
+              mode: collectedItems.length <= 1 ? "lines+markers" : "lines",
+              line: {color: palette[meta.colorIdx % palette.length], width: 2},
+              marker: {size: collectedItems.length <= 1 ? 7 : 0},
+              name: `${meta.baseName} (collected history)`,
               hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
             });
           }
-          if (hasEst) {
-            hasEstimateOnlyTrace = true;
+          if (hasEstimated) {
+            hasEstimatedShareTrace = true;
+            rowsWithEstimated += 1;
             traces.push({
-              x: estItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
-              y: estItems.map((x) => Number(x.fees_usd || 0)),
+              x: estimatedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
+              y: estimatedItems.map((x) => Number(x.fees_usd || 0)),
               mode: "lines",
-              line: {color: palette[i % palette.length], width: 1.5, dash: "dot"},
+              line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
               opacity: 0.85,
-              name: `${String(row.pair || row.pool_id || `Position ${i + 1}`)} (estimated)`,
+              name: `${meta.baseName} (estimated)`,
+              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+            });
+          }
+          if (hasSnapshot) {
+            hasSnapshotOnlyTrace = true;
+            rowsWithSnapshot += 1;
+            traces.push({
+              x: snapshotItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
+              y: snapshotItems.map((x) => Number(x.fees_usd || 0)),
+              mode: "markers",
+              marker: {size: 8, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
+              name: `${meta.baseName} (current unclaimed snapshot)`,
               hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
             });
           }
@@ -18003,7 +18045,7 @@ def _render_positions_page() -> str:
         }
         const titleSuffix = histUsd ? " — historical USD (CoinGecko at each Collect)" : " — spot USD";
         Plotly.newPlot("posFeeChart", traces, {
-          title: "Cumulative collected fees (USD)" + titleSuffix,
+          title: "Collected vs estimated fees (USD)" + titleSuffix,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
@@ -18013,14 +18055,20 @@ def _render_positions_page() -> str:
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
         const pr = lastFeePricing ? ` · ${lastFeePricing}` : "";
-        const missing = Math.max(0, Number(diag.selected || 0) - traces.length);
-        if (hasEstimateOnlyTrace && !hasCollectedHistoryTrace) {
+        const missing = Math.max(0, Number(diag.selected || 0) - rowsWithAnySeries);
+        const cmp = ` · collected rows: ${rowsWithCollected}, estimated rows: ${rowsWithEstimated}, snapshot rows: ${rowsWithSnapshot}`;
+        if (hasEstimatedShareTrace && hasCollectedHistoryTrace) {
           setPosFeeStatus(
-            `Estimate only: collected-fee history not found; showing current unclaimed snapshot (${traces.length}/${diag.selected})${missing ? ` · missing: ${missing}` : ""}`,
+            `Compared collected history with liquidity-share estimate (${traces.length}/${diag.selected})${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}`,
+            false
+          );
+        } else if ((hasEstimatedShareTrace || hasSnapshotOnlyTrace) && !hasCollectedHistoryTrace) {
+          setPosFeeStatus(
+            `Estimate only: collected-fee history not found (${traces.length}/${diag.selected})${cmp}${missing ? ` · missing: ${missing}` : ""}`,
             true
           );
         } else {
-          setPosFeeStatus(`Done: ${traces.length}/${diag.selected} position(s) with fee data${pr}${missing ? ` · missing: ${missing}` : ""}`, false);
+          setPosFeeStatus(`Done: ${traces.length}/${diag.selected} position(s) with fee data${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}`, false);
         }
         renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints);
       } catch (e) {
@@ -18494,7 +18542,6 @@ def _render_positions_page() -> str:
       let lastPollWall = Date.now();
       let anchorServerElapsed = 0;
       let lastPayload = null;
-      const TERMINAL_STAGES = new Set(["done", "failed", "queued"]);
       function smoothElapsedSec() {
         return anchorServerElapsed + (Date.now() - lastPollWall) / 1000;
       }
@@ -18549,21 +18596,17 @@ def _render_positions_page() -> str:
         });
       }
       function formatJobStatusLine(payload) {
+        const st = String(payload.status || "").trim().toLowerCase();
         const lab = String(payload.stage_label || payload.stage || "").trim() || "…";
-        const stg = String(payload.stage || "").trim();
-        const showStg = stg && !TERMINAL_STAGES.has(stg);
-        const stagePart = showStg ? (" · Stage: " + stg) : "";
         const elapsedSec = Math.max(0, smoothElapsedSec());
         const elapsedTxt = formatScanDuration(elapsedSec);
-        const p = Math.min(99, Math.max(0, Number(payload.progress || 0)));
-        let etaSec = 0;
-        if (p >= 3) {
-          etaSec = Math.max(0, elapsedSec * (100 - p) / p);
+        const parts = [lab];
+        if (st !== "queued" && st !== "done" && st !== "failed") {
+          const p = Math.min(99, Math.max(0, Number(payload.progress || 0)));
+          parts.push(`${Math.round(p)}%`);
         }
-        const etaTxt = formatScanDuration(etaSec);
-        const timePart = elapsedTxt ? (" · running for " + elapsedTxt) : "";
-        const etaPart = etaTxt ? (", ~" + etaTxt + " left") : "";
-        return lab + stagePart + timePart + etaPart;
+        if (elapsedTxt) parts.push(elapsedTxt);
+        return parts.join(" · ");
       }
       try {
         tickTimer = setInterval(() => {
@@ -22347,6 +22390,119 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         "estimated_items": est_items_payload,
         "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
     })
+
+
+@app.post("/api/positions/position-fee-compare-data")
+def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> dict[str, Any]:
+    rows_in = list(req.rows or [])
+    if not rows_in:
+        raise HTTPException(status_code=400, detail="rows is required.")
+    lim = max(1, min(100, int(req.max_rows or 20)))
+    rows_work = rows_in[:lim]
+
+    def _norm_fee_items(raw: Any) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for x in (raw or []):
+            if not isinstance(x, dict):
+                continue
+            ts = int(x.get("ts") or 0)
+            v = _safe_float(x.get("fees_usd"))
+            if ts <= 0:
+                continue
+            out.append({"ts": ts, "fees_usd": float(max(0.0, v))})
+        return out
+
+    def _sum_series(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        m: dict[int, float] = {}
+        for it in items:
+            ts = int(it.get("ts") or 0)
+            v = _safe_float(it.get("fees_usd"))
+            if ts <= 0:
+                continue
+            m[ts] = float(m.get(ts, 0.0) + max(0.0, v))
+        return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
+
+    out_rows: list[dict[str, Any]] = []
+    agg_collected: list[dict[str, Any]] = []
+    agg_estimated: list[dict[str, Any]] = []
+    agg_snapshot: list[dict[str, Any]] = []
+    ok_n = 0
+    fail_n = 0
+    for idx, row_req in enumerate(rows_work):
+        try:
+            one = positions_position_fee_series(row_req)
+            mode = str(one.get("mode") or "").strip().lower()
+            items = _norm_fee_items(one.get("items") if isinstance(one.get("items"), list) else [])
+            est_items = _norm_fee_items(one.get("estimated_items") if isinstance(one.get("estimated_items"), list) else [])
+            collected_items: list[dict[str, Any]] = []
+            snapshot_items: list[dict[str, Any]] = []
+            if mode == "row-unclaimed-fallback":
+                snapshot_items = items
+            elif mode in {"exact-snapshots", "onchain-collect-logs"}:
+                collected_items = items
+            else:
+                # Backward-safe default for non-empty historical series.
+                if items:
+                    collected_items = items
+            agg_collected.extend(collected_items)
+            agg_estimated.extend(est_items)
+            agg_snapshot.extend(snapshot_items)
+            out_rows.append(
+                {
+                    "index": int(idx),
+                    "ok": True,
+                    "mode": mode or "unknown",
+                    "fee_pricing": str(one.get("fee_pricing") or ""),
+                    "note": str(one.get("note") or ""),
+                    "collected_items": collected_items,
+                    "estimated_items": est_items,
+                    "snapshot_items": snapshot_items,
+                    "debug": (one.get("debug") if isinstance(one.get("debug"), dict) else {}),
+                }
+            )
+            ok_n += 1
+        except HTTPException as e:
+            out_rows.append(
+                {
+                    "index": int(idx),
+                    "ok": False,
+                    "error": str(e.detail),
+                    "status_code": int(e.status_code),
+                    "collected_items": [],
+                    "estimated_items": [],
+                    "snapshot_items": [],
+                }
+            )
+            fail_n += 1
+        except Exception as e:
+            out_rows.append(
+                {
+                    "index": int(idx),
+                    "ok": False,
+                    "error": str(e)[:220],
+                    "status_code": 500,
+                    "collected_items": [],
+                    "estimated_items": [],
+                    "snapshot_items": [],
+                }
+            )
+            fail_n += 1
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "requested_rows": int(len(rows_in)),
+        "processed_rows": int(len(rows_work)),
+        "rows_ok": int(ok_n),
+        "rows_failed": int(fail_n),
+        "rows": out_rows,
+    }
+    if bool(req.include_aggregate):
+        out["aggregate"] = {
+            "collected_items": _sum_series(agg_collected),
+            "estimated_items": _sum_series(agg_estimated),
+            "snapshot_items": _sum_series(agg_snapshot),
+        }
+    return out
 
 
 @app.post("/api/help/tickets")
