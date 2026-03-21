@@ -4828,6 +4828,33 @@ def _position_creation_date_ymd_from_explorer_owner_pm(
     except Exception:
         rows = []
     if not rows:
+        # Base/L2: contract-scoped explorer endpoint can be sparse/rate-limited.
+        # Fallback to owner-wide tokennfttx (includes Blockscout path), then filter by PM.
+        try:
+            owner_rows = _explorer_owner_nfttx_rows(
+                cid,
+                o,
+                max_rows=600,
+                debug_out=None,
+                deadline_ts=None,
+                pm_rpc_fallback=False,
+                nft_catalog_serial_http=False,
+            )
+        except Exception:
+            owner_rows = []
+        pm_lc = str(pm).strip().lower()
+        rows = [
+            r
+            for r in (owner_rows or [])
+            if isinstance(r, dict)
+            and str(
+                r.get("contractAddress")
+                or r.get("contractaddress")
+                or r.get("tokenAddress")
+                or ""
+            ).strip().lower() == pm_lc
+        ]
+    if not rows:
         return ""
     mint_ts = 0
     first_ts = 0
@@ -11612,7 +11639,68 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
         else:
             acc["liquidity_display"] = _format_usd_compact(_opt_float(acc.get("liquidity_usd")))
         # This row is an owner/protocol/pool aggregate, so liquidity_usd is additive across NFTs.
-    return list(uniq.values())
+
+    out_rows = list(uniq.values())
+    if not out_rows:
+        return out_rows
+
+    # Second-pass liquidity recompute on aggregated rows:
+    # use summed "In position" amounts + external prices, then take max(existing, recomputed)
+    # to avoid undercount when some child rows missed price resolution on first pass.
+    by_chain_tokens: dict[int, set[str]] = {}
+    for r in out_rows:
+        if not isinstance(r, dict):
+            continue
+        if bool(r.get("suspected_spam")) or bool(r.get("spam_skipped")):
+            continue
+        cid = int(r.get("chain_id") or 0)
+        if cid <= 0:
+            continue
+        t0 = str(r.get("token0_id") or "").strip().lower()
+        t1 = str(r.get("token1_id") or "").strip().lower()
+        if _is_eth_address(t0):
+            by_chain_tokens.setdefault(cid, set()).add(t0)
+        if _is_eth_address(t1):
+            by_chain_tokens.setdefault(cid, set()).add(t1)
+    prices_by_chain: dict[int, dict[str, float]] = {}
+    for cid, toks in by_chain_tokens.items():
+        try:
+            prices_by_chain[int(cid)] = _get_token_prices_usd(int(cid), sorted(list(toks)))
+        except Exception:
+            prices_by_chain[int(cid)] = {}
+
+    for r in out_rows:
+        if not isinstance(r, dict):
+            continue
+        if bool(r.get("suspected_spam")) or bool(r.get("spam_skipped")):
+            r["liquidity_usd"] = None
+            r["liquidity_display"] = "-"
+            continue
+        cid = int(r.get("chain_id") or 0)
+        a0 = _safe_float(r.get("position_amount0"))
+        a1 = _safe_float(r.get("position_amount1"))
+        t0 = str(r.get("token0_id") or "").strip().lower()
+        t1 = str(r.get("token1_id") or "").strip().lower()
+        recomputed = _liquidity_usd_from_in_position_external(
+            int(cid),
+            a0,
+            a1,
+            t0,
+            t1,
+            symbol0=str(r.get("position_symbol0") or ""),
+            symbol1=str(r.get("position_symbol1") or ""),
+            pair=str(r.get("pair") or ""),
+            known_prices=prices_by_chain.get(int(cid), {}),
+        )
+        cur = _opt_float(r.get("liquidity_usd"))
+        if recomputed is not None and recomputed > 0:
+            if cur is None or float(recomputed) > float(cur):
+                r["liquidity_usd"] = float(recomputed)
+        if _opt_float(r.get("liquidity_usd")) is not None:
+            r["liquidity_display"] = _format_usd_compact(_opt_float(r.get("liquidity_usd")))
+        else:
+            r["liquidity_display"] = "-"
+    return out_rows
 
 
 def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_dates: bool) -> None:
@@ -16235,6 +16323,12 @@ def _render_positions_page() -> str:
     .info-box { margin-top:11px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:11px; padding:9px; font-size:13px; white-space:pre-wrap; }
     .fee-card { border-color:#cfdcf2; background: linear-gradient(180deg, #f6f9ff 0%, #edf3ff 100%); }
     .fee-card .section-head h3 { font-size:20px; letter-spacing:0.1px; }
+    #posStatus {
+      white-space: normal;
+      overflow: visible;
+      text-overflow: clip;
+      max-width: 100%;
+    }
     #posFeeStatus { font-size:15px; font-weight:600; color:#334155; }
     #posFeeBody .hint { font-size:13px; line-height:1.45; color:#475569; margin:0 0 10px; }
     #posFeeChart { height:360px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
@@ -16248,12 +16342,6 @@ def _render_positions_page() -> str:
     .fee-toggle-pill input { margin:0; width:15px; height:15px; }
     .fee-card .pos-fee-hist-label { font-size:15px; font-weight:700; color:#334155; }
     .fee-card .search-link-btn { font-size:20px; }
-    .scan-bg-toggle {
-      display:inline-flex; align-items:center; gap:6px;
-      color:#334155; font-size:12px; font-weight:600;
-      user-select:none; white-space:nowrap;
-    }
-    .scan-bg-toggle input { margin:0; width:14px; height:14px; }
     @media (max-width: 1100px) {
       .address-columns { grid-template-columns:1fr; }
       .positions-form, .result-card { padding: 13px; }
@@ -16303,9 +16391,9 @@ def _render_positions_page() -> str:
           <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / PancakeSwap v3</h3>
           <div class="section-actions">
             <span class="pos-status" id="posStatus">Ready</span>
-            <label class="scan-bg-toggle" title="Runs in background and requires significant time, around 3-5 minutes.">
+            <label class="fee-toggle-pill" title="Runs in background and requires significant time, around 3-5 minutes.">
               <input type="checkbox" id="posClosedBgEnrich" />
-              <span>Closed positions</span>
+              <span class="pos-fee-hist-label">Closed positions</span>
             </label>
             <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions()">Scan V3</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
@@ -16565,16 +16653,155 @@ def _render_positions_page() -> str:
     let posAutoWarmupTimer = null;
     let posAutoWarmupInFlight = false;
     let posClosedBgEnrichInFlight = false;
-    function setPosStatus(text, isErr) {
+    let posStatusBaseText = "";
+    let posStatusBaseErr = false;
+    let posStatusRuntimeTimer = null;
+    const posStatusLanes = {
+      active: {
+        label: "Active",
+        running: false,
+        queued: false,
+        startMs: 0,
+        progress: 0,
+        elapsedAnchor: 0,
+        pollWallMs: 0,
+        fallbackEtaSec: 95,
+        doneAtMs: 0,
+        lastDoneSec: 0,
+      },
+      closed: {
+        label: "Closed",
+        running: false,
+        queued: false,
+        startMs: 0,
+        progress: 0,
+        elapsedAnchor: 0,
+        pollWallMs: 0,
+        fallbackEtaSec: 270,
+        doneAtMs: 0,
+        lastDoneSec: 0,
+      },
+    };
+    function laneElapsedSec(lane) {
+      if (!lane) return 0;
+      if (lane.running) {
+        if (lane.pollWallMs > 0) {
+          return Math.max(0, Number(lane.elapsedAnchor || 0) + (Date.now() - lane.pollWallMs) / 1000);
+        }
+        if (lane.startMs > 0) {
+          return Math.max(0, (Date.now() - lane.startMs) / 1000);
+        }
+      }
+      return Math.max(0, Number(lane.lastDoneSec || 0));
+    }
+    function laneEtaSec(lane) {
+      if (!lane || !lane.running) return 0;
+      const elapsed = laneElapsedSec(lane);
+      const p = Math.min(99, Math.max(0, Number(lane.progress || 0)));
+      if (p >= 3) return Math.max(0, elapsed * (100 - p) / p);
+      return Math.max(0, Number(lane.fallbackEtaSec || 0) - elapsed);
+    }
+    function laneStatusSuffix(lane) {
+      if (!lane) return "";
+      if (lane.queued && !lane.running) {
+        return `${lane.label}: queued`;
+      }
+      if (lane.running) {
+        const p = Math.round(Math.max(0, Math.min(100, Number(lane.progress || 0))));
+        const elapsed = formatScanDuration(laneElapsedSec(lane)) || "0s";
+        const eta = formatScanDuration(laneEtaSec(lane)) || "0s";
+        return `${lane.label}: ${p}% · ${elapsed} elapsed · ETA ~${eta}`;
+      }
+      if (lane.doneAtMs > 0 && (Date.now() - lane.doneAtMs) <= 15000) {
+        const doneIn = formatScanDuration(Number(lane.lastDoneSec || 0)) || "0s";
+        return `${lane.label}: done in ${doneIn}`;
+      }
+      return "";
+    }
+    function shouldKeepPosRuntimeTicker() {
+      const vals = Object.values(posStatusLanes || {});
+      return vals.some((x) => !!x && (x.running || x.queued || (x.doneAtMs > 0 && (Date.now() - x.doneAtMs) <= 15000)));
+    }
+    function ensurePosRuntimeTicker() {
+      if (shouldKeepPosRuntimeTicker()) {
+        if (!posStatusRuntimeTimer) {
+          posStatusRuntimeTimer = setInterval(() => {
+            renderPosStatus();
+            if (!shouldKeepPosRuntimeTicker() && posStatusRuntimeTimer) {
+              clearInterval(posStatusRuntimeTimer);
+              posStatusRuntimeTimer = null;
+            }
+          }, 1000);
+        }
+      } else if (posStatusRuntimeTimer) {
+        clearInterval(posStatusRuntimeTimer);
+        posStatusRuntimeTimer = null;
+      }
+    }
+    function renderPosStatus() {
       const el = document.getElementById("posStatus");
       if (!el) return;
-      const nextText = String(text || "");
-      const nextErr = !!isErr;
+      const base = String(posStatusBaseText || "");
+      const parts = [];
+      const a = laneStatusSuffix(posStatusLanes.active);
+      const c = laneStatusSuffix(posStatusLanes.closed);
+      if (a) parts.push(a);
+      if (c) parts.push(c);
+      const full = parts.length ? (base ? `${base} | ${parts.join(" | ")}` : parts.join(" | ")) : base;
+      const nextText = String(full || "");
+      const nextErr = !!posStatusBaseErr;
       if (nextText === posLastStatusText && nextErr === posLastStatusErr) return;
       posLastStatusText = nextText;
       posLastStatusErr = nextErr;
       el.textContent = nextText;
       el.style.color = nextErr ? "#b91c1c" : "#475569";
+    }
+    function startPosStatusLane(name) {
+      const lane = posStatusLanes[name];
+      if (!lane) return;
+      lane.running = true;
+      lane.queued = true;
+      lane.startMs = Date.now();
+      lane.progress = 0;
+      lane.elapsedAnchor = 0;
+      lane.pollWallMs = Date.now();
+      lane.doneAtMs = 0;
+      lane.lastDoneSec = 0;
+      ensurePosRuntimeTicker();
+      renderPosStatus();
+    }
+    function updatePosStatusLaneFromPayload(name, payload) {
+      const lane = posStatusLanes[name];
+      if (!lane || !payload || typeof payload !== "object") return;
+      const st = String(payload.status || "").trim().toLowerCase();
+      lane.queued = st === "queued";
+      lane.running = st !== "done" && st !== "failed";
+      lane.progress = Math.max(0, Math.min(100, Number(payload.progress || lane.progress || 0)));
+      lane.elapsedAnchor = Math.max(0, Number(payload.elapsed_sec || lane.elapsedAnchor || 0));
+      lane.pollWallMs = Date.now();
+      if (!lane.startMs) lane.startMs = Date.now() - lane.elapsedAnchor * 1000;
+      ensurePosRuntimeTicker();
+      renderPosStatus();
+    }
+    function finishPosStatusLane(name) {
+      const lane = posStatusLanes[name];
+      if (!lane) return;
+      const elapsed = laneElapsedSec(lane);
+      lane.running = false;
+      lane.queued = false;
+      lane.progress = 100;
+      lane.lastDoneSec = Math.max(0, elapsed);
+      lane.doneAtMs = Date.now();
+      lane.elapsedAnchor = lane.lastDoneSec;
+      lane.pollWallMs = Date.now();
+      ensurePosRuntimeTicker();
+      renderPosStatus();
+    }
+    function setPosStatus(text, isErr) {
+      posStatusBaseText = String(text || "");
+      posStatusBaseErr = !!isErr;
+      ensurePosRuntimeTicker();
+      renderPosStatus();
     }
     function formatScanDuration(sec) {
       const s = Math.max(0, Number(sec) || 0);
@@ -17740,7 +17967,7 @@ def _render_positions_page() -> str:
         true
       );
     }
-    async function pollPosJob(jobId, allowPartialReturn = false, scanKind = "v3") {
+    async function pollPosJob(jobId, allowPartialReturn = false, scanKind = "v3", onTick = null) {
       const jid = String(jobId || "").trim();
       if (!jid) throw new Error("Missing job id");
       const isHeavy = String(scanKind || "v3") === "heavy";
@@ -17829,9 +18056,17 @@ def _render_positions_page() -> str:
           lastPayload = data;
           lastPollWall = Date.now();
           anchorServerElapsed = Number(data.elapsed_sec || 0);
+          if (typeof onTick === "function") {
+            try { onTick(data); } catch (_) {}
+          }
           setProgressFromStatus(st, progress);
           maybeApplyPartialResult(partial);
-          if (st === "done") return data.result || {};
+          if (st === "done") {
+            if (typeof onTick === "function") {
+              try { onTick(data); } catch (_) {}
+            }
+            return data.result || {};
+          }
           assertNotFailedStatus(st, data);
           if (shouldReturnPartial(String(data.stage || ""), progress, partial)) {
             return Object.assign({__partial: true}, partial);
@@ -18256,36 +18491,103 @@ def _render_positions_page() -> str:
       if (!jobId) throw new Error("Invalid job id");
       return jobId;
     }
-    function buildV3ClosedBgEnrichPayload() {
-      return {
-        evm_addresses: posState.evm,
-        include_pools: true,
-        include_lending: false,
-        include_rewards: false,
-        hard_scan: true,
-      };
+    function isClosedBgCandidateRow(row) {
+      if (!row || typeof row !== "object") return false;
+      const seg = String(row.catalog_segment || "").toLowerCase();
+      if (seg === "closed") return true;
+      const st = String(row.position_status || "").toLowerCase();
+      if (st === "inactive") return true;
+      const a0 = Number(row.position_amount0 || 0);
+      const a1 = Number(row.position_amount1 || 0);
+      if ((Number.isFinite(a0) && a0 <= 0) || (Number.isFinite(a1) && a1 <= 0)) return true;
+      return false;
+    }
+    async function runClosedRowsBackgroundEnrich() {
+      const list = Array.isArray(posCache?.pools) ? posCache.pools : [];
+      if (!list.length) return {processed: 0, updated: 0, eligible: 0};
+      const candidates = [];
+      for (let i = 0; i < list.length; i++) {
+        const r = list[i] || {};
+        if (!isClosedBgCandidateRow(r)) continue;
+        if (r.unsupported_protocol) continue;
+        candidates.push(i);
+      }
+      if (!candidates.length) {
+        return {processed: 0, updated: 0, eligible: 0};
+      }
+      const maxRows = Math.min(320, candidates.length);
+      const work = candidates.slice(0, maxRows);
+      let processed = 0;
+      let updated = 0;
+      const startedAt = Date.now();
+      const workersN = Math.min(4, Math.max(1, Math.floor((navigator?.hardwareConcurrency || 4) / 2)));
+      async function workerLoop(workerId) {
+        while (true) {
+          const idxPos = processed;
+          if (idxPos >= work.length) return;
+          processed += 1;
+          const rowIdx = work[idxPos];
+          const cur = Object.assign({}, list[rowIdx] || {});
+          try {
+            const res = await fetch("/api/positions/row/enrich", {
+              method: "POST",
+              headers: {"Content-Type":"application/json"},
+              body: JSON.stringify({row: cur}),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data?.ok && data?.row_updates && typeof data.row_updates === "object") {
+              list[rowIdx] = Object.assign({}, cur, data.row_updates || {});
+              updated += 1;
+            }
+          } catch (_) {}
+          const lane = posStatusLanes.closed;
+          if (lane) {
+            lane.running = true;
+            lane.queued = false;
+            lane.progress = Math.max(0, Math.min(99, Math.round((processed / Math.max(1, work.length)) * 100)));
+            lane.elapsedAnchor = Math.max(0, (Date.now() - startedAt) / 1000);
+            lane.pollWallMs = Date.now();
+          }
+          renderPosStatus();
+          if ((idxPos + 1) % 12 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      }
+      await Promise.all(Array.from({length: workersN}, (_, i) => workerLoop(i)));
+      posCache.pools = list;
+      renderPools(posCache.pools || []);
+      try {
+        const prev = loadPosResults() || {};
+        savePosResults({
+          saved_at: Date.now(),
+          pool_positions: posCache.pools || [],
+          errors: Array.isArray(prev.errors) ? prev.errors : [],
+          infos: Array.isArray(prev.infos) ? prev.infos : [],
+          debug: posCache.debug || {},
+        });
+      } catch (_) {}
+      return {processed: work.length, updated, eligible: candidates.length};
     }
     async function startClosedBgEnrichAfterV3Scan() {
       if (!isClosedBgEnrichEnabled()) return;
       if (!Array.isArray(posState.evm) || !posState.evm.length) return;
       if (posClosedBgEnrichInFlight) return;
       posClosedBgEnrichInFlight = true;
+      startPosStatusLane("closed");
       try {
         setPosStatus("Closed positions enrich started in background (~3-5 min)…", false);
-        const startRes = await fetch("/api/positions/scan/start", {
-          method: "POST",
-          headers: {"Content-Type":"application/json"},
-          body: JSON.stringify(buildV3ClosedBgEnrichPayload()),
-        });
-        const startData = await startRes.json().catch(() => ({}));
-        if (!startRes.ok) throw new Error(startData.detail || "Failed to start closed positions enrich");
-        const bgJobId = String(startData.job_id || "").trim();
-        if (!bgJobId) throw new Error("Invalid job id");
-        const data = await pollPosJob(bgJobId, false, "v3");
-        persistV3ScanResult(data);
-        const rowsN = Array.isArray(data?.pool_positions) ? data.pool_positions.length : 0;
-        setPosStatus(`Closed positions enrich done in background. Pools: ${rowsN}`, false);
+        const out = await runClosedRowsBackgroundEnrich();
+        finishPosStatusLane("closed");
+        if (!out.eligible) {
+          setPosStatus("Closed positions enrich: no eligible rows in current table.", false);
+        } else {
+          setPosStatus(
+            `Closed positions enrich done. Updated ${out.updated}/${out.processed} rows` +
+            (out.eligible > out.processed ? ` (eligible total: ${out.eligible})` : ""),
+            false
+          );
+        }
       } catch (e) {
+        finishPosStatusLane("closed");
         setPosStatus("Closed positions enrich (background): " + (e?.message || "unknown"), true);
       } finally {
         posClosedBgEnrichInFlight = false;
@@ -18308,9 +18610,12 @@ def _render_positions_page() -> str:
       ensureV3SectionVisible();
       try {
         setPosBusy(true);
+        startPosStatusLane("active");
         const jobId = await startV3ScanJob();
         saveActivePosJob(jobId);
-        const data = await pollPosJob(jobId, true, "v3");
+        const data = await pollPosJob(jobId, true, "v3", (payload) => {
+          updatePosStatusLaneFromPayload("active", payload);
+        });
         if (data && data.__partial) {
           handoffToBackground = true;
           setPosStatus("Table updated from server. Background enrich and finalize still running…", false);
@@ -18318,9 +18623,11 @@ def _render_positions_page() -> str:
           return;
         }
         saveActivePosJob("");
+        finishPosStatusLane("active");
         applyV3ScanResult(data, true);
         startClosedBgEnrichAfterV3Scan();
       } catch (e) {
+        finishPosStatusLane("active");
         handleActivePosJobError(e, "v3", false);
       } finally {
         if (!handoffToBackground) setPosBusy(false);
@@ -18331,11 +18638,16 @@ def _render_positions_page() -> str:
       if (!jobId) return;
       try {
         setPosBusy(true);
-        const data = await pollPosJob(jobId, false, "v3");
+        startPosStatusLane("active");
+        const data = await pollPosJob(jobId, false, "v3", (payload) => {
+          updatePosStatusLaneFromPayload("active", payload);
+        });
         saveActivePosJob("");
+        finishPosStatusLane("active");
         applyV3ScanResult(data, false);
         startClosedBgEnrichAfterV3Scan();
       } catch (e) {
+        finishPosStatusLane("active");
         handleActivePosJobError(e, "v3", true);
       } finally {
         setPosBusy(false);
