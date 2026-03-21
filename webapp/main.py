@@ -4037,10 +4037,23 @@ def _eth_get_block_timestamp(chain_id: int, block_number: int) -> int:
         return 0
 
 
+_FIRST_BLOCK_TS_CACHE: dict[tuple[int, int], tuple[float, int]] = {}
+_FIRST_BLOCK_TS_CACHE_LOCK = threading.Lock()
+_FIRST_BLOCK_TS_CACHE_TTL_SEC = 12 * 3600
+
+
 def _eth_first_block_at_or_after_ts(chain_id: int, target_ts: int) -> int:
     """Smallest block number whose timestamp is >= target_ts (binary search)."""
     cid = int(chain_id)
     t = int(target_ts)
+    if cid <= 0 or t <= 0:
+        return 0
+    cache_key = (cid, t)
+    now = time.time()
+    with _FIRST_BLOCK_TS_CACHE_LOCK:
+        cached = _FIRST_BLOCK_TS_CACHE.get(cache_key)
+        if cached and (now - float(cached[0])) <= float(_FIRST_BLOCK_TS_CACHE_TTL_SEC):
+            return int(cached[1])
     latest = _eth_block_number(cid)
     if latest <= 0:
         return 0
@@ -4054,7 +4067,10 @@ def _eth_first_block_at_or_after_ts(chain_id: int, target_ts: int) -> int:
             hi = mid - 1
         else:
             lo = mid + 1
-    return int(ans)
+    out = int(ans)
+    with _FIRST_BLOCK_TS_CACHE_LOCK:
+        _FIRST_BLOCK_TS_CACHE[cache_key] = (now, out)
+    return out
 
 
 def _explorer_v2_chainid(chain_id: int) -> str:
@@ -13905,6 +13921,106 @@ def _fetch_position_fee_series_exact(
     return out
 
 
+def _fetch_v3_collect_series_by_shape(
+    endpoint: str,
+    *,
+    pool_id: str,
+    owner: str,
+    tick_lower: int,
+    tick_upper: int,
+    since_ts: int,
+    chain_id: int,
+) -> list[tuple[int, float]]:
+    """
+    Best-effort fallback for V3 when positionSnapshots fee fields are empty:
+    query Collect events by (pool, owner, tick range) and build cumulative USD series by day.
+    """
+    pid = str(pool_id or "").strip().lower()
+    own = str(owner or "").strip().lower()
+    tl = int(tick_lower)
+    tu = int(tick_upper)
+    if not endpoint or not pid or not _is_eth_address(own) or tl >= tu:
+        return []
+    queries = [
+        (
+            "ID/Bytes/BigInt",
+            """
+            query CollectByShape($pool: ID!, $owner: Bytes!, $tl: BigInt!, $tu: BigInt!, $since: Int!) {
+              collects(
+                first: 1000,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { pool: $pool, owner: $owner, tickLower: $tl, tickUpper: $tu, timestamp_gte: $since }
+              ) {
+                timestamp
+                amountUSD
+                amount0
+                amount1
+                pool { sqrtPrice token0Price token0 { id decimals } token1 { id decimals } }
+              }
+            }
+            """,
+        ),
+        (
+            "pool_/owner String",
+            """
+            query CollectByShape($pool: String!, $owner: String!, $tl: BigInt!, $tu: BigInt!, $since: Int!) {
+              collects(
+                first: 1000,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { pool_: { id: $pool }, owner: $owner, tickLower: $tl, tickUpper: $tu, timestamp_gte: $since }
+              ) {
+                timestamp
+                amountUSD
+                amount0
+                amount1
+                pool { sqrtPrice token0Price token0 { id decimals } token1 { id decimals } }
+              }
+            }
+            """,
+        ),
+    ]
+    rows: list[dict[str, Any]] = []
+    for _kind, q in queries:
+        try:
+            vars_map = {"pool": pid, "owner": own, "tl": int(tl), "tu": int(tu), "since": int(since_ts)}
+            data = graphql_query(endpoint, q, vars_map, retries=1)
+            rows = ((data.get("data") or {}).get("collects") or [])
+            if rows:
+                break
+        except Exception:
+            continue
+    if not rows:
+        return []
+    by_day: dict[int, tuple[int, float]] = {}
+    cum = 0.0
+    for r in rows:
+        try:
+            ts = int((r or {}).get("timestamp") or 0)
+            if ts <= 0:
+                continue
+            inc = max(0.0, _safe_float((r or {}).get("amountUSD")))
+            if inc <= 0:
+                pool = (r or {}).get("pool") or {}
+                a0 = _safe_float((r or {}).get("amount0"))
+                a1 = _safe_float((r or {}).get("amount1"))
+                val = _value_usd_from_token_amounts(a0, a1, pool, int(chain_id))
+                inc = max(0.0, _safe_float(val))
+            if inc <= 0:
+                continue
+            cum += float(inc)
+            day_ts = (ts // 86400) * 86400
+            prev = by_day.get(day_ts)
+            if prev is None or ts > prev[0]:
+                by_day[day_ts] = (ts, float(cum))
+        except Exception:
+            continue
+    out = [(int(ts), float(v)) for ts, (_rt, v) in by_day.items()]
+    out.sort(key=lambda x: x[0])
+    return out
+
+
 def _position_fee_rpc_fallback_enabled() -> bool:
     return os.environ.get("POSITIONS_FEE_RPC_FALLBACK", "1").strip().lower() in (
         "1",
@@ -13975,6 +14091,12 @@ def _decode_v3_npm_collect_log_amounts_raw(data_hex: str) -> tuple[int, int]:
     words = _hex_words(str(data_hex or ""))
     if len(words) < 2:
         return 0, 0
+    # INonfungiblePositionManager.Collect:
+    #   event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)
+    # Data has 3 ABI words; first one is recipient (address padded to 32 bytes).
+    # Legacy variants may still expose only two amount words in some indexers/traces.
+    if len(words) >= 3:
+        return _decode_uint_from_word(words[1]), _decode_uint_from_word(words[2])
     return _decode_uint_from_word(words[0]), _decode_uint_from_word(words[1])
 
 
@@ -15500,6 +15622,10 @@ class PositionPoolSeriesRequest(BaseModel):
     token1_id: str = ""
     token0_symbol: str = ""
     token1_symbol: str = ""
+    tick_lower: int = 0
+    tick_upper: int = 0
+    pool_created_date: str = ""
+    position_created_date: str = ""
     # Current unclaimed fees from table row (best-effort final fallback when history sources are empty).
     fees_owed0: float = 0.0
     fees_owed1: float = 0.0
@@ -17934,6 +18060,10 @@ def _render_positions_page() -> str:
           token1_id: row.token1_id || "",
           token0_symbol: row.position_symbol0 || "",
           token1_symbol: row.position_symbol1 || "",
+          tick_lower: Number(row.tick_lower ?? row.tickLower ?? 0) || 0,
+          tick_upper: Number(row.tick_upper ?? row.tickUpper ?? 0) || 0,
+          pool_created_date: String(row.pool_created_date || ""),
+          position_created_date: String(row.position_created_date || ""),
           fees_owed0: Number(row.fees_owed0 || 0),
           fees_owed1: Number(row.fees_owed1 || 0),
           position_amount0: Number(row.position_amount0 || 0),
@@ -18107,6 +18237,14 @@ def _render_positions_page() -> str:
         }
 
         const rowsOut = Array.isArray(data?.rows) ? data.rows : [];
+        const cmpDebug = (data && typeof data.debug === "object" && data.debug) ? data.debug : {};
+        if (backendHints.length < 5) {
+          const w = Number(cmpDebug.workers || 0);
+          const t = Number(cmpDebug.elapsed_total_ms || 0);
+          const to = Number(cmpDebug.timeout_rows || 0);
+          const sb = Number(cmpDebug.synthetic_baseline_rows || 0);
+          backendHints.push(`compare: workers=${w || "-"}, elapsed_ms=${t || "-"}, timeout_rows=${to || 0}, baseline_rows=${sb || 0}`);
+        }
         const feeState = processFeeCompareRows(
           rowsOut,
           payloadMeta,
@@ -18145,19 +18283,21 @@ def _render_positions_page() -> str:
         }, {displaylogo: false, responsive: true});
         const pr = feeState.lastFeePricing ? ` · ${feeState.lastFeePricing}` : "";
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
+        const timeoutRows = Number(cmpDebug.timeout_rows || 0);
+        const baselineRows = Number(cmpDebug.synthetic_baseline_rows || 0);
         const cmp = ` · collected rows: ${feeState.rowsWithCollected}, estimated rows: ${feeState.rowsWithEstimated}, snapshot rows: ${feeState.rowsWithSnapshot}`;
         if (feeState.hasEstimatedShareTrace && feeState.hasCollectedHistoryTrace) {
           setPosFeeStatus(
-            `Compared collected history with liquidity-share estimate (${traces.length}/${diag.selected})${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}`,
+            `Compared collected history with liquidity-share estimate (${traces.length}/${diag.selected})${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}${timeoutRows ? ` · timeout rows: ${timeoutRows}` : ""}${baselineRows ? ` · baseline rows: ${baselineRows}` : ""}`,
             false
           );
         } else if ((feeState.hasEstimatedShareTrace || feeState.hasSnapshotOnlyTrace) && !feeState.hasCollectedHistoryTrace) {
           setPosFeeStatus(
-            `Estimate only: collected-fee history not found (${traces.length}/${diag.selected})${cmp}${missing ? ` · missing: ${missing}` : ""}`,
+            `Estimate only: collected-fee history not found (${traces.length}/${diag.selected})${cmp}${missing ? ` · missing: ${missing}` : ""}${timeoutRows ? ` · timeout rows: ${timeoutRows}` : ""}${baselineRows ? ` · baseline rows: ${baselineRows}` : ""}`,
             true
           );
         } else {
-          setPosFeeStatus(`Done: ${traces.length}/${diag.selected} position(s) with fee data${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}`, false);
+          setPosFeeStatus(`Done: ${traces.length}/${diag.selected} position(s) with fee data${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}${timeoutRows ? ` · timeout rows: ${timeoutRows}` : ""}${baselineRows ? ` · baseline rows: ${baselineRows}` : ""}`, false);
         }
         renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
       } catch (e) {
@@ -22304,6 +22444,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     days = max(1, min(3650, int(req.days or 30)))
     now_ts = int(time.time())
     since_ts = now_ts - int(days) * 86400
+    collect_since_ts = int(since_ts)
 
     chain_id = _chain_id_by_chain_key(chain_key)
     if chain_id <= 0 and chain_id_hint > 0 and chain_id_hint in CHAIN_ID_TO_KEY:
@@ -22358,6 +22499,25 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "estimated_items": [],
             "estimated_mode": "none",
         })
+
+    # For on-chain/subgraph collect-history scans, do not go earlier than known creation date
+    # (pool preferred, then position), to reduce scan cost and avoid impossible ranges.
+    for raw_dt, src in (
+        (str(getattr(req, "pool_created_date", "") or "").strip(), "pool_created_date"),
+        (str(getattr(req, "position_created_date", "") or "").strip(), "position_created_date"),
+    ):
+        if not raw_dt or raw_dt == "-":
+            continue
+        dt = _parse_utc_iso(raw_dt)
+        if dt is None:
+            continue
+        ts = int(dt.timestamp())
+        if ts > 0:
+            collect_since_ts = max(int(collect_since_ts), int(ts))
+            debug["collect_start_source"] = src
+            debug["collect_start_date"] = raw_dt
+            break
+    debug["collect_start_ts"] = int(collect_since_ts)
 
     position_ids = _fee_series_position_ids_from_request(req)
     debug["position_ids_count"] = len(position_ids)
@@ -22521,7 +22681,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 series = _fetch_position_fee_series_exact(
                     endpoint,
                     pid,
-                    since_ts=since_ts,
+                    since_ts=collect_since_ts,
                     chain_id=chain_id,
                 )
                 for ts, value in series:
@@ -22529,6 +22689,54 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             except Exception:
                 continue
     debug["subgraph_points"] = int(len(exact_by_day))
+    collect_by_shape: dict[int, float] = {}
+    if endpoint and protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"} and str(req.pool_id or "").strip() and _is_eth_address(str(req.address or "").strip().lower()):
+        shape_candidates: list[tuple[int, int]] = []
+        req_tl = int(getattr(req, "tick_lower", 0) or 0)
+        req_tu = int(getattr(req, "tick_upper", 0) or 0)
+        has_precise_shape = bool(req_tl < req_tu)
+        debug["collect_shape_from_row"] = bool(has_precise_shape)
+        if req_tl < req_tu:
+            shape_candidates.append((int(req_tl), int(req_tu)))
+        # If row already has precise ticks, do not spend RPC calls to rediscover them.
+        if not has_precise_shape:
+            for pid in position_ids[:6]:
+                if len(shape_candidates) >= 6:
+                    break
+                try:
+                    tid = _position_token_id_from_raw(pid)
+                    if tid <= 0:
+                        continue
+                    snap = _fetch_v3_position_contract_snapshot(
+                        int(chain_id),
+                        str(protocol),
+                        int(tid),
+                        str(req.address or ""),
+                        include_quotes=False,
+                    ) or {}
+                    tl = int(snap.get("tick_lower") or 0)
+                    tu = int(snap.get("tick_upper") or 0)
+                    if tl < tu and (tl, tu) not in shape_candidates:
+                        shape_candidates.append((int(tl), int(tu)))
+                except Exception:
+                    continue
+        debug["subgraph_collect_shape_candidates"] = int(len(shape_candidates))
+        for tl, tu in shape_candidates:
+            try:
+                s = _fetch_v3_collect_series_by_shape(
+                    endpoint,
+                    pool_id=str(req.pool_id or ""),
+                    owner=str(req.address or ""),
+                    tick_lower=int(tl),
+                    tick_upper=int(tu),
+                    since_ts=int(collect_since_ts),
+                    chain_id=int(chain_id),
+                )
+                for ts, val in s:
+                    collect_by_shape[int(ts)] = float(collect_by_shape.get(int(ts), 0.0) + float(val))
+            except Exception:
+                continue
+    debug["subgraph_collect_points"] = int(len(collect_by_shape))
 
     sub_max = max(exact_by_day.values()) if exact_by_day else 0.0
     rpc_by_day: dict[int, float] = {}
@@ -22552,7 +22760,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     chain_id,
                     protocol,
                     position_ids[:20],
-                    since_ts=since_ts,
+                    since_ts=collect_since_ts,
                     token0_addr=token0,
                     token1_addr=token1,
                     use_historical_usd=want_hist_usd,
@@ -22577,6 +22785,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         if alt_protocol:
                             lookback_days = max(int(days), 180)
                             retry_since_ts = int(now_ts - int(lookback_days) * 86400)
+                            retry_since_ts = max(int(retry_since_ts), int(collect_since_ts))
                             debug["rpc_retry_protocol"] = str(alt_protocol)
                             debug["rpc_retry_days"] = int(lookback_days)
                             debug["rpc_retry_rem_sec"] = float(rem2)
@@ -22660,6 +22869,19 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
             "note": snap_note,
+            "estimated_items": est_items_payload,
+            "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
+        })
+    if collect_by_shape and not force_rpc:
+        collected_reason = "ok_subgraph_collect_events"
+        debug["result_mode"] = "subgraph-collect-events"
+        debug["result_count"] = len(collect_by_shape)
+        return _with_debug({
+            "items": _pack_fee_items(collect_by_shape),
+            "count": len(collect_by_shape),
+            "mode": "subgraph-collect-events",
+            "fee_pricing": "subgraph_collect",
+            "note": "Subgraph Collect events (owner+pool+ticks) cumulative USD.",
             "estimated_items": est_items_payload,
             "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
         })
@@ -22762,6 +22984,14 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     prepared_rows, prep_debug = _prepare_fee_compare_rows(rows_in, max_rows=lim)
     include_row_debug = bool(getattr(req, "include_row_debug", True))
     include_debug_summary = bool(getattr(req, "include_debug_summary", True))
+    workers_cfg = max(1, min(8, int(os.environ.get("POSITIONS_FEE_COMPARE_WORKERS", "4"))))
+    wall_budget_sec = max(5.0, min(120.0, float(os.environ.get("POSITIONS_FEE_COMPARE_WALL_SEC", "40"))))
+    nonempty_baseline = os.environ.get("POSITIONS_FEE_COMPARE_NONEMPTY_BASELINE", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     def _norm_fee_items(raw: Any) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -22800,11 +23030,14 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     per_row_elapsed_ms: list[int] = []
     points_total = {"collected": 0, "estimated": 0, "snapshot": 0}
     rows_with_series = {"collected": 0, "estimated": 0, "snapshot": 0}
+    synthetic_baseline_rows = 0
+    timeout_rows = 0
 
     def _inc_counter(mp: dict[str, int], key: str) -> None:
         k = str(key or "").strip().lower() or "unknown"
         mp[k] = int(mp.get(k, 0)) + 1
-    for src_idx, row_req in prepared_rows:
+
+    def _process_row(src_idx: int, row_req: PositionPoolSeriesRequest) -> dict[str, Any]:
         row_started = time.monotonic()
         try:
             one = positions_position_fee_series(row_req)
@@ -22824,27 +23057,26 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                 # Backward-safe default for non-empty historical series.
                 if items:
                     collected_items = items
-            _inc_counter(mode_counts, mode or "unknown")
-            _inc_counter(pricing_counts, str(one.get("fee_pricing") or ""))
-            _inc_counter(adapter_counts, adapter)
-            _inc_counter(collected_reason_counts, collected_reason)
-            _inc_counter(estimated_reason_counts, estimated_reason)
-            agg_collected.extend(collected_items)
-            agg_estimated.extend(est_items)
-            agg_snapshot.extend(snapshot_items)
-            if collected_items:
-                rows_with_series["collected"] = int(rows_with_series["collected"]) + 1
-            if est_items:
-                rows_with_series["estimated"] = int(rows_with_series["estimated"]) + 1
-            if snapshot_items:
-                rows_with_series["snapshot"] = int(rows_with_series["snapshot"]) + 1
-            points_total["collected"] = int(points_total["collected"]) + int(len(collected_items))
-            points_total["estimated"] = int(points_total["estimated"]) + int(len(est_items))
-            points_total["snapshot"] = int(points_total["snapshot"]) + int(len(snapshot_items))
+            synthetic = False
+            if nonempty_baseline and (not collected_items) and (not est_items) and (not snapshot_items):
+                synthetic = True
+                day_ts = (int(time.time()) // 86400) * 86400
+                snapshot_items = [{"ts": int(day_ts), "fees_usd": 0.0}]
+                mode = "unavailable-baseline"
             elapsed_ms = int((time.monotonic() - row_started) * 1000.0)
-            per_row_elapsed_ms.append(int(elapsed_ms))
-            out_rows.append(
-                {
+            note = str(one.get("note") or "")
+            if synthetic:
+                note = (note + " | synthetic baseline (0 USD) added for non-empty UX.").strip(" |")
+            return {
+                "ok": True,
+                "elapsed_ms": int(elapsed_ms),
+                "mode": mode or "unknown",
+                "adapter": adapter,
+                "fee_pricing": str(one.get("fee_pricing") or ""),
+                "collected_reason": collected_reason,
+                "estimated_reason": estimated_reason,
+                "synthetic_baseline": bool(synthetic),
+                "row": {
                     "index": int(src_idx),
                     "source_index": int(src_idx),
                     "ok": True,
@@ -22853,22 +23085,22 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     "fee_pricing": str(one.get("fee_pricing") or ""),
                     "collected_reason": collected_reason,
                     "estimated_reason": estimated_reason,
-                    "note": str(one.get("note") or ""),
+                    "note": note,
                     "collected_items": collected_items,
                     "estimated_items": est_items,
                     "snapshot_items": snapshot_items,
                     "elapsed_ms": int(elapsed_ms),
+                    "synthetic_baseline": bool(synthetic),
                     "debug": ((one.get("debug") if isinstance(one.get("debug"), dict) else {}) if include_row_debug else {}),
-                }
-            )
-            ok_n += 1
+                },
+            }
         except HTTPException as e:
             elapsed_ms = int((time.monotonic() - row_started) * 1000.0)
-            per_row_elapsed_ms.append(int(elapsed_ms))
-            if len(error_top) < 8:
-                error_top.append(str(e.detail)[:220])
-            out_rows.append(
-                {
+            return {
+                "ok": False,
+                "elapsed_ms": int(elapsed_ms),
+                "error_top": str(e.detail)[:220],
+                "row": {
                     "index": int(src_idx),
                     "source_index": int(src_idx),
                     "ok": False,
@@ -22878,16 +23110,15 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     "estimated_items": [],
                     "snapshot_items": [],
                     "elapsed_ms": int(elapsed_ms),
-                }
-            )
-            fail_n += 1
+                },
+            }
         except Exception as e:
             elapsed_ms = int((time.monotonic() - row_started) * 1000.0)
-            per_row_elapsed_ms.append(int(elapsed_ms))
-            if len(error_top) < 8:
-                error_top.append(str(e)[:220])
-            out_rows.append(
-                {
+            return {
+                "ok": False,
+                "elapsed_ms": int(elapsed_ms),
+                "error_top": str(e)[:220],
+                "row": {
                     "index": int(src_idx),
                     "source_index": int(src_idx),
                     "ok": False,
@@ -22897,9 +23128,137 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     "estimated_items": [],
                     "snapshot_items": [],
                     "elapsed_ms": int(elapsed_ms),
+                },
+            }
+
+    processed: list[dict[str, Any]] = []
+    target_workers = min(int(workers_cfg), max(1, len(prepared_rows)))
+    deadline = float(started + wall_budget_sec)
+    if target_workers <= 1 or len(prepared_rows) <= 1:
+        for src_idx, row_req in prepared_rows:
+            processed.append(_process_row(int(src_idx), row_req))
+            if time.monotonic() >= deadline:
+                break
+        # Rows skipped by wall budget become explicit timeout rows.
+        done_src = {int((x.get("row") or {}).get("source_index") or -1) for x in processed}
+        for src_idx, _row_req in prepared_rows:
+            if int(src_idx) in done_src:
+                continue
+            timeout_rows += 1
+            processed.append(
+                {
+                    "ok": False,
+                    "elapsed_ms": 0,
+                    "error_top": "compare wall budget exceeded",
+                    "row": {
+                        "index": int(src_idx),
+                        "source_index": int(src_idx),
+                        "ok": False,
+                        "error": "compare wall budget exceeded",
+                        "status_code": 504,
+                        "collected_items": [],
+                        "estimated_items": [],
+                        "snapshot_items": [],
+                        "elapsed_ms": 0,
+                    },
                 }
             )
+    else:
+        fut_map: dict[Any, int] = {}
+        with ThreadPoolExecutor(max_workers=target_workers) as ex:
+            for src_idx, row_req in prepared_rows:
+                fut = ex.submit(_process_row, int(src_idx), row_req)
+                fut_map[fut] = int(src_idx)
+            try:
+                timeout_rem = max(0.1, deadline - time.monotonic())
+                for fut in as_completed(list(fut_map.keys()), timeout=float(timeout_rem)):
+                    try:
+                        processed.append(dict(fut.result() or {}))
+                    except Exception as e:
+                        src_idx = int(fut_map.get(fut, 0))
+                        processed.append(
+                            {
+                                "ok": False,
+                                "elapsed_ms": 0,
+                                "error_top": str(e)[:220],
+                                "row": {
+                                    "index": int(src_idx),
+                                    "source_index": int(src_idx),
+                                    "ok": False,
+                                    "error": str(e)[:220],
+                                    "status_code": 500,
+                                    "collected_items": [],
+                                    "estimated_items": [],
+                                    "snapshot_items": [],
+                                    "elapsed_ms": 0,
+                                },
+                            }
+                        )
+            except FuturesTimeoutError:
+                pass
+            for fut, src_idx in list(fut_map.items()):
+                if fut.done():
+                    continue
+                fut.cancel()
+                timeout_rows += 1
+                processed.append(
+                    {
+                        "ok": False,
+                        "elapsed_ms": 0,
+                        "error_top": "compare wall budget exceeded",
+                        "row": {
+                            "index": int(src_idx),
+                            "source_index": int(src_idx),
+                            "ok": False,
+                            "error": "compare wall budget exceeded",
+                            "status_code": 504,
+                            "collected_items": [],
+                            "estimated_items": [],
+                            "snapshot_items": [],
+                            "elapsed_ms": 0,
+                        },
+                    }
+                )
+
+    processed.sort(key=lambda x: int(((x.get("row") or {}).get("source_index") or 0)))
+    for rec in processed:
+        row_obj = dict(rec.get("row") or {})
+        out_rows.append(row_obj)
+        elapsed_ms = int(rec.get("elapsed_ms") or 0)
+        per_row_elapsed_ms.append(int(elapsed_ms))
+        if not bool(rec.get("ok")):
+            if len(error_top) < 8 and str(rec.get("error_top") or "").strip():
+                error_top.append(str(rec.get("error_top") or "")[:220])
             fail_n += 1
+            continue
+        ok_n += 1
+        mode = str(rec.get("mode") or "").strip().lower() or "unknown"
+        adapter = str(rec.get("adapter") or "").strip().lower() or "unknown"
+        fee_pricing = str(rec.get("fee_pricing") or "")
+        collected_reason = str(rec.get("collected_reason") or "").strip().lower() or "unknown"
+        estimated_reason = str(rec.get("estimated_reason") or "").strip().lower() or "unknown"
+        _inc_counter(mode_counts, mode)
+        _inc_counter(pricing_counts, fee_pricing)
+        _inc_counter(adapter_counts, adapter)
+        _inc_counter(collected_reason_counts, collected_reason)
+        _inc_counter(estimated_reason_counts, estimated_reason)
+        c_items = _norm_fee_items(row_obj.get("collected_items") if isinstance(row_obj.get("collected_items"), list) else [])
+        e_items = _norm_fee_items(row_obj.get("estimated_items") if isinstance(row_obj.get("estimated_items"), list) else [])
+        s_items = _norm_fee_items(row_obj.get("snapshot_items") if isinstance(row_obj.get("snapshot_items"), list) else [])
+        if bool(rec.get("synthetic_baseline")):
+            synthetic_baseline_rows += 1
+        agg_collected.extend(c_items)
+        agg_estimated.extend(e_items)
+        agg_snapshot.extend(s_items)
+        if c_items:
+            rows_with_series["collected"] = int(rows_with_series["collected"]) + 1
+        if e_items:
+            rows_with_series["estimated"] = int(rows_with_series["estimated"]) + 1
+        if s_items:
+            rows_with_series["snapshot"] = int(rows_with_series["snapshot"]) + 1
+        points_total["collected"] = int(points_total["collected"]) + int(len(c_items))
+        points_total["estimated"] = int(points_total["estimated"]) + int(len(e_items))
+        points_total["snapshot"] = int(points_total["snapshot"]) + int(len(s_items))
 
     out: dict[str, Any] = {
         "ok": True,
@@ -22926,6 +23285,10 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
             "rows_work": int(len(prepared_rows)),
             "rows_input_capped": int(len(rows_in[:lim])),
             "rows_dedup_dropped": int(prep_debug.get("duplicates_dropped") or 0),
+            "workers": int(target_workers),
+            "wall_budget_sec": float(wall_budget_sec),
+            "timeout_rows": int(timeout_rows),
+            "synthetic_baseline_rows": int(synthetic_baseline_rows),
             "mode_counts": mode_counts,
             "adapter_counts": adapter_counts,
             "adapter_counts_input": (prep_debug.get("adapter_counts_input") if isinstance(prep_debug.get("adapter_counts_input"), dict) else {}),
