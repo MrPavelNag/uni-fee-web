@@ -14356,12 +14356,21 @@ def _collect_v3_pool_flow_events_temp(
                     "truncated": False,
                     "cached": True,
                 }
+    range_blocks = max(0, int(latest) - int(from_block) + 1)
+    required_chunks = int((range_blocks + int(chunk) - 1) // int(chunk)) if range_blocks > 0 else 0
+    truncated_window = bool(required_chunks > int(chunks_cap))
+    scan_from_block = int(from_block)
+    if truncated_window:
+        # For very large windows (L2), prioritize recent blocks first.
+        scan_from_block = max(int(from_block), int(latest) - int(chunk) * int(chunks_cap) + 1)
     inserted = 0
     events_total = 0
     by_type: dict[str, int] = {}
     block_ts_cache: dict[int, int] = {}
-    cur = int(from_block)
+    cur = int(scan_from_block)
     used = 0
+    scanned_from = int(scan_from_block)
+    scanned_to = int(scan_from_block) - 1
     with POOL_FLOW_EVENTS_LOCK:
         with _analytics_conn() as conn:
             while cur <= int(latest) and used < chunks_cap:
@@ -14429,6 +14438,80 @@ def _collect_v3_pool_flow_events_temp(
                     inserted += max(0, int(conn.total_changes) - int(before_changes))
                 cur = int(to_b) + 1
                 used += 1
+                scanned_to = max(int(scanned_to), int(to_b))
+            # If recent-window scan found nothing and we had to truncate, probe early window too.
+            if truncated_window and events_total <= 0:
+                head_cap = max(8, min(40, int(chunks_cap) // 5))
+                hcur = int(from_block)
+                hused = 0
+                while hcur <= int(latest) and hused < head_cap:
+                    hto = min(int(hcur) + int(chunk) - 1, int(latest))
+                    params = {
+                        "fromBlock": hex(int(hcur)),
+                        "toBlock": hex(int(hto)),
+                        "address": str(pool),
+                        "topics": [topic0_or],
+                    }
+                    try:
+                        logs = _eth_get_logs(cid, params, timeout_sec=max(20.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 4.0))
+                    except Exception:
+                        logs = []
+                    rows_to_insert: list[tuple[Any, ...]] = []
+                    for lg in logs or []:
+                        decoded = _decode_v3_pool_flow_log(lg, topic0_by_name)
+                        if not decoded:
+                            continue
+                        blk = _eth_uint_from_rpc_field((lg or {}).get("blockNumber"))
+                        lix = _eth_uint_from_rpc_field((lg or {}).get("logIndex"))
+                        txh = str((lg or {}).get("transactionHash") or "").strip().lower()
+                        if blk <= 0 or lix < 0 or not txh:
+                            continue
+                        ts = block_ts_cache.get(int(blk))
+                        if ts is None:
+                            ts = int(_eth_get_block_timestamp(cid, int(blk)) or 0)
+                            block_ts_cache[int(blk)] = int(ts)
+                        if ts <= 0 or int(ts) < int(since_ts):
+                            continue
+                        ev = str(decoded.get("event_name") or "").strip().lower()
+                        by_type[ev] = int(by_type.get(ev, 0) + 1)
+                        events_total += 1
+                        rows_to_insert.append(
+                            (
+                                int(cid),
+                                str(proto),
+                                str(pool),
+                                int(blk),
+                                int(lix),
+                                str(txh),
+                                int(ts),
+                                str(ev),
+                                str(decoded.get("owner") or ""),
+                                str(decoded.get("recipient") or ""),
+                                int(decoded.get("tick_lower") or 0),
+                                int(decoded.get("tick_upper") or 0),
+                                str(int(decoded.get("amount0_raw") or 0)),
+                                str(int(decoded.get("amount1_raw") or 0)),
+                                str(int(decoded.get("liquidity_raw") or 0)),
+                                float(ts_now),
+                            )
+                        )
+                    if rows_to_insert:
+                        before_changes = int(conn.total_changes)
+                        conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO temp_pool_flow_events(
+                              chain_id, protocol, pool_id, block_number, log_index, tx_hash, ts, event_name,
+                              owner, recipient, tick_lower, tick_upper, amount0_raw, amount1_raw, liquidity_raw, inserted_at
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            rows_to_insert,
+                        )
+                        inserted += max(0, int(conn.total_changes) - int(before_changes))
+                    scanned_from = min(int(scanned_from), int(hcur))
+                    scanned_to = max(int(scanned_to), int(hto))
+                    hcur = int(hto) + 1
+                    hused += 1
+                used += int(hused)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO temp_pool_flow_runs(
@@ -14441,13 +14524,13 @@ def _collect_v3_pool_flow_events_temp(
                     int(cid),
                     str(proto),
                     str(pool),
-                    int(from_block),
-                    int(min(int(latest), int(cur) - 1)),
+                    int(scanned_from),
+                    int(max(int(scanned_to), int(scanned_from))),
                     int(since_ts),
                     int(time.time()),
                     int(events_total),
                     "ok",
-                    ("" if cur > latest else "chunk_cap_reached"),
+                    ("chunk_cap_reached_recent_first" if truncated_window else ("" if cur > latest else "chunk_cap_reached")),
                 ),
             )
             conn.commit()
@@ -14456,14 +14539,14 @@ def _collect_v3_pool_flow_events_temp(
         "run_id": str(run_id),
         "chain_id": int(cid),
         "pool_id": str(pool),
-        "from_block": int(from_block),
-        "to_block": int(min(int(latest), int(cur) - 1)),
+        "from_block": int(scanned_from),
+        "to_block": int(max(int(scanned_to), int(scanned_from))),
         "chunks_used": int(used),
         "chunks_cap": int(chunks_cap),
         "events_total": int(events_total),
         "inserted_rows": int(inserted),
         "event_counts": by_type,
-        "truncated": bool(cur <= latest),
+        "truncated": bool(truncated_window or cur <= latest),
     }
 
 
@@ -18947,16 +19030,20 @@ def _render_positions_page() -> str:
         const pfChunksUsed = Number(d.pool_flow_chunks_used || 0);
         const pfTruncated = !!d.pool_flow_truncated;
         const pfCached = !!d.cached;
+        const analysisMs = Number(d.elapsed_ms || 0);
         const pfCountsObj = (d && typeof d.pool_flow_event_counts === "object" && d.pool_flow_event_counts) ? d.pool_flow_event_counts : {};
         const pfCounts = Object.entries(pfCountsObj)
           .map(([k, v]) => `${String(k)}=${Number(v || 0)}`)
           .join(",");
         if (pfEventsTotal > 0 || pfCollectPoints > 0 || pfChunksUsed > 0) {
           const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
-          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | pool_flow: collect_points=${pfCollectPoints}, events=${pfEventsTotal}, inserted=${pfInsertedRows}, chunks=${pfChunksUsed}, truncated=${pfTruncated ? 1 : 0}, cached=${pfCached ? 1 : 0}${pfCounts ? `, counts=${pfCounts}` : ""}`;
+          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_ms=${analysisMs} | pool_flow: collect_points=${pfCollectPoints}, events=${pfEventsTotal}, inserted=${pfInsertedRows}, chunks=${pfChunksUsed}, truncated=${pfTruncated ? 1 : 0}, cached=${pfCached ? 1 : 0}${pfCounts ? `, counts=${pfCounts}` : ""}`;
+        } else if (analysisMs > 0) {
+          const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
+          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_ms=${analysisMs}`;
         }
         if (backendHints.length < 5) {
-          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
+          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, analysis_ms=${analysisMs}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
           backendHints.push(msg);
         }
         if (hasCollected) {
@@ -23439,6 +23526,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     def _with_debug(payload: dict[str, Any]) -> dict[str, Any]:
         out = dict(payload or {})
+        debug["elapsed_ms"] = int(max(0.0, (time.monotonic() - started_mono) * 1000.0))
         out["collected_reason"] = str(out.get("collected_reason") or collected_reason)
         out["estimated_reason"] = str(out.get("estimated_reason") or estimated_reason)
         out["debug"] = dict(debug)
