@@ -15113,7 +15113,7 @@ def _format_position_liquidity_scalar_compact(liq_raw: int) -> str:
 
 
 def _format_position_token_amount_display(v: float | None, *, zero_if_missing: bool = False) -> str:
-    """Rounded display for In position / Unclaimed fees (comma thousands; fewer trailing digits)."""
+    """Compact rounded display for In position / Unclaimed fees (e.g. 1K, 2.5M)."""
     if v is None:
         return "0" if zero_if_missing else "-"
     try:
@@ -15123,9 +15123,14 @@ def _format_position_token_amount_display(v: float | None, *, zero_if_missing: b
     if x != x or abs(x) == float("inf"):
         return "0" if zero_if_missing else "-"
     av = abs(x)
-    if av >= 1000:
-        xr = round(x, 1)
-        s = f"{xr:,.1f}"
+    if av >= 1_000_000_000_000:
+        s = f"{x / 1_000_000_000_000.0:.1f}T"
+    elif av >= 1_000_000_000:
+        s = f"{x / 1_000_000_000.0:.1f}B"
+    elif av >= 1_000_000:
+        s = f"{x / 1_000_000.0:.1f}M"
+    elif av >= 1_000:
+        s = f"{x / 1_000.0:.1f}K"
     elif av >= 1:
         xr = round(x, 2)
         s = f"{xr:,.2f}"
@@ -17263,18 +17268,40 @@ def _render_positions_page() -> str:
       let lastPollWall = Date.now();
       let anchorServerElapsed = 0;
       let lastPayload = null;
+      const TERMINAL_STAGES = new Set(["done", "failed", "queued"]);
       function smoothElapsedSec() {
         return anchorServerElapsed + (Date.now() - lastPollWall) / 1000;
       }
-      function formatJobStatusLine(d) {
-        const pct = Math.round(Math.min(100, Math.max(0, Number(d.progress || 0))));
-        const lab = String(d.stage_label || d.stage || "").trim() || "…";
-        const stg = String(d.stage || "").trim();
-        const showStg = stg && !["done", "failed", "queued"].includes(stg);
-        const stagePart = showStg ? (" · Stage: " + stg) : "";
-        const t = formatScanDuration(smoothElapsedSec());
-        const timePart = t ? (" · ⏱ " + t) : "";
-        return pct + "% · " + lab + stagePart + timePart;
+      function setProgressFromStatus(status, progress) {
+        if (status === "queued") setPosProgressBar(progId, 0, true);
+        else setPosProgressBar(progId, progress, false);
+      }
+      function maybeApplyPartialResult(partial) {
+        if (!(partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length)) return false;
+        cacheBox.pools = partial.pool_positions || [];
+        cacheBox.debug = partial.debug || null;
+        renderTable(cacheBox.pools);
+        renderScanMessages(partial, errDom);
+        partialRendered = true;
+        return true;
+      }
+      function assertJobHttpOk(resp, data) {
+        if (resp.ok) return;
+        const detail = typeof data?.detail === "string" ? data.detail.trim() : "";
+        const err = new Error(detail || "Job polling failed");
+        if (resp.status === 404) err._posJobTerminal = true;
+        throw err;
+      }
+      function assertNotFailedStatus(status, data) {
+        if (status !== "failed") return;
+        const err = new Error(String(data.error || "Scan failed"));
+        err._posJobTerminal = true;
+        throw err;
+      }
+      function shouldReturnPartial(status, progress, partial) {
+        const stageKey = String(status || "");
+        const backgroundPhase = stageKey.startsWith("enrich_") || stageKey === "finalize" || progress >= 65;
+        return !!(allowPartialReturn && partialRendered && backgroundPhase && partial);
       }
       function statusFallbackLabel(raw, st, partial) {
         const s = String(raw || "").trim().toLowerCase();
@@ -17282,6 +17309,23 @@ def _render_positions_page() -> str:
         if (String(st || "") === "queued") return "Queued";
         if (partial) return "Finishing in background";
         return "Working…";
+      }
+      function withFallbackStageLabel(payload, status, stageLabel) {
+        const backendLbl = String(payload?.stage_label || "").trim();
+        if (backendLbl) return payload;
+        return Object.assign({}, payload, {
+          stage_label: statusFallbackLabel(stageLabel, status, partialRendered),
+        });
+      }
+      function formatJobStatusLine(payload) {
+        const pct = Math.round(Math.min(100, Math.max(0, Number(payload.progress || 0))));
+        const lab = String(payload.stage_label || payload.stage || "").trim() || "…";
+        const stg = String(payload.stage || "").trim();
+        const showStg = stg && !TERMINAL_STAGES.has(stg);
+        const stagePart = showStg ? (" · Stage: " + stg) : "";
+        const t = formatScanDuration(smoothElapsedSec());
+        const timePart = t ? (" · ⏱ " + t) : "";
+        return pct + "% · " + lab + stagePart + timePart;
       }
       try {
         tickTimer = setInterval(() => {
@@ -17291,12 +17335,7 @@ def _render_positions_page() -> str:
         while (true) {
           const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
           const data = await r.json().catch(() => ({}));
-          if (!r.ok) {
-            const detail = typeof data?.detail === "string" ? data.detail.trim() : "";
-            const err = new Error(detail || "Job polling failed");
-            if (r.status === 404) err._posJobTerminal = true;
-            throw err;
-          }
+          assertJobHttpOk(r, data);
           const st = String(data.status || "");
           const stageLabel = String(data.stage_label || data.stage || "");
           const progress = Number(data.progress || 0);
@@ -17304,35 +17343,14 @@ def _render_positions_page() -> str:
           lastPayload = data;
           lastPollWall = Date.now();
           anchorServerElapsed = Number(data.elapsed_sec || 0);
-          if (st === "queued") {
-            setPosProgressBar(progId, 0, true);
-          } else {
-            setPosProgressBar(progId, progress, false);
-          }
-          if (partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length) {
-            cacheBox.pools = partial.pool_positions || [];
-            cacheBox.debug = partial.debug || null;
-            renderTable(cacheBox.pools);
-            renderScanMessages(partial, errDom);
-            partialRendered = true;
-          }
+          setProgressFromStatus(st, progress);
+          maybeApplyPartialResult(partial);
           if (st === "done") return data.result || {};
-          if (st === "failed") {
-            const err = new Error(String(data.error || "Scan failed"));
-            err._posJobTerminal = true;
-            throw err;
-          }
-          const stageKey = String(data.stage || "");
-          const backgroundPhase = stageKey.startsWith("enrich_") || stageKey === "finalize" || progress >= 65;
-          if (allowPartialReturn && partialRendered && backgroundPhase) {
+          assertNotFailedStatus(st, data);
+          if (shouldReturnPartial(String(data.stage || ""), progress, partial)) {
             return Object.assign({__partial: true}, partial);
           }
-          const backendLbl = String(data.stage_label || "").trim();
-          if (!backendLbl) {
-            lastPayload = Object.assign({}, data, {
-              stage_label: statusFallbackLabel(stageLabel, st, partialRendered),
-            });
-          }
+          lastPayload = withFallbackStageLabel(data, st, stageLabel);
           statusSink(formatJobStatusLine(lastPayload), false);
           await new Promise((resolve) => setTimeout(resolve, 1200));
         }
