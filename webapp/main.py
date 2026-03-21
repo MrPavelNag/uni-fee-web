@@ -13649,6 +13649,28 @@ def _fetch_pool_fee_tier_fraction(endpoint: str, pool_id: str) -> float:
         return 0.0
 
 
+def _fetch_pool_token_ids(endpoint: str, pool_id: str) -> tuple[str, str]:
+    pool_lc = str(pool_id or "").strip().lower()
+    if not endpoint or not pool_lc:
+        return "", ""
+    q = """
+    query PoolTokens($pool: String!) {
+      pool(id: $pool) {
+        token0 { id }
+        token1 { id }
+      }
+    }
+    """
+    try:
+        data = graphql_query(endpoint, q, {"pool": pool_lc}, retries=1)
+        p = ((data.get("data") or {}).get("pool") or {})
+        t0 = str(((p.get("token0") or {}).get("id") or "")).strip().lower()
+        t1 = str(((p.get("token1") or {}).get("id") or "")).strip().lower()
+        return (t0 if _is_eth_address(t0) else ""), (t1 if _is_eth_address(t1) else "")
+    except Exception:
+        return "", ""
+
+
 def _fetch_pool_fee_usd_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
     """Daily pool fee USD: feesUSD, or volumeUSD*feeTier fallback when feesUSD is missing."""
     endpoint = get_graph_endpoint(chain_key, version=version)
@@ -22577,6 +22599,14 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         token1 = ""
     want_hist_usd = bool(getattr(req, "fee_usd_historical", False))
     endpoint = get_graph_endpoint(chain_key, version=version)
+    if (not _is_eth_address(token0) or not _is_eth_address(token1)) and endpoint and str(req.pool_id or "").strip():
+        p0, p1 = _fetch_pool_token_ids(endpoint, str(req.pool_id or ""))
+        if not _is_eth_address(token0) and _is_eth_address(p0):
+            token0 = p0
+            debug["token0_source"] = "pool_id_subgraph"
+        if not _is_eth_address(token1) and _is_eth_address(p1):
+            token1 = p1
+            debug["token1_source"] = "pool_id_subgraph"
     debug["token0_resolved"] = bool(_is_eth_address(token0))
     debug["token1_resolved"] = bool(_is_eth_address(token1))
     debug["endpoint_configured"] = bool(endpoint)
@@ -22779,6 +22809,11 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             elapsed = max(0.0, time.monotonic() - started_mono)
             rem_total = max(0.0, total_budget_sec - elapsed)
             rpc_timeout = max(0.8, min(rpc_budget_sec, rem_total))
+            # For small targeted requests (1-2 position ids), force one RPC attempt even
+            # if earlier steps consumed the nominal total budget.
+            if rem_total <= 0.9 and len(position_ids) <= 2:
+                rpc_timeout = max(rpc_timeout, float(rpc_budget_sec))
+                debug["rpc_over_budget_attempt"] = True
             if rpc_timeout <= 0.9:
                 debug["rpc_skipped"] = "time_budget"
             else:
