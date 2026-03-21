@@ -16463,7 +16463,7 @@ def _render_positions_page() -> str:
           <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / PancakeSwap v3</h3>
           <div class="section-actions">
             <span class="pos-status" id="posStatus">Ready</span>
-            <label class="fee-toggle-pill" title="Runs in background and requires significant time, around 3-5 minutes.">
+            <label class="fee-toggle-pill" title="Include closed-position enrich (pair/date) in Scan V3. Usually takes longer.">
               <input type="checkbox" id="posClosedBgEnrich" />
               <span class="pos-fee-hist-label">Closed positions</span>
             </label>
@@ -19202,7 +19202,7 @@ def _render_positions_page() -> str:
       posClosedBgEnrichInFlight = true;
       startPosStatusLane("closed");
       try {
-        setPosStatus("Closed positions enrich started (~3-5 min)…", false);
+        setPosStatus("Enriching closed positions…", false);
         const out = await runClosedRowsBackgroundEnrich();
         finishPosStatusLane("closed");
         posFinalClosedCount = countClosedRows(posCache.pools || []);
@@ -19211,7 +19211,7 @@ def _render_positions_page() -> str:
         const p = Number(out?.processed || 0);
         const pl = Number(out?.planned || 0);
         if (pl > 0 && p < pl) {
-          setPosStatus(`Closed positions enrich stopped by time budget (${p}/${pl} rows processed).`, false);
+          setPosStatus(`Closed enrich paused (${p}/${pl} rows).`, false);
         }
       } catch (e) {
         finishPosStatusLane("closed");
