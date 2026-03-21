@@ -17930,6 +17930,41 @@ def _render_positions_page() -> str:
       if (checked) posHistorySelected.add(k);
       else posHistorySelected.delete(k);
     }
+    function parseCreatedDateMs(row) {
+      const raw = String(row?.pool_created_date || row?.position_created_date || "").trim();
+      if (!raw || raw === "-") return 0;
+      let ms = Date.parse(raw);
+      if (!Number.isFinite(ms) || ms <= 0) {
+        const ymd = raw.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
+        if (ymd) {
+          ms = Date.parse(`${ymd[1]}-${ymd[2]}-${ymd[3]}T00:00:00Z`);
+        }
+      }
+      return (Number.isFinite(ms) && ms > 0) ? Number(ms) : 0;
+    }
+    function chartGridX(minCreatedMs) {
+      const out = {
+        showgrid: true,
+        gridcolor: "#cfd9ea",
+        gridwidth: 1,
+        zeroline: true,
+        zerolinecolor: "#94a3b8",
+        zerolinewidth: 1,
+      };
+      if (Number(minCreatedMs || 0) > 0) out.range = [new Date(Number(minCreatedMs)), new Date()];
+      return out;
+    }
+    function chartGridY(withDollar = false) {
+      return {
+        showgrid: true,
+        gridcolor: "#cfd9ea",
+        gridwidth: 1,
+        zeroline: true,
+        zerolinecolor: "#94a3b8",
+        zerolinewidth: 1,
+        ...(withDollar ? {tickprefix: "$"} : {}),
+      };
+    }
     async function showSelectedPoolSeries() {
       const chartEl = document.getElementById("posPoolChart");
       if (!chartEl) return;
@@ -17944,6 +17979,7 @@ def _render_positions_page() -> str:
         if (!ok) throw new Error("Failed to load chart library");
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
+        let minCreatedMs = 0;
         for (let i = 0; i < selected.length; i++) {
           const hk = parseHistoryKey(selected[i]);
           const idx = hk.idx;
@@ -17952,6 +17988,8 @@ def _render_positions_page() -> str:
             : (posCache.pools || [])[idx];
           if (!row) continue;
           if (row.unsupported_protocol) continue;
+          const createdMs = parseCreatedDateMs(row);
+          if (createdMs > 0 && (!minCreatedMs || createdMs < minCreatedMs)) minCreatedMs = createdMs;
           const payload = {
             chain: row.chain,
             chain_id: Number(row.chain_id) || 0,
@@ -17961,6 +17999,8 @@ def _render_positions_page() -> str:
             position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
             position_liquidity: row.liquidity,
             pool_liquidity: row.pool_liquidity,
+            pool_created_date: String(row.pool_created_date || ""),
+            position_created_date: String(row.position_created_date || ""),
             days: getHistoryDays(),
           };
           const res = await fetch("/api/positions/pool-value-series", {
@@ -17991,8 +18031,8 @@ def _render_positions_page() -> str:
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
-          xaxis: {showgrid: true, gridcolor: "#d9e2f0"},
-          yaxis: {showgrid: true, gridcolor: "#d9e2f0", tickprefix: "$"},
+          xaxis: chartGridX(minCreatedMs),
+          yaxis: chartGridY(true),
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
@@ -18071,6 +18111,7 @@ def _render_positions_page() -> str:
       const rowStatuses = [];
       const rowsPayload = [];
       const payloadMeta = [];
+      let minCreatedMs = 0;
       for (let i = 0; i < selected.length; i++) {
         const hk = parseHistoryKey(selected[i]);
         const idx = hk.idx;
@@ -18088,6 +18129,8 @@ def _render_positions_page() -> str:
           continue;
         }
         const rowLabel = String(row.pair || row.pool_id || row.position_id || `row#${i + 1}`);
+        const createdMs = parseCreatedDateMs(row);
+        if (createdMs > 0 && (!minCreatedMs || createdMs < minCreatedMs)) minCreatedMs = createdMs;
         if (row.unsupported_protocol) {
           diag.unsupported += 1;
           rowStatuses.push({
@@ -18132,9 +18175,10 @@ def _render_positions_page() -> str:
           rowLabel,
           baseName: String(row.pair || row.pool_id || `Position ${i + 1}`),
           pairOrPool: String(row.pair || row.pool_id || "?"),
+          createdMs: Number(createdMs || 0),
         });
       }
-      return {diag, rowStatuses, rowsPayload, payloadMeta};
+      return {diag, rowStatuses, rowsPayload, payloadMeta, minCreatedMs};
     }
     function processFeeCompareRows(rowsOut, payloadMeta, palette, traces, rowStatuses, apiFailTop, backendHints, diag) {
       let lastFeePricing = "";
@@ -18200,13 +18244,40 @@ def _render_positions_page() -> str:
         if (hasCollected) {
           hasCollectedHistoryTrace = true;
           rowsWithCollected += 1;
+          const collectedSorted = collectedItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+          const lineX = [];
+          const lineY = [];
+          const createdMs = Number(meta.createdMs || 0);
+          if (createdMs > 0) {
+            lineX.push(new Date(createdMs));
+            lineY.push(0);
+          }
+          for (const it of collectedSorted) {
+            const ts = Number(it?.ts || 0);
+            if (ts <= 0) continue;
+            lineX.push(new Date(ts * 1000));
+            lineY.push(Number(it?.fees_usd || 0));
+          }
+          if (hasSnapshot) {
+            const snapSorted = snapshotItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+            const snapLast = snapSorted.length ? snapSorted[snapSorted.length - 1] : null;
+            const snapTs = Number(snapLast?.ts || 0);
+            const snapVal = Number(snapLast?.fees_usd || 0);
+            if (snapTs > 0) {
+              const lastCollected = lineY.length ? Number(lineY[lineY.length - 1] || 0) : 0;
+              lineX.push(new Date(snapTs * 1000));
+              lineY.push(Math.max(0, lastCollected + Math.max(0, snapVal)));
+            }
+          }
+          const useLineX = lineX.length ? lineX : collectedItems.map((x) => new Date(Number(x.ts || 0) * 1000));
+          const useLineY = lineY.length ? lineY : collectedItems.map((x) => Number(x.fees_usd || 0));
           traces.push({
-            x: collectedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
-            y: collectedItems.map((x) => Number(x.fees_usd || 0)),
-            mode: collectedItems.length <= 1 ? "lines+markers" : "lines",
+            x: useLineX,
+            y: useLineY,
+            mode: useLineY.length <= 2 ? "lines+markers" : "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 2},
-            marker: {size: collectedItems.length <= 1 ? 7 : 0},
-            name: `${meta.baseName} (collected history)`,
+            marker: {size: useLineY.length <= 2 ? 6 : 0},
+            name: `${meta.baseName} (collected path)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
         }
@@ -18226,6 +18297,24 @@ def _render_positions_page() -> str:
         if (hasSnapshot) {
           hasSnapshotOnlyTrace = true;
           rowsWithSnapshot += 1;
+          if (!hasCollected) {
+            const createdMs = Number(meta.createdMs || 0);
+            const snapSorted = snapshotItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+            const snapLast = snapSorted.length ? snapSorted[snapSorted.length - 1] : null;
+            const snapTs = Number(snapLast?.ts || 0);
+            const snapVal = Number(snapLast?.fees_usd || 0);
+            if (createdMs > 0 && snapTs > 0) {
+              traces.push({
+                x: [new Date(createdMs), new Date(snapTs * 1000)],
+                y: [0, Math.max(0, snapVal)],
+                mode: "lines",
+                line: {color: palette[meta.colorIdx % palette.length], width: 2},
+                opacity: 0.65,
+                name: `${meta.baseName} (from 0 to unclaimed)`,
+                hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+              });
+            }
+          }
           traces.push({
             x: snapshotItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
             y: snapshotItems.map((x) => Number(x.fees_usd || 0)),
@@ -18272,6 +18361,7 @@ def _render_positions_page() -> str:
         const rowStatuses = prepared.rowStatuses;
         const rowsPayload = prepared.rowsPayload;
         const payloadMeta = prepared.payloadMeta;
+        const minCreatedMs = Number(prepared.minCreatedMs || 0);
         if (!rowsPayload.length) {
           chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
@@ -18332,8 +18422,8 @@ def _render_positions_page() -> str:
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
-          xaxis: {showgrid: true, gridcolor: "#d9e2f0"},
-          yaxis: {showgrid: true, gridcolor: "#d9e2f0", tickprefix: "$"},
+          xaxis: chartGridX(minCreatedMs),
+          yaxis: chartGridY(true),
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
@@ -22622,6 +22712,33 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         if not _is_eth_address(token1) and _is_eth_address(p1):
             token1 = p1
             debug["token1_source"] = "pool_id_subgraph"
+    # Hard fallback for V3-like protocols: resolve token addresses from PositionManager.positions(tokenId)
+    # when row symbols/subgraph metadata are incomplete.
+    if (not _is_eth_address(token0) or not _is_eth_address(token1)) and protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+        for pid in position_ids[:3]:
+            try:
+                tid = _position_token_id_from_raw(pid)
+                if tid <= 0:
+                    continue
+                snap = _fetch_v3_position_contract_snapshot(
+                    int(chain_id),
+                    str(protocol),
+                    int(tid),
+                    str(req.address or ""),
+                    include_quotes=False,
+                ) or {}
+                s0 = str(snap.get("token0") or "").strip().lower()
+                s1 = str(snap.get("token1") or "").strip().lower()
+                if not _is_eth_address(token0) and _is_eth_address(s0):
+                    token0 = s0
+                    debug["token0_source"] = "position_manager_snapshot"
+                if not _is_eth_address(token1) and _is_eth_address(s1):
+                    token1 = s1
+                    debug["token1_source"] = "position_manager_snapshot"
+                if _is_eth_address(token0) and _is_eth_address(token1):
+                    break
+            except Exception:
+                continue
     debug["token0_resolved"] = bool(_is_eth_address(token0))
     debug["token1_resolved"] = bool(_is_eth_address(token1))
     debug["endpoint_configured"] = bool(endpoint)
@@ -23220,7 +23337,14 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
             if time.monotonic() >= deadline:
                 break
         # Rows skipped by wall budget become explicit timeout rows.
-        done_src = {int((x.get("row") or {}).get("source_index") or -1) for x in processed}
+        done_src: set[int] = set()
+        for x in processed:
+            row_obj = (x.get("row") if isinstance(x, dict) else {}) or {}
+            v = row_obj.get("source_index")
+            try:
+                done_src.add(int(v) if v is not None else -1)
+            except Exception:
+                done_src.add(-1)
         for src_idx, _row_req in prepared_rows:
             if int(src_idx) in done_src:
                 continue
@@ -23305,7 +23429,11 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     best_by_src: dict[int, dict[str, Any]] = {}
     for rec in processed:
         row_obj = rec.get("row") if isinstance(rec, dict) else {}
-        src = int((row_obj or {}).get("source_index") or 0)
+        src_v = (row_obj or {}).get("source_index")
+        try:
+            src = int(src_v) if src_v is not None else -1
+        except Exception:
+            src = -1
         prev = best_by_src.get(src)
         if prev is None:
             best_by_src[src] = rec
