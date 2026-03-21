@@ -14014,8 +14014,6 @@ def _fetch_v3_position_fees_by_collect_logs(
 
     dec0 = _fetch_erc20_decimals_onchain(cid, t0)
     dec1 = _fetch_erc20_decimals_onchain(cid, t1)
-    pool_min = _minimal_pool_dict_for_fee_usd(t0, t1, dec0, dec1)
-
     from_block = _eth_first_block_at_or_after_ts(cid, int(since_ts))
     latest = _eth_block_number(cid)
     if from_block <= 0 or latest <= 0 or from_block > latest:
@@ -14082,6 +14080,7 @@ def _fetch_v3_position_fees_by_collect_logs(
         return {}, empty_meta
 
     by_day: dict[int, tuple[int, float]] = {}
+    priced_partial = False
 
     if use_historical_usd:
         t_lo = min(t for t, _, _ in evs)
@@ -14109,15 +14108,26 @@ def _fetch_v3_position_fees_by_collect_logs(
                 p1 = _price_usd_at_or_before_series(hist1, ts) if hist1 else None
                 if p1 is None or p1 <= 0:
                     p1 = sp1
-            if p0 is None or p1 is None or p0 <= 0 or p1 <= 0:
+            legs_expected = int(1 if float(dh0) > 0 else 0) + int(1 if float(dh1) > 0 else 0)
+            legs_priced = 0
+            inc_usd = 0.0
+            if float(dh0) > 0 and p0 is not None and float(p0) > 0:
+                inc_usd += float(dh0) * float(p0)
+                legs_priced += 1
+            if float(dh1) > 0 and p1 is not None and float(p1) > 0:
+                inc_usd += float(dh1) * float(p1)
+                legs_priced += 1
+            if legs_priced <= 0 or inc_usd <= 0:
                 continue
-            cum_usd += float(dh0) * float(p0) + float(dh1) * float(p1)
+            if legs_priced < legs_expected:
+                priced_partial = True
+            cum_usd += float(inc_usd)
             day_ts = (int(ts) // 86400) * 86400
             prev = by_day.get(day_ts)
             if prev is None or ts > prev[0]:
                 by_day[day_ts] = (int(ts), float(cum_usd))
         pricing = "onchain_historical"
-        if partial0 or partial1:
+        if partial0 or partial1 or priced_partial:
             pricing = "onchain_historical_mixed"
         detail = (
             "Collect logs: USD per event via CoinGecko contract historical range; "
@@ -14125,25 +14135,44 @@ def _fetch_v3_position_fees_by_collect_logs(
         )
         if partial0 or partial1:
             detail += " Some tokens had no CG history — spot used for those legs."
+        if priced_partial:
+            detail += " Some events were valued by one known token leg only."
         return {int(d): float(v) for d, (_ts, v) in by_day.items()}, {"pricing": pricing, "detail": detail}
 
-    cum0 = Decimal(0)
-    cum1 = Decimal(0)
+    stable0 = _fee_position_token_stable_usd_assumption(cid, t0) is not None
+    stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
+    spot_map = _get_token_prices_usd(cid, [t0, t1])
+    sp0 = 1.0 if stable0 else _safe_float(spot_map.get(t0))
+    sp1 = 1.0 if stable1 else _safe_float(spot_map.get(t1))
+    cum_usd = 0.0
     for ts, dh0, dh1 in evs:
-        cum0 += Decimal(str(dh0))
-        cum1 += Decimal(str(dh1))
-        usd = _value_usd_from_token_amounts(float(cum0), float(cum1), pool_min, cid)
-        if usd is None:
+        legs_expected = int(1 if float(dh0) > 0 else 0) + int(1 if float(dh1) > 0 else 0)
+        legs_priced = 0
+        inc_usd = 0.0
+        if float(dh0) > 0 and float(sp0) > 0:
+            inc_usd += float(dh0) * float(sp0)
+            legs_priced += 1
+        if float(dh1) > 0 and float(sp1) > 0:
+            inc_usd += float(dh1) * float(sp1)
+            legs_priced += 1
+        if legs_priced <= 0 or inc_usd <= 0:
             continue
+        if legs_priced < legs_expected:
+            priced_partial = True
+        cum_usd += float(inc_usd)
         day_ts = (int(ts) // 86400) * 86400
         prev = by_day.get(day_ts)
         if prev is None or ts > prev[0]:
-            by_day[day_ts] = (int(ts), float(usd))
+            by_day[day_ts] = (int(ts), float(cum_usd))
 
     out = {int(d): float(v) for d, (_ts, v) in by_day.items()}
+    pricing = "onchain_spot" if not priced_partial else "onchain_spot_partial"
+    detail = "Collect logs: cumulative fees marked at current spot USD (CoinGecko / ratio)."
+    if priced_partial:
+        detail += " Some events were valued by one known token leg only."
     meta = {
-        "pricing": "onchain_spot",
-        "detail": "Collect logs: cumulative fees marked at current spot USD (CoinGecko / ratio).",
+        "pricing": pricing,
+        "detail": detail,
     }
     return out, meta
 
@@ -15499,12 +15528,18 @@ def _normalize_positions_series_protocol(raw: str, *, for_fees: bool = False) ->
         return p
     if for_fees and p == "pancake_v3_staked":
         return "pancake_v3_staked"
+    if for_fees and p in ("pancake_infinity_cl", "pancake_infinity_bin"):
+        return p
     if p in ("uni-v3", "univ3", "uni_v3"):
         return "uniswap_v3"
     if p in ("uni-v4", "univ4", "uni_v4"):
         return "uniswap_v4"
     if p in ("panc-v3", "panc_v3", "pancake-v3"):
         return "pancake_v3"
+    if for_fees and p in ("panc-inf-cl", "panc_inf_cl", "pancake-infinity-cl"):
+        return "pancake_infinity_cl"
+    if for_fees and p in ("panc-inf-bin", "panc_inf_bin", "pancake-infinity-bin"):
+        return "pancake_infinity_bin"
     return ""
 
 
@@ -18042,6 +18077,7 @@ def _render_positions_page() -> str:
         const traces = [];
         const apiFailTop = [];
         const backendHints = [];
+
         const prepared = buildFeeCompareSelection(selected, histUsd);
         const diag = prepared.diag;
         const rowStatuses = prepared.rowStatuses;
@@ -18053,6 +18089,7 @@ def _render_positions_page() -> str:
           setPosFeeStatus("No valid selected rows for fee data", true);
           return;
         }
+
         const compareReq = {
           rows: rowsPayload,
           max_rows: rowsPayload.length,
@@ -18065,6 +18102,7 @@ def _render_positions_page() -> str:
           setPosFeeStatus(`Failed to load compare data: ${det}`, true);
           return;
         }
+
         const rowsOut = Array.isArray(data?.rows) ? data.rows : [];
         const feeState = processFeeCompareRows(
           rowsOut,
@@ -18090,6 +18128,7 @@ def _render_positions_page() -> str:
           setPosFeeStatus(`No fee data · ${reasonLine}`, true);
           return;
         }
+
         const titleSuffix = histUsd ? " — historical USD (CoinGecko at each Collect)" : " — spot USD";
         Plotly.newPlot("posFeeChart", traces, {
           title: "Collected vs estimated fees (USD)" + titleSuffix,
@@ -22122,6 +22161,122 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
     }
 
 
+def _fee_series_adapter_name(protocol: str) -> str:
+    p = str(protocol or "").strip().lower()
+    if p == "uniswap_v4":
+        return "uniswap_v4"
+    if p in {"pancake_infinity_cl", "pancake_infinity_bin"}:
+        return "pancake_infinity"
+    if p in {"pancake_v3_staked"}:
+        return "pancake_v3_farming"
+    if p in {"uniswap_v3", "pancake_v3"}:
+        return "v3_compatible"
+    return "unknown"
+
+
+def _fee_series_position_ids_from_request(req: PositionPoolSeriesRequest) -> list[str]:
+    ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
+    pid = str(getattr(req, "position_id", "") or "").strip()
+    if pid:
+        ids.append(pid)
+    return list(dict.fromkeys(ids))
+
+
+def _normalize_fee_compare_row(req: PositionPoolSeriesRequest) -> PositionPoolSeriesRequest:
+    raw = req.dict() if hasattr(req, "dict") else dict(req or {})
+    chain_key = str(raw.get("chain") or "").strip().lower()
+    chain_id = int(raw.get("chain_id") or 0)
+    if not chain_key and chain_id > 0 and chain_id in CHAIN_ID_TO_KEY:
+        chain_key = str(CHAIN_ID_TO_KEY.get(int(chain_id)) or "").strip().lower()
+    protocol_raw = str(raw.get("protocol") or "")
+    protocol_norm = _normalize_positions_series_protocol(protocol_raw, for_fees=True) or protocol_raw
+    raw["chain"] = chain_key
+    raw["chain_id"] = int(chain_id)
+    raw["protocol"] = str(protocol_norm or "").strip().lower()
+    raw["pool_id"] = str(raw.get("pool_id") or "").strip().lower()
+    raw["address"] = str(raw.get("address") or "").strip().lower()
+    ids = [str(x).strip() for x in (raw.get("position_ids") or []) if str(x).strip()]
+    pid = str(raw.get("position_id") or "").strip()
+    if pid:
+        ids.append(pid)
+    raw["position_ids"] = list(dict.fromkeys(ids))
+    raw["position_id"] = pid
+    raw["token0_id"] = str(raw.get("token0_id") or "").strip().lower()
+    raw["token1_id"] = str(raw.get("token1_id") or "").strip().lower()
+    return PositionPoolSeriesRequest(**raw)
+
+
+def _fee_compare_row_key(req: PositionPoolSeriesRequest) -> str:
+    chain_id = int(getattr(req, "chain_id", 0) or 0)
+    chain = str(getattr(req, "chain", "") or "").strip().lower()
+    proto = str(getattr(req, "protocol", "") or "").strip().lower()
+    addr = str(getattr(req, "address", "") or "").strip().lower()
+    pool = str(getattr(req, "pool_id", "") or "").strip().lower()
+    ids = _fee_series_position_ids_from_request(req)
+    pid = ids[0] if ids else ""
+    if not proto:
+        return ""
+    if pid:
+        return "|".join([addr, str(chain_id or chain), proto, pid, pool])
+    if pool:
+        return "|".join([addr, str(chain_id or chain), proto, "-", pool])
+    return ""
+
+
+def _fee_compare_row_quality(req: PositionPoolSeriesRequest) -> int:
+    score = 0
+    if _fee_series_position_ids_from_request(req):
+        score += 4
+    if str(getattr(req, "pool_id", "") or "").strip():
+        score += 3
+    if _is_eth_address(str(getattr(req, "token0_id", "") or "")) and _is_eth_address(str(getattr(req, "token1_id", "") or "")):
+        score += 3
+    if _safe_float(getattr(req, "pool_liquidity", 0.0)) > 0:
+        score += 2
+    if _safe_float(getattr(req, "position_liquidity", 0.0)) > 0:
+        score += 1
+    if _safe_float(getattr(req, "pool_tvl_usd", 0.0)) > 0:
+        score += 1
+    if (_safe_float(getattr(req, "position_amount0", 0.0)) > 0) or (_safe_float(getattr(req, "position_amount1", 0.0)) > 0):
+        score += 1
+    return int(score)
+
+
+def _prepare_fee_compare_rows(
+    rows_in: list[PositionPoolSeriesRequest],
+    *,
+    max_rows: int,
+) -> tuple[list[tuple[int, PositionPoolSeriesRequest]], dict[str, Any]]:
+    out: list[tuple[int, PositionPoolSeriesRequest]] = []
+    by_key: dict[str, tuple[int, PositionPoolSeriesRequest]] = {}
+    duplicate_dropped = 0
+    adapter_counts: dict[str, int] = {}
+    for src_idx, row in enumerate(rows_in[: max(1, int(max_rows))]):
+        nrow = _normalize_fee_compare_row(row)
+        ad = _fee_series_adapter_name(str(getattr(nrow, "protocol", "") or ""))
+        adapter_counts[ad] = int(adapter_counts.get(ad, 0)) + 1
+        key = _fee_compare_row_key(nrow)
+        if not key:
+            out.append((int(src_idx), nrow))
+            continue
+        prev = by_key.get(key)
+        if prev is None:
+            by_key[key] = (int(src_idx), nrow)
+            continue
+        prev_i, prev_r = prev
+        if _fee_compare_row_quality(nrow) > _fee_compare_row_quality(prev_r):
+            by_key[key] = (int(src_idx), nrow)
+        duplicate_dropped += 1
+    # Keep deterministic output by source index for deduped keys.
+    deduped = sorted(by_key.values(), key=lambda x: int(x[0]))
+    out.extend(deduped)
+    out.sort(key=lambda x: int(x[0]))
+    return out, {
+        "duplicates_dropped": int(duplicate_dropped),
+        "adapter_counts_input": adapter_counts,
+    }
+
+
 @app.post("/api/positions/position-fee-series")
 def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
     """Cumulative fees: subgraph positionSnapshots when reliable; else NPM Collect logs (eth_getLogs)."""
@@ -22136,11 +22291,12 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     protocol = _normalize_positions_series_protocol(str(req.protocol or ""), for_fees=True)
     if not chain_key:
         raise HTTPException(status_code=400, detail="chain is required.")
-    if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3", "pancake_v3_staked"}:
+    if protocol not in {"uniswap_v3", "uniswap_v4", "pancake_v3", "pancake_v3_staked", "pancake_infinity_cl", "pancake_infinity_bin"}:
         raise HTTPException(
             status_code=400,
-            detail="protocol must be uniswap_v3, uniswap_v4, pancake_v3 or pancake_v3_staked (or UI labels like UNI-V3 / PanC-V3).",
+            detail="protocol must be uniswap_v3, uniswap_v4, pancake_v3, pancake_v3_staked, pancake_infinity_cl or pancake_infinity_bin.",
         )
+    adapter = _fee_series_adapter_name(protocol)
     version = "v4" if protocol.endswith("_v4") else "v3"
     days = max(1, min(3650, int(req.days or 30)))
     now_ts = int(time.time())
@@ -22154,6 +22310,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         "chain": chain_key,
         "chain_id": int(chain_id),
         "protocol": protocol,
+        "adapter": adapter,
         "version": version,
         "days": int(days),
         "budget_total_sec": float(total_budget_sec),
@@ -22183,12 +22340,23 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "fee_pricing": "none",
             "note": "unknown chain",
         })
+    if adapter == "pancake_infinity":
+        collected_reason = "adapter_not_implemented"
+        estimated_reason = "adapter_not_implemented"
+        debug["result_mode"] = "unavailable"
+        debug["result_count"] = 0
+        debug["reason"] = "adapter_not_implemented"
+        return _with_debug({
+            "items": [],
+            "count": 0,
+            "mode": "unavailable",
+            "fee_pricing": "none",
+            "note": "Infinity adapter is recognized but fee history fetching is not implemented yet.",
+            "estimated_items": [],
+            "estimated_mode": "none",
+        })
 
-    position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
-    pos_id_single = str(getattr(req, "position_id", "") or "").strip()
-    if pos_id_single:
-        position_ids.append(pos_id_single)
-    position_ids = list(dict.fromkeys(position_ids))
+    position_ids = _fee_series_position_ids_from_request(req)
     debug["position_ids_count"] = len(position_ids)
     if not position_ids:
         collected_reason = "no_position_ids"
@@ -22547,7 +22715,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     if not rows_in:
         raise HTTPException(status_code=400, detail="rows is required.")
     lim = max(1, min(100, int(req.max_rows or 20)))
-    rows_work = rows_in[:lim]
+    prepared_rows, prep_debug = _prepare_fee_compare_rows(rows_in, max_rows=lim)
     include_row_debug = bool(getattr(req, "include_row_debug", True))
     include_debug_summary = bool(getattr(req, "include_debug_summary", True))
 
@@ -22581,6 +22749,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     fail_n = 0
     mode_counts: dict[str, int] = {}
     pricing_counts: dict[str, int] = {}
+    adapter_counts: dict[str, int] = {}
     collected_reason_counts: dict[str, int] = {}
     estimated_reason_counts: dict[str, int] = {}
     error_top: list[str] = []
@@ -22591,11 +22760,12 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     def _inc_counter(mp: dict[str, int], key: str) -> None:
         k = str(key or "").strip().lower() or "unknown"
         mp[k] = int(mp.get(k, 0)) + 1
-    for idx, row_req in enumerate(rows_work):
+    for src_idx, row_req in prepared_rows:
         row_started = time.monotonic()
         try:
             one = positions_position_fee_series(row_req)
             mode = str(one.get("mode") or "").strip().lower()
+            adapter = str((one.get("debug") or {}).get("adapter") or _fee_series_adapter_name(str(getattr(row_req, "protocol", "") or "")))
             collected_reason = str(one.get("collected_reason") or "").strip().lower() or "unknown"
             estimated_reason = str(one.get("estimated_reason") or "").strip().lower() or "unknown"
             items = _norm_fee_items(one.get("items") if isinstance(one.get("items"), list) else [])
@@ -22612,6 +22782,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     collected_items = items
             _inc_counter(mode_counts, mode or "unknown")
             _inc_counter(pricing_counts, str(one.get("fee_pricing") or ""))
+            _inc_counter(adapter_counts, adapter)
             _inc_counter(collected_reason_counts, collected_reason)
             _inc_counter(estimated_reason_counts, estimated_reason)
             agg_collected.extend(collected_items)
@@ -22630,9 +22801,11 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
             per_row_elapsed_ms.append(int(elapsed_ms))
             out_rows.append(
                 {
-                    "index": int(idx),
+                    "index": int(src_idx),
+                    "source_index": int(src_idx),
                     "ok": True,
                     "mode": mode or "unknown",
+                    "adapter": adapter,
                     "fee_pricing": str(one.get("fee_pricing") or ""),
                     "collected_reason": collected_reason,
                     "estimated_reason": estimated_reason,
@@ -22652,7 +22825,8 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                 error_top.append(str(e.detail)[:220])
             out_rows.append(
                 {
-                    "index": int(idx),
+                    "index": int(src_idx),
+                    "source_index": int(src_idx),
                     "ok": False,
                     "error": str(e.detail),
                     "status_code": int(e.status_code),
@@ -22670,7 +22844,8 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                 error_top.append(str(e)[:220])
             out_rows.append(
                 {
-                    "index": int(idx),
+                    "index": int(src_idx),
+                    "source_index": int(src_idx),
                     "ok": False,
                     "error": str(e)[:220],
                     "status_code": 500,
@@ -22685,7 +22860,8 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     out: dict[str, Any] = {
         "ok": True,
         "requested_rows": int(len(rows_in)),
-        "processed_rows": int(len(rows_work)),
+        "processed_rows": int(len(prepared_rows)),
+        "dedup_rows": int(max(0, len(rows_in[:lim]) - len(prepared_rows))),
         "rows_ok": int(ok_n),
         "rows_failed": int(fail_n),
         "rows": out_rows,
@@ -22703,8 +22879,12 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
             "request_max_rows": int(lim),
             "include_row_debug": bool(include_row_debug),
             "rows_in": int(len(rows_in)),
-            "rows_work": int(len(rows_work)),
+            "rows_work": int(len(prepared_rows)),
+            "rows_input_capped": int(len(rows_in[:lim])),
+            "rows_dedup_dropped": int(prep_debug.get("duplicates_dropped") or 0),
             "mode_counts": mode_counts,
+            "adapter_counts": adapter_counts,
+            "adapter_counts_input": (prep_debug.get("adapter_counts_input") if isinstance(prep_debug.get("adapter_counts_input"), dict) else {}),
             "fee_pricing_counts": pricing_counts,
             "collected_reason_counts": collected_reason_counts,
             "estimated_reason_counts": estimated_reason_counts,
