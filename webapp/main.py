@@ -15444,6 +15444,9 @@ class PositionPoolSeriesRequest(BaseModel):
     token1_id: str = ""
     token0_symbol: str = ""
     token1_symbol: str = ""
+    # Current unclaimed fees from table row (best-effort final fallback when history sources are empty).
+    fees_owed0: float = 0.0
+    fees_owed1: float = 0.0
     # When true, NPM Collect log series uses CoinGecko historical prices at each event (stables $1).
     fee_usd_historical: bool = False
 
@@ -17411,6 +17414,34 @@ def _render_positions_page() -> str:
       const debugEl = document.getElementById("posFeeDebug");
       if (!chartEl) return;
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
+      async function postFeeSeriesWithRetry(payload, maxAttempts = 3) {
+        let lastRes = null;
+        let lastData = {};
+        let lastErr = null;
+        const attempts = Math.max(1, Number(maxAttempts) || 1);
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+          try {
+            const res = await fetch("/api/positions/position-fee-series", {
+              method: "POST",
+              headers: {"Content-Type":"application/json"},
+              body: JSON.stringify(payload),
+            });
+            const data = await res.json().catch(() => ({}));
+            lastRes = res;
+            lastData = data;
+            if (res.ok) return {res, data};
+            const shouldRetry = res.status >= 500 && attempt < attempts;
+            if (!shouldRetry) return {res, data};
+          } catch (e) {
+            lastErr = e;
+            if (attempt >= attempts) break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
+        }
+        if (lastRes) return {res: lastRes, data: lastData};
+        const msg = String(lastErr?.message || "network error");
+        return {res: {ok: false, status: 0}, data: {detail: msg}};
+      }
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
         setPosFeeStatus("Select at least one History checkbox in the Scan table", true);
@@ -17464,14 +17495,11 @@ def _render_positions_page() -> str:
             token1_id: row.token1_id || "",
             token0_symbol: row.position_symbol0 || "",
             token1_symbol: row.position_symbol1 || "",
+            fees_owed0: Number(row.fees_owed0 || 0),
+            fees_owed1: Number(row.fees_owed1 || 0),
             fee_usd_historical: histUsd,
           };
-          const res = await fetch("/api/positions/position-fee-series", {
-            method: "POST",
-            headers: {"Content-Type":"application/json"},
-            body: JSON.stringify(payload),
-          });
-          const data = await res.json().catch(() => ({}));
+          const {res, data} = await postFeeSeriesWithRetry(payload, 3);
           if (data && data.debug && backendHints.length < 5) {
             const d = data.debug || {};
             const mode = String(d.result_mode || data.mode || "");
@@ -21495,10 +21523,16 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     token0 = str(req.token0_id or "").strip().lower()
     token1 = str(req.token1_id or "").strip().lower()
-    if not _is_eth_address(token0):
-        token0 = _token_addr_by_symbol_for_chain(chain_key, str(getattr(req, "token0_symbol", "") or ""))
-    if not _is_eth_address(token1):
-        token1 = _token_addr_by_symbol_for_chain(chain_key, str(getattr(req, "token1_symbol", "") or ""))
+    try:
+        if not _is_eth_address(token0):
+            token0 = _token_addr_by_symbol_for_chain(chain_key, str(getattr(req, "token0_symbol", "") or ""))
+    except Exception:
+        token0 = ""
+    try:
+        if not _is_eth_address(token1):
+            token1 = _token_addr_by_symbol_for_chain(chain_key, str(getattr(req, "token1_symbol", "") or ""))
+    except Exception:
+        token1 = ""
     want_hist_usd = bool(getattr(req, "fee_usd_historical", False))
     endpoint = get_graph_endpoint(chain_key, version=version)
     debug["token0_resolved"] = bool(_is_eth_address(token0))
@@ -21605,6 +21639,44 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "fee_pricing": "subgraph_snapshot",
             "note": low_note,
         })
+
+    # Final best-effort fallback: current row unclaimed fees (single point, spot USD).
+    owed0 = max(0.0, _safe_float(getattr(req, "fees_owed0", 0.0)))
+    owed1 = max(0.0, _safe_float(getattr(req, "fees_owed1", 0.0)))
+    debug["row_fees_owed0"] = float(owed0)
+    debug["row_fees_owed1"] = float(owed1)
+    if owed0 > 0.0 or owed1 > 0.0:
+        p0 = 0.0
+        p1 = 0.0
+        try:
+            tks = [x for x in [token0, token1] if _is_eth_address(x)]
+            pmap = _get_token_prices_usd(int(chain_id), tks) if tks else {}
+            p0 = _safe_float(pmap.get(str(token0 or "").strip().lower()))
+            p1 = _safe_float(pmap.get(str(token1 or "").strip().lower()))
+        except Exception:
+            p0 = 0.0
+            p1 = 0.0
+        if p0 <= 0:
+            p0 = _safe_float(_major_or_stable_price_by_symbol(str(getattr(req, "token0_symbol", "") or "")))
+        if p1 <= 0:
+            p1 = _safe_float(_major_or_stable_price_by_symbol(str(getattr(req, "token1_symbol", "") or "")))
+        usd_now = 0.0
+        if owed0 > 0 and p0 > 0:
+            usd_now += float(owed0) * float(p0)
+        if owed1 > 0 and p1 > 0:
+            usd_now += float(owed1) * float(p1)
+        debug["row_fees_spot_usd"] = float(usd_now)
+        if usd_now > 0:
+            day_ts = (int(now_ts) // 86400) * 86400
+            debug["result_mode"] = "row-unclaimed-fallback"
+            debug["result_count"] = 1
+            return _with_debug({
+                "items": [{"ts": int(day_ts), "fees_usd": float(usd_now)}],
+                "count": 1,
+                "mode": "row-unclaimed-fallback",
+                "fee_pricing": "spot_row_unclaimed",
+                "note": "Fallback: current row unclaimed fees marked to spot USD (single point).",
+            })
 
     debug["result_mode"] = "unavailable"
     debug["result_count"] = 0
