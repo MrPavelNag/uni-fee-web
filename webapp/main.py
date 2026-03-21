@@ -16716,12 +16716,14 @@ def _render_positions_page() -> str:
       renderPools(posCache.pools || []);
     }
     function toggleActiveSortByColumn(key) {
+      if (isPosSortLocked()) return;
       setActiveSortMode(toggleSortModeByColumn(getActiveSortMode(), key, "address"));
     }
     function getClosedSortMode() {
       try { return normalizeClosedSortMode(localStorage.getItem(POS_CLOSED_SORT_KEY) || "address_asc"); } catch (_) { return "address_asc"; }
     }
     function toggleClosedSortByColumn(key) {
+      if (isPosSortLocked()) return;
       setClosedSortMode(toggleSortModeByColumn(getClosedSortMode(), key, "address"));
     }
     function getHeavyActiveSortMode() {
@@ -16732,6 +16734,7 @@ def _render_positions_page() -> str:
       renderHeavyPools(posHeavyCache.pools || []);
     }
     function toggleHeavyActiveSortByColumn(key) {
+      if (isHeavySortLocked()) return;
       setHeavyActiveSortMode(toggleSortModeByColumn(getHeavyActiveSortMode(), key, "address"));
     }
     function getHeavyClosedSortMode() {
@@ -16746,6 +16749,7 @@ def _render_positions_page() -> str:
       renderHeavyPools(posHeavyCache.pools || []);
     }
     function toggleHeavyClosedSortByColumn(key) {
+      if (isHeavySortLocked()) return;
       setHeavyClosedSortMode(toggleSortModeByColumn(getHeavyClosedSortMode(), key, "address"));
     }
     function switchPosPoolsTab(name, silent) {
@@ -16770,7 +16774,7 @@ def _render_positions_page() -> str:
         if (!el) continue;
         el.style.display = k === tab ? "block" : "none";
       }
-      if (clSortBar) clSortBar.style.display = (tab === "closed" && !posScanInProgress) ? "" : "none";
+      if (clSortBar) clSortBar.style.display = (tab === "closed" && !isPosSortLocked()) ? "" : "none";
       document.querySelectorAll("#posPoolsTabBar [data-pos-tab]").forEach((b) => {
         const t = b.getAttribute("data-pos-tab") || "";
         b.classList.toggle("active", t === tab);
@@ -16813,7 +16817,7 @@ def _render_positions_page() -> str:
         if (!el) continue;
         el.style.display = k === tab ? "block" : "none";
       }
-      if (hClSortBar) hClSortBar.style.display = (tab === "closed" && !posHeavyScanInProgress) ? "" : "none";
+      if (hClSortBar) hClSortBar.style.display = (tab === "closed" && !isHeavySortLocked()) ? "" : "none";
       document.querySelectorAll("#posHeavyPoolsTabBar [data-pos-heavy-tab]").forEach((b) => {
         const t = b.getAttribute("data-pos-heavy-tab") || "";
         b.classList.toggle("active", t === tab);
@@ -16845,6 +16849,12 @@ def _render_positions_page() -> str:
     let posFinalActiveSec = 0;
     let posFinalClosedCount = 0;
     let posFinalClosedSec = 0;
+    function isPosSortLocked() {
+      return !!(posScanInProgress || posClosedBgEnrichInFlight);
+    }
+    function isHeavySortLocked() {
+      return !!posHeavyScanInProgress;
+    }
     function countActiveRows(rows) {
       const list = rows || [];
       const trustedSpamKeys = getTrustedSpamKeys();
@@ -17133,6 +17143,12 @@ def _render_positions_page() -> str:
       if (scanBtn) scanBtn.disabled = !!flag;
       if (flag) setPosProgressBar("posProgress", 0, true);
       else setPosProgressBar("posProgress", 0, false);
+      const mainTbl = document.getElementById("posPoolsTable");
+      const closedTbl = document.getElementById("posPoolsClosedTable");
+      const clSortBar = document.getElementById("posPoolsClosedSortBar");
+      if (mainTbl) mainTbl.classList.toggle("pos-sort-disabled", isPosSortLocked());
+      if (closedTbl) closedTbl.classList.toggle("pos-sort-disabled", isPosSortLocked());
+      if (clSortBar && isPosSortLocked()) clSortBar.style.display = "none";
       if (prev && !posScanInProgress) {
         // Re-apply user-selected sort once scan fully stops.
         renderPools(posCache.pools || []);
@@ -17158,6 +17174,12 @@ def _render_positions_page() -> str:
       if (scanBtn) scanBtn.disabled = !!flag;
       if (flag) setPosProgressBar("posHeavyProgress", 0, true);
       else setPosProgressBar("posHeavyProgress", 0, false);
+      const mainTbl = document.getElementById("posHeavyPoolsTable");
+      const closedTbl = document.getElementById("posHeavyPoolsClosedTable");
+      const hClSortBar = document.getElementById("posHeavyClosedSortBar");
+      if (mainTbl) mainTbl.classList.toggle("pos-sort-disabled", isHeavySortLocked());
+      if (closedTbl) closedTbl.classList.toggle("pos-sort-disabled", isHeavySortLocked());
+      if (hClSortBar && isHeavySortLocked()) hClSortBar.style.display = "none";
       if (prev && !posHeavyScanInProgress) {
         // Re-apply user-selected sort once scan fully stops.
         renderHeavyPools(posHeavyCache.pools || []);
@@ -18023,7 +18045,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const totalCols = 13;
-      const activeSortMode = posScanInProgress ? "none" : getActiveSortMode();
+      const activeSortMode = isPosSortLocked() ? "none" : getActiveSortMode();
       let html = `<tr><th onclick="toggleActiveSortByColumn('address')" style="cursor:pointer" title="Sort by Address">Address${sortArrowFor(activeSortMode, "address")}</th><th onclick="toggleActiveSortByColumn('position_id')" style="cursor:pointer" title="Sort by Position ID">Position ID${sortArrowFor(activeSortMode, "position_id")}</th><th onclick="toggleActiveSortByColumn('chain')" style="cursor:pointer" title="Sort by Chain">Chain${sortArrowFor(activeSortMode, "chain")}</th><th onclick="toggleActiveSortByColumn('protocol')" style="cursor:pointer" title="Sort by Protocol">Protocol${sortArrowFor(activeSortMode, "protocol")}</th><th onclick="toggleActiveSortByColumn('pair')" style="cursor:pointer" title="Sort by Pair">Pair${sortArrowFor(activeSortMode, "pair")}</th><th onclick="toggleActiveSortByColumn('fee_tier')" style="cursor:pointer" title="Sort by Fee tier">Fee tier${sortArrowFor(activeSortMode, "fee_tier")}</th><th onclick="toggleActiveSortByColumn('created')" style="white-space:nowrap;cursor:pointer" title="Position mint or first-seen date">Created${sortArrowFor(activeSortMode, "created")}</th><th onclick="toggleActiveSortByColumn('status')" style="cursor:pointer" title="Sort by status">St.${sortArrowFor(activeSortMode, "status")}</th><th>Hide</th><th onclick="toggleActiveSortByColumn('in_position')" style="cursor:pointer" title='Sort by In position'>In position${sortArrowFor(activeSortMode, "in_position")}</th><th onclick="toggleActiveSortByColumn('liquidity')" style="cursor:pointer" title='Calculated from In position amounts and external token prices. Click to sort'>Liquidity${sortArrowFor(activeSortMode, "liquidity")}</th><th onclick="toggleActiveSortByColumn('fees_owed')" style="cursor:pointer" title='Sort by Unclaimed fees'>Unclaimed fees${sortArrowFor(activeSortMode, "fees_owed")}</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       const listAll = rows || [];
       const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
@@ -18194,7 +18216,7 @@ def _render_positions_page() -> str:
       if (!protocolRows.length) {
         protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate (collection name/symbol must suggest Uniswap or Pancake before on-chain PM work).</td></tr>`;
       }
-      const closedSortMode = posScanInProgress ? "none" : getClosedSortMode();
+      const closedSortMode = isPosSortLocked() ? "none" : getClosedSortMode();
       const closedRowsSorted = sortRowsByMode(closedTabRows, closedSortMode);
       let closedHtml = `<tr><th onclick="toggleClosedSortByColumn('address')" style="cursor:pointer" title="Sort by Address">Address${sortArrowFor(closedSortMode, "address")}</th><th onclick="toggleClosedSortByColumn('position_id')" style="cursor:pointer" title="Sort by Position ID">Position ID${sortArrowFor(closedSortMode, "position_id")}</th><th onclick="toggleClosedSortByColumn('chain')" style="cursor:pointer" title="Sort by Chain">Chain${sortArrowFor(closedSortMode, "chain")}</th><th onclick="toggleClosedSortByColumn('protocol')" style="cursor:pointer" title="Sort by Protocol">Protocol${sortArrowFor(closedSortMode, "protocol")}</th><th onclick="toggleClosedSortByColumn('pair')" style="cursor:pointer" title="Sort by Pair">Pair${sortArrowFor(closedSortMode, "pair")}</th><th onclick="toggleClosedSortByColumn('fee_tier')" style="cursor:pointer" title="Sort by Fee tier">Fee tier${sortArrowFor(closedSortMode, "fee_tier")}</th><th onclick="toggleClosedSortByColumn('created')" style="white-space:nowrap;cursor:pointer" title="Position mint or first-seen date">Created${sortArrowFor(closedSortMode, "created")}</th><th onclick="toggleClosedSortByColumn('status')" style="cursor:pointer" title="Sort by status">St.${sortArrowFor(closedSortMode, "status")}</th><th>Hide</th><th onclick="toggleClosedSortByColumn('in_position')" style="cursor:pointer" title='Sort by In position'>In position${sortArrowFor(closedSortMode, "in_position")}</th><th onclick="toggleClosedSortByColumn('liquidity')" style="cursor:pointer" title='Calculated from In position amounts and external token prices. Click to sort'>Liquidity${sortArrowFor(closedSortMode, "liquidity")}</th><th onclick="toggleClosedSortByColumn('fees_owed')" style="cursor:pointer" title='Sort by Unclaimed fees'>Unclaimed fees${sortArrowFor(closedSortMode, "fees_owed")}</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let ci = 0; ci < closedRowsSorted.length; ci++) {
@@ -18277,7 +18299,7 @@ def _render_positions_page() -> str:
       if (clTable) clTable.innerHTML = closedHtml;
       const clSortBar = document.getElementById("posPoolsClosedSortBar");
       const clSortSel = document.getElementById("posClosedSortSelect");
-      if (clSortBar) clSortBar.style.display = (closedTabRows.length && !posScanInProgress) ? "" : "none";
+      if (clSortBar) clSortBar.style.display = (closedTabRows.length && !isPosSortLocked()) ? "" : "none";
       if (clSortSel) {
         const hasMode = Array.from(clSortSel.options || []).some((o) => String(o.value || "") === closedSortMode);
         if (hasMode) clSortSel.value = closedSortMode;
@@ -18288,8 +18310,8 @@ def _render_positions_page() -> str:
       if (otTable) otTable.innerHTML = otHtml;
       const hidTable = document.getElementById("posPoolsHiddenTable");
       if (hidTable) hidTable.innerHTML = hiddenHtml;
-      if (table) table.classList.toggle("pos-sort-disabled", !!posScanInProgress);
-      if (clTable) clTable.classList.toggle("pos-sort-disabled", !!posScanInProgress);
+      if (table) table.classList.toggle("pos-sort-disabled", isPosSortLocked());
+      if (clTable) clTable.classList.toggle("pos-sort-disabled", isPosSortLocked());
       const tabBar = document.getElementById("posPoolsTabBar");
       const cntMainEl = document.getElementById("posMainTabCount");
       const cntPrEl = document.getElementById("posProtocolTabCount");
@@ -18505,7 +18527,7 @@ def _render_positions_page() -> str:
         const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
         return Boolean(r && (r.suspected_spam || r.spam_skipped || ph));
       }
-      const heavyActiveSortMode = posHeavyScanInProgress ? "none" : getHeavyActiveSortMode();
+      const heavyActiveSortMode = isHeavySortLocked() ? "none" : getHeavyActiveSortMode();
       let html = `<tr><th onclick="toggleHeavyActiveSortByColumn('address')" style="cursor:pointer" title="Sort by Address">Address${sortArrowFor(heavyActiveSortMode, "address")}</th><th onclick="toggleHeavyActiveSortByColumn('position_id')" style="cursor:pointer" title="Sort by Position ID">Position ID${sortArrowFor(heavyActiveSortMode, "position_id")}</th><th onclick="toggleHeavyActiveSortByColumn('chain')" style="cursor:pointer" title="Sort by Chain">Chain${sortArrowFor(heavyActiveSortMode, "chain")}</th><th onclick="toggleHeavyActiveSortByColumn('protocol')" style="cursor:pointer" title="Sort by Protocol">Protocol${sortArrowFor(heavyActiveSortMode, "protocol")}</th><th onclick="toggleHeavyActiveSortByColumn('pair')" style="cursor:pointer" title="Sort by Pair">Pair${sortArrowFor(heavyActiveSortMode, "pair")}</th><th onclick="toggleHeavyActiveSortByColumn('fee_tier')" style="cursor:pointer" title="Sort by Fee tier">Fee tier${sortArrowFor(heavyActiveSortMode, "fee_tier")}</th><th onclick="toggleHeavyActiveSortByColumn('created')" style="white-space:nowrap;cursor:pointer" title="Position mint or first-seen date">Created${sortArrowFor(heavyActiveSortMode, "created")}</th><th onclick="toggleHeavyActiveSortByColumn('status')" style="cursor:pointer" title="Sort by status">St.${sortArrowFor(heavyActiveSortMode, "status")}</th><th>Hide</th><th onclick="toggleHeavyActiveSortByColumn('in_position')" style="cursor:pointer" title='Sort by In position'>In position${sortArrowFor(heavyActiveSortMode, "in_position")}</th><th onclick="toggleHeavyActiveSortByColumn('liquidity')" style="cursor:pointer" title='Calculated from In position amounts and external token prices. Click to sort'>Liquidity${sortArrowFor(heavyActiveSortMode, "liquidity")}</th><th onclick="toggleHeavyActiveSortByColumn('fees_owed')" style="cursor:pointer" title='Sort by Unclaimed fees'>Unclaimed fees${sortArrowFor(heavyActiveSortMode, "fees_owed")}</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       if (!listAll.length) {
         html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.</td></tr>`;
@@ -18628,7 +18650,7 @@ def _render_positions_page() -> str:
         protHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('h', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!protocolRows.length) protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate.</td></tr>`;
-      const heavyClosedSortMode = posHeavyScanInProgress ? "none" : getHeavyClosedSortMode();
+      const heavyClosedSortMode = isHeavySortLocked() ? "none" : getHeavyClosedSortMode();
       const heavyClosedRowsSorted = sortRowsByMode(closedTabRows, heavyClosedSortMode);
       let closedHtml = `<tr><th onclick="toggleHeavyClosedSortByColumn('address')" style="cursor:pointer" title="Sort by Address">Address${sortArrowFor(heavyClosedSortMode, "address")}</th><th onclick="toggleHeavyClosedSortByColumn('position_id')" style="cursor:pointer" title="Sort by Position ID">Position ID${sortArrowFor(heavyClosedSortMode, "position_id")}</th><th onclick="toggleHeavyClosedSortByColumn('chain')" style="cursor:pointer" title="Sort by Chain">Chain${sortArrowFor(heavyClosedSortMode, "chain")}</th><th onclick="toggleHeavyClosedSortByColumn('protocol')" style="cursor:pointer" title="Sort by Protocol">Protocol${sortArrowFor(heavyClosedSortMode, "protocol")}</th><th onclick="toggleHeavyClosedSortByColumn('pair')" style="cursor:pointer" title="Sort by Pair">Pair${sortArrowFor(heavyClosedSortMode, "pair")}</th><th onclick="toggleHeavyClosedSortByColumn('fee_tier')" style="cursor:pointer" title="Sort by Fee tier">Fee tier${sortArrowFor(heavyClosedSortMode, "fee_tier")}</th><th onclick="toggleHeavyClosedSortByColumn('created')" style="white-space:nowrap;cursor:pointer" title="Position mint or first-seen date">Created${sortArrowFor(heavyClosedSortMode, "created")}</th><th onclick="toggleHeavyClosedSortByColumn('status')" style="cursor:pointer" title="Sort by status">St.${sortArrowFor(heavyClosedSortMode, "status")}</th><th>Hide</th><th onclick="toggleHeavyClosedSortByColumn('in_position')" style="cursor:pointer" title='Sort by In position'>In position${sortArrowFor(heavyClosedSortMode, "in_position")}</th><th onclick="toggleHeavyClosedSortByColumn('liquidity')" style="cursor:pointer" title='Calculated from In position amounts and external token prices. Click to sort'>Liquidity${sortArrowFor(heavyClosedSortMode, "liquidity")}</th><th onclick="toggleHeavyClosedSortByColumn('fees_owed')" style="cursor:pointer" title='Sort by Unclaimed fees'>Unclaimed fees${sortArrowFor(heavyClosedSortMode, "fees_owed")}</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let ci = 0; ci < heavyClosedRowsSorted.length; ci++) {
@@ -18743,7 +18765,7 @@ def _render_positions_page() -> str:
       if (clTable) clTable.innerHTML = closedHtml;
       const hClSortBar = document.getElementById("posHeavyClosedSortBar");
       const hClSortSel = document.getElementById("posHeavyClosedSortSelect");
-      if (hClSortBar) hClSortBar.style.display = (closedTabRows.length && !posHeavyScanInProgress) ? "" : "none";
+      if (hClSortBar) hClSortBar.style.display = (closedTabRows.length && !isHeavySortLocked()) ? "" : "none";
       if (hClSortSel) {
         const hasMode = Array.from(hClSortSel.options || []).some((o) => String(o.value || "") === heavyClosedSortMode);
         if (hasMode) hClSortSel.value = heavyClosedSortMode;
@@ -18754,8 +18776,8 @@ def _render_positions_page() -> str:
       if (otTable) otTable.innerHTML = otHtml;
       const hidTable = document.getElementById("posHeavyPoolsHiddenTable");
       if (hidTable) hidTable.innerHTML = hiddenHtml;
-      if (table) table.classList.toggle("pos-sort-disabled", !!posHeavyScanInProgress);
-      if (clTable) clTable.classList.toggle("pos-sort-disabled", !!posHeavyScanInProgress);
+      if (table) table.classList.toggle("pos-sort-disabled", isHeavySortLocked());
+      if (clTable) clTable.classList.toggle("pos-sort-disabled", isHeavySortLocked());
       const tabBar = document.getElementById("posHeavyPoolsTabBar");
       const cntMainEl = document.getElementById("posHeavyMainTabCount");
       const cntPrEl = document.getElementById("posHeavyProtocolTabCount");
