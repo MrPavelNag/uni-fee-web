@@ -24,7 +24,7 @@ import time
 import uuid
 import shutil
 from queue import Empty, Queue
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, wait
 from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15520,6 +15520,7 @@ def _normalize_positions_series_protocol(raw: str, *, for_fees: bool = False) ->
 
 class PositionsRowEnrichRequest(BaseModel):
     row: dict[str, Any] = Field(default_factory=dict)
+    include_created_date: bool = True
 
 
 def _format_position_liquidity_scalar_compact(liq_raw: int) -> str:
@@ -16502,17 +16503,6 @@ def _render_positions_page() -> str:
           <div class="table-wrap" id="posPoolsTableMainWrap"><table id="posPoolsTable"></table></div>
           <div class="table-wrap" id="posPoolsTableSpamWrap" style="display:none"><table id="posPoolsSpamTable"></table></div>
           <div class="table-wrap" id="posPoolsTableProtocolWrap" style="display:none"><table id="posPoolsProtocolTable"></table></div>
-          <div id="posPoolsClosedSortBar" class="info-box" style="display:none; margin-bottom:6px; padding:6px 8px;">
-            <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#334155;">
-              <span>Closed sort:</span>
-              <select id="posClosedSortSelect" onchange="setClosedSortMode(this.value)" style="font-size:12px;padding:3px 6px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;">
-                <option value="address_asc">Address A→Z</option>
-                <option value="address_desc">Address Z→A</option>
-                <option value="pair_asc">Pair A→Z</option>
-                <option value="pair_desc">Pair Z→A</option>
-              </select>
-            </label>
-          </div>
           <div class="table-wrap" id="posPoolsTableClosedWrap" style="display:none"><table id="posPoolsClosedTable"></table></div>
           <div class="table-wrap" id="posPoolsTableOtherWrap" style="display:none"><table id="posPoolsOtherTable"></table></div>
           <div class="table-wrap" id="posPoolsTableHiddenWrap" style="display:none"><table id="posPoolsHiddenTable"></table></div>
@@ -16541,17 +16531,6 @@ def _render_positions_page() -> str:
           <div class="table-wrap" id="posHeavyPoolsTableMainWrap"><table id="posHeavyPoolsTable"></table></div>
           <div class="table-wrap" id="posHeavyPoolsTableSpamWrap" style="display:none"><table id="posHeavyPoolsSpamTable"></table></div>
           <div class="table-wrap" id="posHeavyPoolsTableProtocolWrap" style="display:none"><table id="posHeavyPoolsProtocolTable"></table></div>
-          <div id="posHeavyClosedSortBar" class="info-box" style="display:none; margin-bottom:6px; padding:6px 8px;">
-            <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#334155;">
-              <span>Closed sort:</span>
-              <select id="posHeavyClosedSortSelect" onchange="setHeavyClosedSortMode(this.value)" style="font-size:12px;padding:3px 6px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;">
-                <option value="address_asc">Address A→Z</option>
-                <option value="address_desc">Address Z→A</option>
-                <option value="pair_asc">Pair A→Z</option>
-                <option value="pair_desc">Pair Z→A</option>
-              </select>
-            </label>
-          </div>
           <div class="table-wrap" id="posHeavyPoolsTableClosedWrap" style="display:none"><table id="posHeavyPoolsClosedTable"></table></div>
           <div class="table-wrap" id="posHeavyPoolsTableOtherWrap" style="display:none"><table id="posHeavyPoolsOtherTable"></table></div>
           <div class="table-wrap" id="posHeavyPoolsTableHiddenWrap" style="display:none"><table id="posHeavyPoolsHiddenTable"></table></div>
@@ -16852,7 +16831,6 @@ def _render_positions_page() -> str:
       const spW = document.getElementById("posPoolsTableSpamWrap");
       const otW = document.getElementById("posPoolsTableOtherWrap");
       const hidW = document.getElementById("posPoolsTableHiddenWrap");
-      const clSortBar = document.getElementById("posPoolsClosedSortBar");
       if (!mainW) return;
       const tab = normalizePosPoolsTabKey(name);
       const wraps = [
@@ -16867,7 +16845,6 @@ def _render_positions_page() -> str:
         if (!el) continue;
         el.style.display = k === tab ? "block" : "none";
       }
-      if (clSortBar) clSortBar.style.display = (tab === "closed" && !isPosSortLocked()) ? "" : "none";
       document.querySelectorAll("#posPoolsTabBar [data-pos-tab]").forEach((b) => {
         const t = b.getAttribute("data-pos-tab") || "";
         b.classList.toggle("active", t === tab);
@@ -16895,7 +16872,6 @@ def _render_positions_page() -> str:
       const spW = document.getElementById("posHeavyPoolsTableSpamWrap");
       const otW = document.getElementById("posHeavyPoolsTableOtherWrap");
       const hidW = document.getElementById("posHeavyPoolsTableHiddenWrap");
-      const hClSortBar = document.getElementById("posHeavyClosedSortBar");
       if (!mainW) return;
       const tab = normalizePosHeavyPoolsTabKey(name);
       const wraps = [
@@ -16910,7 +16886,6 @@ def _render_positions_page() -> str:
         if (!el) continue;
         el.style.display = k === tab ? "block" : "none";
       }
-      if (hClSortBar) hClSortBar.style.display = (tab === "closed" && !isHeavySortLocked()) ? "" : "none";
       document.querySelectorAll("#posHeavyPoolsTabBar [data-pos-heavy-tab]").forEach((b) => {
         const t = b.getAttribute("data-pos-heavy-tab") || "";
         b.classList.toggle("active", t === tab);
@@ -17238,10 +17213,8 @@ def _render_positions_page() -> str:
       else setPosProgressBar("posProgress", 0, false);
       const mainTbl = document.getElementById("posPoolsTable");
       const closedTbl = document.getElementById("posPoolsClosedTable");
-      const clSortBar = document.getElementById("posPoolsClosedSortBar");
       if (mainTbl) mainTbl.classList.toggle("pos-sort-disabled", isPosSortLocked());
       if (closedTbl) closedTbl.classList.toggle("pos-sort-disabled", isPosSortLocked());
-      if (clSortBar && isPosSortLocked()) clSortBar.style.display = "none";
       if (prev && !posScanInProgress) {
         // Re-apply user-selected sort once scan fully stops.
         renderPools(posCache.pools || []);
@@ -17269,10 +17242,8 @@ def _render_positions_page() -> str:
       else setPosProgressBar("posHeavyProgress", 0, false);
       const mainTbl = document.getElementById("posHeavyPoolsTable");
       const closedTbl = document.getElementById("posHeavyPoolsClosedTable");
-      const hClSortBar = document.getElementById("posHeavyClosedSortBar");
       if (mainTbl) mainTbl.classList.toggle("pos-sort-disabled", isHeavySortLocked());
       if (closedTbl) closedTbl.classList.toggle("pos-sort-disabled", isHeavySortLocked());
-      if (hClSortBar && isHeavySortLocked()) hClSortBar.style.display = "none";
       if (prev && !posHeavyScanInProgress) {
         // Re-apply user-selected sort once scan fully stops.
         renderHeavyPools(posHeavyCache.pools || []);
@@ -18419,13 +18390,6 @@ def _render_positions_page() -> str:
       if (prTable) prTable.innerHTML = protHtml;
       const clTable = document.getElementById("posPoolsClosedTable");
       if (clTable) clTable.innerHTML = closedHtml;
-      const clSortBar = document.getElementById("posPoolsClosedSortBar");
-      const clSortSel = document.getElementById("posClosedSortSelect");
-      if (clSortBar) clSortBar.style.display = (closedTabRows.length && !isPosSortLocked()) ? "" : "none";
-      if (clSortSel) {
-        const hasMode = Array.from(clSortSel.options || []).some((o) => String(o.value || "") === closedSortMode);
-        if (hasMode) clSortSel.value = closedSortMode;
-      }
       const spTable = document.getElementById("posPoolsSpamTable");
       if (spTable) spTable.innerHTML = spamHtml;
       const otTable = document.getElementById("posPoolsOtherTable");
@@ -18885,13 +18849,6 @@ def _render_positions_page() -> str:
       if (prTable) prTable.innerHTML = protHtml;
       const clTable = document.getElementById("posHeavyPoolsClosedTable");
       if (clTable) clTable.innerHTML = closedHtml;
-      const hClSortBar = document.getElementById("posHeavyClosedSortBar");
-      const hClSortSel = document.getElementById("posHeavyClosedSortSelect");
-      if (hClSortBar) hClSortBar.style.display = (closedTabRows.length && !isHeavySortLocked()) ? "" : "none";
-      if (hClSortSel) {
-        const hasMode = Array.from(hClSortSel.options || []).some((o) => String(o.value || "") === heavyClosedSortMode);
-        if (hasMode) hClSortSel.value = heavyClosedSortMode;
-      }
       const spTable = document.getElementById("posHeavyPoolsSpamTable");
       if (spTable) spTable.innerHTML = spamHtml;
       const otTable = document.getElementById("posHeavyPoolsOtherTable");
@@ -19099,7 +19056,7 @@ def _render_positions_page() -> str:
       const wallBudgetMs = 5 * 60 * 1000;
       const rowReqTimeoutMs = 12000;
       const workersN = Math.min(4, Math.max(1, Math.floor((navigator?.hardwareConcurrency || 4) / 2)));
-      async function workerLoop(workerId) {
+      async function workerLoop() {
         while (true) {
           if ((Date.now() - startedAt) >= wallBudgetMs) return;
           const idxPos = processed;
@@ -19115,7 +19072,8 @@ def _render_positions_page() -> str:
             const res = await fetch("/api/positions/row/enrich", {
               method: "POST",
               headers: {"Content-Type":"application/json"},
-              body: JSON.stringify({row: cur}),
+              // Keep background enrich lightweight; Created date has its own dedicated pass.
+              body: JSON.stringify({row: cur, include_created_date: false}),
               signal: ctrl.signal,
             });
             const data = await res.json().catch(() => ({}));
@@ -19137,7 +19095,7 @@ def _render_positions_page() -> str:
           if ((idxPos + 1) % 12 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
         }
       }
-      await Promise.all(Array.from({length: workersN}, (_, i) => workerLoop(i)));
+      await Promise.all(Array.from({length: workersN}, () => workerLoop()));
       posCache.pools = list;
       renderPools(posCache.pools || []);
       try {
@@ -21883,6 +21841,7 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
 @app.post("/api/positions/row/enrich")
 def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     row = dict(req.row or {})
+    include_created_date = bool(getattr(req, "include_created_date", True))
     if bool(row.get("unsupported_protocol")):
         return {"ok": False, "reason": "unsupported_protocol"}
     chain_key = str(row.get("chain") or "").strip().lower()
@@ -21918,15 +21877,16 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     if not isinstance(snap, dict):
         return {"ok": False, "reason": "snapshot_unavailable"}
     updates = _build_row_updates_from_snapshot(row, snap, int(chain_id))
-    # Also enrich Created date for rows shown in Closed/other tabs.
-    try:
-        row_for_date = dict(row)
-        row_for_date["protocol"] = protocol
-        d = _position_creation_date_ymd_for_row(row_for_date)
-        if d:
-            updates["position_created_date"] = d
-    except Exception:
-        pass
+    # Created date can be expensive (RPC/explorer fallbacks), so keep it optional.
+    if include_created_date:
+        try:
+            row_for_date = dict(row)
+            row_for_date["protocol"] = protocol
+            d = _position_creation_date_ymd_for_row(row_for_date)
+            if d:
+                updates["position_created_date"] = d
+        except Exception:
+            pass
     updates["nft_metadata_phishing"] = bool(_row_nft_metadata_phishing_from_explorer(row))
     return {"ok": True, "row_updates": updates}
 
@@ -22038,6 +21998,10 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
 @app.post("/api/positions/position-fee-series")
 def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, Any]:
     """Cumulative fees: subgraph positionSnapshots when reliable; else NPM Collect logs (eth_getLogs)."""
+    started_mono = time.monotonic()
+    total_budget_sec = max(3.0, min(40.0, float(os.environ.get("POSITIONS_FEE_SERIES_BUDGET_SEC", "18"))))
+    subgraph_budget_sec = max(1.0, min(total_budget_sec, float(os.environ.get("POSITIONS_FEE_SUBGRAPH_BUDGET_SEC", "7"))))
+    rpc_budget_sec = max(1.0, min(total_budget_sec, float(os.environ.get("POSITIONS_FEE_RPC_BUDGET_SEC", "8"))))
     chain_key = str(req.chain or "").strip().lower()
     chain_id_hint = int(getattr(req, "chain_id", 0) or 0)
     if not chain_key and chain_id_hint > 0 and chain_id_hint in CHAIN_ID_TO_KEY:
@@ -22065,6 +22029,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         "protocol": protocol,
         "version": version,
         "days": int(days),
+        "budget_total_sec": float(total_budget_sec),
+        "budget_subgraph_sec": float(subgraph_budget_sec),
+        "budget_rpc_sec": float(rpc_budget_sec),
     }
 
     def _with_debug(payload: dict[str, Any]) -> dict[str, Any]:
@@ -22143,6 +22110,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     exact_by_day: dict[int, float] = {}
     if endpoint:
         for pid in position_ids[:20]:
+            if (time.monotonic() - started_mono) >= subgraph_budget_sec:
+                debug["subgraph_cutoff"] = "time_budget"
+                break
             try:
                 series = _fetch_position_fee_series_exact(
                     endpoint,
@@ -22166,15 +22136,30 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         and _is_eth_address(token1)
     ):
         try:
-            rpc_by_day, rpc_meta = _fetch_v3_position_fees_by_collect_logs(
-                chain_id,
-                protocol,
-                position_ids[:20],
-                since_ts=since_ts,
-                token0_addr=token0,
-                token1_addr=token1,
-                use_historical_usd=want_hist_usd,
-            )
+            elapsed = max(0.0, time.monotonic() - started_mono)
+            rem_total = max(0.0, total_budget_sec - elapsed)
+            rpc_timeout = max(0.8, min(rpc_budget_sec, rem_total))
+            if rpc_timeout <= 0.9:
+                debug["rpc_skipped"] = "time_budget"
+            else:
+                ex = ThreadPoolExecutor(max_workers=1)
+                fut = ex.submit(
+                    _fetch_v3_position_fees_by_collect_logs,
+                    chain_id,
+                    protocol,
+                    position_ids[:20],
+                    since_ts=since_ts,
+                    token0_addr=token0,
+                    token1_addr=token1,
+                    use_historical_usd=want_hist_usd,
+                )
+                try:
+                    rpc_by_day, rpc_meta = fut.result(timeout=float(rpc_timeout))
+                except FuturesTimeoutError:
+                    debug["rpc_timeout"] = True
+                    rpc_by_day, rpc_meta = {}, {"pricing": "none", "detail": "RPC fee fallback timed out."}
+                finally:
+                    ex.shutdown(wait=False, cancel_futures=True)
         except Exception:
             rpc_by_day, rpc_meta = {}, {"pricing": "none", "detail": ""}
     debug["rpc_points"] = int(len(rpc_by_day))
