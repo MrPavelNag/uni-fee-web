@@ -18514,7 +18514,7 @@ def _render_positions_page() -> str:
         save("");
         setSt(
           resume
-            ? ((isHeavy ? "Background v4 / Infinity: " : "Background scan: ") + (e?.message || "unknown"))
+            ? ((isHeavy ? "v4 / Infinity: " : "Scan: ") + (e?.message || "unknown"))
             : ((isHeavy ? "v4 / Infinity scan: " : "Scan failed: ") + (e?.message || "unknown")),
           true
         );
@@ -18532,7 +18532,7 @@ def _render_positions_page() -> str:
       }
       setSt(
         resume
-          ? ((isHeavy ? "Background v4 / Infinity: " : "Background scan: ") + (e?.message || "unknown"))
+          ? ((isHeavy ? "v4 / Infinity: " : "Scan: ") + (e?.message || "unknown"))
           : ((isHeavy ? "v4 / Infinity scan: " : "Scan failed: ") + (e?.message || "unknown")),
         true
       );
@@ -18596,7 +18596,7 @@ def _render_positions_page() -> str:
         const s = String(raw || "").trim().toLowerCase();
         if (s.includes("fail")) return "Scan failed";
         if (String(st || "") === "queued") return "Queued";
-        if (partial) return "Finishing in background";
+        if (partial) return "Finishing";
         return "Working…";
       }
       function withFallbackStageLabel(payload, status, stageLabel) {
@@ -19027,7 +19027,7 @@ def _render_positions_page() -> str:
         const data = await pollPosJob(jobId, true, "heavy");
         if (data && data.__partial) {
           handoffToBackground = true;
-          setHeavyStatus("Partial results loaded; enrich continues in background…", false);
+          setHeavyStatus("Partial results loaded; enrich continues…", false);
           setTimeout(() => { resumeHeavyPosJobIfAny(); }, 300);
           return;
         }
@@ -19202,7 +19202,7 @@ def _render_positions_page() -> str:
       posClosedBgEnrichInFlight = true;
       startPosStatusLane("closed");
       try {
-        setPosStatus("Closed positions enrich started in background (~3-5 min)…", false);
+        setPosStatus("Closed positions enrich started (~3-5 min)…", false);
         const out = await runClosedRowsBackgroundEnrich();
         finishPosStatusLane("closed");
         posFinalClosedCount = countClosedRows(posCache.pools || []);
@@ -19215,7 +19215,7 @@ def _render_positions_page() -> str:
         }
       } catch (e) {
         finishPosStatusLane("closed");
-        setPosStatus("Closed positions enrich (background): " + (e?.message || "unknown"), true);
+        setPosStatus("Closed positions enrich: " + (e?.message || "unknown"), true);
       } finally {
         posClosedBgEnrichInFlight = false;
         // Re-apply user sort and remove sort lock after background closed phase.
@@ -19244,7 +19244,7 @@ def _render_positions_page() -> str:
         const data = await pollPosJob(jobId, true, "v3");
         if (data && data.__partial) {
           handoffToBackground = true;
-          setPosStatus("Table updated from server. Background enrich and finalize still running…", false);
+          setPosStatus("Table updated from server. Enrich and finalize still running…", false);
           setTimeout(() => { resumePosJobIfAny(); }, 300);
           return;
         }
@@ -22247,7 +22247,51 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     estimated_reason = "ok_pool_share_daily_fees"
                 elif estimated_reason in {"not_requested", "unknown"}:
                     estimated_reason = "pool_fee_series_empty"
-        debug["estimate_share_source"] = str(share_source)
+        # Second fallback for estimate: derive dynamic daily share from position TVL snapshots.
+        if (not estimated_by_day) and position_ids and endpoint and str(req.pool_id or "").strip():
+            try:
+                pool_fee_days = _fetch_pool_fee_usd_series(chain_key, version, str(req.pool_id or ""), days)
+                pool_tvl_days = _fetch_pool_tvl_series(chain_key, version, str(req.pool_id or ""), days)
+                if pool_fee_days and pool_tvl_days:
+                    pool_tvl_by_day = {int(ts): max(0.0, float(v)) for ts, v in pool_tvl_days}
+                    pos_tvl_by_day: dict[int, float] = {}
+                    for pid in position_ids[:20]:
+                        p_series = _fetch_position_snapshot_series_exact(
+                            endpoint,
+                            pid,
+                            since_ts=since_ts,
+                            chain_id=chain_id,
+                        )
+                        for ts, v in p_series:
+                            dts = (int(ts) // 86400) * 86400
+                            pos_tvl_by_day[dts] = float(pos_tvl_by_day.get(dts, 0.0) + max(0.0, float(v)))
+                    if pos_tvl_by_day:
+                        cum_est = 0.0
+                        used_days = 0
+                        shares: list[float] = []
+                        for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
+                            dts = (int(ts) // 86400) * 86400
+                            p_tvl = max(0.0, float(pos_tvl_by_day.get(dts, 0.0)))
+                            pool_tvl = max(0.0, float(pool_tvl_by_day.get(dts, 0.0)))
+                            if p_tvl <= 0 or pool_tvl <= 0:
+                                continue
+                            s = max(0.0, min(1.0, p_tvl / pool_tvl))
+                            shares.append(float(s))
+                            cum_est += max(0.0, float(fee_usd)) * s
+                            estimated_by_day[dts] = float(cum_est)
+                            used_days += 1
+                        if estimated_by_day:
+                            est_share = float(sum(shares) / len(shares)) if shares else 0.0
+                            estimated_reason = "ok_pool_share_daily_fees_from_position_tvl_snapshots"
+                            debug["estimate_fallback_days_used"] = int(used_days)
+                            debug["estimate_share_source"] = "position_tvl_snapshots_over_pool_tvl"
+                        elif estimated_reason in {"liquidity_share_unavailable", "pool_fee_series_empty", "unknown", "not_requested"}:
+                            estimated_reason = "position_tvl_snapshots_unavailable"
+            except Exception:
+                if estimated_reason in {"liquidity_share_unavailable", "pool_fee_series_empty", "unknown", "not_requested"}:
+                    estimated_reason = "position_tvl_snapshot_fallback_error"
+        if not str(debug.get("estimate_share_source") or "").strip():
+            debug["estimate_share_source"] = str(share_source)
     except Exception:
         estimated_by_day = {}
         est_share = 0.0
