@@ -13607,6 +13607,99 @@ def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int
     return []
 
 
+def _fetch_pool_fee_tier_fraction(endpoint: str, pool_id: str) -> float:
+    pool_lc = str(pool_id or "").strip().lower()
+    if not endpoint or not pool_lc:
+        return 0.0
+    q = """
+    query PoolFeeTier($pool: String!) {
+      pool(id: $pool) { feeTier }
+    }
+    """
+    try:
+        data = graphql_query(endpoint, q, {"pool": pool_lc}, retries=1)
+        raw = str((((data.get("data") or {}).get("pool") or {}).get("feeTier") or "")).strip()
+        if not raw:
+            return 0.0
+        val = float(raw)
+        if not math.isfinite(val) or val <= 0:
+            return 0.0
+        # Uniswap-style feeTier is usually in millionths: 500, 3000, 10000.
+        if val >= 100:
+            return max(0.0, min(1.0, val / 1_000_000.0))
+        # Some sources may already expose a fraction.
+        return max(0.0, min(1.0, val))
+    except Exception:
+        return 0.0
+
+
+def _fetch_pool_fee_usd_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
+    """Daily pool fee USD: feesUSD, or volumeUSD*feeTier fallback when feesUSD is missing."""
+    endpoint = get_graph_endpoint(chain_key, version=version)
+    if not endpoint:
+        return []
+    now_ts = int(time.time())
+    since_ts = now_ts - max(1, int(days)) * 86400
+    vars_base = {"pool": str(pool_id or "").strip().lower(), "since": int(since_ts)}
+    fee_tier = _fetch_pool_fee_tier_fraction(endpoint, str(pool_id or ""))
+    attempts = [
+        """
+        query PoolFeeDays($pool: String!, $since: Int!) {
+          poolDayDatas(
+            first: 400
+            orderBy: date
+            orderDirection: asc
+            where: { pool: $pool, date_gte: $since }
+          ) {
+            date
+            feesUSD
+            volumeUSD
+          }
+        }
+        """,
+        """
+        query PoolFeeDays($pool: String!, $since: Int!) {
+          poolDayDatas(
+            first: 400
+            orderBy: date
+            orderDirection: asc
+            where: { pool: $pool, date_gte: $since }
+          ) {
+            date
+            feeUSD
+            dailyVolumeUSD
+          }
+        }
+        """,
+    ]
+    for q in attempts:
+        try:
+            data = graphql_query(endpoint, q, vars_base, retries=1)
+            rows = (data.get("data") or {}).get("poolDayDatas") or []
+            out: list[tuple[int, float]] = []
+            for r in rows:
+                ts = int(r.get("date") or 0)
+                if ts <= 0:
+                    continue
+                fees = _safe_float(r.get("feesUSD"))
+                if fees <= 0:
+                    fees = _safe_float(r.get("feeUSD"))
+                if fees <= 0:
+                    vol = _safe_float(r.get("volumeUSD"))
+                    if vol <= 0:
+                        vol = _safe_float(r.get("dailyVolumeUSD"))
+                    if vol > 0 and fee_tier > 0:
+                        fees = float(vol) * float(fee_tier)
+                if fees < 0:
+                    continue
+                out.append((ts, max(0.0, float(fees))))
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
+
+
 def _normalize_chain_key_slug(chain_key: str) -> str:
     """Canonical UI/config slug (legacy token: arbitrum-one → arbitrum)."""
     k = str(chain_key or "").strip().lower()
@@ -17747,9 +17840,9 @@ def _render_positions_page() -> str:
       function renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints) {
         if (!debugEl) return;
         const rows = Array.isArray(rowStatuses) ? rowStatuses : [];
-        const okCount = rows.filter((x) => x && x.outcome === "ok").length;
+        const okCount = rows.filter((x) => x && (x.outcome === "ok" || x.outcome === "estimate-only")).length;
         const emptyCount = rows.filter((x) => x && x.outcome === "empty").length;
-        const badCount = rows.filter((x) => x && x.outcome !== "ok" && x.outcome !== "empty").length;
+        const badCount = rows.filter((x) => x && x.outcome !== "ok" && x.outcome !== "estimate-only" && x.outcome !== "empty").length;
         const parts = [];
         parts.push(`<b>Fee source status</b>`);
         parts.push(`Selected: ${Number(diag?.selected || 0)} · with data: ${okCount} · empty: ${emptyCount} · failed/skipped: ${badCount}`);
@@ -17814,6 +17907,8 @@ def _render_positions_page() -> str:
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
         let lastFeePricing = "";
+        let hasCollectedHistoryTrace = false;
+        let hasEstimateOnlyTrace = false;
         const diag = {
           selected: selected.length,
           missingRow: 0,
@@ -17898,9 +17993,12 @@ def _render_positions_page() -> str:
             continue;
           }
           const items = Array.isArray(data.items) ? data.items : [];
+          const estItems = Array.isArray(data.estimated_items) ? data.estimated_items : [];
           const d = data && data.debug ? data.debug : {};
           const mode = String((d && d.result_mode) || data.mode || "");
-          if (!items.length) {
+          const hasMain = items.length > 0;
+          const hasEst = estItems.length > 0;
+          if (!hasMain && !hasEst) {
             diag.emptySeries += 1;
             rowStatuses.push({
               label: rowLabel,
@@ -17916,20 +18014,37 @@ def _render_positions_page() -> str:
           if (fp) lastFeePricing = fp;
           rowStatuses.push({
             label: rowLabel,
-            outcome: "ok",
+            outcome: (!hasMain && hasEst) ? "estimate-only" : "ok",
             mode: mode || "ok",
             pricing: fp,
-            points: items.length,
+            points: hasMain ? items.length : estItems.length,
             detail: String(data.note || ""),
           });
-          traces.push({
-            x: items.map((x) => new Date(Number(x.ts || 0) * 1000)),
-            y: items.map((x) => Number(x.fees_usd || 0)),
-            mode: "lines",
-            line: {color: palette[i % palette.length], width: 2},
-            name: String(row.pair || row.pool_id || `Position ${i + 1}`),
-            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
-          });
+          if (hasMain) {
+            if (mode === "row-unclaimed-fallback") hasEstimateOnlyTrace = true;
+            else hasCollectedHistoryTrace = true;
+            traces.push({
+              x: items.map((x) => new Date(Number(x.ts || 0) * 1000)),
+              y: items.map((x) => Number(x.fees_usd || 0)),
+              mode: items.length <= 1 ? "lines+markers" : "lines",
+              line: {color: palette[i % palette.length], width: 2},
+              marker: {size: items.length <= 1 ? 7 : 0},
+              name: String(row.pair || row.pool_id || `Position ${i + 1}`),
+              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+            });
+          }
+          if (hasEst) {
+            hasEstimateOnlyTrace = true;
+            traces.push({
+              x: estItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
+              y: estItems.map((x) => Number(x.fees_usd || 0)),
+              mode: "lines",
+              line: {color: palette[i % palette.length], width: 1.5, dash: "dot"},
+              opacity: 0.85,
+              name: `${String(row.pair || row.pool_id || `Position ${i + 1}`)} (estimated)`,
+              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+            });
+          }
         }
         if (!traces.length) {
           const reasons = [];
@@ -17958,7 +18073,14 @@ def _render_positions_page() -> str:
         }, {displaylogo: false, responsive: true});
         const pr = lastFeePricing ? ` · ${lastFeePricing}` : "";
         const missing = Math.max(0, Number(diag.selected || 0) - traces.length);
-        setPosFeeStatus(`Done: ${traces.length}/${diag.selected} position(s) with fee data${pr}${missing ? ` · missing: ${missing}` : ""}`, false);
+        if (hasEstimateOnlyTrace && !hasCollectedHistoryTrace) {
+          setPosFeeStatus(
+            `Estimate only: collected-fee history not found; showing current unclaimed snapshot (${traces.length}/${diag.selected})${missing ? ` · missing: ${missing}` : ""}`,
+            true
+          );
+        } else {
+          setPosFeeStatus(`Done: ${traces.length}/${diag.selected} position(s) with fee data${pr}${missing ? ` · missing: ${missing}` : ""}`, false);
+        }
         renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints);
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Error: ${esc(e?.message || "unknown")}</div>`;
@@ -18974,21 +19096,30 @@ def _render_positions_page() -> str:
       let processed = 0;
       let updated = 0;
       const startedAt = Date.now();
+      const wallBudgetMs = 5 * 60 * 1000;
+      const rowReqTimeoutMs = 12000;
       const workersN = Math.min(4, Math.max(1, Math.floor((navigator?.hardwareConcurrency || 4) / 2)));
       async function workerLoop(workerId) {
         while (true) {
+          if ((Date.now() - startedAt) >= wallBudgetMs) return;
           const idxPos = processed;
           if (idxPos >= work.length) return;
           processed += 1;
           const rowIdx = work[idxPos];
           const cur = Object.assign({}, list[rowIdx] || {});
           try {
+            const ctrl = new AbortController();
+            const to = setTimeout(() => {
+              try { ctrl.abort(); } catch (_) {}
+            }, rowReqTimeoutMs);
             const res = await fetch("/api/positions/row/enrich", {
               method: "POST",
               headers: {"Content-Type":"application/json"},
               body: JSON.stringify({row: cur}),
+              signal: ctrl.signal,
             });
             const data = await res.json().catch(() => ({}));
+            clearTimeout(to);
             if (res.ok && data?.ok && data?.row_updates && typeof data.row_updates === "object") {
               list[rowIdx] = Object.assign({}, cur, data.row_updates || {});
               updated += 1;
@@ -19019,7 +19150,7 @@ def _render_positions_page() -> str:
           debug: posCache.debug || {},
         });
       } catch (_) {}
-      return {processed: work.length, updated, eligible: candidates.length};
+      return {processed, updated, eligible: candidates.length, planned: work.length};
     }
     async function startClosedBgEnrichAfterV3Scan() {
       if (!isClosedBgEnrichEnabled()) return;
@@ -19033,10 +19164,11 @@ def _render_positions_page() -> str:
         finishPosStatusLane("closed");
         posFinalClosedCount = countClosedRows(posCache.pools || []);
         posFinalClosedSec = Math.max(0, Number(posStatusLanes?.closed?.lastDoneSec || 0));
-        if (!out.eligible) {
-          setPosFinalSummaryStatus();
-        } else {
-          setPosFinalSummaryStatus();
+        setPosFinalSummaryStatus();
+        const p = Number(out?.processed || 0);
+        const pl = Number(out?.planned || 0);
+        if (pl > 0 && p < pl) {
+          setPosStatus(`Closed positions enrich stopped by time budget (${p}/${pl} rows processed).`, false);
         }
       } catch (e) {
         finishPosStatusLane("closed");
@@ -21988,6 +22120,25 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["fee_usd_historical"] = bool(want_hist_usd)
     debug["rpc_protocol_supported"] = bool(protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"})
     debug["rpc_tokens_ready"] = bool(_is_eth_address(token0) and _is_eth_address(token1))
+    estimated_by_day: dict[int, float] = {}
+    est_share = 0.0
+    try:
+        pos_liq = max(0.0, _safe_float(getattr(req, "position_liquidity", 0.0)))
+        pool_liq = max(0.0, _safe_float(getattr(req, "pool_liquidity", 0.0)))
+        if pos_liq > 0 and pool_liq > 0:
+            est_share = max(0.0, min(1.0, pos_liq / pool_liq))
+            pool_fee_days = _fetch_pool_fee_usd_series(chain_key, version, str(req.pool_id or ""), days)
+            if pool_fee_days:
+                cum_est = 0.0
+                for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
+                    cum_est += max(0.0, float(fee_usd)) * float(est_share)
+                    day_ts = (int(ts) // 86400) * 86400
+                    estimated_by_day[day_ts] = float(cum_est)
+    except Exception:
+        estimated_by_day = {}
+        est_share = 0.0
+    debug["estimated_points"] = int(len(estimated_by_day))
+    debug["estimated_share"] = float(est_share)
 
     exact_by_day: dict[int, float] = {}
     if endpoint:
@@ -22037,6 +22188,21 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
         return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
 
+    est_items_payload = _pack_fee_items(estimated_by_day) if estimated_by_day else []
+
+    def _unavailable_reason_code() -> str:
+        if not bool(debug.get("rpc_protocol_supported")):
+            return "rpc_fallback_not_supported_for_protocol"
+        if not bool(debug.get("rpc_tokens_ready")):
+            return "token0_or_token1_not_resolved_for_rpc"
+        if not bool(debug.get("endpoint_configured")) and not bool(debug.get("rpc_enabled")):
+            return "no_subgraph_endpoint_and_rpc_disabled"
+        if not bool(debug.get("endpoint_configured")):
+            return "no_subgraph_endpoint"
+        if not bool(debug.get("rpc_enabled")):
+            return "rpc_fallback_disabled"
+        return "no_subgraph_or_rpc_fee_data"
+
     if force_rpc and rpc_by_day:
         debug["result_mode"] = "onchain-collect-logs"
         debug["result_count"] = len(rpc_by_day)
@@ -22046,6 +22212,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
             "note": "POSITIONS_FEE_RPC_FORCE: " + (rpc_detail or "NPM Collect logs."),
+            "estimated_items": est_items_payload,
+            "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
         })
 
     if exact_by_day and sub_max >= 1e-6 and not force_rpc:
@@ -22060,6 +22228,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
             "note": snap_note,
+            "estimated_items": est_items_payload,
+            "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
         })
 
     if rpc_by_day:
@@ -22071,6 +22241,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
             "note": "Subgraph fee field empty/zero — " + (rpc_detail or "NPM Collect logs."),
+            "estimated_items": est_items_payload,
+            "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
         })
 
     if exact_by_day:
@@ -22085,6 +22257,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
             "note": low_note,
+            "estimated_items": est_items_payload,
+            "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
         })
 
     # Final best-effort fallback: current row unclaimed fees (single point, spot USD).
@@ -22117,34 +22291,28 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             day_ts = (int(now_ts) // 86400) * 86400
             debug["result_mode"] = "row-unclaimed-fallback"
             debug["result_count"] = 1
+            debug["reason"] = _unavailable_reason_code()
             return _with_debug({
                 "items": [{"ts": int(day_ts), "fees_usd": float(usd_now)}],
                 "count": 1,
                 "mode": "row-unclaimed-fallback",
                 "fee_pricing": "spot_row_unclaimed",
-                "note": "Fallback: current row unclaimed fees marked to spot USD (single point).",
+                "note": "Fallback only: collected-fee history not found; current row unclaimed fees marked to spot USD (single point).",
+                "estimated_items": est_items_payload,
+                "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
             })
 
     debug["result_mode"] = "unavailable"
     debug["result_count"] = 0
-    if not bool(debug.get("rpc_protocol_supported")):
-        debug["reason"] = "rpc_fallback_not_supported_for_protocol"
-    elif not bool(debug.get("rpc_tokens_ready")):
-        debug["reason"] = "token0_or_token1_not_resolved_for_rpc"
-    elif not bool(debug.get("endpoint_configured")) and not bool(debug.get("rpc_enabled")):
-        debug["reason"] = "no_subgraph_endpoint_and_rpc_disabled"
-    elif not bool(debug.get("endpoint_configured")):
-        debug["reason"] = "no_subgraph_endpoint"
-    elif not bool(debug.get("rpc_enabled")):
-        debug["reason"] = "rpc_fallback_disabled"
-    else:
-        debug["reason"] = "no_subgraph_or_rpc_fee_data"
+    debug["reason"] = _unavailable_reason_code()
     return _with_debug({
         "items": [],
         "count": 0,
         "mode": "unavailable",
         "fee_pricing": "none",
         "note": "No fee data: subgraph empty and on-chain Collect logs missing, or token0_id/token1_id needed for RPC fallback.",
+        "estimated_items": est_items_payload,
+        "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
     })
 
 
