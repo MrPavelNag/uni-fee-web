@@ -676,6 +676,7 @@ POSITION_CONTRACT_SNAPSHOT_CACHE: dict[tuple[int, str, int], tuple[float, dict[s
 POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK = threading.Lock()
 MAJOR_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 MAJOR_ASSET_PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("MAJOR_ASSET_PRICE_CACHE_TTL_SEC", "300")))
+POOL_FLOW_EVENTS_LOCK = threading.Lock()
 getcontext().prec = 48
 
 UNISWAP_V3_NPM_BY_CHAIN_ID: dict[int, str] = {
@@ -1042,6 +1043,50 @@ def _init_analytics_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_heavy_enrich_ts ON heavy_protocol_enrich_debug(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_heavy_enrich_job ON heavy_protocol_enrich_debug(job_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temp_pool_flow_runs (
+              run_id TEXT PRIMARY KEY,
+              ts REAL NOT NULL,
+              chain_id INTEGER NOT NULL,
+              protocol TEXT NOT NULL DEFAULT '',
+              pool_id TEXT NOT NULL,
+              from_block INTEGER NOT NULL DEFAULT 0,
+              to_block INTEGER NOT NULL DEFAULT 0,
+              since_ts INTEGER NOT NULL DEFAULT 0,
+              latest_ts INTEGER NOT NULL DEFAULT 0,
+              events_total INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT '',
+              note TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temp_pool_flow_events (
+              chain_id INTEGER NOT NULL,
+              protocol TEXT NOT NULL DEFAULT '',
+              pool_id TEXT NOT NULL,
+              block_number INTEGER NOT NULL DEFAULT 0,
+              log_index INTEGER NOT NULL DEFAULT 0,
+              tx_hash TEXT NOT NULL DEFAULT '',
+              ts INTEGER NOT NULL DEFAULT 0,
+              event_name TEXT NOT NULL DEFAULT '',
+              owner TEXT NOT NULL DEFAULT '',
+              recipient TEXT NOT NULL DEFAULT '',
+              tick_lower INTEGER NOT NULL DEFAULT 0,
+              tick_upper INTEGER NOT NULL DEFAULT 0,
+              amount0_raw TEXT NOT NULL DEFAULT '0',
+              amount1_raw TEXT NOT NULL DEFAULT '0',
+              liquidity_raw TEXT NOT NULL DEFAULT '0',
+              inserted_at REAL NOT NULL DEFAULT 0,
+              PRIMARY KEY(chain_id, pool_id, tx_hash, log_index, event_name)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_temp_pool_flow_events_pool_ts ON temp_pool_flow_events(chain_id, pool_id, ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_temp_pool_flow_events_owner_tick ON temp_pool_flow_events(chain_id, pool_id, owner, tick_lower, tick_upper)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_temp_pool_flow_runs_pool_ts ON temp_pool_flow_runs(chain_id, pool_id, ts)")
         conn.commit()
 
 
@@ -14129,6 +14174,433 @@ def _fetch_v3_collect_series_by_shape(
     return out
 
 
+def _v3_pool_flow_topic0_map() -> dict[str, str]:
+    out: dict[str, str] = {}
+    sigs = {
+        "mint": b"Mint(address,address,int24,int24,uint128,uint256,uint256)",
+        "burn": b"Burn(address,int24,int24,uint128,uint256,uint256)",
+        "collect": b"Collect(address,address,int24,int24,uint128,uint128)",
+        "swap": b"Swap(address,address,int256,int256,uint160,uint128,int24)",
+    }
+    for name, sig in sigs.items():
+        h = _keccak256_hex(sig)
+        if h:
+            out[name] = h
+    return out
+
+
+def _pool_token_addrs_onchain(chain_id: int, pool_id: str) -> tuple[str, str]:
+    p = str(pool_id or "").strip().lower()
+    if not _is_eth_address(p):
+        return "", ""
+    try:
+        batch = _eth_call_hex_batch(
+            int(chain_id),
+            [
+                {"to": p, "data": "0x0dfe1681"},  # token0()
+                {"to": p, "data": "0xd21220a7"},  # token1()
+            ],
+        )
+        t0 = _decode_address_from_word((_hex_words(str(batch[0] or "")) or [""])[0]).lower() if batch and len(batch) > 0 and batch[0] else ""
+        t1 = _decode_address_from_word((_hex_words(str(batch[1] or "")) or [""])[0]).lower() if batch and len(batch) > 1 and batch[1] else ""
+        return (t0 if _is_eth_address(t0) else ""), (t1 if _is_eth_address(t1) else "")
+    except Exception:
+        return "", ""
+
+
+def _decode_v3_pool_flow_log(log_row: dict[str, Any], topic0_by_name: dict[str, str]) -> dict[str, Any] | None:
+    if not isinstance(log_row, dict):
+        return None
+    topics = [str(x or "").strip().lower() for x in (log_row.get("topics") or [])]
+    if not topics:
+        return None
+    topic0 = topics[0]
+    inv = {str(v): str(k) for k, v in (topic0_by_name or {}).items()}
+    event_name = str(inv.get(topic0) or "").strip().lower()
+    if not event_name:
+        return None
+    words = _hex_words(str(log_row.get("data") or ""))
+    owner = ""
+    recipient = ""
+    tick_lower = 0
+    tick_upper = 0
+    amount0_raw = 0
+    amount1_raw = 0
+    liquidity_raw = 0
+    try:
+        if event_name == "mint":
+            # Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)
+            if len(topics) < 4 or len(words) < 4:
+                return None
+            owner = _decode_address_from_word(topics[1][-64:])
+            tick_lower = int(_decode_int_from_word(topics[2][-64:]))
+            tick_upper = int(_decode_int_from_word(topics[3][-64:]))
+            liquidity_raw = int(_decode_uint_from_word(words[1]))
+            amount0_raw = int(_decode_uint_from_word(words[2]))
+            amount1_raw = int(_decode_uint_from_word(words[3]))
+        elif event_name == "burn":
+            # Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)
+            if len(topics) < 4 or len(words) < 3:
+                return None
+            owner = _decode_address_from_word(topics[1][-64:])
+            tick_lower = int(_decode_int_from_word(topics[2][-64:]))
+            tick_upper = int(_decode_int_from_word(topics[3][-64:]))
+            liquidity_raw = int(_decode_uint_from_word(words[0]))
+            amount0_raw = int(_decode_uint_from_word(words[1]))
+            amount1_raw = int(_decode_uint_from_word(words[2]))
+        elif event_name == "collect":
+            # Collect(address indexed owner, address recipient, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount0, uint128 amount1)
+            if len(topics) < 4 or len(words) < 3:
+                return None
+            owner = _decode_address_from_word(topics[1][-64:])
+            tick_lower = int(_decode_int_from_word(topics[2][-64:]))
+            tick_upper = int(_decode_int_from_word(topics[3][-64:]))
+            recipient = _decode_address_from_word(words[0])
+            amount0_raw = int(_decode_uint_from_word(words[1]))
+            amount1_raw = int(_decode_uint_from_word(words[2]))
+        elif event_name == "swap":
+            # Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)
+            if len(topics) < 3 or len(words) < 5:
+                return None
+            owner = _decode_address_from_word(topics[1][-64:])
+            recipient = _decode_address_from_word(topics[2][-64:])
+            amount0_raw = int(_decode_int_from_word(words[0]))
+            amount1_raw = int(_decode_int_from_word(words[1]))
+            liquidity_raw = int(_decode_uint_from_word(words[3]))
+        else:
+            return None
+    except Exception:
+        return None
+    return {
+        "event_name": event_name,
+        "owner": str(owner or "").strip().lower(),
+        "recipient": str(recipient or "").strip().lower(),
+        "tick_lower": int(tick_lower),
+        "tick_upper": int(tick_upper),
+        "amount0_raw": int(amount0_raw),
+        "amount1_raw": int(amount1_raw),
+        "liquidity_raw": int(liquidity_raw),
+    }
+
+
+def _collect_v3_pool_flow_events_temp(
+    chain_id: int,
+    protocol: str,
+    pool_id: str,
+    *,
+    since_ts: int,
+    max_chunks: int = 220,
+) -> dict[str, Any]:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    pool = str(pool_id or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(pool):
+        return {"ok": False, "reason": "invalid_chain_or_pool"}
+    from_block = _eth_first_block_at_or_after_ts(cid, int(since_ts))
+    latest = _eth_block_number(cid)
+    if (from_block <= 0 or from_block > latest) and latest > 0 and int(since_ts) > 0:
+        approx_blocks_per_day = 7200 if cid == 1 else 345_600
+        lookback_days = max(1, int((time.time() - int(since_ts)) // 86400) + 1)
+        from_block = max(1, int(latest) - int(approx_blocks_per_day * lookback_days))
+    if from_block <= 0 or latest <= 0 or from_block > latest:
+        return {"ok": False, "reason": "invalid_block_window"}
+    topic0_by_name = _v3_pool_flow_topic0_map()
+    topic0_or = list(topic0_by_name.values())
+    if not topic0_or:
+        return {"ok": False, "reason": "no_topics"}
+    chunk = _fee_collect_log_chunk_blocks(cid)
+    chunks_cap = max(1, min(2000, int(max_chunks or _fee_collect_log_max_chunks())))
+    run_id = str(uuid.uuid4())
+    ts_now = float(time.time())
+    with _analytics_conn() as conn:
+        prev = conn.execute(
+            """
+            SELECT run_id, ts, from_block, to_block
+            FROM temp_pool_flow_runs
+            WHERE chain_id = ? AND pool_id = ? AND status = 'ok'
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (int(cid), str(pool)),
+        ).fetchone()
+        if prev:
+            prev_run_id = str(prev[0] or "")
+            prev_ts = float(prev[1] or 0.0)
+            prev_from = int(prev[2] or 0)
+            prev_to = int(prev[3] or 0)
+            # Reuse very recent scan that already covers current window and almost-current tip.
+            if prev_ts > 0 and (ts_now - prev_ts) <= 45.0 and prev_from <= int(from_block) and (int(latest) - int(prev_to)) <= int(chunk):
+                rows = conn.execute(
+                    """
+                    SELECT event_name, COUNT(1)
+                    FROM temp_pool_flow_events
+                    WHERE chain_id = ? AND pool_id = ? AND ts >= ?
+                    GROUP BY event_name
+                    """,
+                    (int(cid), str(pool), int(since_ts)),
+                ).fetchall()
+                by_type_cached = {str(k or ""): int(v or 0) for k, v in rows}
+                events_total_cached = int(sum(by_type_cached.values()))
+                return {
+                    "ok": True,
+                    "run_id": prev_run_id,
+                    "chain_id": int(cid),
+                    "pool_id": str(pool),
+                    "from_block": int(prev_from),
+                    "to_block": int(prev_to),
+                    "chunks_used": 0,
+                    "chunks_cap": int(chunks_cap),
+                    "events_total": int(events_total_cached),
+                    "inserted_rows": 0,
+                    "event_counts": by_type_cached,
+                    "truncated": False,
+                    "cached": True,
+                }
+    inserted = 0
+    events_total = 0
+    by_type: dict[str, int] = {}
+    block_ts_cache: dict[int, int] = {}
+    cur = int(from_block)
+    used = 0
+    with POOL_FLOW_EVENTS_LOCK:
+        with _analytics_conn() as conn:
+            while cur <= int(latest) and used < chunks_cap:
+                to_b = min(int(cur) + int(chunk) - 1, int(latest))
+                params = {
+                    "fromBlock": hex(int(cur)),
+                    "toBlock": hex(int(to_b)),
+                    "address": str(pool),
+                    "topics": [topic0_or],
+                }
+                try:
+                    logs = _eth_get_logs(cid, params, timeout_sec=max(20.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 4.0))
+                except Exception:
+                    logs = []
+                rows_to_insert: list[tuple[Any, ...]] = []
+                for lg in logs or []:
+                    decoded = _decode_v3_pool_flow_log(lg, topic0_by_name)
+                    if not decoded:
+                        continue
+                    blk = _eth_uint_from_rpc_field((lg or {}).get("blockNumber"))
+                    lix = _eth_uint_from_rpc_field((lg or {}).get("logIndex"))
+                    txh = str((lg or {}).get("transactionHash") or "").strip().lower()
+                    if blk <= 0 or lix < 0 or not txh:
+                        continue
+                    ts = block_ts_cache.get(int(blk))
+                    if ts is None:
+                        ts = int(_eth_get_block_timestamp(cid, int(blk)) or 0)
+                        block_ts_cache[int(blk)] = int(ts)
+                    if ts <= 0 or int(ts) < int(since_ts):
+                        continue
+                    ev = str(decoded.get("event_name") or "").strip().lower()
+                    by_type[ev] = int(by_type.get(ev, 0) + 1)
+                    events_total += 1
+                    rows_to_insert.append(
+                        (
+                            int(cid),
+                            str(proto),
+                            str(pool),
+                            int(blk),
+                            int(lix),
+                            str(txh),
+                            int(ts),
+                            str(ev),
+                            str(decoded.get("owner") or ""),
+                            str(decoded.get("recipient") or ""),
+                            int(decoded.get("tick_lower") or 0),
+                            int(decoded.get("tick_upper") or 0),
+                            str(int(decoded.get("amount0_raw") or 0)),
+                            str(int(decoded.get("amount1_raw") or 0)),
+                            str(int(decoded.get("liquidity_raw") or 0)),
+                            float(ts_now),
+                        )
+                    )
+                if rows_to_insert:
+                    before_changes = int(conn.total_changes)
+                    conn.executemany(
+                        """
+                        INSERT OR IGNORE INTO temp_pool_flow_events(
+                          chain_id, protocol, pool_id, block_number, log_index, tx_hash, ts, event_name,
+                          owner, recipient, tick_lower, tick_upper, amount0_raw, amount1_raw, liquidity_raw, inserted_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        rows_to_insert,
+                    )
+                    inserted += max(0, int(conn.total_changes) - int(before_changes))
+                cur = int(to_b) + 1
+                used += 1
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO temp_pool_flow_runs(
+                  run_id, ts, chain_id, protocol, pool_id, from_block, to_block, since_ts, latest_ts, events_total, status, note
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(run_id),
+                    float(ts_now),
+                    int(cid),
+                    str(proto),
+                    str(pool),
+                    int(from_block),
+                    int(min(int(latest), int(cur) - 1)),
+                    int(since_ts),
+                    int(time.time()),
+                    int(events_total),
+                    "ok",
+                    ("" if cur > latest else "chunk_cap_reached"),
+                ),
+            )
+            conn.commit()
+    return {
+        "ok": True,
+        "run_id": str(run_id),
+        "chain_id": int(cid),
+        "pool_id": str(pool),
+        "from_block": int(from_block),
+        "to_block": int(min(int(latest), int(cur) - 1)),
+        "chunks_used": int(used),
+        "chunks_cap": int(chunks_cap),
+        "events_total": int(events_total),
+        "inserted_rows": int(inserted),
+        "event_counts": by_type,
+        "truncated": bool(cur <= latest),
+    }
+
+
+def _pool_flow_collect_series_from_temp(
+    chain_id: int,
+    pool_id: str,
+    *,
+    owner: str,
+    tick_lower: int,
+    tick_upper: int,
+    since_ts: int,
+    token0_addr: str,
+    token1_addr: str,
+    use_historical_usd: bool = False,
+) -> tuple[dict[int, float], dict[str, str]]:
+    cid = int(chain_id)
+    pool = str(pool_id or "").strip().lower()
+    own = str(owner or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(pool) or not _is_eth_address(own):
+        return {}, {"pricing": "none", "detail": ""}
+    q = """
+        SELECT ts, amount0_raw, amount1_raw
+        FROM temp_pool_flow_events
+        WHERE chain_id = ?
+          AND pool_id = ?
+          AND event_name = 'collect'
+          AND owner = ?
+          AND ts >= ?
+    """
+    params: list[Any] = [int(cid), str(pool), str(own), int(since_ts)]
+    if int(tick_lower) < int(tick_upper):
+        q += " AND tick_lower = ? AND tick_upper = ?"
+        params.extend([int(tick_lower), int(tick_upper)])
+    q += " ORDER BY ts ASC, block_number ASC, log_index ASC"
+    rows: list[tuple[int, str, str]] = []
+    with _analytics_conn() as conn:
+        rows = conn.execute(q, tuple(params)).fetchall() or []
+    if not rows:
+        return {}, {"pricing": "none", "detail": ""}
+    t0 = str(token0_addr or "").strip().lower()
+    t1 = str(token1_addr or "").strip().lower()
+    if not _is_eth_address(t0) or not _is_eth_address(t1):
+        ot0, ot1 = _pool_token_addrs_onchain(int(cid), str(pool))
+        t0 = t0 if _is_eth_address(t0) else ot0
+        t1 = t1 if _is_eth_address(t1) else ot1
+    if not _is_eth_address(t0) or not _is_eth_address(t1):
+        return {}, {"pricing": "none", "detail": "pool tokens not resolved"}
+    dec0 = _fetch_erc20_decimals_onchain(int(cid), str(t0))
+    dec1 = _fetch_erc20_decimals_onchain(int(cid), str(t1))
+    d0e = max(0, min(36, int(dec0)))
+    d1e = max(0, min(36, int(dec1)))
+    evs: list[tuple[int, float, float]] = []
+    for ts, a0_raw_s, a1_raw_s in rows:
+        try:
+            a0_raw = int(str(a0_raw_s or "0"))
+            a1_raw = int(str(a1_raw_s or "0"))
+        except Exception:
+            continue
+        dh0 = float(Decimal(int(a0_raw)) / (Decimal(10) ** d0e))
+        dh1 = float(Decimal(int(a1_raw)) / (Decimal(10) ** d1e))
+        if dh0 <= 0 and dh1 <= 0:
+            continue
+        evs.append((int(ts), float(max(0.0, dh0)), float(max(0.0, dh1))))
+    if not evs:
+        return {}, {"pricing": "none", "detail": ""}
+    by_day: dict[int, tuple[int, float]] = {}
+    priced_partial = False
+    if use_historical_usd:
+        t_lo = min(t for t, _, _ in evs)
+        t_hi = max(t for t, _, _ in evs)
+        stable0 = _fee_position_token_stable_usd_assumption(int(cid), str(t0)) is not None
+        stable1 = _fee_position_token_stable_usd_assumption(int(cid), str(t1)) is not None
+        hist0 = [] if stable0 else _fetch_coingecko_contract_prices_range(int(cid), str(t0), int(t_lo), int(t_hi))
+        hist1 = [] if stable1 else _fetch_coingecko_contract_prices_range(int(cid), str(t1), int(t_lo), int(t_hi))
+        spot_map = _get_token_prices_usd(int(cid), [str(t0), str(t1)])
+        sp0 = _safe_float(spot_map.get(str(t0)))
+        sp1 = _safe_float(spot_map.get(str(t1)))
+        cum_usd = 0.0
+        for ts, dh0, dh1 in evs:
+            p0 = 1.0 if stable0 else (_price_usd_at_or_before_series(hist0, int(ts)) if hist0 else None)
+            p1 = 1.0 if stable1 else (_price_usd_at_or_before_series(hist1, int(ts)) if hist1 else None)
+            if (p0 is None or _safe_float(p0) <= 0) and not stable0:
+                p0 = sp0
+            if (p1 is None or _safe_float(p1) <= 0) and not stable1:
+                p1 = sp1
+            legs_expected = int(1 if float(dh0) > 0 else 0) + int(1 if float(dh1) > 0 else 0)
+            legs_priced = 0
+            inc = 0.0
+            if float(dh0) > 0 and p0 is not None and float(p0) > 0:
+                inc += float(dh0) * float(p0)
+                legs_priced += 1
+            if float(dh1) > 0 and p1 is not None and float(p1) > 0:
+                inc += float(dh1) * float(p1)
+                legs_priced += 1
+            if inc <= 0 or legs_priced <= 0:
+                continue
+            if legs_priced < legs_expected:
+                priced_partial = True
+            cum_usd += float(inc)
+            dts = (int(ts) // 86400) * 86400
+            prev = by_day.get(dts)
+            if prev is None or int(ts) > prev[0]:
+                by_day[dts] = (int(ts), float(cum_usd))
+        pricing = "pool_flow_historical" if not priced_partial else "pool_flow_historical_partial"
+        detail = "Pool-flow Collect events from temp table, USD by historical prices."
+    else:
+        stable0 = _fee_position_token_stable_usd_assumption(int(cid), str(t0)) is not None
+        stable1 = _fee_position_token_stable_usd_assumption(int(cid), str(t1)) is not None
+        spot_map = _get_token_prices_usd(int(cid), [str(t0), str(t1)])
+        sp0 = 1.0 if stable0 else _safe_float(spot_map.get(str(t0)))
+        sp1 = 1.0 if stable1 else _safe_float(spot_map.get(str(t1)))
+        cum_usd = 0.0
+        for ts, dh0, dh1 in evs:
+            legs_expected = int(1 if float(dh0) > 0 else 0) + int(1 if float(dh1) > 0 else 0)
+            legs_priced = 0
+            inc = 0.0
+            if float(dh0) > 0 and float(sp0) > 0:
+                inc += float(dh0) * float(sp0)
+                legs_priced += 1
+            if float(dh1) > 0 and float(sp1) > 0:
+                inc += float(dh1) * float(sp1)
+                legs_priced += 1
+            if inc <= 0 or legs_priced <= 0:
+                continue
+            if legs_priced < legs_expected:
+                priced_partial = True
+            cum_usd += float(inc)
+            dts = (int(ts) // 86400) * 86400
+            prev = by_day.get(dts)
+            if prev is None or int(ts) > prev[0]:
+                by_day[dts] = (int(ts), float(cum_usd))
+        pricing = "pool_flow_spot" if not priced_partial else "pool_flow_spot_partial"
+        detail = "Pool-flow Collect events from temp table, USD by spot prices."
+    out = {int(d): float(v) for d, (_ts, v) in by_day.items()}
+    return out, {"pricing": pricing, "detail": detail}
+
+
 def _position_fee_rpc_fallback_enabled() -> bool:
     return os.environ.get("POSITIONS_FEE_RPC_FALLBACK", "1").strip().lower() in (
         "1",
@@ -15773,6 +16245,15 @@ class PositionPoolSeriesRequest(BaseModel):
     pool_token0_price: float = 0.0
     # When true, NPM Collect log series uses CoinGecko historical prices at each event (stables $1).
     fee_usd_historical: bool = False
+
+
+class PoolFlowCollectRequest(BaseModel):
+    chain: str = ""
+    chain_id: int = 0
+    protocol: str = "uniswap_v3"
+    pool_ids: list[str] = Field(default_factory=list)
+    days: int = 30
+    max_chunks: int = 220
 
 
 class PositionsFeeCompareDataRequest(BaseModel):
@@ -18460,8 +18941,22 @@ def _render_positions_page() -> str:
           detail: `${String(outRow.note || "")}${collectedReason ? ` | collected_reason=${collectedReason}` : ""}${estimatedReason ? ` | estimated_reason=${estimatedReason}` : ""}`,
         });
         const d = outRow.debug || {};
+        const pfCollectPoints = Number(d.pool_flow_collect_points || 0);
+        const pfEventsTotal = Number(d.pool_flow_events_total || 0);
+        const pfInsertedRows = Number(d.pool_flow_inserted_rows || 0);
+        const pfChunksUsed = Number(d.pool_flow_chunks_used || 0);
+        const pfTruncated = !!d.pool_flow_truncated;
+        const pfCached = !!d.cached;
+        const pfCountsObj = (d && typeof d.pool_flow_event_counts === "object" && d.pool_flow_event_counts) ? d.pool_flow_event_counts : {};
+        const pfCounts = Object.entries(pfCountsObj)
+          .map(([k, v]) => `${String(k)}=${Number(v || 0)}`)
+          .join(",");
+        if (pfEventsTotal > 0 || pfCollectPoints > 0 || pfChunksUsed > 0) {
+          const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
+          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | pool_flow: collect_points=${pfCollectPoints}, events=${pfEventsTotal}, inserted=${pfInsertedRows}, chunks=${pfChunksUsed}, truncated=${pfTruncated ? 1 : 0}, cached=${pfCached ? 1 : 0}${pfCounts ? `, counts=${pfCounts}` : ""}`;
+        }
         if (backendHints.length < 5) {
-          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}`;
+          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
           backendHints.push(msg);
         }
         if (hasCollected) {
@@ -22681,6 +23176,56 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
     }
 
 
+@app.post("/api/positions/pool-flow/temp-collect")
+def positions_pool_flow_temp_collect(req: PoolFlowCollectRequest) -> dict[str, Any]:
+    chain_key = str(req.chain or "").strip().lower()
+    chain_id_hint = int(getattr(req, "chain_id", 0) or 0)
+    if not chain_key and chain_id_hint > 0 and chain_id_hint in CHAIN_ID_TO_KEY:
+        chain_key = str(CHAIN_ID_TO_KEY[int(chain_id_hint)]).strip().lower()
+    chain_id = _chain_id_by_chain_key(chain_key)
+    if chain_id <= 0 and chain_id_hint > 0 and chain_id_hint in CHAIN_ID_TO_KEY:
+        chain_id = int(chain_id_hint)
+    if chain_id <= 0:
+        raise HTTPException(status_code=400, detail="chain/chain_id is required")
+    days = max(1, min(3650, int(getattr(req, "days", 30) or 30)))
+    max_chunks = max(1, min(2000, int(getattr(req, "max_chunks", 220) or 220)))
+    pools_in = [str(x or "").strip().lower() for x in (req.pool_ids or []) if _is_eth_address(str(x or "").strip().lower())]
+    pools = list(dict.fromkeys(pools_in))[:40]
+    if not pools:
+        raise HTTPException(status_code=400, detail="pool_ids is required")
+    since_ts = int(time.time()) - int(days) * 86400
+    protocol = _normalize_positions_series_protocol(str(getattr(req, "protocol", "") or ""), for_fees=True)
+    if protocol not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+        protocol = "uniswap_v3"
+    runs: list[dict[str, Any]] = []
+    totals = {"events_total": 0, "inserted_rows": 0, "pools_ok": 0, "pools_failed": 0}
+    for pool in pools:
+        one = _collect_v3_pool_flow_events_temp(
+            int(chain_id),
+            str(protocol),
+            str(pool),
+            since_ts=int(since_ts),
+            max_chunks=int(max_chunks),
+        )
+        runs.append(one)
+        if bool(one.get("ok")):
+            totals["pools_ok"] += 1
+            totals["events_total"] += int(one.get("events_total") or 0)
+            totals["inserted_rows"] += int(one.get("inserted_rows") or 0)
+        else:
+            totals["pools_failed"] += 1
+    return {
+        "ok": True,
+        "chain": str(CHAIN_ID_TO_KEY.get(int(chain_id), chain_key) or chain_key),
+        "chain_id": int(chain_id),
+        "protocol": str(protocol),
+        "days": int(days),
+        "max_chunks": int(max_chunks),
+        "pools": runs,
+        "totals": totals,
+    }
+
+
 @app.post("/api/positions/benchmark-series")
 def positions_benchmark_series(req: PositionsBenchmarkSeriesRequest) -> dict[str, Any]:
     syms = [str(x or "").strip().upper() for x in (req.symbols or []) if str(x or "").strip()]
@@ -23241,6 +23786,36 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             except Exception:
                 continue
     debug["subgraph_collect_points"] = int(len(collect_by_shape))
+    pool_flow_collect_by_day: dict[int, float] = {}
+    pool_flow_meta: dict[str, str] = {"pricing": "none", "detail": ""}
+    if protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"} and str(req.pool_id or "").strip() and _is_eth_address(str(req.address or "").strip().lower()):
+        try:
+            pool_flow_stats = _collect_v3_pool_flow_events_temp(
+                int(chain_id),
+                str(protocol),
+                str(req.pool_id or ""),
+                since_ts=int(collect_since_ts),
+                max_chunks=int(_fee_collect_log_max_chunks()),
+            )
+            debug["pool_flow_events_total"] = int(pool_flow_stats.get("events_total") or 0)
+            debug["pool_flow_inserted_rows"] = int(pool_flow_stats.get("inserted_rows") or 0)
+            debug["pool_flow_chunks_used"] = int(pool_flow_stats.get("chunks_used") or 0)
+            debug["pool_flow_truncated"] = bool(pool_flow_stats.get("truncated"))
+            debug["pool_flow_event_counts"] = dict(pool_flow_stats.get("event_counts") or {})
+            pool_flow_collect_by_day, pool_flow_meta = _pool_flow_collect_series_from_temp(
+                int(chain_id),
+                str(req.pool_id or ""),
+                owner=str(req.address or ""),
+                tick_lower=int(row_tick_lower or 0),
+                tick_upper=int(row_tick_upper or 0),
+                since_ts=int(collect_since_ts),
+                token0_addr=str(token0 or ""),
+                token1_addr=str(token1 or ""),
+                use_historical_usd=bool(want_hist_usd),
+            )
+        except Exception:
+            pool_flow_collect_by_day, pool_flow_meta = {}, {"pricing": "none", "detail": ""}
+    debug["pool_flow_collect_points"] = int(len(pool_flow_collect_by_day))
 
     sub_max = max(exact_by_day.values()) if exact_by_day else 0.0
     rpc_by_day: dict[int, float] = {}
@@ -23391,6 +23966,19 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "subgraph-collect-events",
             "fee_pricing": "subgraph_collect",
             "note": "Subgraph Collect events (owner+pool+ticks) cumulative USD.",
+            "estimated_items": est_items_payload,
+            "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
+        })
+    if pool_flow_collect_by_day and not force_rpc:
+        collected_reason = "ok_pool_flow_collect_events"
+        debug["result_mode"] = "pool-flow-collect-events"
+        debug["result_count"] = len(pool_flow_collect_by_day)
+        return _with_debug({
+            "items": _pack_fee_items(pool_flow_collect_by_day),
+            "count": len(pool_flow_collect_by_day),
+            "mode": "pool-flow-collect-events",
+            "fee_pricing": str((pool_flow_meta or {}).get("pricing") or "pool_flow_spot"),
+            "note": str((pool_flow_meta or {}).get("detail") or "Pool flow events from temp staging."),
             "estimated_items": est_items_payload,
             "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
         })
