@@ -394,6 +394,14 @@ POSITIONS_EXPLORER_NFTTX_GLOBAL_CONCURRENCY = max(
     ),
 )
 _TOKENNFTTX_HTTP_SEM = threading.BoundedSemaphore(int(POSITIONS_EXPLORER_NFTTX_GLOBAL_CONCURRENCY))
+# Global explorer request rate cap (tokennfttx): keep under public API limits (e.g. 3 req/s).
+# Set to 0 to disable pacing.
+POSITIONS_EXPLORER_NFTTX_RPS_LIMIT = max(
+    0.0,
+    min(20.0, float(os.environ.get("POSITIONS_EXPLORER_NFTTX_RPS_LIMIT", "3"))),
+)
+_TOKENNFTTX_RPS_LOCK = threading.Lock()
+_TOKENNFTTX_RPS_NEXT_TS = 0.0
 # True: call api.etherscan.io/v2 (chainid) before bscscan/basescan/optimistic. Same ETHERSCAN_API_KEY
 # works on v2 for mapped chains. For native hosts: BSC/Base may reject a pure Etherscan key; Arbitrum
 # Arbiscan accepts the same multi-chain Etherscan key — we fall back ARBISCAN_API_KEY → ETHERSCAN_API_KEY.
@@ -5943,6 +5951,22 @@ def _explorer_owner_nfttx_rows(
     def _deadline_hit() -> bool:
         return deadline_ts is not None and time.monotonic() >= float(deadline_ts)
 
+    def _wait_tokennfttx_rps_slot() -> None:
+        lim = float(POSITIONS_EXPLORER_NFTTX_RPS_LIMIT)
+        if lim <= 0:
+            return
+        min_interval = max(0.001, 1.0 / lim)
+        while True:
+            wait_sec = 0.0
+            with _TOKENNFTTX_RPS_LOCK:
+                global _TOKENNFTTX_RPS_NEXT_TS
+                now = time.monotonic()
+                if now >= float(_TOKENNFTTX_RPS_NEXT_TS):
+                    _TOKENNFTTX_RPS_NEXT_TS = now + min_interval
+                    return
+                wait_sec = max(0.001, float(_TOKENNFTTX_RPS_NEXT_TS) - now)
+            time.sleep(min(0.05, wait_sec))
+
     def _finalize() -> list[dict[str, Any]]:
         _explorer_nft_meta_cache_upsert_rows(cid, out, protocol_hint="")
         return out
@@ -5958,6 +5982,7 @@ def _explorer_owner_nfttx_rows(
         debug_out["requests"] = []
         debug_out["http_timeout_sec"] = round(http_timeout, 3)
         debug_out["page_workers"] = int(page_workers)
+        debug_out["rps_limit"] = float(POSITIONS_EXPLORER_NFTTX_RPS_LIMIT)
 
     def _append_from_result(rows_raw: Any) -> str:
         """Return 'empty', 'ok', or 'full'."""
@@ -6011,6 +6036,7 @@ def _explorer_owner_nfttx_rows(
         url = str(tmpl_arg).replace("{page}", str(page_num))
         req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
         try:
+            _wait_tokennfttx_rps_slot()
             with _TOKENNFTTX_HTTP_SEM:
                 with urlopen(req, timeout=http_timeout) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -18033,10 +18059,25 @@ def _render_positions_page() -> str:
       const finishedChecks = includeOwnerChecks && Array.isArray(data?.debug?.pool_scan) ? data.debug.pool_scan.length : 0;
       return `Done${durPart}. Pools: ${poolsN}${finishedChecks ? ` | Owner-chain checks: ${finishedChecks}` : ""}${errCount ? ` | warnings: ${errCount}` : ""}${firstInfo ? ` | ${firstInfo}` : ""}`;
     }
-    function ensureV3SectionVisible(targetSection) {
+    function ensureV3SectionVisible() {
       // Search should reveal Pools section when the user launches Scan V3.
-      if (targetSection === "pools") setSectionCollapsed("pools", false);
-      else setSectionCollapsed("pools", false);
+      setSectionCollapsed("pools", false);
+    }
+    async function startV3ScanJob() {
+      const startRes = await fetch("/api/positions/scan/start", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify(buildV3ScanStartPayload()),
+      });
+      const startData = await startRes.json().catch(() => ({}));
+      if (!startRes.ok) throw new Error(startData.detail || "Failed to start scan");
+      const jobId = String(startData.job_id || "").trim();
+      if (!jobId) throw new Error("Invalid job id");
+      return jobId;
+    }
+    function applyV3ScanResult(data, includeOwnerChecks) {
+      persistV3ScanResult(data);
+      setPosStatus(formatV3DoneStatus(data, includeOwnerChecks), false);
     }
     async function scanPositions(targetSection = "all") {
       let handoffToBackground = false;
@@ -18048,18 +18089,10 @@ def _render_positions_page() -> str:
         setPosStatus("Add at least one EVM address (0x…).", true);
         return;
       }
-      ensureV3SectionVisible(targetSection);
+      ensureV3SectionVisible();
       try {
         setPosBusy(true);
-        const startRes = await fetch("/api/positions/scan/start", {
-          method: "POST",
-          headers: {"Content-Type":"application/json"},
-          body: JSON.stringify(buildV3ScanStartPayload()),
-        });
-        const startData = await startRes.json().catch(() => ({}));
-        if (!startRes.ok) throw new Error(startData.detail || "Failed to start scan");
-        const jobId = String(startData.job_id || "").trim();
-        if (!jobId) throw new Error("Invalid job id");
+        const jobId = await startV3ScanJob();
         saveActivePosJob(jobId);
         const data = await pollPosJob(jobId, true, "v3");
         if (data && data.__partial) {
@@ -18069,8 +18102,7 @@ def _render_positions_page() -> str:
           return;
         }
         saveActivePosJob("");
-        persistV3ScanResult(data);
-        setPosStatus(formatV3DoneStatus(data, true), false);
+        applyV3ScanResult(data, true);
       } catch (e) {
         handleActivePosJobError(e, "v3", false);
       } finally {
@@ -18084,8 +18116,7 @@ def _render_positions_page() -> str:
         setPosBusy(true);
         const data = await pollPosJob(jobId, false, "v3");
         saveActivePosJob("");
-        persistV3ScanResult(data);
-        setPosStatus(formatV3DoneStatus(data, false), false);
+        applyV3ScanResult(data, false);
       } catch (e) {
         handleActivePosJobError(e, "v3", true);
       } finally {
