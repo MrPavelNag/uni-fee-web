@@ -7501,6 +7501,7 @@ def _liquidity_usd_from_in_position_external(
     symbol1: str = "",
     pair: str = "",
     known_prices: dict[str, float] | None = None,
+    pool_token0_price_in_token1: float | None = None,
 ) -> float | None:
     a0 = max(0.0, _safe_float(amount0))
     a1 = max(0.0, _safe_float(amount1))
@@ -7526,6 +7527,17 @@ def _liquidity_usd_from_in_position_external(
         p0 = _major_or_stable_price_by_symbol(symbol0)
     if p1 <= 0:
         p1 = _major_or_stable_price_by_symbol(symbol1)
+    # If one leg is still missing, infer via pool token0Price ratio when available.
+    r01 = _safe_float(pool_token0_price_in_token1)
+    if (
+        r01 > 0
+        and r01 >= (1.0 / POSITIONS_MAX_TOKEN_PRICE_RATIO)
+        and r01 <= POSITIONS_MAX_TOKEN_PRICE_RATIO
+    ):
+        if p0 > 0 and (p1 is None or p1 <= 0):
+            p1 = p0 / r01
+        elif p1 > 0 and (p0 is None or p0 <= 0):
+            p0 = p1 * r01
     if p0 is None or p0 <= 0 or p1 is None or p1 <= 0:
         pair_s = str(pair or "")
         if "/" in pair_s:
@@ -7604,6 +7616,7 @@ def _enrich_rows_liquidity_usd(rows: list[dict[str, Any]], *, max_seconds: int =
             symbol1=str(r.get("position_symbol1") or ""),
             pair=str(r.get("pair") or ""),
             known_prices=prices,
+            pool_token0_price_in_token1=_safe_float(r.get("pool_token0_price")),
         )
         if usd is not None and usd > 0:
             r["liquidity_usd"] = float(usd)
@@ -11640,67 +11653,7 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
             acc["liquidity_display"] = _format_usd_compact(_opt_float(acc.get("liquidity_usd")))
         # This row is an owner/protocol/pool aggregate, so liquidity_usd is additive across NFTs.
 
-    out_rows = list(uniq.values())
-    if not out_rows:
-        return out_rows
-
-    # Second-pass liquidity recompute on aggregated rows:
-    # use summed "In position" amounts + external prices, then take max(existing, recomputed)
-    # to avoid undercount when some child rows missed price resolution on first pass.
-    by_chain_tokens: dict[int, set[str]] = {}
-    for r in out_rows:
-        if not isinstance(r, dict):
-            continue
-        if bool(r.get("suspected_spam")) or bool(r.get("spam_skipped")):
-            continue
-        cid = int(r.get("chain_id") or 0)
-        if cid <= 0:
-            continue
-        t0 = str(r.get("token0_id") or "").strip().lower()
-        t1 = str(r.get("token1_id") or "").strip().lower()
-        if _is_eth_address(t0):
-            by_chain_tokens.setdefault(cid, set()).add(t0)
-        if _is_eth_address(t1):
-            by_chain_tokens.setdefault(cid, set()).add(t1)
-    prices_by_chain: dict[int, dict[str, float]] = {}
-    for cid, toks in by_chain_tokens.items():
-        try:
-            prices_by_chain[int(cid)] = _get_token_prices_usd(int(cid), sorted(list(toks)))
-        except Exception:
-            prices_by_chain[int(cid)] = {}
-
-    for r in out_rows:
-        if not isinstance(r, dict):
-            continue
-        if bool(r.get("suspected_spam")) or bool(r.get("spam_skipped")):
-            r["liquidity_usd"] = None
-            r["liquidity_display"] = "-"
-            continue
-        cid = int(r.get("chain_id") or 0)
-        a0 = _safe_float(r.get("position_amount0"))
-        a1 = _safe_float(r.get("position_amount1"))
-        t0 = str(r.get("token0_id") or "").strip().lower()
-        t1 = str(r.get("token1_id") or "").strip().lower()
-        recomputed = _liquidity_usd_from_in_position_external(
-            int(cid),
-            a0,
-            a1,
-            t0,
-            t1,
-            symbol0=str(r.get("position_symbol0") or ""),
-            symbol1=str(r.get("position_symbol1") or ""),
-            pair=str(r.get("pair") or ""),
-            known_prices=prices_by_chain.get(int(cid), {}),
-        )
-        cur = _opt_float(r.get("liquidity_usd"))
-        if recomputed is not None and recomputed > 0:
-            if cur is None or float(recomputed) > float(cur):
-                r["liquidity_usd"] = float(recomputed)
-        if _opt_float(r.get("liquidity_usd")) is not None:
-            r["liquidity_display"] = _format_usd_compact(_opt_float(r.get("liquidity_usd")))
-        else:
-            r["liquidity_display"] = "-"
-    return out_rows
+    return list(uniq.values())
 
 
 def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_dates: bool) -> None:
@@ -15568,6 +15521,7 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
             f"{_normalize_display_symbol(str(snap.get('token0_symbol') or row.get('position_symbol0') or '?'))}/"
             f"{_normalize_display_symbol(str(snap.get('token1_symbol') or row.get('position_symbol1') or '?'))}"
         ),
+        pool_token0_price_in_token1=_safe_float(snap.get("token0Price") or row.get("pool_token0_price")),
     )
     liq_disp = _format_usd_compact(liq_usd)
     fee_raw = str(snap.get("fee") or "").strip()
@@ -15591,6 +15545,7 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
         "liquidity": str(liq_raw),
         "liquidity_display": liq_disp,
         "liquidity_usd": liq_usd,
+        "pool_token0_price": _safe_float(snap.get("token0Price") or row.get("pool_token0_price")),
         "token0_id": token0_addr,
         "token1_id": token1_addr,
         "position_symbol0": _normalize_display_symbol(str(snap.get("token0_symbol") or row.get("position_symbol0") or "")),
