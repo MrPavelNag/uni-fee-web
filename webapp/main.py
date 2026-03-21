@@ -16574,7 +16574,9 @@ def _render_positions_page() -> str:
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_CLOSED_BG_ENRICH_KEY = "positions_v3_closed_bg_enrich_v1";
+    const POS_ACTIVE_SORT_KEY = "positions_active_sort_v1";
     const POS_CLOSED_SORT_KEY = "positions_closed_sort_v1";
+    const POS_HEAVY_ACTIVE_SORT_KEY = "positions_heavy_active_sort_v1";
     const POS_HEAVY_CLOSED_SORT_KEY = "positions_heavy_closed_sort_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
     const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
@@ -16591,13 +16593,134 @@ def _render_positions_page() -> str:
       if (t === "mismatch") return "main";
       return t;
     }
-    function normalizeClosedSortMode(raw) {
+    function normalizeTabSortMode(raw, fallback) {
       const v = String(raw || "").toLowerCase().trim();
-      const allowed = new Set(["address_asc", "address_desc", "pair_asc", "pair_desc"]);
-      return allowed.has(v) ? v : "address_asc";
+      const allowed = new Set([
+        "address_asc", "address_desc",
+        "position_id_asc", "position_id_desc",
+        "chain_asc", "chain_desc",
+        "protocol_asc", "protocol_desc",
+        "pair_asc", "pair_desc",
+        "fee_tier_asc", "fee_tier_desc",
+        "created_asc", "created_desc",
+        "status_asc", "status_desc",
+        "in_position_asc", "in_position_desc",
+        "liquidity_asc", "liquidity_desc",
+        "fees_owed_asc", "fees_owed_desc",
+      ]);
+      return allowed.has(v) ? v : String(fallback || "address_asc");
+    }
+    function normalizeActiveSortMode(raw) {
+      return normalizeTabSortMode(raw, "address_asc");
+    }
+    function normalizeClosedSortMode(raw) {
+      return normalizeTabSortMode(raw, "address_asc");
+    }
+    function sortModeParts(mode, fallbackKey) {
+      const norm = normalizeTabSortMode(mode, `${String(fallbackKey || "address")}_asc`);
+      const idx = norm.lastIndexOf("_");
+      if (idx <= 0) return { key: String(fallbackKey || "address"), dir: "asc" };
+      const key = norm.slice(0, idx) || String(fallbackKey || "address");
+      const dir = norm.slice(idx + 1) === "desc" ? "desc" : "asc";
+      return { key, dir };
+    }
+    function sortArrowFor(mode, key) {
+      const p = sortModeParts(mode, "address");
+      if (p.key !== String(key || "")) return "";
+      return p.dir === "desc" ? " ▼" : " ▲";
+    }
+    function toggleSortModeByColumn(mode, key, fallbackKey) {
+      const p = sortModeParts(mode, fallbackKey || "address");
+      const k = String(key || "").trim().toLowerCase();
+      if (!k) return normalizeTabSortMode(mode, `${String(fallbackKey || "address")}_asc`);
+      if (p.key === k) {
+        return normalizeTabSortMode(`${k}_${p.dir === "asc" ? "desc" : "asc"}`, `${String(fallbackKey || "address")}_asc`);
+      }
+      return normalizeTabSortMode(`${k}_asc`, `${String(fallbackKey || "address")}_asc`);
+    }
+    function rowSortStringValue(row, key) {
+      const r = row || {};
+      if (key === "address") return String(r.address || "").toLowerCase();
+      if (key === "position_id") return String(r.position_id || "").toLowerCase();
+      if (key === "chain") return String(r.chain || "").toLowerCase();
+      if (key === "protocol") return String(shortProtocol(r.protocol || "") || "").toLowerCase();
+      if (key === "pair") return String(r.pair || "").toLowerCase();
+      if (key === "fee_tier") return String(r.fee_tier || "").toLowerCase();
+      if (key === "created") return String(r.position_created_date || "").toLowerCase();
+      if (key === "status") return String(r.position_status || "").toLowerCase();
+      if (key === "in_position") return String(r.position_amounts_display || "").toLowerCase();
+      if (key === "liquidity") return String(r.liquidity_display || "").toLowerCase();
+      if (key === "fees_owed") return String(r.fees_owed_display || "").toLowerCase();
+      return "";
+    }
+    function rowSortNumericValue(row, key) {
+      const toNumLoose = (v) => {
+        const s = String(v || "").replace(/,/g, ".").replace(/[^0-9.+-]/g, "");
+        const n = Number(s);
+        return Number.isFinite(n) ? n : null;
+      };
+      const r = row || {};
+      if (key === "liquidity") return toNumLoose(r.liquidity_display);
+      return null;
+    }
+    function sortRowsByMode(rows, mode) {
+      const m = normalizeTabSortMode(mode, "address_asc");
+      const p = sortModeParts(m, "address");
+      const out = Array.isArray(rows) ? rows.slice() : [];
+      out.sort((a, b) => {
+        const an = rowSortNumericValue(a, p.key);
+        const bn = rowSortNumericValue(b, p.key);
+        let cmp = 0;
+        if (an !== null || bn !== null) {
+          const av = an !== null ? an : Number.NEGATIVE_INFINITY;
+          const bv = bn !== null ? bn : Number.NEGATIVE_INFINITY;
+          cmp = av < bv ? -1 : (av > bv ? 1 : 0);
+          if (cmp === 0) {
+            const as = rowSortStringValue(a, p.key);
+            const bs = rowSortStringValue(b, p.key);
+            cmp = as.localeCompare(bs);
+          }
+        } else {
+          const as = rowSortStringValue(a, p.key);
+          const bs = rowSortStringValue(b, p.key);
+          cmp = as.localeCompare(bs);
+        }
+        if (cmp === 0) {
+          const aa = String(a?.address || "").toLowerCase();
+          const ba = String(b?.address || "").toLowerCase();
+          const ap = String(a?.pair || "").toLowerCase();
+          const bp = String(b?.pair || "").toLowerCase();
+          cmp = aa.localeCompare(ba) || ap.localeCompare(bp);
+        }
+        return p.dir === "desc" ? -cmp : cmp;
+      });
+      return out;
+    }
+    function getActiveSortMode() {
+      try { return normalizeActiveSortMode(localStorage.getItem(POS_ACTIVE_SORT_KEY) || "address_asc"); } catch (_) { return "address_asc"; }
+    }
+    function setActiveSortMode(mode) {
+      try { localStorage.setItem(POS_ACTIVE_SORT_KEY, normalizeActiveSortMode(mode)); } catch (_) {}
+      renderPools(posCache.pools || []);
+    }
+    function toggleActiveSortByColumn(key) {
+      setActiveSortMode(toggleSortModeByColumn(getActiveSortMode(), key, "address"));
     }
     function getClosedSortMode() {
       try { return normalizeClosedSortMode(localStorage.getItem(POS_CLOSED_SORT_KEY) || "address_asc"); } catch (_) { return "address_asc"; }
+    }
+    function toggleClosedSortByColumn(key) {
+      setClosedSortMode(toggleSortModeByColumn(getClosedSortMode(), key, "address"));
+    }
+    function getHeavyActiveSortMode() {
+      try { return normalizeActiveSortMode(localStorage.getItem(POS_HEAVY_ACTIVE_SORT_KEY) || "address_asc"); } catch (_) { return "address_asc"; }
+    }
+    function setHeavyActiveSortMode(mode) {
+      try { localStorage.setItem(POS_HEAVY_ACTIVE_SORT_KEY, normalizeActiveSortMode(mode)); } catch (_) {}
+      renderHeavyPools(posHeavyCache.pools || []);
+    }
+    function toggleHeavyActiveSortByColumn(key) {
+      setHeavyActiveSortMode(toggleSortModeByColumn(getHeavyActiveSortMode(), key, "address"));
     }
     function getHeavyClosedSortMode() {
       try { return normalizeClosedSortMode(localStorage.getItem(POS_HEAVY_CLOSED_SORT_KEY) || "address_asc"); } catch (_) { return "address_asc"; }
@@ -16610,20 +16733,8 @@ def _render_positions_page() -> str:
       try { localStorage.setItem(POS_HEAVY_CLOSED_SORT_KEY, normalizeClosedSortMode(mode)); } catch (_) {}
       renderHeavyPools(posHeavyCache.pools || []);
     }
-    function sortClosedRows(rows, mode) {
-      const m = normalizeClosedSortMode(mode);
-      const out = Array.isArray(rows) ? rows.slice() : [];
-      out.sort((a, b) => {
-        const aa = String(a?.address || "").toLowerCase();
-        const ba = String(b?.address || "").toLowerCase();
-        const ap = String(a?.pair || "").toLowerCase();
-        const bp = String(b?.pair || "").toLowerCase();
-        if (m === "address_desc") return ba.localeCompare(aa) || ap.localeCompare(bp);
-        if (m === "pair_asc") return ap.localeCompare(bp) || aa.localeCompare(ba);
-        if (m === "pair_desc") return bp.localeCompare(ap) || aa.localeCompare(ba);
-        return aa.localeCompare(ba) || ap.localeCompare(bp);
-      });
-      return out;
+    function toggleHeavyClosedSortByColumn(key) {
+      setHeavyClosedSortMode(toggleSortModeByColumn(getHeavyClosedSortMode(), key, "address"));
     }
     function switchPosPoolsTab(name, silent) {
       const mainW = document.getElementById("posPoolsTableMainWrap");
@@ -16721,9 +16832,31 @@ def _render_positions_page() -> str:
     let posFinalClosedCount = 0;
     let posFinalClosedSec = 0;
     function countActiveRows(rows) {
+      const list = rows || [];
+      const trustedSpamKeys = getTrustedSpamKeys();
+      const manualHiddenKeys = getManualHiddenKeys();
+      const hasCatalogSegments = list.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
       let n = 0;
-      for (const r of (rows || [])) {
+      for (const r of list) {
         if (!r || typeof r !== "object") continue;
+        const rowKey = poolRowKey(r);
+        const trusted = trustedSpamKeys.has(rowKey);
+        const manual = manualHiddenKeys.has(rowKey);
+        const suspected = Boolean(r.suspected_spam || r.spam_skipped);
+        const metaPhish = !!(r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1);
+        const up = r.unsupported_protocol;
+        const unsupported = up === true || up === 1 || up === "true";
+        const seg = String(r.catalog_segment || "").toLowerCase();
+        const isClosed = hasCatalogSegments && seg === "closed";
+        const pmBad = r.nft_catalog_pm_snapshot_ok === false;
+        // Keep final "active" summary aligned with the main Positions tab.
+        if (metaPhish && !trusted) continue;
+        if (unsupported) continue;
+        if (isClosed) continue;
+        if (manual) continue;
+        if (hasPairMismatch(r)) continue;
+        if (suspected && !trusted) continue;
+        if (pmBad) continue;
         if (String(r.position_status || "").toLowerCase() === "active") n += 1;
       }
       return n;
@@ -16740,8 +16873,8 @@ def _render_positions_page() -> str:
     }
     function formatSecShort(sec) {
       const s = Math.max(0, Number(sec) || 0);
-      if (!Number.isFinite(s) || s <= 0) return "0 сек";
-      if (s < 60) return `${Math.round(s)} сек`;
+      if (!Number.isFinite(s) || s <= 0) return "0s";
+      if (s < 60) return `${Math.round(s)}s`;
       return formatScanDuration(s);
     }
     function setPosFinalSummaryStatus() {
@@ -16749,7 +16882,7 @@ def _render_positions_page() -> str:
       const cN = Math.max(0, Number(posFinalClosedCount) || 0);
       const aS = formatSecShort(posFinalActiveSec);
       const cS = formatSecShort(posFinalClosedSec);
-      setPosStatus(`Итог: активные — ${aN}, ${aS}; закрытые — ${cN}, ${cS}`, false);
+      setPosStatus(`Summary: active — ${aN}, ${aS}; closed — ${cN}, ${cS}`, false);
     }
     async function enrichClosedRowsCreatedDates(scope = "v3") {
       const isHeavy = String(scope || "") === "heavy";
@@ -16933,14 +17066,19 @@ def _render_positions_page() -> str:
     function finishPosStatusLane(name) {
       const lane = posStatusLanes[name];
       if (!lane) return;
-      const elapsed = laneElapsedSec(lane);
+      const now = Date.now();
+      const byAnchor = lane.pollWallMs > 0
+        ? Math.max(0, Number(lane.elapsedAnchor || 0) + (now - lane.pollWallMs) / 1000)
+        : Math.max(0, Number(lane.elapsedAnchor || 0));
+      const byStart = lane.startMs > 0 ? Math.max(0, (now - lane.startMs) / 1000) : 0;
+      const elapsed = Math.max(0, Number(lane.lastDoneSec || 0), byAnchor, byStart);
       lane.running = false;
       lane.queued = false;
       lane.progress = 100;
       lane.lastDoneSec = Math.max(0, elapsed);
-      lane.doneAtMs = Date.now();
+      lane.doneAtMs = now;
       lane.elapsedAnchor = lane.lastDoneSec;
-      lane.pollWallMs = Date.now();
+      lane.pollWallMs = now;
       ensurePosRuntimeTicker();
       renderPosStatus();
     }
@@ -17802,7 +17940,8 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const totalCols = 13;
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
+      const activeSortMode = getActiveSortMode();
+      let html = `<tr><th onclick="toggleActiveSortByColumn('address')" style="cursor:pointer" title="Sort by Address">Address${sortArrowFor(activeSortMode, "address")}</th><th onclick="toggleActiveSortByColumn('position_id')" style="cursor:pointer" title="Sort by Position ID">Position ID${sortArrowFor(activeSortMode, "position_id")}</th><th onclick="toggleActiveSortByColumn('chain')" style="cursor:pointer" title="Sort by Chain">Chain${sortArrowFor(activeSortMode, "chain")}</th><th onclick="toggleActiveSortByColumn('protocol')" style="cursor:pointer" title="Sort by Protocol">Protocol${sortArrowFor(activeSortMode, "protocol")}</th><th onclick="toggleActiveSortByColumn('pair')" style="cursor:pointer" title="Sort by Pair">Pair${sortArrowFor(activeSortMode, "pair")}</th><th onclick="toggleActiveSortByColumn('fee_tier')" style="cursor:pointer" title="Sort by Fee tier">Fee tier${sortArrowFor(activeSortMode, "fee_tier")}</th><th onclick="toggleActiveSortByColumn('created')" style="white-space:nowrap;cursor:pointer" title="Position mint or first-seen date">Created${sortArrowFor(activeSortMode, "created")}</th><th onclick="toggleActiveSortByColumn('status')" style="cursor:pointer" title="Sort by status">St.${sortArrowFor(activeSortMode, "status")}</th><th>Hide</th><th onclick="toggleActiveSortByColumn('in_position')" style="cursor:pointer" title='Sort by In position'>In position${sortArrowFor(activeSortMode, "in_position")}</th><th onclick="toggleActiveSortByColumn('liquidity')" style="cursor:pointer" title='Calculated from In position amounts and external token prices. Click to sort'>Liquidity${sortArrowFor(activeSortMode, "liquidity")}</th><th onclick="toggleActiveSortByColumn('fees_owed')" style="cursor:pointer" title='Sort by Unclaimed fees'>Unclaimed fees${sortArrowFor(activeSortMode, "fees_owed")}</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       const listAll = rows || [];
       const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
       const hasExplorerNftCatalog = listAll.some((x) => {
@@ -17874,8 +18013,9 @@ def _render_positions_page() -> str:
         }
         visible.push(row);
       }
-      for (let i = 0; i < visible.length; i++) {
-        const r = visible[i];
+      const visibleSorted = sortRowsByMode(visible, activeSortMode);
+      for (let i = 0; i < visibleSorted.length; i++) {
+        const r = visibleSorted[i];
         const pairTrace = String(r.pair_symbol_source || "").trim();
         const pairTitleRaw = pairTrace ? `source: ${pairTrace}` : "";
         const pairTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
@@ -17972,8 +18112,8 @@ def _render_positions_page() -> str:
         protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate (collection name/symbol must suggest Uniswap or Pancake before on-chain PM work).</td></tr>`;
       }
       const closedSortMode = getClosedSortMode();
-      const closedRowsSorted = sortClosedRows(closedTabRows, closedSortMode);
-      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
+      const closedRowsSorted = sortRowsByMode(closedTabRows, closedSortMode);
+      let closedHtml = `<tr><th onclick="toggleClosedSortByColumn('address')" style="cursor:pointer" title="Sort by Address">Address${sortArrowFor(closedSortMode, "address")}</th><th onclick="toggleClosedSortByColumn('position_id')" style="cursor:pointer" title="Sort by Position ID">Position ID${sortArrowFor(closedSortMode, "position_id")}</th><th onclick="toggleClosedSortByColumn('chain')" style="cursor:pointer" title="Sort by Chain">Chain${sortArrowFor(closedSortMode, "chain")}</th><th onclick="toggleClosedSortByColumn('protocol')" style="cursor:pointer" title="Sort by Protocol">Protocol${sortArrowFor(closedSortMode, "protocol")}</th><th onclick="toggleClosedSortByColumn('pair')" style="cursor:pointer" title="Sort by Pair">Pair${sortArrowFor(closedSortMode, "pair")}</th><th onclick="toggleClosedSortByColumn('fee_tier')" style="cursor:pointer" title="Sort by Fee tier">Fee tier${sortArrowFor(closedSortMode, "fee_tier")}</th><th onclick="toggleClosedSortByColumn('created')" style="white-space:nowrap;cursor:pointer" title="Position mint or first-seen date">Created${sortArrowFor(closedSortMode, "created")}</th><th onclick="toggleClosedSortByColumn('status')" style="cursor:pointer" title="Sort by status">St.${sortArrowFor(closedSortMode, "status")}</th><th>Hide</th><th onclick="toggleClosedSortByColumn('in_position')" style="cursor:pointer" title='Sort by In position'>In position${sortArrowFor(closedSortMode, "in_position")}</th><th onclick="toggleClosedSortByColumn('liquidity')" style="cursor:pointer" title='Calculated from In position amounts and external token prices. Click to sort'>Liquidity${sortArrowFor(closedSortMode, "liquidity")}</th><th onclick="toggleClosedSortByColumn('fees_owed')" style="cursor:pointer" title='Sort by Unclaimed fees'>Unclaimed fees${sortArrowFor(closedSortMode, "fees_owed")}</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let ci = 0; ci < closedRowsSorted.length; ci++) {
         const r = closedRowsSorted[ci];
         const mismatch = hasPairMismatch(r);
@@ -18055,7 +18195,10 @@ def _render_positions_page() -> str:
       const clSortBar = document.getElementById("posPoolsClosedSortBar");
       const clSortSel = document.getElementById("posClosedSortSelect");
       if (clSortBar) clSortBar.style.display = closedTabRows.length ? "" : "none";
-      if (clSortSel) clSortSel.value = closedSortMode;
+      if (clSortSel) {
+        const hasMode = Array.from(clSortSel.options || []).some((o) => String(o.value || "") === closedSortMode);
+        if (hasMode) clSortSel.value = closedSortMode;
+      }
       const spTable = document.getElementById("posPoolsSpamTable");
       if (spTable) spTable.innerHTML = spamHtml;
       const otTable = document.getElementById("posPoolsOtherTable");
@@ -18277,7 +18420,8 @@ def _render_positions_page() -> str:
         const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
         return Boolean(r && (r.suspected_spam || r.spam_skipped || ph));
       }
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
+      const heavyActiveSortMode = getHeavyActiveSortMode();
+      let html = `<tr><th onclick="toggleHeavyActiveSortByColumn('address')" style="cursor:pointer" title="Sort by Address">Address${sortArrowFor(heavyActiveSortMode, "address")}</th><th onclick="toggleHeavyActiveSortByColumn('position_id')" style="cursor:pointer" title="Sort by Position ID">Position ID${sortArrowFor(heavyActiveSortMode, "position_id")}</th><th onclick="toggleHeavyActiveSortByColumn('chain')" style="cursor:pointer" title="Sort by Chain">Chain${sortArrowFor(heavyActiveSortMode, "chain")}</th><th onclick="toggleHeavyActiveSortByColumn('protocol')" style="cursor:pointer" title="Sort by Protocol">Protocol${sortArrowFor(heavyActiveSortMode, "protocol")}</th><th onclick="toggleHeavyActiveSortByColumn('pair')" style="cursor:pointer" title="Sort by Pair">Pair${sortArrowFor(heavyActiveSortMode, "pair")}</th><th onclick="toggleHeavyActiveSortByColumn('fee_tier')" style="cursor:pointer" title="Sort by Fee tier">Fee tier${sortArrowFor(heavyActiveSortMode, "fee_tier")}</th><th onclick="toggleHeavyActiveSortByColumn('created')" style="white-space:nowrap;cursor:pointer" title="Position mint or first-seen date">Created${sortArrowFor(heavyActiveSortMode, "created")}</th><th onclick="toggleHeavyActiveSortByColumn('status')" style="cursor:pointer" title="Sort by status">St.${sortArrowFor(heavyActiveSortMode, "status")}</th><th>Hide</th><th onclick="toggleHeavyActiveSortByColumn('in_position')" style="cursor:pointer" title='Sort by In position'>In position${sortArrowFor(heavyActiveSortMode, "in_position")}</th><th onclick="toggleHeavyActiveSortByColumn('liquidity')" style="cursor:pointer" title='Calculated from In position amounts and external token prices. Click to sort'>Liquidity${sortArrowFor(heavyActiveSortMode, "liquidity")}</th><th onclick="toggleHeavyActiveSortByColumn('fees_owed')" style="cursor:pointer" title='Sort by Unclaimed fees'>Unclaimed fees${sortArrowFor(heavyActiveSortMode, "fees_owed")}</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       if (!listAll.length) {
         html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.</td></tr>`;
         table.innerHTML = html;
@@ -18347,8 +18491,9 @@ def _render_positions_page() -> str:
         }
         visible.push(r);
       }
-      for (let i = 0; i < visible.length; i++) {
-        const r = visible[i];
+      const heavyVisibleSorted = sortRowsByMode(visible, heavyActiveSortMode);
+      for (let i = 0; i < heavyVisibleSorted.length; i++) {
+        const r = heavyVisibleSorted[i];
         const pairTrace = String(r.pair_symbol_source || "").trim();
         const pairTitleRaw = pairTrace ? `source: ${pairTrace}` : "";
         const pairTitle = pairTitleRaw ? ` title="${escAttr(pairTitleRaw)}"` : "";
@@ -18376,6 +18521,7 @@ def _render_positions_page() -> str:
           : `<tr><td colspan='13'>No positions found.</td></tr>`;
       }
       const stCols = 12;
+      const closedCols = 13;
       let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let pi = 0; pi < protocolRows.length; pi++) {
         const r = protocolRows[pi];
@@ -18398,8 +18544,8 @@ def _render_positions_page() -> str:
       }
       if (!protocolRows.length) protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate.</td></tr>`;
       const heavyClosedSortMode = getHeavyClosedSortMode();
-      const heavyClosedRowsSorted = sortClosedRows(closedTabRows, heavyClosedSortMode);
-      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
+      const heavyClosedRowsSorted = sortRowsByMode(closedTabRows, heavyClosedSortMode);
+      let closedHtml = `<tr><th onclick="toggleHeavyClosedSortByColumn('address')" style="cursor:pointer" title="Sort by Address">Address${sortArrowFor(heavyClosedSortMode, "address")}</th><th onclick="toggleHeavyClosedSortByColumn('position_id')" style="cursor:pointer" title="Sort by Position ID">Position ID${sortArrowFor(heavyClosedSortMode, "position_id")}</th><th onclick="toggleHeavyClosedSortByColumn('chain')" style="cursor:pointer" title="Sort by Chain">Chain${sortArrowFor(heavyClosedSortMode, "chain")}</th><th onclick="toggleHeavyClosedSortByColumn('protocol')" style="cursor:pointer" title="Sort by Protocol">Protocol${sortArrowFor(heavyClosedSortMode, "protocol")}</th><th onclick="toggleHeavyClosedSortByColumn('pair')" style="cursor:pointer" title="Sort by Pair">Pair${sortArrowFor(heavyClosedSortMode, "pair")}</th><th onclick="toggleHeavyClosedSortByColumn('fee_tier')" style="cursor:pointer" title="Sort by Fee tier">Fee tier${sortArrowFor(heavyClosedSortMode, "fee_tier")}</th><th onclick="toggleHeavyClosedSortByColumn('created')" style="white-space:nowrap;cursor:pointer" title="Position mint or first-seen date">Created${sortArrowFor(heavyClosedSortMode, "created")}</th><th onclick="toggleHeavyClosedSortByColumn('status')" style="cursor:pointer" title="Sort by status">St.${sortArrowFor(heavyClosedSortMode, "status")}</th><th>Hide</th><th onclick="toggleHeavyClosedSortByColumn('in_position')" style="cursor:pointer" title='Sort by In position'>In position${sortArrowFor(heavyClosedSortMode, "in_position")}</th><th onclick="toggleHeavyClosedSortByColumn('liquidity')" style="cursor:pointer" title='Calculated from In position amounts and external token prices. Click to sort'>Liquidity${sortArrowFor(heavyClosedSortMode, "liquidity")}</th><th onclick="toggleHeavyClosedSortByColumn('fees_owed')" style="cursor:pointer" title='Sort by Unclaimed fees'>Unclaimed fees${sortArrowFor(heavyClosedSortMode, "fees_owed")}</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let ci = 0; ci < heavyClosedRowsSorted.length; ci++) {
         const r = heavyClosedRowsSorted[ci];
         const mismatch = hasPairMismatch(r);
@@ -18513,7 +18659,10 @@ def _render_positions_page() -> str:
       const hClSortBar = document.getElementById("posHeavyClosedSortBar");
       const hClSortSel = document.getElementById("posHeavyClosedSortSelect");
       if (hClSortBar) hClSortBar.style.display = closedTabRows.length ? "" : "none";
-      if (hClSortSel) hClSortSel.value = heavyClosedSortMode;
+      if (hClSortSel) {
+        const hasMode = Array.from(hClSortSel.options || []).some((o) => String(o.value || "") === heavyClosedSortMode);
+        if (hasMode) hClSortSel.value = heavyClosedSortMode;
+      }
       const spTable = document.getElementById("posHeavyPoolsSpamTable");
       if (spTable) spTable.innerHTML = spamHtml;
       const otTable = document.getElementById("posHeavyPoolsOtherTable");
