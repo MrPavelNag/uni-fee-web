@@ -785,7 +785,11 @@ DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
         "https://mainnet.base.org",
         "https://1rpc.io/base",
     ],
-    42161: ["https://arbitrum-one-rpc.publicnode.com"],
+    42161: [
+        "https://1rpc.io/arb",
+        "https://arb1.arbitrum.io/rpc",
+        "https://arbitrum-one-rpc.publicnode.com",
+    ],
 }
 
 # Адреса крупных активов по сети (TOKEN_ADDRESSES / импорт каталога) — те же, что для «Find the best fee on Uniswap»
@@ -14101,7 +14105,8 @@ def _fee_collect_log_chunk_blocks(chain_id: int) -> int:
     cid = int(chain_id)
     if cid == 1:
         return max(2000, min(50_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_ETH", "8000"))))
-    return max(4000, min(200_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_L2", "45000"))))
+    # Many public L2 RPCs (including 1RPC) reject eth_getLogs ranges >10k blocks.
+    return max(2000, min(20_000, int(os.environ.get("POSITIONS_FEE_LOG_CHUNK_L2", "10000"))))
 
 
 def _fee_collect_log_max_chunks() -> int:
@@ -14187,6 +14192,11 @@ def _fetch_v3_position_fees_by_collect_logs(
     dec1 = _fetch_erc20_decimals_onchain(cid, t1)
     from_block = _eth_first_block_at_or_after_ts(cid, int(since_ts))
     latest = _eth_block_number(cid)
+    # Fallback when timestamp->block lookup is inconclusive: bounded recent window.
+    if (from_block <= 0 or from_block > latest) and latest > 0 and int(since_ts) > 0:
+        approx_blocks_per_day = 7200 if cid == 1 else 345_600
+        lookback_days = max(1, int((time.time() - int(since_ts)) // 86400) + 1)
+        from_block = max(1, int(latest) - int(approx_blocks_per_day * lookback_days))
     if from_block <= 0 or latest <= 0 or from_block > latest:
         return {}, empty_meta
 
@@ -22546,8 +22556,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "estimated_mode": "none",
         })
 
-    # For on-chain/subgraph collect-history scans, do not go earlier than known creation date
-    # (pool preferred, then position), to reduce scan cost and avoid impossible ranges.
+    # For on-chain/subgraph collect-history scans, do not go earlier than known creation date.
+    # Use the later known date between pool and position (when both exist).
+    date_candidates: list[tuple[int, str, str]] = []
     for raw_dt, src in (
         (str(getattr(req, "pool_created_date", "") or "").strip(), "pool_created_date"),
         (str(getattr(req, "position_created_date", "") or "").strip(), "position_created_date"),
@@ -22559,10 +22570,14 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             continue
         ts = int(dt.timestamp())
         if ts > 0:
-            collect_since_ts = max(int(collect_since_ts), int(ts))
-            debug["collect_start_source"] = src
-            debug["collect_start_date"] = raw_dt
-            break
+            date_candidates.append((int(ts), src, raw_dt))
+    if date_candidates:
+        date_candidates.sort(key=lambda x: x[0], reverse=True)
+        best_ts, best_src, best_raw = date_candidates[0]
+        collect_since_ts = max(int(collect_since_ts), int(best_ts))
+        debug["collect_start_source"] = best_src
+        debug["collect_start_date"] = best_raw
+        debug["collect_start_candidates"] = [f"{src}:{raw}" for _ts, src, raw in date_candidates[:3]]
     debug["collect_start_ts"] = int(collect_since_ts)
 
     position_ids = _fee_series_position_ids_from_request(req)
