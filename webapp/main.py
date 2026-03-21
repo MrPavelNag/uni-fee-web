@@ -13946,12 +13946,15 @@ def _fee_collect_log_max_chunks() -> int:
     return max(10, min(500, int(os.environ.get("POSITIONS_FEE_LOG_MAX_CHUNKS", "220"))))
 
 
-def _minimal_pool_dict_for_fee_usd(token0: str, token1: str, dec0: int, dec1: int) -> dict[str, Any]:
-    return {
-        "token0": {"id": str(token0).strip().lower(), "decimals": str(int(dec0))},
-        "token1": {"id": str(token1).strip().lower(), "decimals": str(int(dec1))},
-        "token0Price": None,
-    }
+def _collect_log_protocol_candidates(protocol: str) -> list[str]:
+    p = str(protocol or "").strip().lower()
+    if p not in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+        return [p] if p else []
+    out = [p]
+    for c in ("uniswap_v3", "pancake_v3", "pancake_v3_staked"):
+        if c not in out:
+            out.append(c)
+    return out
 
 
 def _eth_uint_from_rpc_field(val: Any) -> int:
@@ -22561,6 +22564,47 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     rpc_by_day, rpc_meta = {}, {"pricing": "none", "detail": "RPC fee fallback timed out."}
                 finally:
                     ex.shutdown(wait=False, cancel_futures=True)
+                # Retry with alternative PM mapping and longer lookback when first pass is empty.
+                if not rpc_by_day:
+                    elapsed2 = max(0.0, time.monotonic() - started_mono)
+                    rem2 = max(0.0, total_budget_sec - elapsed2)
+                    if rem2 > 1.2:
+                        alt_protocol = ""
+                        for cand in _collect_log_protocol_candidates(protocol):
+                            if cand != protocol:
+                                alt_protocol = cand
+                                break
+                        if alt_protocol:
+                            lookback_days = max(int(days), 180)
+                            retry_since_ts = int(now_ts - int(lookback_days) * 86400)
+                            debug["rpc_retry_protocol"] = str(alt_protocol)
+                            debug["rpc_retry_days"] = int(lookback_days)
+                            debug["rpc_retry_rem_sec"] = float(rem2)
+                            try:
+                                ex2 = ThreadPoolExecutor(max_workers=1)
+                                fut2 = ex2.submit(
+                                    _fetch_v3_position_fees_by_collect_logs,
+                                    chain_id,
+                                    alt_protocol,
+                                    position_ids[:20],
+                                    since_ts=retry_since_ts,
+                                    token0_addr=token0,
+                                    token1_addr=token1,
+                                    use_historical_usd=want_hist_usd,
+                                )
+                                try:
+                                    rpc_by_day2, rpc_meta2 = fut2.result(timeout=float(max(1.0, min(rem2, rpc_budget_sec))))
+                                except FuturesTimeoutError:
+                                    debug["rpc_retry_timeout"] = True
+                                    rpc_by_day2, rpc_meta2 = {}, {"pricing": "none", "detail": "RPC retry timed out."}
+                                finally:
+                                    ex2.shutdown(wait=False, cancel_futures=True)
+                                if rpc_by_day2:
+                                    rpc_by_day = dict(rpc_by_day2)
+                                    rpc_meta = dict(rpc_meta2 or {})
+                                    debug["rpc_retry_used"] = True
+                            except Exception:
+                                debug["rpc_retry_error"] = True
         except Exception:
             rpc_by_day, rpc_meta = {}, {"pricing": "none", "detail": ""}
     debug["rpc_points"] = int(len(rpc_by_day))
