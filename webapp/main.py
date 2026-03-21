@@ -17913,7 +17913,6 @@ def _render_positions_page() -> str:
       }
       const stCols = 12;
       const closedCols = 13;
-      const closedCols = 13;
       let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let pi = 0; pi < protocolRows.length; pi++) {
         const r = protocolRows[pi];
