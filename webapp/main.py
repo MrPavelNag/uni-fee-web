@@ -16238,6 +16238,14 @@ def _render_positions_page() -> str:
     #posFeeStatus { font-size:15px; font-weight:600; color:#334155; }
     #posFeeBody .hint { font-size:13px; line-height:1.45; color:#475569; margin:0 0 10px; }
     #posFeeChart { height:360px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
+    #posFeeDebug { margin-top:10px; }
+    .fee-toggle-pill {
+      display:inline-flex; align-items:center; gap:7px;
+      border:1px solid #cbd5e1; background:#f8fafc; border-radius:999px;
+      padding:6px 11px; cursor:pointer;
+    }
+    .fee-toggle-pill:hover { border-color:#93c5fd; background:#eff6ff; }
+    .fee-toggle-pill input { margin:0; width:15px; height:15px; }
     .fee-card .pos-fee-hist-label { font-size:15px; font-weight:700; color:#334155; }
     .fee-card .search-link-btn { font-size:20px; }
     @media (max-width: 1100px) {
@@ -16359,9 +16367,9 @@ def _render_positions_page() -> str:
           <h3>Fee calculation</h3>
           <div class="section-actions">
             <span class="pos-status" id="posFeeStatus">Select History checkboxes, then click Scan</span>
-            <label class="pos-fee-hist-label" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
+            <label class="fee-toggle-pill" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
               <input type="checkbox" id="posFeeHistoricalUsd" />
-              <span>Historical USD</span>
+              <span class="pos-fee-hist-label">Historical USD</span>
             </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Scan</button>
             <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
@@ -16370,6 +16378,7 @@ def _render_positions_page() -> str:
         <div id="posFeeBody" class="section-body">
           <p class="hint">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
           <div id="posFeeChart"></div>
+          <div id="posFeeDebug" class="info-box" style="display:none"></div>
         </div>
       </section>
     </div>
@@ -17139,10 +17148,12 @@ def _render_positions_page() -> str:
     }
     async function showSelectedPositionFees() {
       const chartEl = document.getElementById("posFeeChart");
+      const debugEl = document.getElementById("posFeeDebug");
       if (!chartEl) return;
+      if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
-        setPosFeeStatus("Tick at least one History checkbox in the V3 or v4 / Pancake V3 Farming / Infinity table (same as for TVL).", true);
+        setPosFeeStatus("Select at least one History checkbox in the Scan table", true);
         return;
       }
       try {
@@ -17162,6 +17173,7 @@ def _render_positions_page() -> str:
           missingTokens: 0,
         };
         const apiFailTop = [];
+        const backendHints = [];
         for (let i = 0; i < selected.length; i++) {
           const hk = parseHistoryKey(selected[i]);
           const idx = hk.idx;
@@ -17200,6 +17212,14 @@ def _render_positions_page() -> str:
             body: JSON.stringify(payload),
           });
           const data = await res.json().catch(() => ({}));
+          if (data && data.debug && backendHints.length < 5) {
+            const d = data.debug || {};
+            const mode = String(d.result_mode || data.mode || "");
+            const rpcPts = Number(d.rpc_points || 0);
+            const subPts = Number(d.subgraph_points || 0);
+            const msg = `${String(row.pair || row.pool_id || "?")}: mode=${mode || "-"}, subgraph_points=${subPts}, rpc_points=${rpcPts}`;
+            backendHints.push(msg);
+          }
           if (!res.ok) {
             const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
             console.warn("position-fee-series failed", row.pair || row.pool_id, det);
@@ -17235,6 +17255,20 @@ def _render_positions_page() -> str:
           const reasonLine = reasons.length ? reasons.join(" | ") : "all selected rows returned empty fee series";
           const apiTopHtml = apiFailTop.length ? `<br/>Top API errors: ${esc(apiFailTop.join(" ; "))}` : "";
           chartEl.innerHTML = `<div class='hint'><b>No fee data</b><br/>${esc(reasonLine)}${apiTopHtml}<br/>Tip: run a fresh table scan first so token ids/symbols are enriched before fee fallback.</div>`;
+          if (debugEl) {
+            const parts = [];
+            parts.push(`<b>Debug</b>`);
+            parts.push(`Selected: ${diag.selected}`);
+            parts.push(`Unsupported protocol: ${diag.unsupported}`);
+            parts.push(`API errors: ${diag.apiFail}`);
+            parts.push(`Empty fee series: ${diag.emptySeries}`);
+            parts.push(`Missing token0/token1: ${diag.missingTokens}`);
+            parts.push(`Stale selected row refs: ${diag.missingRow}`);
+            if (apiFailTop.length) parts.push(`Top API errors: ${esc(apiFailTop.join(" ; "))}`);
+            if (backendHints.length) parts.push(`Backend: ${esc(backendHints.join(" | "))}`);
+            debugEl.innerHTML = parts.join("<br/>");
+            debugEl.style.display = "";
+          }
           setPosFeeStatus(`No fee data · ${reasonLine}`, true);
           return;
         }
@@ -17253,6 +17287,10 @@ def _render_positions_page() -> str:
         setPosFeeStatus(`Done: ${traces.length} position(s)${pr}`, false);
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Error: ${esc(e?.message || "unknown")}</div>`;
+        if (debugEl) {
+          debugEl.innerHTML = `<b>Debug</b><br/>Unexpected UI error: ${esc(e?.message || "unknown")}`;
+          debugEl.style.display = "";
+        }
         setPosFeeStatus("Failed to build chart", true);
       }
     }
@@ -21030,24 +21068,44 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     if chain_id <= 0 and chain_id_hint > 0 and chain_id_hint in CHAIN_ID_TO_KEY:
         chain_id = int(chain_id_hint)
         chain_key = str(CHAIN_ID_TO_KEY[int(chain_id)]).strip().lower()
+    debug: dict[str, Any] = {
+        "chain": chain_key,
+        "chain_id": int(chain_id),
+        "protocol": protocol,
+        "version": version,
+        "days": int(days),
+    }
+
+    def _with_debug(payload: dict[str, Any]) -> dict[str, Any]:
+        out = dict(payload or {})
+        out["debug"] = dict(debug)
+        return out
+
     if chain_id <= 0:
-        return {
+        debug["result_mode"] = "unavailable"
+        debug["result_count"] = 0
+        debug["reason"] = "unknown_chain"
+        return _with_debug({
             "items": [],
             "count": 0,
             "mode": "unavailable",
             "fee_pricing": "none",
             "note": "unknown chain",
-        }
+        })
 
     position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
+    debug["position_ids_count"] = len(position_ids)
     if not position_ids:
-        return {
+        debug["result_mode"] = "unavailable"
+        debug["result_count"] = 0
+        debug["reason"] = "no_position_ids"
+        return _with_debug({
             "items": [],
             "count": 0,
             "mode": "unavailable",
             "fee_pricing": "none",
             "note": "no position ids",
-        }
+        })
 
     token0 = str(req.token0_id or "").strip().lower()
     token1 = str(req.token1_id or "").strip().lower()
@@ -21057,6 +21115,12 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         token1 = _token_addr_by_symbol_for_chain(chain_key, str(getattr(req, "token1_symbol", "") or ""))
     want_hist_usd = bool(getattr(req, "fee_usd_historical", False))
     endpoint = get_graph_endpoint(chain_key, version=version)
+    debug["token0_resolved"] = bool(_is_eth_address(token0))
+    debug["token1_resolved"] = bool(_is_eth_address(token1))
+    debug["endpoint_configured"] = bool(endpoint)
+    debug["rpc_enabled"] = bool(_position_fee_rpc_fallback_enabled())
+    debug["rpc_force"] = bool(_position_fee_rpc_force_onchain())
+    debug["fee_usd_historical"] = bool(want_hist_usd)
 
     exact_by_day: dict[int, float] = {}
     if endpoint:
@@ -21072,6 +21136,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     exact_by_day[int(ts)] = float(exact_by_day.get(int(ts), 0.0) + float(value))
             except Exception:
                 continue
+    debug["subgraph_points"] = int(len(exact_by_day))
 
     sub_max = max(exact_by_day.values()) if exact_by_day else 0.0
     rpc_by_day: dict[int, float] = {}
@@ -21094,6 +21159,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             )
         except Exception:
             rpc_by_day, rpc_meta = {}, {"pricing": "none", "detail": ""}
+    debug["rpc_points"] = int(len(rpc_by_day))
+    debug["rpc_pricing"] = str((rpc_meta or {}).get("pricing") or "none")
+    debug["rpc_detail"] = str((rpc_meta or {}).get("detail") or "")
 
     force_rpc = _position_fee_rpc_force_onchain()
     rpc_detail = str((rpc_meta or {}).get("detail") or "").strip()
@@ -21103,54 +21171,65 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
 
     if force_rpc and rpc_by_day:
-        return {
+        debug["result_mode"] = "onchain-collect-logs"
+        debug["result_count"] = len(rpc_by_day)
+        return _with_debug({
             "items": _pack_fee_items(rpc_by_day),
             "count": len(rpc_by_day),
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
             "note": "POSITIONS_FEE_RPC_FORCE: " + (rpc_detail or "NPM Collect logs."),
-        }
+        })
 
     if exact_by_day and sub_max >= 1e-6 and not force_rpc:
         snap_note = "Subgraph positionSnapshots collectedFees, valued in USD."
         if want_hist_usd:
             snap_note += " (Historical USD applies only to the NPM Collect log series; subgraph series unchanged.)"
-        return {
+        debug["result_mode"] = "exact-snapshots"
+        debug["result_count"] = len(exact_by_day)
+        return _with_debug({
             "items": _pack_fee_items(exact_by_day),
             "count": len(exact_by_day),
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
             "note": snap_note,
-        }
+        })
 
     if rpc_by_day:
-        return {
+        debug["result_mode"] = "onchain-collect-logs"
+        debug["result_count"] = len(rpc_by_day)
+        return _with_debug({
             "items": _pack_fee_items(rpc_by_day),
             "count": len(rpc_by_day),
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
             "note": "Subgraph fee field empty/zero — " + (rpc_detail or "NPM Collect logs."),
-        }
+        })
 
     if exact_by_day:
         low_note = "Subgraph collectedFees (USD); may be incomplete where subgraph indexing is wrong."
         if want_hist_usd:
             low_note += " (Historical USD applies only to the NPM Collect log series.)"
-        return {
+        debug["result_mode"] = "exact-snapshots"
+        debug["result_count"] = len(exact_by_day)
+        return _with_debug({
             "items": _pack_fee_items(exact_by_day),
             "count": len(exact_by_day),
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
             "note": low_note,
-        }
+        })
 
-    return {
+    debug["result_mode"] = "unavailable"
+    debug["result_count"] = 0
+    debug["reason"] = "no_subgraph_or_rpc_fee_data"
+    return _with_debug({
         "items": [],
         "count": 0,
         "mode": "unavailable",
         "fee_pricing": "none",
         "note": "No fee data: subgraph empty and on-chain Collect logs missing, or token0_id/token1_id needed for RPC fallback.",
-    }
+    })
 
 
 @app.post("/api/help/tickets")
