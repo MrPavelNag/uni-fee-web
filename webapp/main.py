@@ -14352,13 +14352,17 @@ def _explorer_get_logs_for_pool_events(
     req_used = 0
     template_used = ""
     topic_used = ""
+    status_seen = ""
+    message_seen = ""
     for tmpl in templates:
+        local_any: list[dict[str, Any]] = []
+        topic_hits: list[str] = []
         for t0 in topic0s:
             req_page = 1
             local_logs: list[dict[str, Any]] = []
             while req_page <= lim_pages:
                 url = (
-                    f"{tmpl}&fromBlock={int(from_block)}&toBlock={int(to_block)}&address={pool}"
+                    f"{tmpl}&fromBlock={hex(int(from_block))}&toBlock={hex(int(to_block))}&address={pool}"
                     f"&topic0={str(t0)}&page={int(req_page)}&offset={int(lim_off)}"
                 )
                 req_used += 1
@@ -14369,6 +14373,8 @@ def _explorer_get_logs_for_pool_events(
                         payload = json.loads(resp.read().decode("utf-8"))
                 except Exception:
                     payload = {}
+                status_seen = str((payload or {}).get("status") or status_seen)
+                message_seen = str((payload or {}).get("message") or message_seen)
                 result_rows = _etherscan_api_coerce_result_rows((payload or {}).get("result"))
                 if not result_rows:
                     break
@@ -14398,11 +14404,12 @@ def _explorer_get_logs_for_pool_events(
                 req_page += 1
                 time.sleep(0.10)
             if local_logs:
-                all_logs.extend(local_logs)
-                template_used = str(tmpl).split("&apikey=", 1)[0]
-                topic_used = str(t0)
-                break
-        if all_logs:
+                local_any.extend(local_logs)
+                topic_hits.append(str(t0))
+        if local_any:
+            all_logs.extend(local_any)
+            template_used = str(tmpl).split("&apikey=", 1)[0]
+            topic_used = ",".join(topic_hits[:8])
             break
     if not all_logs:
         return [], {
@@ -14410,6 +14417,8 @@ def _explorer_get_logs_for_pool_events(
             "reason": "no_records",
             "requests": int(req_used),
             "pages": int(pages_used),
+            "status": str(status_seen),
+            "message": str(message_seen),
         }
     dedup: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -14430,6 +14439,8 @@ def _explorer_get_logs_for_pool_events(
         "pages": int(pages_used),
         "template": template_used,
         "topic0": topic_used,
+        "status": str(status_seen),
+        "message": str(message_seen),
     }
 
 
@@ -14521,7 +14532,58 @@ def _collect_v3_pool_flow_events_temp(
     explorer_requests = 0
     explorer_pages = 0
     explorer_template = ""
+    explorer_reason = ""
+    explorer_status = ""
+    explorer_message = ""
     block_ts_cache: dict[int, int] = {}
+    def _merge_counts(dst: dict[str, int], src: dict[str, int]) -> None:
+        for k, v in (src or {}).items():
+            dst[str(k)] = int(dst.get(str(k), 0) + int(v or 0))
+
+    def _rows_from_logs(raw_logs: list[dict[str, Any]]) -> tuple[list[tuple[Any, ...]], dict[str, int], int]:
+        rows_to_insert: list[tuple[Any, ...]] = []
+        counts: dict[str, int] = {}
+        events_n = 0
+        for lg in raw_logs or []:
+            decoded = _decode_v3_pool_flow_log(lg, topic0_by_name)
+            if not decoded:
+                continue
+            blk = _eth_uint_from_rpc_field((lg or {}).get("blockNumber"))
+            lix = _eth_uint_from_rpc_field((lg or {}).get("logIndex"))
+            txh = str((lg or {}).get("transactionHash") or "").strip().lower()
+            if blk <= 0 or lix < 0 or not txh:
+                continue
+            ts = block_ts_cache.get(int(blk))
+            if ts is None:
+                ts = int(_eth_get_block_timestamp(cid, int(blk)) or 0)
+                block_ts_cache[int(blk)] = int(ts)
+            if ts <= 0 or int(ts) < int(since_ts):
+                continue
+            ev = str(decoded.get("event_name") or "").strip().lower()
+            counts[ev] = int(counts.get(ev, 0) + 1)
+            events_n += 1
+            rows_to_insert.append(
+                (
+                    int(cid),
+                    str(proto),
+                    str(pool),
+                    int(blk),
+                    int(lix),
+                    str(txh),
+                    int(ts),
+                    str(ev),
+                    str(decoded.get("owner") or ""),
+                    str(decoded.get("recipient") or ""),
+                    int(decoded.get("tick_lower") or 0),
+                    int(decoded.get("tick_upper") or 0),
+                    str(int(decoded.get("amount0_raw") or 0)),
+                    str(int(decoded.get("amount1_raw") or 0)),
+                    str(int(decoded.get("liquidity_raw") or 0)),
+                    float(ts_now),
+                )
+            )
+        return rows_to_insert, counts, int(events_n)
+
     cur = int(scan_from_block)
     used = 0
     scanned_from = int(scan_from_block)
@@ -14540,45 +14602,9 @@ def _collect_v3_pool_flow_events_temp(
                     logs = _eth_get_logs(cid, params, timeout_sec=max(20.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 4.0))
                 except Exception:
                     logs = []
-                rows_to_insert: list[tuple[Any, ...]] = []
-                for lg in logs or []:
-                    decoded = _decode_v3_pool_flow_log(lg, topic0_by_name)
-                    if not decoded:
-                        continue
-                    blk = _eth_uint_from_rpc_field((lg or {}).get("blockNumber"))
-                    lix = _eth_uint_from_rpc_field((lg or {}).get("logIndex"))
-                    txh = str((lg or {}).get("transactionHash") or "").strip().lower()
-                    if blk <= 0 or lix < 0 or not txh:
-                        continue
-                    ts = block_ts_cache.get(int(blk))
-                    if ts is None:
-                        ts = int(_eth_get_block_timestamp(cid, int(blk)) or 0)
-                        block_ts_cache[int(blk)] = int(ts)
-                    if ts <= 0 or int(ts) < int(since_ts):
-                        continue
-                    ev = str(decoded.get("event_name") or "").strip().lower()
-                    by_type[ev] = int(by_type.get(ev, 0) + 1)
-                    events_total += 1
-                    rows_to_insert.append(
-                        (
-                            int(cid),
-                            str(proto),
-                            str(pool),
-                            int(blk),
-                            int(lix),
-                            str(txh),
-                            int(ts),
-                            str(ev),
-                            str(decoded.get("owner") or ""),
-                            str(decoded.get("recipient") or ""),
-                            int(decoded.get("tick_lower") or 0),
-                            int(decoded.get("tick_upper") or 0),
-                            str(int(decoded.get("amount0_raw") or 0)),
-                            str(int(decoded.get("amount1_raw") or 0)),
-                            str(int(decoded.get("liquidity_raw") or 0)),
-                            float(ts_now),
-                        )
-                    )
+                rows_to_insert, inc_counts, inc_events = _rows_from_logs(logs)
+                _merge_counts(by_type, inc_counts)
+                events_total += int(inc_events)
                 if rows_to_insert:
                     before_changes = int(conn.total_changes)
                     conn.executemany(
@@ -14611,45 +14637,9 @@ def _collect_v3_pool_flow_events_temp(
                         logs = _eth_get_logs(cid, params, timeout_sec=max(20.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 4.0))
                     except Exception:
                         logs = []
-                    rows_to_insert: list[tuple[Any, ...]] = []
-                    for lg in logs or []:
-                        decoded = _decode_v3_pool_flow_log(lg, topic0_by_name)
-                        if not decoded:
-                            continue
-                        blk = _eth_uint_from_rpc_field((lg or {}).get("blockNumber"))
-                        lix = _eth_uint_from_rpc_field((lg or {}).get("logIndex"))
-                        txh = str((lg or {}).get("transactionHash") or "").strip().lower()
-                        if blk <= 0 or lix < 0 or not txh:
-                            continue
-                        ts = block_ts_cache.get(int(blk))
-                        if ts is None:
-                            ts = int(_eth_get_block_timestamp(cid, int(blk)) or 0)
-                            block_ts_cache[int(blk)] = int(ts)
-                        if ts <= 0 or int(ts) < int(since_ts):
-                            continue
-                        ev = str(decoded.get("event_name") or "").strip().lower()
-                        by_type[ev] = int(by_type.get(ev, 0) + 1)
-                        events_total += 1
-                        rows_to_insert.append(
-                            (
-                                int(cid),
-                                str(proto),
-                                str(pool),
-                                int(blk),
-                                int(lix),
-                                str(txh),
-                                int(ts),
-                                str(ev),
-                                str(decoded.get("owner") or ""),
-                                str(decoded.get("recipient") or ""),
-                                int(decoded.get("tick_lower") or 0),
-                                int(decoded.get("tick_upper") or 0),
-                                str(int(decoded.get("amount0_raw") or 0)),
-                                str(int(decoded.get("amount1_raw") or 0)),
-                                str(int(decoded.get("liquidity_raw") or 0)),
-                                float(ts_now),
-                            )
-                        )
+                    rows_to_insert, inc_counts, inc_events = _rows_from_logs(logs)
+                    _merge_counts(by_type, inc_counts)
+                    events_total += int(inc_events)
                     if rows_to_insert:
                         before_changes = int(conn.total_changes)
                         conn.executemany(
@@ -14681,47 +14671,14 @@ def _collect_v3_pool_flow_events_temp(
                 explorer_requests = int((exp_meta or {}).get("requests") or 0)
                 explorer_pages = int((exp_meta or {}).get("pages") or 0)
                 explorer_template = str((exp_meta or {}).get("template") or "")
+                explorer_reason = str((exp_meta or {}).get("reason") or "")
+                explorer_status = str((exp_meta or {}).get("status") or "")
+                explorer_message = str((exp_meta or {}).get("message") or "")
                 if exp_logs:
                     source = "explorer_api_logs"
-                    rows_to_insert: list[tuple[Any, ...]] = []
-                    for lg in exp_logs:
-                        decoded = _decode_v3_pool_flow_log(lg, topic0_by_name)
-                        if not decoded:
-                            continue
-                        blk = _eth_uint_from_rpc_field((lg or {}).get("blockNumber"))
-                        lix = _eth_uint_from_rpc_field((lg or {}).get("logIndex"))
-                        txh = str((lg or {}).get("transactionHash") or "").strip().lower()
-                        if blk <= 0 or lix < 0 or not txh:
-                            continue
-                        ts = block_ts_cache.get(int(blk))
-                        if ts is None:
-                            ts = int(_eth_get_block_timestamp(cid, int(blk)) or 0)
-                            block_ts_cache[int(blk)] = int(ts)
-                        if ts <= 0 or int(ts) < int(since_ts):
-                            continue
-                        ev = str(decoded.get("event_name") or "").strip().lower()
-                        by_type[ev] = int(by_type.get(ev, 0) + 1)
-                        events_total += 1
-                        rows_to_insert.append(
-                            (
-                                int(cid),
-                                str(proto),
-                                str(pool),
-                                int(blk),
-                                int(lix),
-                                str(txh),
-                                int(ts),
-                                str(ev),
-                                str(decoded.get("owner") or ""),
-                                str(decoded.get("recipient") or ""),
-                                int(decoded.get("tick_lower") or 0),
-                                int(decoded.get("tick_upper") or 0),
-                                str(int(decoded.get("amount0_raw") or 0)),
-                                str(int(decoded.get("amount1_raw") or 0)),
-                                str(int(decoded.get("liquidity_raw") or 0)),
-                                float(ts_now),
-                            )
-                        )
+                    rows_to_insert, inc_counts, inc_events = _rows_from_logs(exp_logs)
+                    _merge_counts(by_type, inc_counts)
+                    events_total += int(inc_events)
                     if rows_to_insert:
                         before_changes = int(conn.total_changes)
                         conn.executemany(
@@ -14774,6 +14731,9 @@ def _collect_v3_pool_flow_events_temp(
         "explorer_requests": int(explorer_requests),
         "explorer_pages": int(explorer_pages),
         "explorer_template": str(explorer_template).split("&apikey=", 1)[0],
+        "explorer_reason": str(explorer_reason),
+        "explorer_status": str(explorer_status),
+        "explorer_message": str(explorer_message),
     }
 
 
@@ -19260,6 +19220,10 @@ def _render_positions_page() -> str:
         const pfSource = String(d.pool_flow_source || "").trim();
         const pfExplorerReq = Number(d.pool_flow_explorer_requests || 0);
         const pfExplorerPages = Number(d.pool_flow_explorer_pages || 0);
+        const pfExplorerReason = String(d.pool_flow_explorer_reason || "").trim();
+        const pfExplorerStatus = String(d.pool_flow_explorer_status || "").trim();
+        const pfExplorerMessage = String(d.pool_flow_explorer_message || "").trim();
+        const pfOwnerSrc = String(d.pool_flow_owner_source || "").trim();
         const analysisMs = Number(d.elapsed_ms || 0);
         const pfCountsObj = (d && typeof d.pool_flow_event_counts === "object" && d.pool_flow_event_counts) ? d.pool_flow_event_counts : {};
         const pfCounts = Object.entries(pfCountsObj)
@@ -19267,13 +19231,13 @@ def _render_positions_page() -> str:
           .join(",");
         if (pfEventsTotal > 0 || pfCollectPoints > 0 || pfChunksUsed > 0) {
           const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
-          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_ms=${analysisMs} | pool_flow: source=${pfSource || "-"}, collect_points=${pfCollectPoints}, events=${pfEventsTotal}, inserted=${pfInsertedRows}, chunks=${pfChunksUsed}, truncated=${pfTruncated ? 1 : 0}, cached=${pfCached ? 1 : 0}, explorer_req=${pfExplorerReq}, explorer_pages=${pfExplorerPages}${pfCounts ? `, counts=${pfCounts}` : ""}`;
+          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_ms=${analysisMs} | pool_flow: source=${pfSource || "-"}, owner_src=${pfOwnerSrc || "-"}, collect_points=${pfCollectPoints}, events=${pfEventsTotal}, inserted=${pfInsertedRows}, chunks=${pfChunksUsed}, truncated=${pfTruncated ? 1 : 0}, cached=${pfCached ? 1 : 0}, explorer_req=${pfExplorerReq}, explorer_pages=${pfExplorerPages}${pfExplorerReason ? `, explorer_reason=${pfExplorerReason}` : ""}${pfExplorerStatus ? `, explorer_status=${pfExplorerStatus}` : ""}${pfExplorerMessage ? `, explorer_message=${pfExplorerMessage}` : ""}${pfCounts ? `, counts=${pfCounts}` : ""}`;
         } else if (analysisMs > 0) {
           const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
           rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_ms=${analysisMs}`;
         }
         if (backendHints.length < 5) {
-          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, analysis_ms=${analysisMs}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_source=${pfSource || "-"}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}, pool_flow_explorer_req=${pfExplorerReq}, pool_flow_explorer_pages=${pfExplorerPages}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
+          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, analysis_ms=${analysisMs}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_source=${pfSource || "-"}, pool_flow_owner_src=${pfOwnerSrc || "-"}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}, pool_flow_explorer_req=${pfExplorerReq}, pool_flow_explorer_pages=${pfExplorerPages}${pfExplorerReason ? `, pool_flow_explorer_reason=${pfExplorerReason}` : ""}${pfExplorerStatus ? `, pool_flow_explorer_status=${pfExplorerStatus}` : ""}${pfExplorerMessage ? `, pool_flow_explorer_message=${pfExplorerMessage}` : ""}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
           backendHints.push(msg);
         }
         if (hasCollected) {
@@ -24124,10 +24088,21 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             debug["pool_flow_explorer_requests"] = int(pool_flow_stats.get("explorer_requests") or 0)
             debug["pool_flow_explorer_pages"] = int(pool_flow_stats.get("explorer_pages") or 0)
             debug["pool_flow_explorer_template"] = str(pool_flow_stats.get("explorer_template") or "")
+            debug["pool_flow_explorer_reason"] = str(pool_flow_stats.get("explorer_reason") or "")
+            debug["pool_flow_explorer_status"] = str(pool_flow_stats.get("explorer_status") or "")
+            debug["pool_flow_explorer_message"] = str(pool_flow_stats.get("explorer_message") or "")
+            pool_owner_for_collect = str(req.address or "").strip().lower()
+            if protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+                pm_owner = _position_manager_for_protocol(int(chain_id), str(protocol))
+                if _is_eth_address(pm_owner):
+                    pool_owner_for_collect = str(pm_owner).strip().lower()
+                    debug["pool_flow_owner_source"] = "position_manager"
+                else:
+                    debug["pool_flow_owner_source"] = "wallet"
             pool_flow_collect_by_day, pool_flow_meta = _pool_flow_collect_series_from_temp(
                 int(chain_id),
                 str(req.pool_id or ""),
-                owner=str(req.address or ""),
+                owner=str(pool_owner_for_collect),
                 tick_lower=int(row_tick_lower or 0),
                 tick_upper=int(row_tick_upper or 0),
                 since_ts=int(collect_since_ts),
@@ -24137,6 +24112,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             )
         except Exception:
             pool_flow_collect_by_day, pool_flow_meta = {}, {"pricing": "none", "detail": ""}
+    # Pool-flow staging is diagnostic/auxiliary. Do not use it as primary collected source for one NFT
+    # because pool-level owner/ticks can aggregate multiple positions.
+    pool_flow_collect_by_day = {}
     debug["pool_flow_collect_points"] = int(len(pool_flow_collect_by_day))
 
     sub_max = max(exact_by_day.values()) if exact_by_day else 0.0
