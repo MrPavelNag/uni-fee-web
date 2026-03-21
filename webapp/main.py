@@ -16414,6 +16414,17 @@ def _render_positions_page() -> str:
           <div class="table-wrap" id="posPoolsTableMainWrap"><table id="posPoolsTable"></table></div>
           <div class="table-wrap" id="posPoolsTableSpamWrap" style="display:none"><table id="posPoolsSpamTable"></table></div>
           <div class="table-wrap" id="posPoolsTableProtocolWrap" style="display:none"><table id="posPoolsProtocolTable"></table></div>
+          <div id="posPoolsClosedSortBar" class="info-box" style="display:none; margin-bottom:6px; padding:6px 8px;">
+            <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#334155;">
+              <span>Closed sort:</span>
+              <select id="posClosedSortSelect" onchange="setClosedSortMode(this.value)" style="font-size:12px;padding:3px 6px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;">
+                <option value="address_asc">Address A→Z</option>
+                <option value="address_desc">Address Z→A</option>
+                <option value="pair_asc">Pair A→Z</option>
+                <option value="pair_desc">Pair Z→A</option>
+              </select>
+            </label>
+          </div>
           <div class="table-wrap" id="posPoolsTableClosedWrap" style="display:none"><table id="posPoolsClosedTable"></table></div>
           <div class="table-wrap" id="posPoolsTableOtherWrap" style="display:none"><table id="posPoolsOtherTable"></table></div>
           <div class="table-wrap" id="posPoolsTableHiddenWrap" style="display:none"><table id="posPoolsHiddenTable"></table></div>
@@ -16442,6 +16453,17 @@ def _render_positions_page() -> str:
           <div class="table-wrap" id="posHeavyPoolsTableMainWrap"><table id="posHeavyPoolsTable"></table></div>
           <div class="table-wrap" id="posHeavyPoolsTableSpamWrap" style="display:none"><table id="posHeavyPoolsSpamTable"></table></div>
           <div class="table-wrap" id="posHeavyPoolsTableProtocolWrap" style="display:none"><table id="posHeavyPoolsProtocolTable"></table></div>
+          <div id="posHeavyClosedSortBar" class="info-box" style="display:none; margin-bottom:6px; padding:6px 8px;">
+            <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#334155;">
+              <span>Closed sort:</span>
+              <select id="posHeavyClosedSortSelect" onchange="setHeavyClosedSortMode(this.value)" style="font-size:12px;padding:3px 6px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;">
+                <option value="address_asc">Address A→Z</option>
+                <option value="address_desc">Address Z→A</option>
+                <option value="pair_asc">Pair A→Z</option>
+                <option value="pair_desc">Pair Z→A</option>
+              </select>
+            </label>
+          </div>
           <div class="table-wrap" id="posHeavyPoolsTableClosedWrap" style="display:none"><table id="posHeavyPoolsClosedTable"></table></div>
           <div class="table-wrap" id="posHeavyPoolsTableOtherWrap" style="display:none"><table id="posHeavyPoolsOtherTable"></table></div>
           <div class="table-wrap" id="posHeavyPoolsTableHiddenWrap" style="display:none"><table id="posHeavyPoolsHiddenTable"></table></div>
@@ -16562,6 +16584,8 @@ def _render_positions_page() -> str:
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_CLOSED_BG_ENRICH_KEY = "positions_v3_closed_bg_enrich_v1";
+    const POS_CLOSED_SORT_KEY = "positions_closed_sort_v1";
+    const POS_HEAVY_CLOSED_SORT_KEY = "positions_heavy_closed_sort_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
     const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
@@ -16577,6 +16601,40 @@ def _render_positions_page() -> str:
       if (t === "mismatch") return "main";
       return t;
     }
+    function normalizeClosedSortMode(raw) {
+      const v = String(raw || "").toLowerCase().trim();
+      const allowed = new Set(["address_asc", "address_desc", "pair_asc", "pair_desc"]);
+      return allowed.has(v) ? v : "address_asc";
+    }
+    function getClosedSortMode() {
+      try { return normalizeClosedSortMode(localStorage.getItem(POS_CLOSED_SORT_KEY) || "address_asc"); } catch (_) { return "address_asc"; }
+    }
+    function getHeavyClosedSortMode() {
+      try { return normalizeClosedSortMode(localStorage.getItem(POS_HEAVY_CLOSED_SORT_KEY) || "address_asc"); } catch (_) { return "address_asc"; }
+    }
+    function setClosedSortMode(mode) {
+      try { localStorage.setItem(POS_CLOSED_SORT_KEY, normalizeClosedSortMode(mode)); } catch (_) {}
+      renderPools(posCache.pools || []);
+    }
+    function setHeavyClosedSortMode(mode) {
+      try { localStorage.setItem(POS_HEAVY_CLOSED_SORT_KEY, normalizeClosedSortMode(mode)); } catch (_) {}
+      renderHeavyPools(posHeavyCache.pools || []);
+    }
+    function sortClosedRows(rows, mode) {
+      const m = normalizeClosedSortMode(mode);
+      const out = Array.isArray(rows) ? rows.slice() : [];
+      out.sort((a, b) => {
+        const aa = String(a?.address || "").toLowerCase();
+        const ba = String(b?.address || "").toLowerCase();
+        const ap = String(a?.pair || "").toLowerCase();
+        const bp = String(b?.pair || "").toLowerCase();
+        if (m === "address_desc") return ba.localeCompare(aa) || ap.localeCompare(bp);
+        if (m === "pair_asc") return ap.localeCompare(bp) || aa.localeCompare(ba);
+        if (m === "pair_desc") return bp.localeCompare(ap) || aa.localeCompare(ba);
+        return aa.localeCompare(ba) || ap.localeCompare(bp);
+      });
+      return out;
+    }
     function switchPosPoolsTab(name, silent) {
       const mainW = document.getElementById("posPoolsTableMainWrap");
       const prW = document.getElementById("posPoolsTableProtocolWrap");
@@ -16584,6 +16642,7 @@ def _render_positions_page() -> str:
       const spW = document.getElementById("posPoolsTableSpamWrap");
       const otW = document.getElementById("posPoolsTableOtherWrap");
       const hidW = document.getElementById("posPoolsTableHiddenWrap");
+      const clSortBar = document.getElementById("posPoolsClosedSortBar");
       if (!mainW) return;
       const tab = normalizePosPoolsTabKey(name);
       const wraps = [
@@ -16598,6 +16657,7 @@ def _render_positions_page() -> str:
         if (!el) continue;
         el.style.display = k === tab ? "block" : "none";
       }
+      if (clSortBar) clSortBar.style.display = tab === "closed" ? "" : "none";
       document.querySelectorAll("#posPoolsTabBar [data-pos-tab]").forEach((b) => {
         const t = b.getAttribute("data-pos-tab") || "";
         b.classList.toggle("active", t === tab);
@@ -16607,6 +16667,9 @@ def _render_positions_page() -> str:
           const allowed = new Set(["main", "spam", "protocol", "closed", "other", "hidden"]);
           localStorage.setItem(POS_POOLS_TAB_KEY, allowed.has(tab) ? tab : "main");
         } catch (_) {}
+      }
+      if (tab === "closed") {
+        enrichClosedRowsCreatedDates("v3");
       }
     }
     function normalizePosHeavyPoolsTabKey(raw) {
@@ -16622,6 +16685,7 @@ def _render_positions_page() -> str:
       const spW = document.getElementById("posHeavyPoolsTableSpamWrap");
       const otW = document.getElementById("posHeavyPoolsTableOtherWrap");
       const hidW = document.getElementById("posHeavyPoolsTableHiddenWrap");
+      const hClSortBar = document.getElementById("posHeavyClosedSortBar");
       if (!mainW) return;
       const tab = normalizePosHeavyPoolsTabKey(name);
       const wraps = [
@@ -16636,6 +16700,7 @@ def _render_positions_page() -> str:
         if (!el) continue;
         el.style.display = k === tab ? "block" : "none";
       }
+      if (hClSortBar) hClSortBar.style.display = tab === "closed" ? "" : "none";
       document.querySelectorAll("#posHeavyPoolsTabBar [data-pos-heavy-tab]").forEach((b) => {
         const t = b.getAttribute("data-pos-heavy-tab") || "";
         b.classList.toggle("active", t === tab);
@@ -16645,6 +16710,9 @@ def _render_positions_page() -> str:
           const allowed = new Set(["main", "spam", "protocol", "closed", "other", "hidden"]);
           localStorage.setItem(POS_HEAVY_POOLS_TAB_KEY, allowed.has(tab) ? tab : "main");
         } catch (_) {}
+      }
+      if (tab === "closed") {
+        enrichClosedRowsCreatedDates("heavy");
       }
     }
     let posHasScannedOnce = false;
@@ -16656,6 +16724,93 @@ def _render_positions_page() -> str:
     let posAutoWarmupTimer = null;
     let posAutoWarmupInFlight = false;
     let posClosedBgEnrichInFlight = false;
+    let posClosedDatesEnrichInFlight = false;
+    let posHeavyClosedDatesEnrichInFlight = false;
+    let posFinalActiveCount = 0;
+    let posFinalActiveSec = 0;
+    let posFinalClosedCount = 0;
+    let posFinalClosedSec = 0;
+    function countActiveRows(rows) {
+      let n = 0;
+      for (const r of (rows || [])) {
+        if (!r || typeof r !== "object") continue;
+        if (String(r.position_status || "").toLowerCase() === "active") n += 1;
+      }
+      return n;
+    }
+    function countClosedRows(rows) {
+      let n = 0;
+      for (const r of (rows || [])) {
+        if (!r || typeof r !== "object") continue;
+        const seg = String(r.catalog_segment || "").toLowerCase();
+        if (seg === "closed") { n += 1; continue; }
+        if (isClosedBgCandidateRow(r)) n += 1;
+      }
+      return n;
+    }
+    function formatSecShort(sec) {
+      const s = Math.max(0, Number(sec) || 0);
+      if (!Number.isFinite(s) || s <= 0) return "0 сек";
+      if (s < 60) return `${Math.round(s)} сек`;
+      return formatScanDuration(s);
+    }
+    function setPosFinalSummaryStatus() {
+      const aN = Math.max(0, Number(posFinalActiveCount) || 0);
+      const cN = Math.max(0, Number(posFinalClosedCount) || 0);
+      const aS = formatSecShort(posFinalActiveSec);
+      const cS = formatSecShort(posFinalClosedSec);
+      setPosStatus(`Итог: активные — ${aN}, ${aS}; закрытые — ${cN}, ${cS}`, false);
+    }
+    async function enrichClosedRowsCreatedDates(scope = "v3") {
+      const isHeavy = String(scope || "") === "heavy";
+      if (isHeavy && posHeavyClosedDatesEnrichInFlight) return;
+      if (!isHeavy && posClosedDatesEnrichInFlight) return;
+      if (isHeavy) posHeavyClosedDatesEnrichInFlight = true;
+      else posClosedDatesEnrichInFlight = true;
+      try {
+        const list = isHeavy ? (posHeavyCache.pools || []) : (posCache.pools || []);
+        const hasCatalogSegments = list.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
+        const idxs = [];
+        for (let i = 0; i < list.length; i++) {
+          const r = list[i] || {};
+          const seg = String(r.catalog_segment || "").toLowerCase();
+          const isClosed = hasCatalogSegments && seg === "closed";
+          if (!isClosed) continue;
+          const d = String(r.position_created_date || "").trim();
+          if (d && d !== "-") continue;
+          if (r.unsupported_protocol) continue;
+          idxs.push(i);
+          if (idxs.length >= 80) break;
+        }
+        if (!idxs.length) return;
+        for (let k = 0; k < idxs.length; k++) {
+          const i = idxs[k];
+          const row = Object.assign({}, list[i] || {});
+          try {
+            const res = await fetch("/api/positions/row/enrich", {
+              method: "POST",
+              headers: {"Content-Type":"application/json"},
+              body: JSON.stringify({row}),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data?.ok && data?.row_updates && typeof data.row_updates === "object") {
+              list[i] = Object.assign({}, row, data.row_updates || {});
+            }
+          } catch (_) {}
+          if ((k + 1) % 8 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        if (isHeavy) {
+          posHeavyCache.pools = list;
+          renderHeavyPools(posHeavyCache.pools || []);
+        } else {
+          posCache.pools = list;
+          renderPools(posCache.pools || []);
+        }
+      } finally {
+        if (isHeavy) posHeavyClosedDatesEnrichInFlight = false;
+        else posClosedDatesEnrichInFlight = false;
+      }
+    }
     let posStatusBaseText = "";
     let posStatusBaseErr = false;
     let posStatusRuntimeTimer = null;
@@ -16710,10 +16865,9 @@ def _render_positions_page() -> str:
         return `${lane.label}: queued`;
       }
       if (lane.running) {
-        const p = Math.round(Math.max(0, Math.min(100, Number(lane.progress || 0))));
         const elapsed = formatScanDuration(laneElapsedSec(lane)) || "0s";
         const eta = formatScanDuration(laneEtaSec(lane)) || "0s";
-        return `${lane.label}: ${p}% · ${elapsed} elapsed · ETA ~${eta}`;
+        return `${lane.label}: running for ${elapsed}, ~${eta} left`;
       }
       if (lane.doneAtMs > 0 && (Date.now() - lane.doneAtMs) <= 15000) {
         const doneIn = formatScanDuration(Number(lane.lastDoneSec || 0)) || "0s";
@@ -17803,6 +17957,8 @@ def _render_positions_page() -> str:
         otHtml += `<tr><td colspan='${otCols}' style='white-space:normal;color:#64748b'>No rows here: phishing-style collection metadata, pair string vs on-chain symbols (Issue: Pair mismatch), and PM snapshot read failures land on this tab. Spam, protocol gate, and closed positions stay on their own tabs.</td></tr>`;
       }
       const stCols = 12;
+      const closedCols = 13;
+      const closedCols = 13;
       let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let pi = 0; pi < protocolRows.length; pi++) {
         const r = protocolRows[pi];
@@ -17826,9 +17982,11 @@ def _render_positions_page() -> str:
       if (!protocolRows.length) {
         protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate (collection name/symbol must suggest Uniswap or Pancake before on-chain PM work).</td></tr>`;
       }
-      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
-      for (let ci = 0; ci < closedTabRows.length; ci++) {
-        const r = closedTabRows[ci];
+      const closedSortMode = getClosedSortMode();
+      const closedRowsSorted = sortClosedRows(closedTabRows, closedSortMode);
+      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
+      for (let ci = 0; ci < closedRowsSorted.length; ci++) {
+        const r = closedRowsSorted[ci];
         const mismatch = hasPairMismatch(r);
         const mismatchStyle = mismatch ? " style='background:#f1f5f9;color:#475569;font-weight:600'" : "";
         const pairTrace = String(r.pair_symbol_source || "").trim();
@@ -17840,6 +17998,7 @@ def _render_positions_page() -> str:
         closedHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         closedHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         closedHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td>${esc(r.fee_tier || "")}</td>`;
+        closedHtml += `<td>${esc(r.position_created_date || "-")}</td>`;
         closedHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
         closedHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${rowTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         closedHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
@@ -17847,7 +18006,7 @@ def _render_positions_page() -> str:
         closedHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('v', ${Number(r._src_idx) || 0}, this.checked)" title='Closed on-chain (zero open liquidity on PM)' /></td></tr>`;
       }
       if (!closedTabRows.length) {
-        closedHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No closed positions: on-chain open-liquidity check marked these as zero liquidity on the position manager (catalog_segment=closed).</td></tr>`;
+        closedHtml += `<tr><td colspan='${closedCols}' style='white-space:normal;color:#64748b'>No closed positions: on-chain open-liquidity check marked these as zero liquidity on the position manager (catalog_segment=closed).</td></tr>`;
       }
       let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let si = 0; si < spamRows.length; si++) {
@@ -17904,6 +18063,10 @@ def _render_positions_page() -> str:
       if (prTable) prTable.innerHTML = protHtml;
       const clTable = document.getElementById("posPoolsClosedTable");
       if (clTable) clTable.innerHTML = closedHtml;
+      const clSortBar = document.getElementById("posPoolsClosedSortBar");
+      const clSortSel = document.getElementById("posClosedSortSelect");
+      if (clSortBar) clSortBar.style.display = closedTabRows.length ? "" : "none";
+      if (clSortSel) clSortSel.value = closedSortMode;
       const spTable = document.getElementById("posPoolsSpamTable");
       if (spTable) spTable.innerHTML = spamHtml;
       const otTable = document.getElementById("posPoolsOtherTable");
@@ -18059,14 +18222,21 @@ def _render_positions_page() -> str:
         });
       }
       function formatJobStatusLine(payload) {
-        const pct = Math.round(Math.min(100, Math.max(0, Number(payload.progress || 0))));
         const lab = String(payload.stage_label || payload.stage || "").trim() || "…";
         const stg = String(payload.stage || "").trim();
         const showStg = stg && !TERMINAL_STAGES.has(stg);
         const stagePart = showStg ? (" · Stage: " + stg) : "";
-        const t = formatScanDuration(smoothElapsedSec());
-        const timePart = t ? (" · ⏱ " + t) : "";
-        return pct + "% · " + lab + stagePart + timePart;
+        const elapsedSec = Math.max(0, smoothElapsedSec());
+        const elapsedTxt = formatScanDuration(elapsedSec);
+        const p = Math.min(99, Math.max(0, Number(payload.progress || 0)));
+        let etaSec = 0;
+        if (p >= 3) {
+          etaSec = Math.max(0, elapsedSec * (100 - p) / p);
+        }
+        const etaTxt = formatScanDuration(etaSec);
+        const timePart = elapsedTxt ? (" · running for " + elapsedTxt) : "";
+        const etaPart = etaTxt ? (", ~" + etaTxt + " left") : "";
+        return lab + stagePart + timePart + etaPart;
       }
       try {
         tickTimer = setInterval(() => {
@@ -18238,9 +18408,11 @@ def _render_positions_page() -> str:
         protHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('h', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!protocolRows.length) protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate.</td></tr>`;
-      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
-      for (let ci = 0; ci < closedTabRows.length; ci++) {
-        const r = closedTabRows[ci];
+      const heavyClosedSortMode = getHeavyClosedSortMode();
+      const heavyClosedRowsSorted = sortClosedRows(closedTabRows, heavyClosedSortMode);
+      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
+      for (let ci = 0; ci < heavyClosedRowsSorted.length; ci++) {
+        const r = heavyClosedRowsSorted[ci];
         const mismatch = hasPairMismatch(r);
         const mismatchStyle = mismatch ? " style='background:#f1f5f9;color:#475569;font-weight:600'" : "";
         const pairTrace = String(r.pair_symbol_source || "").trim();
@@ -18252,13 +18424,14 @@ def _render_positions_page() -> str:
         closedHtml += `<td class='mono' style='font-weight:700'>${esc(shortAddr4(r.address || ""))}</td><td class='mono'>${esc(shortAddr4(r.position_id || ""))}</td>`;
         closedHtml += `<td>${esc(r.chain || "")}</td><td>${esc(shortProtocol(r.protocol || ""))}</td>`;
         closedHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.pair || "")}${mismatch ? " ⚠" : ""}</td><td>${esc(r.fee_tier || "")}</td>`;
+        closedHtml += `<td>${esc(r.position_created_date || "-")}</td>`;
         closedHtml += `<td>${statusDot(r.position_status || "-")}</td>`;
         closedHtml += `<td><input type='checkbox' onchange="setHideRow('${rowKeyEsc}', this.checked, ${heavyTrustSpamParam(r) ? "true" : "false"})" /></td>`;
         closedHtml += `<td${mismatchStyle}${mismatchTitle}>${esc(r.position_amounts_display || "-")}</td>`;
         closedHtml += `<td>${esc(String(r.liquidity_display || "0"))}</td><td${mismatchStyle}${mismatchTitle}>${esc(r.fees_owed_display || "-")}</td>`;
         closedHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('h', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
-      if (!closedTabRows.length) closedHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No closed positions.</td></tr>`;
+      if (!closedTabRows.length) closedHtml += `<tr><td colspan='${closedCols}' style='white-space:normal;color:#64748b'>No closed positions.</td></tr>`;
       let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let si = 0; si < spamRows.length; si++) {
         const r = spamRows[si];
@@ -18348,6 +18521,10 @@ def _render_positions_page() -> str:
       if (prTable) prTable.innerHTML = protHtml;
       const clTable = document.getElementById("posHeavyPoolsClosedTable");
       if (clTable) clTable.innerHTML = closedHtml;
+      const hClSortBar = document.getElementById("posHeavyClosedSortBar");
+      const hClSortSel = document.getElementById("posHeavyClosedSortSelect");
+      if (hClSortBar) hClSortBar.style.display = closedTabRows.length ? "" : "none";
+      if (hClSortSel) hClSortSel.value = heavyClosedSortMode;
       const spTable = document.getElementById("posHeavyPoolsSpamTable");
       if (spTable) spTable.innerHTML = spamHtml;
       const otTable = document.getElementById("posHeavyPoolsOtherTable");
@@ -18493,6 +18670,8 @@ def _render_positions_page() -> str:
       });
       posHasScannedOnce = true;
       updatePosSearchButton();
+      posFinalActiveCount = countActiveRows(posCache.pools || []);
+      posFinalActiveSec = Math.max(0, Number(data?.scan_duration_sec || laneElapsedSec(posStatusLanes.active) || 0));
     }
     function formatV3DoneStatus(data, includeOwnerChecks) {
       const poolsN = (data.pool_positions || []).length;
@@ -18605,14 +18784,12 @@ def _render_positions_page() -> str:
         setPosStatus("Closed positions enrich started in background (~3-5 min)…", false);
         const out = await runClosedRowsBackgroundEnrich();
         finishPosStatusLane("closed");
+        posFinalClosedCount = countClosedRows(posCache.pools || []);
+        posFinalClosedSec = Math.max(0, Number(posStatusLanes?.closed?.lastDoneSec || 0));
         if (!out.eligible) {
-          setPosStatus("Closed positions enrich: no eligible rows in current table.", false);
+          setPosFinalSummaryStatus();
         } else {
-          setPosStatus(
-            `Closed positions enrich done. Updated ${out.updated}/${out.processed} rows` +
-            (out.eligible > out.processed ? ` (eligible total: ${out.eligible})` : ""),
-            false
-          );
+          setPosFinalSummaryStatus();
         }
       } catch (e) {
         finishPosStatusLane("closed");
@@ -18653,7 +18830,13 @@ def _render_positions_page() -> str:
         saveActivePosJob("");
         finishPosStatusLane("active");
         applyV3ScanResult(data, true);
-        startClosedBgEnrichAfterV3Scan();
+        if (isClosedBgEnrichEnabled()) {
+          startClosedBgEnrichAfterV3Scan();
+        } else {
+          posFinalClosedCount = 0;
+          posFinalClosedSec = 0;
+          setPosFinalSummaryStatus();
+        }
       } catch (e) {
         finishPosStatusLane("active");
         handleActivePosJobError(e, "v3", false);
@@ -18673,7 +18856,13 @@ def _render_positions_page() -> str:
         saveActivePosJob("");
         finishPosStatusLane("active");
         applyV3ScanResult(data, false);
-        startClosedBgEnrichAfterV3Scan();
+        if (isClosedBgEnrichEnabled()) {
+          startClosedBgEnrichAfterV3Scan();
+        } else {
+          posFinalClosedCount = 0;
+          posFinalClosedSec = 0;
+          setPosFinalSummaryStatus();
+        }
       } catch (e) {
         finishPosStatusLane("active");
         handleActivePosJobError(e, "v3", true);
@@ -21350,6 +21539,15 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     if not isinstance(snap, dict):
         return {"ok": False, "reason": "snapshot_unavailable"}
     updates = _build_row_updates_from_snapshot(row, snap, int(chain_id))
+    # Also enrich Created date for rows shown in Closed/other tabs.
+    try:
+        row_for_date = dict(row)
+        row_for_date["protocol"] = protocol
+        d = _position_creation_date_ymd_for_row(row_for_date)
+        if d:
+            updates["position_created_date"] = d
+    except Exception:
+        pass
     updates["nft_metadata_phishing"] = bool(_row_nft_metadata_phishing_from_explorer(row))
     return {"ok": True, "row_updates": updates}
 
