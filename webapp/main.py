@@ -16248,6 +16248,12 @@ def _render_positions_page() -> str:
     .fee-toggle-pill input { margin:0; width:15px; height:15px; }
     .fee-card .pos-fee-hist-label { font-size:15px; font-weight:700; color:#334155; }
     .fee-card .search-link-btn { font-size:20px; }
+    .scan-bg-toggle {
+      display:inline-flex; align-items:center; gap:6px;
+      color:#334155; font-size:12px; font-weight:600;
+      user-select:none; white-space:nowrap;
+    }
+    .scan-bg-toggle input { margin:0; width:14px; height:14px; }
     @media (max-width: 1100px) {
       .address-columns { grid-template-columns:1fr; }
       .positions-form, .result-card { padding: 13px; }
@@ -16296,8 +16302,11 @@ def _render_positions_page() -> str:
         <div class="section-head" style="flex-wrap:nowrap;align-items:center">
           <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / PancakeSwap v3</h3>
           <div class="section-actions">
-            <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
+            <label class="scan-bg-toggle" title="Runs in background and requires significant time, around 3-5 minutes.">
+              <input type="checkbox" id="posClosedBgEnrich" />
+              <span>Closed positions</span>
+            </label>
             <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions()">Scan V3</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
@@ -16324,7 +16333,6 @@ def _render_positions_page() -> str:
         <div class="section-head" style="flex-wrap:nowrap;align-items:center">
           <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v4 / Pancake V3 Farming / Infinity</h3>
           <div class="section-actions">
-            <div id="posHeavyProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posHeavyStatus">Ready</span>
             <button id="posHeavySearchBtn" class="search-link-btn" type="button" onclick="scanHeavyPositions()">Scan v4 / Infinity</button>
             <button class="collapse-btn" id="toggleHeavyPoolsBtn" type="button" onclick="togglePosSection('heavy')" title="Collapse/expand">▾</button>
@@ -16462,6 +16470,7 @@ def _render_positions_page() -> str:
     let posHeavyLastStatusErr = false;
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
+    const POS_CLOSED_BG_ENRICH_KEY = "positions_v3_closed_bg_enrich_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
     const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
@@ -16555,6 +16564,7 @@ def _render_positions_page() -> str:
     let posLastStatusErr = false;
     let posAutoWarmupTimer = null;
     let posAutoWarmupInFlight = false;
+    let posClosedBgEnrichInFlight = false;
     function setPosStatus(text, isErr) {
       const el = document.getElementById("posStatus");
       if (!el) return;
@@ -16639,6 +16649,29 @@ def _render_positions_page() -> str:
       const btn = document.getElementById("posSearchBtn");
       if (!btn) return;
       btn.textContent = posHasScannedOnce ? "Scan again V3" : "Scan V3";
+    }
+    function isClosedBgEnrichEnabled() {
+      const el = document.getElementById("posClosedBgEnrich");
+      return !!(el && el.checked);
+    }
+    function loadClosedBgEnrichOption() {
+      try {
+        const raw = String(localStorage.getItem(POS_CLOSED_BG_ENRICH_KEY) || "").toLowerCase();
+        return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+      } catch (_) {
+        return false;
+      }
+    }
+    function saveClosedBgEnrichOption(flag) {
+      try { localStorage.setItem(POS_CLOSED_BG_ENRICH_KEY, flag ? "1" : "0"); } catch (_) {}
+    }
+    function bindClosedBgEnrichOption() {
+      const el = document.getElementById("posClosedBgEnrich");
+      if (!el) return;
+      el.checked = loadClosedBgEnrichOption();
+      el.addEventListener("change", () => {
+        saveClosedBgEnrichOption(!!el.checked);
+      });
     }
     function updateHeavySearchButton() {
       const btn = document.getElementById("posHeavySearchBtn");
@@ -18223,6 +18256,41 @@ def _render_positions_page() -> str:
       if (!jobId) throw new Error("Invalid job id");
       return jobId;
     }
+    function buildV3ClosedBgEnrichPayload() {
+      return {
+        evm_addresses: posState.evm,
+        include_pools: true,
+        include_lending: false,
+        include_rewards: false,
+        hard_scan: true,
+      };
+    }
+    async function startClosedBgEnrichAfterV3Scan() {
+      if (!isClosedBgEnrichEnabled()) return;
+      if (!Array.isArray(posState.evm) || !posState.evm.length) return;
+      if (posClosedBgEnrichInFlight) return;
+      posClosedBgEnrichInFlight = true;
+      try {
+        setPosStatus("Closed positions enrich started in background (~3-5 min)…", false);
+        const startRes = await fetch("/api/positions/scan/start", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify(buildV3ClosedBgEnrichPayload()),
+        });
+        const startData = await startRes.json().catch(() => ({}));
+        if (!startRes.ok) throw new Error(startData.detail || "Failed to start closed positions enrich");
+        const bgJobId = String(startData.job_id || "").trim();
+        if (!bgJobId) throw new Error("Invalid job id");
+        const data = await pollPosJob(bgJobId, false, "v3");
+        persistV3ScanResult(data);
+        const rowsN = Array.isArray(data?.pool_positions) ? data.pool_positions.length : 0;
+        setPosStatus(`Closed positions enrich done in background. Pools: ${rowsN}`, false);
+      } catch (e) {
+        setPosStatus("Closed positions enrich (background): " + (e?.message || "unknown"), true);
+      } finally {
+        posClosedBgEnrichInFlight = false;
+      }
+    }
     function applyV3ScanResult(data, includeOwnerChecks) {
       persistV3ScanResult(data);
       setPosStatus(formatV3DoneStatus(data, includeOwnerChecks), false);
@@ -18251,6 +18319,7 @@ def _render_positions_page() -> str:
         }
         saveActivePosJob("");
         applyV3ScanResult(data, true);
+        startClosedBgEnrichAfterV3Scan();
       } catch (e) {
         handleActivePosJobError(e, "v3", false);
       } finally {
@@ -18265,6 +18334,7 @@ def _render_positions_page() -> str:
         const data = await pollPosJob(jobId, false, "v3");
         saveActivePosJob("");
         applyV3ScanResult(data, false);
+        startClosedBgEnrichAfterV3Scan();
       } catch (e) {
         handleActivePosJobError(e, "v3", true);
       } finally {
@@ -18272,6 +18342,7 @@ def _render_positions_page() -> str:
       }
     }
     loadPosState();
+    bindClosedBgEnrichOption();
     renderAllChips();
     setSectionCollapsed("pools", false);
     const saved = loadPosResults();
@@ -20777,7 +20848,7 @@ def _scan_positions_core(
 
 
 def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: str) -> None:
-    hard_scan_enabled = False
+    hard_scan_enabled = bool(getattr(req, "hard_scan", False))
     if POSITIONS_EXPLORER_NFT_CATALOG_SCAN:
         start_label = "Scanning NFT collections"
         start_progress = 12.0
