@@ -15782,6 +15782,17 @@ def _render_placeholder_page(
       color: #64748b;
       letter-spacing: 0.02em;
     }}
+    .js-runtime-banner {{
+      display: none;
+      margin: 10px 0 14px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #fecaca;
+      background: #fef2f2;
+      color: #991b1b;
+      font-size: 13px;
+      white-space: normal;
+    }}
     {extra_css}
   </style>
 </head>
@@ -15800,6 +15811,7 @@ def _render_placeholder_page(
         <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
       </div>
     </div>
+    <div id="jsRuntimeBanner" class="js-runtime-banner"></div>
     {intro_html}
     {extra_html}
     <footer class="app-footer">Uni Fee v{APP_VERSION}</footer>
@@ -15811,6 +15823,29 @@ def _render_placeholder_page(
       <div class="wallet-note">Rabby and Phantom are supported. Sign-in uses a gasless message signature.</div>
     </div>
   </div>
+  <script>
+    (function () {{
+      let shown = false;
+      function showJsBanner(msg) {{
+        if (shown) return;
+        const el = document.getElementById("jsRuntimeBanner");
+        if (!el) return;
+        const detail = String(msg || "Unknown frontend error");
+        el.style.display = "block";
+        el.textContent = "Frontend script failed to initialize. Check recent JS changes. Details: " + detail;
+        shown = true;
+      }}
+      window.addEventListener("error", function (ev) {{
+        const m = (ev && (ev.message || (ev.error && ev.error.message))) || "window error";
+        showJsBanner(m);
+      }});
+      window.addEventListener("unhandledrejection", function (ev) {{
+        const r = ev ? ev.reason : "";
+        const m = (r && (r.message || String(r))) || "unhandled promise rejection";
+        showJsBanner(m);
+      }});
+    }})();
+  </script>
   <script>
     let authState = {{authenticated: false}};
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";

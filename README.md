@@ -105,6 +105,23 @@ export RENDER_HEALTHCHECK_URL="https://uni-fee-web.onrender.com/healthz"
 
 Если `RENDER_DEPLOY_HOOK_URL` не задан, скрипт только коммитит+пушит.
 
+### Локальные git hooks (защита от JS-падения UI)
+
+В проекте есть pre-commit проверка inline JavaScript в `webapp/main.py`,
+которая ловит частые фатальные ошибки (например, дубли `const/let` в одном скоупе).
+
+Включить один раз:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Проверка вручную:
+
+```bash
+python3 scripts/check_inline_js_guardrails.py webapp/main.py
+```
+
 ### Шаги
 
 1. Запушьте проект в GitHub (если еще не там).
