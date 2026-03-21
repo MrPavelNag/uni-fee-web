@@ -16298,7 +16298,7 @@ def _render_positions_page() -> str:
           <div class="section-actions">
             <div id="posProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="posStatus">Ready</span>
-            <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions('pools')">Scan V3</button>
+            <button id="posSearchBtn" class="search-link-btn" type="button" onclick="scanPositions()">Scan V3</button>
             <button class="collapse-btn" id="togglePoolsBtn" type="button" onclick="togglePosSection('pools')" title="Collapse/expand">▾</button>
           </div>
         </div>
@@ -18227,7 +18227,7 @@ def _render_positions_page() -> str:
       persistV3ScanResult(data);
       setPosStatus(formatV3DoneStatus(data, includeOwnerChecks), false);
     }
-    async function scanPositions(targetSection = "all") {
+    async function scanPositions() {
       let handoffToBackground = false;
       if (posHasScannedOnce) {
         const ok = window.confirm("Run scan again and replace current results?");
@@ -20858,13 +20858,19 @@ def _create_positions_job() -> str:
     return job_id
 
 
+def _start_positions_scan_job(req: PositionsScanRequest, sid: str, *, pool_scan_profile: str) -> str:
+    """Create and start async positions scan job for selected profile."""
+    job_id = _create_positions_job()
+    req_for_job = _positions_scan_request_with_updates(req, pool_scan_profile=pool_scan_profile)
+    t = threading.Thread(target=_run_positions_scan_job, args=(job_id, req_for_job, sid), daemon=True)
+    t.start()
+    return job_id
+
+
 @app.post("/api/positions/scan/start")
 def scan_positions_start(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
     sid = _ensure_session_cookie(request, response)
-    job_id = _create_positions_job()
-    v3_req = _positions_scan_request_with_updates(req, pool_scan_profile="v3")
-    t = threading.Thread(target=_run_positions_scan_job, args=(job_id, v3_req, sid), daemon=True)
-    t.start()
+    job_id = _start_positions_scan_job(req, sid, pool_scan_profile="v3")
     return {"job_id": job_id}
 
 
@@ -20872,10 +20878,7 @@ def scan_positions_start(req: PositionsScanRequest, request: Request, response: 
 def scan_positions_v4_infinity_start(req: PositionsScanRequest, request: Request, response: Response) -> dict[str, Any]:
     """Separate async job: Uniswap v4 + Pancake V3 Farming / Infinity only (NFT catalog + heavy PM snapshot)."""
     sid = _ensure_session_cookie(request, response)
-    job_id = _create_positions_job()
-    heavy_req = _positions_scan_request_with_updates(req, pool_scan_profile="heavy")
-    t = threading.Thread(target=_run_positions_scan_job, args=(job_id, heavy_req, sid), daemon=True)
-    t.start()
+    job_id = _start_positions_scan_job(req, sid, pool_scan_profile="heavy")
     return {"job_id": job_id}
 
 
