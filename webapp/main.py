@@ -7159,6 +7159,30 @@ def _normalize_display_symbol(symbol: str) -> str:
     return s
 
 
+def _normalize_fee_symbol_hint(symbol: str) -> str:
+    """
+    Normalize noisy UI symbols for address/price lookup in fee-series path.
+    Examples: 'USD₮0' -> 'USDT', 'USDC.e' -> 'USDC', 'WETH9' -> 'WETH'.
+    """
+    s = _normalize_display_symbol(str(symbol or "")).strip()
+    if not s:
+        return ""
+    s = s.replace("₮", "T").replace("．", ".")
+    s = re.sub(r"[^A-Za-z0-9._-]+", "", s).upper()
+    if not s:
+        return ""
+    s = re.sub(r"\\d+$", "", s)
+    if s.endswith(".E"):
+        s = s[:-2]
+    if s in {"WETH9", "WETH"}:
+        return "WETH"
+    if s.startswith("USDT"):
+        return "USDT"
+    if s.startswith("USDC"):
+        return "USDC"
+    return s
+
+
 def _is_probably_spam_symbol(symbol: str) -> bool:
     s = str(symbol or "").strip()
     if not s or s == "?":
@@ -22537,14 +22561,18 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     token0 = str(req.token0_id or "").strip().lower()
     token1 = str(req.token1_id or "").strip().lower()
+    sym0_hint = _normalize_fee_symbol_hint(str(getattr(req, "token0_symbol", "") or ""))
+    sym1_hint = _normalize_fee_symbol_hint(str(getattr(req, "token1_symbol", "") or ""))
+    debug["token0_symbol_hint"] = sym0_hint
+    debug["token1_symbol_hint"] = sym1_hint
     try:
         if not _is_eth_address(token0):
-            token0 = _token_addr_by_symbol_for_chain(chain_key, str(getattr(req, "token0_symbol", "") or ""))
+            token0 = _token_addr_by_symbol_for_chain(chain_key, sym0_hint or str(getattr(req, "token0_symbol", "") or ""))
     except Exception:
         token0 = ""
     try:
         if not _is_eth_address(token1):
-            token1 = _token_addr_by_symbol_for_chain(chain_key, str(getattr(req, "token1_symbol", "") or ""))
+            token1 = _token_addr_by_symbol_for_chain(chain_key, sym1_hint or str(getattr(req, "token1_symbol", "") or ""))
     except Exception:
         token1 = ""
     want_hist_usd = bool(getattr(req, "fee_usd_historical", False))
@@ -22934,9 +22962,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             p0 = 0.0
             p1 = 0.0
         if p0 <= 0:
-            p0 = _safe_float(_major_or_stable_price_by_symbol(str(getattr(req, "token0_symbol", "") or "")))
+            p0 = _safe_float(_major_or_stable_price_by_symbol(sym0_hint or str(getattr(req, "token0_symbol", "") or "")))
         if p1 <= 0:
-            p1 = _safe_float(_major_or_stable_price_by_symbol(str(getattr(req, "token1_symbol", "") or "")))
+            p1 = _safe_float(_major_or_stable_price_by_symbol(sym1_hint or str(getattr(req, "token1_symbol", "") or "")))
         usd_now = 0.0
         if owed0 > 0 and p0 > 0:
             usd_now += float(owed0) * float(p0)
@@ -22986,6 +23014,8 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     include_debug_summary = bool(getattr(req, "include_debug_summary", True))
     workers_cfg = max(1, min(8, int(os.environ.get("POSITIONS_FEE_COMPARE_WORKERS", "4"))))
     wall_budget_sec = max(5.0, min(120.0, float(os.environ.get("POSITIONS_FEE_COMPARE_WALL_SEC", "40"))))
+    if len(prepared_rows) <= 2:
+        wall_budget_sec = max(float(wall_budget_sec), 180.0)
     nonempty_baseline = os.environ.get("POSITIONS_FEE_COMPARE_NONEMPTY_BASELINE", "1").strip().lower() in (
         "1",
         "true",
@@ -23221,6 +23251,27 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                 )
 
     processed.sort(key=lambda x: int(((x.get("row") or {}).get("source_index") or 0)))
+    # De-duplicate by source row: prefer successful result over timeout/error for the same source index.
+    best_by_src: dict[int, dict[str, Any]] = {}
+    for rec in processed:
+        row_obj = rec.get("row") if isinstance(rec, dict) else {}
+        src = int((row_obj or {}).get("source_index") or 0)
+        prev = best_by_src.get(src)
+        if prev is None:
+            best_by_src[src] = rec
+            continue
+        prev_ok = bool(prev.get("ok"))
+        cur_ok = bool(rec.get("ok"))
+        if cur_ok and not prev_ok:
+            best_by_src[src] = rec
+            continue
+        if cur_ok and prev_ok:
+            prev_pts = len(((prev.get("row") or {}).get("collected_items") or [])) + len(((prev.get("row") or {}).get("estimated_items") or [])) + len(((prev.get("row") or {}).get("snapshot_items") or []))
+            cur_pts = len(((rec.get("row") or {}).get("collected_items") or [])) + len(((rec.get("row") or {}).get("estimated_items") or [])) + len(((rec.get("row") or {}).get("snapshot_items") or []))
+            if cur_pts > prev_pts:
+                best_by_src[src] = rec
+    processed = sorted(best_by_src.values(), key=lambda x: int(((x.get("row") or {}).get("source_index") or 0)))
+
     for rec in processed:
         row_obj = dict(rec.get("row") or {})
         out_rows.append(row_obj)
