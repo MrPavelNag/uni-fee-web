@@ -398,10 +398,27 @@ _TOKENNFTTX_HTTP_SEM = threading.BoundedSemaphore(int(POSITIONS_EXPLORER_NFTTX_G
 # Set to 0 to disable pacing.
 POSITIONS_EXPLORER_NFTTX_RPS_LIMIT = max(
     0.0,
-    min(20.0, float(os.environ.get("POSITIONS_EXPLORER_NFTTX_RPS_LIMIT", "3"))),
+    min(20.0, float(os.environ.get("POSITIONS_EXPLORER_NFTTX_RPS_LIMIT", "5"))),
+)
+POSITIONS_EXPLORER_NFTTX_RPS_SCOPE = (
+    "global"
+    if str(os.environ.get("POSITIONS_EXPLORER_NFTTX_RPS_SCOPE", "per_host")).strip().lower() == "global"
+    else "per_host"
 )
 _TOKENNFTTX_RPS_LOCK = threading.Lock()
-_TOKENNFTTX_RPS_NEXT_TS = 0.0
+_TOKENNFTTX_RPS_NEXT_TS_BY_KEY: dict[str, float] = {}
+# Etherscan API V2 free tier does not support tokennfttx for these chains.
+# Skip api.etherscan.io/v2 for them and use native explorers / blockscout / RPC fallbacks.
+_ETHERSCAN_V2_TOKENNFTTX_UNSUPPORTED_FREE_CHAIN_IDS: frozenset[int] = frozenset(
+    {56, 97, 8453, 84532, 10, 11155420, 43114, 43113}
+)
+
+
+def _etherscan_v2_tokennfttx_enabled_for_chain(chain_id: int) -> bool:
+    cid = int(chain_id)
+    if cid <= 0:
+        return False
+    return cid not in _ETHERSCAN_V2_TOKENNFTTX_UNSUPPORTED_FREE_CHAIN_IDS
 # True: call api.etherscan.io/v2 (chainid) before bscscan/basescan/optimistic. Same ETHERSCAN_API_KEY
 # works on v2 for mapped chains. For native hosts: BSC/Base may reject a pure Etherscan key; Arbitrum
 # Arbiscan accepts the same multi-chain Etherscan key — we fall back ARBISCAN_API_KEY → ETHERSCAN_API_KEY.
@@ -4785,6 +4802,62 @@ def _position_creation_date_ymd(chain_id: int, protocol: str, position_id: Any) 
     return date_str
 
 
+def _position_creation_date_ymd_from_explorer_owner_pm(
+    chain_id: int,
+    protocol: str,
+    owner: str,
+    token_id: Any,
+) -> str:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    o = str(owner or "").strip().lower()
+    tid = _position_token_id_from_raw(token_id)
+    if cid <= 0 or not proto or not _is_eth_address(o) or tid <= 0:
+        return ""
+    pm = _position_manager_for_protocol(cid, proto)
+    if not _is_eth_address(pm):
+        return ""
+    try:
+        rows = _explorer_nfttx_rows(
+            cid,
+            str(pm),
+            o,
+            max_rows=250,
+            protocol=proto,
+        )
+    except Exception:
+        rows = []
+    if not rows:
+        return ""
+    mint_ts = 0
+    first_ts = 0
+    zero_addr = "0x0000000000000000000000000000000000000000"
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        t_id = _position_token_id_from_raw(_explorer_nfttx_row_token_id_str(r))
+        if int(t_id) != int(tid):
+            continue
+        try:
+            ts = int(str(r.get("timeStamp") or r.get("timestamp") or "0"), 10)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        if first_ts <= 0 or ts < first_ts:
+            first_ts = ts
+        from_addr = str(r.get("from") or "").strip().lower()
+        if from_addr == zero_addr and (mint_ts <= 0 or ts < mint_ts):
+            mint_ts = ts
+    best_ts = mint_ts if mint_ts > 0 else first_ts
+    if best_ts <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(best_ts), tz=timezone.utc).date().isoformat()
+    except Exception:
+        return ""
+
+
 def _position_creation_date_peek(chain_id: int, protocol: str, position_id: Any) -> str:
     cid = int(chain_id)
     proto = str(protocol or "").strip().lower()
@@ -4964,12 +5037,19 @@ def _position_creation_date_ymd_for_row(row: dict[str, Any]) -> str:
     pids = _row_position_id_candidates(row)
     if not pids:
         return ""
+    owner = str(row.get("address") or "").strip().lower()
     dates: list[str] = []
     for pid in pids:
         for proto in _position_creation_date_keys_for_row(row):
             if not _position_manager_for_protocol(cid, proto):
                 continue
             d = _position_creation_date_ymd(cid, proto, pid)
+            if not d:
+                # Base/L2 public RPC can fail historical getLogs; fallback to explorer tokennfttx
+                # for this owner+PM+tokenId to recover Created date.
+                d = _position_creation_date_ymd_from_explorer_owner_pm(cid, proto, owner, pid)
+                if d:
+                    _position_creation_date_cache_set(cid, proto, pid, d)
             if d:
                 dates.append(d)
                 break
@@ -5492,6 +5572,7 @@ def _explorer_nfttx_rows(
     chainid_for_v2 = _explorer_v2_chainid(cid)
     if not chainid_for_v2:
         return []
+    v2_allowed = _etherscan_v2_tokennfttx_enabled_for_chain(cid)
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip() or eth_key
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
@@ -5506,7 +5587,7 @@ def _explorer_nfttx_rows(
     offset = max(20, min(1000, int(max_rows)))
     for owner_addr in owner_candidates:
         # Primary: Etherscan API v2 + ETHERSCAN_API_KEY for all mapped chains (incl. BSC).
-        if eth_key:
+        if eth_key and v2_allowed:
             urls.append((
                 "https://api.etherscan.io/v2/api"
                 f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
@@ -5623,7 +5704,7 @@ def _explorer_nfttx_rows(
     # Fallback: query tokennfttx by contract only (without owner filter),
     # then filter rows locally by owner in from/to fields.
     contract_urls: list[str] = []
-    if eth_key:
+    if eth_key and v2_allowed:
         contract_urls.append(
             "https://api.etherscan.io/v2/api"
             f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
@@ -5855,6 +5936,7 @@ def _explorer_owner_nfttx_rows(
     chainid_for_v2 = _explorer_v2_chainid(cid)
     if not chainid_for_v2:
         return []
+    v2_allowed = _etherscan_v2_tokennfttx_enabled_for_chain(cid)
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip() or eth_key
     base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
@@ -5876,9 +5958,10 @@ def _explorer_owner_nfttx_rows(
         debug_out["has_polygon_key"] = bool(polygon_key)
         debug_out["has_optimistic_key"] = bool(optimistic_key)
         debug_out["has_uni_key"] = bool(uni_key)
+        debug_out["v2_allowed_for_chain"] = bool(v2_allowed)
     offset = max(20, min(1000, int(max_rows)))
     v2_tmpl = ""
-    if eth_key:
+    if eth_key and v2_allowed:
         v2_tmpl = (
             "https://api.etherscan.io/v2/api"
             f"?chainid={chainid_for_v2}&module=account&action=tokennfttx"
@@ -5951,20 +6034,32 @@ def _explorer_owner_nfttx_rows(
     def _deadline_hit() -> bool:
         return deadline_ts is not None and time.monotonic() >= float(deadline_ts)
 
-    def _wait_tokennfttx_rps_slot() -> None:
+    def _tokennfttx_rps_key(url: str) -> str:
+        if POSITIONS_EXPLORER_NFTTX_RPS_SCOPE == "global":
+            return "*"
+        u = str(url or "")
+        try:
+            if "://" in u:
+                return u.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].strip().lower() or "*"
+        except Exception:
+            return "*"
+        return "*"
+
+    def _wait_tokennfttx_rps_slot(url: str) -> None:
         lim = float(POSITIONS_EXPLORER_NFTTX_RPS_LIMIT)
         if lim <= 0:
             return
         min_interval = max(0.001, 1.0 / lim)
+        rk = _tokennfttx_rps_key(url)
         while True:
             wait_sec = 0.0
             with _TOKENNFTTX_RPS_LOCK:
-                global _TOKENNFTTX_RPS_NEXT_TS
                 now = time.monotonic()
-                if now >= float(_TOKENNFTTX_RPS_NEXT_TS):
-                    _TOKENNFTTX_RPS_NEXT_TS = now + min_interval
+                next_ts = float(_TOKENNFTTX_RPS_NEXT_TS_BY_KEY.get(rk) or 0.0)
+                if now >= next_ts:
+                    _TOKENNFTTX_RPS_NEXT_TS_BY_KEY[rk] = now + min_interval
                     return
-                wait_sec = max(0.001, float(_TOKENNFTTX_RPS_NEXT_TS) - now)
+                wait_sec = max(0.001, next_ts - now)
             time.sleep(min(0.05, wait_sec))
 
     def _finalize() -> list[dict[str, Any]]:
@@ -5983,6 +6078,7 @@ def _explorer_owner_nfttx_rows(
         debug_out["http_timeout_sec"] = round(http_timeout, 3)
         debug_out["page_workers"] = int(page_workers)
         debug_out["rps_limit"] = float(POSITIONS_EXPLORER_NFTTX_RPS_LIMIT)
+        debug_out["rps_scope"] = str(POSITIONS_EXPLORER_NFTTX_RPS_SCOPE)
 
     def _append_from_result(rows_raw: Any) -> str:
         """Return 'empty', 'ok', or 'full'."""
@@ -6036,7 +6132,7 @@ def _explorer_owner_nfttx_rows(
         url = str(tmpl_arg).replace("{page}", str(page_num))
         req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
         try:
-            _wait_tokennfttx_rps_slot()
+            _wait_tokennfttx_rps_slot(url)
             with _TOKENNFTTX_HTTP_SEM:
                 with urlopen(req, timeout=http_timeout) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -16097,6 +16193,20 @@ def _render_positions_page() -> str:
     #posHeavyPoolsClosedTable th, #posHeavyPoolsClosedTable td,
     #posHeavyPoolsOtherTable th, #posHeavyPoolsOtherTable td,
     #posHeavyPoolsHiddenTable th, #posHeavyPoolsHiddenTable td { white-space: nowrap; }
+    #posPoolsTable th:last-child,
+    #posPoolsSpamTable th:last-child,
+    #posPoolsProtocolTable th:last-child,
+    #posPoolsClosedTable th:last-child,
+    #posPoolsOtherTable th:last-child,
+    #posPoolsHiddenTable th:last-child,
+    #posHeavyPoolsTable th:last-child,
+    #posHeavyPoolsSpamTable th:last-child,
+    #posHeavyPoolsProtocolTable th:last-child,
+    #posHeavyPoolsClosedTable th:last-child,
+    #posHeavyPoolsOtherTable th:last-child,
+    #posHeavyPoolsHiddenTable th:last-child {
+      font-weight: 800;
+    }
     .pos-pools-tab-bar { display: none; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 9px; }
     .pos-tab-btn {
       border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
