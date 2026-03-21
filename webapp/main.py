@@ -16596,6 +16596,7 @@ def _render_positions_page() -> str:
     function normalizeTabSortMode(raw, fallback) {
       const v = String(raw || "").toLowerCase().trim();
       const allowed = new Set([
+        "none",
         "address_asc", "address_desc",
         "position_id_asc", "position_id_desc",
         "chain_asc", "chain_desc",
@@ -16611,13 +16612,14 @@ def _render_positions_page() -> str:
       return allowed.has(v) ? v : String(fallback || "address_asc");
     }
     function normalizeActiveSortMode(raw) {
-      return normalizeTabSortMode(raw, "address_asc");
+      return normalizeTabSortMode(raw, "none");
     }
     function normalizeClosedSortMode(raw) {
       return normalizeTabSortMode(raw, "address_asc");
     }
     function sortModeParts(mode, fallbackKey) {
       const norm = normalizeTabSortMode(mode, `${String(fallbackKey || "address")}_asc`);
+      if (norm === "none") return { key: "none", dir: "asc" };
       const idx = norm.lastIndexOf("_");
       if (idx <= 0) return { key: String(fallbackKey || "address"), dir: "asc" };
       const key = norm.slice(0, idx) || String(fallbackKey || "address");
@@ -16630,9 +16632,13 @@ def _render_positions_page() -> str:
       return p.dir === "desc" ? " ▼" : " ▲";
     }
     function toggleSortModeByColumn(mode, key, fallbackKey) {
-      const p = sortModeParts(mode, fallbackKey || "address");
+      const norm = normalizeTabSortMode(mode, `${String(fallbackKey || "address")}_asc`);
+      const p = sortModeParts(norm, fallbackKey || "address");
       const k = String(key || "").trim().toLowerCase();
       if (!k) return normalizeTabSortMode(mode, `${String(fallbackKey || "address")}_asc`);
+      if (norm === "none") {
+        return normalizeTabSortMode(`${k}_asc`, `${String(fallbackKey || "address")}_asc`);
+      }
       if (p.key === k) {
         return normalizeTabSortMode(`${k}_${p.dir === "asc" ? "desc" : "asc"}`, `${String(fallbackKey || "address")}_asc`);
       }
@@ -16667,6 +16673,7 @@ def _render_positions_page() -> str:
       const m = normalizeTabSortMode(mode, "address_asc");
       const p = sortModeParts(m, "address");
       const out = Array.isArray(rows) ? rows.slice() : [];
+      if (p.key === "none") return out;
       out.sort((a, b) => {
         const an = rowSortNumericValue(a, p.key);
         const bn = rowSortNumericValue(b, p.key);
@@ -16697,7 +16704,7 @@ def _render_positions_page() -> str:
       return out;
     }
     function getActiveSortMode() {
-      try { return normalizeActiveSortMode(localStorage.getItem(POS_ACTIVE_SORT_KEY) || "address_asc"); } catch (_) { return "address_asc"; }
+      try { return normalizeActiveSortMode(localStorage.getItem(POS_ACTIVE_SORT_KEY) || "none"); } catch (_) { return "none"; }
     }
     function setActiveSortMode(mode) {
       try { localStorage.setItem(POS_ACTIVE_SORT_KEY, normalizeActiveSortMode(mode)); } catch (_) {}
@@ -16713,7 +16720,7 @@ def _render_positions_page() -> str:
       setClosedSortMode(toggleSortModeByColumn(getClosedSortMode(), key, "address"));
     }
     function getHeavyActiveSortMode() {
-      try { return normalizeActiveSortMode(localStorage.getItem(POS_HEAVY_ACTIVE_SORT_KEY) || "address_asc"); } catch (_) { return "address_asc"; }
+      try { return normalizeActiveSortMode(localStorage.getItem(POS_HEAVY_ACTIVE_SORT_KEY) || "none"); } catch (_) { return "none"; }
     }
     function setHeavyActiveSortMode(mode) {
       try { localStorage.setItem(POS_HEAVY_ACTIVE_SORT_KEY, normalizeActiveSortMode(mode)); } catch (_) {}
@@ -17696,6 +17703,35 @@ def _render_positions_page() -> str:
       const debugEl = document.getElementById("posFeeDebug");
       if (!chartEl) return;
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
+      function renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints) {
+        if (!debugEl) return;
+        const rows = Array.isArray(rowStatuses) ? rowStatuses : [];
+        const okCount = rows.filter((x) => x && x.outcome === "ok").length;
+        const emptyCount = rows.filter((x) => x && x.outcome === "empty").length;
+        const badCount = rows.filter((x) => x && x.outcome !== "ok" && x.outcome !== "empty").length;
+        const parts = [];
+        parts.push(`<b>Fee source status</b>`);
+        parts.push(`Selected: ${Number(diag?.selected || 0)} · with data: ${okCount} · empty: ${emptyCount} · failed/skipped: ${badCount}`);
+        if (rows.length) {
+          const lines = rows.slice(0, 24).map((x) => {
+            const label = esc(String(x?.label || "?"));
+            const outcome = esc(String(x?.outcome || "-"));
+            const mode = esc(String(x?.mode || "-"));
+            const pricing = String(x?.pricing || "").trim();
+            const pts = Number(x?.points || 0);
+            const detail = String(x?.detail || "").trim();
+            const pp = pricing ? `, pricing=${esc(pricing)}` : "";
+            const pt = pts > 0 ? `, points=${pts}` : "";
+            const dt = detail ? `, ${esc(detail)}` : "";
+            return `• ${label}: ${outcome}, mode=${mode}${pp}${pt}${dt}`;
+          });
+          parts.push(lines.join("<br/>"));
+        }
+        if (apiFailTop.length) parts.push(`Top API errors: ${esc(apiFailTop.join(" ; "))}`);
+        if (backendHints.length) parts.push(`Backend hints: ${esc(backendHints.join(" | "))}`);
+        debugEl.innerHTML = parts.join("<br/>");
+        debugEl.style.display = "";
+      }
       async function postFeeSeriesWithRetry(payload, maxAttempts = 3) {
         let lastRes = null;
         let lastData = {};
@@ -17747,6 +17783,7 @@ def _render_positions_page() -> str:
         };
         const apiFailTop = [];
         const backendHints = [];
+        const rowStatuses = [];
         for (let i = 0; i < selected.length; i++) {
           const hk = parseHistoryKey(selected[i]);
           const idx = hk.idx;
@@ -17755,10 +17792,23 @@ def _render_positions_page() -> str:
             : (posCache.pools || [])[idx];
           if (!row) {
             diag.missingRow += 1;
+            rowStatuses.push({
+              label: `${String(hk.scope || "v")}:${Number(idx) || 0}`,
+              outcome: "stale-row-ref",
+              mode: "n/a",
+              detail: "selected row is not present in current cache",
+            });
             continue;
           }
+          const rowLabel = String(row.pair || row.pool_id || row.position_id || `row#${i + 1}`);
           if (row.unsupported_protocol) {
             diag.unsupported += 1;
+            rowStatuses.push({
+              label: rowLabel,
+              outcome: "unsupported-protocol",
+              mode: "n/a",
+              detail: String(row.protocol || ""),
+            });
             continue;
           }
           const missingTokens = (!String(row.token0_id || "").trim() || !String(row.token1_id || "").trim());
@@ -17794,18 +17844,43 @@ def _render_positions_page() -> str:
             const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
             console.warn("position-fee-series failed", row.pair || row.pool_id, det);
             diag.apiFail += 1;
+            const d = data && data.debug ? data.debug : {};
+            rowStatuses.push({
+              label: rowLabel,
+              outcome: "api-error",
+              mode: String((d && d.result_mode) || data.mode || "error"),
+              detail: det,
+            });
             if (apiFailTop.length < 3) {
               apiFailTop.push(`${String(row.pair || row.pool_id || "?")}: ${det}`);
             }
             continue;
           }
           const items = Array.isArray(data.items) ? data.items : [];
+          const d = data && data.debug ? data.debug : {};
+          const mode = String((d && d.result_mode) || data.mode || "");
           if (!items.length) {
             diag.emptySeries += 1;
+            rowStatuses.push({
+              label: rowLabel,
+              outcome: "empty",
+              mode: mode || "unavailable",
+              pricing: String(data.fee_pricing || (d && d.rpc_pricing) || ""),
+              points: 0,
+              detail: String((d && d.reason) || data.note || "empty fee series"),
+            });
             continue;
           }
           const fp = String(data.fee_pricing || "").trim();
           if (fp) lastFeePricing = fp;
+          rowStatuses.push({
+            label: rowLabel,
+            outcome: "ok",
+            mode: mode || "ok",
+            pricing: fp,
+            points: items.length,
+            detail: String(data.note || ""),
+          });
           traces.push({
             x: items.map((x) => new Date(Number(x.ts || 0) * 1000)),
             y: items.map((x) => Number(x.fees_usd || 0)),
@@ -17825,20 +17900,7 @@ def _render_positions_page() -> str:
           const reasonLine = reasons.length ? reasons.join(" | ") : "all selected rows returned empty fee series";
           const apiTopHtml = apiFailTop.length ? `<br/>Top API errors: ${esc(apiFailTop.join(" ; "))}` : "";
           chartEl.innerHTML = `<div class='hint'><b>No fee data</b><br/>${esc(reasonLine)}${apiTopHtml}<br/>Tip: run a fresh table scan first so token ids/symbols are enriched before fee fallback.</div>`;
-          if (debugEl) {
-            const parts = [];
-            parts.push(`<b>Debug</b>`);
-            parts.push(`Selected: ${diag.selected}`);
-            parts.push(`Unsupported protocol: ${diag.unsupported}`);
-            parts.push(`API errors: ${diag.apiFail}`);
-            parts.push(`Empty fee series: ${diag.emptySeries}`);
-            parts.push(`Missing token0/token1: ${diag.missingTokens}`);
-            parts.push(`Stale selected row refs: ${diag.missingRow}`);
-            if (apiFailTop.length) parts.push(`Top API errors: ${esc(apiFailTop.join(" ; "))}`);
-            if (backendHints.length) parts.push(`Backend: ${esc(backendHints.join(" | "))}`);
-            debugEl.innerHTML = parts.join("<br/>");
-            debugEl.style.display = "";
-          }
+          renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatus(`No fee data · ${reasonLine}`, true);
           return;
         }
@@ -17854,7 +17916,9 @@ def _render_positions_page() -> str:
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
         const pr = lastFeePricing ? ` · ${lastFeePricing}` : "";
-        setPosFeeStatus(`Done: ${traces.length} position(s)${pr}`, false);
+        const missing = Math.max(0, Number(diag.selected || 0) - traces.length);
+        setPosFeeStatus(`Done: ${traces.length}/${diag.selected} position(s) with fee data${pr}${missing ? ` · missing: ${missing}` : ""}`, false);
+        renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints);
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Error: ${esc(e?.message || "unknown")}</div>`;
         if (debugEl) {
@@ -21877,6 +21941,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["rpc_enabled"] = bool(_position_fee_rpc_fallback_enabled())
     debug["rpc_force"] = bool(_position_fee_rpc_force_onchain())
     debug["fee_usd_historical"] = bool(want_hist_usd)
+    debug["rpc_protocol_supported"] = bool(protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"})
+    debug["rpc_tokens_ready"] = bool(_is_eth_address(token0) and _is_eth_address(token1))
 
     exact_by_day: dict[int, float] = {}
     if endpoint:
@@ -21898,7 +21964,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     rpc_by_day: dict[int, float] = {}
     rpc_meta: dict[str, str] = {"pricing": "none", "detail": ""}
     if (
-        protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
+        bool(debug.get("rpc_protocol_supported"))
         and _position_fee_rpc_fallback_enabled()
         and _is_eth_address(token0)
         and _is_eth_address(token1)
@@ -22016,7 +22082,18 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     debug["result_mode"] = "unavailable"
     debug["result_count"] = 0
-    debug["reason"] = "no_subgraph_or_rpc_fee_data"
+    if not bool(debug.get("rpc_protocol_supported")):
+        debug["reason"] = "rpc_fallback_not_supported_for_protocol"
+    elif not bool(debug.get("rpc_tokens_ready")):
+        debug["reason"] = "token0_or_token1_not_resolved_for_rpc"
+    elif not bool(debug.get("endpoint_configured")) and not bool(debug.get("rpc_enabled")):
+        debug["reason"] = "no_subgraph_endpoint_and_rpc_disabled"
+    elif not bool(debug.get("endpoint_configured")):
+        debug["reason"] = "no_subgraph_endpoint"
+    elif not bool(debug.get("rpc_enabled")):
+        debug["reason"] = "rpc_fallback_disabled"
+    else:
+        debug["reason"] = "no_subgraph_or_rpc_fee_data"
     return _with_debug({
         "items": [],
         "count": 0,
