@@ -4771,37 +4771,6 @@ def _position_mint_block_erc721_transfer_on_pm(
     return int(best_blk)
 
 
-def _position_creation_date_ymd(chain_id: int, protocol: str, position_id: Any) -> str:
-    cid = int(chain_id)
-    proto = str(protocol or "").strip().lower()
-    tid = _position_token_id_from_raw(position_id)
-    if cid <= 0 or not proto or tid <= 0:
-        return ""
-    key = (cid, proto, int(tid))
-    with POSITION_CREATION_DATE_CACHE_LOCK:
-        cached = POSITION_CREATION_DATE_CACHE.get(key)
-        if cached is not None:
-            hit = str(cached or "").strip()
-            if hit:
-                return hit
-            POSITION_CREATION_DATE_CACHE.pop(key, None)
-    pm = _position_manager_for_protocol(cid, proto)
-    if not _is_eth_address(pm):
-        return ""
-    first_block = _position_mint_block_erc721_transfer_on_pm(cid, pm, int(tid), deadline_ts=None)
-    date_str = ""
-    if first_block > 0:
-        ts = _eth_get_block_timestamp(cid, first_block)
-        if ts > 0:
-            date_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
-    with POSITION_CREATION_DATE_CACHE_LOCK:
-        if date_str:
-            POSITION_CREATION_DATE_CACHE[key] = date_str
-        else:
-            POSITION_CREATION_DATE_CACHE.pop(key, None)
-    return date_str
-
-
 def _position_creation_date_ymd_from_explorer_owner_pm(
     chain_id: int,
     protocol: str,
@@ -5070,13 +5039,11 @@ def _position_creation_date_ymd_for_row(row: dict[str, Any]) -> str:
         for proto in _position_creation_date_keys_for_row(row):
             if not _position_manager_for_protocol(cid, proto):
                 continue
-            d = _position_creation_date_ymd(cid, proto, pid)
-            if not d:
-                # Base/L2 public RPC can fail historical getLogs; fallback to explorer tokennfttx
-                # for this owner+PM+tokenId to recover Created date.
-                d = _position_creation_date_ymd_from_explorer_owner_pm(cid, proto, owner, pid)
-                if d:
-                    _position_creation_date_cache_set(cid, proto, pid, d)
+            # Lightweight-only strategy: use explorer index fallback directly.
+            # Heavy RPC/log-based mint date probing is intentionally disabled.
+            d = _position_creation_date_ymd_from_explorer_owner_pm(cid, proto, owner, pid)
+            if d:
+                _position_creation_date_cache_set(cid, proto, pid, d)
             if d:
                 dates.append(d)
                 break
@@ -16408,10 +16375,10 @@ def _render_positions_page() -> str:
       border:1px solid #64748b;
       box-shadow: inset 0 0 0 1px rgba(255,255,255,0.45);
     }
-    .status-dot.active { background:#16a34a; border-color:#166534; }
-    .status-dot.inactive { background:#ef4444; border-color:#991b1b; }
-    .status-dot.hidden { background:#64748b; border-color:#334155; }
-    .status-dot.explorer { background:#2563eb; border-color:#1e40af; }
+    .status-dot.active { background:#65a878; border-color:#4f8260; }
+    .status-dot.inactive { background:#d68989; border-color:#aa6767; }
+    .status-dot.hidden { background:#8796aa; border-color:#66768a; }
+    .status-dot.explorer { background:#6e9bc6; border-color:#557ea6; }
     .errors-box { margin-top:11px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:11px; padding:9px; font-size:13px; white-space:pre-wrap; }
     .info-box { margin-top:11px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:11px; padding:9px; font-size:13px; white-space:pre-wrap; }
     .fee-card { border-color:#cfdcf2; background: linear-gradient(180deg, #f6f9ff 0%, #edf3ff 100%); }
@@ -16976,7 +16943,7 @@ def _render_positions_page() -> str:
       const cN = Math.max(0, Number(posFinalClosedCount) || 0);
       const aS = formatSecShort(posFinalActiveSec);
       const cS = formatSecShort(posFinalClosedSec);
-      setPosStatus(`Summary: open (not closed) positions — ${aN}, ${aS}; closed — ${cN}, ${cS}`, false);
+      setPosStatus(`Summary: open positions — ${aN}, ${aS}; closed — ${cN}, ${cS}`, false);
     }
     async function enrichClosedRowsCreatedDates(scope = "v3") {
       const isHeavy = String(scope || "") === "heavy";
