@@ -3271,6 +3271,55 @@ def _major_or_stable_price_by_symbol(symbol: str) -> float | None:
     return None
 
 
+def _major_coingecko_id_by_symbol(symbol: str) -> str:
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return ""
+    alias = {
+        "WETH": "ETH",
+        "WETH.E": "ETH",
+        "WETH9": "ETH",
+        "WBTC": "BTC",
+        "WBNB": "BNB",
+    }
+    s = alias.get(s, s)
+    mapping = {
+        "BTC": "bitcoin",
+        "ETH": "ethereum",
+        "BNB": "binancecoin",
+        "UNI": "uniswap",
+        "SOL": "solana",
+        "ARB": "arbitrum",
+    }
+    return mapping.get(s, "")
+
+
+def _fetch_coingecko_major_series_days(coin_id: str, days: int) -> list[tuple[int, float]]:
+    cid = str(coin_id or "").strip().lower()
+    d = max(1, min(3650, int(days or 30)))
+    if not cid:
+        return []
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart?vs_currency=usd&days={d}&interval=daily"
+        req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+        with urlopen(req, timeout=14) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        rows = payload.get("prices") or []
+        out: list[tuple[int, float]] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            ts_ms = _safe_float(row[0])
+            px = _safe_float(row[1])
+            if ts_ms <= 0 or px <= 0:
+                continue
+            out.append((int(ts_ms // 1000), float(px)))
+        out.sort(key=lambda x: x[0])
+        return out
+    except Exception:
+        return []
+
+
 def _rpc_urls_for_chain(chain_id: int) -> list[str]:
     env_key = f"POSITIONS_RPC_URLS_{int(chain_id)}"
     custom = os.environ.get(env_key, "").strip()
@@ -4545,6 +4594,15 @@ def _position_token_id_from_raw(position_id: Any) -> int:
     if m:
         try:
             v = int(m.group(1), 10)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    # Last-resort cleanup for UI-decorated ids (e.g. "5324069⧉" or "id=5324069").
+    m2 = re.search(r"(\d{3,})", raw)
+    if m2:
+        try:
+            v = int(m2.group(1), 10)
             if v > 0:
                 return v
         except ValueError:
@@ -14203,37 +14261,57 @@ def _fetch_v3_position_fees_by_collect_logs(
     chunk = _fee_collect_log_chunk_blocks(cid)
     max_chunks = _fee_collect_log_max_chunks()
     topics_or = topic0s if len(topic0s) > 1 else topic0s[0]
+    range_blocks = max(0, int(latest) - int(from_block) + 1)
+    required_chunks = int((range_blocks + int(chunk) - 1) // int(chunk)) if range_blocks > 0 else 0
+    truncated_window = bool(required_chunks > max_chunks)
+    tail_from_block = int(from_block)
+    if truncated_window:
+        # On fast L2s the full window can be millions of blocks; prioritize recent history first.
+        tail_from_block = max(int(from_block), int(latest) - int(chunk) * int(max_chunks) + 1)
 
     raw_events: list[tuple[int, int, int, int]] = []
-    for pid in position_ids:
-        tid = _position_token_id_from_raw(pid)
-        if tid <= 0:
-            continue
-        topic1 = "0x" + _encode_uint_word(int(tid))
-        cur = int(from_block)
-        chunks_used = 0
-        while cur <= int(latest) and chunks_used < max_chunks:
-            to_b = min(cur + int(chunk) - 1, int(latest))
-            params: dict[str, Any] = {
-                "fromBlock": hex(int(cur)),
-                "toBlock": hex(int(to_b)),
-                "address": pm,
-                "topics": [topics_or, topic1],
-            }
-            try:
-                logs = _eth_get_logs(cid, params, timeout_sec=max(20.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 5.0))
-            except Exception:
-                logs = []
-            for lg in logs or []:
-                if not isinstance(lg, dict):
-                    continue
-                data_hex = str(lg.get("data") or "")
-                r0, r1 = _decode_v3_npm_collect_log_amounts_raw(data_hex)
-                blk = _eth_uint_from_rpc_field(lg.get("blockNumber"))
-                lix = _eth_uint_from_rpc_field(lg.get("logIndex"))
-                raw_events.append((int(blk), int(lix), int(r0), int(r1)))
-            cur = int(to_b) + 1
-            chunks_used += 1
+    def _scan_collect_logs_window(start_block: int, end_block: int, chunk_cap: int) -> None:
+        nonlocal raw_events
+        s = max(1, int(start_block))
+        e = max(s, int(end_block))
+        cap = max(1, int(chunk_cap))
+        for pid in position_ids:
+            tid = _position_token_id_from_raw(pid)
+            if tid <= 0:
+                continue
+            topic1 = "0x" + _encode_uint_word(int(tid))
+            cur = int(s)
+            chunks_used = 0
+            while cur <= int(e) and chunks_used < cap:
+                to_b = min(cur + int(chunk) - 1, int(e))
+                params: dict[str, Any] = {
+                    "fromBlock": hex(int(cur)),
+                    "toBlock": hex(int(to_b)),
+                    "address": pm,
+                    "topics": [topics_or, topic1],
+                }
+                try:
+                    logs = _eth_get_logs(cid, params, timeout_sec=max(20.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 5.0))
+                except Exception:
+                    logs = []
+                for lg in logs or []:
+                    if not isinstance(lg, dict):
+                        continue
+                    data_hex = str(lg.get("data") or "")
+                    r0, r1 = _decode_v3_npm_collect_log_amounts_raw(data_hex)
+                    blk = _eth_uint_from_rpc_field(lg.get("blockNumber"))
+                    lix = _eth_uint_from_rpc_field(lg.get("logIndex"))
+                    raw_events.append((int(blk), int(lix), int(r0), int(r1)))
+                cur = int(to_b) + 1
+                chunks_used += 1
+
+    # Pass 1: recent window (full window when small enough).
+    _scan_collect_logs_window(int(tail_from_block), int(latest), int(max_chunks))
+    # Pass 2: tiny early-window probe when range was truncated and recent window was empty.
+    if truncated_window and not raw_events:
+        head_chunks = max(8, min(40, int(max_chunks) // 5))
+        head_to = min(int(latest), int(from_block) + int(chunk) * int(head_chunks) - 1)
+        _scan_collect_logs_window(int(from_block), int(head_to), int(head_chunks))
 
     if not raw_events:
         return {}, empty_meta
@@ -14314,6 +14392,8 @@ def _fetch_v3_position_fees_by_collect_logs(
             "Collect logs: USD per event via CoinGecko contract historical range; "
             "stables=$1; missing historical series uses spot for that token."
         )
+        if truncated_window:
+            detail += " Log scan window was truncated due to RPC range budget; recent blocks prioritized."
         if partial0 or partial1:
             detail += " Some tokens had no CG history — spot used for those legs."
         if priced_partial:
@@ -14349,6 +14429,8 @@ def _fetch_v3_position_fees_by_collect_logs(
     out = {int(d): float(v) for d, (_ts, v) in by_day.items()}
     pricing = "onchain_spot" if not priced_partial else "onchain_spot_partial"
     detail = "Collect logs: cumulative fees marked at current spot USD (CoinGecko / ratio)."
+    if truncated_window:
+        detail += " Log scan window was truncated due to RPC range budget; recent blocks prioritized."
     if priced_partial:
         detail += " Some events were valued by one known token leg only."
     meta = {
@@ -15701,6 +15783,12 @@ class PositionsFeeCompareDataRequest(BaseModel):
     include_debug_summary: bool = True
 
 
+class PositionsBenchmarkSeriesRequest(BaseModel):
+    symbols: list[str] = Field(default_factory=list)
+    days: int = 30
+    base100: bool = True
+
+
 def _normalize_positions_series_protocol(raw: str, *, for_fees: bool = False) -> str:
     """
     Map table/UI labels (e.g. UNI-V3, PanC-V3 from NFT catalog) to internal protocol keys
@@ -16741,8 +16829,24 @@ def _render_positions_page() -> str:
       </section>
       <section class="result-card">
         <div class="section-head">
-          <h3>Show history <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:72px;margin-left:6px"/></h3>
+          <h3>Show history</h3>
           <div class="section-actions">
+            <label class="fee-toggle-pill" title="Build chart from pool creation date.">
+              <input type="checkbox" id="posHistoryFromCreation" checked onchange="onHistoryRangeModeChange('creation')" />
+              <span class="pos-fee-hist-label">From creation date</span>
+            </label>
+            <label class="fee-toggle-pill" title="Build chart for the last N days.">
+              <input type="checkbox" id="posHistoryUseDays" onchange="onHistoryRangeModeChange('days')" />
+              <span class="pos-fee-hist-label">Last</span>
+            </label>
+            <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:72px" />
+            <span class="hint" style="font-size:12px;color:#475569">days</span>
+            <label class="fee-toggle-pill" title="Overlay benchmark lines on history chart.">
+              <input type="checkbox" id="posHistoryBenchmarkOn" />
+              <span class="pos-fee-hist-label">Benchmark</span>
+            </label>
+            <input id="posHistoryBenchA" value="BTC" style="width:58px" />
+            <input id="posHistoryBenchB" value="ETH" style="width:58px" />
             <span class="pos-status" id="posHistoryStatus">Select pools and click Search</span>
             <button class="search-link-btn" type="button" onclick="showSelectedPoolSeries()">Search</button>
             <button class="collapse-btn" id="toggleHistoryBtn" type="button" onclick="togglePosSection('history')" title="Collapse/expand">▾</button>
@@ -16750,6 +16854,7 @@ def _render_positions_page() -> str:
         </div>
         <div id="posHistoryBody" class="section-body">
           <div id="posPoolChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+          <div id="posHistoryDebug" class="info-box" style="display:none"></div>
         </div>
       </section>
       <section class="result-card">
@@ -17748,6 +17853,47 @@ def _render_positions_page() -> str:
       const v = Number(document.getElementById("posHistoryDays")?.value || 30);
       return Math.max(1, Math.min(3650, Math.round(v)));
     }
+    function onHistoryRangeModeChange(mode) {
+      const c = document.getElementById("posHistoryFromCreation");
+      const d = document.getElementById("posHistoryUseDays");
+      const daysInput = document.getElementById("posHistoryDays");
+      if (!c || !d) return;
+      if (mode === "creation") {
+        c.checked = true;
+        d.checked = false;
+      } else if (mode === "days") {
+        c.checked = false;
+        d.checked = true;
+      }
+      if (!c.checked && !d.checked) c.checked = true;
+      if (daysInput) daysInput.disabled = !!c.checked;
+    }
+    function getHistoryRangeMode() {
+      const c = !!(document.getElementById("posHistoryFromCreation")?.checked);
+      const d = !!(document.getElementById("posHistoryUseDays")?.checked);
+      if (!c && !d) {
+        onHistoryRangeModeChange("creation");
+        return "creation";
+      }
+      return c ? "creation" : "days";
+    }
+    function getHistoryDaysForRow(row) {
+      const manualDays = getHistoryDays();
+      if (getHistoryRangeMode() !== "creation") return manualDays;
+      const createdMs = parseCreatedDateMs(row);
+      if (!createdMs || createdMs <= 0) return manualDays;
+      const days = Math.ceil((Date.now() - createdMs) / 86400000);
+      return Math.max(1, Math.min(3650, Number(days) || manualDays));
+    }
+    function getBenchmarkSymbols() {
+      const on = !!(document.getElementById("posHistoryBenchmarkOn") && document.getElementById("posHistoryBenchmarkOn").checked);
+      if (!on) return [];
+      const a = String(document.getElementById("posHistoryBenchA")?.value || "BTC").trim().toUpperCase();
+      const b = String(document.getElementById("posHistoryBenchB")?.value || "ETH").trim().toUpperCase();
+      const clean = (s) => String(s || "").replace(/[^A-Z0-9._-]+/g, "").trim().toUpperCase();
+      const out = [clean(a), clean(b)].filter(Boolean);
+      return Array.from(new Set(out));
+    }
     function savePosResults(payload) {
       try {
         localStorage.setItem(POS_RESULTS_STORAGE_KEY, JSON.stringify(payload || {}));
@@ -17951,7 +18097,15 @@ def _render_positions_page() -> str:
         zerolinecolor: "#94a3b8",
         zerolinewidth: 1,
       };
-      if (Number(minCreatedMs || 0) > 0) out.range = [new Date(Number(minCreatedMs)), new Date()];
+      const mode = getHistoryRangeMode();
+      const now = new Date();
+      if (mode === "creation" && Number(minCreatedMs || 0) > 0) {
+        out.range = [new Date(Number(minCreatedMs)), now];
+      } else if (mode === "days") {
+        const days = getHistoryDays();
+        const from = new Date(Date.now() - (Math.max(1, days) * 86400000));
+        out.range = [from, now];
+      }
       return out;
     }
     function chartGridY(withDollar = false) {
@@ -17967,7 +18121,9 @@ def _render_positions_page() -> str:
     }
     async function showSelectedPoolSeries() {
       const chartEl = document.getElementById("posPoolChart");
+      const debugEl = document.getElementById("posHistoryDebug");
       if (!chartEl) return;
+      if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
         setPosHistoryStatus("Select at least one History checkbox in the V3 or v4 / Pancake V3 Farming / Infinity table.", true);
@@ -17980,6 +18136,10 @@ def _render_positions_page() -> str:
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
         let minCreatedMs = 0;
+        const mode = getHistoryRangeMode();
+        const usedDays = [];
+        const selectedRowsMeta = [];
+        const benchmarkSymbols = getBenchmarkSymbols();
         for (let i = 0; i < selected.length; i++) {
           const hk = parseHistoryKey(selected[i]);
           const idx = hk.idx;
@@ -17990,6 +18150,9 @@ def _render_positions_page() -> str:
           if (row.unsupported_protocol) continue;
           const createdMs = parseCreatedDateMs(row);
           if (createdMs > 0 && (!minCreatedMs || createdMs < minCreatedMs)) minCreatedMs = createdMs;
+          const rowDays = getHistoryDaysForRow(row);
+          usedDays.push(rowDays);
+          selectedRowsMeta.push(`${String(row.pair || row.pool_id || row.position_id || `row#${i + 1}`)}: days=${rowDays}, created=${createdMs > 0 ? new Date(createdMs).toISOString().slice(0, 10) : "-"}`);
           const payload = {
             chain: row.chain,
             chain_id: Number(row.chain_id) || 0,
@@ -18001,7 +18164,7 @@ def _render_positions_page() -> str:
             pool_liquidity: row.pool_liquidity,
             pool_created_date: String(row.pool_created_date || ""),
             position_created_date: String(row.position_created_date || ""),
-            days: getHistoryDays(),
+            days: rowDays,
           };
           const res = await fetch("/api/positions/pool-value-series", {
             method: "POST",
@@ -18026,6 +18189,40 @@ def _render_positions_page() -> str:
           setPosHistoryStatus("No history data", false);
           return;
         }
+        let benchmarkCount = 0;
+        if (benchmarkSymbols.length) {
+          const benchDays = (mode === "days")
+            ? getHistoryDays()
+            : Math.max(1, Math.min(3650, Math.ceil((Date.now() - Number(minCreatedMs || Date.now())) / 86400000)));
+          try {
+            const benchRes = await fetch("/api/positions/benchmark-series", {
+              method: "POST",
+              headers: {"Content-Type":"application/json"},
+              body: JSON.stringify({symbols: benchmarkSymbols, days: benchDays, base100: true}),
+            });
+            const benchData = await benchRes.json().catch(() => ({}));
+            const benchSeries = Array.isArray(benchData?.series) ? benchData.series : [];
+            for (const s of benchSeries) {
+              const items = Array.isArray(s?.items) ? s.items : [];
+              if (!items.length) continue;
+              benchmarkCount += 1;
+              traces.push({
+                x: items.map((x) => new Date(Number(x.ts || 0) * 1000)),
+                y: items.map((x) => Number(x.value || 0)),
+                mode: "lines",
+                line: {width: 1.6, dash: "dash"},
+                opacity: 0.9,
+                yaxis: "y2",
+                name: `${String(s.symbol || "?")} benchmark`,
+                hovertemplate: "%{x|%b %d, %Y}<br>%{y:.2f}<extra>%{fullData.name}</extra>",
+              });
+            }
+            const benchErr = Array.isArray(benchData?.errors) ? benchData.errors : [];
+            if (debugEl && benchErr.length) {
+              selectedRowsMeta.push(`benchmark_errors: ${benchErr.join(" ; ")}`);
+            }
+          } catch (_) {}
+        }
         Plotly.newPlot("posPoolChart", traces, {
           title: "Position TVL history",
           paper_bgcolor: "#ffffff",
@@ -18033,12 +18230,36 @@ def _render_positions_page() -> str:
           margin: {t: 34, b: 42, l: 54, r: 12},
           xaxis: chartGridX(minCreatedMs),
           yaxis: chartGridY(true),
+          ...(benchmarkCount > 0 ? {
+            yaxis2: {
+              overlaying: "y",
+              side: "right",
+              showgrid: false,
+              title: "Benchmark (base=100)",
+            },
+          } : {}),
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
+        if (debugEl) {
+          const minDays = usedDays.length ? Math.min(...usedDays) : 0;
+          const maxDays = usedDays.length ? Math.max(...usedDays) : 0;
+          const lines = [];
+          lines.push(`<b>History chart debug</b>`);
+          lines.push(`mode=${esc(mode)} · selected=${Number(selected.length || 0)} · traces=${Number(traces.length || 0)}`);
+          lines.push(`benchmark=${esc(benchmarkSymbols.join(",") || "-")} · benchmark_traces=${benchmarkCount}`);
+          lines.push(`days_used=${esc(minDays === maxDays ? String(minDays) : `${minDays}..${maxDays}`)} · min_created=${esc(minCreatedMs > 0 ? new Date(minCreatedMs).toISOString().slice(0, 10) : "-")}`);
+          if (selectedRowsMeta.length) lines.push(selectedRowsMeta.slice(0, 12).map((x) => `• ${esc(x)}`).join("<br/>"));
+          debugEl.innerHTML = lines.join("<br/>");
+          debugEl.style.display = "";
+        }
         setPosHistoryStatus(`History loaded for ${traces.length} position(s).`, false);
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Failed to load chart: ${esc(e?.message || "unknown")}</div>`;
+        if (debugEl) {
+          debugEl.innerHTML = `<b>History chart debug</b><br/>Error: ${esc(e?.message || "unknown")}`;
+          debugEl.style.display = "";
+        }
         setPosHistoryStatus("History load failed", true);
       }
     }
@@ -18131,6 +18352,7 @@ def _render_positions_page() -> str:
         const rowLabel = String(row.pair || row.pool_id || row.position_id || `row#${i + 1}`);
         const createdMs = parseCreatedDateMs(row);
         if (createdMs > 0 && (!minCreatedMs || createdMs < minCreatedMs)) minCreatedMs = createdMs;
+        const rowDays = getHistoryDaysForRow(row);
         if (row.unsupported_protocol) {
           diag.unsupported += 1;
           rowStatuses.push({
@@ -18154,7 +18376,7 @@ def _render_positions_page() -> str:
           position_liquidity: row.liquidity,
           pool_liquidity: row.pool_liquidity,
           pool_tvl_usd: Number(row.pool_tvl_usd || 0),
-          days: getHistoryDays(),
+          days: rowDays,
           token0_id: row.token0_id || "",
           token1_id: row.token1_id || "",
           token0_symbol: row.position_symbol0 || "",
@@ -18176,6 +18398,7 @@ def _render_positions_page() -> str:
           baseName: String(row.pair || row.pool_id || `Position ${i + 1}`),
           pairOrPool: String(row.pair || row.pool_id || "?"),
           createdMs: Number(createdMs || 0),
+          days: Number(rowDays || 0),
         });
       }
       return {diag, rowStatuses, rowsPayload, payloadMeta, minCreatedMs};
@@ -18390,6 +18613,13 @@ def _render_positions_page() -> str:
           const to = Number(cmpDebug.timeout_rows || 0);
           const sb = Number(cmpDebug.synthetic_baseline_rows || 0);
           backendHints.push(`compare: workers=${w || "-"}, elapsed_ms=${t || "-"}, timeout_rows=${to || 0}, baseline_rows=${sb || 0}`);
+        }
+        if (backendHints.length < 6) {
+          const mode = getHistoryRangeMode();
+          const daysArr = (payloadMeta || []).map((m) => Number(m?.days || 0)).filter((x) => x > 0);
+          const minD = daysArr.length ? Math.min(...daysArr) : 0;
+          const maxD = daysArr.length ? Math.max(...daysArr) : 0;
+          backendHints.push(`chart_range: mode=${mode}, days=${minD === maxD ? minD : `${minD}..${maxD}`}, min_created=${minCreatedMs > 0 ? new Date(minCreatedMs).toISOString().slice(0, 10) : "-"}`);
         }
         const feeState = processFeeCompareRows(
           rowsOut,
@@ -19648,6 +19878,7 @@ def _render_positions_page() -> str:
       }
     }
     loadPosState();
+    onHistoryRangeModeChange("creation");
     bindClosedBgEnrichOption();
     renderAllChips();
     setSectionCollapsed("pools", false);
@@ -22450,6 +22681,57 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
     }
 
 
+@app.post("/api/positions/benchmark-series")
+def positions_benchmark_series(req: PositionsBenchmarkSeriesRequest) -> dict[str, Any]:
+    syms = [str(x or "").strip().upper() for x in (req.symbols or []) if str(x or "").strip()]
+    syms = list(dict.fromkeys(syms))[:6]
+    days = max(1, min(3650, int(req.days or 30)))
+    base100 = bool(getattr(req, "base100", True))
+    series_out: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for sym in syms:
+        coin_id = _major_coingecko_id_by_symbol(sym)
+        if not coin_id:
+            errors.append(f"{sym}: unsupported benchmark symbol")
+            continue
+        raw = _fetch_coingecko_major_series_days(coin_id, days)
+        if not raw:
+            errors.append(f"{sym}: no series")
+            continue
+        items: list[dict[str, Any]] = []
+        if base100:
+            first_px = 0.0
+            for _ts, px in raw:
+                if px > 0:
+                    first_px = float(px)
+                    break
+            if first_px <= 0:
+                errors.append(f"{sym}: invalid base price")
+                continue
+            for ts, px in raw:
+                idx = (float(px) / float(first_px)) * 100.0
+                items.append({"ts": int(ts), "value": float(idx), "price_usd": float(px)})
+        else:
+            for ts, px in raw:
+                items.append({"ts": int(ts), "value": float(px), "price_usd": float(px)})
+        series_out.append(
+            {
+                "symbol": sym,
+                "coin_id": coin_id,
+                "mode": ("index100" if base100 else "usd"),
+                "items": items,
+                "count": len(items),
+            }
+        )
+    return {
+        "ok": True,
+        "days": int(days),
+        "base100": bool(base100),
+        "series": series_out,
+        "errors": errors[:8],
+    }
+
+
 def _fee_series_adapter_name(protocol: str) -> str:
     p = str(protocol or "").strip().lower()
     if p == "uniswap_v4":
@@ -22688,6 +22970,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     token0 = str(req.token0_id or "").strip().lower()
     token1 = str(req.token1_id or "").strip().lower()
+    row_tick_lower = int(getattr(req, "tick_lower", 0) or 0)
+    row_tick_upper = int(getattr(req, "tick_upper", 0) or 0)
+    snap_quote_amount0 = 0.0
+    snap_quote_amount1 = 0.0
     sym0_hint = _normalize_fee_symbol_hint(str(getattr(req, "token0_symbol", "") or ""))
     sym1_hint = _normalize_fee_symbol_hint(str(getattr(req, "token1_symbol", "") or ""))
     debug["token0_symbol_hint"] = sym0_hint
@@ -22712,33 +22998,57 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         if not _is_eth_address(token1) and _is_eth_address(p1):
             token1 = p1
             debug["token1_source"] = "pool_id_subgraph"
-    # Hard fallback for V3-like protocols: resolve token addresses from PositionManager.positions(tokenId)
-    # when row symbols/subgraph metadata are incomplete.
-    if (not _is_eth_address(token0) or not _is_eth_address(token1)) and protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
-        for pid in position_ids[:3]:
-            try:
-                tid = _position_token_id_from_raw(pid)
-                if tid <= 0:
+    # V3-like contract snapshot fallback: token resolution + shape + quote amounts.
+    if protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+        need_snap = (
+            (not _is_eth_address(token0))
+            or (not _is_eth_address(token1))
+            or not (row_tick_lower < row_tick_upper)
+            or (
+                _safe_float(getattr(req, "position_amount0", 0.0)) <= 0
+                and _safe_float(getattr(req, "position_amount1", 0.0)) <= 0
+            )
+        )
+        if need_snap:
+            for pid in position_ids[:3]:
+                try:
+                    tid = _position_token_id_from_raw(pid)
+                    if tid <= 0:
+                        continue
+                    snap = _fetch_v3_position_contract_snapshot(
+                        int(chain_id),
+                        str(protocol),
+                        int(tid),
+                        str(req.address or ""),
+                        include_quotes=True,
+                    ) or {}
+                    if not snap:
+                        continue
+                    debug["contract_snapshot_used"] = True
+                    s0 = str(snap.get("token0") or "").strip().lower()
+                    s1 = str(snap.get("token1") or "").strip().lower()
+                    if not _is_eth_address(token0) and _is_eth_address(s0):
+                        token0 = s0
+                        debug["token0_source"] = "position_manager_snapshot"
+                    if not _is_eth_address(token1) and _is_eth_address(s1):
+                        token1 = s1
+                        debug["token1_source"] = "position_manager_snapshot"
+                    tl = int(snap.get("tick_lower") or 0)
+                    tu = int(snap.get("tick_upper") or 0)
+                    if not (row_tick_lower < row_tick_upper) and tl < tu:
+                        row_tick_lower = int(tl)
+                        row_tick_upper = int(tu)
+                        debug["collect_shape_from_snapshot"] = True
+                    q0 = max(0.0, _safe_float(snap.get("quote_amount0")))
+                    q1 = max(0.0, _safe_float(snap.get("quote_amount1")))
+                    if q0 > 0:
+                        snap_quote_amount0 = float(q0)
+                    if q1 > 0:
+                        snap_quote_amount1 = float(q1)
+                    if _is_eth_address(token0) and _is_eth_address(token1) and (row_tick_lower < row_tick_upper):
+                        break
+                except Exception:
                     continue
-                snap = _fetch_v3_position_contract_snapshot(
-                    int(chain_id),
-                    str(protocol),
-                    int(tid),
-                    str(req.address or ""),
-                    include_quotes=False,
-                ) or {}
-                s0 = str(snap.get("token0") or "").strip().lower()
-                s1 = str(snap.get("token1") or "").strip().lower()
-                if not _is_eth_address(token0) and _is_eth_address(s0):
-                    token0 = s0
-                    debug["token0_source"] = "position_manager_snapshot"
-                if not _is_eth_address(token1) and _is_eth_address(s1):
-                    token1 = s1
-                    debug["token1_source"] = "position_manager_snapshot"
-                if _is_eth_address(token0) and _is_eth_address(token1):
-                    break
-            except Exception:
-                continue
     debug["token0_resolved"] = bool(_is_eth_address(token0))
     debug["token1_resolved"] = bool(_is_eth_address(token1))
     debug["endpoint_configured"] = bool(endpoint)
@@ -22770,6 +23080,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 latest_pool_tvl = max(0.0, _safe_float(getattr(req, "pool_tvl_usd", 0.0)))
             amt0 = max(0.0, _safe_float(getattr(req, "position_amount0", 0.0)))
             amt1 = max(0.0, _safe_float(getattr(req, "position_amount1", 0.0)))
+            if amt0 <= 0 and amt1 <= 0 and (snap_quote_amount0 > 0 or snap_quote_amount1 > 0):
+                amt0 = float(max(0.0, snap_quote_amount0))
+                amt1 = float(max(0.0, snap_quote_amount1))
+                debug["estimate_amount_source"] = "position_manager_quote"
             pos_usd = _liquidity_usd_from_in_position_external(
                 int(chain_id),
                 amt0,
@@ -22882,8 +23196,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     collect_by_shape: dict[int, float] = {}
     if endpoint and protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"} and str(req.pool_id or "").strip() and _is_eth_address(str(req.address or "").strip().lower()):
         shape_candidates: list[tuple[int, int]] = []
-        req_tl = int(getattr(req, "tick_lower", 0) or 0)
-        req_tu = int(getattr(req, "tick_upper", 0) or 0)
+        req_tl = int(row_tick_lower or 0)
+        req_tu = int(row_tick_upper or 0)
         has_precise_shape = bool(req_tl < req_tu)
         debug["collect_shape_from_row"] = bool(has_precise_shape)
         if req_tl < req_tu:
