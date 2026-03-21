@@ -4803,6 +4803,11 @@ def _row_chain_id_position_id(row: dict[str, Any]) -> tuple[int, str]:
         cid = int(row.get("chain_id") or 0)
     except Exception:
         cid = 0
+    if cid <= 0:
+        try:
+            cid = int(_chain_id_by_chain_key(str(row.get("chain") or "")) or 0)
+        except Exception:
+            cid = 0
     return cid, str(row.get("position_id") or "").strip()
 
 
@@ -4837,6 +4842,15 @@ def _position_creation_date_keys_for_row(row: dict[str, Any]) -> list[str]:
         _add("uniswap_v3")
     elif disp.startswith("panc-") or disp.startswith("pancake"):
         _add("pancake_v3")
+
+    # Some rows can have ambiguous v3 labeling on chains where both Uniswap/Pancake v3 PM exist.
+    # Try all configured v3 PM protocols for this chain as fallback to recover Created date.
+    if cid > 0 and any(x in keys for x in ("uniswap_v3", "pancake_v3", "pancake_v3_staked")):
+        if _is_eth_address(str(UNISWAP_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()):
+            _add("uniswap_v3")
+        if _is_eth_address(str(PANCAKE_V3_NPM_BY_CHAIN_ID.get(cid) or "").strip().lower()):
+            _add("pancake_v3")
+            _add("pancake_v3_staked")
     return keys
 
 
@@ -16024,9 +16038,12 @@ def _render_positions_page() -> str:
           <div class="section-actions">
             <span class="pos-status" id="posHistoryStatus">Select pools and click Search</span>
             <button class="search-link-btn" type="button" onclick="showSelectedPoolSeries()">Search</button>
+            <button class="collapse-btn" id="toggleHistoryBtn" type="button" onclick="togglePosSection('history')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <div id="posPoolChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+        <div id="posHistoryBody" class="section-body">
+          <div id="posPoolChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+        </div>
       </section>
       <section class="result-card">
         <div class="section-head">
@@ -16038,10 +16055,13 @@ def _render_positions_page() -> str:
               <span>Historical USD</span>
             </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Scan</button>
+            <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
           </div>
         </div>
-        <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
-        <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+        <div id="posFeeBody" class="section-body">
+          <p class="hint" style="font-size:12px;margin:0 0 8px;color:#475569">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The time window is the number of days in <b>Show history</b>. If subgraph fee fields are empty or zero, Uniswap/Pancake v3 uses NPM <b>Collect</b> events via RPC. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
+          <div id="posFeeChart" style="height:340px;border:1px solid #dbe3ef;border-radius:10px;background:#f8fbff;padding:6px"></div>
+        </div>
       </section>
     </div>
     """
@@ -16114,7 +16134,7 @@ def _render_positions_page() -> str:
       renderChips(kind);
       if (kind === "evm" && (posState.evm || []).length) scheduleBackgroundWarmup("remove");
     }
-    const posSectionState = {pools: false, heavy: false};
+    const posSectionState = {pools: false, heavy: false, history: false, fees: false};
     const posCache = {pools: [], debug: null};
     const posHeavyCache = {pools: [], debug: null};
     const POS_HEAVY_RESULTS_STORAGE_KEY = "positions_heavy_scan_results_v1";
@@ -16462,8 +16482,8 @@ def _render_positions_page() -> str:
       }
     }
     function setSectionCollapsed(key, collapsed) {
-      const bodyMap = {pools: "posPoolsBody", heavy: "posHeavyPoolsBody"};
-      const btnMap = {pools: "togglePoolsBtn", heavy: "toggleHeavyPoolsBtn"};
+      const bodyMap = {pools: "posPoolsBody", heavy: "posHeavyPoolsBody", history: "posHistoryBody", fees: "posFeeBody"};
+      const btnMap = {pools: "togglePoolsBtn", heavy: "toggleHeavyPoolsBtn", history: "toggleHistoryBtn", fees: "toggleFeeBtn"};
       const body = document.getElementById(bodyMap[key]);
       const btn = document.getElementById(btnMap[key]);
       if (!body || !btn) return;
@@ -16477,6 +16497,21 @@ def _render_positions_page() -> str:
       if (!next) {
         if (key === "pools") renderPools(posCache.pools || []);
         if (key === "heavy") renderHeavyPools(posHeavyCache.pools || []);
+        if (key === "history" || key === "fees") {
+          requestAnimationFrame(() => {
+            try {
+              if (window.Plotly && typeof Plotly.Plots.resize === "function") {
+                if (key === "history") {
+                  const g = document.getElementById("posPoolChart");
+                  if (g) Plotly.Plots.resize(g);
+                } else {
+                  const g = document.getElementById("posFeeChart");
+                  if (g) Plotly.Plots.resize(g);
+                }
+              }
+            } catch (_) {}
+          });
+        }
       }
     }
     async function ensurePlotly() {
@@ -16917,7 +16952,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const totalCols = 13;
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>History</th></tr>`;
       const listAll = rows || [];
       const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
       const hasExplorerNftCatalog = listAll.some((x) => {
@@ -17020,7 +17055,7 @@ def _render_positions_page() -> str:
           : `<tr><td colspan='${totalCols}'>No pool positions found.</td></tr>`;
       }
       const otCols = 15;
-      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>History</th></tr>`;
+      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th>History</th></tr>`;
       for (let oi = 0; oi < otherRows.length; oi++) {
         const r = otherRows[oi];
         const issue = String(r._other_issue_label || "Other");
@@ -17062,7 +17097,7 @@ def _render_positions_page() -> str:
         otHtml += `<tr><td colspan='${otCols}' style='white-space:normal;color:#64748b'>No rows here: phishing-style collection metadata, pair string vs on-chain symbols (Issue: Pair mismatch), and PM snapshot read failures land on this tab. Spam, protocol gate, and closed positions stay on their own tabs.</td></tr>`;
       }
       const stCols = 12;
-      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
+      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
       for (let pi = 0; pi < protocolRows.length; pi++) {
         const r = protocolRows[pi];
         const mismatch = hasPairMismatch(r);
@@ -17085,7 +17120,7 @@ def _render_positions_page() -> str:
       if (!protocolRows.length) {
         protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate (collection name/symbol must suggest Uniswap or Pancake before on-chain PM work).</td></tr>`;
       }
-      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
+      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
       for (let ci = 0; ci < closedTabRows.length; ci++) {
         const r = closedTabRows[ci];
         const mismatch = hasPairMismatch(r);
@@ -17108,7 +17143,7 @@ def _render_positions_page() -> str:
       if (!closedTabRows.length) {
         closedHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No closed positions: on-chain open-liquidity check marked these as zero liquidity on the position manager (catalog_segment=closed).</td></tr>`;
       }
-      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
+      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
       for (let si = 0; si < spamRows.length; si++) {
         const r = spamRows[si];
         const mismatch = hasPairMismatch(r);
@@ -17131,7 +17166,7 @@ def _render_positions_page() -> str:
       if (!spamRows.length) {
         spamHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No spam heuristics: TVL/symbol rules did not flag supported rows (phase 6). Trust a row via Hide to re-run enrich.</td></tr>`;
       }
-      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
+      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
       for (let hi = 0; hi < hiddenRows.length; hi++) {
         const r = hiddenRows[hi];
         const mismatch = hasPairMismatch(r);
@@ -17368,7 +17403,7 @@ def _render_positions_page() -> str:
         const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
         return Boolean(r && (r.suspected_spam || r.spam_skipped || ph));
       }
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>Status</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th>Liquidity</th><th>Unclaimed fees</th><th>History</th></tr>`;
       if (!listAll.length) {
         html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.</td></tr>`;
         table.innerHTML = html;
