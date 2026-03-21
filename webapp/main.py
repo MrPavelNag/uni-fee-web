@@ -14283,6 +14283,156 @@ def _decode_v3_pool_flow_log(log_row: dict[str, Any], topic0_by_name: dict[str, 
     }
 
 
+def _explorer_logs_templates_for_chain(chain_id: int) -> list[str]:
+    cid = int(chain_id)
+    out: list[str] = []
+    eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip() or eth_key
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
+    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip() or eth_key
+    polygon_key = os.environ.get("POLYGONSCAN_API_KEY", "").strip() or eth_key
+    optimistic_key = (
+        os.environ.get("OPTIMISTIC_ETHERSCAN_API_KEY", "").strip()
+        or os.environ.get("OPTIMISM_ETHERSCAN_API_KEY", "").strip()
+        or eth_key
+    )
+    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip() or eth_key
+    chainid_for_v2 = _explorer_v2_chainid(cid)
+    if eth_key and chainid_for_v2:
+        out.append(f"https://api.etherscan.io/v2/api?chainid={chainid_for_v2}&module=logs&action=getLogs&apikey={eth_key}")
+    if cid == 1 and eth_key:
+        out.append(f"https://api.etherscan.io/api?module=logs&action=getLogs&apikey={eth_key}")
+    if cid == 56 and bsc_key:
+        out.append(f"https://api.bscscan.com/api?module=logs&action=getLogs&apikey={bsc_key}")
+    if cid == 8453 and base_key:
+        out.append(f"https://api.basescan.org/api?module=logs&action=getLogs&apikey={base_key}")
+    if cid == 42161 and arb_key:
+        out.append(f"https://api.arbiscan.io/api?module=logs&action=getLogs&apikey={arb_key}")
+    if cid == 137 and polygon_key:
+        out.append(f"https://api.polygonscan.com/api?module=logs&action=getLogs&apikey={polygon_key}")
+    if cid == 10 and optimistic_key:
+        out.append(f"https://api-optimistic.etherscan.io/api?module=logs&action=getLogs&apikey={optimistic_key}")
+    if cid in {130, 1301} and uni_key:
+        uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
+        out.append(f"{uniscan_api}?module=logs&action=getLogs&apikey={uni_key}")
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for u in out:
+        k = str(u or "").strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        dedup.append(k)
+    return dedup
+
+
+def _explorer_get_logs_for_pool_events(
+    chain_id: int,
+    pool_id: str,
+    *,
+    from_block: int,
+    to_block: int,
+    topic0s: list[str],
+    max_pages: int = 50,
+    offset: int = 1000,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cid = int(chain_id)
+    pool = str(pool_id or "").strip().lower()
+    if cid <= 0 or not _is_eth_address(pool):
+        return [], {"source": "explorer_api_logs", "reason": "invalid_chain_or_pool"}
+    templates = _explorer_logs_templates_for_chain(cid)
+    if not templates:
+        return [], {"source": "explorer_api_logs", "reason": "no_explorer_templates"}
+    if not topic0s:
+        return [], {"source": "explorer_api_logs", "reason": "no_topics"}
+    lim_pages = max(1, min(200, int(max_pages or 50)))
+    lim_off = max(10, min(1000, int(offset or 1000)))
+    all_logs: list[dict[str, Any]] = []
+    pages_used = 0
+    req_used = 0
+    template_used = ""
+    topic_used = ""
+    for tmpl in templates:
+        for t0 in topic0s:
+            req_page = 1
+            local_logs: list[dict[str, Any]] = []
+            while req_page <= lim_pages:
+                url = (
+                    f"{tmpl}&fromBlock={int(from_block)}&toBlock={int(to_block)}&address={pool}"
+                    f"&topic0={str(t0)}&page={int(req_page)}&offset={int(lim_off)}"
+                )
+                req_used += 1
+                payload: dict[str, Any] = {}
+                try:
+                    req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+                    with urlopen(req, timeout=float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)) as resp:
+                        payload = json.loads(resp.read().decode("utf-8"))
+                except Exception:
+                    payload = {}
+                result_rows = _etherscan_api_coerce_result_rows((payload or {}).get("result"))
+                if not result_rows:
+                    break
+                for r in result_rows:
+                    if not isinstance(r, dict):
+                        continue
+                    txh = str((r.get("transactionHash") or r.get("hash") or "")).strip().lower()
+                    topics = r.get("topics")
+                    if not isinstance(topics, list):
+                        topics = []
+                        for k in ("topic0", "topic1", "topic2", "topic3"):
+                            tv = str(r.get(k) or "").strip().lower()
+                            if tv:
+                                topics.append(tv)
+                    local_logs.append(
+                        {
+                            "transactionHash": txh,
+                            "blockNumber": r.get("blockNumber"),
+                            "logIndex": r.get("logIndex"),
+                            "data": r.get("data"),
+                            "topics": topics,
+                        }
+                    )
+                pages_used += 1
+                if len(result_rows) < int(lim_off):
+                    break
+                req_page += 1
+                time.sleep(0.10)
+            if local_logs:
+                all_logs.extend(local_logs)
+                template_used = str(tmpl).split("&apikey=", 1)[0]
+                topic_used = str(t0)
+                break
+        if all_logs:
+            break
+    if not all_logs:
+        return [], {
+            "source": "explorer_api_logs",
+            "reason": "no_records",
+            "requests": int(req_used),
+            "pages": int(pages_used),
+        }
+    dedup: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for lg in all_logs:
+        txh = str((lg or {}).get("transactionHash") or "").strip().lower()
+        lix = _eth_uint_from_rpc_field((lg or {}).get("logIndex"))
+        t0 = str(((lg or {}).get("topics") or [""])[0] or "").strip().lower()
+        if not txh:
+            continue
+        k = "|".join([txh, str(int(lix)), t0])
+        if k in seen:
+            continue
+        seen.add(k)
+        dedup.append(lg)
+    return dedup, {
+        "source": "explorer_api_logs",
+        "requests": int(req_used),
+        "pages": int(pages_used),
+        "template": template_used,
+        "topic0": topic_used,
+    }
+
+
 def _collect_v3_pool_flow_events_temp(
     chain_id: int,
     protocol: str,
@@ -14355,6 +14505,7 @@ def _collect_v3_pool_flow_events_temp(
                     "event_counts": by_type_cached,
                     "truncated": False,
                     "cached": True,
+                    "source": "cached",
                 }
     range_blocks = max(0, int(latest) - int(from_block) + 1)
     required_chunks = int((range_blocks + int(chunk) - 1) // int(chunk)) if range_blocks > 0 else 0
@@ -14366,6 +14517,10 @@ def _collect_v3_pool_flow_events_temp(
     inserted = 0
     events_total = 0
     by_type: dict[str, int] = {}
+    source = "rpc_logs"
+    explorer_requests = 0
+    explorer_pages = 0
+    explorer_template = ""
     block_ts_cache: dict[int, int] = {}
     cur = int(scan_from_block)
     used = 0
@@ -14512,6 +14667,73 @@ def _collect_v3_pool_flow_events_temp(
                     hcur = int(hto) + 1
                     hused += 1
                 used += int(hused)
+            # Explorer API fallback: when RPC window is truncated/limited and still empty.
+            if events_total <= 0:
+                exp_logs, exp_meta = _explorer_get_logs_for_pool_events(
+                    int(cid),
+                    str(pool),
+                    from_block=int(scanned_from),
+                    to_block=int(latest),
+                    topic0s=topic0_or,
+                    max_pages=60,
+                    offset=1000,
+                )
+                explorer_requests = int((exp_meta or {}).get("requests") or 0)
+                explorer_pages = int((exp_meta or {}).get("pages") or 0)
+                explorer_template = str((exp_meta or {}).get("template") or "")
+                if exp_logs:
+                    source = "explorer_api_logs"
+                    rows_to_insert: list[tuple[Any, ...]] = []
+                    for lg in exp_logs:
+                        decoded = _decode_v3_pool_flow_log(lg, topic0_by_name)
+                        if not decoded:
+                            continue
+                        blk = _eth_uint_from_rpc_field((lg or {}).get("blockNumber"))
+                        lix = _eth_uint_from_rpc_field((lg or {}).get("logIndex"))
+                        txh = str((lg or {}).get("transactionHash") or "").strip().lower()
+                        if blk <= 0 or lix < 0 or not txh:
+                            continue
+                        ts = block_ts_cache.get(int(blk))
+                        if ts is None:
+                            ts = int(_eth_get_block_timestamp(cid, int(blk)) or 0)
+                            block_ts_cache[int(blk)] = int(ts)
+                        if ts <= 0 or int(ts) < int(since_ts):
+                            continue
+                        ev = str(decoded.get("event_name") or "").strip().lower()
+                        by_type[ev] = int(by_type.get(ev, 0) + 1)
+                        events_total += 1
+                        rows_to_insert.append(
+                            (
+                                int(cid),
+                                str(proto),
+                                str(pool),
+                                int(blk),
+                                int(lix),
+                                str(txh),
+                                int(ts),
+                                str(ev),
+                                str(decoded.get("owner") or ""),
+                                str(decoded.get("recipient") or ""),
+                                int(decoded.get("tick_lower") or 0),
+                                int(decoded.get("tick_upper") or 0),
+                                str(int(decoded.get("amount0_raw") or 0)),
+                                str(int(decoded.get("amount1_raw") or 0)),
+                                str(int(decoded.get("liquidity_raw") or 0)),
+                                float(ts_now),
+                            )
+                        )
+                    if rows_to_insert:
+                        before_changes = int(conn.total_changes)
+                        conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO temp_pool_flow_events(
+                              chain_id, protocol, pool_id, block_number, log_index, tx_hash, ts, event_name,
+                              owner, recipient, tick_lower, tick_upper, amount0_raw, amount1_raw, liquidity_raw, inserted_at
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            rows_to_insert,
+                        )
+                        inserted += max(0, int(conn.total_changes) - int(before_changes))
             conn.execute(
                 """
                 INSERT OR REPLACE INTO temp_pool_flow_runs(
@@ -14530,7 +14752,8 @@ def _collect_v3_pool_flow_events_temp(
                     int(time.time()),
                     int(events_total),
                     "ok",
-                    ("chunk_cap_reached_recent_first" if truncated_window else ("" if cur > latest else "chunk_cap_reached")),
+                    ("chunk_cap_reached_recent_first" if truncated_window else ("" if cur > latest else "chunk_cap_reached"))
+                    + (f"|explorer:{explorer_pages}p" if explorer_pages > 0 else ""),
                 ),
             )
             conn.commit()
@@ -14547,6 +14770,10 @@ def _collect_v3_pool_flow_events_temp(
         "inserted_rows": int(inserted),
         "event_counts": by_type,
         "truncated": bool(truncated_window or cur <= latest),
+        "source": str(source),
+        "explorer_requests": int(explorer_requests),
+        "explorer_pages": int(explorer_pages),
+        "explorer_template": str(explorer_template).split("&apikey=", 1)[0],
     }
 
 
@@ -19030,6 +19257,9 @@ def _render_positions_page() -> str:
         const pfChunksUsed = Number(d.pool_flow_chunks_used || 0);
         const pfTruncated = !!d.pool_flow_truncated;
         const pfCached = !!d.cached;
+        const pfSource = String(d.pool_flow_source || "").trim();
+        const pfExplorerReq = Number(d.pool_flow_explorer_requests || 0);
+        const pfExplorerPages = Number(d.pool_flow_explorer_pages || 0);
         const analysisMs = Number(d.elapsed_ms || 0);
         const pfCountsObj = (d && typeof d.pool_flow_event_counts === "object" && d.pool_flow_event_counts) ? d.pool_flow_event_counts : {};
         const pfCounts = Object.entries(pfCountsObj)
@@ -19037,13 +19267,13 @@ def _render_positions_page() -> str:
           .join(",");
         if (pfEventsTotal > 0 || pfCollectPoints > 0 || pfChunksUsed > 0) {
           const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
-          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_ms=${analysisMs} | pool_flow: collect_points=${pfCollectPoints}, events=${pfEventsTotal}, inserted=${pfInsertedRows}, chunks=${pfChunksUsed}, truncated=${pfTruncated ? 1 : 0}, cached=${pfCached ? 1 : 0}${pfCounts ? `, counts=${pfCounts}` : ""}`;
+          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_ms=${analysisMs} | pool_flow: source=${pfSource || "-"}, collect_points=${pfCollectPoints}, events=${pfEventsTotal}, inserted=${pfInsertedRows}, chunks=${pfChunksUsed}, truncated=${pfTruncated ? 1 : 0}, cached=${pfCached ? 1 : 0}, explorer_req=${pfExplorerReq}, explorer_pages=${pfExplorerPages}${pfCounts ? `, counts=${pfCounts}` : ""}`;
         } else if (analysisMs > 0) {
           const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
           rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_ms=${analysisMs}`;
         }
         if (backendHints.length < 5) {
-          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, analysis_ms=${analysisMs}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
+          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, analysis_ms=${analysisMs}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_source=${pfSource || "-"}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}, pool_flow_explorer_req=${pfExplorerReq}, pool_flow_explorer_pages=${pfExplorerPages}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
           backendHints.push(msg);
         }
         if (hasCollected) {
@@ -23890,6 +24120,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             debug["pool_flow_chunks_used"] = int(pool_flow_stats.get("chunks_used") or 0)
             debug["pool_flow_truncated"] = bool(pool_flow_stats.get("truncated"))
             debug["pool_flow_event_counts"] = dict(pool_flow_stats.get("event_counts") or {})
+            debug["pool_flow_source"] = str(pool_flow_stats.get("source") or "")
+            debug["pool_flow_explorer_requests"] = int(pool_flow_stats.get("explorer_requests") or 0)
+            debug["pool_flow_explorer_pages"] = int(pool_flow_stats.get("explorer_pages") or 0)
+            debug["pool_flow_explorer_template"] = str(pool_flow_stats.get("explorer_template") or "")
             pool_flow_collect_by_day, pool_flow_meta = _pool_flow_collect_series_from_temp(
                 int(chain_id),
                 str(req.pool_id or ""),
