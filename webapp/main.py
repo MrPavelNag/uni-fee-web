@@ -16401,16 +16401,17 @@ def _render_positions_page() -> str:
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
     .status-dot {
       display:inline-block;
-      width:9px;
-      height:9px;
+      width:12px;
+      height:12px;
       border-radius:999px;
       vertical-align:middle;
-      border:1px solid transparent;
+      border:1px solid #64748b;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.45);
     }
-    .status-dot.active { background:#7d9f89; border-color:#6f8e7a; }
-    .status-dot.inactive { background:#ab8787; border-color:#987676; }
-    .status-dot.hidden { background:#94a3b8; border-color:#64748b; }
-    .status-dot.explorer { background:#93b4d4; border-color:#6b93b8; }
+    .status-dot.active { background:#16a34a; border-color:#166534; }
+    .status-dot.inactive { background:#ef4444; border-color:#991b1b; }
+    .status-dot.hidden { background:#64748b; border-color:#334155; }
+    .status-dot.explorer { background:#2563eb; border-color:#1e40af; }
     .errors-box { margin-top:11px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:11px; padding:9px; font-size:13px; white-space:pre-wrap; }
     .info-box { margin-top:11px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:11px; padding:9px; font-size:13px; white-space:pre-wrap; }
     .fee-card { border-color:#cfdcf2; background: linear-gradient(180deg, #f6f9ff 0%, #edf3ff 100%); }
@@ -16923,7 +16924,7 @@ def _render_positions_page() -> str:
     function isHeavySortLocked() {
       return !!posHeavyScanInProgress;
     }
-    function countActiveRows(rows) {
+    function countOpenMainRows(rows) {
       const list = rows || [];
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
@@ -16949,7 +16950,8 @@ def _render_positions_page() -> str:
         if (hasPairMismatch(r)) continue;
         if (suspected && !trusted) continue;
         if (pmBad) continue;
-        if (String(r.position_status || "").toLowerCase() === "active") n += 1;
+        // "Open" here means visible working positions (not closed and not routed to other tabs).
+        n += 1;
       }
       return n;
     }
@@ -16974,7 +16976,7 @@ def _render_positions_page() -> str:
       const cN = Math.max(0, Number(posFinalClosedCount) || 0);
       const aS = formatSecShort(posFinalActiveSec);
       const cS = formatSecShort(posFinalClosedSec);
-      setPosStatus(`Summary: active — ${aN}, ${aS}; closed — ${cN}, ${cS}`, false);
+      setPosStatus(`Summary: open (not closed) positions — ${aN}, ${aS}; closed — ${cN}, ${cS}`, false);
     }
     async function enrichClosedRowsCreatedDates(scope = "v3") {
       const isHeavy = String(scope || "") === "heavy";
@@ -18182,6 +18184,31 @@ def _render_positions_page() -> str:
           continue;
         }
         if (isClosed) {
+          const stClosed = String(row.position_status || "").toLowerCase();
+          const pairRaw = String(row.pair || "").trim();
+          const srcRaw = String(row.pair_symbol_source || "").trim().toLowerCase();
+          const pmBadClosed = row && (row.nft_catalog_pm_snapshot_ok === false);
+          const unresolvedClosed = (!pairRaw.includes("/")) || srcRaw === "explorer:tokennfttx" || pmBadClosed;
+          if (stClosed === "active") {
+            otherRows.push(
+              Object.assign({}, row, {
+                _other_issue_label: "Closed status mismatch",
+                _other_issue_detail: "catalog_segment=closed but position_status=active",
+              }),
+            );
+            continue;
+          }
+          if (unresolvedClosed) {
+            otherRows.push(
+              Object.assign({}, row, {
+                _other_issue_label: "Closed unresolved",
+                _other_issue_detail: "Closed row lacks resolved pair/snapshot and needs explicit row enrich.",
+              }),
+            );
+            continue;
+          }
+        }
+        if (isClosed) {
           closedTabRows.push(row);
           continue;
         }
@@ -18655,6 +18682,31 @@ def _render_positions_page() -> str:
           continue;
         }
         if (isClosed) {
+          const stClosed = String(r.position_status || "").toLowerCase();
+          const pairRaw = String(r.pair || "").trim();
+          const srcRaw = String(r.pair_symbol_source || "").trim().toLowerCase();
+          const pmBadClosed = r && (r.nft_catalog_pm_snapshot_ok === false);
+          const unresolvedClosed = (!pairRaw.includes("/")) || srcRaw === "explorer:tokennfttx" || pmBadClosed;
+          if (stClosed === "active") {
+            otherRows.push(
+              Object.assign({}, r, {
+                _other_issue_label: "Closed status mismatch",
+                _other_issue_detail: "catalog_segment=closed but position_status=active",
+              }),
+            );
+            continue;
+          }
+          if (unresolvedClosed) {
+            otherRows.push(
+              Object.assign({}, r, {
+                _other_issue_label: "Closed unresolved",
+                _other_issue_detail: "Closed row lacks resolved pair/snapshot and needs explicit row enrich.",
+              }),
+            );
+            continue;
+          }
+        }
+        if (isClosed) {
           closedTabRows.push(r);
           continue;
         }
@@ -18996,7 +19048,7 @@ def _render_positions_page() -> str:
       });
       posHasScannedOnce = true;
       updatePosSearchButton();
-      posFinalActiveCount = countActiveRows(posCache.pools || []);
+      posFinalActiveCount = countOpenMainRows(posCache.pools || []);
       posFinalActiveSec = Math.max(0, Number(data?.scan_duration_sec || laneElapsedSec(posStatusLanes.active) || 0));
     }
     function formatV3DoneStatus(data, includeOwnerChecks) {
@@ -19133,6 +19185,8 @@ def _render_positions_page() -> str:
         setPosStatus("Closed positions enrich (background): " + (e?.message || "unknown"), true);
       } finally {
         posClosedBgEnrichInFlight = false;
+        // Re-apply user sort and remove sort lock after background closed phase.
+        renderPools(posCache.pools || []);
       }
     }
     function applyV3ScanResult(data, includeOwnerChecks) {
