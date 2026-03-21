@@ -17370,7 +17370,7 @@ def _render_positions_page() -> str:
       const trustedSpamKeys = getTrustedSpamKeys();
       const manualHiddenKeys = getManualHiddenKeys();
       const totalCols = 13;
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       const listAll = rows || [];
       const hasCatalogSegments = listAll.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
       const hasExplorerNftCatalog = listAll.some((x) => {
@@ -17473,7 +17473,7 @@ def _render_positions_page() -> str:
           : `<tr><td colspan='${totalCols}'>No pool positions found.</td></tr>`;
       }
       const otCols = 15;
-      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th title='Exact amounts currently in the position'>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th title='Unclaimed fees currently owed by position NFT'>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let oi = 0; oi < otherRows.length; oi++) {
         const r = otherRows[oi];
         const issue = String(r._other_issue_label || "Other");
@@ -17515,7 +17515,7 @@ def _render_positions_page() -> str:
         otHtml += `<tr><td colspan='${otCols}' style='white-space:normal;color:#64748b'>No rows here: phishing-style collection metadata, pair string vs on-chain symbols (Issue: Pair mismatch), and PM snapshot read failures land on this tab. Spam, protocol gate, and closed positions stay on their own tabs.</td></tr>`;
       }
       const stCols = 12;
-      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let pi = 0; pi < protocolRows.length; pi++) {
         const r = protocolRows[pi];
         const mismatch = hasPairMismatch(r);
@@ -17538,7 +17538,7 @@ def _render_positions_page() -> str:
       if (!protocolRows.length) {
         protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate (collection name/symbol must suggest Uniswap or Pancake before on-chain PM work).</td></tr>`;
       }
-      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let ci = 0; ci < closedTabRows.length; ci++) {
         const r = closedTabRows[ci];
         const mismatch = hasPairMismatch(r);
@@ -17561,7 +17561,7 @@ def _render_positions_page() -> str:
       if (!closedTabRows.length) {
         closedHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No closed positions: on-chain open-liquidity check marked these as zero liquidity on the position manager (catalog_segment=closed).</td></tr>`;
       }
-      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let si = 0; si < spamRows.length; si++) {
         const r = spamRows[si];
         const mismatch = hasPairMismatch(r);
@@ -17584,7 +17584,7 @@ def _render_positions_page() -> str:
       if (!spamRows.length) {
         spamHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No spam heuristics: TVL/symbol rules did not flag supported rows (phase 6). Trust a row via Hide to re-run enrich.</td></tr>`;
       }
-      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let hi = 0; hi < hiddenRows.length; hi++) {
         const r = hiddenRows[hi];
         const mismatch = hasPairMismatch(r);
@@ -17822,7 +17822,7 @@ def _render_positions_page() -> str:
         const ph = !!(r && (r.nft_metadata_phishing === true || r.nft_metadata_phishing === 1));
         return Boolean(r && (r.suspected_spam || r.spam_skipped || ph));
       }
-      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let html = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       if (!listAll.length) {
         html += `<tr><td colspan='13' style='white-space:normal;color:#64748b'>No rows. Run &quot;Scan v4 / Infinity&quot; or check that the wallet holds Uniswap v4 / Pancake V3 Farming / Infinity NFTs on supported chains.</td></tr>`;
         table.innerHTML = html;
@@ -17921,7 +17921,7 @@ def _render_positions_page() -> str:
           : `<tr><td colspan='13'>No positions found.</td></tr>`;
       }
       const stCols = 12;
-      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let protHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let pi = 0; pi < protocolRows.length; pi++) {
         const r = protocolRows[pi];
         const mismatch = hasPairMismatch(r);
@@ -17942,7 +17942,7 @@ def _render_positions_page() -> str:
         protHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('h', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!protocolRows.length) protHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No rows filtered by protocol gate.</td></tr>`;
-      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let closedHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let ci = 0; ci < closedTabRows.length; ci++) {
         const r = closedTabRows[ci];
         const mismatch = hasPairMismatch(r);
@@ -17963,7 +17963,7 @@ def _render_positions_page() -> str:
         closedHtml += `<td><input type='checkbox' ${checked} onchange="setHistorySelected('h', ${Number(r._src_idx) || 0}, this.checked)" /></td></tr>`;
       }
       if (!closedTabRows.length) closedHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No closed positions.</td></tr>`;
-      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let spamHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let si = 0; si < spamRows.length; si++) {
         const r = spamRows[si];
         const mismatch = hasPairMismatch(r);
@@ -17985,7 +17985,7 @@ def _render_positions_page() -> str:
       }
       if (!spamRows.length) spamHtml += `<tr><td colspan='${stCols}' style='white-space:normal;color:#64748b'>No spam rows.</td></tr>`;
       const otCols = 15;
-      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let otHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Issue</th><th title="NFT collection name and symbol from block explorer (untrusted)">Collection metadata</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let oi = 0; oi < otherRows.length; oi++) {
         const r = otherRows[oi];
         const issue = String(r._other_issue_label || "Other");
@@ -18024,7 +18024,7 @@ def _render_positions_page() -> str:
         otHtml += "</tr>";
       }
       if (!otherRows.length) otHtml += `<tr><td colspan='${otCols}' style='white-space:normal;color:#64748b'>No other issues.</td></tr>`;
-      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900">History</th></tr>`;
+      let hiddenHtml = `<tr><th>Address</th><th>Position ID</th><th>Chain</th><th>Protocol</th><th>Pair</th><th>Fee tier</th><th style="white-space:nowrap" title="Position mint or first-seen date">Created</th><th>St.</th><th>Hide</th><th>In position</th><th title='Calculated from In position amounts and external token prices'>Liquidity</th><th>Unclaimed fees</th><th style="font-weight:900;color:#14532d">History</th></tr>`;
       for (let hi = 0; hi < hiddenRows.length; hi++) {
         const r = hiddenRows[hi];
         const mismatch = hasPairMismatch(r);
