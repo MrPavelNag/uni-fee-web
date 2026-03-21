@@ -15469,6 +15469,10 @@ class PositionPoolSeriesRequest(BaseModel):
     # Current unclaimed fees from table row (best-effort final fallback when history sources are empty).
     fees_owed0: float = 0.0
     fees_owed1: float = 0.0
+    # Optional fallback inputs for estimate-share mode when raw liquidity fields are missing.
+    position_amount0: float = 0.0
+    position_amount1: float = 0.0
+    pool_token0_price: float = 0.0
     # When true, NPM Collect log series uses CoinGecko historical prices at each event (stables $1).
     fee_usd_historical: bool = False
 
@@ -17913,6 +17917,9 @@ def _render_positions_page() -> str:
             token1_symbol: row.position_symbol1 || "",
             fees_owed0: Number(row.fees_owed0 || 0),
             fees_owed1: Number(row.fees_owed1 || 0),
+            position_amount0: Number(row.position_amount0 || 0),
+            position_amount1: Number(row.position_amount1 || 0),
+            pool_token0_price: Number(row.pool_token0_price || 0),
             fee_usd_historical: histUsd,
           });
           payloadMeta.push({
@@ -22195,9 +22202,42 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     try:
         pos_liq = max(0.0, _safe_float(getattr(req, "position_liquidity", 0.0)))
         pool_liq = max(0.0, _safe_float(getattr(req, "pool_liquidity", 0.0)))
+        share_source = "raw_liquidity"
         if pos_liq <= 0 or pool_liq <= 0:
-            estimated_reason = "liquidity_share_unavailable"
-        else:
+            # Fallback: estimate share from current position USD vs latest pool TVL USD.
+            # This keeps estimated curve available even when raw liquidity is absent in a row.
+            share_source = "position_usd_over_pool_tvl"
+            pool_id_raw = str(req.pool_id or "").strip()
+            latest_pool_tvl = 0.0
+            if pool_id_raw:
+                try:
+                    tvl_points = _fetch_pool_tvl_series(chain_key, version, pool_id_raw, max(7, int(days)))
+                    if tvl_points:
+                        latest_pool_tvl = max(0.0, _safe_float(tvl_points[-1][1]))
+                except Exception:
+                    latest_pool_tvl = 0.0
+            amt0 = max(0.0, _safe_float(getattr(req, "position_amount0", 0.0)))
+            amt1 = max(0.0, _safe_float(getattr(req, "position_amount1", 0.0)))
+            pos_usd = _liquidity_usd_from_in_position_external(
+                int(chain_id),
+                amt0,
+                amt1,
+                str(token0 or ""),
+                str(token1 or ""),
+                symbol0=str(getattr(req, "token0_symbol", "") or ""),
+                symbol1=str(getattr(req, "token1_symbol", "") or ""),
+                pair=f"{str(getattr(req, 'token0_symbol', '') or '')}/{str(getattr(req, 'token1_symbol', '') or '')}",
+                known_prices={},
+                pool_token0_price_in_token1=_safe_float(getattr(req, "pool_token0_price", 0.0)),
+            ) or 0.0
+            debug["estimate_share_position_usd"] = float(max(0.0, pos_usd))
+            debug["estimate_share_latest_pool_tvl_usd"] = float(max(0.0, latest_pool_tvl))
+            if pos_usd > 0 and latest_pool_tvl > 0:
+                pos_liq = float(pos_usd)
+                pool_liq = float(latest_pool_tvl)
+            else:
+                estimated_reason = "liquidity_share_unavailable"
+        if pos_liq > 0 and pool_liq > 0:
             est_share = max(0.0, min(1.0, pos_liq / pool_liq))
             if est_share <= 0:
                 estimated_reason = "liquidity_share_zero"
@@ -22217,6 +22257,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     estimated_reason = "ok_pool_share_daily_fees"
                 elif estimated_reason in {"not_requested", "unknown"}:
                     estimated_reason = "pool_fee_series_empty"
+        debug["estimate_share_source"] = str(share_source)
     except Exception:
         estimated_by_day = {}
         est_share = 0.0
