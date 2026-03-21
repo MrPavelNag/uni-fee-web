@@ -11626,8 +11626,20 @@ def _aggregate_pool_rows_by_owner_protocol_pool(rows: list[dict[str, Any]]) -> l
 def _apply_creation_dates_phase(rows: list[dict[str, Any]], *, include_creation_dates: bool) -> None:
     if not include_creation_dates or not rows:
         return
+    has_catalog_segments = any(
+        isinstance(x, dict) and ("catalog_segment" in x) for x in rows
+    )
     for r in rows:
         if not isinstance(r, dict):
+            continue
+        # Closed rows are enriched in a dedicated closed pass (checkbox-controlled).
+        # Skipping them here keeps primary scan faster.
+        seg = str(r.get("catalog_segment") or "").strip().lower()
+        st = str(r.get("position_status") or "").strip().lower()
+        is_closed_like = (seg == "closed") if has_catalog_segments else (st == "inactive")
+        if is_closed_like:
+            existing = str(r.get("position_created_date") or "").strip()
+            r["position_created_date"] = existing or "-"
             continue
         cid, pid = _row_chain_id_position_id(r)
         existing = str(r.get("position_created_date") or "").strip()
@@ -12437,7 +12449,7 @@ def _enrich_nft_catalog_heavy_rows_parallel(
                     duration_ms=ms,
                 )
                 return False
-            updates = _build_row_updates_from_snapshot(row, snap, chain_id)
+            updates = _build_row_updates_from_snapshot(row, snap, chain_id, include_liquidity=False)
             row.update(updates)
             if is_ex:
                 row["nft_catalog_pm_snapshot_ok"] = True
@@ -12617,7 +12629,7 @@ def _enrich_nft_catalog_rows_from_chain(
                         row["nft_catalog_pm_snapshot_reason"] = "position_snapshot_unavailable"
                     fail_n += 1
                     continue
-                updates = _build_row_updates_from_snapshot(row, snap, chain_id)
+                updates = _build_row_updates_from_snapshot(row, snap, chain_id, include_liquidity=False)
                 row.update(updates)
                 if is_ex_nft:
                     row["nft_catalog_pm_snapshot_ok"] = True
@@ -13444,9 +13456,6 @@ def _scan_pool_positions(
     uniq_rows = _filter_pool_rows_for_scan_profile(uniq_rows, pool_scan_profile)
     timings["pool_scan_profile"] = _normalize_pool_scan_profile(pool_scan_profile)
     timings["aggregate_rows_sec"] = round(max(0.0, time.monotonic() - t_agg), 3)
-    t_liq = time.monotonic()
-    _enrich_rows_liquidity_usd(uniq_rows, max_seconds=4 if not hard_scan else 10)
-    timings["liquidity_usd_enrich_sec"] = round(max(0.0, time.monotonic() - t_liq), 3)
     _apply_creation_dates_phase(uniq_rows, include_creation_dates=include_creation_dates)
     v3_ctr = {"scanned": 0, "kept": 0, "skipped0": 0, "closed_hidden": 0, "invalid": 0}
     for d in debug_rows:
@@ -15539,7 +15548,13 @@ def _format_position_token_amount_display(v: float | None, *, zero_if_missing: b
     return out if out else "0"
 
 
-def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], chain_id: int) -> dict[str, Any]:
+def _build_row_updates_from_snapshot(
+    row: dict[str, Any],
+    snap: dict[str, Any],
+    chain_id: int,
+    *,
+    include_liquidity: bool = True,
+) -> dict[str, Any]:
     dec0 = _parse_int_like(snap.get("token0_decimals") or 18)
     dec1 = _parse_int_like(snap.get("token1_decimals") or 18)
     if dec0 <= 0 or dec0 > 36:
@@ -15570,21 +15585,6 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
         status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
     token0_addr = str(snap.get("token0") or row.get("token0_id") or "").strip().lower()
     token1_addr = str(snap.get("token1") or row.get("token1_id") or "").strip().lower()
-    liq_usd = _liquidity_usd_from_in_position_external(
-        int(chain_id),
-        a0_now,
-        a1_now,
-        token0_addr,
-        token1_addr,
-        symbol0=str(snap.get("token0_symbol") or row.get("position_symbol0") or ""),
-        symbol1=str(snap.get("token1_symbol") or row.get("position_symbol1") or ""),
-        pair=(
-            f"{_normalize_display_symbol(str(snap.get('token0_symbol') or row.get('position_symbol0') or '?'))}/"
-            f"{_normalize_display_symbol(str(snap.get('token1_symbol') or row.get('position_symbol1') or '?'))}"
-        ),
-        pool_token0_price_in_token1=_safe_float(snap.get("token0Price") or row.get("pool_token0_price")),
-    )
-    liq_disp = _format_usd_compact(liq_usd)
     fee_raw = str(snap.get("fee") or "").strip()
     fee_disp = fee_raw
     try:
@@ -15593,7 +15593,7 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
             fee_disp = f"{fee_int / 10000.0:.2f}%"
     except Exception:
         fee_disp = fee_raw or "-"
-    return {
+    out = {
         "position_amount0": (float(amount0) if amount0 is not None else 0.0),
         "position_amount1": (float(amount1) if amount1 is not None else 0.0),
         "fees_owed0": (float(fee0) if fee0 is not None else 0.0),
@@ -15603,9 +15603,6 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
         "position_amounts_display": f"{_format_position_token_amount_display(amount0)} / {_format_position_token_amount_display(amount1)}",
         "fees_owed_display": f"{_format_position_token_amount_display(fee0, zero_if_missing=True)} / {_format_position_token_amount_display(fee1, zero_if_missing=True)}",
         "position_status": status,
-        "liquidity": str(liq_raw),
-        "liquidity_display": liq_disp,
-        "liquidity_usd": liq_usd,
         "pool_token0_price": _safe_float(snap.get("token0Price") or row.get("pool_token0_price")),
         "token0_id": token0_addr,
         "token1_id": token1_addr,
@@ -15621,6 +15618,9 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
         "suspected_spam": False,
         "spam_skipped": False,
     }
+    if include_liquidity:
+        out["liquidity"] = str(liq_raw)
+    return out
 
 
 INTENT_OPTIONS: list[tuple[str, str]] = [
@@ -16924,11 +16924,12 @@ def _render_positions_page() -> str:
     }
     function countClosedRows(rows) {
       let n = 0;
+      const hasCatalogSegments = (rows || []).some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
       for (const r of (rows || [])) {
         if (!r || typeof r !== "object") continue;
         const seg = String(r.catalog_segment || "").toLowerCase();
         if (seg === "closed") { n += 1; continue; }
-        if (isClosedBgCandidateRow(r)) n += 1;
+        if (isClosedBgCandidateRow(r, hasCatalogSegments)) n += 1;
       }
       return n;
     }
@@ -18487,6 +18488,8 @@ def _render_positions_page() -> str:
       const renderTable = isHeavy ? renderHeavyPools : renderPools;
       const errDom = isHeavy ? "posHeavyErrors" : "posErrors";
       let partialRendered = false;
+      const PARTIAL_RENDER_THROTTLE_MS = 5000;
+      let lastPartialRenderMs = 0;
       let tickTimer = null;
       let lastPollWall = Date.now();
       let anchorServerElapsed = 0;
@@ -18499,13 +18502,18 @@ def _render_positions_page() -> str:
         if (status === "queued") setPosProgressBar(progId, 0, true);
         else setPosProgressBar(progId, progress, false);
       }
-      function maybeApplyPartialResult(partial) {
+      function maybeApplyPartialResult(partial, force = false) {
         if (!(partial && Array.isArray(partial.pool_positions) && partial.pool_positions.length)) return false;
         cacheBox.pools = partial.pool_positions || [];
         cacheBox.debug = partial.debug || null;
+        const now = Date.now();
+        if (!force && partialRendered && (now - lastPartialRenderMs) < PARTIAL_RENDER_THROTTLE_MS) {
+          return false;
+        }
         renderTable(cacheBox.pools);
         renderScanMessages(partial, errDom);
         partialRendered = true;
+        lastPartialRenderMs = now;
         return true;
       }
       function assertJobHttpOk(resp, data) {
@@ -18577,8 +18585,9 @@ def _render_positions_page() -> str:
             try { onTick(data); } catch (_) {}
           }
           setProgressFromStatus(st, progress);
-          maybeApplyPartialResult(partial);
+          maybeApplyPartialResult(partial, false);
           if (st === "done") {
+            maybeApplyPartialResult(partial, true);
             if (typeof onTick === "function") {
               try { onTick(data); } catch (_) {}
             }
@@ -19043,9 +19052,10 @@ def _render_positions_page() -> str:
       if (!jobId) throw new Error("Invalid job id");
       return jobId;
     }
-    function isClosedBgCandidateRow(row) {
+    function isClosedBgCandidateRow(row, hasCatalogSegments) {
       if (!row || typeof row !== "object") return false;
       const seg = String(row.catalog_segment || "").toLowerCase();
+      if (hasCatalogSegments) return seg === "closed";
       if (seg === "closed") return true;
       const st = String(row.position_status || "").toLowerCase();
       if (st === "inactive") return true;
@@ -19057,17 +19067,19 @@ def _render_positions_page() -> str:
     async function runClosedRowsBackgroundEnrich() {
       const list = Array.isArray(posCache?.pools) ? posCache.pools : [];
       if (!list.length) return {processed: 0, updated: 0, eligible: 0};
+      const hasCatalogSegments = list.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
       const candidates = [];
       for (let i = 0; i < list.length; i++) {
         const r = list[i] || {};
-        if (!isClosedBgCandidateRow(r)) continue;
+        if (!isClosedBgCandidateRow(r, hasCatalogSegments)) continue;
         if (r.unsupported_protocol) continue;
         candidates.push(i);
       }
       if (!candidates.length) {
         return {processed: 0, updated: 0, eligible: 0};
       }
-      const maxRows = Math.min(320, candidates.length);
+      // Keep closed enrich bounded so checkbox mode stays responsive.
+      const maxRows = Math.min(140, candidates.length);
       const work = candidates.slice(0, maxRows);
       let processed = 0;
       let updated = 0;
@@ -21520,7 +21532,7 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
             snap = _fetch_v3_position_contract_snapshot(chain_id, proto, token_id, owner)
             if not isinstance(snap, dict):
                 continue
-            row_updates = _build_row_updates_from_snapshot(row, snap, chain_id)
+            row_updates = _build_row_updates_from_snapshot(row, snap, chain_id, include_liquidity=False)
             if row_updates:
                 row.update(row_updates)
                 row["nft_metadata_phishing"] = bool(_row_nft_metadata_phishing_from_explorer(row))
@@ -21530,7 +21542,19 @@ def _run_positions_scan_enrich_phases(job_id: str, result: dict[str, Any], *, ha
         except Exception:
             continue
 
-    _enrich_rows_liquidity_usd(pool_rows, max_seconds=4)
+    t_usd = time.monotonic()
+    _enrich_rows_liquidity_usd(pool_rows, max_seconds=6 if not hard_scan else 10)
+    usd_sec = round(max(0.0, time.monotonic() - t_usd), 3)
+    dbg = result.get("debug")
+    if not isinstance(dbg, dict):
+        dbg = {}
+    tmap = dbg.get("timings")
+    if not isinstance(tmap, dict):
+        tmap = {}
+    tmap["primary_scan_liquidity_usd_sec"] = float(usd_sec)
+    dbg["timings"] = tmap
+    result["debug"] = dbg
+
     infos = result.get("infos") if isinstance(result.get("infos"), list) else []
     infos = list(infos)
     if hard_scan and (checked or updated):
@@ -21552,6 +21576,7 @@ def _scan_positions_core(
     sid: str = "unknown",
     *,
     include_creation_dates: bool = True,
+    defer_liquidity_usd: bool = False,
     pos_job_id: str | None = None,
 ) -> dict[str, Any]:
     core_started = time.monotonic()
@@ -21649,9 +21674,6 @@ def _scan_positions_core(
                     f"Heavy PM pipeline (debug): ok={int(ne_heavy.get('heavy_ok') or 0)}, "
                     f"fail={int(ne_heavy.get('heavy_fail') or 0)}."
                 )
-        t_usd = time.monotonic()
-        _enrich_rows_liquidity_usd(pool_rows, max_seconds=6)
-        debug_timings["nft_catalog_liquidity_usd_sec"] = round(max(0.0, time.monotonic() - t_usd), 3)
         t_phish = time.monotonic()
         phish_n = _nft_catalog_sync_phishing_metadata(pool_rows)
         debug_timings["nft_catalog_phishing_flagged"] = int(phish_n)
@@ -21666,6 +21688,10 @@ def _scan_positions_core(
         phish_n = _nft_catalog_sync_phishing_metadata(pool_rows)
         debug_timings["nft_catalog_phishing_flagged"] = int(phish_n)
         debug_timings["nft_catalog_phishing_sync_sec"] = round(max(0.0, time.monotonic() - t_phish), 3)
+    if pool_rows and not bool(defer_liquidity_usd):
+        t_usd = time.monotonic()
+        _enrich_rows_liquidity_usd(pool_rows, max_seconds=6 if not hard_scan_enabled else 10)
+        debug_timings["primary_scan_liquidity_usd_sec"] = round(max(0.0, time.monotonic() - t_usd), 3)
     t_debug = time.monotonic()
     debug_summary_rows = _build_pool_debug_summary_rows(pool_debug_rows)
     cache_hits, cache_misses, skip_live, legacy_disabled, row_live_enrich_disabled = _extract_index_scan_counters(
@@ -21756,6 +21782,7 @@ def _run_positions_scan_job(job_id: str, req: PositionsScanRequest, session_id: 
             req,
             sid=session_id,
             include_creation_dates=True,
+            defer_liquidity_usd=True,
             pos_job_id=job_id,
         )
         if _update_pos_job(
@@ -21897,7 +21924,7 @@ def positions_row_enrich(req: PositionsRowEnrichRequest) -> dict[str, Any]:
     )
     if not isinstance(snap, dict):
         return {"ok": False, "reason": "snapshot_unavailable"}
-    updates = _build_row_updates_from_snapshot(row, snap, int(chain_id))
+    updates = _build_row_updates_from_snapshot(row, snap, int(chain_id), include_liquidity=False)
     # Created date can be expensive (RPC/explorer fallbacks), so keep it optional.
     if include_created_date:
         try:
