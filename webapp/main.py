@@ -15458,8 +15458,10 @@ class PositionPoolSeriesRequest(BaseModel):
     pool_id: str
     address: str
     position_ids: list[str] = Field(default_factory=list)
+    position_id: str = ""
     position_liquidity: str = "0"
     pool_liquidity: str = "0"
+    pool_tvl_usd: float = 0.0
     days: int = 30
     # For on-chain Collect-log fee fallback (same as row.token0_id / token1_id in UI).
     token0_id: str = ""
@@ -17020,7 +17022,6 @@ def _render_positions_page() -> str:
         progress: 0,
         elapsedAnchor: 0,
         pollWallMs: 0,
-        fallbackEtaSec: 95,
         doneAtMs: 0,
         lastDoneSec: 0,
       },
@@ -17032,7 +17033,6 @@ def _render_positions_page() -> str:
         progress: 0,
         elapsedAnchor: 0,
         pollWallMs: 0,
-        fallbackEtaSec: 270,
         doneAtMs: 0,
         lastDoneSec: 0,
       },
@@ -17091,7 +17091,11 @@ def _render_positions_page() -> str:
       const base = String(posStatusBaseText || "");
       const parts = [];
       const a = laneStatusSuffix(posStatusLanes.active);
-      const c = laneStatusSuffix(posStatusLanes.closed);
+      let c = laneStatusSuffix(posStatusLanes.closed);
+      // Avoid duplicate "closed" info when final summary already contains closed timing/count.
+      if (base.toLowerCase().startsWith("summary:") && base.toLowerCase().includes("closed —")) {
+        c = "";
+      }
       if (a) parts.push(a);
       if (c) parts.push(c);
       const full = parts.length ? (base ? `${base} | ${parts.join(" | ")}` : parts.join(" | ")) : base;
@@ -17778,68 +17782,252 @@ def _render_positions_page() -> str:
         setPosHistoryStatus("History load failed", true);
       }
     }
+    function renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints) {
+      if (!debugEl) return;
+      const rows = Array.isArray(rowStatuses) ? rowStatuses : [];
+      const okCount = rows.filter((x) => x && (x.outcome === "ok" || x.outcome === "estimate-only")).length;
+      const emptyCount = rows.filter((x) => x && x.outcome === "empty").length;
+      const badCount = rows.filter((x) => x && x.outcome !== "ok" && x.outcome !== "estimate-only" && x.outcome !== "empty").length;
+      const parts = [];
+      parts.push(`<b>Fee source status</b>`);
+      parts.push(`Selected: ${Number(diag?.selected || 0)} · with data: ${okCount} · empty: ${emptyCount} · failed/skipped: ${badCount}`);
+      if (rows.length) {
+        const lines = rows.slice(0, 24).map((x) => {
+          const label = esc(String(x?.label || "?"));
+          const outcome = esc(String(x?.outcome || "-"));
+          const mode = esc(String(x?.mode || "-"));
+          const pricing = String(x?.pricing || "").trim();
+          const pts = Number(x?.points || 0);
+          const detail = String(x?.detail || "").trim();
+          const pp = pricing ? `, pricing=${esc(pricing)}` : "";
+          const pt = pts > 0 ? `, points=${pts}` : "";
+          const dt = detail ? `, ${esc(detail)}` : "";
+          return `• ${label}: ${outcome}, mode=${mode}${pp}${pt}${dt}`;
+        });
+        parts.push(lines.join("<br/>"));
+      }
+      if (apiFailTop.length) parts.push(`Top API errors: ${esc(apiFailTop.join(" ; "))}`);
+      if (backendHints.length) parts.push(`Backend hints: ${esc(backendHints.join(" | "))}`);
+      debugEl.innerHTML = parts.join("<br/>");
+      debugEl.style.display = "";
+    }
+    async function postJsonWithRetry(url, payload, maxAttempts = 3) {
+      let lastRes = null;
+      let lastData = {};
+      let lastErr = null;
+      const attempts = Math.max(1, Number(maxAttempts) || 1);
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          const res = await fetch(String(url || ""), {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json().catch(() => ({}));
+          lastRes = res;
+          lastData = data;
+          if (res.ok) return {res, data};
+          const shouldRetry = res.status >= 500 && attempt < attempts;
+          if (!shouldRetry) return {res, data};
+        } catch (e) {
+          lastErr = e;
+          if (attempt >= attempts) break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
+      }
+      if (lastRes) return {res: lastRes, data: lastData};
+      const msg = String(lastErr?.message || "network error");
+      return {res: {ok: false, status: 0}, data: {detail: msg}};
+    }
+    function buildFeeCompareSelection(selected, histUsd) {
+      const diag = {
+        selected: selected.length,
+        missingRow: 0,
+        unsupported: 0,
+        apiFail: 0,
+        emptySeries: 0,
+        missingTokens: 0,
+      };
+      const rowStatuses = [];
+      const rowsPayload = [];
+      const payloadMeta = [];
+      for (let i = 0; i < selected.length; i++) {
+        const hk = parseHistoryKey(selected[i]);
+        const idx = hk.idx;
+        const row = hk.scope === "h"
+          ? (posHeavyCache.pools || [])[idx]
+          : (posCache.pools || [])[idx];
+        if (!row) {
+          diag.missingRow += 1;
+          rowStatuses.push({
+            label: `${String(hk.scope || "v")}:${Number(idx) || 0}`,
+            outcome: "stale-row-ref",
+            mode: "n/a",
+            detail: "selected row is not present in current cache",
+          });
+          continue;
+        }
+        const rowLabel = String(row.pair || row.pool_id || row.position_id || `row#${i + 1}`);
+        if (row.unsupported_protocol) {
+          diag.unsupported += 1;
+          rowStatuses.push({
+            label: rowLabel,
+            outcome: "unsupported-protocol",
+            mode: "n/a",
+            detail: String(row.protocol || ""),
+          });
+          continue;
+        }
+        const missingTokens = (!String(row.token0_id || "").trim() || !String(row.token1_id || "").trim());
+        if (missingTokens) diag.missingTokens += 1;
+        rowsPayload.push({
+          chain: row.chain,
+          chain_id: Number(row.chain_id) || 0,
+          protocol: row.protocol,
+          pool_id: row.pool_id,
+          address: row.address,
+          position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
+          position_id: String(row.position_id || ""),
+          position_liquidity: row.liquidity,
+          pool_liquidity: row.pool_liquidity,
+          pool_tvl_usd: Number(row.pool_tvl_usd || 0),
+          days: getHistoryDays(),
+          token0_id: row.token0_id || "",
+          token1_id: row.token1_id || "",
+          token0_symbol: row.position_symbol0 || "",
+          token1_symbol: row.position_symbol1 || "",
+          fees_owed0: Number(row.fees_owed0 || 0),
+          fees_owed1: Number(row.fees_owed1 || 0),
+          position_amount0: Number(row.position_amount0 || 0),
+          position_amount1: Number(row.position_amount1 || 0),
+          pool_token0_price: Number(row.pool_token0_price || 0),
+          fee_usd_historical: histUsd,
+        });
+        payloadMeta.push({
+          colorIdx: i,
+          rowLabel,
+          baseName: String(row.pair || row.pool_id || `Position ${i + 1}`),
+          pairOrPool: String(row.pair || row.pool_id || "?"),
+        });
+      }
+      return {diag, rowStatuses, rowsPayload, payloadMeta};
+    }
+    function processFeeCompareRows(rowsOut, payloadMeta, palette, traces, rowStatuses, apiFailTop, backendHints, diag) {
+      let lastFeePricing = "";
+      let hasCollectedHistoryTrace = false;
+      let hasEstimatedShareTrace = false;
+      let hasSnapshotOnlyTrace = false;
+      let rowsWithCollected = 0;
+      let rowsWithEstimated = 0;
+      let rowsWithSnapshot = 0;
+      let rowsWithAnySeries = 0;
+      for (const outRow of rowsOut) {
+        const pos = Number(outRow?.index || 0);
+        const meta = payloadMeta[pos] || {colorIdx: pos, rowLabel: `row#${pos + 1}`, baseName: `Position ${pos + 1}`, pairOrPool: "?"};
+        if (!outRow?.ok) {
+          const det = String(outRow?.error || "compare data failed");
+          diag.apiFail += 1;
+          rowStatuses.push({
+            label: meta.rowLabel,
+            outcome: "api-error",
+            mode: "error",
+            detail: det,
+          });
+          if (apiFailTop.length < 3) apiFailTop.push(`${meta.pairOrPool}: ${det}`);
+          continue;
+        }
+        const mode = String(outRow.mode || "").trim();
+        const feePricing = String(outRow.fee_pricing || "").trim();
+        const collectedReason = String(outRow.collected_reason || "").trim();
+        const estimatedReason = String(outRow.estimated_reason || "").trim();
+        if (feePricing) lastFeePricing = feePricing;
+        const collectedItems = Array.isArray(outRow.collected_items) ? outRow.collected_items : [];
+        const estimatedItems = Array.isArray(outRow.estimated_items) ? outRow.estimated_items : [];
+        const snapshotItems = Array.isArray(outRow.snapshot_items) ? outRow.snapshot_items : [];
+        const hasCollected = collectedItems.length > 0;
+        const hasEstimated = estimatedItems.length > 0;
+        const hasSnapshot = snapshotItems.length > 0;
+        if (!hasCollected && !hasEstimated && !hasSnapshot) {
+          diag.emptySeries += 1;
+          rowStatuses.push({
+            label: meta.rowLabel,
+            outcome: "empty",
+            mode: mode || "unavailable",
+            pricing: feePricing,
+            points: 0,
+            detail: String(outRow.note || "empty fee series"),
+          });
+          continue;
+        }
+        rowsWithAnySeries += 1;
+        rowStatuses.push({
+          label: meta.rowLabel,
+          outcome: (!hasCollected && (hasEstimated || hasSnapshot)) ? "estimate-only" : "ok",
+          mode: mode || "ok",
+          pricing: feePricing,
+          points: collectedItems.length + estimatedItems.length + snapshotItems.length,
+          detail: `${String(outRow.note || "")}${collectedReason ? ` | collected_reason=${collectedReason}` : ""}${estimatedReason ? ` | estimated_reason=${estimatedReason}` : ""}`,
+        });
+        const d = outRow.debug || {};
+        if (backendHints.length < 5) {
+          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}`;
+          backendHints.push(msg);
+        }
+        if (hasCollected) {
+          hasCollectedHistoryTrace = true;
+          rowsWithCollected += 1;
+          traces.push({
+            x: collectedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
+            y: collectedItems.map((x) => Number(x.fees_usd || 0)),
+            mode: collectedItems.length <= 1 ? "lines+markers" : "lines",
+            line: {color: palette[meta.colorIdx % palette.length], width: 2},
+            marker: {size: collectedItems.length <= 1 ? 7 : 0},
+            name: `${meta.baseName} (collected history)`,
+            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+          });
+        }
+        if (hasEstimated) {
+          hasEstimatedShareTrace = true;
+          rowsWithEstimated += 1;
+          traces.push({
+            x: estimatedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
+            y: estimatedItems.map((x) => Number(x.fees_usd || 0)),
+            mode: "lines",
+            line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
+            opacity: 0.85,
+            name: `${meta.baseName} (estimated)`,
+            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+          });
+        }
+        if (hasSnapshot) {
+          hasSnapshotOnlyTrace = true;
+          rowsWithSnapshot += 1;
+          traces.push({
+            x: snapshotItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
+            y: snapshotItems.map((x) => Number(x.fees_usd || 0)),
+            mode: "markers",
+            marker: {size: 8, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
+            name: `${meta.baseName} (current unclaimed snapshot)`,
+            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+          });
+        }
+      }
+      return {
+        lastFeePricing,
+        hasCollectedHistoryTrace,
+        hasEstimatedShareTrace,
+        hasSnapshotOnlyTrace,
+        rowsWithCollected,
+        rowsWithEstimated,
+        rowsWithSnapshot,
+        rowsWithAnySeries,
+      };
+    }
     async function showSelectedPositionFees() {
       const chartEl = document.getElementById("posFeeChart");
       const debugEl = document.getElementById("posFeeDebug");
       if (!chartEl) return;
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
-      function renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints) {
-        if (!debugEl) return;
-        const rows = Array.isArray(rowStatuses) ? rowStatuses : [];
-        const okCount = rows.filter((x) => x && (x.outcome === "ok" || x.outcome === "estimate-only")).length;
-        const emptyCount = rows.filter((x) => x && x.outcome === "empty").length;
-        const badCount = rows.filter((x) => x && x.outcome !== "ok" && x.outcome !== "estimate-only" && x.outcome !== "empty").length;
-        const parts = [];
-        parts.push(`<b>Fee source status</b>`);
-        parts.push(`Selected: ${Number(diag?.selected || 0)} · with data: ${okCount} · empty: ${emptyCount} · failed/skipped: ${badCount}`);
-        if (rows.length) {
-          const lines = rows.slice(0, 24).map((x) => {
-            const label = esc(String(x?.label || "?"));
-            const outcome = esc(String(x?.outcome || "-"));
-            const mode = esc(String(x?.mode || "-"));
-            const pricing = String(x?.pricing || "").trim();
-            const pts = Number(x?.points || 0);
-            const detail = String(x?.detail || "").trim();
-            const pp = pricing ? `, pricing=${esc(pricing)}` : "";
-            const pt = pts > 0 ? `, points=${pts}` : "";
-            const dt = detail ? `, ${esc(detail)}` : "";
-            return `• ${label}: ${outcome}, mode=${mode}${pp}${pt}${dt}`;
-          });
-          parts.push(lines.join("<br/>"));
-        }
-        if (apiFailTop.length) parts.push(`Top API errors: ${esc(apiFailTop.join(" ; "))}`);
-        if (backendHints.length) parts.push(`Backend hints: ${esc(backendHints.join(" | "))}`);
-        debugEl.innerHTML = parts.join("<br/>");
-        debugEl.style.display = "";
-      }
-      async function postJsonWithRetry(url, payload, maxAttempts = 3) {
-        let lastRes = null;
-        let lastData = {};
-        let lastErr = null;
-        const attempts = Math.max(1, Number(maxAttempts) || 1);
-        for (let attempt = 1; attempt <= attempts; attempt++) {
-          try {
-            const res = await fetch(String(url || ""), {
-              method: "POST",
-              headers: {"Content-Type":"application/json"},
-              body: JSON.stringify(payload),
-            });
-            const data = await res.json().catch(() => ({}));
-            lastRes = res;
-            lastData = data;
-            if (res.ok) return {res, data};
-            const shouldRetry = res.status >= 500 && attempt < attempts;
-            if (!shouldRetry) return {res, data};
-          } catch (e) {
-            lastErr = e;
-            if (attempt >= attempts) break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
-        }
-        if (lastRes) return {res: lastRes, data: lastData};
-        const msg = String(lastErr?.message || "network error");
-        return {res: {ok: false, status: 0}, data: {detail: msg}};
-      }
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
         setPosFeeStatus("Select at least one History checkbox in the Scan table", true);
@@ -17852,86 +18040,16 @@ def _render_positions_page() -> str:
         const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
-        let lastFeePricing = "";
-        let hasCollectedHistoryTrace = false;
-        let hasEstimatedShareTrace = false;
-        let hasSnapshotOnlyTrace = false;
-        let rowsWithCollected = 0;
-        let rowsWithEstimated = 0;
-        let rowsWithSnapshot = 0;
-        const diag = {
-          selected: selected.length,
-          missingRow: 0,
-          unsupported: 0,
-          apiFail: 0,
-          emptySeries: 0,
-          missingTokens: 0,
-        };
         const apiFailTop = [];
         const backendHints = [];
-        const rowStatuses = [];
-        const rowsPayload = [];
-        const payloadMeta = [];
-        for (let i = 0; i < selected.length; i++) {
-          const hk = parseHistoryKey(selected[i]);
-          const idx = hk.idx;
-          const row = hk.scope === "h"
-            ? (posHeavyCache.pools || [])[idx]
-            : (posCache.pools || [])[idx];
-          if (!row) {
-            diag.missingRow += 1;
-            rowStatuses.push({
-              label: `${String(hk.scope || "v")}:${Number(idx) || 0}`,
-              outcome: "stale-row-ref",
-              mode: "n/a",
-              detail: "selected row is not present in current cache",
-            });
-            continue;
-          }
-          const rowLabel = String(row.pair || row.pool_id || row.position_id || `row#${i + 1}`);
-          if (row.unsupported_protocol) {
-            diag.unsupported += 1;
-            rowStatuses.push({
-              label: rowLabel,
-              outcome: "unsupported-protocol",
-              mode: "n/a",
-              detail: String(row.protocol || ""),
-            });
-            continue;
-          }
-          const missingTokens = (!String(row.token0_id || "").trim() || !String(row.token1_id || "").trim());
-          if (missingTokens) diag.missingTokens += 1;
-          rowsPayload.push({
-            chain: row.chain,
-            chain_id: Number(row.chain_id) || 0,
-            protocol: row.protocol,
-            pool_id: row.pool_id,
-            address: row.address,
-            position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
-            position_liquidity: row.liquidity,
-            pool_liquidity: row.pool_liquidity,
-            days: getHistoryDays(),
-            token0_id: row.token0_id || "",
-            token1_id: row.token1_id || "",
-            token0_symbol: row.position_symbol0 || "",
-            token1_symbol: row.position_symbol1 || "",
-            fees_owed0: Number(row.fees_owed0 || 0),
-            fees_owed1: Number(row.fees_owed1 || 0),
-            position_amount0: Number(row.position_amount0 || 0),
-            position_amount1: Number(row.position_amount1 || 0),
-            pool_token0_price: Number(row.pool_token0_price || 0),
-            fee_usd_historical: histUsd,
-          });
-          payloadMeta.push({
-            colorIdx: i,
-            rowLabel,
-            baseName: String(row.pair || row.pool_id || `Position ${i + 1}`),
-            pairOrPool: String(row.pair || row.pool_id || "?"),
-          });
-        }
+        const prepared = buildFeeCompareSelection(selected, histUsd);
+        const diag = prepared.diag;
+        const rowStatuses = prepared.rowStatuses;
+        const rowsPayload = prepared.rowsPayload;
+        const payloadMeta = prepared.payloadMeta;
         if (!rowsPayload.length) {
           chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
-          renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints);
+          renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatus("No valid selected rows for fee data", true);
           return;
         }
@@ -17948,98 +18066,16 @@ def _render_positions_page() -> str:
           return;
         }
         const rowsOut = Array.isArray(data?.rows) ? data.rows : [];
-        let rowsWithAnySeries = 0;
-        for (const outRow of rowsOut) {
-          const pos = Number(outRow?.index || 0);
-          const meta = payloadMeta[pos] || {colorIdx: pos, rowLabel: `row#${pos + 1}`, baseName: `Position ${pos + 1}`, pairOrPool: "?"};
-          if (!outRow?.ok) {
-            const det = String(outRow?.error || "compare data failed");
-            diag.apiFail += 1;
-            rowStatuses.push({
-              label: meta.rowLabel,
-              outcome: "api-error",
-              mode: "error",
-              detail: det,
-            });
-            if (apiFailTop.length < 3) apiFailTop.push(`${meta.pairOrPool}: ${det}`);
-            continue;
-          }
-          const mode = String(outRow.mode || "").trim();
-          const feePricing = String(outRow.fee_pricing || "").trim();
-          const collectedReason = String(outRow.collected_reason || "").trim();
-          const estimatedReason = String(outRow.estimated_reason || "").trim();
-          if (feePricing) lastFeePricing = feePricing;
-          const collectedItems = Array.isArray(outRow.collected_items) ? outRow.collected_items : [];
-          const estimatedItems = Array.isArray(outRow.estimated_items) ? outRow.estimated_items : [];
-          const snapshotItems = Array.isArray(outRow.snapshot_items) ? outRow.snapshot_items : [];
-          const hasCollected = collectedItems.length > 0;
-          const hasEstimated = estimatedItems.length > 0;
-          const hasSnapshot = snapshotItems.length > 0;
-          if (!hasCollected && !hasEstimated && !hasSnapshot) {
-            diag.emptySeries += 1;
-            rowStatuses.push({
-              label: meta.rowLabel,
-              outcome: "empty",
-              mode: mode || "unavailable",
-              pricing: feePricing,
-              points: 0,
-              detail: String(outRow.note || "empty fee series"),
-            });
-            continue;
-          }
-          rowsWithAnySeries += 1;
-          rowStatuses.push({
-            label: meta.rowLabel,
-            outcome: (!hasCollected && (hasEstimated || hasSnapshot)) ? "estimate-only" : "ok",
-            mode: mode || "ok",
-            pricing: feePricing,
-            points: collectedItems.length + estimatedItems.length + snapshotItems.length,
-            detail: `${String(outRow.note || "")}${collectedReason ? ` | collected_reason=${collectedReason}` : ""}${estimatedReason ? ` | estimated_reason=${estimatedReason}` : ""}`,
-          });
-          const d = outRow.debug || {};
-          if (backendHints.length < 5) {
-            const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}`;
-            backendHints.push(msg);
-          }
-          if (hasCollected) {
-            hasCollectedHistoryTrace = true;
-            rowsWithCollected += 1;
-            traces.push({
-              x: collectedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
-              y: collectedItems.map((x) => Number(x.fees_usd || 0)),
-              mode: collectedItems.length <= 1 ? "lines+markers" : "lines",
-              line: {color: palette[meta.colorIdx % palette.length], width: 2},
-              marker: {size: collectedItems.length <= 1 ? 7 : 0},
-              name: `${meta.baseName} (collected history)`,
-              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
-            });
-          }
-          if (hasEstimated) {
-            hasEstimatedShareTrace = true;
-            rowsWithEstimated += 1;
-            traces.push({
-              x: estimatedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
-              y: estimatedItems.map((x) => Number(x.fees_usd || 0)),
-              mode: "lines",
-              line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
-              opacity: 0.85,
-              name: `${meta.baseName} (estimated)`,
-              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
-            });
-          }
-          if (hasSnapshot) {
-            hasSnapshotOnlyTrace = true;
-            rowsWithSnapshot += 1;
-            traces.push({
-              x: snapshotItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
-              y: snapshotItems.map((x) => Number(x.fees_usd || 0)),
-              mode: "markers",
-              marker: {size: 8, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
-              name: `${meta.baseName} (current unclaimed snapshot)`,
-              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
-            });
-          }
-        }
+        const feeState = processFeeCompareRows(
+          rowsOut,
+          payloadMeta,
+          palette,
+          traces,
+          rowStatuses,
+          apiFailTop,
+          backendHints,
+          diag,
+        );
         if (!traces.length) {
           const reasons = [];
           if (diag.unsupported > 0) reasons.push(`unsupported protocol: ${diag.unsupported}`);
@@ -18050,7 +18086,7 @@ def _render_positions_page() -> str:
           const reasonLine = reasons.length ? reasons.join(" | ") : "all selected rows returned empty fee series";
           const apiTopHtml = apiFailTop.length ? `<br/>Top API errors: ${esc(apiFailTop.join(" ; "))}` : "";
           chartEl.innerHTML = `<div class='hint'><b>No fee data</b><br/>${esc(reasonLine)}${apiTopHtml}<br/>Tip: run a fresh table scan first so token ids/symbols are enriched before fee fallback.</div>`;
-          renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints);
+          renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatus(`No fee data · ${reasonLine}`, true);
           return;
         }
@@ -18065,15 +18101,15 @@ def _render_positions_page() -> str:
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
-        const pr = lastFeePricing ? ` · ${lastFeePricing}` : "";
-        const missing = Math.max(0, Number(diag.selected || 0) - rowsWithAnySeries);
-        const cmp = ` · collected rows: ${rowsWithCollected}, estimated rows: ${rowsWithEstimated}, snapshot rows: ${rowsWithSnapshot}`;
-        if (hasEstimatedShareTrace && hasCollectedHistoryTrace) {
+        const pr = feeState.lastFeePricing ? ` · ${feeState.lastFeePricing}` : "";
+        const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
+        const cmp = ` · collected rows: ${feeState.rowsWithCollected}, estimated rows: ${feeState.rowsWithEstimated}, snapshot rows: ${feeState.rowsWithSnapshot}`;
+        if (feeState.hasEstimatedShareTrace && feeState.hasCollectedHistoryTrace) {
           setPosFeeStatus(
             `Compared collected history with liquidity-share estimate (${traces.length}/${diag.selected})${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}`,
             false
           );
-        } else if ((hasEstimatedShareTrace || hasSnapshotOnlyTrace) && !hasCollectedHistoryTrace) {
+        } else if ((feeState.hasEstimatedShareTrace || feeState.hasSnapshotOnlyTrace) && !feeState.hasCollectedHistoryTrace) {
           setPosFeeStatus(
             `Estimate only: collected-fee history not found (${traces.length}/${diag.selected})${cmp}${missing ? ` · missing: ${missing}` : ""}`,
             true
@@ -18081,7 +18117,7 @@ def _render_positions_page() -> str:
         } else {
           setPosFeeStatus(`Done: ${traces.length}/${diag.selected} position(s) with fee data${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}`, false);
         }
-        renderFeeDiagnostics(diag, rowStatuses, apiFailTop, backendHints);
+        renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Error: ${esc(e?.message || "unknown")}</div>`;
         if (debugEl) {
@@ -19002,7 +19038,7 @@ def _render_positions_page() -> str:
       setSectionCollapsed("heavy", false);
     }
     async function scanHeavyPositions() {
-      let handoffToBackground = false;
+      let handoffToResume = false;
       if (posHeavyHasScannedOnce) {
         const ok = window.confirm("Run v4 / Infinity scan again and replace current results?");
         if (!ok) return;
@@ -19026,7 +19062,7 @@ def _render_positions_page() -> str:
         saveActiveHeavyPosJob(jobId);
         const data = await pollPosJob(jobId, true, "heavy");
         if (data && data.__partial) {
-          handoffToBackground = true;
+          handoffToResume = true;
           setHeavyStatus("Partial results loaded; enrich continues…", false);
           setTimeout(() => { resumeHeavyPosJobIfAny(); }, 300);
           return;
@@ -19037,7 +19073,7 @@ def _render_positions_page() -> str:
       } catch (e) {
         handleActivePosJobError(e, "heavy", false);
       } finally {
-        if (!handoffToBackground) setHeavyBusy(false);
+        if (!handoffToResume) setHeavyBusy(false);
       }
     }
     async function resumeHeavyPosJobIfAny() {
@@ -19118,7 +19154,7 @@ def _render_positions_page() -> str:
       if ((Number.isFinite(a0) && a0 <= 0) || (Number.isFinite(a1) && a1 <= 0)) return true;
       return false;
     }
-    async function runClosedRowsBackgroundEnrich() {
+    async function runClosedRowsEnrich() {
       const list = Array.isArray(posCache?.pools) ? posCache.pools : [];
       if (!list.length) return {processed: 0, updated: 0, eligible: 0};
       const hasCatalogSegments = list.some((x) => x && Object.prototype.hasOwnProperty.call(x, "catalog_segment"));
@@ -19157,7 +19193,7 @@ def _render_positions_page() -> str:
             const res = await fetch("/api/positions/row/enrich", {
               method: "POST",
               headers: {"Content-Type":"application/json"},
-              // Keep background enrich lightweight; Created date has its own dedicated pass.
+              // Keep this enrich lightweight; created date has its own dedicated pass.
               body: JSON.stringify({row: cur, include_created_date: false}),
               signal: ctrl.signal,
             });
@@ -19202,8 +19238,7 @@ def _render_positions_page() -> str:
       posClosedBgEnrichInFlight = true;
       startPosStatusLane("closed");
       try {
-        setPosStatus("Enriching closed positions…", false);
-        const out = await runClosedRowsBackgroundEnrich();
+        const out = await runClosedRowsEnrich();
         finishPosStatusLane("closed");
         posFinalClosedCount = countClosedRows(posCache.pools || []);
         posFinalClosedSec = Math.max(0, Number(posStatusLanes?.closed?.lastDoneSec || 0));
@@ -19218,7 +19253,7 @@ def _render_positions_page() -> str:
         setPosStatus("Closed positions enrich: " + (e?.message || "unknown"), true);
       } finally {
         posClosedBgEnrichInFlight = false;
-        // Re-apply user sort and remove sort lock after background closed phase.
+        // Re-apply user sort and remove sort lock after closed phase.
         renderPools(posCache.pools || []);
       }
     }
@@ -19227,7 +19262,7 @@ def _render_positions_page() -> str:
       setPosStatus(formatV3DoneStatus(data, includeOwnerChecks), false);
     }
     async function scanPositions() {
-      let handoffToBackground = false;
+      let handoffToResume = false;
       if (posHasScannedOnce) {
         const ok = window.confirm("Run scan again and replace current results?");
         if (!ok) return;
@@ -19243,7 +19278,7 @@ def _render_positions_page() -> str:
         saveActivePosJob(jobId);
         const data = await pollPosJob(jobId, true, "v3");
         if (data && data.__partial) {
-          handoffToBackground = true;
+          handoffToResume = true;
           setPosStatus("Table updated from server. Enrich and finalize still running…", false);
           setTimeout(() => { resumePosJobIfAny(); }, 300);
           return;
@@ -19260,7 +19295,7 @@ def _render_positions_page() -> str:
       } catch (e) {
         handleActivePosJobError(e, "v3", false);
       } finally {
-        if (!handoffToBackground) setPosBusy(false);
+        if (!handoffToResume) setPosBusy(false);
       }
     }
     async function resumePosJobIfAny() {
@@ -22150,6 +22185,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         })
 
     position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
+    pos_id_single = str(getattr(req, "position_id", "") or "").strip()
+    if pos_id_single:
+        position_ids.append(pos_id_single)
+    position_ids = list(dict.fromkeys(position_ids))
     debug["position_ids_count"] = len(position_ids)
     if not position_ids:
         collected_reason = "no_position_ids"
@@ -22206,6 +22245,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         latest_pool_tvl = max(0.0, _safe_float(tvl_points[-1][1]))
                 except Exception:
                     latest_pool_tvl = 0.0
+            if latest_pool_tvl <= 0:
+                latest_pool_tvl = max(0.0, _safe_float(getattr(req, "pool_tvl_usd", 0.0)))
             amt0 = max(0.0, _safe_float(getattr(req, "position_amount0", 0.0)))
             amt1 = max(0.0, _safe_float(getattr(req, "position_amount1", 0.0)))
             pos_usd = _liquidity_usd_from_in_position_external(
