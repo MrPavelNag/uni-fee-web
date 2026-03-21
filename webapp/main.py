@@ -7341,6 +7341,62 @@ def _format_usd_compact(value: float | None) -> str:
     return f"${(v / 1_000_000_000_000.0):,.2f}T".rstrip("0").rstrip(".")
 
 
+def _liquidity_usd_from_in_position_external(
+    chain_id: int,
+    amount0: float | None,
+    amount1: float | None,
+    token0_addr: str,
+    token1_addr: str,
+    *,
+    symbol0: str = "",
+    symbol1: str = "",
+    pair: str = "",
+    known_prices: dict[str, float] | None = None,
+) -> float | None:
+    a0 = max(0.0, _safe_float(amount0))
+    a1 = max(0.0, _safe_float(amount1))
+    if a0 <= 0.0 and a1 <= 0.0:
+        return None
+    t0 = str(token0_addr or "").strip().lower()
+    t1 = str(token1_addr or "").strip().lower()
+    prices = dict(known_prices or {})
+    if not prices and int(chain_id) > 0:
+        req: list[str] = []
+        if _is_eth_address(t0):
+            req.append(t0)
+        if _is_eth_address(t1) and t1 != t0:
+            req.append(t1)
+        if req:
+            try:
+                prices = _get_token_prices_usd(int(chain_id), req)
+            except Exception:
+                prices = {}
+    p0 = _safe_float(prices.get(t0))
+    p1 = _safe_float(prices.get(t1))
+    if p0 <= 0:
+        p0 = _major_or_stable_price_by_symbol(symbol0)
+    if p1 <= 0:
+        p1 = _major_or_stable_price_by_symbol(symbol1)
+    if p0 is None or p0 <= 0 or p1 is None or p1 <= 0:
+        pair_s = str(pair or "")
+        if "/" in pair_s:
+            s0, s1 = pair_s.split("/", 1)
+            if p0 is None or p0 <= 0:
+                p0 = _major_or_stable_price_by_symbol(s0)
+            if p1 is None or p1 <= 0:
+                p1 = _major_or_stable_price_by_symbol(s1)
+    p0 = _safe_float(p0)
+    p1 = _safe_float(p1)
+    usd = 0.0
+    if a0 > 0 and p0 > 0:
+        usd += a0 * p0
+    if a1 > 0 and p1 > 0:
+        usd += a1 * p1
+    if usd <= 0:
+        return None
+    return float(usd)
+
+
 def _enrich_rows_liquidity_usd(rows: list[dict[str, Any]], *, max_seconds: int = 4) -> None:
     if not isinstance(rows, list) or not rows:
         return
@@ -7384,39 +7440,28 @@ def _enrich_rows_liquidity_usd(rows: list[dict[str, Any]], *, max_seconds: int =
             r["liquidity_display"] = "-"
             continue
         cid = int(r.get("chain_id") or 0)
-        if cid <= 0:
-            continue
         prices = prices_by_chain.get(int(cid), {})
-        if not prices:
-            continue
         a0 = _safe_float(r.get("position_amount0"))
         a1 = _safe_float(r.get("position_amount1"))
         t0 = str(r.get("token0_id") or "").strip().lower()
         t1 = str(r.get("token1_id") or "").strip().lower()
-        p0 = _safe_float(prices.get(t0))
-        p1 = _safe_float(prices.get(t1))
-        if p0 <= 0:
-            p0 = _major_or_stable_price_by_symbol(str(r.get("position_symbol0") or ""))
-        if p1 <= 0:
-            p1 = _major_or_stable_price_by_symbol(str(r.get("position_symbol1") or ""))
-        if p0 is None or p0 <= 0 or p1 is None or p1 <= 0:
-            pair = str(r.get("pair") or "")
-            if "/" in pair:
-                s0, s1 = pair.split("/", 1)
-                if p0 is None or p0 <= 0:
-                    p0 = _major_or_stable_price_by_symbol(s0)
-                if p1 is None or p1 <= 0:
-                    p1 = _major_or_stable_price_by_symbol(s1)
-        p0 = _safe_float(p0)
-        p1 = _safe_float(p1)
-        usd = 0.0
-        if a0 > 0 and p0 > 0:
-            usd += a0 * p0
-        if a1 > 0 and p1 > 0:
-            usd += a1 * p1
-        if usd > 0:
+        usd = _liquidity_usd_from_in_position_external(
+            int(cid),
+            a0,
+            a1,
+            t0,
+            t1,
+            symbol0=str(r.get("position_symbol0") or ""),
+            symbol1=str(r.get("position_symbol1") or ""),
+            pair=str(r.get("pair") or ""),
+            known_prices=prices,
+        )
+        if usd is not None and usd > 0:
             r["liquidity_usd"] = float(usd)
             r["liquidity_display"] = _format_usd_compact(float(usd))
+        else:
+            r["liquidity_usd"] = None
+            r["liquidity_display"] = "-"
 
 
 def _pool_token0_price_from_sqrt_x96(sqrt_price_x96: int, dec0: int, dec1: int) -> float | None:
@@ -15298,23 +15343,20 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
         status = "inactive" if (a0_now <= 0.0 or a1_now <= 0.0) else "active"
     token0_addr = str(snap.get("token0") or row.get("token0_id") or "").strip().lower()
     token1_addr = str(snap.get("token1") or row.get("token1_id") or "").strip().lower()
-    liq_usd = None
-    try:
-        prices = _get_token_prices_usd(int(chain_id), [token0_addr, token1_addr])
-        p0 = _safe_float(prices.get(token0_addr))
-        p1 = _safe_float(prices.get(token1_addr))
-        usd = 0.0
-        if a0_now > 0 and p0 > 0:
-            usd += a0_now * p0
-        if a1_now > 0 and p1 > 0:
-            usd += a1_now * p1
-        if usd > 0:
-            liq_usd = float(usd)
-    except Exception:
-        liq_usd = None
+    liq_usd = _liquidity_usd_from_in_position_external(
+        int(chain_id),
+        a0_now,
+        a1_now,
+        token0_addr,
+        token1_addr,
+        symbol0=str(snap.get("token0_symbol") or row.get("position_symbol0") or ""),
+        symbol1=str(snap.get("token1_symbol") or row.get("position_symbol1") or ""),
+        pair=(
+            f"{_normalize_display_symbol(str(snap.get('token0_symbol') or row.get('position_symbol0') or '?'))}/"
+            f"{_normalize_display_symbol(str(snap.get('token1_symbol') or row.get('position_symbol1') or '?'))}"
+        ),
+    )
     liq_disp = _format_usd_compact(liq_usd)
-    if is_v4_snap and liq_raw > 0 and (liq_usd is None or float(liq_usd) <= 0.0):
-        liq_disp = f"v4 L {_format_position_liquidity_scalar_compact(liq_raw)}"
     fee_raw = str(snap.get("fee") or "").strip()
     fee_disp = fee_raw
     try:
@@ -15954,46 +15996,46 @@ def _render_placeholder_page(
 
 def _render_positions_page() -> str:
     extra_css = """
-    .positions-grid { display:grid; gap:14px; margin-top:4px; min-width:0; width:100%; max-width:100%; }
+    .positions-grid { display:grid; gap:15px; margin-top:4px; min-width:0; width:100%; max-width:100%; }
     .positions-form, .result-card {
       background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%);
       border: 1px solid #d4deee;
-      border-radius: 14px;
-      padding: 14px;
+      border-radius: 15px;
+      padding: 15px;
       box-shadow: 0 6px 20px rgba(15,23,42,0.06);
       min-width: 0;
       max-width: 100%;
     }
-    .positions-form h3, .result-card h3 { margin:0; font-size:17px; color:#1f3a8a; }
-    .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; min-width:0; }
-    .address-columns { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
+    .positions-form h3, .result-card h3 { margin:0; font-size:19px; color:#1f3a8a; }
+    .section-head { display:flex; align-items:center; justify-content:space-between; gap:11px; margin-bottom:9px; min-width:0; }
+    .address-columns { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:11px; }
     .stables-address-columns { grid-template-columns:repeat(3, minmax(0, 1fr)); }
-    .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
-    .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
-    .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; }
-    .btn-plus { width:26px; min-width:26px; height:26px; border:none; border-radius:0; padding:0; font-size:22px; line-height:1; display:inline-flex; align-items:center; justify-content:center; background:transparent; color:#2563eb; font-weight:800; box-shadow:none; }
+    .addr-box { border:1px solid #d7e1ef; border-radius:13px; background:#f8fbff; padding:11px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
+    .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:9px; }
+    .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:9px; padding:9px; font-size:14px; }
+    .btn-plus { width:29px; min-width:29px; height:29px; border:none; border-radius:0; padding:0; font-size:24px; line-height:1; display:inline-flex; align-items:center; justify-content:center; background:transparent; color:#2563eb; font-weight:800; box-shadow:none; }
     .btn-plus:hover { color:#1d4ed8; background:transparent; }
-    .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; min-height:26px; }
-    .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
-    .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; }
+    .chips { display:flex; flex-wrap:wrap; gap:7px; margin-top:9px; min-height:29px; }
+    .chip { display:inline-flex; align-items:center; gap:7px; border:1px solid #bfdbfe; border-radius:999px; padding:5px 9px; background:#eff6ff; color:#1f3a8a; font-size:13px; }
+    .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; font-size:13px; }
     .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
-    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:17px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
+    .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:19px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
-    .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
-    .section-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; min-width:0; flex:1 1 auto; }
+    .collapse-btn { border:none; background:transparent; color:#334155; font-size:15px; font-weight:800; cursor:pointer; padding:0 2px; min-width:18px; text-align:center; }
+    .section-actions { display:flex; align-items:center; gap:11px; flex-wrap:wrap; justify-content:flex-end; min-width:0; flex:1 1 auto; }
     .section-head .section-actions { margin-left: auto; justify-content: flex-end; }
-    .pos-fee-hist-label { display:inline-flex; align-items:center; gap:6px; font-size:13px; font-weight:600; color:#475569; margin:0; cursor:pointer; user-select:none; flex-shrink:0; white-space:nowrap; }
-    .pos-fee-hist-label input { margin:0; width:15px; height:15px; accent-color:#2563eb; flex-shrink:0; }
+    .pos-fee-hist-label { display:inline-flex; align-items:center; gap:7px; font-size:14px; font-weight:600; color:#475569; margin:0; cursor:pointer; user-select:none; flex-shrink:0; white-space:nowrap; }
+    .pos-fee-hist-label input { margin:0; width:16px; height:16px; accent-color:#2563eb; flex-shrink:0; }
     .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
-    .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:12px; padding:0 0 0 4px; }
-    .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; position: relative; }
+    .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:13px; padding:0 0 0 4px; }
+    .pos-progress { width: 154px; height: 7px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; position: relative; }
     .pos-progress .bar { height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); width: 0%; transition: width 0.35s ease-out; }
     .pos-progress.pos-progress-indeterminate .bar { width: 40%; animation: posLoad 1s linear infinite; }
     @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
     .pos-status {
       color:#475569;
-      font-size:13px;
+      font-size:14px;
       display:inline-block;
       min-width: 0;
       flex: 1 1 160px;
@@ -16013,9 +16055,9 @@ def _render_positions_page() -> str:
       max-width:100%;
       min-width:0;
     }
-    table { width:100%; border-collapse:collapse; font-size:11px; min-width:820px; }
-    th, td { border-bottom:1px solid #e2e8f0; padding:4px 5px; text-align:left; vertical-align:top; }
-    th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; font-size:11px; font-weight:700; padding:5px 5px; }
+    table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
+    th, td { border-bottom:1px solid #e2e8f0; padding:5px 6px; text-align:left; vertical-align:top; }
+    th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; font-size:12px; font-weight:700; padding:6px 6px; }
     #posPoolsTable { min-width: 1080px; table-layout: auto; }
     #posPoolsTable th, #posPoolsTable td { white-space: nowrap; }
     #posPoolsTable th:nth-child(1), #posPoolsTable td:nth-child(1) {
@@ -16029,22 +16071,22 @@ def _render_positions_page() -> str:
     #posHeavyPoolsClosedTable th, #posHeavyPoolsClosedTable td,
     #posHeavyPoolsOtherTable th, #posHeavyPoolsOtherTable td,
     #posHeavyPoolsHiddenTable th, #posHeavyPoolsHiddenTable td { white-space: nowrap; }
-    .pos-pools-tab-bar { display: none; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .pos-pools-tab-bar { display: none; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 9px; }
     .pos-tab-btn {
       border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
-      padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+      padding: 7px 13px; font-size: 13px; font-weight: 600; cursor: pointer;
     }
     .pos-tab-btn:hover { border-color: #93c5fd; color: #1d4ed8; }
     .pos-tab-btn.active { border-color: #2563eb; background: #eff6ff; color: #1e3a8a; }
     #posPoolsTable td.pos-pools-details-cell { white-space: normal; vertical-align: middle; background: #f1f5f9; }
     #posPoolsTable .pos-collapsed-section summary {
-      cursor: pointer; font-weight: 700; color: #1e3a8a; padding: 8px 6px; user-select: none;
+      cursor: pointer; font-weight: 700; color: #1e3a8a; padding: 9px 7px; user-select: none;
     }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
     .status-dot {
       display:inline-block;
-      width:8px;
-      height:8px;
+      width:9px;
+      height:9px;
       border-radius:999px;
       vertical-align:middle;
       border:1px solid transparent;
@@ -16053,29 +16095,29 @@ def _render_positions_page() -> str:
     .status-dot.inactive { background:#ab8787; border-color:#987676; }
     .status-dot.hidden { background:#94a3b8; border-color:#64748b; }
     .status-dot.explorer { background:#93b4d4; border-color:#6b93b8; }
-    .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
-    .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
+    .errors-box { margin-top:11px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:11px; padding:9px; font-size:13px; white-space:pre-wrap; }
+    .info-box { margin-top:11px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:11px; padding:9px; font-size:13px; white-space:pre-wrap; }
     @media (max-width: 1100px) {
       .address-columns { grid-template-columns:1fr; }
-      .positions-form, .result-card { padding: 12px; }
+      .positions-form, .result-card { padding: 13px; }
       .section-head { flex-wrap: wrap; align-items: center; }
-      .section-head h3 { font-size: 16px; }
-      .search-link-btn { font-size: 15px; }
+      .section-head h3 { font-size: 18px; }
+      .search-link-btn { font-size: 16px; }
     }
     @media (max-width: 720px) {
-      .positions-grid { gap: 10px; }
-      .positions-form, .result-card { padding: 10px; border-radius: 12px; }
-      .addr-box { padding: 8px; }
+      .positions-grid { gap: 11px; }
+      .positions-form, .result-card { padding: 11px; border-radius: 13px; }
+      .addr-box { padding: 9px; }
       .addr-input-row { gap: 6px; }
-      .addr-input-row input { font-size: 12px; padding: 7px; }
-      .btn-plus { width: 24px; min-width: 24px; height: 24px; font-size: 20px; }
-      .chip { font-size: 11px; padding: 3px 7px; }
-      .pos-status { font-size: 12px; min-width: 0; max-width: 100%; flex: 1 1 140px; }
+      .addr-input-row input { font-size: 13px; padding: 8px; }
+      .btn-plus { width: 26px; min-width: 26px; height: 26px; font-size: 22px; }
+      .chip { font-size: 12px; padding: 4px 8px; }
+      .pos-status { font-size: 13px; min-width: 0; max-width: 100%; flex: 1 1 140px; }
       .table-wrap { border-radius: 8px; }
-      table { min-width: 740px; font-size: 11px; }
+      table { min-width: 814px; font-size: 12px; }
       th, td { padding: 6px; }
-      .mono { font-size: 10px; }
-      .errors-box, .info-box { font-size: 11px; padding: 7px; }
+      .mono { font-size: 11px; }
+      .errors-box, .info-box { font-size: 12px; padding: 8px; }
     }
     """
     extra_html = """
