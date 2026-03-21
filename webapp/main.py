@@ -19239,12 +19239,9 @@ def _render_positions_page() -> str:
       ensureV3SectionVisible();
       try {
         setPosBusy(true);
-        startPosStatusLane("active");
         const jobId = await startV3ScanJob();
         saveActivePosJob(jobId);
-        const data = await pollPosJob(jobId, true, "v3", (payload) => {
-          updatePosStatusLaneFromPayload("active", payload);
-        });
+        const data = await pollPosJob(jobId, true, "v3");
         if (data && data.__partial) {
           handoffToBackground = true;
           setPosStatus("Table updated from server. Background enrich and finalize still running…", false);
@@ -19252,7 +19249,6 @@ def _render_positions_page() -> str:
           return;
         }
         saveActivePosJob("");
-        finishPosStatusLane("active");
         applyV3ScanResult(data, true);
         if (isClosedBgEnrichEnabled()) {
           startClosedBgEnrichAfterV3Scan();
@@ -19262,7 +19258,6 @@ def _render_positions_page() -> str:
           setPosFinalSummaryStatus();
         }
       } catch (e) {
-        finishPosStatusLane("active");
         handleActivePosJobError(e, "v3", false);
       } finally {
         if (!handoffToBackground) setPosBusy(false);
@@ -19273,12 +19268,8 @@ def _render_positions_page() -> str:
       if (!jobId) return;
       try {
         setPosBusy(true);
-        startPosStatusLane("active");
-        const data = await pollPosJob(jobId, false, "v3", (payload) => {
-          updatePosStatusLaneFromPayload("active", payload);
-        });
+        const data = await pollPosJob(jobId, false, "v3");
         saveActivePosJob("");
-        finishPosStatusLane("active");
         applyV3ScanResult(data, false);
         if (isClosedBgEnrichEnabled()) {
           startClosedBgEnrichAfterV3Scan();
@@ -19288,7 +19279,6 @@ def _render_positions_page() -> str:
           setPosFinalSummaryStatus();
         }
       } catch (e) {
-        finishPosStatusLane("active");
         handleActivePosJobError(e, "v3", true);
       } finally {
         setPosBusy(false);
