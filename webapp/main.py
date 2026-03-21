@@ -16288,6 +16288,11 @@ def _render_positions_page() -> str:
     #posHeavyPoolsHiddenTable th:last-child {
       font-weight: 800;
     }
+    .pos-sort-disabled th[onclick] {
+      pointer-events: none;
+      cursor: default !important;
+      color: #64748b;
+    }
     .pos-pools-tab-bar { display: none; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 9px; }
     .pos-tab-btn {
       border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; border-radius: 8px;
@@ -16765,7 +16770,7 @@ def _render_positions_page() -> str:
         if (!el) continue;
         el.style.display = k === tab ? "block" : "none";
       }
-      if (clSortBar) clSortBar.style.display = tab === "closed" ? "" : "none";
+      if (clSortBar) clSortBar.style.display = (tab === "closed" && !posScanInProgress) ? "" : "none";
       document.querySelectorAll("#posPoolsTabBar [data-pos-tab]").forEach((b) => {
         const t = b.getAttribute("data-pos-tab") || "";
         b.classList.toggle("active", t === tab);
@@ -16808,7 +16813,7 @@ def _render_positions_page() -> str:
         if (!el) continue;
         el.style.display = k === tab ? "block" : "none";
       }
-      if (hClSortBar) hClSortBar.style.display = tab === "closed" ? "" : "none";
+      if (hClSortBar) hClSortBar.style.display = (tab === "closed" && !posHeavyScanInProgress) ? "" : "none";
       document.querySelectorAll("#posHeavyPoolsTabBar [data-pos-heavy-tab]").forEach((b) => {
         const t = b.getAttribute("data-pos-heavy-tab") || "";
         b.classList.toggle("active", t === tab);
@@ -18272,7 +18277,7 @@ def _render_positions_page() -> str:
       if (clTable) clTable.innerHTML = closedHtml;
       const clSortBar = document.getElementById("posPoolsClosedSortBar");
       const clSortSel = document.getElementById("posClosedSortSelect");
-      if (clSortBar) clSortBar.style.display = closedTabRows.length ? "" : "none";
+      if (clSortBar) clSortBar.style.display = (closedTabRows.length && !posScanInProgress) ? "" : "none";
       if (clSortSel) {
         const hasMode = Array.from(clSortSel.options || []).some((o) => String(o.value || "") === closedSortMode);
         if (hasMode) clSortSel.value = closedSortMode;
@@ -18283,6 +18288,8 @@ def _render_positions_page() -> str:
       if (otTable) otTable.innerHTML = otHtml;
       const hidTable = document.getElementById("posPoolsHiddenTable");
       if (hidTable) hidTable.innerHTML = hiddenHtml;
+      if (table) table.classList.toggle("pos-sort-disabled", !!posScanInProgress);
+      if (clTable) clTable.classList.toggle("pos-sort-disabled", !!posScanInProgress);
       const tabBar = document.getElementById("posPoolsTabBar");
       const cntMainEl = document.getElementById("posMainTabCount");
       const cntPrEl = document.getElementById("posProtocolTabCount");
@@ -18736,7 +18743,7 @@ def _render_positions_page() -> str:
       if (clTable) clTable.innerHTML = closedHtml;
       const hClSortBar = document.getElementById("posHeavyClosedSortBar");
       const hClSortSel = document.getElementById("posHeavyClosedSortSelect");
-      if (hClSortBar) hClSortBar.style.display = closedTabRows.length ? "" : "none";
+      if (hClSortBar) hClSortBar.style.display = (closedTabRows.length && !posHeavyScanInProgress) ? "" : "none";
       if (hClSortSel) {
         const hasMode = Array.from(hClSortSel.options || []).some((o) => String(o.value || "") === heavyClosedSortMode);
         if (hasMode) hClSortSel.value = heavyClosedSortMode;
@@ -18747,6 +18754,8 @@ def _render_positions_page() -> str:
       if (otTable) otTable.innerHTML = otHtml;
       const hidTable = document.getElementById("posHeavyPoolsHiddenTable");
       if (hidTable) hidTable.innerHTML = hiddenHtml;
+      if (table) table.classList.toggle("pos-sort-disabled", !!posHeavyScanInProgress);
+      if (clTable) clTable.classList.toggle("pos-sort-disabled", !!posHeavyScanInProgress);
       const tabBar = document.getElementById("posHeavyPoolsTabBar");
       const cntMainEl = document.getElementById("posHeavyMainTabCount");
       const cntPrEl = document.getElementById("posHeavyProtocolTabCount");
