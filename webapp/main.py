@@ -24378,6 +24378,57 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             ledger_by_day = {}
     debug["ledger_points"] = int(len(ledger_by_day))
 
+    force_rpc = _position_fee_rpc_force_onchain()
+    if ledger_by_day and not force_rpc:
+        collected_reason = "ok_npm_fee_ledger"
+        debug["result_mode"] = "npm-fee-ledger"
+        debug["result_count"] = len(ledger_by_day)
+        pricing = "ledger_spot"
+        if ledger_pricing_modes:
+            uniq = list(dict.fromkeys([str(x) for x in ledger_pricing_modes if str(x).strip()]))
+            if len(uniq) == 1:
+                pricing = uniq[0]
+            elif uniq:
+                pricing = "ledger_mixed"
+        # Build optional snapshot point from current row unclaimed fees (same logic as fallback),
+        # so frontend can extend collected path to "now".
+        snapshot_items_payload: list[dict[str, Any]] = []
+        owed0_led = max(0.0, _safe_float(getattr(req, "fees_owed0", 0.0)))
+        owed1_led = max(0.0, _safe_float(getattr(req, "fees_owed1", 0.0)))
+        if owed0_led > 0.0 or owed1_led > 0.0:
+            p0_led = 0.0
+            p1_led = 0.0
+            try:
+                tks_led = [x for x in [token0, token1] if _is_eth_address(x)]
+                pmap_led = _get_token_prices_usd(int(chain_id), tks_led) if tks_led else {}
+                p0_led = _safe_float(pmap_led.get(str(token0 or "").strip().lower()))
+                p1_led = _safe_float(pmap_led.get(str(token1 or "").strip().lower()))
+            except Exception:
+                p0_led = 0.0
+                p1_led = 0.0
+            if p0_led <= 0:
+                p0_led = _safe_float(_major_or_stable_price_by_symbol(sym0_hint or str(getattr(req, "token0_symbol", "") or "")))
+            if p1_led <= 0:
+                p1_led = _safe_float(_major_or_stable_price_by_symbol(sym1_hint or str(getattr(req, "token1_symbol", "") or "")))
+            usd_now_led = 0.0
+            if owed0_led > 0 and p0_led > 0:
+                usd_now_led += float(owed0_led) * float(p0_led)
+            if owed1_led > 0 and p1_led > 0:
+                usd_now_led += float(owed1_led) * float(p1_led)
+            if usd_now_led > 0:
+                day_ts_led = (int(now_ts) // 86400) * 86400
+                snapshot_items_payload = [{"ts": int(day_ts_led), "fees_usd": float(usd_now_led)}]
+        return _with_debug({
+            "items": _pack_fee_items(ledger_by_day),
+            "snapshot_items": snapshot_items_payload,
+            "count": len(ledger_by_day),
+            "mode": "npm-fee-ledger",
+            "fee_pricing": pricing,
+            "note": "Position-level NPM ledger: Collect minus DecreaseLiquidity principal.",
+            "estimated_items": est_items_payload,
+            "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
+        })
+
     exact_by_day: dict[int, float] = {}
     if endpoint:
         for pid in position_ids[:20]:
@@ -24564,7 +24615,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["rpc_pricing"] = str((rpc_meta or {}).get("pricing") or "none")
     debug["rpc_detail"] = str((rpc_meta or {}).get("detail") or "")
 
-    force_rpc = _position_fee_rpc_force_onchain()
     rpc_detail = str((rpc_meta or {}).get("detail") or "").strip()
     rpc_pricing = str((rpc_meta or {}).get("pricing") or "none").strip()
 
@@ -24596,27 +24646,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
             "note": "POSITIONS_FEE_RPC_FORCE: " + (rpc_detail or "NPM Collect logs."),
-            "estimated_items": est_items_payload,
-            "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
-        })
-
-    if ledger_by_day and not force_rpc:
-        collected_reason = "ok_npm_fee_ledger"
-        debug["result_mode"] = "npm-fee-ledger"
-        debug["result_count"] = len(ledger_by_day)
-        pricing = "ledger_spot"
-        if ledger_pricing_modes:
-            uniq = list(dict.fromkeys([str(x) for x in ledger_pricing_modes if str(x).strip()]))
-            if len(uniq) == 1:
-                pricing = uniq[0]
-            elif uniq:
-                pricing = "ledger_mixed"
-        return _with_debug({
-            "items": _pack_fee_items(ledger_by_day),
-            "count": len(ledger_by_day),
-            "mode": "npm-fee-ledger",
-            "fee_pricing": pricing,
-            "note": "Position-level NPM ledger: Collect minus DecreaseLiquidity principal.",
             "estimated_items": est_items_payload,
             "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
         })
@@ -24751,7 +24780,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     workers_cfg = max(1, min(8, int(os.environ.get("POSITIONS_FEE_COMPARE_WORKERS", "4"))))
     wall_budget_sec = max(5.0, min(120.0, float(os.environ.get("POSITIONS_FEE_COMPARE_WALL_SEC", "40"))))
     if len(prepared_rows) <= 2:
-        wall_budget_sec = max(float(wall_budget_sec), 180.0)
+        wall_budget_sec = min(float(wall_budget_sec), 45.0)
     nonempty_baseline = os.environ.get("POSITIONS_FEE_COMPARE_NONEMPTY_BASELINE", "1").strip().lower() in (
         "1",
         "true",
@@ -24813,8 +24842,9 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
             estimated_reason = str(one.get("estimated_reason") or "").strip().lower() or "unknown"
             items = _norm_fee_items(one.get("items") if isinstance(one.get("items"), list) else [])
             est_items = _norm_fee_items(one.get("estimated_items") if isinstance(one.get("estimated_items"), list) else [])
+            snap_items_raw = _norm_fee_items(one.get("snapshot_items") if isinstance(one.get("snapshot_items"), list) else [])
             collected_items: list[dict[str, Any]] = []
-            snapshot_items: list[dict[str, Any]] = []
+            snapshot_items: list[dict[str, Any]] = list(snap_items_raw)
             if mode == "row-unclaimed-fallback":
                 snapshot_items = items
             elif mode in {"exact-snapshots", "onchain-collect-logs"}:
