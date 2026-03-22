@@ -18312,8 +18312,8 @@ def _render_positions_page() -> str:
             </label>
             <input id="posHistoryBenchA" value="BTC" style="width:58px" />
             <input id="posHistoryBenchB" value="ETH" style="width:58px" />
-            <span class="pos-status" id="posHistoryStatus">Select pools and click Search</span>
-            <button class="search-link-btn" type="button" onclick="showSelectedPoolSeries()">Search</button>
+            <span class="pos-status" id="posHistoryStatus">Select pools and click Build chart</span>
+            <button class="search-link-btn" type="button" onclick="showSelectedPoolSeries()">Build chart</button>
             <button class="collapse-btn" id="toggleHistoryBtn" type="button" onclick="togglePosSection('history')" title="Collapse/expand">▾</button>
           </div>
         </div>
@@ -18326,12 +18326,12 @@ def _render_positions_page() -> str:
         <div class="section-head">
           <h3>Fee calculation</h3>
           <div class="section-actions">
-            <span class="pos-status" id="posFeeStatus">Select History checkboxes, then click Scan</span>
+            <span class="pos-status" id="posFeeStatus">Select History checkboxes, then click Build chart</span>
             <label class="fee-toggle-pill" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
               <input type="checkbox" id="posFeeHistoricalUsd" />
-              <span class="pos-fee-hist-label">Historical USD</span>
+              <span class="pos-fee-hist-label">If sold instantly</span>
             </label>
-            <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Scan</button>
+            <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Build chart</button>
             <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
           </div>
         </div>
@@ -18429,6 +18429,7 @@ def _render_positions_page() -> str:
     const POS_HEAVY_CLOSED_SORT_KEY = "positions_heavy_closed_sort_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
     const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
+    const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
       position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder).",
     };
@@ -19110,24 +19111,14 @@ def _render_positions_page() -> str:
         if (elapsedSec > 0) parts.push(`${Math.round(elapsedSec)}s`);
         if (stage) parts.push(stage);
         if (selected > 0) parts.push(`rows ${withData}/${selected}`);
-        if (msg) parts.push(msg);
         el.classList.remove("fee-status-bar");
         el.style.color = "#475569";
         el.textContent = parts.join(" | ");
         return;
       }
       parts.push(`${title}: ${msg || (state === "ok" ? "Done" : (state === "warn" ? "Partial" : "Error"))}`);
-      if (selected > 0) parts.push(`rows ${withData}/${selected}`);
-      if (selected > 0 || collected > 0 || estimated > 0 || snapshot > 0) {
-        parts.push(`rows_with_data: collected ${collected}, estimated ${estimated}, snapshot ${snapshot}`);
-      }
-      if (collectedPts > 0 || estimatedPts > 0 || snapshotPts > 0) {
-        parts.push(`points: collected ${collectedPts}, estimated ${estimatedPts}, snapshot ${snapshotPts}`);
-      }
-      if (mode) parts.push(`mode ${mode}`);
-      if (missing > 0) parts.push(`missing ${missing}`);
-      if (timeoutRows > 0) parts.push(`timeout ${timeoutRows}`);
-      if (baselineRows > 0) parts.push(`baseline ${baselineRows}`);
+      parts.push(`points collected ${Math.max(0, Number(collectedPts || 0))}`);
+      if (estimatedPts > 0) parts.push(`estimated ${Math.max(0, Number(estimatedPts || 0))}`);
       if (elapsedSec > 0) parts.push(`${Math.round(elapsedSec)}s`);
       el.classList.remove("fee-status-bar");
       el.style.color = state === "error" ? "#b91c1c" : (state === "warn" ? "#92400e" : "#475569");
@@ -19913,6 +19904,58 @@ def _render_positions_page() -> str:
       const msg = String(lastErr?.message || "network error");
       return {res: {ok: false, status: 0}, data: {detail: msg}};
     }
+    function buildFeeScanCacheKey(rowsPayload, histUsd) {
+      const src = (rowsPayload || []).map((r) => [
+        String(r?.chain_id || ""),
+        String(r?.protocol || ""),
+        String(r?.pool_id || ""),
+        String(r?.address || ""),
+        String(r?.position_id || ""),
+        Array.isArray(r?.position_ids) ? r.position_ids.join(",") : "",
+        Number(!!histUsd),
+      ].join("|")).join("||");
+      return src || `empty|${Number(!!histUsd)}`;
+    }
+    function loadFeeScanCache(key) {
+      try {
+        const raw = localStorage.getItem(POS_FEE_SCAN_CACHE_KEY);
+        if (!raw) return null;
+        const obj = JSON.parse(raw);
+        if (!obj || typeof obj !== "object") return null;
+        const ts = Number(obj.ts || 0);
+        if (!ts || (Date.now() - ts) > 15 * 60 * 1000) return null;
+        const byKey = obj.byKey || {};
+        const rec = byKey[String(key || "")];
+        if (!rec || typeof rec !== "object") return null;
+        const rows = Array.isArray(rec.rows) ? rec.rows : [];
+        const debug = (rec.debug && typeof rec.debug === "object") ? rec.debug : {};
+        if (!rows.length) return null;
+        return {rows, debug};
+      } catch (_) {
+        return null;
+      }
+    }
+    function saveFeeScanCache(key, rows, debug) {
+      try {
+        const raw = localStorage.getItem(POS_FEE_SCAN_CACHE_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        const byKey = (obj && typeof obj.byKey === "object" && obj.byKey) ? obj.byKey : {};
+        byKey[String(key || "")] = {
+          rows: Array.isArray(rows) ? rows : [],
+          debug: (debug && typeof debug === "object") ? debug : {},
+          saved_at: Date.now(),
+        };
+        const keys = Object.keys(byKey);
+        if (keys.length > 16) {
+          keys.sort((a, b) => Number(byKey[b]?.saved_at || 0) - Number(byKey[a]?.saved_at || 0));
+          const keep = new Set(keys.slice(0, 16));
+          for (const k of keys) {
+            if (!keep.has(k)) delete byKey[k];
+          }
+        }
+        localStorage.setItem(POS_FEE_SCAN_CACHE_KEY, JSON.stringify({ts: Date.now(), byKey}));
+      } catch (_) {}
+    }
     function buildFeeCompareSelection(selected, histUsd) {
       const diag = {
         selected: selected.length,
@@ -19994,6 +20037,7 @@ def _render_positions_page() -> str:
           pairOrPool: String(row.pair || row.pool_id || "?"),
           createdMs: Number(createdMs || 0),
           days: Number(rowDays || 0),
+          liquidityLabel: String(row.liquidity_display || row.liquidity || "-"),
         });
       }
       return {diag, rowStatuses, rowsPayload, payloadMeta, minCreatedMs};
@@ -20132,7 +20176,7 @@ def _render_positions_page() -> str:
             y: useLineY,
             mode: "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
-            name: `${meta.baseName} (collected path)`,
+            name: `${meta.baseName} (today USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
           if (collectedPointX.length) {
@@ -20156,7 +20200,7 @@ def _render_positions_page() -> str:
             mode: "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
             opacity: 0.85,
-            name: `${meta.baseName} (estimated)`,
+            name: `${meta.baseName} (estimated, today USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
         }
@@ -20226,7 +20270,7 @@ def _render_positions_page() -> str:
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
-        setPosFeeStatus("Select at least one History checkbox in the Scan table", true);
+        setPosFeeStatus("Select at least one History checkbox in the table", true);
         return;
       }
       const feeStartedAt = Date.now();
@@ -20251,7 +20295,7 @@ def _render_positions_page() -> str:
           const stageIdx = Math.min(stages.length - 1, Math.floor((pct / 100) * stages.length));
           setPosFeeStatusBar({
             state: "loading",
-            title: "Fee scan",
+            title: "Build chart",
             selected: selected.length,
             withData: 0,
             progress: pct,
@@ -20283,7 +20327,7 @@ def _render_positions_page() -> str:
           chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
           if (estChartEl) estChartEl.innerHTML = "<div class='hint'>No estimated data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
-          setPosFeeStatusBar({state: "error", title: "Fee scan", message: "No valid selected rows", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
+          setPosFeeStatusBar({state: "error", title: "Build chart", message: "No valid selected rows", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
 
@@ -20292,18 +20336,33 @@ def _render_positions_page() -> str:
           max_rows: rowsPayload.length,
           include_aggregate: false,
         };
-        const {res, data} = await postJsonWithRetry("/api/positions/position-fee-compare-data", compareReq, 3);
-        if (!res.ok) {
+        const feeCacheKey = buildFeeScanCacheKey(rowsPayload, histUsd);
+        const cachedCompare = loadFeeScanCache(feeCacheKey);
+        let res = null;
+        let data = null;
+        if (cachedCompare) {
+          res = {ok: true, status: 200};
+          data = {rows: cachedCompare.rows, debug: cachedCompare.debug, cached: true};
+          if (backendHints.length < 8) backendHints.push("compare_source=cache");
+        } else {
+          const fetched = await postJsonWithRetry("/api/positions/position-fee-compare-data", compareReq, 3);
+          res = fetched.res;
+          data = fetched.data;
+        }
+        if (!res?.ok) {
           stopFeeStatusTimer();
           const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
           chartEl.innerHTML = `<div class='hint'>Failed to load compare data: ${esc(det)}</div>`;
           if (estChartEl) estChartEl.innerHTML = "<div class='hint'>No estimated data.</div>";
-          setPosFeeStatusBar({state: "error", title: "Fee scan", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
+          setPosFeeStatusBar({state: "error", title: "Build chart", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
 
         const rowsOut = Array.isArray(data?.rows) ? data.rows : [];
         const cmpDebug = (data && typeof data.debug === "object" && data.debug) ? data.debug : {};
+        if (!cachedCompare) {
+          saveFeeScanCache(feeCacheKey, rowsOut, cmpDebug);
+        }
         if (backendHints.length < 5) {
           const w = Number(cmpDebug.workers || 0);
           const t = Number(cmpDebug.elapsed_total_ms || 0);
@@ -20342,7 +20401,7 @@ def _render_positions_page() -> str:
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatusBar({
             state: "warn",
-            title: "Fee scan",
+            title: "Build chart",
             message: `No fee data · ${reasonLine}`,
             selected: Number(diag.selected || 0),
             withData: 0,
@@ -20371,9 +20430,46 @@ def _render_positions_page() -> str:
           return (hardTraces.length ? hardTraces : (srcTraces || [])).concat(estimatedTraces);
         };
         const mainTitleSuffix = histUsd
-          ? " — historical + spot USD"
-          : " — spot USD (today)";
+          ? " — historical USD + today USD"
+          : " — today USD";
+        let liquidityRef = "";
+        if ((payloadMeta || []).length === 1) {
+          const liqOne = String(payloadMeta[0]?.liquidityLabel || "").trim();
+          if (liqOne && liqOne !== "-") liquidityRef = ` | liquidity: ${liqOne}`;
+        } else if ((payloadMeta || []).length > 1) {
+          liquidityRef = " | liquidity: multi";
+        }
         let overlayTraces = buildOverlayTraces(traces);
+        if (histUsd) {
+          const histHardColors = ["#2563eb", "#7c3aed", "#0f766e", "#dc2626", "#1d4ed8"];
+          const histEstColors = ["#16a34a", "#22c55e", "#15803d", "#4ade80"];
+          let hi = 0;
+          let ei = 0;
+          const toLegendBase = (name) => String(name || "")
+            .replace(/\s*\[(historical|today)\s*USD\]\s*$/i, "")
+            .replace(/\s*\(today USD\)\s*$/i, "")
+            .replace(/\s*\(if sold instantly\)\s*$/i, "")
+            .replace(/\s*\(estimated,\s*today USD\)\s*$/i, "")
+            .replace(/\s*\(estimated,\s*if sold instantly\)\s*$/i, "")
+            .replace(/\s*\(estimated\)\s*$/i, "")
+            .replace(/\s*\(collect points.*\)\s*$/i, "")
+            .trim();
+          overlayTraces = overlayTraces.map((t) => {
+            const name = String(t?.name || "");
+            const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
+            const isEstimated = name.toLowerCase().includes("(estimated)");
+            const base = toLegendBase(name) || name;
+            const legendName = isEstimated
+              ? `${base} (estimated, if sold instantly)`
+              : `${base} (if sold instantly)`;
+            const c = isEstimated ? histEstColors[(ei++) % histEstColors.length] : histHardColors[(hi++) % histHardColors.length];
+            return {
+              ...t,
+              name: legendName,
+              line: { ...lineIn, color: c },
+            };
+          });
+        }
         if (histUsd) {
           try {
             const preparedSpot = buildFeeCompareSelection(selected, false);
@@ -20410,11 +20506,24 @@ def _render_positions_page() -> str:
                     const markerIn = (t && typeof t === "object" && t.marker && typeof t.marker === "object") ? t.marker : {};
                     const isEstimated = name.toLowerCase().includes("(estimated)");
                     const isMarkerOnly = String(t?.mode || "").toLowerCase() === "markers";
+                    const base = String(name || "")
+                      .replace(/\s*\[(historical|today)\s*USD\]\s*$/i, "")
+                      .replace(/\s*\(today USD\)\s*$/i, "")
+                      .replace(/\s*\(if sold instantly\)\s*$/i, "")
+                      .replace(/\s*\(estimated,\s*today USD\)\s*$/i, "")
+                      .replace(/\s*\(estimated,\s*if sold instantly\)\s*$/i, "")
+                      .replace(/\s*\(estimated\)\s*$/i, "")
+                      .replace(/\s*\(collect points.*\)\s*$/i, "")
+                      .trim();
+                    const legendName = isEstimated
+                      ? `${base} (estimated, today USD)`
+                      : `${base} (today USD)`;
                     return {
                       ...t,
-                      name: `${name} [spot]`,
+                      name: legendName,
                       line: {
                         ...lineIn,
+                        color: isEstimated ? "#fb923c" : "#f97316",
                         dash: isEstimated ? "dot" : "dashdot",
                         width: Math.max(1.8, Number(lineIn.width || 2)),
                       },
@@ -20436,11 +20545,11 @@ def _render_positions_page() -> str:
           }
         }
         Plotly.newPlot("posFeeChart", overlayTraces, {
-          title: "Collected + estimated fees (USD)" + mainTitleSuffix,
+          title: "Collected + estimated fees (USD)" + mainTitleSuffix + liquidityRef,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
-          xaxis: chartGridX(minCreatedMs),
+          xaxis: chartGridX(minCreatedMs, 20),
           yaxis: chartGridY(true),
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
@@ -20452,7 +20561,7 @@ def _render_positions_page() -> str:
         if (feeState.hasEstimatedShareTrace && feeState.hasCollectedHistoryTrace) {
           setPosFeeStatusBar({
             state: "ok",
-            title: "Fee scan",
+            title: "Build chart",
             message: "Collected + estimate ready",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
@@ -20471,7 +20580,7 @@ def _render_positions_page() -> str:
         } else if ((feeState.hasEstimatedShareTrace || feeState.hasSnapshotOnlyTrace) && !feeState.hasCollectedHistoryTrace) {
           setPosFeeStatusBar({
             state: "warn",
-            title: "Fee scan",
+            title: "Build chart",
             message: "Estimate/snapshot only",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
@@ -20490,7 +20599,7 @@ def _render_positions_page() -> str:
         } else {
           setPosFeeStatusBar({
             state: "ok",
-            title: "Fee scan",
+            title: "Build chart",
             message: "Done",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
@@ -20515,7 +20624,7 @@ def _render_positions_page() -> str:
           debugEl.innerHTML = `<b>Debug</b><br/>Unexpected UI error: ${esc(e?.message || "unknown")}`;
           debugEl.style.display = "";
         }
-        setPosFeeStatusBar({state: "error", title: "Fee scan", message: "Failed to build chart", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
+        setPosFeeStatusBar({state: "error", title: "Build chart", message: "Failed to build chart", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
       }
     }
     function normPosSym(v) {
@@ -21744,9 +21853,9 @@ def _render_positions_page() -> str:
         traces: 0,
         mode: getHistoryRangeMode(),
         days: getHistoryDays(),
-        message: "Select pools and click Search",
+        message: "Select pools and click Build chart",
       });
-      setPosFeeStatus("Select History checkboxes, then click Scan", false);
+      setPosFeeStatus("Select History checkboxes, then click Build chart", false);
     }
     resumePosJobIfAny();
     const savedHeavy = loadHeavyPosResults();
@@ -25072,6 +25181,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 if pool_fee_days and pool_tvl_days:
                     pool_tvl_by_day = {int(ts): max(0.0, float(v)) for ts, v in pool_tvl_days}
                     pos_tvl_by_day: dict[int, float] = {}
+                    debug["estimate_pool_fee_days_count"] = int(len(pool_fee_days))
+                    debug["estimate_pool_tvl_days_count"] = int(len(pool_tvl_days))
                     for pid in position_ids[:20]:
                         p_series = _fetch_position_snapshot_series_exact(
                             endpoint,
@@ -25083,6 +25194,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             dts = (int(ts) // 86400) * 86400
                             pos_tvl_by_day[dts] = float(pos_tvl_by_day.get(dts, 0.0) + max(0.0, float(v)))
                     if pos_tvl_by_day:
+                        debug["estimate_pos_tvl_days_count"] = int(len(pos_tvl_by_day))
                         sample_step_days = max(
                             1,
                             min(30, int(os.environ.get("POSITIONS_ESTIMATE_SHARE_SAMPLE_DAYS", "3"))),
@@ -25146,9 +25258,12 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             debug["estimate_share_source"] = "sparse_position_tvl_snapshots_over_pool_tvl"
                         elif estimated_reason in {"liquidity_share_unavailable", "pool_fee_series_empty", "unknown", "not_requested"}:
                             estimated_reason = "position_tvl_snapshots_unavailable"
+                    else:
+                        debug["estimate_pos_tvl_days_count"] = 0
             except Exception:
                 if estimated_reason in {"liquidity_share_unavailable", "pool_fee_series_empty", "unknown", "not_requested"}:
                     estimated_reason = "position_tvl_snapshot_fallback_error"
+                debug["estimate_snapshot_fallback_exc"] = True
         # Third fallback: static share from any available position snapshot / pool TVL overlap.
         if (not estimated_by_day) and position_ids and endpoint and str(req.pool_id or "").strip():
             try:
@@ -25193,8 +25308,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             )
                             debug["estimate_share_source"] = str(static_source)
                             debug["estimate_static_share_used"] = float(static_share)
+                    else:
+                        debug["estimate_static_share_used"] = 0.0
             except Exception:
-                pass
+                debug["estimate_static_share_fallback_exc"] = True
         if not str(debug.get("estimate_share_source") or "").strip():
             debug["estimate_share_source"] = str(share_source)
     except Exception:
