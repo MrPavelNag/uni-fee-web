@@ -20333,12 +20333,13 @@ def _render_positions_page() -> str:
         const estSparsePoints = Number(d?.estimate_sparse_share_points || 0);
         const estUsed = Number(d?.estimate_fallback_days_used || 0);
         const estMissing = Number(d?.estimate_fallback_days_missing || 0);
+        const estDynamicUsed = Number(d?.estimate_dynamic_share_days_used || 0);
         const estStatic = Number(d?.estimate_static_share_used || 0);
         const estSrc = String(d?.estimate_share_source || "").trim();
         const perfEstimateMs = Number(d?.perf_estimate_ms || 0);
         const perfLedgerMs = Number(d?.perf_ledger_ms || 0);
         const perfAprMs = Number(d?.perf_apr_ms || 0);
-        return `${meta.pairOrPool}: mode=${String(d?.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, perf_estimate_ms=${perfEstimateMs}, perf_ledger_ms=${perfLedgerMs}, perf_apr_ms=${perfAprMs}, ledger_points=${Number(d?.ledger_points || 0)}, subgraph_points=${Number(d?.subgraph_points || 0)}, rpc_points=${Number(d?.rpc_points || 0)}, pool_flow_source=${pf.source || "-"}, pool_flow_owner_src=${pf.ownerSrc || "-"}, pool_flow_collect_points=${pf.collectPoints}, pool_flow_events=${pf.eventsTotal}, pool_flow_chunks=${pf.chunksUsed}, pool_flow_truncated=${pf.truncated ? 1 : 0}, pool_flow_cached=${pf.cached ? 1 : 0}, pool_flow_explorer_req=${pf.explorerReq}, pool_flow_explorer_pages=${pf.explorerPages}${pf.explorerReason ? `, pool_flow_explorer_reason=${pf.explorerReason}` : ""}${pf.explorerStatus ? `, pool_flow_explorer_status=${pf.explorerStatus}` : ""}${pf.explorerMessage ? `, pool_flow_explorer_message=${pf.explorerMessage}` : ""}${pf.counts ? `, pool_flow_counts=${pf.counts}` : ""}`;
+        return `${meta.pairOrPool}: mode=${String(d?.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_dynamic_used=${estDynamicUsed}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, perf_estimate_ms=${perfEstimateMs}, perf_ledger_ms=${perfLedgerMs}, perf_apr_ms=${perfAprMs}, ledger_points=${Number(d?.ledger_points || 0)}, subgraph_points=${Number(d?.subgraph_points || 0)}, rpc_points=${Number(d?.rpc_points || 0)}, pool_flow_source=${pf.source || "-"}, pool_flow_owner_src=${pf.ownerSrc || "-"}, pool_flow_collect_points=${pf.collectPoints}, pool_flow_events=${pf.eventsTotal}, pool_flow_chunks=${pf.chunksUsed}, pool_flow_truncated=${pf.truncated ? 1 : 0}, pool_flow_cached=${pf.cached ? 1 : 0}, pool_flow_explorer_req=${pf.explorerReq}, pool_flow_explorer_pages=${pf.explorerPages}${pf.explorerReason ? `, pool_flow_explorer_reason=${pf.explorerReason}` : ""}${pf.explorerStatus ? `, pool_flow_explorer_status=${pf.explorerStatus}` : ""}${pf.explorerMessage ? `, pool_flow_explorer_message=${pf.explorerMessage}` : ""}${pf.counts ? `, pool_flow_counts=${pf.counts}` : ""}`;
       };
       const buildAprByTs = (aprItems) => {
         const out = new Map();
@@ -20528,6 +20529,14 @@ def _render_positions_page() -> str:
           const liqHover = (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-";
           const estX = estimatedItems.map((x) => new Date(Number(x.ts || 0) * 1000));
           const estY = estimatedItems.map((x) => Number(x.fees_usd || 0));
+          const estHover = estimatedItems.map((x) => {
+            const dt = new Date(Number(x?.ts || 0) * 1000);
+            const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
+            const val = Number(x?.fees_usd || 0);
+            const liqDay = Number(x?.liquidity_usd || 0);
+            const liqText = liqDay > 0 ? `$${liqDay.toFixed(2)}` : String(liqHover);
+            return `${dtLabel}<br>$${val.toFixed(2)}<br>Liquidity: ${liqText}`;
+          });
           if (estX.length === 1) {
             const onlyTs = Number(estX[0]?.getTime?.() || 0);
             const createdMs = Number(meta.createdMs || 0);
@@ -20535,6 +20544,7 @@ def _render_positions_page() -> str:
             if (anchorTs > 0) {
               estX.unshift(new Date(anchorTs));
               estY.unshift(0);
+              estHover.unshift(`${new Date(anchorTs).toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"})}<br>$0.00<br>Liquidity: ${String(liqHover)}`);
             }
           }
           const singleEstimatedPoint = estX.length === 1;
@@ -20546,7 +20556,8 @@ def _render_positions_page() -> str:
             marker: singleEstimatedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
             opacity: 0.85,
             name: `${legendBase} (estimated, today USD)`,
-            hovertemplate: `%{x|%b %d, %Y}<br>$%{y:.2f}<br>Liquidity: ${esc(liqHover)}<extra></extra>`,
+            hovertemplate: "%{hovertext}<extra></extra>",
+            hovertext: estHover,
           });
         }
         if (hasSnapshot) {
@@ -20562,25 +20573,38 @@ def _render_positions_page() -> str:
               snapMarkerVal = Math.max(0, lastCollectedVal + Math.max(0, snapVal));
             }
             const snapDt = new Date(snapTs * 1000);
-            const snapDtLabel = snapDt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
-            const snapLiq = esc(liqLabel && liqLabel !== "-" ? String(liqLabel) : "-");
+            const snapAprMeta = aprByTs.get(snapTs);
+            const snapAprPct = Number(snapAprMeta?.aprPct || 0);
+            const snapFeeDelta = Number(snapAprMeta?.feeDelta || 0);
+            const snapLiqUsd = Number(snapAprMeta?.liquidityUsd || 0);
+            const createdMs = Number(meta.createdMs || 0);
+            const snapDaysFallback = (!hasCollected && createdMs > 0)
+              ? Math.max(1.0, (Number(snapTs * 1000) - createdMs) / 86400000)
+              : 0;
+            const snapAprDays = Number(snapAprMeta?.days || 0) > 0 ? Number(snapAprMeta?.days || 0) : snapDaysFallback;
+            const snapHover = formatCollectedHover({
+              dt: snapDt,
+              val: snapMarkerVal,
+              aprPct: snapAprPct,
+              feeDeltaUsd: snapFeeDelta > 0 ? snapFeeDelta : snapVal,
+              liqUsd: snapLiqUsd,
+              aprDays: snapAprDays,
+              liqHover: (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-",
+            });
             if (!hasCollected) {
-              const createdMs = Number(meta.createdMs || 0);
               const snapMs = Number(snapDt.getTime() || 0);
               const anchorMs = (createdMs > 0 && createdMs < snapMs) ? createdMs : Math.max(0, snapMs - 86400000);
               if (anchorMs > 0) {
                 traces.push({
                   x: [new Date(anchorMs), snapDt],
                   y: [0, snapMarkerVal],
-                  mode: "lines+markers",
+                  mode: "lines",
                   line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
-                  marker: {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
                   name: `${legendBase} (today USD)`,
                   hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
                 });
               }
             }
-            if (hasCollected) {
             traces.push({
               x: [snapDt],
               y: [snapMarkerVal],
@@ -20588,9 +20612,9 @@ def _render_positions_page() -> str:
               marker: {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
               showlegend: false,
               name: `${legendBase} (collect points)`,
-              hovertemplate: `${snapDtLabel}<br>$${Number(snapMarkerVal || 0).toFixed(2)}<br>Liquidity: ${snapLiq}<extra></extra>`,
+              hovertemplate: "%{hovertext}<extra></extra>",
+              hovertext: [snapHover],
             });
-            }
           }
         }
       }
@@ -25502,6 +25526,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["estimate_pool_id"] = str(pool_id_for_estimate or "")
 
     estimated_by_day: dict[int, float] = {}
+    estimated_liquidity_by_day: dict[int, float] = {}
     est_share = 0.0
     try:
         def _lookup_series_day(day_map: dict[int, float], known_days: list[int], day_ts: int) -> float:
@@ -25667,7 +25692,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             static_share = 0.0
             if pos_liq > 0 and pool_liq > 0:
                 static_share = max(0.0, min(1.0, pos_liq / pool_liq))
-                debug["estimate_static_share_used"] = float(static_share)
+                # Keep this metric as "actually used" (set below if fallback path is used).
+                debug["estimate_static_share_used"] = 0.0
                 if share_source != "raw_liquidity_onchain_recovered":
                     share_source = "raw_liquidity"
 
@@ -25679,26 +25705,35 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
                 day_ts = (int(ts) // 86400) * 86400
                 share_day = 0.0
+                liq_day_usd = 0.0
                 if pos_days and pool_days:
                     pos_tvl_day = _lookup_series_day(pos_tvl_by_day, pos_days, day_ts)
                     pool_tvl_day = _lookup_series_day(pool_tvl_by_day, pool_days, day_ts)
                     if pos_tvl_day > 0.0 and pool_tvl_day > 0.0:
                         share_day = max(0.0, min(1.0, pos_tvl_day / pool_tvl_day))
+                        liq_day_usd = float(pos_tvl_day)
                         dynamic_used += 1
                 if share_day <= 0.0:
                     if static_share > 0.0:
                         share_day = float(static_share)
+                        if pos_days:
+                            liq_day_usd = float(_lookup_series_day(pos_tvl_by_day, pos_days, day_ts))
                         fallback_used += 1
                     else:
                         fallback_missing += 1
                         continue
                 cum_est += max(0.0, float(fee_usd)) * float(share_day)
                 estimated_by_day[day_ts] = float(cum_est)
+                if liq_day_usd > 0.0:
+                    estimated_liquidity_by_day[day_ts] = float(liq_day_usd)
                 share_sum += float(share_day)
 
             debug["estimate_fallback_days_used"] = int(fallback_used)
             debug["estimate_fallback_days_missing"] = int(fallback_missing)
             debug["estimate_sparse_share_points"] = int(fallback_missing)
+            debug["estimate_dynamic_share_days_used"] = int(dynamic_used)
+            if fallback_used > 0 and static_share > 0:
+                debug["estimate_static_share_used"] = float(static_share)
             if dynamic_used > 0:
                 share_source = ("daily_tvl_snapshots" if pos_tvl_source == "position_snapshots" else "daily_tvl_amounts_fallback")
             elif fallback_used > 0 and static_share > 0:
@@ -25763,7 +25798,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         int(tid),
                         since_ts=int(collect_since_ts),
                     )
-                    if cached_one and scan_done and (not single_position_mode_hint):
+                    if cached_one and scan_done:
                         cache_hits += 1
                         for ts, val in cached_one.items():
                             ledger_by_day[int(ts)] = float(ledger_by_day.get(int(ts), 0.0) + float(val))
@@ -25875,6 +25910,16 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
         return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
+
+    def _pack_estimated_items(m: dict[int, float], liq_by_day: dict[int, float]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for ts, v in sorted(m.items(), key=lambda x: x[0]):
+            item: dict[str, Any] = {"ts": int(ts), "fees_usd": float(v)}
+            liq = max(0.0, _safe_float((liq_by_day or {}).get(int(ts))))
+            if liq > 0.0:
+                item["liquidity_usd"] = float(liq)
+            out.append(item)
+        return out
 
     position_tvl_by_day_cache: dict[int, float] | None = None
 
@@ -25995,7 +26040,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         debug["perf_apr_ms"] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
         return items
 
-    est_items_payload = _pack_fee_items(estimated_by_day) if estimated_by_day else []
+    est_items_payload = _pack_estimated_items(estimated_by_day, estimated_liquidity_by_day) if estimated_by_day else []
 
     force_rpc = _position_fee_rpc_force_onchain()
     if ledger_by_day and not force_rpc:
@@ -26448,9 +26493,13 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                 continue
             ts = int(x.get("ts") or 0)
             v = _safe_float(x.get("fees_usd"))
+            liq = max(0.0, _safe_float(x.get("liquidity_usd")))
             if ts <= 0:
                 continue
-            out.append({"ts": ts, "fees_usd": float(max(0.0, v))})
+            item: dict[str, Any] = {"ts": ts, "fees_usd": float(max(0.0, v))}
+            if liq > 0.0:
+                item["liquidity_usd"] = float(liq)
+            out.append(item)
         return out
 
     def _norm_apr_items(raw: Any) -> list[dict[str, Any]]:
