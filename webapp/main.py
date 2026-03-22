@@ -19093,6 +19093,9 @@ def _render_positions_page() -> str:
       const collected = Number(opts.collected || 0);
       const estimated = Number(opts.estimated || 0);
       const snapshot = Number(opts.snapshot || 0);
+      const collectedPts = Number(opts.collectedPoints || 0);
+      const estimatedPts = Number(opts.estimatedPoints || 0);
+      const snapshotPts = Number(opts.snapshotPoints || 0);
       const mode = String(opts.mode || "").trim();
       const missing = Number(opts.missing || 0);
       const timeoutRows = Number(opts.timeoutRows || 0);
@@ -19116,7 +19119,10 @@ def _render_positions_page() -> str:
       parts.push(`${title}: ${msg || (state === "ok" ? "Done" : (state === "warn" ? "Partial" : "Error"))}`);
       if (selected > 0) parts.push(`rows ${withData}/${selected}`);
       if (selected > 0 || collected > 0 || estimated > 0 || snapshot > 0) {
-        parts.push(`collected ${collected}, estimated ${estimated}, snapshot ${snapshot}`);
+        parts.push(`rows_with_data: collected ${collected}, estimated ${estimated}, snapshot ${snapshot}`);
+      }
+      if (collectedPts > 0 || estimatedPts > 0 || snapshotPts > 0) {
+        parts.push(`points: collected ${collectedPts}, estimated ${estimatedPts}, snapshot ${snapshotPts}`);
       }
       if (mode) parts.push(`mode ${mode}`);
       if (missing > 0) parts.push(`missing ${missing}`);
@@ -19625,7 +19631,7 @@ def _render_positions_page() -> str:
       }
       return (Number.isFinite(ms) && ms > 0) ? Number(ms) : 0;
     }
-    function chartGridX(minCreatedMs) {
+    function chartGridX(minCreatedMs, rightPadDays = 0) {
       const out = {
         showgrid: true,
         gridcolor: "#cfd9ea",
@@ -19635,7 +19641,8 @@ def _render_positions_page() -> str:
         zerolinewidth: 1,
       };
       const mode = getHistoryRangeMode();
-      const now = new Date();
+      const padMs = Math.max(0, Number(rightPadDays || 0)) * 86400000;
+      const now = new Date(Date.now() + padMs);
       if (mode === "creation" && Number(minCreatedMs || 0) > 0) {
         out.range = [new Date(Number(minCreatedMs)), now];
       } else if (mode === "days") {
@@ -19788,7 +19795,7 @@ def _render_positions_page() -> str:
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
-          xaxis: chartGridX(minCreatedMs),
+          xaxis: chartGridX(minCreatedMs, 5),
           yaxis: chartGridY(true),
           ...(benchmarkCount > 0 ? {
             yaxis2: {
@@ -20000,6 +20007,9 @@ def _render_positions_page() -> str:
       let rowsWithEstimated = 0;
       let rowsWithSnapshot = 0;
       let rowsWithAnySeries = 0;
+      let collectedPointsTotal = 0;
+      let estimatedPointsTotal = 0;
+      let snapshotPointsTotal = 0;
       for (const outRow of rowsOut) {
         const pos = Number(outRow?.index || 0);
         const meta = payloadMeta[pos] || {colorIdx: pos, rowLabel: `row#${pos + 1}`, baseName: `Position ${pos + 1}`, pairOrPool: "?"};
@@ -20026,6 +20036,9 @@ def _render_positions_page() -> str:
         const hasCollected = collectedItems.length > 0;
         const hasEstimated = estimatedItems.length > 0;
         const hasSnapshot = snapshotItems.length > 0;
+        collectedPointsTotal += Number(collectedItems.length || 0);
+        estimatedPointsTotal += Number(estimatedItems.length || 0);
+        snapshotPointsTotal += Number(snapshotItems.length || 0);
         if (!hasCollected && !hasEstimated && !hasSnapshot) {
           diag.emptySeries += 1;
           rowStatuses.push({
@@ -20150,32 +20163,41 @@ def _render_positions_page() -> str:
         if (hasSnapshot) {
           hasSnapshotOnlyTrace = true;
           rowsWithSnapshot += 1;
+          const snapSorted = snapshotItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+          const snapLast = snapSorted.length ? snapSorted[snapSorted.length - 1] : null;
+          const snapTs = Number(snapLast?.ts || 0);
+          const snapVal = Number(snapLast?.fees_usd || 0);
           if (!hasCollected) {
             const createdMs = Number(meta.createdMs || 0);
-            const snapSorted = snapshotItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
-            const snapLast = snapSorted.length ? snapSorted[snapSorted.length - 1] : null;
-            const snapTs = Number(snapLast?.ts || 0);
-            const snapVal = Number(snapLast?.fees_usd || 0);
             if (createdMs > 0 && snapTs > 0) {
               traces.push({
                 x: [new Date(createdMs), new Date(snapTs * 1000)],
                 y: [0, Math.max(0, snapVal)],
                 mode: "lines",
-                line: {color: palette[meta.colorIdx % palette.length], width: 2},
+                line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
                 opacity: 0.65,
                 name: `${meta.baseName} (from 0 to unclaimed)`,
                 hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
               });
             }
           }
-          traces.push({
-            x: snapshotItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
-            y: snapshotItems.map((x) => Number(x.fees_usd || 0)),
-            mode: "markers",
-            marker: {size: 8, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
-            name: `${meta.baseName} (current unclaimed snapshot)`,
-            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
-          });
+          if (snapTs > 0) {
+            let snapMarkerVal = Math.max(0, snapVal);
+            if (hasCollected) {
+              const collTail = collectedItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+              const lastCollectedVal = collTail.length ? Number(collTail[collTail.length - 1]?.fees_usd || 0) : 0;
+              snapMarkerVal = Math.max(0, lastCollectedVal + Math.max(0, snapVal));
+            }
+            traces.push({
+              x: [new Date(snapTs * 1000)],
+              y: [snapMarkerVal],
+              mode: "markers",
+              marker: {size: 9, color: "#f97316", symbol: "diamond"},
+              showlegend: false,
+              name: `${meta.baseName} (snapshot point)`,
+              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>Snapshot</extra>",
+            });
+          }
         }
       }
       return {
@@ -20187,6 +20209,9 @@ def _render_positions_page() -> str:
         rowsWithEstimated,
         rowsWithSnapshot,
         rowsWithAnySeries,
+        collectedPointsTotal,
+        estimatedPointsTotal,
+        snapshotPointsTotal,
       };
     }
     async function showSelectedPositionFees() {
@@ -20330,22 +20355,88 @@ def _render_positions_page() -> str:
           return;
         }
 
-        const titleSuffix = histUsd ? " — historical USD (CoinGecko at each Collect)" : " — spot USD";
-        const estimatedTracesRaw = traces.filter((t) => String(t?.name || "").toLowerCase().includes("(estimated)"));
-        const hardTraces = traces.filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated)"));
-        const estimateColors = ["#f97316", "#ea580c", "#fb923c", "#fdba74"];
-        const estimatedTraces = estimatedTracesRaw.map((t, idx) => {
-          const c = estimateColors[idx % estimateColors.length];
-          const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
-          return {
-            ...t,
-            line: { ...lineIn, color: c, dash: "dash", width: Math.max(2, Number(lineIn.width || 2)) },
-            opacity: 0.95,
-          };
-        });
-        const overlayTraces = (hardTraces.length ? hardTraces : traces).concat(estimatedTraces);
+        const buildOverlayTraces = (srcTraces) => {
+          const estimatedTracesRaw = (srcTraces || []).filter((t) => String(t?.name || "").toLowerCase().includes("(estimated)"));
+          const hardTraces = (srcTraces || []).filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated)"));
+          const estimateColors = ["#f97316", "#ea580c", "#fb923c", "#fdba74"];
+          const estimatedTraces = estimatedTracesRaw.map((t, idx) => {
+            const c = estimateColors[idx % estimateColors.length];
+            const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
+            return {
+              ...t,
+              line: { ...lineIn, color: c, dash: "dash", width: Math.max(2, Number(lineIn.width || 2)) },
+              opacity: 0.95,
+            };
+          });
+          return (hardTraces.length ? hardTraces : (srcTraces || [])).concat(estimatedTraces);
+        };
+        const mainTitleSuffix = histUsd
+          ? " — historical + spot USD"
+          : " — spot USD (today)";
+        let overlayTraces = buildOverlayTraces(traces);
+        if (histUsd) {
+          try {
+            const preparedSpot = buildFeeCompareSelection(selected, false);
+            const rowsPayloadSpot = preparedSpot.rowsPayload || [];
+            if (rowsPayloadSpot.length) {
+              const compareReqSpot = {
+                rows: rowsPayloadSpot,
+                max_rows: rowsPayloadSpot.length,
+                include_aggregate: false,
+              };
+              const {res: resSpot, data: dataSpot} = await postJsonWithRetry("/api/positions/position-fee-compare-data", compareReqSpot, 3);
+              if (resSpot.ok) {
+                const rowsOutSpot = Array.isArray(dataSpot?.rows) ? dataSpot.rows : [];
+                const tracesSpot = [];
+                const diagSpot = preparedSpot.diag || {};
+                const rowStatusesSpot = preparedSpot.rowStatuses || [];
+                const payloadMetaSpot = preparedSpot.payloadMeta || [];
+                const apiFailTopSpot = [];
+                const backendHintsSpot = [];
+                const feeStateSpot = processFeeCompareRows(
+                  rowsOutSpot,
+                  payloadMetaSpot,
+                  palette,
+                  tracesSpot,
+                  rowStatusesSpot,
+                  apiFailTopSpot,
+                  backendHintsSpot,
+                  diagSpot,
+                );
+                if (tracesSpot.length) {
+                  const spotOverlay = buildOverlayTraces(tracesSpot).map((t) => {
+                    const name = String(t?.name || "");
+                    const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
+                    const markerIn = (t && typeof t === "object" && t.marker && typeof t.marker === "object") ? t.marker : {};
+                    const isEstimated = name.toLowerCase().includes("(estimated)");
+                    const isMarkerOnly = String(t?.mode || "").toLowerCase() === "markers";
+                    return {
+                      ...t,
+                      name: `${name} [spot]`,
+                      line: {
+                        ...lineIn,
+                        dash: isEstimated ? "dot" : "dashdot",
+                        width: Math.max(1.8, Number(lineIn.width || 2)),
+                      },
+                      marker: {
+                        ...markerIn,
+                        symbol: isMarkerOnly ? "circle-open" : markerIn.symbol,
+                      },
+                      opacity: 0.78,
+                    };
+                  });
+                  overlayTraces = overlayTraces.concat(spotOverlay);
+                  if (backendHints.length < 8) {
+                    backendHints.push(`dual_view_spot_rows: collected=${Number(feeStateSpot.rowsWithCollected || 0)}, estimated=${Number(feeStateSpot.rowsWithEstimated || 0)}, snapshot=${Number(feeStateSpot.rowsWithSnapshot || 0)}`);
+                  }
+                }
+              }
+            }
+          } catch (_) {
+          }
+        }
         Plotly.newPlot("posFeeChart", overlayTraces, {
-          title: "Collected + estimated fees (USD)" + titleSuffix,
+          title: "Collected + estimated fees (USD)" + mainTitleSuffix,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
@@ -20368,6 +20459,9 @@ def _render_positions_page() -> str:
             collected: Number(feeState.rowsWithCollected || 0),
             estimated: Number(feeState.rowsWithEstimated || 0),
             snapshot: Number(feeState.rowsWithSnapshot || 0),
+            collectedPoints: Number(feeState.collectedPointsTotal || 0),
+            estimatedPoints: Number(feeState.estimatedPointsTotal || 0),
+            snapshotPoints: Number(feeState.snapshotPointsTotal || 0),
             mode: feeState.lastFeePricing || "",
             missing,
             timeoutRows,
@@ -20384,6 +20478,9 @@ def _render_positions_page() -> str:
             collected: Number(feeState.rowsWithCollected || 0),
             estimated: Number(feeState.rowsWithEstimated || 0),
             snapshot: Number(feeState.rowsWithSnapshot || 0),
+            collectedPoints: Number(feeState.collectedPointsTotal || 0),
+            estimatedPoints: Number(feeState.estimatedPointsTotal || 0),
+            snapshotPoints: Number(feeState.snapshotPointsTotal || 0),
             mode: feeState.lastFeePricing || "",
             missing,
             timeoutRows,
@@ -20400,6 +20497,9 @@ def _render_positions_page() -> str:
             collected: Number(feeState.rowsWithCollected || 0),
             estimated: Number(feeState.rowsWithEstimated || 0),
             snapshot: Number(feeState.rowsWithSnapshot || 0),
+            collectedPoints: Number(feeState.collectedPointsTotal || 0),
+            estimatedPoints: Number(feeState.estimatedPointsTotal || 0),
+            snapshotPoints: Number(feeState.snapshotPointsTotal || 0),
             mode: feeState.lastFeePricing || "",
             missing,
             timeoutRows,
@@ -24983,16 +25083,50 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             dts = (int(ts) // 86400) * 86400
                             pos_tvl_by_day[dts] = float(pos_tvl_by_day.get(dts, 0.0) + max(0.0, float(v)))
                     if pos_tvl_by_day:
-                        cum_est = 0.0
-                        used_days = 0
-                        shares: list[float] = []
-                        for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
-                            dts = (int(ts) // 86400) * 86400
+                        sample_step_days = max(
+                            1,
+                            min(30, int(os.environ.get("POSITIONS_ESTIMATE_SHARE_SAMPLE_DAYS", "3"))),
+                        )
+                        max_gap_days = max(
+                            sample_step_days,
+                            min(45, int(os.environ.get("POSITIONS_ESTIMATE_SHARE_MAX_GAP_DAYS", "10"))),
+                        )
+                        sample_step_sec = int(sample_step_days) * 86400
+                        max_gap_sec = int(max_gap_days) * 86400
+                        sparse_share_by_day: dict[int, float] = {}
+                        last_sample_day = 0
+                        for dts in sorted(pos_tvl_by_day.keys()):
+                            if last_sample_day and (int(dts) - int(last_sample_day)) < int(sample_step_sec):
+                                continue
                             p_tvl = max(0.0, float(pos_tvl_by_day.get(dts, 0.0)))
                             pool_tvl = max(0.0, float(pool_tvl_by_day.get(dts, 0.0)))
                             if p_tvl <= 0 or pool_tvl <= 0:
                                 continue
                             s = max(0.0, min(1.0, p_tvl / pool_tvl))
+                            if s <= 0:
+                                continue
+                            sparse_share_by_day[int(dts)] = float(s)
+                            last_sample_day = int(dts)
+                        cum_est = 0.0
+                        used_days = 0
+                        missing_days = 0
+                        shares: list[float] = []
+                        sparse_days_sorted = sorted(sparse_share_by_day.keys())
+                        for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
+                            dts = (int(ts) // 86400) * 86400
+                            chosen_day = 0
+                            for sd in sparse_days_sorted:
+                                if int(sd) <= int(dts):
+                                    chosen_day = int(sd)
+                                else:
+                                    break
+                            if chosen_day <= 0 or (int(dts) - int(chosen_day)) > int(max_gap_sec):
+                                missing_days += 1
+                                continue
+                            s = max(0.0, min(1.0, float(sparse_share_by_day.get(chosen_day, 0.0))))
+                            if s <= 0:
+                                missing_days += 1
+                                continue
                             shares.append(float(s))
                             cum_est += max(0.0, float(fee_usd)) * s
                             estimated_by_day[dts] = float(cum_est)
@@ -25000,12 +25134,16 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         if estimated_by_day:
                             est_share = float(sum(shares) / len(shares)) if shares else 0.0
                             estimated_reason = (
-                                "ok_pool_share_daily_turnover_x_fee_tier_from_position_tvl_snapshots"
+                                "ok_pool_share_daily_turnover_x_fee_tier_from_sparse_position_tvl_snapshots"
                                 if str(fee_days_reason) == "ok_volume_x_fee_tier"
-                                else "ok_pool_share_daily_fees_from_position_tvl_snapshots"
+                                else "ok_pool_share_daily_fees_from_sparse_position_tvl_snapshots"
                             )
                             debug["estimate_fallback_days_used"] = int(used_days)
-                            debug["estimate_share_source"] = "position_tvl_snapshots_over_pool_tvl"
+                            debug["estimate_fallback_days_missing"] = int(missing_days)
+                            debug["estimate_sparse_share_points"] = int(len(sparse_share_by_day))
+                            debug["estimate_sparse_step_days"] = int(sample_step_days)
+                            debug["estimate_sparse_max_gap_days"] = int(max_gap_days)
+                            debug["estimate_share_source"] = "sparse_position_tvl_snapshots_over_pool_tvl"
                         elif estimated_reason in {"liquidity_share_unavailable", "pool_fee_series_empty", "unknown", "not_requested"}:
                             estimated_reason = "position_tvl_snapshots_unavailable"
             except Exception:
