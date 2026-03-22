@@ -15604,6 +15604,33 @@ def _load_v3_npm_fee_ledger_day_from_cache(
     return out
 
 
+def _count_v3_npm_fee_events_temp(
+    chain_id: int,
+    protocol: str,
+    token_id: int,
+    *,
+    since_ts: int,
+) -> int:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    tid = int(token_id)
+    if cid <= 0 or not proto or tid <= 0:
+        return 0
+    try:
+        with _analytics_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(1)
+                FROM temp_npm_fee_events
+                WHERE chain_id = ? AND protocol = ? AND token_id = ? AND ts >= ?
+                """,
+                (int(cid), str(proto), int(tid), int(since_ts)),
+            ).fetchone()
+        return int((row[0] if row else 0) or 0)
+    except Exception:
+        return 0
+
+
 def _is_v3_npm_fee_scan_complete(
     chain_id: int,
     protocol: str,
@@ -20057,6 +20084,10 @@ def _render_positions_page() -> str:
       for (const outRow of rowsOut) {
         const pos = Number(outRow?.index || 0);
         const meta = payloadMeta[pos] || {colorIdx: pos, rowLabel: `row#${pos + 1}`, baseName: `Position ${pos + 1}`, pairOrPool: "?"};
+        const liqLabel = String(meta?.liquidityLabel || "").trim();
+        const legendBase = (liqLabel && liqLabel !== "-")
+          ? `${meta.baseName} [liq ${liqLabel}]`
+          : String(meta.baseName || "");
         if (!outRow?.ok) {
           const det = String(outRow?.error || "compare data failed");
           diag.apiFail += 1;
@@ -20132,7 +20163,15 @@ def _render_positions_page() -> str:
           rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_time=${analysisTimeTxt}`;
         }
         if (backendHints.length < 5) {
-          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, ledger_points=${Number(d.ledger_points || 0)}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_source=${pfSource || "-"}, pool_flow_owner_src=${pfOwnerSrc || "-"}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}, pool_flow_explorer_req=${pfExplorerReq}, pool_flow_explorer_pages=${pfExplorerPages}${pfExplorerReason ? `, pool_flow_explorer_reason=${pfExplorerReason}` : ""}${pfExplorerStatus ? `, pool_flow_explorer_status=${pfExplorerStatus}` : ""}${pfExplorerMessage ? `, pool_flow_explorer_message=${pfExplorerMessage}` : ""}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
+          const estFeeDays = Number(d.estimate_pool_fee_days_count || 0);
+          const estPoolTvlDays = Number(d.estimate_pool_tvl_days_count || 0);
+          const estPosTvlDays = Number(d.estimate_pos_tvl_days_count || 0);
+          const estSparsePoints = Number(d.estimate_sparse_share_points || 0);
+          const estUsed = Number(d.estimate_fallback_days_used || 0);
+          const estMissing = Number(d.estimate_fallback_days_missing || 0);
+          const estStatic = Number(d.estimate_static_share_used || 0);
+          const estSrc = String(d.estimate_share_source || "").trim();
+          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, ledger_points=${Number(d.ledger_points || 0)}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_source=${pfSource || "-"}, pool_flow_owner_src=${pfOwnerSrc || "-"}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}, pool_flow_explorer_req=${pfExplorerReq}, pool_flow_explorer_pages=${pfExplorerPages}${pfExplorerReason ? `, pool_flow_explorer_reason=${pfExplorerReason}` : ""}${pfExplorerStatus ? `, pool_flow_explorer_status=${pfExplorerStatus}` : ""}${pfExplorerMessage ? `, pool_flow_explorer_message=${pfExplorerMessage}` : ""}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
           backendHints.push(msg);
         }
         if (hasCollected) {
@@ -20176,7 +20215,7 @@ def _render_positions_page() -> str:
             y: useLineY,
             mode: "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
-            name: `${meta.baseName} (today USD)`,
+            name: `${legendBase} (today USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
           if (collectedPointX.length) {
@@ -20185,7 +20224,7 @@ def _render_positions_page() -> str:
               y: collectedPointY,
               mode: "markers",
               marker: {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
-              name: `${meta.baseName} (collect points)`,
+              name: `${legendBase} (collect points)`,
               showlegend: false,
               hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>Collect point</extra>",
             });
@@ -20200,7 +20239,7 @@ def _render_positions_page() -> str:
             mode: "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
             opacity: 0.85,
-            name: `${meta.baseName} (estimated, today USD)`,
+            name: `${legendBase} (estimated, today USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
         }
@@ -20220,7 +20259,7 @@ def _render_positions_page() -> str:
                 mode: "lines",
                 line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
                 opacity: 0.65,
-                name: `${meta.baseName} (from 0 to unclaimed)`,
+                name: `${legendBase} (from 0 to unclaimed)`,
                 hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
               });
             }
@@ -20238,7 +20277,7 @@ def _render_positions_page() -> str:
               mode: "markers",
               marker: {size: 9, color: "#f97316", symbol: "diamond"},
               showlegend: false,
-              name: `${meta.baseName} (snapshot point)`,
+              name: `${legendBase} (snapshot point)`,
               hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>Snapshot</extra>",
             });
           }
@@ -20432,13 +20471,6 @@ def _render_positions_page() -> str:
         const mainTitleSuffix = histUsd
           ? " — historical USD + today USD"
           : " — today USD";
-        let liquidityRef = "";
-        if ((payloadMeta || []).length === 1) {
-          const liqOne = String(payloadMeta[0]?.liquidityLabel || "").trim();
-          if (liqOne && liqOne !== "-") liquidityRef = ` | liquidity: ${liqOne}`;
-        } else if ((payloadMeta || []).length > 1) {
-          liquidityRef = " | liquidity: multi";
-        }
         let overlayTraces = buildOverlayTraces(traces);
         if (histUsd) {
           const histHardColors = ["#2563eb", "#7c3aed", "#0f766e", "#dc2626", "#1d4ed8"];
@@ -20545,7 +20577,7 @@ def _render_positions_page() -> str:
           }
         }
         Plotly.newPlot("posFeeChart", overlayTraces, {
-          title: "Collected + estimated fees (USD)" + mainTitleSuffix + liquidityRef,
+          title: "Collected + estimated fees (USD)" + mainTitleSuffix,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
