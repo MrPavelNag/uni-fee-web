@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 import shutil
+from bisect import bisect_right
 from queue import Empty, Queue
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, wait
 from decimal import Decimal, getcontext
@@ -18163,7 +18164,6 @@ def _render_positions_page() -> str:
     }
     .fee-toggle-pill:hover { border-color:#93c5fd; background:#eff6ff; }
     .fee-toggle-pill input { margin:0; width:15px; height:15px; }
-    .chart-size-select { font-size:12px; padding:2px 6px; border:1px solid #cbd5e1; border-radius:999px; background:#fff; color:#334155; }
     .fee-card .pos-fee-hist-label { font-size:15px; font-weight:700; color:#334155; }
     .fee-card .search-link-btn { font-size:20px; }
     @media (max-width: 1100px) {
@@ -18289,7 +18289,7 @@ def _render_positions_page() -> str:
             </label>
             <input id="posHistoryBenchA" value="BTC" style="width:58px" />
             <input id="posHistoryBenchB" value="ETH" style="width:58px" />
-            <span class="pos-status" id="posHistoryStatus">Select pools and click Build chart</span>
+            <span class="pos-status" id="posHistoryStatus">Select pools and run chart</span>
             <button class="search-link-btn" type="button" onclick="showSelectedPoolSeries()">Build chart</button>
             <button class="collapse-btn" id="toggleHistoryBtn" type="button" onclick="togglePosSection('history')" title="Collapse/expand">▾</button>
           </div>
@@ -18303,7 +18303,7 @@ def _render_positions_page() -> str:
         <div class="section-head">
           <h3>Fee calculation</h3>
           <div class="section-actions">
-            <span class="pos-status" id="posFeeStatus">Select History checkboxes, then click Build chart</span>
+            <span class="pos-status" id="posFeeStatus">Select History checkboxes, then run chart</span>
             <label class="fee-toggle-pill" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
               <input type="checkbox" id="posFeeHistoricalUsd" />
               <span class="pos-fee-hist-label">If sold instantly</span>
@@ -18311,14 +18311,6 @@ def _render_positions_page() -> str:
             <label class="fee-toggle-pill" title="Show annualized return labels next to collect points.">
               <input type="checkbox" id="posFeeAprLabels" checked />
               <span class="pos-fee-hist-label">APR</span>
-            </label>
-            <label class="fee-toggle-pill" title="Adjust fee chart vertical size.">
-              <span class="pos-fee-hist-label">Chart height</span>
-              <select id="posFeeChartHeight" class="chart-size-select" onchange="applyFeeChartHeightFromControl()">
-                <option value="416">S</option>
-                <option value="546" selected>M</option>
-                <option value="728">L</option>
-              </select>
             </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Build chart</button>
             <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
@@ -18421,7 +18413,6 @@ def _render_positions_page() -> str:
     const POS_HISTORY_LAST_CHART_KEY = "positions_history_last_chart_v1";
     const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v3";
     const POS_FEE_LAST_CHART_KEY = "positions_fee_last_chart_v1";
-    const POS_FEE_CHART_HEIGHT_KEY = "positions_fee_chart_height_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
       position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder).",
     };
@@ -19689,33 +19680,6 @@ def _render_positions_page() -> str:
         ...(withDollar ? {tickprefix: "$"} : {}),
       };
     }
-    function normalizeFeeChartHeight(raw) {
-      const v = Number(raw || 0);
-      // Backward compatibility: old saved values are auto-upscaled by ~30%.
-      if (v === 320) return 416;
-      if (v === 420) return 546;
-      if (v === 560) return 728;
-      if (v === 416 || v === 546 || v === 728) return v;
-      return 546;
-    }
-    function applyFeeChartHeightFromControl() {
-      const sel = document.getElementById("posFeeChartHeight");
-      const chartEl = document.getElementById("posFeeChart");
-      if (!sel || !chartEl) return;
-      const h = normalizeFeeChartHeight(sel.value);
-      chartEl.style.height = `${h}px`;
-      try { localStorage.setItem(POS_FEE_CHART_HEIGHT_KEY, String(h)); } catch (_) {}
-      try { if (window.Plotly && typeof window.Plotly.Plots?.resize === "function") window.Plotly.Plots.resize(chartEl); } catch (_) {}
-    }
-    function restoreFeeChartHeightControl() {
-      const sel = document.getElementById("posFeeChartHeight");
-      const chartEl = document.getElementById("posFeeChart");
-      if (!sel || !chartEl) return;
-      let h = 546;
-      try { h = normalizeFeeChartHeight(localStorage.getItem(POS_FEE_CHART_HEIGHT_KEY)); } catch (_) {}
-      sel.value = String(h);
-      chartEl.style.height = `${h}px`;
-    }
     async function showSelectedPoolSeries() {
       const chartEl = document.getElementById("posPoolChart");
       const debugEl = document.getElementById("posHistoryDebug");
@@ -20096,6 +20060,26 @@ def _render_positions_page() -> str:
         );
       } catch (_) {}
     }
+    function feeChartLayout(title, minCreatedMs, legendOpts) {
+      return {
+        title: String(title || "Collected & Estimated Fees"),
+        paper_bgcolor: "#ffffff",
+        plot_bgcolor: "#f8fbff",
+        margin: {t: 34, b: 70, l: 54, r: 12},
+        xaxis: {...chartGridX(Number(minCreatedMs || 0), 20), fixedrange: true},
+        yaxis: {...chartGridY(true), fixedrange: true},
+        showlegend: true,
+        legend: {
+          orientation: "h",
+          x: 0,
+          xanchor: "left",
+          y: -0.12,
+          yanchor: "top",
+          tracegroupgap: 4,
+          ...(legendOpts && typeof legendOpts === "object" ? legendOpts : {}),
+        },
+      };
+    }
     async function restoreLastFeeChartFromCache() {
       const chartEl = document.getElementById("posFeeChart");
       if (!chartEl) return false;
@@ -20110,16 +20094,7 @@ def _render_positions_page() -> str:
         if (!traces.length) return false;
         const ok = await ensurePlotly();
         if (!ok) return false;
-        Plotly.newPlot("posFeeChart", traces, {
-          title: String(obj.title || "Collected & Estimated Fees"),
-          paper_bgcolor: "#ffffff",
-          plot_bgcolor: "#f8fbff",
-          margin: {t: 34, b: 64, l: 54, r: 12},
-          xaxis: {...chartGridX(0, 20), fixedrange: true},
-          yaxis: {...chartGridY(true), fixedrange: true},
-          showlegend: true,
-          legend: {orientation: "h", x: 0, xanchor: "left", y: -0.12, yanchor: "top"},
-        }, {displaylogo: false, responsive: true});
+        Plotly.newPlot("posFeeChart", traces, feeChartLayout(String(obj.title || "Collected & Estimated Fees"), 0), {displaylogo: false, responsive: true});
         setPosFeeStatus("Chart restored from cache.", false);
         return true;
       } catch (_) {
@@ -20233,6 +20208,75 @@ def _render_positions_page() -> str:
     }
     function processFeeCompareRows(rowsOut, payloadMeta, palette, traces, rowStatuses, apiFailTop, backendHints, diag, options) {
       const showAprLabels = !(options && options.showAprLabels === false);
+      const sortByTs = (arr) => (Array.isArray(arr) ? arr : []).slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+      const lastByTs = (arr) => {
+        const sorted = sortByTs(arr);
+        return sorted.length ? sorted[sorted.length - 1] : null;
+      };
+      const appendLastStatusDetail = (extra) => {
+        if (!rowStatuses.length || !extra) return;
+        const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
+        rowStatuses[rowStatuses.length - 1].detail = `${prevDetail}${extra}`;
+      };
+      const parsePoolFlowDebug = (d) => {
+        const countsObj = (d && typeof d.pool_flow_event_counts === "object" && d.pool_flow_event_counts) ? d.pool_flow_event_counts : {};
+        return {
+          collectPoints: Number(d?.pool_flow_collect_points || 0),
+          eventsTotal: Number(d?.pool_flow_events_total || 0),
+          insertedRows: Number(d?.pool_flow_inserted_rows || 0),
+          chunksUsed: Number(d?.pool_flow_chunks_used || 0),
+          truncated: !!d?.pool_flow_truncated,
+          cached: !!d?.cached,
+          source: String(d?.pool_flow_source || "").trim(),
+          explorerReq: Number(d?.pool_flow_explorer_requests || 0),
+          explorerPages: Number(d?.pool_flow_explorer_pages || 0),
+          explorerReason: String(d?.pool_flow_explorer_reason || "").trim(),
+          explorerStatus: String(d?.pool_flow_explorer_status || "").trim(),
+          explorerMessage: String(d?.pool_flow_explorer_message || "").trim(),
+          ownerSrc: String(d?.pool_flow_owner_source || "").trim(),
+          counts: Object.entries(countsObj).map(([k, v]) => `${String(k)}=${Number(v || 0)}`).join(","),
+        };
+      };
+      const buildPoolFlowStatusTail = (pf) =>
+        `source=${pf.source || "-"}, owner_src=${pf.ownerSrc || "-"}, collect_points=${pf.collectPoints}, events=${pf.eventsTotal}, inserted=${pf.insertedRows}, chunks=${pf.chunksUsed}, truncated=${pf.truncated ? 1 : 0}, cached=${pf.cached ? 1 : 0}, explorer_req=${pf.explorerReq}, explorer_pages=${pf.explorerPages}` +
+        (pf.explorerReason ? `, explorer_reason=${pf.explorerReason}` : "") +
+        (pf.explorerStatus ? `, explorer_status=${pf.explorerStatus}` : "") +
+        (pf.explorerMessage ? `, explorer_message=${pf.explorerMessage}` : "") +
+        (pf.counts ? `, counts=${pf.counts}` : "");
+      const buildBackendHintMessage = (meta, d, mode, collectedReason, estimatedReason, analysisTimeTxt, pf) => {
+        const estFeeDays = Number(d?.estimate_pool_fee_days_count || 0);
+        const estPoolTvlDays = Number(d?.estimate_pool_tvl_days_count || 0);
+        const estPosTvlDays = Number(d?.estimate_pos_tvl_days_count || 0);
+        const estSparsePoints = Number(d?.estimate_sparse_share_points || 0);
+        const estUsed = Number(d?.estimate_fallback_days_used || 0);
+        const estMissing = Number(d?.estimate_fallback_days_missing || 0);
+        const estStatic = Number(d?.estimate_static_share_used || 0);
+        const estSrc = String(d?.estimate_share_source || "").trim();
+        return `${meta.pairOrPool}: mode=${String(d?.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, ledger_points=${Number(d?.ledger_points || 0)}, subgraph_points=${Number(d?.subgraph_points || 0)}, rpc_points=${Number(d?.rpc_points || 0)}, pool_flow_source=${pf.source || "-"}, pool_flow_owner_src=${pf.ownerSrc || "-"}, pool_flow_collect_points=${pf.collectPoints}, pool_flow_events=${pf.eventsTotal}, pool_flow_chunks=${pf.chunksUsed}, pool_flow_truncated=${pf.truncated ? 1 : 0}, pool_flow_cached=${pf.cached ? 1 : 0}, pool_flow_explorer_req=${pf.explorerReq}, pool_flow_explorer_pages=${pf.explorerPages}${pf.explorerReason ? `, pool_flow_explorer_reason=${pf.explorerReason}` : ""}${pf.explorerStatus ? `, pool_flow_explorer_status=${pf.explorerStatus}` : ""}${pf.explorerMessage ? `, pool_flow_explorer_message=${pf.explorerMessage}` : ""}${pf.counts ? `, pool_flow_counts=${pf.counts}` : ""}`;
+      };
+      const buildAprByTs = (aprItems) => {
+        const out = new Map();
+        for (const ai of (Array.isArray(aprItems) ? aprItems : [])) {
+          const ts = Number(ai?.ts || 0);
+          if (ts <= 0) continue;
+          out.set(ts, {
+            aprPct: Number(ai?.apr_pct || 0),
+            days: Number(ai?.days || 0),
+            feeDelta: Number(ai?.fee_delta_usd || 0),
+            liquidityUsd: Number(ai?.liquidity_usd || 0),
+          });
+        }
+        return out;
+      };
+      const formatCollectedHover = ({dt, val, aprPct, feeDeltaUsd, liqUsd, aprDays, liqHover}) => {
+        const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
+        const liqAtPoint = liqUsd > 0 ? `$${liqUsd.toFixed(2)}` : esc(liqHover);
+        const daysLine = aprDays > 0 ? `<br>Days: ${aprDays.toFixed(1)}` : "";
+        const feeStepLine = feeDeltaUsd > 0 ? `$${feeDeltaUsd.toFixed(2)}` : `$${val.toFixed(2)}`;
+        return aprPct > 0
+          ? `${dtLabel}<br>${feeStepLine}<br>${aprPct.toFixed(1)}%${daysLine}<br>Liquidity: ${liqAtPoint}`
+          : `${dtLabel}<br>${feeStepLine}${daysLine}<br>Liquidity: ${liqAtPoint}`;
+      };
       let lastFeePricing = "";
       let hasCollectedHistoryTrace = false;
       let hasEstimatedShareTrace = false;
@@ -20271,18 +20315,7 @@ def _render_positions_page() -> str:
         const collectedItems = Array.isArray(outRow.collected_items) ? outRow.collected_items : [];
         const estimatedItems = Array.isArray(outRow.estimated_items) ? outRow.estimated_items : [];
         const snapshotItems = Array.isArray(outRow.snapshot_items) ? outRow.snapshot_items : [];
-        const aprItems = Array.isArray(outRow.apr_items) ? outRow.apr_items : [];
-        const aprByTs = new Map();
-        for (const ai of aprItems) {
-          const ts = Number(ai?.ts || 0);
-          if (ts <= 0) continue;
-          aprByTs.set(ts, {
-            aprPct: Number(ai?.apr_pct || 0),
-            days: Number(ai?.days || 0),
-            feeDelta: Number(ai?.fee_delta_usd || 0),
-            liquidityUsd: Number(ai?.liquidity_usd || 0),
-          });
-        }
+        const aprByTs = buildAprByTs(outRow.apr_items);
         const hasCollected = collectedItems.length > 0;
         const hasEstimated = estimatedItems.length > 0;
         const hasSnapshot = snapshotItems.length > 0;
@@ -20311,48 +20344,21 @@ def _render_positions_page() -> str:
           detail: `${String(outRow.note || "")}${collectedReason ? ` | collected_reason=${collectedReason}` : ""}${estimatedReason ? ` | estimated_reason=${estimatedReason}` : ""}`,
         });
         const d = outRow.debug || {};
-        const pfCollectPoints = Number(d.pool_flow_collect_points || 0);
-        const pfEventsTotal = Number(d.pool_flow_events_total || 0);
-        const pfInsertedRows = Number(d.pool_flow_inserted_rows || 0);
-        const pfChunksUsed = Number(d.pool_flow_chunks_used || 0);
-        const pfTruncated = !!d.pool_flow_truncated;
-        const pfCached = !!d.cached;
-        const pfSource = String(d.pool_flow_source || "").trim();
-        const pfExplorerReq = Number(d.pool_flow_explorer_requests || 0);
-        const pfExplorerPages = Number(d.pool_flow_explorer_pages || 0);
-        const pfExplorerReason = String(d.pool_flow_explorer_reason || "").trim();
-        const pfExplorerStatus = String(d.pool_flow_explorer_status || "").trim();
-        const pfExplorerMessage = String(d.pool_flow_explorer_message || "").trim();
-        const pfOwnerSrc = String(d.pool_flow_owner_source || "").trim();
+        const pf = parsePoolFlowDebug(d);
         const analysisMs = Number(d.elapsed_ms || 0);
         const analysisTimeTxt = formatProcessTimeFromMs(analysisMs);
-        const pfCountsObj = (d && typeof d.pool_flow_event_counts === "object" && d.pool_flow_event_counts) ? d.pool_flow_event_counts : {};
-        const pfCounts = Object.entries(pfCountsObj)
-          .map(([k, v]) => `${String(k)}=${Number(v || 0)}`)
-          .join(",");
-        if (pfEventsTotal > 0 || pfCollectPoints > 0 || pfChunksUsed > 0) {
-          const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
-          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_time=${analysisTimeTxt} | pool_flow: source=${pfSource || "-"}, owner_src=${pfOwnerSrc || "-"}, collect_points=${pfCollectPoints}, events=${pfEventsTotal}, inserted=${pfInsertedRows}, chunks=${pfChunksUsed}, truncated=${pfTruncated ? 1 : 0}, cached=${pfCached ? 1 : 0}, explorer_req=${pfExplorerReq}, explorer_pages=${pfExplorerPages}${pfExplorerReason ? `, explorer_reason=${pfExplorerReason}` : ""}${pfExplorerStatus ? `, explorer_status=${pfExplorerStatus}` : ""}${pfExplorerMessage ? `, explorer_message=${pfExplorerMessage}` : ""}${pfCounts ? `, counts=${pfCounts}` : ""}`;
+        if (pf.eventsTotal > 0 || pf.collectPoints > 0 || pf.chunksUsed > 0) {
+          appendLastStatusDetail(` | analysis_time=${analysisTimeTxt} | pool_flow: ${buildPoolFlowStatusTail(pf)}`);
         } else if (analysisMs > 0) {
-          const prevDetail = String(rowStatuses[rowStatuses.length - 1]?.detail || "");
-          rowStatuses[rowStatuses.length - 1].detail = `${prevDetail} | analysis_time=${analysisTimeTxt}`;
+          appendLastStatusDetail(` | analysis_time=${analysisTimeTxt}`);
         }
         if (backendHints.length < 5) {
-          const estFeeDays = Number(d.estimate_pool_fee_days_count || 0);
-          const estPoolTvlDays = Number(d.estimate_pool_tvl_days_count || 0);
-          const estPosTvlDays = Number(d.estimate_pos_tvl_days_count || 0);
-          const estSparsePoints = Number(d.estimate_sparse_share_points || 0);
-          const estUsed = Number(d.estimate_fallback_days_used || 0);
-          const estMissing = Number(d.estimate_fallback_days_missing || 0);
-          const estStatic = Number(d.estimate_static_share_used || 0);
-          const estSrc = String(d.estimate_share_source || "").trim();
-          const msg = `${meta.pairOrPool}: mode=${String(d.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, ledger_points=${Number(d.ledger_points || 0)}, subgraph_points=${Number(d.subgraph_points || 0)}, rpc_points=${Number(d.rpc_points || 0)}, pool_flow_source=${pfSource || "-"}, pool_flow_owner_src=${pfOwnerSrc || "-"}, pool_flow_collect_points=${pfCollectPoints}, pool_flow_events=${pfEventsTotal}, pool_flow_chunks=${pfChunksUsed}, pool_flow_truncated=${pfTruncated ? 1 : 0}, pool_flow_cached=${pfCached ? 1 : 0}, pool_flow_explorer_req=${pfExplorerReq}, pool_flow_explorer_pages=${pfExplorerPages}${pfExplorerReason ? `, pool_flow_explorer_reason=${pfExplorerReason}` : ""}${pfExplorerStatus ? `, pool_flow_explorer_status=${pfExplorerStatus}` : ""}${pfExplorerMessage ? `, pool_flow_explorer_message=${pfExplorerMessage}` : ""}${pfCounts ? `, pool_flow_counts=${pfCounts}` : ""}`;
-          backendHints.push(msg);
+          backendHints.push(buildBackendHintMessage(meta, d, mode, collectedReason, estimatedReason, analysisTimeTxt, pf));
         }
         if (hasCollected) {
           hasCollectedHistoryTrace = true;
           rowsWithCollected += 1;
-          const collectedSorted = collectedItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+          const collectedSorted = sortByTs(collectedItems);
           const lineX = [];
           const lineY = [];
           const collectedPointX = [];
@@ -20381,19 +20387,10 @@ def _render_positions_page() -> str:
             const aprDays = Number(aprMeta?.days || 0);
             const aprText = (showAprLabels && aprPct > 0) ? `<b>${aprPct.toFixed(1)}%</b>` : "";
             collectedPointText.push(aprText);
-            const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
-            const liqAtPoint = liqUsd > 0 ? `$${liqUsd.toFixed(2)}` : esc(liqHover);
-            const daysLine = (aprDays > 0) ? `<br>Days: ${aprDays.toFixed(1)}` : "";
-            const feeStepLine = feeDeltaUsd > 0 ? `$${feeDeltaUsd.toFixed(2)}` : `$${val.toFixed(2)}`;
-            collectedPointHover.push(
-              aprPct > 0
-                ? `${dtLabel}<br>${feeStepLine}<br>${aprPct.toFixed(1)}%${daysLine}<br>Liquidity: ${liqAtPoint}`
-                : `${dtLabel}<br>${feeStepLine}${daysLine}<br>Liquidity: ${liqAtPoint}`
-            );
+            collectedPointHover.push(formatCollectedHover({dt, val, aprPct, feeDeltaUsd, liqUsd, aprDays, liqHover}));
           }
           if (hasSnapshot) {
-            const snapSorted = snapshotItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
-            const snapLast = snapSorted.length ? snapSorted[snapSorted.length - 1] : null;
+            const snapLast = lastByTs(snapshotItems);
             const snapTs = Number(snapLast?.ts || 0);
             const snapVal = Number(snapLast?.fees_usd || 0);
             if (snapTs > 0) {
@@ -20446,15 +20443,13 @@ def _render_positions_page() -> str:
         if (hasSnapshot) {
           hasSnapshotOnlyTrace = true;
           rowsWithSnapshot += 1;
-          const snapSorted = snapshotItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
-          const snapLast = snapSorted.length ? snapSorted[snapSorted.length - 1] : null;
+          const snapLast = lastByTs(snapshotItems);
           const snapTs = Number(snapLast?.ts || 0);
           const snapVal = Number(snapLast?.fees_usd || 0);
           if (snapTs > 0) {
             let snapMarkerVal = Math.max(0, snapVal);
             if (hasCollected) {
-              const collTail = collectedItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
-              const lastCollectedVal = collTail.length ? Number(collTail[collTail.length - 1]?.fees_usd || 0) : 0;
+              const lastCollectedVal = Number(lastByTs(collectedItems)?.fees_usd || 0);
               snapMarkerVal = Math.max(0, lastCollectedVal + Math.max(0, snapVal));
             }
             const snapDt = new Date(snapTs * 1000);
@@ -20518,7 +20513,7 @@ def _render_positions_page() -> str:
           const stageIdx = Math.min(stages.length - 1, Math.floor((pct / 100) * stages.length));
           setPosFeeStatusBar({
             state: "loading",
-            title: "Build chart",
+            title: "Fee calculation",
             selected: selected.length,
             withData: 0,
             progress: pct,
@@ -20550,7 +20545,7 @@ def _render_positions_page() -> str:
           stopFeeStatusTimer();
           chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
-          setPosFeeStatusBar({state: "error", title: "Build chart", message: "No valid selected rows", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
+          setPosFeeStatusBar({state: "error", title: "Fee calculation", message: "No valid selected rows", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
 
@@ -20576,7 +20571,7 @@ def _render_positions_page() -> str:
           stopFeeStatusTimer();
           const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
           chartEl.innerHTML = `<div class='hint'>Failed to load compare data: ${esc(det)}</div>`;
-          setPosFeeStatusBar({state: "error", title: "Build chart", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
+          setPosFeeStatusBar({state: "error", title: "Fee calculation", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
 
@@ -20624,7 +20619,7 @@ def _render_positions_page() -> str:
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatusBar({
             state: "warn",
-            title: "Build chart",
+            title: "Fee calculation",
             message: `No fee data · ${reasonLine}`,
             selected: Number(diag.selected || 0),
             withData: 0,
@@ -20787,16 +20782,7 @@ def _render_positions_page() -> str:
           return out;
         };
         overlayTraces = compactLegendByPair(overlayTraces);
-        Plotly.newPlot("posFeeChart", overlayTraces, {
-          title: mainTitle,
-          paper_bgcolor: "#ffffff",
-          plot_bgcolor: "#f8fbff",
-          margin: {t: 34, b: 70, l: 54, r: 12},
-          xaxis: {...chartGridX(minCreatedMs, 20), fixedrange: true},
-          yaxis: {...chartGridY(true), fixedrange: true},
-          showlegend: true,
-          legend: {orientation: "h", x: 0, xanchor: "left", y: -0.12, yanchor: "top", tracegroupgap: 4},
-        }, {displaylogo: false, responsive: true});
+        Plotly.newPlot("posFeeChart", overlayTraces, feeChartLayout(mainTitle, minCreatedMs), {displaylogo: false, responsive: true});
         saveLastFeeChartCache(overlayTraces, mainTitle);
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
@@ -20805,8 +20791,8 @@ def _render_positions_page() -> str:
         if (feeState.hasEstimatedShareTrace && feeState.hasCollectedHistoryTrace) {
           setPosFeeStatusBar({
             state: "ok",
-            title: "Build chart",
-            message: "Collected + estimate ready",
+            title: "Fee calculation",
+            message: "Collected & estimated ready",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
             collected: Number(feeState.rowsWithCollected || 0),
@@ -20824,7 +20810,7 @@ def _render_positions_page() -> str:
         } else if ((feeState.hasEstimatedShareTrace || feeState.hasSnapshotOnlyTrace) && !feeState.hasCollectedHistoryTrace) {
           setPosFeeStatusBar({
             state: "warn",
-            title: "Build chart",
+            title: "Fee calculation",
             message: "Estimate/snapshot only",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
@@ -20843,7 +20829,7 @@ def _render_positions_page() -> str:
         } else {
           setPosFeeStatusBar({
             state: "ok",
-            title: "Build chart",
+            title: "Fee calculation",
             message: "Done",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
@@ -20868,7 +20854,7 @@ def _render_positions_page() -> str:
           debugEl.innerHTML = `<b>Debug</b><br/>Unexpected UI error: ${esc(e?.message || "unknown")}`;
           debugEl.style.display = "";
         }
-        setPosFeeStatusBar({state: "error", title: "Build chart", message: "Failed to build chart", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
+        setPosFeeStatusBar({state: "error", title: "Fee calculation", message: "Failed to build chart", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
       }
     }
     function normPosSym(v) {
@@ -22088,7 +22074,7 @@ def _render_positions_page() -> str:
         days: getHistoryDays(),
         message: "Cached results restored",
       });
-      setPosFeeStatus("Cache restored — you can click Build chart under Fee calculation.", false);
+      setPosFeeStatus("Cache restored — open Fee calculation when ready.", false);
     } else {
       updatePosSearchButton();
       setPosStatus("Ready", false);
@@ -22099,11 +22085,10 @@ def _render_positions_page() -> str:
         traces: 0,
         mode: getHistoryRangeMode(),
         days: getHistoryDays(),
-        message: "Select pools and click Build chart",
+        message: "Select pools and run chart",
       });
-      setPosFeeStatus("Select History checkboxes, then click Build chart", false);
+      setPosFeeStatus("Select History checkboxes, then run chart", false);
     }
-    restoreFeeChartHeightControl();
     restoreLastHistoryChartFromCache();
     restoreLastFeeChartFromCache();
     resumePosJobIfAny();
@@ -25625,43 +25610,48 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             return []
         tvl_by_day = _position_tvl_by_day_for_apr()
         known_days = sorted(int(x) for x in tvl_by_day.keys() if int(x) > 0)
-        fallback_liq_usd = 0.0
-        if not known_days:
+        def _fallback_position_liquidity_usd() -> float:
             # Fallback when snapshots are unavailable: use current row in-position USD.
             # This keeps APR labels visible (approx) instead of dropping them completely.
             try:
                 amt0 = max(0.0, _safe_float(getattr(req, "position_amount0", 0.0)))
                 amt1 = max(0.0, _safe_float(getattr(req, "position_amount1", 0.0)))
-                fallback_liq_usd = _liquidity_usd_from_in_position_external(
-                    int(chain_id),
-                    amt0,
-                    amt1,
-                    str(token0 or ""),
-                    str(token1 or ""),
-                    symbol0=str(getattr(req, "token0_symbol", "") or ""),
-                    symbol1=str(getattr(req, "token1_symbol", "") or ""),
-                    pair=f"{str(getattr(req, 'token0_symbol', '') or '')}/{str(getattr(req, 'token1_symbol', '') or '')}",
-                    known_prices={},
-                    pool_token0_price_in_token1=_safe_float(getattr(req, "pool_token0_price", 0.0)),
-                ) or 0.0
+                return float(
+                    _liquidity_usd_from_in_position_external(
+                        int(chain_id),
+                        amt0,
+                        amt1,
+                        str(token0 or ""),
+                        str(token1 or ""),
+                        symbol0=str(getattr(req, "token0_symbol", "") or ""),
+                        symbol1=str(getattr(req, "token1_symbol", "") or ""),
+                        pair=f"{str(getattr(req, 'token0_symbol', '') or '')}/{str(getattr(req, 'token1_symbol', '') or '')}",
+                        known_prices={},
+                        pool_token0_price_in_token1=_safe_float(getattr(req, "pool_token0_price", 0.0)),
+                    )
+                    or 0.0
+                )
             except Exception:
-                fallback_liq_usd = 0.0
+                return 0.0
+
+        fallback_liq_usd = 0.0
+        if known_days:
+            debug["apr_liquidity_source"] = "position_tvl_snapshots"
+        else:
+            fallback_liq_usd = _fallback_position_liquidity_usd()
             if fallback_liq_usd <= 0.0:
                 return []
             debug["apr_liquidity_source"] = "row_in_position_fallback"
-        else:
-            debug["apr_liquidity_source"] = "position_tvl_snapshots"
 
         def _lookup_tvl(day_ts: int) -> float:
             d = int(day_ts)
             if not known_days:
                 return float(max(0.0, fallback_liq_usd))
-            prev_days = [x for x in known_days if x <= d]
-            if prev_days:
-                return max(0.0, float(tvl_by_day.get(int(prev_days[-1]), 0.0)))
-            next_days = [x for x in known_days if x > d]
-            if next_days:
-                return max(0.0, float(tvl_by_day.get(int(next_days[0]), 0.0)))
+            idx = bisect_right(known_days, d)
+            if idx > 0:
+                return max(0.0, float(tvl_by_day.get(int(known_days[idx - 1]), 0.0)))
+            if known_days:
+                return max(0.0, float(tvl_by_day.get(int(known_days[0]), 0.0)))
             return 0.0
 
         items: list[dict[str, Any]] = []
@@ -25669,6 +25659,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         if not points_sorted:
             return []
         debug["apr_mode"] = "segment_between_collects"
+        first_ts = int(points_sorted[0][0])
+        apr_start_ts = int(collect_since_ts or 0)
+        if apr_start_ts <= 0 or apr_start_ts > first_ts:
+            apr_start_ts = first_ts
         prev_ts: int | None = None
         prev_cum: float | None = None
         for ts, cum in points_sorted:
@@ -25679,6 +25673,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             if prev_ts is not None and prev_cum is not None:
                 fee_delta = max(0.0, float(cum) - float(prev_cum))
                 days_delta = max(1.0, (float(ts) - float(prev_ts)) / 86400.0)
+            else:
+                # First point: APR for the first step (period start -> first collect).
+                fee_delta = max(0.0, float(cum))
+                days_delta = max(1.0, (float(ts) - float(apr_start_ts)) / 86400.0)
             apr_pct = 0.0
             if tvl_usd > 0.0 and fee_delta > 0.0 and days_delta > 0.0:
                 apr_pct = max(0.0, (fee_delta / tvl_usd) * (365.0 / days_delta) * 100.0)
