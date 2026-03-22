@@ -17854,6 +17854,36 @@ def _render_positions_page() -> str:
       max-width: 100%;
     }
     #posFeeStatus { font-size:15px; font-weight:600; color:#334155; }
+    #posFeeStatus.fee-status-bar {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      flex-wrap: wrap;
+      line-height: 1.25;
+      padding: 2px 0;
+    }
+    .fee-status-title {
+      font-weight: 800;
+      color: #0f172a;
+      margin-right: 2px;
+    }
+    .fee-status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border-radius: 999px;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      color: #334155;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 2px 8px;
+      white-space: nowrap;
+    }
+    .fee-status-pill.ok { border-color:#86efac; background:#f0fdf4; color:#166534; }
+    .fee-status-pill.warn { border-color:#fde68a; background:#fffbeb; color:#92400e; }
+    .fee-status-pill.err { border-color:#fecaca; background:#fef2f2; color:#b91c1c; }
+    .fee-status-pill.info { border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8; }
     #posFeeBody .hint { font-size:13px; line-height:1.45; color:#475569; margin:0 0 10px; }
     #posFeeChart { height:360px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
     #posFeeDebug { margin-top:10px; }
@@ -18013,7 +18043,6 @@ def _render_positions_page() -> str:
           </div>
         </div>
         <div id="posFeeBody" class="section-body">
-          <p class="hint">Uses the same table rows and <b>History</b> checkboxes as the TVL chart above. The chart compares <b>collected fee history</b> (subgraph or NPM Collect logs via RPC) with an <b>estimated cumulative fee</b> curve (pool daily fees × your liquidity share). If collected history is missing, only estimate/snapshot is shown. <b>Historical USD</b> prices each Collect with CoinGecko on that day; otherwise spot USD is used. This toggle does not change subgraph-only series.</p>
           <div id="posFeeChart"></div>
           <div id="posFeeDebug" class="info-box" style="display:none"></div>
         </div>
@@ -18751,8 +18780,41 @@ def _render_positions_page() -> str:
     function setPosFeeStatus(text, isErr) {
       const el = document.getElementById("posFeeStatus");
       if (!el) return;
+      el.classList.remove("fee-status-bar");
       el.textContent = String(text || "");
       el.style.color = isErr ? "#b91c1c" : "#475569";
+    }
+    function feeStatusPill(label, value, tone = "info") {
+      const l = esc(String(label || "").trim());
+      const v = esc(String(value == null ? "" : value).trim());
+      return `<span class="fee-status-pill ${esc(tone)}">${l}: ${v}</span>`;
+    }
+    function setPosFeeStatusBar(opts = {}) {
+      const el = document.getElementById("posFeeStatus");
+      if (!el) return;
+      const state = String(opts.state || "info").toLowerCase();
+      const tone = state === "ok" ? "ok" : (state === "error" ? "err" : (state === "warn" ? "warn" : "info"));
+      const title = String(opts.title || "Fee calculation");
+      const pills = [];
+      const selected = Number(opts.selected || 0);
+      const withData = Number(opts.withData || 0);
+      if (selected > 0) pills.push(feeStatusPill("Rows", `${withData}/${selected}`, tone));
+      if (Number(opts.collected || 0) > 0 || selected > 0) pills.push(feeStatusPill("Collected", Number(opts.collected || 0), Number(opts.collected || 0) > 0 ? "ok" : tone));
+      if (Number(opts.estimated || 0) > 0 || selected > 0) pills.push(feeStatusPill("Estimated", Number(opts.estimated || 0), Number(opts.estimated || 0) > 0 ? "ok" : tone));
+      if (Number(opts.snapshot || 0) > 0 || selected > 0) pills.push(feeStatusPill("Snapshot", Number(opts.snapshot || 0), Number(opts.snapshot || 0) > 0 ? "ok" : tone));
+      const mode = String(opts.mode || "").trim();
+      if (mode) pills.push(feeStatusPill("Mode", mode, "info"));
+      const missing = Number(opts.missing || 0);
+      if (missing > 0) pills.push(feeStatusPill("Missing", missing, "warn"));
+      const timeoutRows = Number(opts.timeoutRows || 0);
+      if (timeoutRows > 0) pills.push(feeStatusPill("Timeout", timeoutRows, "warn"));
+      const baselineRows = Number(opts.baselineRows || 0);
+      if (baselineRows > 0) pills.push(feeStatusPill("Baseline", baselineRows, "info"));
+      const msg = String(opts.message || "").trim();
+      if (msg) pills.push(feeStatusPill("Status", msg, tone));
+      el.classList.add("fee-status-bar");
+      el.style.color = "#334155";
+      el.innerHTML = `<span class="fee-status-title">${esc(title)}</span>${pills.join("")}`;
     }
     function setPosHistoryStatus(text, isErr) {
       const el = document.getElementById("posHistoryStatus");
@@ -19747,7 +19809,7 @@ def _render_positions_page() -> str:
         return;
       }
       try {
-        setPosFeeStatus("Loading fees…", false);
+        setPosFeeStatusBar({state: "loading", title: "Fee calculation", message: "Loading fees", selected: selected.length, withData: 0});
         const ok = await ensurePlotly();
         if (!ok) throw new Error("Failed to load chart library");
         const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
@@ -19765,7 +19827,7 @@ def _render_positions_page() -> str:
         if (!rowsPayload.length) {
           chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
-          setPosFeeStatus("No valid selected rows for fee data", true);
+          setPosFeeStatusBar({state: "error", title: "Fee calculation", message: "No valid selected rows", selected: selected.length, withData: 0});
           return;
         }
 
@@ -19778,7 +19840,7 @@ def _render_positions_page() -> str:
         if (!res.ok) {
           const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
           chartEl.innerHTML = `<div class='hint'>Failed to load compare data: ${esc(det)}</div>`;
-          setPosFeeStatus(`Failed to load compare data: ${det}`, true);
+          setPosFeeStatusBar({state: "error", title: "Fee calculation", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0});
           return;
         }
 
@@ -19819,7 +19881,17 @@ def _render_positions_page() -> str:
           const apiTopHtml = apiFailTop.length ? `<br/>Top API errors: ${esc(apiFailTop.join(" ; "))}` : "";
           chartEl.innerHTML = `<div class='hint'><b>No fee data</b><br/>${esc(reasonLine)}${apiTopHtml}<br/>Tip: run a fresh table scan first so token ids/symbols are enriched before fee fallback.</div>`;
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
-          setPosFeeStatus(`No fee data · ${reasonLine}`, true);
+          setPosFeeStatusBar({
+            state: "warn",
+            title: "Fee calculation",
+            message: `No fee data · ${reasonLine}`,
+            selected: Number(diag.selected || 0),
+            withData: 0,
+            collected: 0,
+            estimated: 0,
+            snapshot: 0,
+            mode: feeState.lastFeePricing || "",
+          });
           return;
         }
 
@@ -19834,23 +19906,54 @@ def _render_positions_page() -> str:
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
-        const pr = feeState.lastFeePricing ? ` · ${feeState.lastFeePricing}` : "";
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
         const baselineRows = Number(cmpDebug.synthetic_baseline_rows || 0);
-        const cmp = ` · collected rows: ${feeState.rowsWithCollected}, estimated rows: ${feeState.rowsWithEstimated}, snapshot rows: ${feeState.rowsWithSnapshot}`;
         if (feeState.hasEstimatedShareTrace && feeState.hasCollectedHistoryTrace) {
-          setPosFeeStatus(
-            `Compared collected history with liquidity-share estimate (${traces.length}/${diag.selected})${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}${timeoutRows ? ` · timeout rows: ${timeoutRows}` : ""}${baselineRows ? ` · baseline rows: ${baselineRows}` : ""}`,
-            false
-          );
+          setPosFeeStatusBar({
+            state: "ok",
+            title: "Fee calculation",
+            message: "Collected + estimate ready",
+            selected: Number(diag.selected || 0),
+            withData: Number(feeState.rowsWithAnySeries || 0),
+            collected: Number(feeState.rowsWithCollected || 0),
+            estimated: Number(feeState.rowsWithEstimated || 0),
+            snapshot: Number(feeState.rowsWithSnapshot || 0),
+            mode: feeState.lastFeePricing || "",
+            missing,
+            timeoutRows,
+            baselineRows,
+          });
         } else if ((feeState.hasEstimatedShareTrace || feeState.hasSnapshotOnlyTrace) && !feeState.hasCollectedHistoryTrace) {
-          setPosFeeStatus(
-            `Estimate only: collected-fee history not found (${traces.length}/${diag.selected})${cmp}${missing ? ` · missing: ${missing}` : ""}${timeoutRows ? ` · timeout rows: ${timeoutRows}` : ""}${baselineRows ? ` · baseline rows: ${baselineRows}` : ""}`,
-            true
-          );
+          setPosFeeStatusBar({
+            state: "warn",
+            title: "Fee calculation",
+            message: "Estimate/snapshot only",
+            selected: Number(diag.selected || 0),
+            withData: Number(feeState.rowsWithAnySeries || 0),
+            collected: Number(feeState.rowsWithCollected || 0),
+            estimated: Number(feeState.rowsWithEstimated || 0),
+            snapshot: Number(feeState.rowsWithSnapshot || 0),
+            mode: feeState.lastFeePricing || "",
+            missing,
+            timeoutRows,
+            baselineRows,
+          });
         } else {
-          setPosFeeStatus(`Done: ${traces.length}/${diag.selected} position(s) with fee data${cmp}${pr}${missing ? ` · missing: ${missing}` : ""}${timeoutRows ? ` · timeout rows: ${timeoutRows}` : ""}${baselineRows ? ` · baseline rows: ${baselineRows}` : ""}`, false);
+          setPosFeeStatusBar({
+            state: "ok",
+            title: "Fee calculation",
+            message: "Done",
+            selected: Number(diag.selected || 0),
+            withData: Number(feeState.rowsWithAnySeries || 0),
+            collected: Number(feeState.rowsWithCollected || 0),
+            estimated: Number(feeState.rowsWithEstimated || 0),
+            snapshot: Number(feeState.rowsWithSnapshot || 0),
+            mode: feeState.lastFeePricing || "",
+            missing,
+            timeoutRows,
+            baselineRows,
+          });
         }
         renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
       } catch (e) {
@@ -19859,7 +19962,7 @@ def _render_positions_page() -> str:
           debugEl.innerHTML = `<b>Debug</b><br/>Unexpected UI error: ${esc(e?.message || "unknown")}`;
           debugEl.style.display = "";
         }
-        setPosFeeStatus("Failed to build chart", true);
+        setPosFeeStatusBar({state: "error", title: "Fee calculation", message: "Failed to build chart", selected: selected.length, withData: 0});
       }
     }
     function normPosSym(v) {
@@ -24195,6 +24298,24 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "fee_pricing": "none",
             "note": "no position ids",
         })
+    if len(position_ids) <= 1:
+        single_budget_sec = max(
+            20.0,
+            min(90.0, float(os.environ.get("POSITIONS_FEE_SERIES_SINGLE_BUDGET_SEC", "55"))),
+        )
+        if float(single_budget_sec) > float(total_budget_sec):
+            total_budget_sec = float(single_budget_sec)
+            subgraph_budget_sec = max(
+                1.0,
+                min(total_budget_sec, float(os.environ.get("POSITIONS_FEE_SUBGRAPH_BUDGET_SEC", "7"))),
+            )
+            rpc_budget_sec = max(
+                1.0,
+                min(total_budget_sec, float(os.environ.get("POSITIONS_FEE_RPC_BUDGET_SEC", "8"))),
+            )
+            debug["budget_total_sec"] = float(total_budget_sec)
+            debug["budget_subgraph_sec"] = float(subgraph_budget_sec)
+            debug["budget_rpc_sec"] = float(rpc_budget_sec)
 
     token0 = str(req.token0_id or "").strip().lower()
     token1 = str(req.token1_id or "").strip().lower()
@@ -24445,15 +24566,25 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 debug["ledger_cache_partial"] = int(len(stale_cached_by_tid))
                 elapsed_now = max(0.0, time.monotonic() - started_mono)
                 rem_budget = max(0.0, float(total_budget_sec) - float(elapsed_now))
-                # Keep fee-series request responsive: reserve time for downstream fallbacks and packing.
-                ledger_budget_sec = max(2.0, min(8.0, rem_budget * 0.45))
+                # For single-position requests prefer full ledger coverage (all Collect events).
+                single_position_mode = bool(len(position_ids) <= 2)
+                if single_position_mode:
+                    ledger_budget_sec = max(6.0, min(35.0, rem_budget * 0.85))
+                else:
+                    # Keep fee-series request responsive for multi-row compares.
+                    ledger_budget_sec = max(2.0, min(8.0, rem_budget * 0.45))
                 ledger_deadline = time.monotonic() + float(ledger_budget_sec)
-                ledger_chunks_cap = max(12, min(48, int(_fee_collect_log_max_chunks())))
+                if single_position_mode:
+                    ledger_chunks_cap = max(48, min(260, int(_fee_collect_log_max_chunks())))
+                    scan_token_ids = list(cache_misses[:2])
+                else:
+                    ledger_chunks_cap = max(12, min(48, int(_fee_collect_log_max_chunks())))
+                    scan_token_ids = list(cache_misses[:12])
                 if cache_misses:
                     ledger_scan = _scan_v3_npm_fee_events_to_temp(
                         int(chain_id),
                         str(protocol),
-                        cache_misses[:12],
+                        scan_token_ids,
                         since_ts=int(collect_since_ts),
                         max_chunks=int(ledger_chunks_cap),
                         deadline_ts=float(ledger_deadline),
@@ -24467,7 +24598,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     debug["ledger_deadline_hit"] = bool(ledger_scan.get("deadline_hit"))
                     debug["ledger_budget_sec"] = float(ledger_budget_sec)
                     debug["ledger_event_counts"] = dict(ledger_scan.get("event_counts") or {})
-                    for tid in cache_misses[:12]:
+                    for tid in scan_token_ids:
                         one_day, one_meta = _build_v3_npm_fee_ledger_from_temp(
                             int(chain_id),
                             str(protocol),
@@ -24905,8 +25036,11 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     include_debug_summary = bool(getattr(req, "include_debug_summary", True))
     workers_cfg = max(1, min(8, int(os.environ.get("POSITIONS_FEE_COMPARE_WORKERS", "4"))))
     wall_budget_sec = max(5.0, min(120.0, float(os.environ.get("POSITIONS_FEE_COMPARE_WALL_SEC", "40"))))
-    if len(prepared_rows) <= 2:
-        wall_budget_sec = min(float(wall_budget_sec), 45.0)
+    # For single-row fee check prioritize completeness over ultra-fast return.
+    if len(prepared_rows) <= 1:
+        wall_budget_sec = max(float(wall_budget_sec), 90.0)
+    elif len(prepared_rows) <= 2:
+        wall_budget_sec = max(float(wall_budget_sec), 60.0)
     nonempty_baseline = os.environ.get("POSITIONS_FEE_COMPARE_NONEMPTY_BASELINE", "1").strip().lower() in (
         "1",
         "true",
