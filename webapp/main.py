@@ -18154,7 +18154,7 @@ def _render_positions_page() -> str:
     .fee-status-pill.err { border-color:#fecaca; background:#fef2f2; color:#b91c1c; }
     .fee-status-pill.info { border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8; }
     #posFeeBody .hint { font-size:13px; line-height:1.45; color:#475569; margin:0 0 10px; }
-    #posFeeChart { height:360px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
+    #posFeeChart { height:420px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
     #posFeeDebug { margin-top:10px; }
     .fee-toggle-pill {
       display:inline-flex; align-items:center; gap:7px;
@@ -18163,6 +18163,7 @@ def _render_positions_page() -> str:
     }
     .fee-toggle-pill:hover { border-color:#93c5fd; background:#eff6ff; }
     .fee-toggle-pill input { margin:0; width:15px; height:15px; }
+    .chart-size-select { font-size:12px; padding:2px 6px; border:1px solid #cbd5e1; border-radius:999px; background:#fff; color:#334155; }
     .fee-card .pos-fee-hist-label { font-size:15px; font-weight:700; color:#334155; }
     .fee-card .search-link-btn { font-size:20px; }
     @media (max-width: 1100px) {
@@ -18311,6 +18312,14 @@ def _render_positions_page() -> str:
               <input type="checkbox" id="posFeeAprLabels" checked />
               <span class="pos-fee-hist-label">Show APR labels</span>
             </label>
+            <label class="fee-toggle-pill" title="Adjust fee chart vertical size.">
+              <span class="pos-fee-hist-label">Chart height</span>
+              <select id="posFeeChartHeight" class="chart-size-select" onchange="applyFeeChartHeightFromControl()">
+                <option value="320">S</option>
+                <option value="420" selected>M</option>
+                <option value="560">L</option>
+              </select>
+            </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Build chart</button>
             <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
           </div>
@@ -18410,6 +18419,7 @@ def _render_positions_page() -> str:
     const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
     const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v2";
     const POS_FEE_LAST_CHART_KEY = "positions_fee_last_chart_v1";
+    const POS_FEE_CHART_HEIGHT_KEY = "positions_fee_chart_height_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
       position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder).",
     };
@@ -19634,6 +19644,29 @@ def _render_positions_page() -> str:
         ...(withDollar ? {tickprefix: "$"} : {}),
       };
     }
+    function normalizeFeeChartHeight(raw) {
+      const v = Number(raw || 0);
+      if (v === 320 || v === 420 || v === 560) return v;
+      return 420;
+    }
+    function applyFeeChartHeightFromControl() {
+      const sel = document.getElementById("posFeeChartHeight");
+      const chartEl = document.getElementById("posFeeChart");
+      if (!sel || !chartEl) return;
+      const h = normalizeFeeChartHeight(sel.value);
+      chartEl.style.height = `${h}px`;
+      try { localStorage.setItem(POS_FEE_CHART_HEIGHT_KEY, String(h)); } catch (_) {}
+      try { if (window.Plotly && typeof window.Plotly.Plots?.resize === "function") window.Plotly.Plots.resize(chartEl); } catch (_) {}
+    }
+    function restoreFeeChartHeightControl() {
+      const sel = document.getElementById("posFeeChartHeight");
+      const chartEl = document.getElementById("posFeeChart");
+      if (!sel || !chartEl) return;
+      let h = 420;
+      try { h = normalizeFeeChartHeight(localStorage.getItem(POS_FEE_CHART_HEIGHT_KEY)); } catch (_) {}
+      sel.value = String(h);
+      chartEl.style.height = `${h}px`;
+    }
     async function showSelectedPoolSeries() {
       const chartEl = document.getElementById("posPoolChart");
       const debugEl = document.getElementById("posHistoryDebug");
@@ -20212,6 +20245,7 @@ def _render_positions_page() -> str:
           const collectedPointY = [];
           const collectedPointText = [];
           const collectedPointHover = [];
+          const liqHover = (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-";
           const createdMs = Number(meta.createdMs || 0);
           if (createdMs > 0) {
             lineX.push(new Date(createdMs));
@@ -20234,8 +20268,8 @@ def _render_positions_page() -> str:
             const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
             collectedPointHover.push(
               aprPct > 0
-                ? `${dtLabel}<br>$${val.toFixed(2)}<br>${aprPct.toFixed(1)}%${liqUsd > 0 ? `<br>base liquidity $${liqUsd.toFixed(2)}` : ""}`
-                : `${dtLabel}<br>$${val.toFixed(2)}`
+                ? `${dtLabel}<br>$${val.toFixed(2)}<br>${aprPct.toFixed(1)}%<br>Liquidity: ${esc(liqHover)}`
+                : `${dtLabel}<br>$${val.toFixed(2)}<br>Liquidity: ${esc(liqHover)}`
             );
           }
           if (hasSnapshot) {
@@ -20279,6 +20313,7 @@ def _render_positions_page() -> str:
         if (hasEstimated) {
           hasEstimatedShareTrace = true;
           rowsWithEstimated += 1;
+          const liqHover = (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-";
           traces.push({
             x: estimatedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
             y: estimatedItems.map((x) => Number(x.fees_usd || 0)),
@@ -20286,7 +20321,7 @@ def _render_positions_page() -> str:
             line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
             opacity: 0.85,
             name: `${legendBase} (estimated, today USD)`,
-            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+            hovertemplate: `%{x|%b %d, %Y}<br>$%{y:.2f}<br>Liquidity: ${esc(liqHover)}<extra></extra>`,
           });
         }
         if (hasSnapshot) {
@@ -20584,7 +20619,8 @@ def _render_positions_page() -> str:
                   {showAprLabels: false},
                 );
                 if (tracesSpot.length) {
-                  const spotOverlay = applyFeeTraceStyleByPair(tracesSpot, "today", 0.78);
+                  const spotOverlay = applyFeeTraceStyleByPair(tracesSpot, "today", 0.78)
+                    .filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated"));
                   overlayTraces = overlayTraces.concat(spotOverlay);
                   if (backendHints.length < 8) {
                     backendHints.push(`dual_view_spot_rows: collected=${Number(feeStateSpot.rowsWithCollected || 0)}, estimated=${Number(feeStateSpot.rowsWithEstimated || 0)}, snapshot=${Number(feeStateSpot.rowsWithSnapshot || 0)}`);
@@ -20595,6 +20631,52 @@ def _render_positions_page() -> str:
           } catch (_) {
           }
         }
+        const compactLegendByPair = (srcTraces) => {
+          const typeRank = {instant: 0, today: 1, estimated: 2, other: 3};
+          const typeLabel = {instant: "if sold instantly", today: "today USD", estimated: "estimated", other: "series"};
+          const byBase = new Map();
+          const baseOrder = [];
+          for (const t of (srcTraces || [])) {
+            if (!t || typeof t !== "object") continue;
+            const name = String(t?.name || "");
+            const base = toLegendBase(name) || name || "pair";
+            const lower = name.toLowerCase();
+            const isEstimated = lower.includes("(estimated");
+            const isToday = lower.includes("(today usd)");
+            const tp = isEstimated ? "estimated" : (isToday ? "today" : "instant");
+            if (!byBase.has(base)) {
+              byBase.set(base, []);
+              baseOrder.push(base);
+            }
+            byBase.get(base).push({trace: t, type: tp});
+          }
+          const out = [];
+          for (const base of baseOrder) {
+            const rows = byBase.get(base) || [];
+            rows.sort((a, b) => Number(typeRank[a.type] ?? 99) - Number(typeRank[b.type] ?? 99));
+            const seenType = new Set();
+            let baseShown = false;
+            for (const row of rows) {
+              const t = row.trace || {};
+              const type = String(row.type || "other");
+              const label = String(typeLabel[type] || "series");
+              const firstOfType = !seenType.has(type);
+              if (firstOfType) seenType.add(type);
+              const showLegend = firstOfType;
+              const legendName = firstOfType
+                ? (baseShown ? label : `${base} (${label})`)
+                : String(t.name || "");
+              if (firstOfType && !baseShown) baseShown = true;
+              out.push({
+                ...t,
+                showlegend: showLegend,
+                name: legendName,
+              });
+            }
+          }
+          return out;
+        };
+        overlayTraces = compactLegendByPair(overlayTraces);
         Plotly.newPlot("posFeeChart", overlayTraces, {
           title: "Collected + estimated fees (USD)" + mainTitleSuffix,
           paper_bgcolor: "#ffffff",
@@ -21909,6 +21991,7 @@ def _render_positions_page() -> str:
       });
       setPosFeeStatus("Select History checkboxes, then click Build chart", false);
     }
+    restoreFeeChartHeightControl();
     restoreLastFeeChartFromCache();
     resumePosJobIfAny();
     const savedHeavy = loadHeavyPosResults();
@@ -25220,55 +25303,48 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         debug["estimate_fallback_days_used"] = 0
         debug["estimate_fallback_days_missing"] = 0
         debug["estimate_static_share_used"] = 0.0
-        if pos_liq <= 0 or pool_liq <= 0:
-            # Fallback: estimate share from current position USD vs latest pool TVL USD.
-            # This keeps estimated curve available even when raw liquidity is absent in a row.
-            share_source = "position_usd_over_pool_tvl"
-            pool_id_raw = str(pool_id_for_estimate or "").strip()
-            latest_pool_tvl = 0.0
-            if pool_id_raw:
-                try:
-                    tvl_points = _fetch_pool_tvl_series(chain_key, version, pool_id_raw, max(7, int(days)))
-                    debug["estimate_pool_tvl_days_count"] = int(len(tvl_points or []))
-                    if tvl_points:
-                        latest_pool_tvl = max(0.0, _safe_float(tvl_points[-1][1]))
-                except Exception:
-                    latest_pool_tvl = 0.0
-                    debug["estimate_pool_tvl_days_count"] = 0
-            if latest_pool_tvl <= 0:
-                latest_pool_tvl = max(0.0, _safe_float(getattr(req, "pool_tvl_usd", 0.0)))
-            amt0 = max(0.0, _safe_float(getattr(req, "position_amount0", 0.0)))
-            amt1 = max(0.0, _safe_float(getattr(req, "position_amount1", 0.0)))
-            if amt0 <= 0 and amt1 <= 0 and (snap_quote_amount0 > 0 or snap_quote_amount1 > 0):
-                amt0 = float(max(0.0, snap_quote_amount0))
-                amt1 = float(max(0.0, snap_quote_amount1))
-                debug["estimate_amount_source"] = "position_manager_quote"
-            pos_usd = _liquidity_usd_from_in_position_external(
-                int(chain_id),
-                amt0,
-                amt1,
-                str(token0 or ""),
-                str(token1 or ""),
-                symbol0=str(getattr(req, "token0_symbol", "") or ""),
-                symbol1=str(getattr(req, "token1_symbol", "") or ""),
-                pair=f"{str(getattr(req, 'token0_symbol', '') or '')}/{str(getattr(req, 'token1_symbol', '') or '')}",
-                known_prices={},
-                pool_token0_price_in_token1=_safe_float(getattr(req, "pool_token0_price", 0.0)),
-            ) or 0.0
-            debug["estimate_share_position_usd"] = float(max(0.0, pos_usd))
-            debug["estimate_share_latest_pool_tvl_usd"] = float(max(0.0, latest_pool_tvl))
-            if pos_usd > 0 and latest_pool_tvl > 0:
-                pos_liq = float(pos_usd)
-                pool_liq = float(latest_pool_tvl)
-            else:
-                estimated_reason = "liquidity_share_unavailable"
-        if pos_liq > 0 and pool_liq > 0:
-            est_share = max(0.0, min(1.0, pos_liq / pool_liq))
-            if est_share <= 0:
-                estimated_reason = "liquidity_share_zero"
-            else:
-                pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
-                if pool_fee_days:
+
+        # Recover exact current liquidity from chain if row is incomplete.
+        if (pos_liq <= 0 or pool_liq <= 0) and protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
+            try:
+                for pid in position_ids[:3]:
+                    tid = _position_token_id_from_raw(pid)
+                    if tid <= 0:
+                        continue
+                    snap_liq = _fetch_v3_position_contract_snapshot(
+                        int(chain_id),
+                        str(protocol),
+                        int(tid),
+                        str(req.address or ""),
+                        include_quotes=False,
+                    ) or {}
+                    if pos_liq <= 0:
+                        pos_liq = max(0.0, _safe_float(snap_liq.get("liquidity")))
+                    if (not _is_eth_address(pool_id_for_estimate)):
+                        p_fix = str(snap_liq.get("pool_id") or "").strip().lower()
+                        if _is_eth_address(p_fix):
+                            pool_id_for_estimate = p_fix
+                    if pool_liq <= 0 and _is_eth_address(pool_id_for_estimate):
+                        try:
+                            # UniswapV3Pool.liquidity() -> uint128
+                            pool_liq = max(
+                                0.0,
+                                float(_decode_uint_eth_call(_eth_call_hex(int(chain_id), str(pool_id_for_estimate), "0x1a686502"))),
+                            )
+                        except Exception:
+                            pass
+                    if pos_liq > 0 and pool_liq > 0:
+                        break
+                if pos_liq > 0 and pool_liq > 0:
+                    share_source = "raw_liquidity_onchain_recovered"
+            except Exception:
+                pass
+
+        pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
+        if pool_fee_days:
+            if pos_liq > 0 and pool_liq > 0:
+                est_share = max(0.0, min(1.0, pos_liq / pool_liq))
+                if est_share > 0:
                     cum_est = 0.0
                     for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
                         cum_est += max(0.0, float(fee_usd)) * float(est_share)
@@ -25279,8 +25355,12 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         if str(fee_days_reason) == "ok_volume_x_fee_tier"
                         else "ok_pool_share_daily_fees"
                     )
-                elif estimated_reason in {"not_requested", "unknown"}:
-                    estimated_reason = str(fee_days_reason or "pool_fee_series_empty")
+                else:
+                    estimated_reason = "liquidity_share_zero"
+            else:
+                estimated_reason = "liquidity_share_unavailable"
+        elif estimated_reason in {"not_requested", "unknown"}:
+            estimated_reason = str(fee_days_reason or "pool_fee_series_empty")
         if not str(debug.get("estimate_share_source") or "").strip():
             debug["estimate_share_source"] = str(share_source)
     except Exception as ex:
