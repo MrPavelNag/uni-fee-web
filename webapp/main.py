@@ -15478,7 +15478,7 @@ def _build_v3_npm_fee_ledger_from_temp(
             points.append((int(ts), float(cum_fee0), float(cum_fee1)))
     if not points:
         return {}, {"pricing": "none", "detail": "no_collect_points"}
-    by_day: dict[int, tuple[int, float]] = {}
+    series_by_ts: dict[int, float] = {}
     priced_partial = False
     pricing_mode = "historical" if use_historical_usd else "spot"
     if use_historical_usd:
@@ -15511,10 +15511,7 @@ def _build_v3_npm_fee_ledger_from_temp(
                 continue
             if legs_priced < legs_expected:
                 priced_partial = True
-            dts = (int(ts) // 86400) * 86400
-            prev = by_day.get(dts)
-            if prev is None or int(ts) > prev[0]:
-                by_day[dts] = (int(ts), float(usd))
+            series_by_ts[int(ts)] = float(usd)
         pricing = "ledger_historical" if not priced_partial else "ledger_historical_partial"
     else:
         stable0 = _fee_position_token_stable_usd_assumption(cid, t0) is not None
@@ -15536,19 +15533,22 @@ def _build_v3_npm_fee_ledger_from_temp(
                 continue
             if legs_priced < legs_expected:
                 priced_partial = True
-            dts = (int(ts) // 86400) * 86400
-            prev = by_day.get(dts)
-            if prev is None or int(ts) > prev[0]:
-                by_day[dts] = (int(ts), float(usd))
+            series_by_ts[int(ts)] = float(usd)
         pricing = "ledger_spot" if not priced_partial else "ledger_spot_partial"
-    out = {int(d): float(v) for d, (_ts, v) in by_day.items()}
+    out = {int(ts): float(v) for ts, v in sorted(series_by_ts.items(), key=lambda x: x[0])}
     if not out:
         return {}, {"pricing": "none", "detail": "ledger_points_unpriced"}
     # Cache ledger per day into temp table for fast subsequent reads.
+    by_day_cache: dict[int, tuple[int, float]] = {}
+    for ts, usd in out.items():
+        dts = (int(ts) // 86400) * 86400
+        prev = by_day_cache.get(dts)
+        if prev is None or int(ts) > prev[0]:
+            by_day_cache[dts] = (int(ts), float(usd))
     now_ts = float(time.time())
     with _analytics_conn() as conn:
         rows_up = []
-        for dts, usd in out.items():
+        for dts, (_ts, usd) in by_day_cache.items():
             rows_up.append((int(cid), str(proto), int(tid), int(dts), "0", "0", float(usd), str(pricing_mode), float(now_ts)))
         conn.executemany(
             """
@@ -15559,7 +15559,7 @@ def _build_v3_npm_fee_ledger_from_temp(
             rows_up,
         )
         conn.commit()
-    return out, {"pricing": pricing, "detail": "Position-level NPM ledger (Collect minus Decrease principal)."}
+    return out, {"pricing": pricing, "detail": "Position-level NPM ledger (event-level Collect minus Decrease principal)."}
 
 
 def _load_v3_npm_fee_ledger_day_from_cache(
@@ -18144,7 +18144,7 @@ def _render_positions_page() -> str:
       text-overflow: clip;
       max-width: 100%;
     }
-    #posFeeStatus { font-size:15px; font-weight:600; color:#334155; }
+    #posFeeStatus { font-size:13px; font-weight:400; color:#334155; }
     #posFeeStatus.fee-status-bar,
     #posHistoryStatus.fee-status-bar {
       display: inline-flex;
@@ -18178,6 +18178,7 @@ def _render_positions_page() -> str:
     .fee-status-pill.info { border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8; }
     #posFeeBody .hint { font-size:13px; line-height:1.45; color:#475569; margin:0 0 10px; }
     #posFeeChart { height:360px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
+    #posFeeEstimatedChart { height:260px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; margin-top:8px; }
     #posFeeDebug { margin-top:10px; }
     .fee-toggle-pill {
       display:inline-flex; align-items:center; gap:7px;
@@ -18336,6 +18337,7 @@ def _render_positions_page() -> str:
         </div>
         <div id="posFeeBody" class="section-body">
           <div id="posFeeChart"></div>
+          <div id="posFeeEstimatedChart"></div>
           <div id="posFeeDebug" class="info-box" style="display:none"></div>
         </div>
       </section>
@@ -20173,8 +20175,10 @@ def _render_positions_page() -> str:
     }
     async function showSelectedPositionFees() {
       const chartEl = document.getElementById("posFeeChart");
+      const estChartEl = document.getElementById("posFeeEstimatedChart");
       const debugEl = document.getElementById("posFeeDebug");
       if (!chartEl) return;
+      if (estChartEl) estChartEl.innerHTML = "";
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
@@ -20233,6 +20237,7 @@ def _render_positions_page() -> str:
         if (!rowsPayload.length) {
           stopFeeStatusTimer();
           chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
+          if (estChartEl) estChartEl.innerHTML = "<div class='hint'>No estimated data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatusBar({state: "error", title: "Fee scan", message: "No valid selected rows", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
@@ -20248,6 +20253,7 @@ def _render_positions_page() -> str:
           stopFeeStatusTimer();
           const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
           chartEl.innerHTML = `<div class='hint'>Failed to load compare data: ${esc(det)}</div>`;
+          if (estChartEl) estChartEl.innerHTML = "<div class='hint'>No estimated data.</div>";
           setPosFeeStatusBar({state: "error", title: "Fee scan", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
@@ -20289,6 +20295,7 @@ def _render_positions_page() -> str:
           const reasonLine = reasons.length ? reasons.join(" | ") : "all selected rows returned empty fee series";
           const apiTopHtml = apiFailTop.length ? `<br/>Top API errors: ${esc(apiFailTop.join(" ; "))}` : "";
           chartEl.innerHTML = `<div class='hint'><b>No fee data</b><br/>${esc(reasonLine)}${apiTopHtml}<br/>Tip: run a fresh table scan first so token ids/symbols are enriched before fee fallback.</div>`;
+          if (estChartEl) estChartEl.innerHTML = "<div class='hint'>No estimated data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatusBar({
             state: "warn",
@@ -20306,8 +20313,10 @@ def _render_positions_page() -> str:
         }
 
         const titleSuffix = histUsd ? " — historical USD (CoinGecko at each Collect)" : " — spot USD";
-        Plotly.newPlot("posFeeChart", traces, {
-          title: "Collected vs estimated fees (USD)" + titleSuffix,
+        const estimatedTraces = traces.filter((t) => String(t?.name || "").toLowerCase().includes("(estimated)"));
+        const hardTraces = traces.filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated)"));
+        Plotly.newPlot("posFeeChart", (hardTraces.length ? hardTraces : traces), {
+          title: "Collected fees (hard data) + current snapshot" + titleSuffix,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
@@ -20316,6 +20325,22 @@ def _render_positions_page() -> str:
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
+        if (estChartEl) {
+          if (estimatedTraces.length) {
+            Plotly.newPlot("posFeeEstimatedChart", estimatedTraces, {
+              title: "Estimated fees (volume × fee tier × share)",
+              paper_bgcolor: "#ffffff",
+              plot_bgcolor: "#f8fbff",
+              margin: {t: 34, b: 42, l: 54, r: 12},
+              xaxis: chartGridX(minCreatedMs),
+              yaxis: chartGridY(true),
+              showlegend: true,
+              legend: {orientation: "h", y: -0.2},
+            }, {displaylogo: false, responsive: true});
+          } else {
+            estChartEl.innerHTML = "<div class='hint'>No estimated data for selected rows.</div>";
+          }
+        }
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
         const baselineRows = Number(cmpDebug.synthetic_baseline_rows || 0);
@@ -24993,6 +25018,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     token_ids.append(int(tid))
             debug["ledger_token_ids"] = int(len(token_ids))
             if token_ids:
+                single_position_mode_hint = bool(len(position_ids) <= 1)
                 pricing_mode = ("historical" if bool(want_hist_usd) else "spot")
                 cache_hits = 0
                 cache_misses: list[int] = []
@@ -25011,7 +25037,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         int(tid),
                         since_ts=int(collect_since_ts),
                     )
-                    if cached_one and scan_done:
+                    if cached_one and scan_done and (not single_position_mode_hint):
                         cache_hits += 1
                         for ts, val in cached_one.items():
                             ledger_by_day[int(ts)] = float(ledger_by_day.get(int(ts), 0.0) + float(val))
