@@ -20084,6 +20084,8 @@ def _render_positions_page() -> str:
           const collectedSorted = collectedItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
           const lineX = [];
           const lineY = [];
+          const collectedPointX = [];
+          const collectedPointY = [];
           const createdMs = Number(meta.createdMs || 0);
           if (createdMs > 0) {
             lineX.push(new Date(createdMs));
@@ -20092,8 +20094,12 @@ def _render_positions_page() -> str:
           for (const it of collectedSorted) {
             const ts = Number(it?.ts || 0);
             if (ts <= 0) continue;
-            lineX.push(new Date(ts * 1000));
-            lineY.push(Number(it?.fees_usd || 0));
+            const dt = new Date(ts * 1000);
+            const val = Number(it?.fees_usd || 0);
+            lineX.push(dt);
+            lineY.push(val);
+            collectedPointX.push(dt);
+            collectedPointY.push(val);
           }
           if (hasSnapshot) {
             const snapSorted = snapshotItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
@@ -20111,12 +20117,22 @@ def _render_positions_page() -> str:
           traces.push({
             x: useLineX,
             y: useLineY,
-            mode: useLineY.length <= 2 ? "lines+markers" : "lines",
-            line: {color: palette[meta.colorIdx % palette.length], width: 2},
-            marker: {size: useLineY.length <= 2 ? 6 : 0},
+            mode: "lines",
+            line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
             name: `${meta.baseName} (collected path)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
+          if (collectedPointX.length) {
+            traces.push({
+              x: collectedPointX,
+              y: collectedPointY,
+              mode: "markers",
+              marker: {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
+              name: `${meta.baseName} (collect points)`,
+              showlegend: false,
+              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>Collect point</extra>",
+            });
+          }
         }
         if (hasEstimated) {
           hasEstimatedShareTrace = true;
@@ -20178,7 +20194,10 @@ def _render_positions_page() -> str:
       const estChartEl = document.getElementById("posFeeEstimatedChart");
       const debugEl = document.getElementById("posFeeDebug");
       if (!chartEl) return;
-      if (estChartEl) estChartEl.innerHTML = "";
+      if (estChartEl) {
+        estChartEl.innerHTML = "";
+        estChartEl.style.display = "none";
+      }
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
@@ -20295,7 +20314,6 @@ def _render_positions_page() -> str:
           const reasonLine = reasons.length ? reasons.join(" | ") : "all selected rows returned empty fee series";
           const apiTopHtml = apiFailTop.length ? `<br/>Top API errors: ${esc(apiFailTop.join(" ; "))}` : "";
           chartEl.innerHTML = `<div class='hint'><b>No fee data</b><br/>${esc(reasonLine)}${apiTopHtml}<br/>Tip: run a fresh table scan first so token ids/symbols are enriched before fee fallback.</div>`;
-          if (estChartEl) estChartEl.innerHTML = "<div class='hint'>No estimated data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatusBar({
             state: "warn",
@@ -20313,10 +20331,21 @@ def _render_positions_page() -> str:
         }
 
         const titleSuffix = histUsd ? " — historical USD (CoinGecko at each Collect)" : " — spot USD";
-        const estimatedTraces = traces.filter((t) => String(t?.name || "").toLowerCase().includes("(estimated)"));
+        const estimatedTracesRaw = traces.filter((t) => String(t?.name || "").toLowerCase().includes("(estimated)"));
         const hardTraces = traces.filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated)"));
-        Plotly.newPlot("posFeeChart", (hardTraces.length ? hardTraces : traces), {
-          title: "Collected fees (hard data) + current snapshot" + titleSuffix,
+        const estimateColors = ["#f97316", "#ea580c", "#fb923c", "#fdba74"];
+        const estimatedTraces = estimatedTracesRaw.map((t, idx) => {
+          const c = estimateColors[idx % estimateColors.length];
+          const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
+          return {
+            ...t,
+            line: { ...lineIn, color: c, dash: "dash", width: Math.max(2, Number(lineIn.width || 2)) },
+            opacity: 0.95,
+          };
+        });
+        const overlayTraces = (hardTraces.length ? hardTraces : traces).concat(estimatedTraces);
+        Plotly.newPlot("posFeeChart", overlayTraces, {
+          title: "Collected + estimated fees (USD)" + titleSuffix,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
@@ -20325,22 +20354,6 @@ def _render_positions_page() -> str:
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
-        if (estChartEl) {
-          if (estimatedTraces.length) {
-            Plotly.newPlot("posFeeEstimatedChart", estimatedTraces, {
-              title: "Estimated fees (volume × fee tier × share)",
-              paper_bgcolor: "#ffffff",
-              plot_bgcolor: "#f8fbff",
-              margin: {t: 34, b: 42, l: 54, r: 12},
-              xaxis: chartGridX(minCreatedMs),
-              yaxis: chartGridY(true),
-              showlegend: true,
-              legend: {orientation: "h", y: -0.2},
-            }, {displaylogo: false, responsive: true});
-          } else {
-            estChartEl.innerHTML = "<div class='hint'>No estimated data for selected rows.</div>";
-          }
-        }
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
         const baselineRows = Number(cmpDebug.synthetic_baseline_rows || 0);
