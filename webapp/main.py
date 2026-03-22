@@ -10,6 +10,7 @@ Cloud-ready web MVP for pool analysis.
 from __future__ import annotations
 
 import os
+import math
 import base64
 import contextlib
 import hashlib
@@ -25490,10 +25491,11 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 debug["estimate_static_share_fallback_exc"] = True
         if not str(debug.get("estimate_share_source") or "").strip():
             debug["estimate_share_source"] = str(share_source)
-    except Exception:
+    except Exception as ex:
         estimated_by_day = {}
         est_share = 0.0
         estimated_reason = "estimate_error"
+        debug["estimate_error_detail"] = str(ex)[:220]
     debug["estimated_points"] = int(len(estimated_by_day))
     debug["estimated_share"] = float(est_share)
 
