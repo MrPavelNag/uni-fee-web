@@ -20706,8 +20706,6 @@ def _render_positions_page() -> str:
           include_aggregate: false,
         };
         const feeCacheKey = buildFeeScanCacheKey(rowsPayload, histUsd);
-        // Force fresh compare data on every manual rebuild for stable repeatability.
-        clearFeeScanCacheKey(feeCacheKey);
         const cachedCompare = loadFeeScanCache(feeCacheKey);
         let res = null;
         let data = null;
@@ -20851,13 +20849,22 @@ def _render_positions_page() -> str:
         let overlayTraces = applyFeeTraceStyleByPair(traces, histUsd ? "historical" : "today", 1.0);
         if (histUsd) {
           try {
-            const rowsOutSpot = (rowsOut || []).map((r) => ({
-              ...(r && typeof r === "object" ? r : {}),
-              collected_items: Array.isArray(r?.alt_collected_items) ? r.alt_collected_items : [],
-              estimated_items: [],
-              snapshot_items: [],
-              apr_items: [],
-            }));
+            const isEstimateOnlyRow = (r) => {
+              const mode = String(r?.mode || "").trim().toLowerCase();
+              if (mode === "row-unclaimed-fallback") return true;
+              const hasCollected = Array.isArray(r?.collected_items) && r.collected_items.length > 0;
+              const hasSnapshot = Array.isArray(r?.snapshot_items) && r.snapshot_items.length > 0;
+              return (!hasCollected && hasSnapshot);
+            };
+            const rowsOutSpot = (rowsOut || [])
+              .filter((r) => !isEstimateOnlyRow(r))
+              .map((r) => ({
+                ...(r && typeof r === "object" ? r : {}),
+                collected_items: Array.isArray(r?.alt_collected_items) ? r.alt_collected_items : [],
+                estimated_items: [],
+                snapshot_items: [],
+                apr_items: [],
+              }));
             const tracesSpot = [];
             const diagSpot = prepared.diag || {};
             const rowStatusesSpot = prepared.rowStatuses || [];
@@ -20882,7 +20889,7 @@ def _render_positions_page() -> str:
                 backendHints.push(`dual_view_spot_local_reprice: collected=${Number(feeStateSpot.rowsWithCollected || 0)}`);
               }
             } else if (backendHints.length < 8) {
-              backendHints.push("dual_view_spot_local_reprice: unavailable");
+              backendHints.push("dual_view_spot_local_reprice: skipped_for_estimate_only");
             }
           } catch (_) {
           }
