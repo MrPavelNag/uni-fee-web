@@ -18474,7 +18474,7 @@ def _render_positions_page() -> str:
     const POS_HEAVY_CLOSED_SORT_KEY = "positions_heavy_closed_sort_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
     const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
-    const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v1";
+    const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v2";
     const POS_FEE_LAST_CHART_KEY = "positions_fee_last_chart_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
       position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder).",
@@ -25117,6 +25117,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     token0 = str(req.token0_id or "").strip().lower()
     token1 = str(req.token1_id or "").strip().lower()
+    pool_id_for_estimate = str(req.pool_id or "").strip().lower()
     row_tick_lower = int(getattr(req, "tick_lower", 0) or 0)
     row_tick_upper = int(getattr(req, "tick_upper", 0) or 0)
     snap_quote_amount0 = 0.0
@@ -25219,11 +25220,43 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["fee_usd_historical"] = bool(want_hist_usd)
     debug["rpc_protocol_supported"] = bool(protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"})
     debug["rpc_tokens_ready"] = bool(_is_eth_address(token0) and _is_eth_address(token1))
+
+    # Estimated series requires real pool address. Some catalog rows can carry PM address in pool_id.
+    try:
+        pm_addr = str(_position_manager_for_protocol(int(chain_id), str(protocol)) or "").strip().lower()
+        pool_invalid = (
+            (not _is_eth_address(pool_id_for_estimate))
+            or (_is_eth_address(pm_addr) and str(pool_id_for_estimate) == str(pm_addr))
+            or (_is_eth_address(str(req.address or "").strip().lower()) and str(pool_id_for_estimate) == str(req.address or "").strip().lower())
+        )
+        if pool_invalid:
+            for pid in position_ids[:3]:
+                tid = _position_token_id_from_raw(pid)
+                if tid <= 0:
+                    continue
+                snap_fix = _fetch_v3_position_contract_snapshot(
+                    int(chain_id),
+                    str(protocol),
+                    int(tid),
+                    str(req.address or ""),
+                    include_quotes=False,
+                ) or {}
+                p_fix = str(snap_fix.get("pool_id") or "").strip().lower()
+                if _is_eth_address(p_fix):
+                    pool_id_for_estimate = str(p_fix)
+                    debug["estimate_pool_id_source"] = "position_manager_snapshot"
+                    break
+        if not str(debug.get("estimate_pool_id_source") or "").strip():
+            debug["estimate_pool_id_source"] = ("row_pool_id" if _is_eth_address(pool_id_for_estimate) else "unresolved")
+    except Exception:
+        debug["estimate_pool_id_source"] = "error"
+    debug["estimate_pool_id"] = str(pool_id_for_estimate or "")
+
     estimated_by_day: dict[int, float] = {}
     est_share = 0.0
     try:
         def _estimated_pool_fee_days() -> tuple[list[tuple[int, float]], str]:
-            pool_id_raw = str(req.pool_id or "").strip()
+            pool_id_raw = str(pool_id_for_estimate or "").strip()
             if not pool_id_raw:
                 return [], "missing_pool_id"
             fee_tier = _parse_fee_tier_fraction_from_raw(getattr(req, "fee_tier_raw", ""))
@@ -25253,7 +25286,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             # Fallback: estimate share from current position USD vs latest pool TVL USD.
             # This keeps estimated curve available even when raw liquidity is absent in a row.
             share_source = "position_usd_over_pool_tvl"
-            pool_id_raw = str(req.pool_id or "").strip()
+            pool_id_raw = str(pool_id_for_estimate or "").strip()
             latest_pool_tvl = 0.0
             if pool_id_raw:
                 try:
@@ -25309,10 +25342,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 elif estimated_reason in {"not_requested", "unknown"}:
                     estimated_reason = str(fee_days_reason or "pool_fee_series_empty")
         # Second fallback for estimate: derive dynamic daily share from position TVL snapshots.
-        if (not estimated_by_day) and position_ids and endpoint and str(req.pool_id or "").strip():
+        if (not estimated_by_day) and position_ids and endpoint and str(pool_id_for_estimate or "").strip():
             try:
                 pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
-                pool_tvl_days = _fetch_pool_tvl_series(chain_key, version, str(req.pool_id or ""), days)
+                pool_tvl_days = _fetch_pool_tvl_series(chain_key, version, str(pool_id_for_estimate or ""), days)
                 if pool_fee_days and pool_tvl_days:
                     pool_tvl_by_day = {int(ts): max(0.0, float(v)) for ts, v in pool_tvl_days}
                     pos_tvl_by_day: dict[int, float] = {}
@@ -25400,10 +25433,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     estimated_reason = "position_tvl_snapshot_fallback_error"
                 debug["estimate_snapshot_fallback_exc"] = True
         # Third fallback: static share from any available position snapshot / pool TVL overlap.
-        if (not estimated_by_day) and position_ids and endpoint and str(req.pool_id or "").strip():
+        if (not estimated_by_day) and position_ids and endpoint and str(pool_id_for_estimate or "").strip():
             try:
                 pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
-                pool_tvl_days = _fetch_pool_tvl_series(chain_key, version, str(req.pool_id or ""), days)
+                pool_tvl_days = _fetch_pool_tvl_series(chain_key, version, str(pool_id_for_estimate or ""), days)
                 if pool_fee_days and pool_tvl_days:
                     pool_tvl_by_day = {int(ts): max(0.0, float(v)) for ts, v in pool_tvl_days}
                     static_share = 0.0
@@ -25596,14 +25629,38 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         if not collected_by_day:
             return []
         tvl_by_day = _position_tvl_by_day_for_apr()
-        if not tvl_by_day:
-            return []
         known_days = sorted(int(x) for x in tvl_by_day.keys() if int(x) > 0)
+        fallback_liq_usd = 0.0
         if not known_days:
-            return []
+            # Fallback when snapshots are unavailable: use current row in-position USD.
+            # This keeps APR labels visible (approx) instead of dropping them completely.
+            try:
+                amt0 = max(0.0, _safe_float(getattr(req, "position_amount0", 0.0)))
+                amt1 = max(0.0, _safe_float(getattr(req, "position_amount1", 0.0)))
+                fallback_liq_usd = _liquidity_usd_from_in_position_external(
+                    int(chain_id),
+                    amt0,
+                    amt1,
+                    str(token0 or ""),
+                    str(token1 or ""),
+                    symbol0=str(getattr(req, "token0_symbol", "") or ""),
+                    symbol1=str(getattr(req, "token1_symbol", "") or ""),
+                    pair=f"{str(getattr(req, 'token0_symbol', '') or '')}/{str(getattr(req, 'token1_symbol', '') or '')}",
+                    known_prices={},
+                    pool_token0_price_in_token1=_safe_float(getattr(req, "pool_token0_price", 0.0)),
+                ) or 0.0
+            except Exception:
+                fallback_liq_usd = 0.0
+            if fallback_liq_usd <= 0.0:
+                return []
+            debug["apr_liquidity_source"] = "row_in_position_fallback"
+        else:
+            debug["apr_liquidity_source"] = "position_tvl_snapshots"
 
         def _lookup_tvl(day_ts: int) -> float:
             d = int(day_ts)
+            if not known_days:
+                return float(max(0.0, fallback_liq_usd))
             prev_days = [x for x in known_days if x <= d]
             if prev_days:
                 return max(0.0, float(tvl_by_day.get(int(prev_days[-1]), 0.0)))
