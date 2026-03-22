@@ -2712,6 +2712,18 @@ def _fetch_v3_position_contract_snapshot(
         token0 = _decode_address_from_word(words[2]).lower()
         token1 = _decode_address_from_word(words[3]).lower()
         fee = _decode_uint_from_word(words[4])
+        pool_id = ""
+        try:
+            factory = str(UNISWAP_V3_FACTORY_BY_CHAIN_ID.get(int(cid)) or "").strip().lower()
+            if _is_eth_address(factory) and _is_eth_address(token0) and _is_eth_address(token1) and int(fee) > 0:
+                pool_data = "0x1698ee82" + _encode_address_word(token0) + _encode_address_word(token1) + _encode_uint_word(int(fee))
+                pool_words = _hex_words(_eth_call_hex(int(cid), factory, pool_data))
+                if pool_words:
+                    paddr = _decode_address_from_word(pool_words[0]).lower()
+                    if _is_eth_address(paddr):
+                        pool_id = str(paddr)
+        except Exception:
+            pool_id = ""
         tick_lower = _decode_int_from_word(words[5])
         tick_upper = _decode_int_from_word(words[6])
         liq = max(0, _decode_uint_from_word(words[7]))
@@ -2768,6 +2780,7 @@ def _fetch_v3_position_contract_snapshot(
             "operator": str(operator or "").lower(),
             "token0": str(token0),
             "token1": str(token1),
+            "pool_id": str(pool_id or ""),
             "fee": int(fee),
             "tick_lower": int(tick_lower),
             "tick_upper": int(tick_upper),
@@ -17400,6 +17413,9 @@ def _build_row_updates_from_snapshot(
         "suspected_spam": False,
         "spam_skipped": False,
     }
+    pool_id_snap = str(snap.get("pool_id") or "").strip().lower()
+    if _is_eth_address(pool_id_snap):
+        out["pool_id"] = str(pool_id_snap)
     if include_liquidity:
         out["liquidity"] = str(liq_raw)
     return out
@@ -18356,6 +18372,10 @@ def _render_positions_page() -> str:
             <label class="fee-toggle-pill" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
               <input type="checkbox" id="posFeeHistoricalUsd" />
               <span class="pos-fee-hist-label">If sold instantly</span>
+            </label>
+            <label class="fee-toggle-pill" title="Show annualized return labels next to collect points.">
+              <input type="checkbox" id="posFeeAprLabels" checked />
+              <span class="pos-fee-hist-label">Show APR labels</span>
             </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Build chart</button>
             <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
@@ -20130,7 +20150,8 @@ def _render_positions_page() -> str:
       }
       return {diag, rowStatuses, rowsPayload, payloadMeta, minCreatedMs};
     }
-    function processFeeCompareRows(rowsOut, payloadMeta, palette, traces, rowStatuses, apiFailTop, backendHints, diag) {
+    function processFeeCompareRows(rowsOut, payloadMeta, palette, traces, rowStatuses, apiFailTop, backendHints, diag, options) {
+      const showAprLabels = !(options && options.showAprLabels === false);
       let lastFeePricing = "";
       let hasCollectedHistoryTrace = false;
       let hasEstimatedShareTrace = false;
@@ -20169,6 +20190,18 @@ def _render_positions_page() -> str:
         const collectedItems = Array.isArray(outRow.collected_items) ? outRow.collected_items : [];
         const estimatedItems = Array.isArray(outRow.estimated_items) ? outRow.estimated_items : [];
         const snapshotItems = Array.isArray(outRow.snapshot_items) ? outRow.snapshot_items : [];
+        const aprItems = Array.isArray(outRow.apr_items) ? outRow.apr_items : [];
+        const aprByTs = new Map();
+        for (const ai of aprItems) {
+          const ts = Number(ai?.ts || 0);
+          if (ts <= 0) continue;
+          aprByTs.set(ts, {
+            aprPct: Number(ai?.apr_pct || 0),
+            days: Number(ai?.days || 0),
+            feeDelta: Number(ai?.fee_delta_usd || 0),
+            liquidityUsd: Number(ai?.liquidity_usd || 0),
+          });
+        }
         const hasCollected = collectedItems.length > 0;
         const hasEstimated = estimatedItems.length > 0;
         const hasSnapshot = snapshotItems.length > 0;
@@ -20243,6 +20276,8 @@ def _render_positions_page() -> str:
           const lineY = [];
           const collectedPointX = [];
           const collectedPointY = [];
+          const collectedPointText = [];
+          const collectedPointHover = [];
           const createdMs = Number(meta.createdMs || 0);
           if (createdMs > 0) {
             lineX.push(new Date(createdMs));
@@ -20257,6 +20292,18 @@ def _render_positions_page() -> str:
             lineY.push(val);
             collectedPointX.push(dt);
             collectedPointY.push(val);
+            const aprMeta = aprByTs.get(ts);
+            const aprPct = Number(aprMeta?.aprPct || 0);
+            const aprDays = Number(aprMeta?.days || 0);
+            const feeDelta = Number(aprMeta?.feeDelta || 0);
+            const liqUsd = Number(aprMeta?.liquidityUsd || 0);
+            const aprText = (showAprLabels && aprPct > 0) ? `${aprPct.toFixed(1)}% APR` : "";
+            collectedPointText.push(aprText);
+            collectedPointHover.push(
+              aprPct > 0
+                ? `%{x|%b %d, %Y}<br>$%{y:.2f}<br>${esc(aprText)}<br>${esc(`period ${Math.max(0, aprDays).toFixed(1)}d, fee $${Math.max(0, feeDelta).toFixed(2)}, in position $${Math.max(0, liqUsd).toFixed(2)}`)}<extra>Collect point</extra>`
+                : "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>Collect point</extra>"
+            );
           }
           if (hasSnapshot) {
             const snapSorted = snapshotItems.slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
@@ -20280,14 +20327,19 @@ def _render_positions_page() -> str:
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
           if (collectedPointX.length) {
+            const hasAprLabel = showAprLabels && collectedPointText.some((t) => String(t || "").trim());
             traces.push({
               x: collectedPointX,
               y: collectedPointY,
-              mode: "markers",
+              mode: hasAprLabel ? "markers+text" : "markers",
               marker: {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
+              text: hasAprLabel ? collectedPointText : undefined,
+              textposition: hasAprLabel ? "top right" : undefined,
+              textfont: hasAprLabel ? {size: 10, color: palette[meta.colorIdx % palette.length]} : undefined,
+              hovertemplate: hasAprLabel ? "%{hovertext}<extra></extra>" : "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>Collect point</extra>",
+              hovertext: hasAprLabel ? collectedPointHover : undefined,
               name: `${legendBase} (collect points)`,
               showlegend: false,
-              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>Collect point</extra>",
             });
           }
         }
@@ -20406,6 +20458,7 @@ def _render_positions_page() -> str:
         const ok = await ensurePlotly();
         if (!ok) throw new Error("Failed to load chart library");
         const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
+        const showAprLabels = !!(document.getElementById("posFeeAprLabels") && document.getElementById("posFeeAprLabels").checked);
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
         const apiFailTop = [];
@@ -20479,6 +20532,7 @@ def _render_positions_page() -> str:
           apiFailTop,
           backendHints,
           diag,
+          {showAprLabels},
         );
         if (!traces.length) {
           stopFeeStatusTimer();
@@ -20594,6 +20648,7 @@ def _render_positions_page() -> str:
                   apiFailTopSpot,
                   backendHintsSpot,
                   diagSpot,
+                  {showAprLabels: false},
                 );
                 if (tracesSpot.length) {
                   const spotOverlay = applyFeeTraceStyleByPair(tracesSpot, "today", 0.78);
@@ -25511,6 +25566,76 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
         return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
 
+    position_tvl_by_day_cache: dict[int, float] | None = None
+
+    def _position_tvl_by_day_for_apr() -> dict[int, float]:
+        nonlocal position_tvl_by_day_cache
+        if isinstance(position_tvl_by_day_cache, dict):
+            return dict(position_tvl_by_day_cache)
+        out: dict[int, float] = {}
+        if not endpoint or not position_ids:
+            position_tvl_by_day_cache = out
+            return out
+        try:
+            for pid in position_ids[:20]:
+                p_series = _fetch_position_snapshot_series_exact(
+                    endpoint,
+                    pid,
+                    since_ts=collect_since_ts,
+                    chain_id=chain_id,
+                )
+                for ts, v in p_series:
+                    dts = (int(ts) // 86400) * 86400
+                    out[dts] = float(out.get(dts, 0.0) + max(0.0, float(v)))
+        except Exception:
+            out = {}
+        position_tvl_by_day_cache = dict(out)
+        return out
+
+    def _build_fee_apr_items(collected_by_day: dict[int, float]) -> list[dict[str, Any]]:
+        if not collected_by_day:
+            return []
+        tvl_by_day = _position_tvl_by_day_for_apr()
+        if not tvl_by_day:
+            return []
+        known_days = sorted(int(x) for x in tvl_by_day.keys() if int(x) > 0)
+        if not known_days:
+            return []
+
+        def _lookup_tvl(day_ts: int) -> float:
+            d = int(day_ts)
+            prev_days = [x for x in known_days if x <= d]
+            if prev_days:
+                return max(0.0, float(tvl_by_day.get(int(prev_days[-1]), 0.0)))
+            next_days = [x for x in known_days if x > d]
+            if next_days:
+                return max(0.0, float(tvl_by_day.get(int(next_days[0]), 0.0)))
+            return 0.0
+
+        items: list[dict[str, Any]] = []
+        prev_ts = int(collect_since_ts)
+        prev_cum = 0.0
+        for ts, cum in sorted(((int(k), float(v)) for k, v in collected_by_day.items()), key=lambda x: x[0]):
+            day_ts = (int(ts) // 86400) * 86400
+            tvl_usd = _lookup_tvl(day_ts)
+            fee_delta = max(0.0, float(cum) - float(prev_cum))
+            days_delta = max(1.0, (float(ts) - float(prev_ts)) / 86400.0)
+            apr_pct = 0.0
+            if tvl_usd > 0.0 and fee_delta > 0.0 and days_delta > 0.0:
+                apr_pct = max(0.0, (fee_delta / tvl_usd) * (365.0 / days_delta) * 100.0)
+            items.append(
+                {
+                    "ts": int(ts),
+                    "apr_pct": float(apr_pct),
+                    "days": float(days_delta),
+                    "fee_delta_usd": float(fee_delta),
+                    "liquidity_usd": float(tvl_usd),
+                }
+            )
+            prev_ts = int(ts)
+            prev_cum = float(cum)
+        return items
+
     est_items_payload = _pack_fee_items(estimated_by_day) if estimated_by_day else []
 
     force_rpc = _position_fee_rpc_force_onchain()
@@ -25553,9 +25678,12 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             if usd_now_led > 0:
                 day_ts_led = (int(now_ts) // 86400) * 86400
                 snapshot_items_payload = [{"ts": int(day_ts_led), "fees_usd": float(usd_now_led)}]
+        apr_items_payload = _build_fee_apr_items(ledger_by_day)
+        debug["apr_items_count"] = int(len(apr_items_payload))
         return _with_debug({
             "items": _pack_fee_items(ledger_by_day),
             "snapshot_items": snapshot_items_payload,
+            "apr_items": apr_items_payload,
             "count": len(ledger_by_day),
             "mode": "npm-fee-ledger",
             "fee_pricing": pricing,
@@ -25778,11 +25906,14 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         return "no_subgraph_or_rpc_fee_data"
 
     if force_rpc and rpc_by_day:
+        apr_items_payload = _build_fee_apr_items(rpc_by_day)
+        debug["apr_items_count"] = int(len(apr_items_payload))
         collected_reason = "ok_rpc_collect_logs_forced"
         debug["result_mode"] = "onchain-collect-logs"
         debug["result_count"] = len(rpc_by_day)
         return _with_debug({
             "items": _pack_fee_items(rpc_by_day),
+            "apr_items": apr_items_payload,
             "count": len(rpc_by_day),
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
@@ -25792,6 +25923,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         })
 
     if exact_by_day and sub_max >= 1e-6 and not force_rpc:
+        apr_items_payload = _build_fee_apr_items(exact_by_day)
+        debug["apr_items_count"] = int(len(apr_items_payload))
         collected_reason = "ok_subgraph_exact_snapshots"
         snap_note = "Subgraph positionSnapshots collectedFees, valued in USD."
         if want_hist_usd:
@@ -25800,6 +25933,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         debug["result_count"] = len(exact_by_day)
         return _with_debug({
             "items": _pack_fee_items(exact_by_day),
+            "apr_items": apr_items_payload,
             "count": len(exact_by_day),
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
@@ -25808,11 +25942,14 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
         })
     if collect_by_shape and not force_rpc:
+        apr_items_payload = _build_fee_apr_items(collect_by_shape)
+        debug["apr_items_count"] = int(len(apr_items_payload))
         collected_reason = "ok_subgraph_collect_events"
         debug["result_mode"] = "subgraph-collect-events"
         debug["result_count"] = len(collect_by_shape)
         return _with_debug({
             "items": _pack_fee_items(collect_by_shape),
+            "apr_items": apr_items_payload,
             "count": len(collect_by_shape),
             "mode": "subgraph-collect-events",
             "fee_pricing": "subgraph_collect",
@@ -25821,11 +25958,14 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "estimated_mode": ("pool-share-daily-fees" if est_items_payload else "none"),
         })
     if rpc_by_day:
+        apr_items_payload = _build_fee_apr_items(rpc_by_day)
+        debug["apr_items_count"] = int(len(apr_items_payload))
         collected_reason = "ok_rpc_collect_logs"
         debug["result_mode"] = "onchain-collect-logs"
         debug["result_count"] = len(rpc_by_day)
         return _with_debug({
             "items": _pack_fee_items(rpc_by_day),
+            "apr_items": apr_items_payload,
             "count": len(rpc_by_day),
             "mode": "onchain-collect-logs",
             "fee_pricing": rpc_pricing,
@@ -25835,6 +25975,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         })
 
     if exact_by_day:
+        apr_items_payload = _build_fee_apr_items(exact_by_day)
+        debug["apr_items_count"] = int(len(apr_items_payload))
         collected_reason = ("subgraph_low_confidence_force_rpc_no_logs" if force_rpc else "subgraph_low_confidence")
         low_note = "Subgraph collectedFees (USD); may be incomplete where subgraph indexing is wrong."
         if want_hist_usd:
@@ -25843,6 +25985,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         debug["result_count"] = len(exact_by_day)
         return _with_debug({
             "items": _pack_fee_items(exact_by_day),
+            "apr_items": apr_items_payload,
             "count": len(exact_by_day),
             "mode": "exact-snapshots",
             "fee_pricing": "subgraph_snapshot",
@@ -25944,6 +26087,29 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
             out.append({"ts": ts, "fees_usd": float(max(0.0, v))})
         return out
 
+    def _norm_apr_items(raw: Any) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for x in (raw or []):
+            if not isinstance(x, dict):
+                continue
+            ts = int(x.get("ts") or 0)
+            apr_pct = _safe_float(x.get("apr_pct"))
+            days = max(0.0, _safe_float(x.get("days")))
+            fee_delta = max(0.0, _safe_float(x.get("fee_delta_usd")))
+            liq_usd = max(0.0, _safe_float(x.get("liquidity_usd")))
+            if ts <= 0:
+                continue
+            out.append(
+                {
+                    "ts": int(ts),
+                    "apr_pct": float(max(0.0, apr_pct)),
+                    "days": float(days),
+                    "fee_delta_usd": float(fee_delta),
+                    "liquidity_usd": float(liq_usd),
+                }
+            )
+        return out
+
     def _sum_series(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         m: dict[int, float] = {}
         for it in items:
@@ -25987,6 +26153,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
             items = _norm_fee_items(one.get("items") if isinstance(one.get("items"), list) else [])
             est_items = _norm_fee_items(one.get("estimated_items") if isinstance(one.get("estimated_items"), list) else [])
             snap_items_raw = _norm_fee_items(one.get("snapshot_items") if isinstance(one.get("snapshot_items"), list) else [])
+            apr_items = _norm_apr_items(one.get("apr_items") if isinstance(one.get("apr_items"), list) else [])
             collected_items: list[dict[str, Any]] = []
             snapshot_items: list[dict[str, Any]] = list(snap_items_raw)
             if mode == "row-unclaimed-fallback":
@@ -26029,6 +26196,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     "collected_items": collected_items,
                     "estimated_items": est_items,
                     "snapshot_items": snapshot_items,
+                    "apr_items": apr_items,
                     "elapsed_ms": int(elapsed_ms),
                     "synthetic_baseline": bool(synthetic),
                     "debug": ((one.get("debug") if isinstance(one.get("debug"), dict) else {}) if include_row_debug else {}),
@@ -26049,6 +26217,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     "collected_items": [],
                     "estimated_items": [],
                     "snapshot_items": [],
+                    "apr_items": [],
                     "elapsed_ms": int(elapsed_ms),
                 },
             }
@@ -26067,6 +26236,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     "collected_items": [],
                     "estimated_items": [],
                     "snapshot_items": [],
+                    "apr_items": [],
                     "elapsed_ms": int(elapsed_ms),
                 },
             }
@@ -26106,6 +26276,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                         "collected_items": [],
                         "estimated_items": [],
                         "snapshot_items": [],
+                        "apr_items": [],
                         "elapsed_ms": 0,
                     },
                 }
@@ -26137,6 +26308,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                                     "collected_items": [],
                                     "estimated_items": [],
                                     "snapshot_items": [],
+                                    "apr_items": [],
                                     "elapsed_ms": 0,
                                 },
                             }
@@ -26162,6 +26334,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                             "collected_items": [],
                             "estimated_items": [],
                             "snapshot_items": [],
+                            "apr_items": [],
                             "elapsed_ms": 0,
                         },
                     }
