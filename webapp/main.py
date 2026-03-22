@@ -20117,6 +20117,19 @@ def _render_positions_page() -> str:
         localStorage.setItem(POS_FEE_SCAN_CACHE_KEY, JSON.stringify({ts: Date.now(), byKey}));
       } catch (_) {}
     }
+    function clearFeeScanCacheKey(key) {
+      try {
+        const raw = localStorage.getItem(POS_FEE_SCAN_CACHE_KEY);
+        if (!raw) return;
+        const obj = JSON.parse(raw);
+        if (!obj || typeof obj !== "object") return;
+        const byKey = (obj && typeof obj.byKey === "object" && obj.byKey) ? obj.byKey : {};
+        const k = String(key || "");
+        if (!k || !(k in byKey)) return;
+        delete byKey[k];
+        localStorage.setItem(POS_FEE_SCAN_CACHE_KEY, JSON.stringify({ts: Date.now(), byKey}));
+      } catch (_) {}
+    }
     function saveLastFeeChartCache(traces, title) {
       try {
         const safeTraces = Array.isArray(traces) ? traces.slice(0, 80) : [];
@@ -20322,7 +20335,10 @@ def _render_positions_page() -> str:
         const estMissing = Number(d?.estimate_fallback_days_missing || 0);
         const estStatic = Number(d?.estimate_static_share_used || 0);
         const estSrc = String(d?.estimate_share_source || "").trim();
-        return `${meta.pairOrPool}: mode=${String(d?.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, ledger_points=${Number(d?.ledger_points || 0)}, subgraph_points=${Number(d?.subgraph_points || 0)}, rpc_points=${Number(d?.rpc_points || 0)}, pool_flow_source=${pf.source || "-"}, pool_flow_owner_src=${pf.ownerSrc || "-"}, pool_flow_collect_points=${pf.collectPoints}, pool_flow_events=${pf.eventsTotal}, pool_flow_chunks=${pf.chunksUsed}, pool_flow_truncated=${pf.truncated ? 1 : 0}, pool_flow_cached=${pf.cached ? 1 : 0}, pool_flow_explorer_req=${pf.explorerReq}, pool_flow_explorer_pages=${pf.explorerPages}${pf.explorerReason ? `, pool_flow_explorer_reason=${pf.explorerReason}` : ""}${pf.explorerStatus ? `, pool_flow_explorer_status=${pf.explorerStatus}` : ""}${pf.explorerMessage ? `, pool_flow_explorer_message=${pf.explorerMessage}` : ""}${pf.counts ? `, pool_flow_counts=${pf.counts}` : ""}`;
+        const perfEstimateMs = Number(d?.perf_estimate_ms || 0);
+        const perfLedgerMs = Number(d?.perf_ledger_ms || 0);
+        const perfAprMs = Number(d?.perf_apr_ms || 0);
+        return `${meta.pairOrPool}: mode=${String(d?.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, perf_estimate_ms=${perfEstimateMs}, perf_ledger_ms=${perfLedgerMs}, perf_apr_ms=${perfAprMs}, ledger_points=${Number(d?.ledger_points || 0)}, subgraph_points=${Number(d?.subgraph_points || 0)}, rpc_points=${Number(d?.rpc_points || 0)}, pool_flow_source=${pf.source || "-"}, pool_flow_owner_src=${pf.ownerSrc || "-"}, pool_flow_collect_points=${pf.collectPoints}, pool_flow_events=${pf.eventsTotal}, pool_flow_chunks=${pf.chunksUsed}, pool_flow_truncated=${pf.truncated ? 1 : 0}, pool_flow_cached=${pf.cached ? 1 : 0}, pool_flow_explorer_req=${pf.explorerReq}, pool_flow_explorer_pages=${pf.explorerPages}${pf.explorerReason ? `, pool_flow_explorer_reason=${pf.explorerReason}` : ""}${pf.explorerStatus ? `, pool_flow_explorer_status=${pf.explorerStatus}` : ""}${pf.explorerMessage ? `, pool_flow_explorer_message=${pf.explorerMessage}` : ""}${pf.counts ? `, pool_flow_counts=${pf.counts}` : ""}`;
       };
       const buildAprByTs = (aprItems) => {
         const out = new Map();
@@ -20548,6 +20564,23 @@ def _render_positions_page() -> str:
             const snapDt = new Date(snapTs * 1000);
             const snapDtLabel = snapDt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
             const snapLiq = esc(liqLabel && liqLabel !== "-" ? String(liqLabel) : "-");
+            if (!hasCollected) {
+              const createdMs = Number(meta.createdMs || 0);
+              const snapMs = Number(snapDt.getTime() || 0);
+              const anchorMs = (createdMs > 0 && createdMs < snapMs) ? createdMs : Math.max(0, snapMs - 86400000);
+              if (anchorMs > 0) {
+                traces.push({
+                  x: [new Date(anchorMs), snapDt],
+                  y: [0, snapMarkerVal],
+                  mode: "lines+markers",
+                  line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
+                  marker: {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
+                  name: `${legendBase} (today USD)`,
+                  hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+                });
+              }
+            }
+            if (hasCollected) {
             traces.push({
               x: [snapDt],
               y: [snapMarkerVal],
@@ -20557,6 +20590,7 @@ def _render_positions_page() -> str:
               name: `${legendBase} (collect points)`,
               hovertemplate: `${snapDtLabel}<br>$${Number(snapMarkerVal || 0).toFixed(2)}<br>Liquidity: ${snapLiq}<extra></extra>`,
             });
+            }
           }
         }
       }
@@ -20648,6 +20682,8 @@ def _render_positions_page() -> str:
           include_aggregate: false,
         };
         const feeCacheKey = buildFeeScanCacheKey(rowsPayload, histUsd);
+        // Force fresh compare data on every manual rebuild for stable repeatability.
+        clearFeeScanCacheKey(feeCacheKey);
         const cachedCompare = loadFeeScanCache(feeCacheKey);
         let res = null;
         let data = null;
@@ -20678,7 +20714,11 @@ def _render_positions_page() -> str:
           const t = Number(cmpDebug.elapsed_total_ms || 0);
           const to = Number(cmpDebug.timeout_rows || 0);
           const sb = Number(cmpDebug.synthetic_baseline_rows || 0);
-          backendHints.push(`compare: workers=${w || "-"}, elapsed_ms=${t || "-"}, timeout_rows=${to || 0}, baseline_rows=${sb || 0}`);
+          const rAvg = Number(cmpDebug.elapsed_avg_row_ms || 0);
+          const rP95 = Number(cmpDebug.elapsed_p95_row_ms || 0);
+          const rMax = Number(cmpDebug.elapsed_max_row_ms || 0);
+          const rSlow = Number(cmpDebug.slow_rows_10s || 0);
+          backendHints.push(`compare: workers=${w || "-"}, elapsed_ms=${t || "-"}, timeout_rows=${to || 0}, baseline_rows=${sb || 0}, row_avg_ms=${rAvg || 0}, row_p95_ms=${rP95 || 0}, row_max_ms=${rMax || 0}, slow_rows_10s=${rSlow || 0}`);
         }
         if (backendHints.length < 6) {
           const mode = getHistoryRangeMode();
@@ -20787,43 +20827,38 @@ def _render_positions_page() -> str:
         let overlayTraces = applyFeeTraceStyleByPair(traces, histUsd ? "historical" : "today", 1.0);
         if (histUsd) {
           try {
-            const preparedSpot = buildFeeCompareSelection(selected, false);
-            const rowsPayloadSpot = preparedSpot.rowsPayload || [];
-            if (rowsPayloadSpot.length) {
-              const compareReqSpot = {
-                rows: rowsPayloadSpot,
-                max_rows: rowsPayloadSpot.length,
-                include_aggregate: false,
-              };
-              const {res: resSpot, data: dataSpot} = await postJsonWithRetry("/api/positions/position-fee-compare-data", compareReqSpot, 3);
-              if (resSpot.ok) {
-                const rowsOutSpot = Array.isArray(dataSpot?.rows) ? dataSpot.rows : [];
-                const tracesSpot = [];
-                const diagSpot = preparedSpot.diag || {};
-                const rowStatusesSpot = preparedSpot.rowStatuses || [];
-                const payloadMetaSpot = preparedSpot.payloadMeta || [];
-                const apiFailTopSpot = [];
-                const backendHintsSpot = [];
-                const feeStateSpot = processFeeCompareRows(
-                  rowsOutSpot,
-                  payloadMetaSpot,
-                  palette,
-                  tracesSpot,
-                  rowStatusesSpot,
-                  apiFailTopSpot,
-                  backendHintsSpot,
-                  diagSpot,
-                  {showAprLabels: false},
-                );
-                if (tracesSpot.length) {
-                  const spotOverlay = applyFeeTraceStyleByPair(tracesSpot, "today", 0.78)
-                    .filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated)"));
-                  overlayTraces = overlayTraces.concat(spotOverlay);
-                  if (backendHints.length < 8) {
-                    backendHints.push(`dual_view_spot_rows: collected=${Number(feeStateSpot.rowsWithCollected || 0)}, estimated=${Number(feeStateSpot.rowsWithEstimated || 0)}, snapshot=${Number(feeStateSpot.rowsWithSnapshot || 0)}`);
-                  }
-                }
+            const rowsOutSpot = (rowsOut || []).map((r) => ({
+              ...(r && typeof r === "object" ? r : {}),
+              collected_items: Array.isArray(r?.alt_collected_items) ? r.alt_collected_items : [],
+              estimated_items: [],
+              snapshot_items: [],
+              apr_items: [],
+            }));
+            const tracesSpot = [];
+            const diagSpot = prepared.diag || {};
+            const rowStatusesSpot = prepared.rowStatuses || [];
+            const apiFailTopSpot = [];
+            const backendHintsSpot = [];
+            const feeStateSpot = processFeeCompareRows(
+              rowsOutSpot,
+              payloadMeta,
+              palette,
+              tracesSpot,
+              rowStatusesSpot,
+              apiFailTopSpot,
+              backendHintsSpot,
+              diagSpot,
+              {showAprLabels: false},
+            );
+            if (tracesSpot.length) {
+              const spotOverlay = applyFeeTraceStyleByPair(tracesSpot, "today", 0.78)
+                .filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated)"));
+              overlayTraces = overlayTraces.concat(spotOverlay);
+              if (backendHints.length < 8) {
+                backendHints.push(`dual_view_spot_local_reprice: collected=${Number(feeStateSpot.rowsWithCollected || 0)}`);
               }
+            } else if (backendHints.length < 8) {
+              backendHints.push("dual_view_spot_local_reprice: unavailable");
             }
           } catch (_) {
           }
@@ -25229,6 +25264,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         "budget_subgraph_sec": float(subgraph_budget_sec),
         "budget_rpc_sec": float(rpc_budget_sec),
     }
+    perf_estimate_started = time.monotonic()
+    perf_ledger_started = 0.0
     collected_reason = "unknown"
     estimated_reason = "not_requested"
 
@@ -25689,10 +25726,13 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         est_share = 0.0
         estimated_reason = "estimate_error"
         debug["estimate_error_detail"] = str(ex)[:220]
+    debug["perf_estimate_ms"] = int(max(0.0, (time.monotonic() - perf_estimate_started) * 1000.0))
     debug["estimated_points"] = int(len(estimated_by_day))
     debug["estimated_share"] = float(est_share)
 
+    perf_ledger_started = time.monotonic()
     ledger_by_day: dict[int, float] = {}
+    ledger_by_day_alt: dict[int, float] = {}
     ledger_pricing_modes: list[str] = []
     if protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"} and position_ids:
         try:
@@ -25705,6 +25745,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             if token_ids:
                 single_position_mode_hint = bool(len(position_ids) <= 1)
                 pricing_mode = ("historical" if bool(want_hist_usd) else "spot")
+                alt_pricing_mode = ("spot" if str(pricing_mode) == "historical" else "historical")
                 cache_hits = 0
                 cache_misses: list[int] = []
                 stale_cached_by_tid: dict[int, dict[int, float]] = {}
@@ -25726,6 +25767,16 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         cache_hits += 1
                         for ts, val in cached_one.items():
                             ledger_by_day[int(ts)] = float(ledger_by_day.get(int(ts), 0.0) + float(val))
+                        if bool(want_hist_usd):
+                            cached_alt = _load_v3_npm_fee_ledger_day_from_cache(
+                                int(chain_id),
+                                str(protocol),
+                                int(tid),
+                                since_ts=int(collect_since_ts),
+                                pricing_mode=str(alt_pricing_mode),
+                            )
+                            for ts, val in dict(cached_alt or {}).items():
+                                ledger_by_day_alt[int(ts)] = float(ledger_by_day_alt.get(int(ts), 0.0) + float(val))
                     else:
                         if cached_one:
                             stale_cached_by_tid[int(tid)] = dict(cached_one)
@@ -25792,12 +25843,35 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             src_map = dict(stale_cached_by_tid.get(int(tid)) or {})
                         for ts, val in src_map.items():
                             ledger_by_day[int(ts)] = float(ledger_by_day.get(int(ts), 0.0) + float(val))
+                        if bool(want_hist_usd):
+                            src_alt = _load_v3_npm_fee_ledger_day_from_cache(
+                                int(chain_id),
+                                str(protocol),
+                                int(tid),
+                                since_ts=int(collect_since_ts),
+                                pricing_mode=str(alt_pricing_mode),
+                            )
+                            if not src_alt:
+                                one_day_alt, _one_meta_alt = _build_v3_npm_fee_ledger_from_temp(
+                                    int(chain_id),
+                                    str(protocol),
+                                    int(tid),
+                                    since_ts=int(collect_since_ts),
+                                    token0_addr=str(token0 or ""),
+                                    token1_addr=str(token1 or ""),
+                                    use_historical_usd=(str(alt_pricing_mode) == "historical"),
+                                )
+                                src_alt = dict(one_day_alt or {})
+                            for ts, val in dict(src_alt or {}).items():
+                                ledger_by_day_alt[int(ts)] = float(ledger_by_day_alt.get(int(ts), 0.0) + float(val))
                 else:
                     debug["ledger_source"] = "cache"
                     debug["ledger_budget_sec"] = 0.0
         except Exception:
             ledger_by_day = {}
+    debug["perf_ledger_ms"] = int(max(0.0, (time.monotonic() - perf_ledger_started) * 1000.0))
     debug["ledger_points"] = int(len(ledger_by_day))
+    debug["ledger_alt_points"] = int(len(ledger_by_day_alt))
 
     def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
         return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
@@ -25829,7 +25903,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         return out
 
     def _build_fee_apr_items(collected_by_day: dict[int, float]) -> list[dict[str, Any]]:
+        t0 = time.monotonic()
         if not collected_by_day:
+            debug["perf_apr_ms"] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
             return []
         tvl_by_day = _position_tvl_by_day_for_apr()
         known_days = sorted(int(x) for x in tvl_by_day.keys() if int(x) > 0)
@@ -25863,6 +25939,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         else:
             fallback_liq_usd = _fallback_position_liquidity_usd()
             if fallback_liq_usd <= 0.0:
+                debug["perf_apr_ms"] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
                 return []
             debug["apr_liquidity_source"] = "row_in_position_fallback"
 
@@ -25880,6 +25957,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         items: list[dict[str, Any]] = []
         points_sorted = sorted(((int(k), float(v)) for k, v in collected_by_day.items()), key=lambda x: x[0])
         if not points_sorted:
+            debug["perf_apr_ms"] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
             return []
         debug["apr_mode"] = "segment_between_collects"
         first_ts = int(points_sorted[0][0])
@@ -25914,6 +25992,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             )
             prev_ts = int(ts)
             prev_cum = float(cum)
+        debug["perf_apr_ms"] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
         return items
 
     est_items_payload = _pack_fee_items(estimated_by_day) if estimated_by_day else []
@@ -25962,6 +26041,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         debug["apr_items_count"] = int(len(apr_items_payload))
         return _with_debug({
             "items": _pack_fee_items(ledger_by_day),
+            "alt_collected_items": _pack_fee_items(ledger_by_day_alt) if ledger_by_day_alt else [],
             "snapshot_items": snapshot_items_payload,
             "apr_items": apr_items_payload,
             "count": len(ledger_by_day),
@@ -26437,6 +26517,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
             collected_reason = str(one.get("collected_reason") or "").strip().lower() or "unknown"
             estimated_reason = str(one.get("estimated_reason") or "").strip().lower() or "unknown"
             items = _norm_fee_items(one.get("items") if isinstance(one.get("items"), list) else [])
+            alt_items = _norm_fee_items(one.get("alt_collected_items") if isinstance(one.get("alt_collected_items"), list) else [])
             est_items = _norm_fee_items(one.get("estimated_items") if isinstance(one.get("estimated_items"), list) else [])
             snap_items_raw = _norm_fee_items(one.get("snapshot_items") if isinstance(one.get("snapshot_items"), list) else [])
             apr_items = _norm_apr_items(one.get("apr_items") if isinstance(one.get("apr_items"), list) else [])
@@ -26480,6 +26561,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     "estimated_reason": estimated_reason,
                     "note": note,
                     "collected_items": collected_items,
+                    "alt_collected_items": alt_items,
                     "estimated_items": est_items,
                     "snapshot_items": snapshot_items,
                     "apr_items": apr_items,
@@ -26501,6 +26583,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     "error": str(e.detail),
                     "status_code": int(e.status_code),
                     "collected_items": [],
+                    "alt_collected_items": [],
                     "estimated_items": [],
                     "snapshot_items": [],
                     "apr_items": [],
@@ -26520,6 +26603,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
                     "error": str(e)[:220],
                     "status_code": 500,
                     "collected_items": [],
+                    "alt_collected_items": [],
                     "estimated_items": [],
                     "snapshot_items": [],
                     "apr_items": [],
@@ -26709,6 +26793,14 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     if include_debug_summary:
         total_elapsed_ms = int((time.monotonic() - started) * 1000.0)
         row_avg_ms = int(sum(per_row_elapsed_ms) / max(1, len(per_row_elapsed_ms))) if per_row_elapsed_ms else 0
+        row_max_ms = int(max(per_row_elapsed_ms)) if per_row_elapsed_ms else 0
+        row_p95_ms = 0
+        row_slow_10s = 0
+        if per_row_elapsed_ms:
+            vals = sorted(int(max(0, x)) for x in per_row_elapsed_ms)
+            idx95 = max(0, min(len(vals) - 1, int(math.ceil(0.95 * len(vals))) - 1))
+            row_p95_ms = int(vals[idx95])
+            row_slow_10s = int(sum(1 for x in vals if int(x) >= 10_000))
         out["debug"] = {
             "request_max_rows": int(lim),
             "include_row_debug": bool(include_row_debug),
@@ -26730,6 +26822,9 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
             "points_total": points_total,
             "elapsed_total_ms": int(total_elapsed_ms),
             "elapsed_avg_row_ms": int(row_avg_ms),
+            "elapsed_max_row_ms": int(row_max_ms),
+            "elapsed_p95_row_ms": int(row_p95_ms),
+            "slow_rows_10s": int(row_slow_10s),
             "errors_top": error_top,
         }
     return out
