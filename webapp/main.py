@@ -25011,6 +25011,52 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             except Exception:
                 if estimated_reason in {"liquidity_share_unavailable", "pool_fee_series_empty", "unknown", "not_requested"}:
                     estimated_reason = "position_tvl_snapshot_fallback_error"
+        # Third fallback: static share from any available position snapshot / pool TVL overlap.
+        if (not estimated_by_day) and position_ids and endpoint and str(req.pool_id or "").strip():
+            try:
+                pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
+                pool_tvl_days = _fetch_pool_tvl_series(chain_key, version, str(req.pool_id or ""), days)
+                if pool_fee_days and pool_tvl_days:
+                    pool_tvl_by_day = {int(ts): max(0.0, float(v)) for ts, v in pool_tvl_days}
+                    static_share = 0.0
+                    static_source = ""
+                    for pid in position_ids[:20]:
+                        p_series = _fetch_position_snapshot_series_exact(
+                            endpoint,
+                            pid,
+                            since_ts=since_ts,
+                            chain_id=chain_id,
+                        )
+                        for ts, v in p_series:
+                            dts = (int(ts) // 86400) * 86400
+                            p_tvl = max(0.0, float(v))
+                            pool_tvl = max(0.0, float(pool_tvl_by_day.get(dts, 0.0)))
+                            if p_tvl <= 0 or pool_tvl <= 0:
+                                continue
+                            s = max(0.0, min(1.0, p_tvl / pool_tvl))
+                            if s > 0:
+                                static_share = float(s)
+                                static_source = "position_snapshot_over_pool_tvl"
+                                break
+                        if static_share > 0:
+                            break
+                    if static_share > 0:
+                        cum_est = 0.0
+                        for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
+                            dts = (int(ts) // 86400) * 86400
+                            cum_est += max(0.0, float(fee_usd)) * float(static_share)
+                            estimated_by_day[dts] = float(cum_est)
+                        if estimated_by_day:
+                            est_share = float(static_share)
+                            estimated_reason = (
+                                "ok_pool_share_daily_turnover_x_fee_tier_from_static_snapshot_share"
+                                if str(fee_days_reason) == "ok_volume_x_fee_tier"
+                                else "ok_pool_share_daily_fees_from_static_snapshot_share"
+                            )
+                            debug["estimate_share_source"] = str(static_source)
+                            debug["estimate_static_share_used"] = float(static_share)
+            except Exception:
+                pass
         if not str(debug.get("estimate_share_source") or "").strip():
             debug["estimate_share_source"] = str(share_source)
     except Exception:
