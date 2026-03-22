@@ -18417,7 +18417,9 @@ def _render_positions_page() -> str:
     const POS_HEAVY_CLOSED_SORT_KEY = "positions_heavy_closed_sort_v1";
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
     const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
-    const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v2";
+    const POS_HISTORY_UI_STATE_KEY = "positions_history_ui_state_v1";
+    const POS_HISTORY_LAST_CHART_KEY = "positions_history_last_chart_v1";
+    const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v3";
     const POS_FEE_LAST_CHART_KEY = "positions_fee_last_chart_v1";
     const POS_FEE_CHART_HEIGHT_KEY = "positions_fee_chart_height_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
@@ -19391,6 +19393,7 @@ def _render_positions_page() -> str:
       }
       if (!c.checked && !d.checked) c.checked = true;
       if (daysInput) daysInput.disabled = !!c.checked;
+      saveHistoryUiState();
     }
     function getHistoryRangeMode() {
       const c = !!(document.getElementById("posHistoryFromCreation")?.checked);
@@ -19417,6 +19420,48 @@ def _render_positions_page() -> str:
       const clean = (s) => String(s || "").replace(/[^A-Z0-9._-]+/g, "").trim().toUpperCase();
       const out = [clean(a), clean(b)].filter(Boolean);
       return Array.from(new Set(out));
+    }
+    function saveHistoryUiState() {
+      try {
+        const payload = {
+          mode: getHistoryRangeMode(),
+          days: getHistoryDays(),
+          benchmarkOn: !!document.getElementById("posHistoryBenchmarkOn")?.checked,
+          benchA: String(document.getElementById("posHistoryBenchA")?.value || "BTC").trim().toUpperCase(),
+          benchB: String(document.getElementById("posHistoryBenchB")?.value || "ETH").trim().toUpperCase(),
+        };
+        localStorage.setItem(POS_HISTORY_UI_STATE_KEY, JSON.stringify(payload));
+      } catch (_) {}
+    }
+    function restoreHistoryUiState() {
+      try {
+        const raw = localStorage.getItem(POS_HISTORY_UI_STATE_KEY);
+        if (!raw) return;
+        const obj = JSON.parse(raw);
+        if (!obj || typeof obj !== "object") return;
+        const mode = String(obj.mode || "creation").toLowerCase();
+        const days = Math.max(1, Math.min(3650, Number(obj.days || 30) || 30));
+        const c = document.getElementById("posHistoryFromCreation");
+        const d = document.getElementById("posHistoryUseDays");
+        const daysInput = document.getElementById("posHistoryDays");
+        const bOn = document.getElementById("posHistoryBenchmarkOn");
+        const bA = document.getElementById("posHistoryBenchA");
+        const bB = document.getElementById("posHistoryBenchB");
+        if (daysInput) daysInput.value = String(days);
+        if (bOn) bOn.checked = !!obj.benchmarkOn;
+        if (bA) bA.value = String(obj.benchA || "BTC").trim().toUpperCase();
+        if (bB) bB.value = String(obj.benchB || "ETH").trim().toUpperCase();
+        if (c && d) onHistoryRangeModeChange(mode === "days" ? "days" : "creation");
+      } catch (_) {}
+    }
+    function bindHistoryUiStateAutosave() {
+      const ids = ["posHistoryDays", "posHistoryBenchmarkOn", "posHistoryBenchA", "posHistoryBenchB"];
+      for (const id of ids) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        const evt = (id === "posHistoryDays" || id === "posHistoryBenchA" || id === "posHistoryBenchB") ? "input" : "change";
+        el.addEventListener(evt, () => saveHistoryUiState());
+      }
     }
     function savePosResults(payload) {
       try {
@@ -19816,6 +19861,8 @@ def _render_positions_page() -> str:
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
+        saveHistoryUiState();
+        saveLastHistoryChartCache(traces, "Position TVL history", minCreatedMs, benchmarkCount);
         if (debugEl) {
           const minDays = usedDays.length ? Math.min(...usedDays) : 0;
           const maxDays = usedDays.length ? Math.max(...usedDays) : 0;
@@ -19920,6 +19967,69 @@ def _render_positions_page() -> str:
       if (lastRes) return {res: lastRes, data: lastData};
       const msg = String(lastErr?.message || "network error");
       return {res: {ok: false, status: 0}, data: {detail: msg}};
+    }
+    function saveLastHistoryChartCache(traces, title, minCreatedMs, benchmarkCount) {
+      try {
+        const safeTraces = Array.isArray(traces) ? traces.slice(0, 80) : [];
+        localStorage.setItem(
+          POS_HISTORY_LAST_CHART_KEY,
+          JSON.stringify({
+            ts: Date.now(),
+            title: String(title || "Position TVL history"),
+            traces: safeTraces,
+            minCreatedMs: Number(minCreatedMs || 0),
+            benchmarkCount: Number(benchmarkCount || 0),
+          }),
+        );
+      } catch (_) {}
+    }
+    async function restoreLastHistoryChartFromCache() {
+      const chartEl = document.getElementById("posPoolChart");
+      if (!chartEl) return false;
+      try {
+        const raw = localStorage.getItem(POS_HISTORY_LAST_CHART_KEY);
+        if (!raw) return false;
+        const obj = JSON.parse(raw);
+        if (!obj || typeof obj !== "object") return false;
+        const ts = Number(obj.ts || 0);
+        if (!ts || (Date.now() - ts) > 24 * 3600 * 1000) return false;
+        const traces = Array.isArray(obj.traces) ? obj.traces : [];
+        if (!traces.length) return false;
+        const ok = await ensurePlotly();
+        if (!ok) return false;
+        const minCreatedMs = Number(obj.minCreatedMs || 0);
+        const benchmarkCount = Number(obj.benchmarkCount || 0);
+        Plotly.newPlot("posPoolChart", traces, {
+          title: String(obj.title || "Position TVL history"),
+          paper_bgcolor: "#ffffff",
+          plot_bgcolor: "#f8fbff",
+          margin: {t: 34, b: 42, l: 54, r: 12},
+          xaxis: chartGridX(minCreatedMs, 5),
+          yaxis: chartGridY(true),
+          ...(benchmarkCount > 0 ? {
+            yaxis2: {
+              overlaying: "y",
+              side: "right",
+              showgrid: false,
+              title: "Benchmark (base=100)",
+            },
+          } : {}),
+          showlegend: true,
+          legend: {orientation: "h", y: -0.2},
+        }, {displaylogo: false, responsive: true});
+        setPosHistoryStatusBar({
+          state: "info",
+          title: "Show history",
+          selected: Number(posHistorySelected.size || 0),
+          traces: Number(traces.length || 0),
+          mode: getHistoryRangeMode(),
+          days: getHistoryDays(),
+          message: "History chart restored from cache",
+        });
+        return true;
+      } catch (_) {
+        return false;
+      }
     }
     function buildFeeScanCacheKey(rowsPayload, histUsd) {
       const src = (rowsPayload || []).map((r) => [
@@ -20552,7 +20662,7 @@ def _render_positions_page() -> str:
             const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
             const markerIn = (t && typeof t === "object" && t.marker && typeof t.marker === "object") ? t.marker : {};
             const modeLower = String(t?.mode || "").toLowerCase();
-            const isEstimated = name.toLowerCase().includes("(estimated)");
+            const isEstimated = name.toLowerCase().includes("(estimated");
             const isMarkerOnly = modeLower === "markers";
             const base = toLegendBase(name) || name;
             const color = getPairColor(base);
@@ -20681,11 +20791,11 @@ def _render_positions_page() -> str:
           title: "Collected + estimated fees (USD)" + mainTitleSuffix,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
-          margin: {t: 34, b: 42, l: 54, r: 12},
+          margin: {t: 34, b: 120, l: 54, r: 12},
           xaxis: chartGridX(minCreatedMs, 20),
           yaxis: chartGridY(true),
           showlegend: true,
-          legend: {orientation: "v", x: 0, y: -0.05, tracegroupgap: 8},
+          legend: {orientation: "h", x: 0, xanchor: "left", y: -0.24, yanchor: "top", tracegroupgap: 8},
         }, {displaylogo: false, responsive: true});
         saveLastFeeChartCache(overlayTraces, "Collected + estimated fees (USD)" + mainTitleSuffix);
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
@@ -21955,6 +22065,8 @@ def _render_positions_page() -> str:
     }
     loadPosState();
     onHistoryRangeModeChange("creation");
+    restoreHistoryUiState();
+    bindHistoryUiStateAutosave();
     bindClosedBgEnrichOption();
     renderAllChips();
     setSectionCollapsed("pools", false);
@@ -21992,6 +22104,7 @@ def _render_positions_page() -> str:
       setPosFeeStatus("Select History checkboxes, then click Build chart", false);
     }
     restoreFeeChartHeightControl();
+    restoreLastHistoryChartFromCache();
     restoreLastFeeChartFromCache();
     resumePosJobIfAny();
     const savedHeavy = loadHeavyPosResults();
