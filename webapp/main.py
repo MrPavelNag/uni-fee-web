@@ -13811,6 +13811,84 @@ def _fetch_pool_fee_tier_fraction(endpoint: str, pool_id: str) -> float:
         return 0.0
 
 
+def _parse_fee_tier_fraction_from_raw(raw: Any) -> float:
+    s = str(raw or "").strip().replace("%", "")
+    if not s or s == "-":
+        return 0.0
+    try:
+        val = float(s)
+    except Exception:
+        return 0.0
+    if not math.isfinite(val) or val <= 0:
+        return 0.0
+    # Common formats:
+    # - 3000 (Uniswap millionths) => 0.003
+    # - 0.3 (percent-like from UI) => 0.003
+    # - 0.003 (fraction) => 0.003
+    if val >= 100:
+        return max(0.0, min(1.0, val / 1_000_000.0))
+    if val >= 1:
+        return max(0.0, min(1.0, val / 100.0))
+    return max(0.0, min(1.0, val))
+
+
+def _fetch_pool_volume_usd_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
+    endpoint = get_graph_endpoint(chain_key, version=version)
+    if not endpoint:
+        return []
+    now_ts = int(time.time())
+    since_ts = now_ts - max(1, int(days)) * 86400
+    vars_base = {"pool": str(pool_id or "").strip().lower(), "since": int(since_ts)}
+    attempts = [
+        """
+        query PoolVolumeDays($pool: String!, $since: Int!) {
+          poolDayDatas(
+            first: 400
+            orderBy: date
+            orderDirection: asc
+            where: { pool: $pool, date_gte: $since }
+          ) {
+            date
+            volumeUSD
+          }
+        }
+        """,
+        """
+        query PoolVolumeDays($pool: String!, $since: Int!) {
+          poolDayDatas(
+            first: 400
+            orderBy: date
+            orderDirection: asc
+            where: { pool: $pool, date_gte: $since }
+          ) {
+            date
+            dailyVolumeUSD
+          }
+        }
+        """,
+    ]
+    for q in attempts:
+        try:
+            data = graphql_query(endpoint, q, vars_base, retries=1)
+            rows = (data.get("data") or {}).get("poolDayDatas") or []
+            out: list[tuple[int, float]] = []
+            for r in rows:
+                ts = int(r.get("date") or 0)
+                if ts <= 0:
+                    continue
+                vol = _safe_float(r.get("volumeUSD"))
+                if vol <= 0:
+                    vol = _safe_float(r.get("dailyVolumeUSD"))
+                if vol < 0:
+                    continue
+                out.append((ts, max(0.0, float(vol))))
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
+
+
 def _fetch_pool_token_ids(endpoint: str, pool_id: str) -> tuple[str, str]:
     pool_lc = str(pool_id or "").strip().lower()
     if not endpoint or not pool_lc:
@@ -14499,6 +14577,127 @@ def _explorer_get_logs_for_pool_events(
     }
 
 
+def _explorer_get_logs_for_npm_token_events(
+    chain_id: int,
+    pm_contract: str,
+    token_id: int,
+    *,
+    from_block: int,
+    to_block: int,
+    topic0s: list[str],
+    max_pages: int = 120,
+    offset: int = 1000,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cid = int(chain_id)
+    pm = str(pm_contract or "").strip().lower()
+    tid = int(token_id)
+    if cid <= 0 or not _is_eth_address(pm) or tid <= 0:
+        return [], {"source": "explorer_api_logs", "reason": "invalid_input"}
+    templates = _explorer_logs_templates_for_chain(cid)
+    if not templates:
+        return [], {"source": "explorer_api_logs", "reason": "no_explorer_templates"}
+    if not topic0s:
+        return [], {"source": "explorer_api_logs", "reason": "no_topics"}
+    lim_pages = max(1, min(240, int(max_pages or 120)))
+    lim_off = max(10, min(1000, int(offset or 1000)))
+    topic1 = "0x" + _encode_uint_word(int(tid))
+    all_logs: list[dict[str, Any]] = []
+    pages_used = 0
+    req_used = 0
+    template_used = ""
+    topic_used = ""
+    status_seen = ""
+    message_seen = ""
+    for tmpl in templates:
+        local_any: list[dict[str, Any]] = []
+        topic_hits: list[str] = []
+        for t0 in topic0s:
+            req_page = 1
+            local_logs: list[dict[str, Any]] = []
+            while req_page <= lim_pages:
+                url = (
+                    f"{tmpl}&fromBlock={hex(int(from_block))}&toBlock={hex(int(to_block))}&address={pm}"
+                    f"&topic0={str(t0)}&topic1={topic1}&page={int(req_page)}&offset={int(lim_off)}"
+                )
+                req_used += 1
+                payload: dict[str, Any] = {}
+                try:
+                    req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+                    with urlopen(req, timeout=float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)) as resp:
+                        payload = json.loads(resp.read().decode("utf-8"))
+                except Exception:
+                    payload = {}
+                status_seen = str((payload or {}).get("status") or status_seen)
+                message_seen = str((payload or {}).get("message") or message_seen)
+                result_rows = _etherscan_api_coerce_result_rows((payload or {}).get("result"))
+                if not result_rows:
+                    break
+                for r in result_rows:
+                    if not isinstance(r, dict):
+                        continue
+                    txh = str((r.get("transactionHash") or r.get("hash") or "")).strip().lower()
+                    topics = r.get("topics")
+                    if not isinstance(topics, list):
+                        topics = []
+                        for k in ("topic0", "topic1", "topic2", "topic3"):
+                            tv = str(r.get(k) or "").strip().lower()
+                            if tv:
+                                topics.append(tv)
+                    local_logs.append(
+                        {
+                            "transactionHash": txh,
+                            "blockNumber": r.get("blockNumber"),
+                            "logIndex": r.get("logIndex"),
+                            "data": r.get("data"),
+                            "topics": topics,
+                        }
+                    )
+                pages_used += 1
+                if len(result_rows) < int(lim_off):
+                    break
+                req_page += 1
+                time.sleep(0.10)
+            if local_logs:
+                local_any.extend(local_logs)
+                topic_hits.append(str(t0))
+        if local_any:
+            all_logs.extend(local_any)
+            template_used = str(tmpl).split("&apikey=", 1)[0]
+            topic_used = ",".join(topic_hits[:8])
+            break
+    if not all_logs:
+        return [], {
+            "source": "explorer_api_logs",
+            "reason": "no_records",
+            "requests": int(req_used),
+            "pages": int(pages_used),
+            "status": str(status_seen),
+            "message": str(message_seen),
+        }
+    dedup: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for lg in all_logs:
+        txh = str((lg or {}).get("transactionHash") or "").strip().lower()
+        lix = _eth_uint_from_rpc_field((lg or {}).get("logIndex"))
+        t0 = str(((lg or {}).get("topics") or [""])[0] or "").strip().lower()
+        if not txh:
+            continue
+        k = "|".join([txh, str(int(lix)), t0])
+        if k in seen:
+            continue
+        seen.add(k)
+        dedup.append(lg)
+    return dedup, {
+        "source": "explorer_api_logs",
+        "requests": int(req_used),
+        "pages": int(pages_used),
+        "template": template_used,
+        "topic0": topic_used,
+        "status": str(status_seen),
+        "message": str(message_seen),
+    }
+
+
 def _collect_v3_pool_flow_events_temp(
     chain_id: int,
     protocol: str,
@@ -14969,6 +15168,10 @@ def _scan_v3_npm_fee_events_to_temp(
     deadline_hit = False
     progress_done = 0
     progress_pending = 0
+    explorer_requests = 0
+    explorer_pages = 0
+    explorer_status = ""
+    explorer_message = ""
 
     def _progress_get(conn: sqlite3.Connection, tid: int) -> tuple[int, int]:
         row = conn.execute(
@@ -15099,6 +15302,88 @@ def _scan_v3_npm_fee_events_to_temp(
                 if done_now:
                     progress_done += 1
                     break
+            # RPC chunk budget may leave old range uncovered; for small token set,
+            # backfill complete history via explorer getLogs by tokenId.
+            if cur_to >= int(from_block) and (not deadline_hit):
+                exp_logs, exp_meta = _explorer_get_logs_for_npm_token_events(
+                    int(cid),
+                    str(pm),
+                    int(tid),
+                    from_block=int(from_block),
+                    to_block=int(latest),
+                    topic0s=list(all_topic0),
+                    max_pages=160,
+                    offset=1000,
+                )
+                explorer_requests += int((exp_meta or {}).get("requests") or 0)
+                explorer_pages += int((exp_meta or {}).get("pages") or 0)
+                if str((exp_meta or {}).get("status") or "").strip():
+                    explorer_status = str((exp_meta or {}).get("status") or "")
+                if str((exp_meta or {}).get("message") or "").strip():
+                    explorer_message = str((exp_meta or {}).get("message") or "")
+                if exp_logs:
+                    batch_rows: list[tuple[Any, ...]] = []
+                    for lg in exp_logs:
+                        if not isinstance(lg, dict):
+                            continue
+                        topics = [str(x or "").strip().lower() for x in (lg.get("topics") or [])]
+                        if not topics:
+                            continue
+                        ev = str(topic_to_name.get(str(topics[0])) or "").strip().lower()
+                        if ev not in {"collect", "decrease", "increase"}:
+                            continue
+                        blk = _eth_uint_from_rpc_field(lg.get("blockNumber"))
+                        lix = _eth_uint_from_rpc_field(lg.get("logIndex"))
+                        txh = str(lg.get("transactionHash") or "").strip().lower()
+                        if blk <= 0 or lix < 0 or not txh:
+                            continue
+                        ts = block_ts_cache.get(int(blk))
+                        if ts is None:
+                            ts = int(_eth_get_block_timestamp(cid, int(blk)) or 0)
+                            block_ts_cache[int(blk)] = ts
+                        if ts <= 0 or int(ts) < int(since_ts):
+                            continue
+                        liq_raw = 0
+                        a0_raw = 0
+                        a1_raw = 0
+                        dhex = str(lg.get("data") or "")
+                        if ev == "collect":
+                            a0_raw, a1_raw = _decode_v3_npm_collect_log_amounts_raw(dhex)
+                        else:
+                            liq_raw, a0_raw, a1_raw = _decode_v3_npm_liq_amounts_raw(dhex)
+                        by_type[ev] = int(by_type.get(ev, 0) + 1)
+                        events_total += 1
+                        batch_rows.append(
+                            (
+                                int(cid),
+                                str(proto),
+                                int(tid),
+                                int(blk),
+                                int(lix),
+                                str(txh),
+                                int(ts),
+                                str(ev),
+                                str(int(a0_raw)),
+                                str(int(a1_raw)),
+                                str(int(liq_raw)),
+                                float(ts_now),
+                            )
+                        )
+                    if batch_rows:
+                        before = int(conn.total_changes)
+                        conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO temp_npm_fee_events(
+                              chain_id, protocol, token_id, block_number, log_index, tx_hash, ts, event_name,
+                              amount0_raw, amount1_raw, liquidity_raw, inserted_at
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            batch_rows,
+                        )
+                        inserted += max(0, int(conn.total_changes) - int(before))
+                    _progress_set(conn, int(tid), int(from_block) - 1, True)
+                    progress_done += 1
+                    cur_to = int(from_block) - 1
             if cur_to >= int(from_block):
                 progress_pending += 1
         conn.commit()
@@ -15114,6 +15399,10 @@ def _scan_v3_npm_fee_events_to_temp(
         "event_counts": by_type,
         "progress_done_tokens": int(progress_done),
         "progress_pending_tokens": int(progress_pending),
+        "explorer_requests": int(explorer_requests),
+        "explorer_pages": int(explorer_pages),
+        "explorer_status": str(explorer_status),
+        "explorer_message": str(explorer_message),
     }
 
 
@@ -16904,6 +17193,8 @@ class PositionPoolSeriesRequest(BaseModel):
     position_amount0: float = 0.0
     position_amount1: float = 0.0
     pool_token0_price: float = 0.0
+    fee_tier_raw: str = ""
+    fee_tier: str = ""
     # When true, NPM Collect log series uses CoinGecko historical prices at each event (stables $1).
     fee_usd_historical: bool = False
 
@@ -17854,7 +18145,8 @@ def _render_positions_page() -> str:
       max-width: 100%;
     }
     #posFeeStatus { font-size:15px; font-weight:600; color:#334155; }
-    #posFeeStatus.fee-status-bar {
+    #posFeeStatus.fee-status-bar,
+    #posHistoryStatus.fee-status-bar {
       display: inline-flex;
       align-items: center;
       gap: 7px;
@@ -18793,34 +19085,73 @@ def _render_positions_page() -> str:
       const el = document.getElementById("posFeeStatus");
       if (!el) return;
       const state = String(opts.state || "info").toLowerCase();
-      const tone = state === "ok" ? "ok" : (state === "error" ? "err" : (state === "warn" ? "warn" : "info"));
       const title = String(opts.title || "Fee calculation");
-      const pills = [];
       const selected = Number(opts.selected || 0);
       const withData = Number(opts.withData || 0);
-      if (selected > 0) pills.push(feeStatusPill("Rows", `${withData}/${selected}`, tone));
-      if (Number(opts.collected || 0) > 0 || selected > 0) pills.push(feeStatusPill("Collected", Number(opts.collected || 0), Number(opts.collected || 0) > 0 ? "ok" : tone));
-      if (Number(opts.estimated || 0) > 0 || selected > 0) pills.push(feeStatusPill("Estimated", Number(opts.estimated || 0), Number(opts.estimated || 0) > 0 ? "ok" : tone));
-      if (Number(opts.snapshot || 0) > 0 || selected > 0) pills.push(feeStatusPill("Snapshot", Number(opts.snapshot || 0), Number(opts.snapshot || 0) > 0 ? "ok" : tone));
+      const collected = Number(opts.collected || 0);
+      const estimated = Number(opts.estimated || 0);
+      const snapshot = Number(opts.snapshot || 0);
       const mode = String(opts.mode || "").trim();
-      if (mode) pills.push(feeStatusPill("Mode", mode, "info"));
       const missing = Number(opts.missing || 0);
-      if (missing > 0) pills.push(feeStatusPill("Missing", missing, "warn"));
       const timeoutRows = Number(opts.timeoutRows || 0);
-      if (timeoutRows > 0) pills.push(feeStatusPill("Timeout", timeoutRows, "warn"));
       const baselineRows = Number(opts.baselineRows || 0);
-      if (baselineRows > 0) pills.push(feeStatusPill("Baseline", baselineRows, "info"));
+      const msg = String(opts.message || "").trim();
+      const progress = Math.max(0, Math.min(100, Number(opts.progress || 0)));
+      const elapsedSec = Math.max(0, Number(opts.elapsedSec || 0));
+      const stage = String(opts.stage || "").trim();
+      const parts = [];
+      if (state === "loading") {
+        parts.push(`${title}: ${progress}%`);
+        if (elapsedSec > 0) parts.push(`${Math.round(elapsedSec)}s`);
+        if (stage) parts.push(stage);
+        if (selected > 0) parts.push(`rows ${withData}/${selected}`);
+        if (msg) parts.push(msg);
+        el.classList.remove("fee-status-bar");
+        el.style.color = "#475569";
+        el.textContent = parts.join(" | ");
+        return;
+      }
+      parts.push(`${title}: ${msg || (state === "ok" ? "Done" : (state === "warn" ? "Partial" : "Error"))}`);
+      if (selected > 0) parts.push(`rows ${withData}/${selected}`);
+      if (selected > 0 || collected > 0 || estimated > 0 || snapshot > 0) {
+        parts.push(`collected ${collected}, estimated ${estimated}, snapshot ${snapshot}`);
+      }
+      if (mode) parts.push(`mode ${mode}`);
+      if (missing > 0) parts.push(`missing ${missing}`);
+      if (timeoutRows > 0) parts.push(`timeout ${timeoutRows}`);
+      if (baselineRows > 0) parts.push(`baseline ${baselineRows}`);
+      if (elapsedSec > 0) parts.push(`${Math.round(elapsedSec)}s`);
+      el.classList.remove("fee-status-bar");
+      el.style.color = state === "error" ? "#b91c1c" : (state === "warn" ? "#92400e" : "#475569");
+      el.textContent = parts.join(" | ");
+    }
+    function setPosHistoryStatus(text, isErr) {
+      const el = document.getElementById("posHistoryStatus");
+      if (!el) return;
+      el.classList.remove("fee-status-bar");
+      el.textContent = text || "";
+      el.style.color = isErr ? "#b91c1c" : "#475569";
+    }
+    function setPosHistoryStatusBar(opts = {}) {
+      const el = document.getElementById("posHistoryStatus");
+      if (!el) return;
+      const state = String(opts.state || "info").toLowerCase();
+      const tone = state === "ok" ? "ok" : (state === "error" ? "err" : (state === "warn" ? "warn" : "info"));
+      const title = String(opts.title || "Show history");
+      const pills = [];
+      const selected = Number(opts.selected || 0);
+      const traces = Number(opts.traces || 0);
+      const benchmark = Number(opts.benchmark || 0);
+      const mode = String(opts.mode || "").trim();
+      const days = Number(opts.days || 0);
+      if (selected > 0 || traces > 0) pills.push(feeStatusPill("Rows", `${traces}/${selected || 0}`, tone));
+      if (benchmark > 0) pills.push(feeStatusPill("Benchmark", benchmark, "info"));
+      if (mode) pills.push(feeStatusPill("Range", mode === "creation" ? "from creation" : `last ${Math.max(1, days)}d`, "info"));
       const msg = String(opts.message || "").trim();
       if (msg) pills.push(feeStatusPill("Status", msg, tone));
       el.classList.add("fee-status-bar");
       el.style.color = "#334155";
       el.innerHTML = `<span class="fee-status-title">${esc(title)}</span>${pills.join("")}`;
-    }
-    function setPosHistoryStatus(text, isErr) {
-      const el = document.getElementById("posHistoryStatus");
-      if (!el) return;
-      el.textContent = text || "";
-      el.style.color = isErr ? "#b91c1c" : "#475569";
     }
     async function startBackgroundWarmup(reason = "auto") {
       if (posAutoWarmupInFlight) return;
@@ -19330,11 +19661,25 @@ def _render_positions_page() -> str:
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
-        setPosHistoryStatus("Select at least one History checkbox in the V3 or v4 / Pancake V3 Farming / Infinity table.", true);
+        setPosHistoryStatusBar({
+          state: "error",
+          title: "Show history",
+          selected: 0,
+          traces: 0,
+          message: "Select at least one History checkbox",
+        });
         return;
       }
       try {
-        setPosHistoryStatus("Loading history...", false);
+        setPosHistoryStatusBar({
+          state: "loading",
+          title: "Show history",
+          selected: selected.length,
+          traces: 0,
+          mode: getHistoryRangeMode(),
+          days: getHistoryDays(),
+          message: "Loading history",
+        });
         const ok = await ensurePlotly();
         if (!ok) throw new Error("Failed to load chart library");
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
@@ -19390,7 +19735,16 @@ def _render_positions_page() -> str:
         }
         if (!traces.length) {
           chartEl.innerHTML = "<div class='hint'>No historical data found for selected rows.</div>";
-          setPosHistoryStatus("No history data", false);
+          setPosHistoryStatusBar({
+            state: "warn",
+            title: "Show history",
+            selected: selected.length,
+            traces: 0,
+            benchmark: 0,
+            mode,
+            days: getHistoryDays(),
+            message: "No history data",
+          });
           return;
         }
         let benchmarkCount = 0;
@@ -19457,14 +19811,31 @@ def _render_positions_page() -> str:
           debugEl.innerHTML = lines.join("<br/>");
           debugEl.style.display = "";
         }
-        setPosHistoryStatus(`History loaded for ${traces.length} position(s).`, false);
+        setPosHistoryStatusBar({
+          state: "ok",
+          title: "Show history",
+          selected: selected.length,
+          traces: traces.length,
+          benchmark: benchmarkCount,
+          mode,
+          days: getHistoryDays(),
+          message: "History loaded",
+        });
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Failed to load chart: ${esc(e?.message || "unknown")}</div>`;
         if (debugEl) {
           debugEl.innerHTML = `<b>History chart debug</b><br/>Error: ${esc(e?.message || "unknown")}`;
           debugEl.style.display = "";
         }
-        setPosHistoryStatus("History load failed", true);
+        setPosHistoryStatusBar({
+          state: "error",
+          title: "Show history",
+          selected: selected.length,
+          traces: 0,
+          mode: getHistoryRangeMode(),
+          days: getHistoryDays(),
+          message: "History load failed",
+        });
       }
     }
     function renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints) {
@@ -19603,6 +19974,8 @@ def _render_positions_page() -> str:
           position_amount0: Number(row.position_amount0 || 0),
           position_amount1: Number(row.position_amount1 || 0),
           pool_token0_price: Number(row.pool_token0_price || 0),
+          fee_tier_raw: String(row.fee_tier_raw || ""),
+          fee_tier: String(row.fee_tier || ""),
           fee_usd_historical: histUsd,
         });
         payloadMeta.push({
@@ -19808,8 +20181,41 @@ def _render_positions_page() -> str:
         setPosFeeStatus("Select at least one History checkbox in the Scan table", true);
         return;
       }
+      const feeStartedAt = Date.now();
+      let feeStatusTimer = null;
+      const stopFeeStatusTimer = () => {
+        if (feeStatusTimer) {
+          clearInterval(feeStatusTimer);
+          feeStatusTimer = null;
+        }
+      };
+      const startFeeStatusTimer = () => {
+        const stages = [
+          "Prepare rows",
+          "Build fee ledger",
+          "Collect history",
+          "Apply USD pricing",
+          "Render chart",
+        ];
+        const tick = () => {
+          const elapsed = Math.max(0, Math.floor((Date.now() - feeStartedAt) / 1000));
+          const pct = Math.max(1, Math.min(94, Math.floor((elapsed / 60) * 100)));
+          const stageIdx = Math.min(stages.length - 1, Math.floor((pct / 100) * stages.length));
+          setPosFeeStatusBar({
+            state: "loading",
+            title: "Fee scan",
+            selected: selected.length,
+            withData: 0,
+            progress: pct,
+            elapsedSec: elapsed,
+            stage: stages[stageIdx],
+          });
+        };
+        tick();
+        feeStatusTimer = setInterval(tick, 900);
+      };
       try {
-        setPosFeeStatusBar({state: "loading", title: "Fee calculation", message: "Loading fees", selected: selected.length, withData: 0});
+        startFeeStatusTimer();
         const ok = await ensurePlotly();
         if (!ok) throw new Error("Failed to load chart library");
         const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
@@ -19825,9 +20231,10 @@ def _render_positions_page() -> str:
         const payloadMeta = prepared.payloadMeta;
         const minCreatedMs = Number(prepared.minCreatedMs || 0);
         if (!rowsPayload.length) {
+          stopFeeStatusTimer();
           chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
-          setPosFeeStatusBar({state: "error", title: "Fee calculation", message: "No valid selected rows", selected: selected.length, withData: 0});
+          setPosFeeStatusBar({state: "error", title: "Fee scan", message: "No valid selected rows", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
 
@@ -19838,9 +20245,10 @@ def _render_positions_page() -> str:
         };
         const {res, data} = await postJsonWithRetry("/api/positions/position-fee-compare-data", compareReq, 3);
         if (!res.ok) {
+          stopFeeStatusTimer();
           const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
           chartEl.innerHTML = `<div class='hint'>Failed to load compare data: ${esc(det)}</div>`;
-          setPosFeeStatusBar({state: "error", title: "Fee calculation", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0});
+          setPosFeeStatusBar({state: "error", title: "Fee scan", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
 
@@ -19871,6 +20279,7 @@ def _render_positions_page() -> str:
           diag,
         );
         if (!traces.length) {
+          stopFeeStatusTimer();
           const reasons = [];
           if (diag.unsupported > 0) reasons.push(`unsupported protocol: ${diag.unsupported}`);
           if (diag.apiFail > 0) reasons.push(`API errors: ${diag.apiFail}`);
@@ -19883,7 +20292,7 @@ def _render_positions_page() -> str:
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatusBar({
             state: "warn",
-            title: "Fee calculation",
+            title: "Fee scan",
             message: `No fee data · ${reasonLine}`,
             selected: Number(diag.selected || 0),
             withData: 0,
@@ -19891,6 +20300,7 @@ def _render_positions_page() -> str:
             estimated: 0,
             snapshot: 0,
             mode: feeState.lastFeePricing || "",
+            elapsedSec: (Date.now() - feeStartedAt) / 1000,
           });
           return;
         }
@@ -19909,10 +20319,11 @@ def _render_positions_page() -> str:
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
         const baselineRows = Number(cmpDebug.synthetic_baseline_rows || 0);
+        stopFeeStatusTimer();
         if (feeState.hasEstimatedShareTrace && feeState.hasCollectedHistoryTrace) {
           setPosFeeStatusBar({
             state: "ok",
-            title: "Fee calculation",
+            title: "Fee scan",
             message: "Collected + estimate ready",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
@@ -19923,11 +20334,12 @@ def _render_positions_page() -> str:
             missing,
             timeoutRows,
             baselineRows,
+            elapsedSec: (Date.now() - feeStartedAt) / 1000,
           });
         } else if ((feeState.hasEstimatedShareTrace || feeState.hasSnapshotOnlyTrace) && !feeState.hasCollectedHistoryTrace) {
           setPosFeeStatusBar({
             state: "warn",
-            title: "Fee calculation",
+            title: "Fee scan",
             message: "Estimate/snapshot only",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
@@ -19938,11 +20350,12 @@ def _render_positions_page() -> str:
             missing,
             timeoutRows,
             baselineRows,
+            elapsedSec: (Date.now() - feeStartedAt) / 1000,
           });
         } else {
           setPosFeeStatusBar({
             state: "ok",
-            title: "Fee calculation",
+            title: "Fee scan",
             message: "Done",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
@@ -19953,16 +20366,18 @@ def _render_positions_page() -> str:
             missing,
             timeoutRows,
             baselineRows,
+            elapsedSec: (Date.now() - feeStartedAt) / 1000,
           });
         }
         renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
       } catch (e) {
+        stopFeeStatusTimer();
         chartEl.innerHTML = `<div class='hint'>Error: ${esc(e?.message || "unknown")}</div>`;
         if (debugEl) {
           debugEl.innerHTML = `<b>Debug</b><br/>Unexpected UI error: ${esc(e?.message || "unknown")}`;
           debugEl.style.display = "";
         }
-        setPosFeeStatusBar({state: "error", title: "Fee calculation", message: "Failed to build chart", selected: selected.length, withData: 0});
+        setPosFeeStatusBar({state: "error", title: "Fee scan", message: "Failed to build chart", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
       }
     }
     function normPosSym(v) {
@@ -21171,12 +21586,28 @@ def _render_positions_page() -> str:
       posHasScannedOnce = true;
       updatePosSearchButton();
       setPosStatus(`Restored cached results. Pools: ${saved.pool_positions.length}`, false);
-      setPosHistoryStatus("Cached results restored.", false);
+      setPosHistoryStatusBar({
+        state: "info",
+        title: "Show history",
+        selected: 0,
+        traces: 0,
+        mode: getHistoryRangeMode(),
+        days: getHistoryDays(),
+        message: "Cached results restored",
+      });
       setPosFeeStatus("Cache restored — you can click Scan under Fee calculation.", false);
     } else {
       updatePosSearchButton();
       setPosStatus("Ready", false);
-      setPosHistoryStatus("Select pools and click Search", false);
+      setPosHistoryStatusBar({
+        state: "info",
+        title: "Show history",
+        selected: 0,
+        traces: 0,
+        mode: getHistoryRangeMode(),
+        days: getHistoryDays(),
+        message: "Select pools and click Search",
+      });
       setPosFeeStatus("Select History checkboxes, then click Scan", false);
     }
     resumePosJobIfAny();
@@ -24409,6 +24840,30 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     estimated_by_day: dict[int, float] = {}
     est_share = 0.0
     try:
+        def _estimated_pool_fee_days() -> tuple[list[tuple[int, float]], str]:
+            pool_id_raw = str(req.pool_id or "").strip()
+            if not pool_id_raw:
+                return [], "missing_pool_id"
+            fee_tier = _parse_fee_tier_fraction_from_raw(getattr(req, "fee_tier_raw", ""))
+            if fee_tier <= 0:
+                fee_tier = _parse_fee_tier_fraction_from_raw(getattr(req, "fee_tier", ""))
+            if fee_tier <= 0 and endpoint:
+                fee_tier = _fetch_pool_fee_tier_fraction(endpoint, pool_id_raw)
+            debug["estimate_fee_tier_fraction"] = float(fee_tier)
+            volume_days = _fetch_pool_volume_usd_series(chain_key, version, pool_id_raw, days)
+            debug["estimate_volume_days"] = int(len(volume_days))
+            if volume_days and fee_tier > 0:
+                out = [(int(ts), max(0.0, float(vol)) * float(fee_tier)) for ts, vol in volume_days]
+                debug["estimate_pool_fee_input"] = "volume_x_fee_tier"
+                debug["estimate_pool_fee_days"] = int(len(out))
+                return out, "ok_volume_x_fee_tier"
+            pool_fee_days = _fetch_pool_fee_usd_series(chain_key, version, pool_id_raw, days)
+            debug["estimate_pool_fee_input"] = "pool_day_fees_fallback"
+            debug["estimate_pool_fee_days"] = int(len(pool_fee_days))
+            if pool_fee_days:
+                return pool_fee_days, "ok_pool_day_fees"
+            return [], "pool_fee_series_empty"
+
         pos_liq = max(0.0, _safe_float(getattr(req, "position_liquidity", 0.0)))
         pool_liq = max(0.0, _safe_float(getattr(req, "pool_liquidity", 0.0)))
         share_source = "raw_liquidity"
@@ -24457,25 +24912,24 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             if est_share <= 0:
                 estimated_reason = "liquidity_share_zero"
             else:
-                pool_id_raw = str(req.pool_id or "").strip()
-                if not pool_id_raw:
-                    estimated_reason = "missing_pool_id"
-                    pool_fee_days = []
-                else:
-                    pool_fee_days = _fetch_pool_fee_usd_series(chain_key, version, pool_id_raw, days)
+                pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
                 if pool_fee_days:
                     cum_est = 0.0
                     for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
                         cum_est += max(0.0, float(fee_usd)) * float(est_share)
                         day_ts = (int(ts) // 86400) * 86400
                         estimated_by_day[day_ts] = float(cum_est)
-                    estimated_reason = "ok_pool_share_daily_fees"
+                    estimated_reason = (
+                        "ok_pool_share_daily_turnover_x_fee_tier"
+                        if str(fee_days_reason) == "ok_volume_x_fee_tier"
+                        else "ok_pool_share_daily_fees"
+                    )
                 elif estimated_reason in {"not_requested", "unknown"}:
-                    estimated_reason = "pool_fee_series_empty"
+                    estimated_reason = str(fee_days_reason or "pool_fee_series_empty")
         # Second fallback for estimate: derive dynamic daily share from position TVL snapshots.
         if (not estimated_by_day) and position_ids and endpoint and str(req.pool_id or "").strip():
             try:
-                pool_fee_days = _fetch_pool_fee_usd_series(chain_key, version, str(req.pool_id or ""), days)
+                pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
                 pool_tvl_days = _fetch_pool_tvl_series(chain_key, version, str(req.pool_id or ""), days)
                 if pool_fee_days and pool_tvl_days:
                     pool_tvl_by_day = {int(ts): max(0.0, float(v)) for ts, v in pool_tvl_days}
@@ -24507,7 +24961,11 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             used_days += 1
                         if estimated_by_day:
                             est_share = float(sum(shares) / len(shares)) if shares else 0.0
-                            estimated_reason = "ok_pool_share_daily_fees_from_position_tvl_snapshots"
+                            estimated_reason = (
+                                "ok_pool_share_daily_turnover_x_fee_tier_from_position_tvl_snapshots"
+                                if str(fee_days_reason) == "ok_volume_x_fee_tier"
+                                else "ok_pool_share_daily_fees_from_position_tvl_snapshots"
+                            )
                             debug["estimate_fallback_days_used"] = int(used_days)
                             debug["estimate_share_source"] = "position_tvl_snapshots_over_pool_tvl"
                         elif estimated_reason in {"liquidity_share_unavailable", "pool_fee_series_empty", "unknown", "not_requested"}:
@@ -24598,6 +25056,12 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     debug["ledger_deadline_hit"] = bool(ledger_scan.get("deadline_hit"))
                     debug["ledger_budget_sec"] = float(ledger_budget_sec)
                     debug["ledger_event_counts"] = dict(ledger_scan.get("event_counts") or {})
+                    debug["ledger_progress_done_tokens"] = int(ledger_scan.get("progress_done_tokens") or 0)
+                    debug["ledger_progress_pending_tokens"] = int(ledger_scan.get("progress_pending_tokens") or 0)
+                    debug["ledger_explorer_requests"] = int(ledger_scan.get("explorer_requests") or 0)
+                    debug["ledger_explorer_pages"] = int(ledger_scan.get("explorer_pages") or 0)
+                    debug["ledger_explorer_status"] = str(ledger_scan.get("explorer_status") or "")
+                    debug["ledger_explorer_message"] = str(ledger_scan.get("explorer_message") or "")
                     for tid in scan_token_ids:
                         one_day, one_meta = _build_v3_npm_fee_ledger_from_temp(
                             int(chain_id),
