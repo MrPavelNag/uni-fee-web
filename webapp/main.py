@@ -99,7 +99,7 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.6"
 APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
@@ -18310,7 +18310,7 @@ def _render_positions_page() -> str:
             </label>
             <label class="fee-toggle-pill" title="Show annualized return labels next to collect points.">
               <input type="checkbox" id="posFeeAprLabels" checked />
-              <span class="pos-fee-hist-label">Show APR labels</span>
+              <span class="pos-fee-hist-label">APR</span>
             </label>
             <label class="fee-toggle-pill" title="Adjust fee chart vertical size.">
               <span class="pos-fee-hist-label">Chart height</span>
@@ -20267,14 +20267,16 @@ def _render_positions_page() -> str:
             const aprMeta = aprByTs.get(ts);
             const aprPct = Number(aprMeta?.aprPct || 0);
             const liqUsd = Number(aprMeta?.liquidityUsd || 0);
+            const aprDays = Number(aprMeta?.days || 0);
             const aprText = (showAprLabels && aprPct > 0) ? `<b>${aprPct.toFixed(1)}%</b>` : "";
             collectedPointText.push(aprText);
             const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
             const liqAtPoint = liqUsd > 0 ? `$${liqUsd.toFixed(2)}` : esc(liqHover);
+            const daysLine = (aprDays > 0) ? `<br>Days: ${aprDays.toFixed(1)}` : "";
             collectedPointHover.push(
               aprPct > 0
-                ? `${dtLabel}<br>$${val.toFixed(2)}<br>${aprPct.toFixed(1)}%<br>Liquidity: ${liqAtPoint}`
-                : `${dtLabel}<br>$${val.toFixed(2)}<br>Liquidity: ${liqAtPoint}`
+                ? `${dtLabel}<br>$${val.toFixed(2)}<br>${aprPct.toFixed(1)}%${daysLine}<br>Liquidity: ${liqAtPoint}`
+                : `${dtLabel}<br>$${val.toFixed(2)}${daysLine}<br>Liquidity: ${liqAtPoint}`
             );
           }
           if (hasSnapshot) {
@@ -20558,7 +20560,7 @@ def _render_positions_page() -> str:
               ? `${base} (estimated, ${isToday ? "today USD" : "if sold instantly"})`
               : `${base} (${isToday ? "today USD" : "if sold instantly"})`;
             const dash = isEstimated
-              ? (isToday ? "dot" : "dashdot")
+              ? "longdash"
               : (isToday ? "solid" : "dash");
             return {
               ...t,
@@ -20668,6 +20670,7 @@ def _render_positions_page() -> str:
                 ...t,
                 showlegend: showLegend,
                 name: legendName,
+                legendgroup: String(base || "pair"),
               });
             }
           }
@@ -20682,7 +20685,7 @@ def _render_positions_page() -> str:
           xaxis: chartGridX(minCreatedMs, 20),
           yaxis: chartGridY(true),
           showlegend: true,
-          legend: {orientation: "h", y: -0.2},
+          legend: {orientation: "v", x: 0, y: -0.05, tracegroupgap: 8},
         }, {displaylogo: false, responsive: true});
         saveLastFeeChartCache(overlayTraces, "Collected + estimated fees (USD)" + mainTitleSuffix);
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
@@ -25549,13 +25552,16 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             return 0.0
 
         items: list[dict[str, Any]] = []
-        prev_ts = int(collect_since_ts)
-        prev_cum = 0.0
+        prev_ts: int | None = None
+        prev_cum: float | None = None
         for ts, cum in sorted(((int(k), float(v)) for k, v in collected_by_day.items()), key=lambda x: x[0]):
             day_ts = (int(ts) // 86400) * 86400
             tvl_usd = _lookup_tvl(day_ts)
-            fee_delta = max(0.0, float(cum) - float(prev_cum))
-            days_delta = max(1.0, (float(ts) - float(prev_ts)) / 86400.0)
+            fee_delta = 0.0
+            days_delta = 0.0
+            if prev_ts is not None and prev_cum is not None:
+                fee_delta = max(0.0, float(cum) - float(prev_cum))
+                days_delta = max(1.0, (float(ts) - float(prev_ts)) / 86400.0)
             apr_pct = 0.0
             if tvl_usd > 0.0 and fee_delta > 0.0 and days_delta > 0.0:
                 apr_pct = max(0.0, (fee_delta / tvl_usd) * (365.0 / days_delta) * 100.0)
