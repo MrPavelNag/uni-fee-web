@@ -18154,7 +18154,7 @@ def _render_positions_page() -> str:
     .fee-status-pill.err { border-color:#fecaca; background:#fef2f2; color:#b91c1c; }
     .fee-status-pill.info { border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8; }
     #posFeeBody .hint { font-size:13px; line-height:1.45; color:#475569; margin:0 0 10px; }
-    #posFeeChart { height:420px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
+    #posFeeChart { height:546px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
     #posFeeDebug { margin-top:10px; }
     .fee-toggle-pill {
       display:inline-flex; align-items:center; gap:7px;
@@ -18315,9 +18315,9 @@ def _render_positions_page() -> str:
             <label class="fee-toggle-pill" title="Adjust fee chart vertical size.">
               <span class="pos-fee-hist-label">Chart height</span>
               <select id="posFeeChartHeight" class="chart-size-select" onchange="applyFeeChartHeightFromControl()">
-                <option value="320">S</option>
-                <option value="420" selected>M</option>
-                <option value="560">L</option>
+                <option value="416">S</option>
+                <option value="546" selected>M</option>
+                <option value="728">L</option>
               </select>
             </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Build chart</button>
@@ -19646,8 +19646,12 @@ def _render_positions_page() -> str:
     }
     function normalizeFeeChartHeight(raw) {
       const v = Number(raw || 0);
-      if (v === 320 || v === 420 || v === 560) return v;
-      return 420;
+      // Backward compatibility: old saved values are auto-upscaled by ~30%.
+      if (v === 320) return 416;
+      if (v === 420) return 546;
+      if (v === 560) return 728;
+      if (v === 416 || v === 546 || v === 728) return v;
+      return 546;
     }
     function applyFeeChartHeightFromControl() {
       const sel = document.getElementById("posFeeChartHeight");
@@ -19662,7 +19666,7 @@ def _render_positions_page() -> str:
       const sel = document.getElementById("posFeeChartHeight");
       const chartEl = document.getElementById("posFeeChart");
       if (!sel || !chartEl) return;
-      let h = 420;
+      let h = 546;
       try { h = normalizeFeeChartHeight(localStorage.getItem(POS_FEE_CHART_HEIGHT_KEY)); } catch (_) {}
       sel.value = String(h);
       chartEl.style.height = `${h}px`;
@@ -20266,10 +20270,11 @@ def _render_positions_page() -> str:
             const aprText = (showAprLabels && aprPct > 0) ? `<b>${aprPct.toFixed(1)}%</b>` : "";
             collectedPointText.push(aprText);
             const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
+            const liqAtPoint = liqUsd > 0 ? `$${liqUsd.toFixed(2)}` : esc(liqHover);
             collectedPointHover.push(
               aprPct > 0
-                ? `${dtLabel}<br>$${val.toFixed(2)}<br>${aprPct.toFixed(1)}%<br>Liquidity: ${esc(liqHover)}`
-                : `${dtLabel}<br>$${val.toFixed(2)}<br>Liquidity: ${esc(liqHover)}`
+                ? `${dtLabel}<br>$${val.toFixed(2)}<br>${aprPct.toFixed(1)}%<br>Liquidity: ${liqAtPoint}`
+                : `${dtLabel}<br>$${val.toFixed(2)}<br>Liquidity: ${liqAtPoint}`
             );
           }
           if (hasSnapshot) {
@@ -20303,8 +20308,8 @@ def _render_positions_page() -> str:
               text: hasAprLabel ? collectedPointText : undefined,
               textposition: hasAprLabel ? "top right" : undefined,
               textfont: hasAprLabel ? {size: 13, color: "#0f172a"} : undefined,
-              hovertemplate: hasAprLabel ? "%{hovertext}<extra></extra>" : "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>Collect point</extra>",
-              hovertext: hasAprLabel ? collectedPointHover : undefined,
+              hovertemplate: "%{hovertext}<extra></extra>",
+              hovertext: collectedPointHover,
               name: `${legendBase} (collect points)`,
               showlegend: false,
             });
@@ -20331,20 +20336,6 @@ def _render_positions_page() -> str:
           const snapLast = snapSorted.length ? snapSorted[snapSorted.length - 1] : null;
           const snapTs = Number(snapLast?.ts || 0);
           const snapVal = Number(snapLast?.fees_usd || 0);
-          if (!hasCollected) {
-            const createdMs = Number(meta.createdMs || 0);
-            if (createdMs > 0 && snapTs > 0) {
-              traces.push({
-                x: [new Date(createdMs), new Date(snapTs * 1000)],
-                y: [0, Math.max(0, snapVal)],
-                mode: "lines",
-                line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
-                opacity: 0.65,
-                name: `${legendBase} (from 0 to unclaimed)`,
-                hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
-              });
-            }
-          }
           if (snapTs > 0) {
             let snapMarkerVal = Math.max(0, snapVal);
             if (hasCollected) {
@@ -20352,14 +20343,17 @@ def _render_positions_page() -> str:
               const lastCollectedVal = collTail.length ? Number(collTail[collTail.length - 1]?.fees_usd || 0) : 0;
               snapMarkerVal = Math.max(0, lastCollectedVal + Math.max(0, snapVal));
             }
+            const snapDt = new Date(snapTs * 1000);
+            const snapDtLabel = snapDt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
+            const snapLiq = esc(liqLabel && liqLabel !== "-" ? String(liqLabel) : "-");
             traces.push({
-              x: [new Date(snapTs * 1000)],
+              x: [snapDt],
               y: [snapMarkerVal],
               mode: "markers",
-              marker: {size: 9, color: "#f97316", symbol: "diamond"},
+              marker: {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
               showlegend: false,
-              name: `${legendBase} (snapshot point)`,
-              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>Snapshot</extra>",
+              name: `${legendBase} (collect points)`,
+              hovertemplate: `${snapDtLabel}<br>$${Number(snapMarkerVal || 0).toFixed(2)}<br>Liquidity: ${snapLiq}<extra></extra>`,
             });
           }
         }
@@ -20632,13 +20626,15 @@ def _render_positions_page() -> str:
           }
         }
         const compactLegendByPair = (srcTraces) => {
-          const typeRank = {instant: 0, today: 1, estimated: 2, other: 3};
+          const typeRank = {today: 0, instant: 1, estimated: 2, other: 3};
           const typeLabel = {instant: "if sold instantly", today: "today USD", estimated: "estimated", other: "series"};
           const byBase = new Map();
           const baseOrder = [];
           for (const t of (srcTraces || [])) {
             if (!t || typeof t !== "object") continue;
             const name = String(t?.name || "");
+            const modeLower = String(t?.mode || "").toLowerCase();
+            const markerOnly = modeLower.includes("markers") && !modeLower.includes("lines");
             const base = toLegendBase(name) || name || "pair";
             const lower = name.toLowerCase();
             const isEstimated = lower.includes("(estimated");
@@ -20648,7 +20644,7 @@ def _render_positions_page() -> str:
               byBase.set(base, []);
               baseOrder.push(base);
             }
-            byBase.get(base).push({trace: t, type: tp});
+            byBase.get(base).push({trace: t, type: tp, markerOnly});
           }
           const out = [];
           for (const base of baseOrder) {
@@ -20660,7 +20656,8 @@ def _render_positions_page() -> str:
               const t = row.trace || {};
               const type = String(row.type || "other");
               const label = String(typeLabel[type] || "series");
-              const firstOfType = !seenType.has(type);
+              const canOwnLegend = !Boolean(row.markerOnly);
+              const firstOfType = canOwnLegend && !seenType.has(type);
               if (firstOfType) seenType.add(type);
               const showLegend = firstOfType;
               const legendName = firstOfType
