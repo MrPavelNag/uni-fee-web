@@ -20111,14 +20111,14 @@ def _render_positions_page() -> str:
         const ok = await ensurePlotly();
         if (!ok) return false;
         Plotly.newPlot("posFeeChart", traces, {
-          title: String(obj.title || "Collected + estimated fees (USD)"),
+          title: String(obj.title || "Collected & Estimated Fees"),
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
-          margin: {t: 34, b: 42, l: 54, r: 12},
-          xaxis: chartGridX(0, 20),
-          yaxis: chartGridY(true),
+          margin: {t: 34, b: 64, l: 54, r: 12},
+          xaxis: {...chartGridX(0, 20), fixedrange: true},
+          yaxis: {...chartGridY(true), fixedrange: true},
           showlegend: true,
-          legend: {orientation: "h", y: -0.2},
+          legend: {orientation: "h", x: 0, xanchor: "left", y: -0.12, yanchor: "top"},
         }, {displaylogo: false, responsive: true});
         setPosFeeStatus("Chart restored from cache.", false);
         return true;
@@ -20379,7 +20379,7 @@ def _render_positions_page() -> str:
             const feeDeltaUsd = Number(aprMeta?.feeDelta || 0);
             const liqUsd = Number(aprMeta?.liquidityUsd || 0);
             const aprDays = Number(aprMeta?.days || 0);
-            const aprText = "";
+            const aprText = (showAprLabels && aprPct > 0) ? `<b>${aprPct.toFixed(1)}%</b>` : "";
             collectedPointText.push(aprText);
             const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
             const liqAtPoint = liqUsd > 0 ? `$${liqUsd.toFixed(2)}` : esc(liqHover);
@@ -20413,7 +20413,7 @@ def _render_positions_page() -> str:
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
           if (collectedPointX.length) {
-            const hasAprLabel = false;
+            const hasAprLabel = showAprLabels && collectedPointText.some((t) => String(t || "").trim());
             traces.push({
               x: collectedPointX,
               y: collectedPointY,
@@ -20692,9 +20692,7 @@ def _render_positions_page() -> str:
             };
           });
         };
-        const mainTitleSuffix = histUsd
-          ? " — historical USD + today USD"
-          : " — today USD";
+        const mainTitle = "Collected & Estimated Fees";
         let overlayTraces = applyFeeTraceStyleByPair(traces, histUsd ? "historical" : "today", 1.0);
         if (histUsd) {
           try {
@@ -20790,16 +20788,16 @@ def _render_positions_page() -> str:
         };
         overlayTraces = compactLegendByPair(overlayTraces);
         Plotly.newPlot("posFeeChart", overlayTraces, {
-          title: "Collected + estimated fees (USD)" + mainTitleSuffix,
+          title: mainTitle,
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
-          margin: {t: 34, b: 120, l: 54, r: 12},
-          xaxis: chartGridX(minCreatedMs, 20),
-          yaxis: chartGridY(true),
+          margin: {t: 34, b: 70, l: 54, r: 12},
+          xaxis: {...chartGridX(minCreatedMs, 20), fixedrange: true},
+          yaxis: {...chartGridY(true), fixedrange: true},
           showlegend: true,
-          legend: {orientation: "h", x: 0, xanchor: "left", y: -0.24, yanchor: "top", tracegroupgap: 8},
+          legend: {orientation: "h", x: 0, xanchor: "left", y: -0.12, yanchor: "top", tracegroupgap: 4},
         }, {displaylogo: false, responsive: true});
-        saveLastFeeChartCache(overlayTraces, "Collected + estimated fees (USD)" + mainTitleSuffix);
+        saveLastFeeChartCache(overlayTraces, mainTitle);
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
         const baselineRows = Number(cmpDebug.synthetic_baseline_rows || 0);
