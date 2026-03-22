@@ -25378,6 +25378,34 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     estimated_by_day: dict[int, float] = {}
     est_share = 0.0
     try:
+        def _lookup_series_day(day_map: dict[int, float], known_days: list[int], day_ts: int) -> float:
+            if not known_days:
+                return 0.0
+            d = int(day_ts)
+            idx = bisect_right(known_days, d)
+            if idx > 0:
+                return max(0.0, float(day_map.get(int(known_days[idx - 1]), 0.0)))
+            return max(0.0, float(day_map.get(int(known_days[0]), 0.0)))
+
+        def _position_tvl_by_day_for_estimate() -> dict[int, float]:
+            out: dict[int, float] = {}
+            if not endpoint or not position_ids:
+                return out
+            try:
+                for pid in position_ids[:20]:
+                    p_series = _fetch_position_snapshot_series_exact(
+                        endpoint,
+                        pid,
+                        since_ts=collect_since_ts,
+                        chain_id=chain_id,
+                    )
+                    for ts, v in p_series:
+                        dts = (int(ts) // 86400) * 86400
+                        out[dts] = float(out.get(dts, 0.0) + max(0.0, float(v)))
+            except Exception:
+                return {}
+            return out
+
         def _estimated_pool_fee_days() -> tuple[list[tuple[int, float]], str]:
             pool_id_raw = str(pool_id_for_estimate or "").strip()
             if not pool_id_raw:
@@ -25449,21 +25477,70 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
         pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
         if pool_fee_days:
+            # Primary mode: daily share from historical TVL on each day.
+            pos_tvl_by_day = _position_tvl_by_day_for_estimate()
+            pool_tvl_by_day_raw = _fetch_pool_tvl_series(chain_key, version, str(pool_id_for_estimate or ""), days)
+            pool_tvl_by_day: dict[int, float] = {
+                (int(ts) // 86400) * 86400: max(0.0, float(v))
+                for ts, v in (pool_tvl_by_day_raw or [])
+                if int(ts) > 0 and float(v) > 0.0
+            }
+            pos_days = sorted(int(x) for x in pos_tvl_by_day.keys() if int(x) > 0)
+            pool_days = sorted(int(x) for x in pool_tvl_by_day.keys() if int(x) > 0)
+            debug["estimate_pos_tvl_days_count"] = int(len(pos_days))
+            debug["estimate_pool_tvl_days_count"] = int(len(pool_days))
+
+            static_share = 0.0
             if pos_liq > 0 and pool_liq > 0:
-                est_share = max(0.0, min(1.0, pos_liq / pool_liq))
-                if est_share > 0:
-                    cum_est = 0.0
-                    for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
-                        cum_est += max(0.0, float(fee_usd)) * float(est_share)
-                        day_ts = (int(ts) // 86400) * 86400
-                        estimated_by_day[day_ts] = float(cum_est)
-                    estimated_reason = (
-                        "ok_pool_share_daily_turnover_x_fee_tier"
-                        if str(fee_days_reason) == "ok_volume_x_fee_tier"
-                        else "ok_pool_share_daily_fees"
-                    )
-                else:
-                    estimated_reason = "liquidity_share_zero"
+                static_share = max(0.0, min(1.0, pos_liq / pool_liq))
+                debug["estimate_static_share_used"] = float(static_share)
+                if share_source != "raw_liquidity_onchain_recovered":
+                    share_source = "raw_liquidity"
+
+            cum_est = 0.0
+            dynamic_used = 0
+            fallback_used = 0
+            fallback_missing = 0
+            share_sum = 0.0
+            for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
+                day_ts = (int(ts) // 86400) * 86400
+                share_day = 0.0
+                if pos_days and pool_days:
+                    pos_tvl_day = _lookup_series_day(pos_tvl_by_day, pos_days, day_ts)
+                    pool_tvl_day = _lookup_series_day(pool_tvl_by_day, pool_days, day_ts)
+                    if pos_tvl_day > 0.0 and pool_tvl_day > 0.0:
+                        share_day = max(0.0, min(1.0, pos_tvl_day / pool_tvl_day))
+                        dynamic_used += 1
+                if share_day <= 0.0:
+                    if static_share > 0.0:
+                        share_day = float(static_share)
+                        fallback_used += 1
+                    else:
+                        fallback_missing += 1
+                        continue
+                cum_est += max(0.0, float(fee_usd)) * float(share_day)
+                estimated_by_day[day_ts] = float(cum_est)
+                share_sum += float(share_day)
+
+            debug["estimate_fallback_days_used"] = int(fallback_used)
+            debug["estimate_fallback_days_missing"] = int(fallback_missing)
+            debug["estimate_sparse_share_points"] = int(fallback_missing)
+            if dynamic_used > 0:
+                share_source = "daily_tvl_snapshots"
+            elif fallback_used > 0 and static_share > 0:
+                share_source = (
+                    "raw_liquidity_onchain_recovered"
+                    if share_source == "raw_liquidity_onchain_recovered"
+                    else "raw_liquidity"
+                )
+            est_share = float(share_sum / max(1, (dynamic_used + fallback_used)))
+
+            if estimated_by_day:
+                estimated_reason = (
+                    "ok_pool_share_daily_turnover_x_fee_tier"
+                    if str(fee_days_reason) == "ok_volume_x_fee_tier"
+                    else "ok_pool_share_daily_fees"
+                )
             else:
                 estimated_reason = "liquidity_share_unavailable"
         elif estimated_reason in {"not_requested", "unknown"}:
