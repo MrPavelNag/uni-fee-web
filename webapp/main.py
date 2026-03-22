@@ -24378,6 +24378,11 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             ledger_by_day = {}
     debug["ledger_points"] = int(len(ledger_by_day))
 
+    def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
+        return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
+
+    est_items_payload = _pack_fee_items(estimated_by_day) if estimated_by_day else []
+
     force_rpc = _position_fee_rpc_force_onchain()
     if ledger_by_day and not force_rpc:
         collected_reason = "ok_npm_fee_ledger"
@@ -24617,11 +24622,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     rpc_detail = str((rpc_meta or {}).get("detail") or "").strip()
     rpc_pricing = str((rpc_meta or {}).get("pricing") or "none").strip()
-
-    def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
-        return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
-
-    est_items_payload = _pack_fee_items(estimated_by_day) if estimated_by_day else []
 
     def _unavailable_reason_code() -> str:
         if not bool(debug.get("rpc_protocol_supported")):
