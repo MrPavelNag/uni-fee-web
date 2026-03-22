@@ -678,6 +678,15 @@ POSITION_CONTRACT_SNAPSHOT_CACHE: dict[tuple[int, str, int], tuple[float, dict[s
 POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK = threading.Lock()
 MAJOR_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 MAJOR_ASSET_PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("MAJOR_ASSET_PRICE_CACHE_TTL_SEC", "300")))
+FEE_SERIES_CACHE_TTL_SEC = max(30, int(os.environ.get("FEE_SERIES_CACHE_TTL_SEC", "300")))
+COINGECKO_RANGE_CACHE: dict[tuple[int, str, int, int], tuple[float, list[tuple[int, float]]]] = {}
+COINGECKO_RANGE_CACHE_LOCK = threading.Lock()
+POOL_TVL_SERIES_CACHE: dict[tuple[str, str, str, int], tuple[float, list[tuple[int, float]]]] = {}
+POOL_TVL_SERIES_CACHE_LOCK = threading.Lock()
+POOL_VOLUME_SERIES_CACHE: dict[tuple[str, str, str, int], tuple[float, list[tuple[int, float]]]] = {}
+POOL_VOLUME_SERIES_CACHE_LOCK = threading.Lock()
+POSITION_SNAPSHOT_SERIES_CACHE: dict[tuple[str, str, int, int], tuple[float, list[tuple[int, float]]]] = {}
+POSITION_SNAPSHOT_SERIES_CACHE_LOCK = threading.Lock()
 POOL_FLOW_EVENTS_LOCK = threading.Lock()
 getcontext().prec = 48
 
@@ -3072,6 +3081,12 @@ def _fetch_coingecko_contract_prices_range(
     addr = str(contract_address or "").strip().lower()
     if not platform or not _is_eth_address(addr):
         return []
+    cache_key = (int(chain_id), addr, int(from_ts), int(to_ts))
+    now = time.time()
+    with COINGECKO_RANGE_CACHE_LOCK:
+        cached = COINGECKO_RANGE_CACHE.get(cache_key)
+        if cached and (now - float(cached[0])) <= float(FEE_SERIES_CACHE_TTL_SEC):
+            return list(cached[1])
     fr = max(0, int(from_ts) - 86_400)
     to = int(to_ts) + 86_400
     if to <= fr:
@@ -3097,8 +3112,12 @@ def _fetch_coingecko_contract_prices_range(
             if p > 0:
                 out.append((t_ms // 1000, p))
         out.sort(key=lambda x: x[0])
+        with COINGECKO_RANGE_CACHE_LOCK:
+            COINGECKO_RANGE_CACHE[cache_key] = (now, list(out))
         return out
     except Exception:
+        with COINGECKO_RANGE_CACHE_LOCK:
+            COINGECKO_RANGE_CACHE[cache_key] = (now, [])
         return []
 
 
@@ -13744,6 +13763,17 @@ def _scan_pool_positions(
 
 
 def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
+    cache_key = (
+        str(chain_key or "").strip().lower(),
+        str(version or "").strip().lower(),
+        str(pool_id or "").strip().lower(),
+        int(max(1, int(days or 1))),
+    )
+    now = time.time()
+    with POOL_TVL_SERIES_CACHE_LOCK:
+        cached = POOL_TVL_SERIES_CACHE.get(cache_key)
+        if cached and (now - float(cached[0])) <= float(FEE_SERIES_CACHE_TTL_SEC):
+            return list(cached[1])
     endpoint = get_graph_endpoint(chain_key, version=version)
     if not endpoint:
         return []
@@ -13794,9 +13824,13 @@ def _fetch_pool_tvl_series(chain_key: str, version: str, pool_id: str, days: int
                     continue
                 out.append((ts, tvl))
             if out:
+                with POOL_TVL_SERIES_CACHE_LOCK:
+                    POOL_TVL_SERIES_CACHE[cache_key] = (now, list(out))
                 return out
         except Exception:
             continue
+    with POOL_TVL_SERIES_CACHE_LOCK:
+        POOL_TVL_SERIES_CACHE[cache_key] = (now, [])
     return []
 
 
@@ -13848,6 +13882,17 @@ def _parse_fee_tier_fraction_from_raw(raw: Any) -> float:
 
 
 def _fetch_pool_volume_usd_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
+    cache_key = (
+        str(chain_key or "").strip().lower(),
+        str(version or "").strip().lower(),
+        str(pool_id or "").strip().lower(),
+        int(max(1, int(days or 1))),
+    )
+    now = time.time()
+    with POOL_VOLUME_SERIES_CACHE_LOCK:
+        cached = POOL_VOLUME_SERIES_CACHE.get(cache_key)
+        if cached and (now - float(cached[0])) <= float(FEE_SERIES_CACHE_TTL_SEC):
+            return list(cached[1])
     endpoint = get_graph_endpoint(chain_key, version=version)
     if not endpoint:
         return []
@@ -13898,9 +13943,13 @@ def _fetch_pool_volume_usd_series(chain_key: str, version: str, pool_id: str, da
                     continue
                 out.append((ts, max(0.0, float(vol))))
             if out:
+                with POOL_VOLUME_SERIES_CACHE_LOCK:
+                    POOL_VOLUME_SERIES_CACHE[cache_key] = (now, list(out))
                 return out
         except Exception:
             continue
+    with POOL_VOLUME_SERIES_CACHE_LOCK:
+        POOL_VOLUME_SERIES_CACHE[cache_key] = (now, [])
     return []
 
 
@@ -13954,6 +14003,12 @@ def _fetch_position_snapshot_series_exact(
     pid = str(position_id or "").strip()
     if not pid:
         return []
+    cache_key = (str(endpoint or "").strip(), str(pid), int(since_ts), int(chain_id))
+    now = time.time()
+    with POSITION_SNAPSHOT_SERIES_CACHE_LOCK:
+        cached = POSITION_SNAPSHOT_SERIES_CACHE.get(cache_key)
+        if cached and (now - float(cached[0])) <= float(FEE_SERIES_CACHE_TTL_SEC):
+            return list(cached[1])
     queries = [
         (
             "ID",
@@ -14020,6 +14075,8 @@ def _fetch_position_snapshot_series_exact(
         except Exception:
             continue
     if not rows:
+        with POSITION_SNAPSHOT_SERIES_CACHE_LOCK:
+            POSITION_SNAPSHOT_SERIES_CACHE[cache_key] = (now, [])
         return []
 
     # Keep only the last snapshot per day for this position.
@@ -14050,6 +14107,8 @@ def _fetch_position_snapshot_series_exact(
             continue
     out = [(day_ts, val) for day_ts, (_real_ts, val) in by_day.items()]
     out.sort(key=lambda x: x[0])
+    with POSITION_SNAPSHOT_SERIES_CACHE_LOCK:
+        POSITION_SNAPSHOT_SERIES_CACHE[cache_key] = (now, list(out))
     return out
 
 
