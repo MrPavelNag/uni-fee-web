@@ -13925,73 +13925,6 @@ def _fetch_pool_token_ids(endpoint: str, pool_id: str) -> tuple[str, str]:
         return "", ""
 
 
-def _fetch_pool_fee_usd_series(chain_key: str, version: str, pool_id: str, days: int) -> list[tuple[int, float]]:
-    """Daily pool fee USD: feesUSD, or volumeUSD*feeTier fallback when feesUSD is missing."""
-    endpoint = get_graph_endpoint(chain_key, version=version)
-    if not endpoint:
-        return []
-    now_ts = int(time.time())
-    since_ts = now_ts - max(1, int(days)) * 86400
-    vars_base = {"pool": str(pool_id or "").strip().lower(), "since": int(since_ts)}
-    fee_tier = _fetch_pool_fee_tier_fraction(endpoint, str(pool_id or ""))
-    attempts = [
-        """
-        query PoolFeeDays($pool: String!, $since: Int!) {
-          poolDayDatas(
-            first: 400
-            orderBy: date
-            orderDirection: asc
-            where: { pool: $pool, date_gte: $since }
-          ) {
-            date
-            feesUSD
-            volumeUSD
-          }
-        }
-        """,
-        """
-        query PoolFeeDays($pool: String!, $since: Int!) {
-          poolDayDatas(
-            first: 400
-            orderBy: date
-            orderDirection: asc
-            where: { pool: $pool, date_gte: $since }
-          ) {
-            date
-            feeUSD
-            dailyVolumeUSD
-          }
-        }
-        """,
-    ]
-    for q in attempts:
-        try:
-            data = graphql_query(endpoint, q, vars_base, retries=1)
-            rows = (data.get("data") or {}).get("poolDayDatas") or []
-            out: list[tuple[int, float]] = []
-            for r in rows:
-                ts = int(r.get("date") or 0)
-                if ts <= 0:
-                    continue
-                fees = _safe_float(r.get("feesUSD"))
-                if fees <= 0:
-                    fees = _safe_float(r.get("feeUSD"))
-                if fees <= 0:
-                    vol = _safe_float(r.get("volumeUSD"))
-                    if vol <= 0:
-                        vol = _safe_float(r.get("dailyVolumeUSD"))
-                    if vol > 0 and fee_tier > 0:
-                        fees = float(vol) * float(fee_tier)
-                if fees < 0:
-                    continue
-                out.append((ts, max(0.0, float(fees))))
-            if out:
-                return out
-        except Exception:
-            continue
-    return []
-
-
 def _normalize_chain_key_slug(chain_key: str) -> str:
     """Canonical UI/config slug (legacy token: arbitrum-one → arbitrum)."""
     k = str(chain_key or "").strip().lower()
@@ -20168,19 +20101,9 @@ def _render_positions_page() -> str:
         const pos = Number(outRow?.index || 0);
         const meta = payloadMeta[pos] || {colorIdx: pos, rowLabel: `row#${pos + 1}`, baseName: `Position ${pos + 1}`, pairOrPool: "?"};
         const liqLabel = String(meta?.liquidityLabel || "").trim();
-        const aprItemsForLegend = Array.isArray(outRow?.apr_items) ? outRow.apr_items : [];
-        const aprValsForLegend = aprItemsForLegend
-          .map((x) => Number(x?.apr_pct || 0))
-          .filter((v) => Number.isFinite(v) && v > 0);
-        const avgAprForLegend = aprValsForLegend.length
-          ? (aprValsForLegend.reduce((acc, v) => acc + v, 0) / aprValsForLegend.length)
-          : 0;
-        const legendCore = (liqLabel && liqLabel !== "-")
+        const legendBase = (liqLabel && liqLabel !== "-")
           ? `${meta.baseName} [liq ${liqLabel}]`
           : String(meta.baseName || "");
-        const legendBase = avgAprForLegend > 0
-          ? `${legendCore} [avg APR ${avgAprForLegend.toFixed(1)}%]`
-          : legendCore;
         if (!outRow?.ok) {
           const det = String(outRow?.error || "compare data failed");
           diag.apiFail += 1;
@@ -20305,12 +20228,13 @@ def _render_positions_page() -> str:
             collectedPointY.push(val);
             const aprMeta = aprByTs.get(ts);
             const aprPct = Number(aprMeta?.aprPct || 0);
+            const liqUsd = Number(aprMeta?.liquidityUsd || 0);
             const aprText = (showAprLabels && aprPct > 0) ? `<b>${aprPct.toFixed(1)}%</b>` : "";
             collectedPointText.push(aprText);
             const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
             collectedPointHover.push(
               aprPct > 0
-                ? `${dtLabel}<br>$${val.toFixed(2)}<br>${aprPct.toFixed(1)}%`
+                ? `${dtLabel}<br>$${val.toFixed(2)}<br>${aprPct.toFixed(1)}%${liqUsd > 0 ? `<br>base liquidity $${liqUsd.toFixed(2)}` : ""}`
                 : `${dtLabel}<br>$${val.toFixed(2)}`
             );
           }
@@ -20605,7 +20529,7 @@ def _render_positions_page() -> str:
               ? `${base} (estimated, ${isToday ? "today USD" : "if sold instantly"})`
               : `${base} (${isToday ? "today USD" : "if sold instantly"})`;
             const dash = isEstimated
-              ? (isToday ? "solid" : "dot")
+              ? (isToday ? "dot" : "dashdot")
               : (isToday ? "solid" : "dash");
             return {
               ...t,
@@ -25280,17 +25204,22 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 out = [(int(ts), max(0.0, float(vol)) * float(fee_tier)) for ts, vol in volume_days]
                 debug["estimate_pool_fee_input"] = "volume_x_fee_tier"
                 debug["estimate_pool_fee_days"] = int(len(out))
+                debug["estimate_pool_fee_days_count"] = int(len(out))
                 return out, "ok_volume_x_fee_tier"
-            pool_fee_days = _fetch_pool_fee_usd_series(chain_key, version, pool_id_raw, days)
-            debug["estimate_pool_fee_input"] = "pool_day_fees_fallback"
-            debug["estimate_pool_fee_days"] = int(len(pool_fee_days))
-            if pool_fee_days:
-                return pool_fee_days, "ok_pool_day_fees"
+            debug["estimate_pool_fee_input"] = "volume_x_fee_tier_unavailable"
+            debug["estimate_pool_fee_days"] = 0
+            debug["estimate_pool_fee_days_count"] = 0
             return [], "pool_fee_series_empty"
 
         pos_liq = max(0.0, _safe_float(getattr(req, "position_liquidity", 0.0)))
         pool_liq = max(0.0, _safe_float(getattr(req, "pool_liquidity", 0.0)))
         share_source = "raw_liquidity"
+        debug["estimate_pool_tvl_days_count"] = 0
+        debug["estimate_pos_tvl_days_count"] = 0
+        debug["estimate_sparse_share_points"] = 0
+        debug["estimate_fallback_days_used"] = 0
+        debug["estimate_fallback_days_missing"] = 0
+        debug["estimate_static_share_used"] = 0.0
         if pos_liq <= 0 or pool_liq <= 0:
             # Fallback: estimate share from current position USD vs latest pool TVL USD.
             # This keeps estimated curve available even when raw liquidity is absent in a row.
@@ -25300,10 +25229,12 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             if pool_id_raw:
                 try:
                     tvl_points = _fetch_pool_tvl_series(chain_key, version, pool_id_raw, max(7, int(days)))
+                    debug["estimate_pool_tvl_days_count"] = int(len(tvl_points or []))
                     if tvl_points:
                         latest_pool_tvl = max(0.0, _safe_float(tvl_points[-1][1]))
                 except Exception:
                     latest_pool_tvl = 0.0
+                    debug["estimate_pool_tvl_days_count"] = 0
             if latest_pool_tvl <= 0:
                 latest_pool_tvl = max(0.0, _safe_float(getattr(req, "pool_tvl_usd", 0.0)))
             amt0 = max(0.0, _safe_float(getattr(req, "position_amount0", 0.0)))
@@ -25350,145 +25281,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     )
                 elif estimated_reason in {"not_requested", "unknown"}:
                     estimated_reason = str(fee_days_reason or "pool_fee_series_empty")
-        # Second fallback for estimate: derive dynamic daily share from position TVL snapshots.
-        if (not estimated_by_day) and position_ids and endpoint and str(pool_id_for_estimate or "").strip():
-            try:
-                pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
-                pool_tvl_days = _fetch_pool_tvl_series(chain_key, version, str(pool_id_for_estimate or ""), days)
-                if pool_fee_days and pool_tvl_days:
-                    pool_tvl_by_day = {int(ts): max(0.0, float(v)) for ts, v in pool_tvl_days}
-                    pos_tvl_by_day: dict[int, float] = {}
-                    debug["estimate_pool_fee_days_count"] = int(len(pool_fee_days))
-                    debug["estimate_pool_tvl_days_count"] = int(len(pool_tvl_days))
-                    for pid in position_ids[:20]:
-                        p_series = _fetch_position_snapshot_series_exact(
-                            endpoint,
-                            pid,
-                            since_ts=since_ts,
-                            chain_id=chain_id,
-                        )
-                        for ts, v in p_series:
-                            dts = (int(ts) // 86400) * 86400
-                            pos_tvl_by_day[dts] = float(pos_tvl_by_day.get(dts, 0.0) + max(0.0, float(v)))
-                    if pos_tvl_by_day:
-                        debug["estimate_pos_tvl_days_count"] = int(len(pos_tvl_by_day))
-                        sample_step_days = max(
-                            1,
-                            min(30, int(os.environ.get("POSITIONS_ESTIMATE_SHARE_SAMPLE_DAYS", "3"))),
-                        )
-                        max_gap_days = max(
-                            sample_step_days,
-                            min(45, int(os.environ.get("POSITIONS_ESTIMATE_SHARE_MAX_GAP_DAYS", "10"))),
-                        )
-                        sample_step_sec = int(sample_step_days) * 86400
-                        max_gap_sec = int(max_gap_days) * 86400
-                        sparse_share_by_day: dict[int, float] = {}
-                        last_sample_day = 0
-                        for dts in sorted(pos_tvl_by_day.keys()):
-                            if last_sample_day and (int(dts) - int(last_sample_day)) < int(sample_step_sec):
-                                continue
-                            p_tvl = max(0.0, float(pos_tvl_by_day.get(dts, 0.0)))
-                            pool_tvl = max(0.0, float(pool_tvl_by_day.get(dts, 0.0)))
-                            if p_tvl <= 0 or pool_tvl <= 0:
-                                continue
-                            s = max(0.0, min(1.0, p_tvl / pool_tvl))
-                            if s <= 0:
-                                continue
-                            sparse_share_by_day[int(dts)] = float(s)
-                            last_sample_day = int(dts)
-                        cum_est = 0.0
-                        used_days = 0
-                        missing_days = 0
-                        shares: list[float] = []
-                        sparse_days_sorted = sorted(sparse_share_by_day.keys())
-                        for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
-                            dts = (int(ts) // 86400) * 86400
-                            chosen_day = 0
-                            for sd in sparse_days_sorted:
-                                if int(sd) <= int(dts):
-                                    chosen_day = int(sd)
-                                else:
-                                    break
-                            if chosen_day <= 0 or (int(dts) - int(chosen_day)) > int(max_gap_sec):
-                                missing_days += 1
-                                continue
-                            s = max(0.0, min(1.0, float(sparse_share_by_day.get(chosen_day, 0.0))))
-                            if s <= 0:
-                                missing_days += 1
-                                continue
-                            shares.append(float(s))
-                            cum_est += max(0.0, float(fee_usd)) * s
-                            estimated_by_day[dts] = float(cum_est)
-                            used_days += 1
-                        if estimated_by_day:
-                            est_share = float(sum(shares) / len(shares)) if shares else 0.0
-                            estimated_reason = (
-                                "ok_pool_share_daily_turnover_x_fee_tier_from_sparse_position_tvl_snapshots"
-                                if str(fee_days_reason) == "ok_volume_x_fee_tier"
-                                else "ok_pool_share_daily_fees_from_sparse_position_tvl_snapshots"
-                            )
-                            debug["estimate_fallback_days_used"] = int(used_days)
-                            debug["estimate_fallback_days_missing"] = int(missing_days)
-                            debug["estimate_sparse_share_points"] = int(len(sparse_share_by_day))
-                            debug["estimate_sparse_step_days"] = int(sample_step_days)
-                            debug["estimate_sparse_max_gap_days"] = int(max_gap_days)
-                            debug["estimate_share_source"] = "sparse_position_tvl_snapshots_over_pool_tvl"
-                        elif estimated_reason in {"liquidity_share_unavailable", "pool_fee_series_empty", "unknown", "not_requested"}:
-                            estimated_reason = "position_tvl_snapshots_unavailable"
-                    else:
-                        debug["estimate_pos_tvl_days_count"] = 0
-            except Exception:
-                if estimated_reason in {"liquidity_share_unavailable", "pool_fee_series_empty", "unknown", "not_requested"}:
-                    estimated_reason = "position_tvl_snapshot_fallback_error"
-                debug["estimate_snapshot_fallback_exc"] = True
-        # Third fallback: static share from any available position snapshot / pool TVL overlap.
-        if (not estimated_by_day) and position_ids and endpoint and str(pool_id_for_estimate or "").strip():
-            try:
-                pool_fee_days, fee_days_reason = _estimated_pool_fee_days()
-                pool_tvl_days = _fetch_pool_tvl_series(chain_key, version, str(pool_id_for_estimate or ""), days)
-                if pool_fee_days and pool_tvl_days:
-                    pool_tvl_by_day = {int(ts): max(0.0, float(v)) for ts, v in pool_tvl_days}
-                    static_share = 0.0
-                    static_source = ""
-                    for pid in position_ids[:20]:
-                        p_series = _fetch_position_snapshot_series_exact(
-                            endpoint,
-                            pid,
-                            since_ts=since_ts,
-                            chain_id=chain_id,
-                        )
-                        for ts, v in p_series:
-                            dts = (int(ts) // 86400) * 86400
-                            p_tvl = max(0.0, float(v))
-                            pool_tvl = max(0.0, float(pool_tvl_by_day.get(dts, 0.0)))
-                            if p_tvl <= 0 or pool_tvl <= 0:
-                                continue
-                            s = max(0.0, min(1.0, p_tvl / pool_tvl))
-                            if s > 0:
-                                static_share = float(s)
-                                static_source = "position_snapshot_over_pool_tvl"
-                                break
-                        if static_share > 0:
-                            break
-                    if static_share > 0:
-                        cum_est = 0.0
-                        for ts, fee_usd in sorted(pool_fee_days, key=lambda x: x[0]):
-                            dts = (int(ts) // 86400) * 86400
-                            cum_est += max(0.0, float(fee_usd)) * float(static_share)
-                            estimated_by_day[dts] = float(cum_est)
-                        if estimated_by_day:
-                            est_share = float(static_share)
-                            estimated_reason = (
-                                "ok_pool_share_daily_turnover_x_fee_tier_from_static_snapshot_share"
-                                if str(fee_days_reason) == "ok_volume_x_fee_tier"
-                                else "ok_pool_share_daily_fees_from_static_snapshot_share"
-                            )
-                            debug["estimate_share_source"] = str(static_source)
-                            debug["estimate_static_share_used"] = float(static_share)
-                    else:
-                        debug["estimate_static_share_used"] = 0.0
-            except Exception:
-                debug["estimate_static_share_fallback_exc"] = True
         if not str(debug.get("estimate_share_source") or "").strip():
             debug["estimate_share_source"] = str(share_source)
     except Exception as ex:
