@@ -1122,11 +1122,26 @@ def _init_analytics_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temp_npm_fee_scan_progress (
+              chain_id INTEGER NOT NULL,
+              protocol TEXT NOT NULL DEFAULT '',
+              token_id INTEGER NOT NULL,
+              since_ts INTEGER NOT NULL DEFAULT 0,
+              next_to_block INTEGER NOT NULL DEFAULT 0,
+              done INTEGER NOT NULL DEFAULT 0,
+              updated_at REAL NOT NULL DEFAULT 0,
+              PRIMARY KEY(chain_id, protocol, token_id, since_ts)
+            )
+            """
+        )
         cols_ledger = {str(r[1]) for r in conn.execute("PRAGMA table_info(temp_npm_fee_ledger_day)").fetchall()}
         if "pricing_mode" not in cols_ledger:
             conn.execute("ALTER TABLE temp_npm_fee_ledger_day ADD COLUMN pricing_mode TEXT NOT NULL DEFAULT 'spot'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_temp_npm_fee_events_ts ON temp_npm_fee_events(chain_id, protocol, token_id, ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_temp_npm_fee_ledger_day_ts ON temp_npm_fee_ledger_day(chain_id, protocol, token_id, day_ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_temp_npm_fee_scan_progress_updated ON temp_npm_fee_scan_progress(updated_at)")
         conn.commit()
 
 
@@ -14795,6 +14810,15 @@ def _position_fee_rpc_force_onchain() -> bool:
     )
 
 
+def _position_fee_rpc_alt_retry_enabled() -> bool:
+    return os.environ.get("POSITIONS_FEE_RPC_ALT_RETRY", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _position_pool_flow_debug_enabled() -> bool:
     return os.environ.get("POSITIONS_POOL_FLOW_DEBUG", "0").strip().lower() in (
         "1",
@@ -14936,10 +14960,6 @@ def _scan_v3_npm_fee_events_to_temp(
     range_blocks = max(0, int(latest) - int(from_block) + 1)
     required_chunks = int((range_blocks + int(chunk) - 1) // int(chunk)) if range_blocks > 0 else 0
     truncated = bool(required_chunks > int(chunks_cap))
-    scan_from = int(from_block)
-    if truncated:
-        scan_from = max(int(from_block), int(latest) - int(chunk) * int(chunks_cap) + 1)
-    cur = int(scan_from)
     used = 0
     inserted = 0
     events_total = 0
@@ -14947,20 +14967,65 @@ def _scan_v3_npm_fee_events_to_temp(
     block_ts_cache: dict[int, int] = {}
     ts_now = float(time.time())
     deadline_hit = False
+    progress_done = 0
+    progress_pending = 0
+
+    def _progress_get(conn: sqlite3.Connection, tid: int) -> tuple[int, int]:
+        row = conn.execute(
+            """
+            SELECT next_to_block, done
+            FROM temp_npm_fee_scan_progress
+            WHERE chain_id = ? AND protocol = ? AND token_id = ? AND since_ts = ?
+            """,
+            (int(cid), str(proto), int(tid), int(since_ts)),
+        ).fetchone()
+        if not row:
+            return int(latest), 0
+        try:
+            nb = int(row[0] or 0)
+            dn = int(row[1] or 0)
+        except Exception:
+            return int(latest), 0
+        if nb <= 0:
+            nb = int(latest)
+        return int(nb), int(1 if dn else 0)
+
+    def _progress_set(conn: sqlite3.Connection, tid: int, next_to: int, done_flag: bool) -> None:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO temp_npm_fee_scan_progress(
+              chain_id, protocol, token_id, since_ts, next_to_block, done, updated_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                int(cid),
+                str(proto),
+                int(tid),
+                int(since_ts),
+                int(max(0, next_to)),
+                int(1 if done_flag else 0),
+                float(time.time()),
+            ),
+        )
+
     with _analytics_conn() as conn:
-        while cur <= int(latest) and used < chunks_cap:
+        for tid in pids:
             if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
                 deadline_hit = True
                 break
-            to_b = min(int(cur) + int(chunk) - 1, int(latest))
-            batch_rows: list[tuple[Any, ...]] = []
-            for tid in pids:
+            next_to_block, done_flag = _progress_get(conn, int(tid))
+            if done_flag:
+                progress_done += 1
+                continue
+            cur_to = int(min(max(1, next_to_block), latest))
+            while cur_to >= int(from_block) and used < chunks_cap:
                 if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
                     deadline_hit = True
                     break
+                from_b = max(int(from_block), int(cur_to) - int(chunk) + 1)
                 params = {
-                    "fromBlock": hex(int(cur)),
-                    "toBlock": hex(int(to_b)),
+                    "fromBlock": hex(int(from_b)),
+                    "toBlock": hex(int(cur_to)),
                     "address": str(pm),
                     "topics": [all_topic0 if len(all_topic0) > 1 else all_topic0[0], "0x" + _encode_uint_word(int(tid))],
                 }
@@ -14968,6 +15033,7 @@ def _scan_v3_npm_fee_events_to_temp(
                     logs = _eth_get_logs(cid, params, timeout_sec=max(20.0, float(POSITIONS_ONCHAIN_TIMEOUT_SEC) * 5.0))
                 except Exception:
                     logs = []
+                batch_rows: list[tuple[Any, ...]] = []
                 for lg in logs or []:
                     if not isinstance(lg, dict):
                         continue
@@ -15014,31 +15080,40 @@ def _scan_v3_npm_fee_events_to_temp(
                             float(ts_now),
                         )
                     )
-            if batch_rows:
-                before = int(conn.total_changes)
-                conn.executemany(
-                    """
-                    INSERT OR IGNORE INTO temp_npm_fee_events(
-                      chain_id, protocol, token_id, block_number, log_index, tx_hash, ts, event_name,
-                      amount0_raw, amount1_raw, liquidity_raw, inserted_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    batch_rows,
-                )
-                inserted += max(0, int(conn.total_changes) - int(before))
-            cur = int(to_b) + 1
-            used += 1
+                if batch_rows:
+                    before = int(conn.total_changes)
+                    conn.executemany(
+                        """
+                        INSERT OR IGNORE INTO temp_npm_fee_events(
+                          chain_id, protocol, token_id, block_number, log_index, tx_hash, ts, event_name,
+                          amount0_raw, amount1_raw, liquidity_raw, inserted_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        batch_rows,
+                    )
+                    inserted += max(0, int(conn.total_changes) - int(before))
+                used += 1
+                cur_to = int(from_b) - 1
+                done_now = bool(cur_to < int(from_block))
+                _progress_set(conn, int(tid), int(cur_to), done_now)
+                if done_now:
+                    progress_done += 1
+                    break
+            if cur_to >= int(from_block):
+                progress_pending += 1
         conn.commit()
     return {
         "ok": True,
         "source": "npm_events",
         "chunks_used": int(used),
         "chunks_cap": int(chunks_cap),
-        "truncated": bool(truncated or cur <= latest or deadline_hit),
+        "truncated": bool(truncated or progress_pending > 0 or deadline_hit),
         "deadline_hit": bool(deadline_hit),
         "events_total": int(events_total),
         "inserted_rows": int(inserted),
         "event_counts": by_type,
+        "progress_done_tokens": int(progress_done),
+        "progress_pending_tokens": int(progress_pending),
     }
 
 
@@ -15238,6 +15313,33 @@ def _load_v3_npm_fee_ledger_day_from_cache(
             continue
         out[ts] = v
     return out
+
+
+def _is_v3_npm_fee_scan_complete(
+    chain_id: int,
+    protocol: str,
+    token_id: int,
+    *,
+    since_ts: int,
+) -> bool:
+    cid = int(chain_id)
+    proto = str(protocol or "").strip().lower()
+    tid = int(token_id)
+    if cid <= 0 or not proto or tid <= 0:
+        return False
+    try:
+        with _analytics_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT done
+                FROM temp_npm_fee_scan_progress
+                WHERE chain_id = ? AND protocol = ? AND token_id = ? AND since_ts = ?
+                """,
+                (int(cid), str(proto), int(tid), int(since_ts)),
+            ).fetchone()
+        return bool(row and int(row[0] or 0) == 1)
+    except Exception:
+        return False
 
 
 def _fetch_v3_position_fees_by_collect_logs(
@@ -24315,6 +24417,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 pricing_mode = ("historical" if bool(want_hist_usd) else "spot")
                 cache_hits = 0
                 cache_misses: list[int] = []
+                stale_cached_by_tid: dict[int, dict[int, float]] = {}
                 for tid in token_ids:
                     cached_one = _load_v3_npm_fee_ledger_day_from_cache(
                         int(chain_id),
@@ -24323,14 +24426,23 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         since_ts=int(collect_since_ts),
                         pricing_mode=str(pricing_mode),
                     )
-                    if cached_one:
+                    scan_done = _is_v3_npm_fee_scan_complete(
+                        int(chain_id),
+                        str(protocol),
+                        int(tid),
+                        since_ts=int(collect_since_ts),
+                    )
+                    if cached_one and scan_done:
                         cache_hits += 1
                         for ts, val in cached_one.items():
                             ledger_by_day[int(ts)] = float(ledger_by_day.get(int(ts), 0.0) + float(val))
                     else:
+                        if cached_one:
+                            stale_cached_by_tid[int(tid)] = dict(cached_one)
                         cache_misses.append(int(tid))
                 debug["ledger_cache_hits"] = int(cache_hits)
                 debug["ledger_cache_misses"] = int(len(cache_misses))
+                debug["ledger_cache_partial"] = int(len(stale_cached_by_tid))
                 elapsed_now = max(0.0, time.monotonic() - started_mono)
                 rem_budget = max(0.0, float(total_budget_sec) - float(elapsed_now))
                 # Keep fee-series request responsive: reserve time for downstream fallbacks and packing.
@@ -24369,7 +24481,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             pmode = str(one_meta.get("pricing") or "").strip()
                             if pmode:
                                 ledger_pricing_modes.append(pmode)
-                        for ts, val in (one_day or {}).items():
+                        src_map = dict(one_day or {})
+                        if not src_map and int(tid) in stale_cached_by_tid:
+                            src_map = dict(stale_cached_by_tid.get(int(tid)) or {})
+                        for ts, val in src_map.items():
                             ledger_by_day[int(ts)] = float(ledger_by_day.get(int(ts), 0.0) + float(val))
                 else:
                     debug["ledger_source"] = "cache"
@@ -24435,7 +24550,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         })
 
     exact_by_day: dict[int, float] = {}
-    if endpoint:
+    if endpoint and (not force_rpc):
         for pid in position_ids[:20]:
             if (time.monotonic() - started_mono) >= subgraph_budget_sec:
                 debug["subgraph_cutoff"] = "time_budget"
@@ -24453,7 +24568,14 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 continue
     debug["subgraph_points"] = int(len(exact_by_day))
     collect_by_shape: dict[int, float] = {}
-    if endpoint and protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"} and str(req.pool_id or "").strip() and _is_eth_address(str(req.address or "").strip().lower()):
+    should_try_collect_shape = bool((not force_rpc) and (not exact_by_day))
+    if (
+        should_try_collect_shape
+        and endpoint
+        and protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
+        and str(req.pool_id or "").strip()
+        and _is_eth_address(str(req.address or "").strip().lower())
+    ):
         shape_candidates: list[tuple[int, int]] = []
         req_tl = int(row_tick_lower or 0)
         req_tu = int(row_tick_upper or 0)
@@ -24536,7 +24658,11 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     sub_max = max(exact_by_day.values()) if exact_by_day else 0.0
     rpc_by_day: dict[int, float] = {}
     rpc_meta: dict[str, str] = {"pricing": "none", "detail": ""}
+    exact_confident = bool(exact_by_day) and (float(snapshot_now_usd) <= 0.0 or float(sub_max) >= float(snapshot_now_usd) * 0.95)
+    should_try_rpc = bool(force_rpc or ((not collect_by_shape) and (not exact_confident)))
     if (
+        should_try_rpc
+        and
         bool(debug.get("rpc_protocol_supported"))
         and _position_fee_rpc_fallback_enabled()
         and _is_eth_address(token0)
