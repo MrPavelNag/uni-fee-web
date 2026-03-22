@@ -20021,6 +20021,15 @@ def _render_positions_page() -> str:
         const rows = Array.isArray(rec.rows) ? rec.rows : [];
         const debug = (rec.debug && typeof rec.debug === "object") ? rec.debug : {};
         if (!rows.length) return null;
+        // Do not reuse cached compare payloads that already contain failed/timeout rows.
+        const hasFailedRows = rows.some((r) => {
+          if (!r || typeof r !== "object") return true;
+          if (r.ok === false) return true;
+          const err = String(r.error || "").trim();
+          return !!err;
+        });
+        const hasTimeoutRows = Number(debug?.timeout_rows || 0) > 0;
+        if (hasFailedRows || hasTimeoutRows) return null;
         return {rows, debug};
       } catch (_) {
         return null;
@@ -26125,6 +26134,12 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
         wall_budget_sec = max(float(wall_budget_sec), 90.0)
     elif len(prepared_rows) <= 2:
         wall_budget_sec = max(float(wall_budget_sec), 60.0)
+    elif len(prepared_rows) <= 4:
+        # 3-4 rows often hit the 40s wall budget on heavier pools.
+        wall_budget_sec = max(float(wall_budget_sec), 80.0)
+    else:
+        # Scale up modestly for larger compare batches while keeping a hard cap.
+        wall_budget_sec = max(float(wall_budget_sec), min(120.0, 30.0 + 15.0 * float(len(prepared_rows))))
     nonempty_baseline = os.environ.get("POSITIONS_FEE_COMPARE_NONEMPTY_BASELINE", "1").strip().lower() in (
         "1",
         "true",
