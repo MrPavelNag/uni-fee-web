@@ -20412,6 +20412,14 @@ def _render_positions_page() -> str:
           }
           const useLineX = lineX.length ? lineX : collectedItems.map((x) => new Date(Number(x.ts || 0) * 1000));
           const useLineY = lineY.length ? lineY : collectedItems.map((x) => Number(x.fees_usd || 0));
+          if (useLineX.length === 1) {
+            const onlyTs = Number(useLineX[0]?.getTime?.() || 0);
+            const anchorTs = (createdMs > 0 && createdMs < onlyTs) ? createdMs : Math.max(0, onlyTs - 86400000);
+            if (anchorTs > 0) {
+              useLineX.unshift(new Date(anchorTs));
+              useLineY.unshift(0);
+            }
+          }
           const singleCollectedPoint = useLineX.length === 1;
           traces.push({
             x: useLineX,
@@ -20443,10 +20451,21 @@ def _render_positions_page() -> str:
           hasEstimatedShareTrace = true;
           rowsWithEstimated += 1;
           const liqHover = (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-";
-          const singleEstimatedPoint = estimatedItems.length === 1;
+          const estX = estimatedItems.map((x) => new Date(Number(x.ts || 0) * 1000));
+          const estY = estimatedItems.map((x) => Number(x.fees_usd || 0));
+          if (estX.length === 1) {
+            const onlyTs = Number(estX[0]?.getTime?.() || 0);
+            const createdMs = Number(meta.createdMs || 0);
+            const anchorTs = (createdMs > 0 && createdMs < onlyTs) ? createdMs : Math.max(0, onlyTs - 86400000);
+            if (anchorTs > 0) {
+              estX.unshift(new Date(anchorTs));
+              estY.unshift(0);
+            }
+          }
+          const singleEstimatedPoint = estX.length === 1;
           traces.push({
-            x: estimatedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
-            y: estimatedItems.map((x) => Number(x.fees_usd || 0)),
+            x: estX,
+            y: estY,
             mode: singleEstimatedPoint ? "lines+markers" : "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
             marker: singleEstimatedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
@@ -25417,6 +25436,47 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 return {}
             return out
 
+        def _position_tvl_by_day_from_amounts(day_ts_list: list[int]) -> dict[int, float]:
+            out: dict[int, float] = {}
+            if not day_ts_list:
+                return out
+            amt0 = max(0.0, _safe_float(getattr(req, "position_amount0", 0.0)))
+            amt1 = max(0.0, _safe_float(getattr(req, "position_amount1", 0.0)))
+            if amt0 <= 0.0 and amt1 <= 0.0:
+                # Use contract snapshot quote amounts if request row does not carry them.
+                amt0 = max(0.0, float(snap_quote_amount0 or 0.0))
+                amt1 = max(0.0, float(snap_quote_amount1 or 0.0))
+            if amt0 <= 0.0 and amt1 <= 0.0:
+                return out
+            day_min = min(int(x) for x in day_ts_list if int(x) > 0)
+            day_max = max(int(x) for x in day_ts_list if int(x) > 0)
+            stable0 = _fee_position_token_stable_usd_assumption(int(chain_id), str(token0 or ""))
+            stable1 = _fee_position_token_stable_usd_assumption(int(chain_id), str(token1 or ""))
+            hist0: list[tuple[int, float]] = []
+            hist1: list[tuple[int, float]] = []
+            if stable0 is None and _is_eth_address(str(token0 or "")):
+                hist0 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token0 or ""), int(day_min), int(day_max))
+            if stable1 is None and _is_eth_address(str(token1 or "")):
+                hist1 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token1 or ""), int(day_min), int(day_max))
+            spot_map = _get_token_prices_usd(int(chain_id), [x for x in [str(token0 or ""), str(token1 or "")] if _is_eth_address(x)])
+            p0_spot = _safe_float(spot_map.get(str(token0 or "").strip().lower()))
+            p1_spot = _safe_float(spot_map.get(str(token1 or "").strip().lower()))
+            if p0_spot <= 0:
+                p0_spot = _safe_float(_major_or_stable_price_by_symbol(sym0_hint or str(getattr(req, "token0_symbol", "") or "")))
+            if p1_spot <= 0:
+                p1_spot = _safe_float(_major_or_stable_price_by_symbol(sym1_hint or str(getattr(req, "token1_symbol", "") or "")))
+            for day_ts in sorted(set(int(x) for x in day_ts_list if int(x) > 0)):
+                p0 = 1.0 if stable0 is not None else _safe_float(_price_usd_at_or_before_series(hist0, int(day_ts)))
+                p1 = 1.0 if stable1 is not None else _safe_float(_price_usd_at_or_before_series(hist1, int(day_ts)))
+                if p0 <= 0:
+                    p0 = max(0.0, float(p0_spot))
+                if p1 <= 0:
+                    p1 = max(0.0, float(p1_spot))
+                tvl_usd = (float(amt0) * float(p0)) + (float(amt1) * float(p1))
+                if tvl_usd > 0.0:
+                    out[int(day_ts)] = float(tvl_usd)
+            return out
+
         def _estimated_pool_fee_days() -> tuple[list[tuple[int, float]], str]:
             pool_id_raw = str(pool_id_for_estimate or "").strip()
             if not pool_id_raw:
@@ -25490,16 +25550,23 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         if pool_fee_days:
             # Primary mode: daily share from historical TVL on each day.
             pos_tvl_by_day = _position_tvl_by_day_for_estimate()
+            pos_tvl_source = "position_snapshots"
             pool_tvl_by_day_raw = _fetch_pool_tvl_series(chain_key, version, str(pool_id_for_estimate or ""), days)
             pool_tvl_by_day: dict[int, float] = {
                 (int(ts) // 86400) * 86400: max(0.0, float(v))
                 for ts, v in (pool_tvl_by_day_raw or [])
                 if int(ts) > 0 and float(v) > 0.0
             }
+            fee_day_keys = [(int(ts) // 86400) * 86400 for ts, _fee in sorted(pool_fee_days, key=lambda x: x[0]) if int(ts) > 0]
+            if not pos_tvl_by_day and fee_day_keys:
+                pos_tvl_by_day = _position_tvl_by_day_from_amounts(fee_day_keys)
+                if pos_tvl_by_day:
+                    pos_tvl_source = "amounts_x_daily_prices"
             pos_days = sorted(int(x) for x in pos_tvl_by_day.keys() if int(x) > 0)
             pool_days = sorted(int(x) for x in pool_tvl_by_day.keys() if int(x) > 0)
             debug["estimate_pos_tvl_days_count"] = int(len(pos_days))
             debug["estimate_pool_tvl_days_count"] = int(len(pool_days))
+            debug["estimate_pos_tvl_source"] = str(pos_tvl_source)
 
             static_share = 0.0
             if pos_liq > 0 and pool_liq > 0:
@@ -25537,7 +25604,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             debug["estimate_fallback_days_missing"] = int(fallback_missing)
             debug["estimate_sparse_share_points"] = int(fallback_missing)
             if dynamic_used > 0:
-                share_source = "daily_tvl_snapshots"
+                share_source = ("daily_tvl_snapshots" if pos_tvl_source == "position_snapshots" else "daily_tvl_amounts_fallback")
             elif fallback_used > 0 and static_share > 0:
                 share_source = (
                     "raw_liquidity_onchain_recovered"
