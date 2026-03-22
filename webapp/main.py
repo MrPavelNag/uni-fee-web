@@ -18377,14 +18377,6 @@ def _render_positions_page() -> str:
               <input type="checkbox" id="posFeeAprLabels" checked />
               <span class="pos-fee-hist-label">Show APR labels</span>
             </label>
-            <label class="fee-toggle-pill" title="Average APR shown in legend.">
-              <span class="pos-fee-hist-label">APR avg</span>
-              <select id="posFeeAprAvgMode" style="font-size:12px; padding:2px 6px; border:1px solid #cbd5e1; border-radius:999px; background:#fff;">
-                <option value="simple">simple</option>
-                <option value="in_position">by in position</option>
-                <option value="fee_delta">by fee delta</option>
-              </select>
-            </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Build chart</button>
             <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
           </div>
@@ -20160,7 +20152,6 @@ def _render_positions_page() -> str:
     }
     function processFeeCompareRows(rowsOut, payloadMeta, palette, traces, rowStatuses, apiFailTop, backendHints, diag, options) {
       const showAprLabels = !(options && options.showAprLabels === false);
-      const aprAvgMode = String((options && options.aprAvgMode) || "simple").trim().toLowerCase();
       let lastFeePricing = "";
       let hasCollectedHistoryTrace = false;
       let hasEstimatedShareTrace = false;
@@ -20177,30 +20168,17 @@ def _render_positions_page() -> str:
         const meta = payloadMeta[pos] || {colorIdx: pos, rowLabel: `row#${pos + 1}`, baseName: `Position ${pos + 1}`, pairOrPool: "?"};
         const liqLabel = String(meta?.liquidityLabel || "").trim();
         const aprItemsForLegend = Array.isArray(outRow?.apr_items) ? outRow.apr_items : [];
-        const avgAprForLegend = (() => {
-          const rows = aprItemsForLegend
-            .map((x) => ({
-              apr: Number(x?.apr_pct || 0),
-              liq: Number(x?.liquidity_usd || 0),
-              fee: Number(x?.fee_delta_usd || 0),
-            }))
-            .filter((r) => Number.isFinite(r.apr) && r.apr > 0);
-          if (!rows.length) return 0;
-          if (aprAvgMode === "in_position") {
-            const wSum = rows.reduce((acc, r) => acc + Math.max(0, r.liq), 0);
-            if (wSum > 0) return rows.reduce((acc, r) => acc + (Math.max(0, r.liq) * r.apr), 0) / wSum;
-          }
-          if (aprAvgMode === "fee_delta") {
-            const wSum = rows.reduce((acc, r) => acc + Math.max(0, r.fee), 0);
-            if (wSum > 0) return rows.reduce((acc, r) => acc + (Math.max(0, r.fee) * r.apr), 0) / wSum;
-          }
-          return rows.reduce((acc, r) => acc + r.apr, 0) / rows.length;
-        })();
+        const aprValsForLegend = aprItemsForLegend
+          .map((x) => Number(x?.apr_pct || 0))
+          .filter((v) => Number.isFinite(v) && v > 0);
+        const avgAprForLegend = aprValsForLegend.length
+          ? (aprValsForLegend.reduce((acc, v) => acc + v, 0) / aprValsForLegend.length)
+          : 0;
         const legendCore = (liqLabel && liqLabel !== "-")
           ? `${meta.baseName} [liq ${liqLabel}]`
           : String(meta.baseName || "");
         const legendBase = avgAprForLegend > 0
-          ? `${legendCore} [avg ${avgAprForLegend.toFixed(1)}%]`
+          ? `${legendCore} [avg APR ${avgAprForLegend.toFixed(1)}%]`
           : legendCore;
         if (!outRow?.ok) {
           const det = String(outRow?.error || "compare data failed");
@@ -20489,7 +20467,6 @@ def _render_positions_page() -> str:
         if (!ok) throw new Error("Failed to load chart library");
         const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
         const showAprLabels = !!(document.getElementById("posFeeAprLabels") && document.getElementById("posFeeAprLabels").checked);
-        const aprAvgMode = String(document.getElementById("posFeeAprAvgMode")?.value || "simple").trim().toLowerCase();
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
         const apiFailTop = [];
@@ -20563,7 +20540,7 @@ def _render_positions_page() -> str:
           apiFailTop,
           backendHints,
           diag,
-          {showAprLabels, aprAvgMode},
+          {showAprLabels},
         );
         if (!traces.length) {
           stopFeeStatusTimer();
@@ -20627,8 +20604,8 @@ def _render_positions_page() -> str:
               ? `${base} (estimated, ${isToday ? "today USD" : "if sold instantly"})`
               : `${base} (${isToday ? "today USD" : "if sold instantly"})`;
             const dash = isEstimated
-              ? (isToday ? "dashdot" : "dot")
-              : (isToday ? "dash" : "solid");
+              ? (isToday ? "solid" : "dot")
+              : (isToday ? "solid" : "dash");
             return {
               ...t,
               name: legendName,
@@ -20679,7 +20656,7 @@ def _render_positions_page() -> str:
                   apiFailTopSpot,
                   backendHintsSpot,
                   diagSpot,
-                  {showAprLabels: false, aprAvgMode},
+                  {showAprLabels: false},
                 );
                 if (tracesSpot.length) {
                   const spotOverlay = applyFeeTraceStyleByPair(tracesSpot, "today", 0.78);
