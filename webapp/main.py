@@ -18205,7 +18205,6 @@ def _render_positions_page() -> str:
     .fee-status-pill.info { border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8; }
     #posFeeBody .hint { font-size:13px; line-height:1.45; color:#475569; margin:0 0 10px; }
     #posFeeChart { height:360px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; }
-    #posFeeEstimatedChart { height:260px; border:1px solid #dbe3ef; border-radius:12px; background:#f8fbff; padding:8px; margin-top:8px; }
     #posFeeDebug { margin-top:10px; }
     .fee-toggle-pill {
       display:inline-flex; align-items:center; gap:7px;
@@ -18364,7 +18363,6 @@ def _render_positions_page() -> str:
         </div>
         <div id="posFeeBody" class="section-body">
           <div id="posFeeChart"></div>
-          <div id="posFeeEstimatedChart"></div>
           <div id="posFeeDebug" class="info-box" style="display:none"></div>
         </div>
       </section>
@@ -18457,6 +18455,7 @@ def _render_positions_page() -> str:
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
     const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
     const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v1";
+    const POS_FEE_LAST_CHART_KEY = "positions_fee_last_chart_v1";
     const NFT_PM_SNAPSHOT_LABELS = {
       position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder).",
     };
@@ -19983,7 +19982,61 @@ def _render_positions_page() -> str:
         localStorage.setItem(POS_FEE_SCAN_CACHE_KEY, JSON.stringify({ts: Date.now(), byKey}));
       } catch (_) {}
     }
+    function saveLastFeeChartCache(traces, title) {
+      try {
+        const safeTraces = Array.isArray(traces) ? traces.slice(0, 80) : [];
+        localStorage.setItem(
+          POS_FEE_LAST_CHART_KEY,
+          JSON.stringify({
+            ts: Date.now(),
+            title: String(title || ""),
+            traces: safeTraces,
+          }),
+        );
+      } catch (_) {}
+    }
+    async function restoreLastFeeChartFromCache() {
+      const chartEl = document.getElementById("posFeeChart");
+      if (!chartEl) return false;
+      try {
+        const raw = localStorage.getItem(POS_FEE_LAST_CHART_KEY);
+        if (!raw) return false;
+        const obj = JSON.parse(raw);
+        if (!obj || typeof obj !== "object") return false;
+        const ts = Number(obj.ts || 0);
+        if (!ts || (Date.now() - ts) > 24 * 3600 * 1000) return false;
+        const traces = Array.isArray(obj.traces) ? obj.traces : [];
+        if (!traces.length) return false;
+        const ok = await ensurePlotly();
+        if (!ok) return false;
+        Plotly.newPlot("posFeeChart", traces, {
+          title: String(obj.title || "Collected + estimated fees (USD)"),
+          paper_bgcolor: "#ffffff",
+          plot_bgcolor: "#f8fbff",
+          margin: {t: 34, b: 42, l: 54, r: 12},
+          xaxis: chartGridX(0, 20),
+          yaxis: chartGridY(true),
+          showlegend: true,
+          legend: {orientation: "h", y: -0.2},
+        }, {displaylogo: false, responsive: true});
+        setPosFeeStatus("Chart restored from cache.", false);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
     function buildFeeCompareSelection(selected, histUsd) {
+      const numOrZero = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : 0;
+      };
+      const strOrEmpty = (...vals) => {
+        for (const v of vals) {
+          const s = String(v ?? "").trim();
+          if (s) return s;
+        }
+        return "";
+      };
       const diag = {
         selected: selected.length,
         missingRow: 0,
@@ -20026,8 +20079,16 @@ def _render_positions_page() -> str:
           });
           continue;
         }
-        const missingTokens = (!String(row.token0_id || "").trim() || !String(row.token1_id || "").trim());
+        const tickLower = numOrZero(row.tick_lower ?? row.tickLower?.tickIdx ?? row.tickLower ?? 0);
+        const tickUpper = numOrZero(row.tick_upper ?? row.tickUpper?.tickIdx ?? row.tickUpper ?? 0);
+        const token0Id = strOrEmpty(row.token0_id, row.token0?.id, row.pool?.token0?.id, row.token0);
+        const token1Id = strOrEmpty(row.token1_id, row.token1?.id, row.pool?.token1?.id, row.token1);
+        const missingTokens = (!token0Id || !token1Id);
         if (missingTokens) diag.missingTokens += 1;
+        const posLiquidity = strOrEmpty(row.liquidity, row.position_liquidity, row.position?.liquidity, "0");
+        const poolLiquidity = strOrEmpty(row.pool_liquidity, row.pool?.liquidity, "0");
+        const posAmount0 = numOrZero(row.position_amount0 ?? row.amount0 ?? row.position?.amount0 ?? 0);
+        const posAmount1 = numOrZero(row.position_amount1 ?? row.amount1 ?? row.position?.amount1 ?? 0);
         rowsPayload.push({
           chain: row.chain,
           chain_id: Number(row.chain_id) || 0,
@@ -20036,25 +20097,25 @@ def _render_positions_page() -> str:
           address: row.address,
           position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
           position_id: String(row.position_id || ""),
-          position_liquidity: row.liquidity,
-          pool_liquidity: row.pool_liquidity,
+          position_liquidity: posLiquidity,
+          pool_liquidity: poolLiquidity,
           pool_tvl_usd: Number(row.pool_tvl_usd || 0),
           days: rowDays,
-          token0_id: row.token0_id || "",
-          token1_id: row.token1_id || "",
+          token0_id: token0Id,
+          token1_id: token1Id,
           token0_symbol: row.position_symbol0 || "",
           token1_symbol: row.position_symbol1 || "",
-          tick_lower: Number(row.tick_lower ?? row.tickLower ?? 0) || 0,
-          tick_upper: Number(row.tick_upper ?? row.tickUpper ?? 0) || 0,
+          tick_lower: tickLower,
+          tick_upper: tickUpper,
           pool_created_date: String(row.pool_created_date || ""),
           position_created_date: String(row.position_created_date || ""),
           fees_owed0: Number(row.fees_owed0 || 0),
           fees_owed1: Number(row.fees_owed1 || 0),
-          position_amount0: Number(row.position_amount0 || 0),
-          position_amount1: Number(row.position_amount1 || 0),
+          position_amount0: posAmount0,
+          position_amount1: posAmount1,
           pool_token0_price: Number(row.pool_token0_price || 0),
-          fee_tier_raw: String(row.fee_tier_raw || ""),
-          fee_tier: String(row.fee_tier || ""),
+          fee_tier_raw: strOrEmpty(row.fee_tier_raw, row.feeTier, row.fee_tier),
+          fee_tier: strOrEmpty(row.fee_tier, row.feeTier, row.fee_tier_raw),
           fee_usd_historical: histUsd,
         });
         payloadMeta.push({
@@ -20299,13 +20360,8 @@ def _render_positions_page() -> str:
     }
     async function showSelectedPositionFees() {
       const chartEl = document.getElementById("posFeeChart");
-      const estChartEl = document.getElementById("posFeeEstimatedChart");
       const debugEl = document.getElementById("posFeeDebug");
       if (!chartEl) return;
-      if (estChartEl) {
-        estChartEl.innerHTML = "";
-        estChartEl.style.display = "none";
-      }
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
       const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
       if (!selected.length) {
@@ -20364,7 +20420,6 @@ def _render_positions_page() -> str:
         if (!rowsPayload.length) {
           stopFeeStatusTimer();
           chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
-          if (estChartEl) estChartEl.innerHTML = "<div class='hint'>No estimated data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatusBar({state: "error", title: "Build chart", message: "No valid selected rows", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
@@ -20392,7 +20447,6 @@ def _render_positions_page() -> str:
           stopFeeStatusTimer();
           const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
           chartEl.innerHTML = `<div class='hint'>Failed to load compare data: ${esc(det)}</div>`;
-          if (estChartEl) estChartEl.innerHTML = "<div class='hint'>No estimated data.</div>";
           setPosFeeStatusBar({state: "error", title: "Build chart", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
@@ -20453,55 +20507,65 @@ def _render_positions_page() -> str:
           return;
         }
 
-        const buildOverlayTraces = (srcTraces) => {
-          const estimatedTracesRaw = (srcTraces || []).filter((t) => String(t?.name || "").toLowerCase().includes("(estimated)"));
-          const hardTraces = (srcTraces || []).filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated)"));
-          const estimateColors = ["#f97316", "#ea580c", "#fb923c", "#fdba74"];
-          const estimatedTraces = estimatedTracesRaw.map((t, idx) => {
-            const c = estimateColors[idx % estimateColors.length];
+        const toLegendBase = (name) => String(name || "")
+          .replace(/\s*\[(historical|today)\s*USD\]\s*$/i, "")
+          .replace(/\s*\(today USD\)\s*$/i, "")
+          .replace(/\s*\(if sold instantly\)\s*$/i, "")
+          .replace(/\s*\(estimated,\s*today USD\)\s*$/i, "")
+          .replace(/\s*\(estimated,\s*if sold instantly\)\s*$/i, "")
+          .replace(/\s*\(estimated\)\s*$/i, "")
+          .replace(/\s*\(collect points.*\)\s*$/i, "")
+          .trim();
+        const pairPalette = ["#2563eb", "#dc2626", "#059669", "#7c3aed", "#0f766e", "#b45309", "#be123c", "#1d4ed8", "#16a34a", "#9333ea"];
+        const pairColorByBase = Object.create(null);
+        let pairColorIdx = 0;
+        const getPairColor = (base) => {
+          const k = String(base || "").trim().toLowerCase() || "pair";
+          if (!pairColorByBase[k]) {
+            pairColorByBase[k] = pairPalette[pairColorIdx % pairPalette.length];
+            pairColorIdx += 1;
+          }
+          return pairColorByBase[k];
+        };
+        const applyFeeTraceStyleByPair = (srcTraces, viewMode, viewOpacity = 1.0) => {
+          const isToday = String(viewMode || "").toLowerCase() === "today";
+          return (srcTraces || []).map((t) => {
+            const name = String(t?.name || "");
             const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
+            const markerIn = (t && typeof t === "object" && t.marker && typeof t.marker === "object") ? t.marker : {};
+            const modeLower = String(t?.mode || "").toLowerCase();
+            const isEstimated = name.toLowerCase().includes("(estimated)");
+            const isMarkerOnly = modeLower === "markers";
+            const base = toLegendBase(name) || name;
+            const color = getPairColor(base);
+            const legendName = isEstimated
+              ? `${base} (estimated, ${isToday ? "today USD" : "if sold instantly"})`
+              : `${base} (${isToday ? "today USD" : "if sold instantly"})`;
+            const dash = isEstimated
+              ? (isToday ? "dashdot" : "dot")
+              : (isToday ? "dash" : "solid");
             return {
               ...t,
-              line: { ...lineIn, color: c, dash: "dash", width: Math.max(2, Number(lineIn.width || 2)) },
-              opacity: 0.95,
+              name: legendName,
+              line: {
+                ...lineIn,
+                color,
+                dash,
+                width: Math.max(1.8, Number(lineIn.width || 2)),
+              },
+              marker: {
+                ...markerIn,
+                color,
+                symbol: (isToday && isMarkerOnly) ? "circle-open" : markerIn.symbol,
+              },
+              opacity: Number(viewOpacity),
             };
           });
-          return (hardTraces.length ? hardTraces : (srcTraces || [])).concat(estimatedTraces);
         };
         const mainTitleSuffix = histUsd
           ? " — historical USD + today USD"
           : " — today USD";
-        let overlayTraces = buildOverlayTraces(traces);
-        if (histUsd) {
-          const histHardColors = ["#2563eb", "#7c3aed", "#0f766e", "#dc2626", "#1d4ed8"];
-          const histEstColors = ["#16a34a", "#22c55e", "#15803d", "#4ade80"];
-          let hi = 0;
-          let ei = 0;
-          const toLegendBase = (name) => String(name || "")
-            .replace(/\s*\[(historical|today)\s*USD\]\s*$/i, "")
-            .replace(/\s*\(today USD\)\s*$/i, "")
-            .replace(/\s*\(if sold instantly\)\s*$/i, "")
-            .replace(/\s*\(estimated,\s*today USD\)\s*$/i, "")
-            .replace(/\s*\(estimated,\s*if sold instantly\)\s*$/i, "")
-            .replace(/\s*\(estimated\)\s*$/i, "")
-            .replace(/\s*\(collect points.*\)\s*$/i, "")
-            .trim();
-          overlayTraces = overlayTraces.map((t) => {
-            const name = String(t?.name || "");
-            const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
-            const isEstimated = name.toLowerCase().includes("(estimated)");
-            const base = toLegendBase(name) || name;
-            const legendName = isEstimated
-              ? `${base} (estimated, if sold instantly)`
-              : `${base} (if sold instantly)`;
-            const c = isEstimated ? histEstColors[(ei++) % histEstColors.length] : histHardColors[(hi++) % histHardColors.length];
-            return {
-              ...t,
-              name: legendName,
-              line: { ...lineIn, color: c },
-            };
-          });
-        }
+        let overlayTraces = applyFeeTraceStyleByPair(traces, histUsd ? "historical" : "today", 1.0);
         if (histUsd) {
           try {
             const preparedSpot = buildFeeCompareSelection(selected, false);
@@ -20532,40 +20596,7 @@ def _render_positions_page() -> str:
                   diagSpot,
                 );
                 if (tracesSpot.length) {
-                  const spotOverlay = buildOverlayTraces(tracesSpot).map((t) => {
-                    const name = String(t?.name || "");
-                    const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
-                    const markerIn = (t && typeof t === "object" && t.marker && typeof t.marker === "object") ? t.marker : {};
-                    const isEstimated = name.toLowerCase().includes("(estimated)");
-                    const isMarkerOnly = String(t?.mode || "").toLowerCase() === "markers";
-                    const base = String(name || "")
-                      .replace(/\s*\[(historical|today)\s*USD\]\s*$/i, "")
-                      .replace(/\s*\(today USD\)\s*$/i, "")
-                      .replace(/\s*\(if sold instantly\)\s*$/i, "")
-                      .replace(/\s*\(estimated,\s*today USD\)\s*$/i, "")
-                      .replace(/\s*\(estimated,\s*if sold instantly\)\s*$/i, "")
-                      .replace(/\s*\(estimated\)\s*$/i, "")
-                      .replace(/\s*\(collect points.*\)\s*$/i, "")
-                      .trim();
-                    const legendName = isEstimated
-                      ? `${base} (estimated, today USD)`
-                      : `${base} (today USD)`;
-                    return {
-                      ...t,
-                      name: legendName,
-                      line: {
-                        ...lineIn,
-                        color: isEstimated ? "#fb923c" : "#f97316",
-                        dash: isEstimated ? "dot" : "dashdot",
-                        width: Math.max(1.8, Number(lineIn.width || 2)),
-                      },
-                      marker: {
-                        ...markerIn,
-                        symbol: isMarkerOnly ? "circle-open" : markerIn.symbol,
-                      },
-                      opacity: 0.78,
-                    };
-                  });
+                  const spotOverlay = applyFeeTraceStyleByPair(tracesSpot, "today", 0.78);
                   overlayTraces = overlayTraces.concat(spotOverlay);
                   if (backendHints.length < 8) {
                     backendHints.push(`dual_view_spot_rows: collected=${Number(feeStateSpot.rowsWithCollected || 0)}, estimated=${Number(feeStateSpot.rowsWithEstimated || 0)}, snapshot=${Number(feeStateSpot.rowsWithSnapshot || 0)}`);
@@ -20586,6 +20617,7 @@ def _render_positions_page() -> str:
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
+        saveLastFeeChartCache(overlayTraces, "Collected + estimated fees (USD)" + mainTitleSuffix);
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
         const baselineRows = Number(cmpDebug.synthetic_baseline_rows || 0);
@@ -21874,7 +21906,7 @@ def _render_positions_page() -> str:
         days: getHistoryDays(),
         message: "Cached results restored",
       });
-      setPosFeeStatus("Cache restored — you can click Scan under Fee calculation.", false);
+      setPosFeeStatus("Cache restored — you can click Build chart under Fee calculation.", false);
     } else {
       updatePosSearchButton();
       setPosStatus("Ready", false);
@@ -21889,6 +21921,7 @@ def _render_positions_page() -> str:
       });
       setPosFeeStatus("Select History checkboxes, then click Build chart", false);
     }
+    restoreLastFeeChartFromCache();
     resumePosJobIfAny();
     const savedHeavy = loadHeavyPosResults();
     if (savedHeavy && Array.isArray(savedHeavy.pool_positions) && savedHeavy.pool_positions.length) {
@@ -25059,15 +25092,30 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             debug["token1_source"] = "pool_id_subgraph"
     # V3-like contract snapshot fallback: token resolution + shape + quote amounts.
     if protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}:
-        need_snap = (
+        req_pos_liq = max(0.0, _safe_float(getattr(req, "position_liquidity", 0.0)))
+        req_pool_liq = max(0.0, _safe_float(getattr(req, "pool_liquidity", 0.0)))
+        has_row_liquidity_share = bool(req_pos_liq > 0 and req_pool_liq > 0)
+        has_row_amounts = bool(
+            _safe_float(getattr(req, "position_amount0", 0.0)) > 0
+            or _safe_float(getattr(req, "position_amount1", 0.0)) > 0
+        )
+        need_addr_or_shape = (
             (not _is_eth_address(token0))
             or (not _is_eth_address(token1))
             or not (row_tick_lower < row_tick_upper)
-            or (
-                _safe_float(getattr(req, "position_amount0", 0.0)) <= 0
-                and _safe_float(getattr(req, "position_amount1", 0.0)) <= 0
-            )
         )
+        # If row already has liquidity share from Scan V3, do not re-query snapshot
+        # only to recover amount0/amount1 quotes.
+        need_quote_amounts = bool((not has_row_liquidity_share) and (not has_row_amounts))
+        need_snap = (
+            bool(need_addr_or_shape)
+            or bool(need_quote_amounts)
+        )
+        debug["row_has_liquidity_share"] = bool(has_row_liquidity_share)
+        debug["row_has_position_amounts"] = bool(has_row_amounts)
+        debug["snapshot_fallback_need_addr_or_shape"] = bool(need_addr_or_shape)
+        debug["snapshot_fallback_need_quote_amounts"] = bool(need_quote_amounts)
+        debug["snapshot_fallback_skipped_reuse_row_data"] = bool(not need_snap)
         if need_snap:
             for pid in position_ids[:3]:
                 try:
