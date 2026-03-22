@@ -19102,6 +19102,8 @@ def _render_positions_page() -> str:
       parts.push(`${title}: ${msg || (state === "ok" ? "Done" : (state === "warn" ? "Partial" : "Error"))}`);
       parts.push(`points collected ${Math.max(0, Number(collectedPts || 0))}`);
       if (estimatedPts > 0) parts.push(`estimated ${Math.max(0, Number(estimatedPts || 0))}`);
+      if (timeoutRows > 0) parts.push(`timeout ${Math.max(0, timeoutRows)}`);
+      if (missing > 0) parts.push(`missing ${Math.max(0, missing)}`);
       if (elapsedSec > 0) parts.push(`${Math.round(elapsedSec)}s`);
       el.classList.remove("fee-status-bar");
       el.style.color = state === "error" ? "#b91c1c" : (state === "warn" ? "#92400e" : "#475569");
@@ -20410,11 +20412,13 @@ def _render_positions_page() -> str:
           }
           const useLineX = lineX.length ? lineX : collectedItems.map((x) => new Date(Number(x.ts || 0) * 1000));
           const useLineY = lineY.length ? lineY : collectedItems.map((x) => Number(x.fees_usd || 0));
+          const singleCollectedPoint = useLineX.length === 1;
           traces.push({
             x: useLineX,
             y: useLineY,
-            mode: "lines",
+            mode: singleCollectedPoint ? "lines+markers" : "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
+            marker: singleCollectedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
             name: `${legendBase} (today USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
@@ -20439,11 +20443,13 @@ def _render_positions_page() -> str:
           hasEstimatedShareTrace = true;
           rowsWithEstimated += 1;
           const liqHover = (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-";
+          const singleEstimatedPoint = estimatedItems.length === 1;
           traces.push({
             x: estimatedItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
             y: estimatedItems.map((x) => Number(x.fees_usd || 0)),
-            mode: "lines",
+            mode: singleEstimatedPoint ? "lines+markers" : "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
+            marker: singleEstimatedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
             opacity: 0.85,
             name: `${legendBase} (estimated, today USD)`,
             hovertemplate: `%{x|%b %d, %Y}<br>$%{y:.2f}<br>Liquidity: ${esc(liqHover)}<extra></extra>`,
@@ -20672,6 +20678,7 @@ def _render_positions_page() -> str:
             const isMarkerOnly = modeLower === "markers";
             const base = toLegendBase(name) || name;
             const color = getPairColor(base);
+            const feeType = isEstimated ? "estimated" : (isToday ? "today" : "instant");
             const legendName = isEstimated
               ? `${base} (estimated, ${isToday ? "today USD" : "if sold instantly"})`
               : `${base} (${isToday ? "today USD" : "if sold instantly"})`;
@@ -20693,6 +20700,8 @@ def _render_positions_page() -> str:
                 symbol: (isToday && isMarkerOnly) ? "circle-open" : markerIn.symbol,
               },
               opacity: Number(viewOpacity),
+              _feeType: feeType,
+              _feeBase: base,
             };
           });
         };
@@ -20751,11 +20760,12 @@ def _render_positions_page() -> str:
             const name = String(t?.name || "");
             const modeLower = String(t?.mode || "").toLowerCase();
             const markerOnly = modeLower.includes("markers") && !modeLower.includes("lines");
-            const base = toLegendBase(name) || name || "pair";
+            const base = String(t?._feeBase || toLegendBase(name) || name || "pair");
+            const tpRaw = String(t?._feeType || "").trim().toLowerCase();
             const lower = name.toLowerCase();
-            const isEstimated = lower.includes("(estimated");
-            const isToday = lower.includes("(today usd)");
-            const tp = isEstimated ? "estimated" : (isToday ? "today" : "instant");
+            const tp = (tpRaw === "today" || tpRaw === "instant" || tpRaw === "estimated")
+              ? tpRaw
+              : (lower.includes("(estimated") ? "estimated" : (lower.includes("(today usd)") ? "today" : "instant"));
             if (!byBase.has(base)) {
               byBase.set(base, []);
               baseOrder.push(base);
@@ -20796,12 +20806,13 @@ def _render_positions_page() -> str:
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
         const baselineRows = Number(cmpDebug.synthetic_baseline_rows || 0);
+        const hasPartialRows = timeoutRows > 0 || missing > 0;
         stopFeeStatusTimer();
         if (feeState.hasEstimatedShareTrace && feeState.hasCollectedHistoryTrace) {
           setPosFeeStatusBar({
-            state: "ok",
+            state: hasPartialRows ? "warn" : "ok",
             title: "Fee calculation",
-            message: "Collected & estimated ready",
+            message: hasPartialRows ? "Partial (some rows timed out/missing)" : "Collected & estimated ready",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
             collected: Number(feeState.rowsWithCollected || 0),
@@ -20837,9 +20848,9 @@ def _render_positions_page() -> str:
           });
         } else {
           setPosFeeStatusBar({
-            state: "ok",
+            state: hasPartialRows ? "warn" : "ok",
             title: "Fee calculation",
-            message: "Done",
+            message: hasPartialRows ? "Partial (some rows timed out/missing)" : "Done",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
             collected: Number(feeState.rowsWithCollected || 0),
