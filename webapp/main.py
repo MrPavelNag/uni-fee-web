@@ -20616,7 +20616,7 @@ def _render_positions_page() -> str:
                 );
                 if (tracesSpot.length) {
                   const spotOverlay = applyFeeTraceStyleByPair(tracesSpot, "today", 0.78)
-                    .filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated"));
+                    .filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated)"));
                   overlayTraces = overlayTraces.concat(spotOverlay);
                   if (backendHints.length < 8) {
                     backendHints.push(`dual_view_spot_rows: collected=${Number(feeStateSpot.rowsWithCollected || 0)}, estimated=${Number(feeStateSpot.rowsWithEstimated || 0)}, snapshot=${Number(feeStateSpot.rowsWithSnapshot || 0)}`);
