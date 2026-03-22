@@ -20376,17 +20376,19 @@ def _render_positions_page() -> str:
             collectedPointY.push(val);
             const aprMeta = aprByTs.get(ts);
             const aprPct = Number(aprMeta?.aprPct || 0);
+            const feeDeltaUsd = Number(aprMeta?.feeDelta || 0);
             const liqUsd = Number(aprMeta?.liquidityUsd || 0);
             const aprDays = Number(aprMeta?.days || 0);
-            const aprText = (showAprLabels && aprPct > 0) ? `<b>${aprPct.toFixed(1)}%</b>` : "";
+            const aprText = "";
             collectedPointText.push(aprText);
             const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
             const liqAtPoint = liqUsd > 0 ? `$${liqUsd.toFixed(2)}` : esc(liqHover);
             const daysLine = (aprDays > 0) ? `<br>Days: ${aprDays.toFixed(1)}` : "";
+            const feeStepLine = feeDeltaUsd > 0 ? `$${feeDeltaUsd.toFixed(2)}` : `$${val.toFixed(2)}`;
             collectedPointHover.push(
               aprPct > 0
-                ? `${dtLabel}<br>$${val.toFixed(2)}<br>${aprPct.toFixed(1)}%${daysLine}<br>Liquidity: ${liqAtPoint}`
-                : `${dtLabel}<br>$${val.toFixed(2)}${daysLine}<br>Liquidity: ${liqAtPoint}`
+                ? `${dtLabel}<br>${feeStepLine}<br>${aprPct.toFixed(1)}%${daysLine}<br>Liquidity: ${liqAtPoint}`
+                : `${dtLabel}<br>${feeStepLine}${daysLine}<br>Liquidity: ${liqAtPoint}`
             );
           }
           if (hasSnapshot) {
@@ -20411,7 +20413,7 @@ def _render_positions_page() -> str:
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
           if (collectedPointX.length) {
-            const hasAprLabel = showAprLabels && collectedPointText.some((t) => String(t || "").trim());
+            const hasAprLabel = false;
             traces.push({
               x: collectedPointX,
               y: collectedPointY,
@@ -25665,9 +25667,13 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             return 0.0
 
         items: list[dict[str, Any]] = []
+        points_sorted = sorted(((int(k), float(v)) for k, v in collected_by_day.items()), key=lambda x: x[0])
+        if not points_sorted:
+            return []
+        debug["apr_mode"] = "segment_between_collects"
         prev_ts: int | None = None
         prev_cum: float | None = None
-        for ts, cum in sorted(((int(k), float(v)) for k, v in collected_by_day.items()), key=lambda x: x[0]):
+        for ts, cum in points_sorted:
             day_ts = (int(ts) // 86400) * 86400
             tvl_usd = _lookup_tvl(day_ts)
             fee_delta = 0.0
