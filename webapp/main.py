@@ -26133,6 +26133,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     token_ids.append(int(tid))
             debug["ledger_token_ids"] = int(len(token_ids))
             if token_ids:
+                ledger_since_ts = int((int(collect_since_ts) // 86400) * 86400)
+                debug["ledger_since_ts"] = int(ledger_since_ts)
                 pricing_mode = ("historical" if bool(want_hist_usd) else "spot")
                 alt_pricing_mode = ("spot" if str(pricing_mode) == "historical" else "historical")
                 cache_hits = 0
@@ -26144,14 +26146,14 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         int(chain_id),
                         str(protocol),
                         int(tid),
-                        since_ts=int(collect_since_ts),
+                        since_ts=int(ledger_since_ts),
                         pricing_mode=str(pricing_mode),
                     )
                     scan_done = _is_v3_npm_fee_scan_complete(
                         int(chain_id),
                         str(protocol),
                         int(tid),
-                        since_ts=int(collect_since_ts),
+                        since_ts=int(ledger_since_ts),
                     )
                     # Fast-path: when a completed scan already confirms there are no Collect events
                     # in the requested range, skip expensive rebuild/scan for this token.
@@ -26174,7 +26176,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                                 int(chain_id),
                                 str(protocol),
                                 int(tid),
-                                since_ts=int(collect_since_ts),
+                                since_ts=int(ledger_since_ts),
                                 pricing_mode=str(alt_pricing_mode),
                             )
                             for ts, val in dict(cached_alt or {}).items():
@@ -26210,7 +26212,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         int(chain_id),
                         str(protocol),
                         scan_token_ids,
-                        since_ts=int(collect_since_ts),
+                        since_ts=int(ledger_since_ts),
                         max_chunks=int(ledger_chunks_cap),
                         deadline_ts=float(ledger_deadline),
                     )
@@ -26234,7 +26236,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             int(chain_id),
                             str(protocol),
                             int(tid),
-                            since_ts=int(collect_since_ts),
+                            since_ts=int(ledger_since_ts),
                             token0_addr=str(token0 or ""),
                             token1_addr=str(token1 or ""),
                             use_historical_usd=bool(want_hist_usd),
@@ -26253,7 +26255,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                                 int(chain_id),
                                 str(protocol),
                                 int(tid),
-                                since_ts=int(collect_since_ts),
+                                since_ts=int(ledger_since_ts),
                                 pricing_mode=str(alt_pricing_mode),
                             )
                             if not src_alt:
@@ -26261,7 +26263,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                                     int(chain_id),
                                     str(protocol),
                                     int(tid),
-                                    since_ts=int(collect_since_ts),
+                                    since_ts=int(ledger_since_ts),
                                     token0_addr=str(token0 or ""),
                                     token1_addr=str(token1 or ""),
                                     use_historical_usd=(str(alt_pricing_mode) == "historical"),
