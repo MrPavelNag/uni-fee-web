@@ -20117,19 +20117,6 @@ def _render_positions_page() -> str:
         localStorage.setItem(POS_FEE_SCAN_CACHE_KEY, JSON.stringify({ts: Date.now(), byKey}));
       } catch (_) {}
     }
-    function clearFeeScanCacheKey(key) {
-      try {
-        const raw = localStorage.getItem(POS_FEE_SCAN_CACHE_KEY);
-        if (!raw) return;
-        const obj = JSON.parse(raw);
-        if (!obj || typeof obj !== "object") return;
-        const byKey = (obj && typeof obj.byKey === "object" && obj.byKey) ? obj.byKey : {};
-        const k = String(key || "");
-        if (!k || !(k in byKey)) return;
-        delete byKey[k];
-        localStorage.setItem(POS_FEE_SCAN_CACHE_KEY, JSON.stringify({ts: Date.now(), byKey}));
-      } catch (_) {}
-    }
     function saveLastFeeChartCache(traces, title) {
       try {
         const safeTraces = Array.isArray(traces) ? traces.slice(0, 80) : [];
@@ -20407,7 +20394,7 @@ def _render_positions_page() -> str:
         const hasEstimated = estimatedItems.length > 0;
         const hasSnapshot = snapshotItems.length > 0;
         const collectedTotalUsd = hasCollected ? Math.max(0, Number(lastByTs(collectedItems)?.fees_usd || 0)) : 0;
-        const aprVals = aprItems.map((x) => Number(x?.apr_pct || 0)).filter((x) => x > 0);
+        const aprVals = Array.from(aprByTs.values()).map((x) => Number(x?.aprPct || 0)).filter((x) => x > 0);
         const avgAprPct = aprVals.length ? (aprVals.reduce((a, b) => a + b, 0) / aprVals.length) : 0;
         const legendStats = [];
         if (collectedTotalUsd > 0) legendStats.push(`Fee $${collectedTotalUsd.toFixed(2)}`);
@@ -25792,7 +25779,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     token_ids.append(int(tid))
             debug["ledger_token_ids"] = int(len(token_ids))
             if token_ids:
-                single_position_mode_hint = bool(len(position_ids) <= 1)
                 pricing_mode = ("historical" if bool(want_hist_usd) else "spot")
                 alt_pricing_mode = ("spot" if str(pricing_mode) == "historical" else "historical")
                 cache_hits = 0
@@ -26217,31 +26203,37 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         debug["pool_flow_skipped"] = True
     debug["pool_flow_collect_points"] = 0
 
+    def _row_unclaimed_spot_usd() -> float:
+        owed0_now = max(0.0, _safe_float(getattr(req, "fees_owed0", 0.0)))
+        owed1_now = max(0.0, _safe_float(getattr(req, "fees_owed1", 0.0)))
+        if owed0_now <= 0.0 and owed1_now <= 0.0:
+            return 0.0
+        p0_now = 0.0
+        p1_now = 0.0
+        try:
+            tks_now = [x for x in [token0, token1] if _is_eth_address(x)]
+            pmap_now = _get_token_prices_usd(int(chain_id), tks_now) if tks_now else {}
+            p0_now = _safe_float(pmap_now.get(str(token0 or "").strip().lower()))
+            p1_now = _safe_float(pmap_now.get(str(token1 or "").strip().lower()))
+        except Exception:
+            p0_now = 0.0
+            p1_now = 0.0
+        if p0_now <= 0:
+            p0_now = _safe_float(_major_or_stable_price_by_symbol(sym0_hint or str(getattr(req, "token0_symbol", "") or "")))
+        if p1_now <= 0:
+            p1_now = _safe_float(_major_or_stable_price_by_symbol(sym1_hint or str(getattr(req, "token1_symbol", "") or "")))
+        usd_now = 0.0
+        if owed0_now > 0 and p0_now > 0:
+            usd_now += float(owed0_now) * float(p0_now)
+        if owed1_now > 0 and p1_now > 0:
+            usd_now += float(owed1_now) * float(p1_now)
+        return float(max(0.0, usd_now))
+
     # Current-row unclaimed fees in spot USD (used as confidence anchor for subgraph path).
     # Must be initialized before exact_confident checks.
     snapshot_now_usd = 0.0
     try:
-        owed0_now = max(0.0, _safe_float(getattr(req, "fees_owed0", 0.0)))
-        owed1_now = max(0.0, _safe_float(getattr(req, "fees_owed1", 0.0)))
-        if owed0_now > 0.0 or owed1_now > 0.0:
-            p0_now = 0.0
-            p1_now = 0.0
-            try:
-                tks_now = [x for x in [token0, token1] if _is_eth_address(x)]
-                pmap_now = _get_token_prices_usd(int(chain_id), tks_now) if tks_now else {}
-                p0_now = _safe_float(pmap_now.get(str(token0 or "").strip().lower()))
-                p1_now = _safe_float(pmap_now.get(str(token1 or "").strip().lower()))
-            except Exception:
-                p0_now = 0.0
-                p1_now = 0.0
-            if p0_now <= 0:
-                p0_now = _safe_float(_major_or_stable_price_by_symbol(sym0_hint or str(getattr(req, "token0_symbol", "") or "")))
-            if p1_now <= 0:
-                p1_now = _safe_float(_major_or_stable_price_by_symbol(sym1_hint or str(getattr(req, "token1_symbol", "") or "")))
-            if owed0_now > 0 and p0_now > 0:
-                snapshot_now_usd += float(owed0_now) * float(p0_now)
-            if owed1_now > 0 and p1_now > 0:
-                snapshot_now_usd += float(owed1_now) * float(p1_now)
+        snapshot_now_usd = _row_unclaimed_spot_usd()
     except Exception:
         snapshot_now_usd = 0.0
     debug["snapshot_now_usd"] = float(max(0.0, snapshot_now_usd))
@@ -26448,25 +26440,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["row_fees_owed0"] = float(owed0)
     debug["row_fees_owed1"] = float(owed1)
     if owed0 > 0.0 or owed1 > 0.0:
-        p0 = 0.0
-        p1 = 0.0
-        try:
-            tks = [x for x in [token0, token1] if _is_eth_address(x)]
-            pmap = _get_token_prices_usd(int(chain_id), tks) if tks else {}
-            p0 = _safe_float(pmap.get(str(token0 or "").strip().lower()))
-            p1 = _safe_float(pmap.get(str(token1 or "").strip().lower()))
-        except Exception:
-            p0 = 0.0
-            p1 = 0.0
-        if p0 <= 0:
-            p0 = _safe_float(_major_or_stable_price_by_symbol(sym0_hint or str(getattr(req, "token0_symbol", "") or "")))
-        if p1 <= 0:
-            p1 = _safe_float(_major_or_stable_price_by_symbol(sym1_hint or str(getattr(req, "token1_symbol", "") or "")))
-        usd_now = 0.0
-        if owed0 > 0 and p0 > 0:
-            usd_now += float(owed0) * float(p0)
-        if owed1 > 0 and p1 > 0:
-            usd_now += float(owed1) * float(p1)
+        usd_now = _row_unclaimed_spot_usd()
         debug["row_fees_spot_usd"] = float(usd_now)
         if usd_now > 0:
             day_ts = (int(now_ts) // 86400) * 86400
