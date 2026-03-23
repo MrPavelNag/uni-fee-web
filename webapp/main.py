@@ -19884,8 +19884,9 @@ def _render_positions_page() -> str:
       if (!chartEl) return;
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
       const selectedAll = Array.from(posHistorySelected).sort(cmpHistoryKey);
-      const selected = selectedAll.slice(0, 1);
-      const droppedPairs = Math.max(0, selectedAll.length - selected.length);
+      const selectedLimit = 1;
+      const selected = selectedAll.slice(0, 12);
+      const droppedPairs = Math.max(0, selectedAll.length - selectedLimit);
       if (!selected.length) {
         setPosHistoryStatusBar({
           state: "error",
@@ -19900,7 +19901,7 @@ def _render_positions_page() -> str:
         setPosHistoryStatusBar({
           state: "loading",
           title: "Show history",
-          selected: selected.length,
+          selected: Math.min(selectedLimit, selectedAll.length),
           traces: 0,
           mode: getHistoryRangeMode(),
           days: getHistoryDays(),
@@ -19915,6 +19916,7 @@ def _render_positions_page() -> str:
         const usedDays = [];
         const selectedRowsMeta = [];
         const benchmarkSymbols = getBenchmarkSymbols();
+        let rowsDrawn = 0;
         for (let i = 0; i < selected.length; i++) {
           const hk = parseHistoryKey(selected[i]);
           const idx = hk.idx;
@@ -19991,6 +19993,8 @@ def _render_positions_page() -> str:
               hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
             });
           }
+          rowsDrawn += 1;
+          if (rowsDrawn >= selectedLimit) break;
         }
         if (!traces.length) {
           chartEl.innerHTML = "<div class='hint'>No historical data found for selected rows.</div>";
@@ -20024,7 +20028,7 @@ def _render_positions_page() -> str:
           const maxDays = usedDays.length ? Math.max(...usedDays) : 0;
           const lines = [];
           lines.push(`<b>History chart debug</b>`);
-          lines.push(`mode=${esc(mode)} · selected=${Number(selected.length || 0)} · traces=${Number(traces.length || 0)}`);
+          lines.push(`mode=${esc(mode)} · selected=${Number(rowsDrawn || 0)} · traces=${Number(traces.length || 0)}`);
           if (droppedPairs > 0) lines.push(`selection_limit=1 · skipped=${Number(droppedPairs || 0)}`);
           lines.push(`benchmark=${esc(benchmarkSymbols.join(",") || "-")} · benchmark_traces=${benchmarkCount}`);
           lines.push(`days_used=${esc(minDays === maxDays ? String(minDays) : `${minDays}..${maxDays}`)} · min_created=${esc(minCreatedMs > 0 ? new Date(minCreatedMs).toISOString().slice(0, 10) : "-")}`);
@@ -20035,7 +20039,7 @@ def _render_positions_page() -> str:
         setPosHistoryStatusBar({
           state: droppedPairs > 0 ? "warn" : "ok",
           title: "Show history",
-          selected: selected.length,
+          selected: Number(rowsDrawn || Math.min(selectedLimit, selectedAll.length)),
           traces: traces.length,
           benchmark: benchmarkCount,
           mode,
@@ -20254,13 +20258,27 @@ def _render_positions_page() -> str:
         );
       } catch (_) {}
     }
-    function feeChartLayout(title, minCreatedMs, legendOpts) {
+    function feeChartLayout(title, minCreatedMs, legendOpts, maxDataMs = 0) {
+      const xCfg = {...chartGridX(Number(minCreatedMs || 0), 2), fixedrange: true};
+      const mode = getHistoryRangeMode();
+      const maxMs = Number(maxDataMs || 0);
+      if (mode === "creation" && maxMs > 0) {
+        let leftMs = Number(minCreatedMs || 0);
+        if (!(leftMs > 0) && Array.isArray(xCfg.range) && xCfg.range[0]) {
+          try { leftMs = Number(new Date(xCfg.range[0]).getTime() || 0); } catch (_) {}
+        }
+        if (!(leftMs > 0)) {
+          leftMs = Math.max(0, maxMs - (30 * 86400000));
+        }
+        const rightMs = Math.max(maxMs + (2 * 86400000), leftMs + 86400000);
+        xCfg.range = [new Date(leftMs), new Date(rightMs)];
+      }
       return {
         title: String(title || "Collected & Estimated Fees"),
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         margin: {t: 34, b: 70, l: 54, r: 12},
-        xaxis: {...chartGridX(Number(minCreatedMs || 0), 20), fixedrange: true},
+        xaxis: xCfg,
         yaxis: {...chartGridY(true), fixedrange: true},
         showlegend: true,
         legend: {
@@ -20288,7 +20306,18 @@ def _render_positions_page() -> str:
         if (!traces.length) return false;
         const ok = await ensurePlotly();
         if (!ok) return false;
-        Plotly.newPlot("posFeeChart", traces, feeChartLayout(String(obj.title || "Collected & Estimated Fees"), 0), {displaylogo: false, responsive: true});
+        const traceMaxMs = (arr) => {
+          let out = 0;
+          for (const t of (Array.isArray(arr) ? arr : [])) {
+            const xs = Array.isArray(t?.x) ? t.x : [];
+            for (const xv of xs) {
+              const ms = Number(new Date(xv).getTime() || 0);
+              if (ms > out) out = ms;
+            }
+          }
+          return out;
+        };
+        Plotly.newPlot("posFeeChart", traces, feeChartLayout(String(obj.title || "Collected & Estimated Fees"), 0, null, traceMaxMs(traces)), {displaylogo: false, responsive: true});
         setPosFeeStatus("Chart restored from cache.", false);
         return true;
       } catch (_) {
@@ -20521,6 +20550,13 @@ def _render_positions_page() -> str:
         const hasCollected = collectedItems.length > 0;
         const hasEstimated = estimatedItems.length > 0;
         const hasSnapshot = snapshotItems.length > 0;
+        const firstCollectedTs = Number(sortByTs(collectedItems)[0]?.ts || 0);
+        const firstEstimatedTs = Number(sortByTs(estimatedItems)[0]?.ts || 0);
+        const firstSnapshotTs = Number(sortByTs(snapshotItems)[0]?.ts || 0);
+        const firstAnyTs = [firstCollectedTs, firstEstimatedTs, firstSnapshotTs]
+          .map((x) => Number(x || 0))
+          .filter((x) => x > 0)
+          .sort((a, b) => a - b)[0] || 0;
         const collectedTotalUsd = hasCollected ? Math.max(0, Number(lastByTs(collectedItems)?.fees_usd || 0)) : 0;
         const snapshotUnclaimedUsd = hasSnapshot ? snapshotTailUsd(snapshotItems) : 0;
         const feeTotalLegendUsdFromRow = Math.max(0, Number(outRow?.legend_fee_total_usd || 0));
@@ -20582,8 +20618,17 @@ def _render_positions_page() -> str:
           const collectedPointHover = [];
           const liqHover = (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-";
           const createdMs = Number(meta.createdMs || 0);
-          if (createdMs > 0) {
-            lineX.push(new Date(createdMs));
+          const firstAnyMs = Number(firstAnyTs > 0 ? firstAnyTs * 1000 : 0);
+          const firstCollectedMs = Number(firstCollectedTs > 0 ? firstCollectedTs * 1000 : 0);
+          let anchorMs = createdMs > 0 ? createdMs : 0;
+          if (anchorMs <= 0 && firstAnyMs > 0) {
+            anchorMs = firstAnyMs;
+            if (firstCollectedMs > 0 && anchorMs >= firstCollectedMs) {
+              anchorMs = Math.max(0, firstCollectedMs - 86400000);
+            }
+          }
+          if (anchorMs > 0) {
+            lineX.push(new Date(anchorMs));
             lineY.push(0);
           }
           for (const it of collectedSorted) {
@@ -21021,7 +21066,9 @@ def _render_positions_page() -> str:
               }));
             const tracesSpot = [];
             const diagSpot = prepared.diag || {};
-            const rowStatusesSpot = prepared.rowStatuses || [];
+            // Keep diagnostics for the main run only: spot overlay must not
+            // append duplicate status rows to the same array.
+            const rowStatusesSpot = [];
             const apiFailTopSpot = [];
             const backendHintsSpot = [];
             const feeStateSpot = processFeeCompareRows(
@@ -21102,7 +21149,18 @@ def _render_positions_page() -> str:
           return out;
         };
         overlayTraces = compactLegendByPair(overlayTraces);
-        Plotly.newPlot("posFeeChart", overlayTraces, feeChartLayout(mainTitle, minCreatedMs), {displaylogo: false, responsive: true});
+        const traceMaxMs = (arr) => {
+          let out = 0;
+          for (const t of (Array.isArray(arr) ? arr : [])) {
+            const xs = Array.isArray(t?.x) ? t.x : [];
+            for (const xv of xs) {
+              const ms = Number(new Date(xv).getTime() || 0);
+              if (ms > out) out = ms;
+            }
+          }
+          return out;
+        };
+        Plotly.newPlot("posFeeChart", overlayTraces, feeChartLayout(mainTitle, minCreatedMs, null, traceMaxMs(overlayTraces)), {displaylogo: false, responsive: true});
         saveLastFeeChartCache(overlayTraces, mainTitle);
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
@@ -25155,9 +25213,19 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
 
     # 1) Build strict "in position" daily history from exact snapshots.
     if endpoint and chain_id > 0 and position_ids:
+        exact_by_day: dict[int, float] = {}
         amount0_by_day: dict[int, float] = {}
         amount1_by_day: dict[int, float] = {}
         for pid in position_ids[:20]:
+            series_exact = _fetch_position_snapshot_series_exact(
+                endpoint,
+                pid,
+                since_ts=since_ts,
+                chain_id=chain_id,
+            )
+            for ts, tvl in series_exact:
+                dts = int((int(ts) // 86400) * 86400)
+                exact_by_day[dts] = float(exact_by_day.get(dts, 0.0) + max(0.0, float(tvl)))
             series_amt = _fetch_position_snapshot_amounts_series_exact(
                 endpoint,
                 pid,
@@ -25168,8 +25236,8 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                 dts = int(ts)
                 amount0_by_day[dts] = float(amount0_by_day.get(dts, 0.0) + float(a0))
                 amount1_by_day[dts] = float(amount1_by_day.get(dts, 0.0) + float(a1))
-        if amount0_by_day or amount1_by_day:
-            known_days = sorted(set(amount0_by_day.keys()) | set(amount1_by_day.keys()))
+        if amount0_by_day or amount1_by_day or exact_by_day:
+            known_days = sorted(set(amount0_by_day.keys()) | set(amount1_by_day.keys()) | set(exact_by_day.keys()))
             if known_days:
                 day_start = max(int((since_ts // 86400) * 86400), int(min(known_days)))
                 day_end = int(max(max(known_days), (now_ts // 86400) * 86400))
@@ -25206,6 +25274,14 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                     continue
                 ff_amount0[int(dts)] = float(max(0.0, cur0))
                 ff_amount1[int(dts)] = float(max(0.0, cur1))
+            if (not ff_amount0) and exact_by_day:
+                # Some subgraphs expose exact daily TVL but sparse/absent amount snapshots.
+                # Keep series available; use row amounts only for hold approximation.
+                row_a0 = max(0.0, _safe_float(getattr(req, "position_amount0", 0.0)))
+                row_a1 = max(0.0, _safe_float(getattr(req, "position_amount1", 0.0)))
+                for dts in sorted(int(x) for x in exact_by_day.keys() if int(x) > 0):
+                    ff_amount0[int(dts)] = float(row_a0)
+                    ff_amount1[int(dts)] = float(row_a1)
 
             token0_addr = str(getattr(req, "token0_id", "") or "").strip().lower()
             token1_addr = str(getattr(req, "token1_id", "") or "").strip().lower()
@@ -25236,7 +25312,9 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                 a1 = float(max(0.0, ff_amount1.get(int(dts), 0.0)))
                 p0 = _price_day(token0_addr, stable0, hist0, p0_spot, int(dts))
                 p1 = _price_day(token1_addr, stable1, hist1, p1_spot, int(dts))
-                tvl_usd = float(max(0.0, (a0 * max(0.0, p0)) + (a1 * max(0.0, p1))))
+                tvl_from_amounts = float(max(0.0, (a0 * max(0.0, p0)) + (a1 * max(0.0, p1))))
+                tvl_exact = float(max(0.0, exact_by_day.get(int(dts), 0.0)))
+                tvl_usd = float(tvl_exact if tvl_exact > 0 else tvl_from_amounts)
                 if (not start_found) and tvl_usd > 0:
                     start_found = True
                     start_tvl_usd = float(tvl_usd)
@@ -25291,7 +25369,7 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                 "items": items,
                 "count": len(items),
                 "mode": "exact-snapshots-in-position",
-                "note": "TVL from daily in-position amounts; hold from start amounts; benchmark from start-date buy",
+                "note": "TVL from exact daily in-position snapshots (amounts when available); hold from start amounts; benchmark from start-date buy",
                 "token0_symbol": sym0,
                 "token1_symbol": sym1,
                 "benchmarks": benchmarks_out,
@@ -26060,6 +26138,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 cache_hits = 0
                 cache_misses: list[int] = []
                 stale_cached_by_tid: dict[int, dict[int, float]] = {}
+                no_collect_confirmed: list[int] = []
                 for tid in token_ids:
                     cached_one = _load_v3_npm_fee_ledger_day_from_cache(
                         int(chain_id),
@@ -26074,6 +26153,18 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         int(tid),
                         since_ts=int(collect_since_ts),
                     )
+                    # Fast-path: when a completed scan already confirms there are no Collect events
+                    # in the requested range, skip expensive rebuild/scan for this token.
+                    if scan_done:
+                        ev_count_done = _count_v3_npm_fee_events_temp(
+                            int(chain_id),
+                            str(protocol),
+                            int(tid),
+                            since_ts=int(collect_since_ts),
+                        )
+                        if int(ev_count_done) <= 0:
+                            no_collect_confirmed.append(int(tid))
+                            continue
                     if cached_one and scan_done:
                         cache_hits += 1
                         for ts, val in cached_one.items():
@@ -26095,6 +26186,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 debug["ledger_cache_hits"] = int(cache_hits)
                 debug["ledger_cache_misses"] = int(len(cache_misses))
                 debug["ledger_cache_partial"] = int(len(stale_cached_by_tid))
+                debug["ledger_no_collect_confirmed"] = int(len(no_collect_confirmed))
+                if no_collect_confirmed and not cache_misses and not ledger_by_day:
+                    debug["ledger_fastpath_skip"] = "no_collect_confirmed"
                 elapsed_now = max(0.0, time.monotonic() - started_mono)
                 rem_budget = max(0.0, float(total_budget_sec) - float(elapsed_now))
                 # For single-position requests prefer full ledger coverage (all Collect events).
