@@ -21067,7 +21067,8 @@ def _render_positions_page() -> str:
                 ...(r && typeof r === "object" ? r : {}),
                 collected_items: Array.isArray(r?.alt_collected_items) ? r.alt_collected_items : [],
                 estimated_items: [],
-                snapshot_items: [],
+                // Keep current unclaimed snapshot so "today USD" reaches the latest point.
+                snapshot_items: Array.isArray(r?.snapshot_items) ? r.snapshot_items : [],
                 apr_items: [],
                 legend_fee_total_usd: Math.max(
                   0,
