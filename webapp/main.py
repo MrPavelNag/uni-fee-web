@@ -20370,6 +20370,10 @@ def _render_positions_page() -> str:
           ? `${dtLabel}<br>${feeStepLine}<br>${aprPct.toFixed(1)}%${daysLine}<br>Liquidity: ${liqAtPoint}`
           : `${dtLabel}<br>${feeStepLine}${daysLine}<br>Liquidity: ${liqAtPoint}`;
       };
+      const snapshotTailUsd = (snapshotItems) => {
+        const tail = lastByTs(snapshotItems || []);
+        return Math.max(0, Number(tail?.fees_usd || 0));
+      };
       let lastFeePricing = "";
       let hasCollectedHistoryTrace = false;
       let hasEstimatedShareTrace = false;
@@ -20413,12 +20417,18 @@ def _render_positions_page() -> str:
         const hasEstimated = estimatedItems.length > 0;
         const hasSnapshot = snapshotItems.length > 0;
         const collectedTotalUsd = hasCollected ? Math.max(0, Number(lastByTs(collectedItems)?.fees_usd || 0)) : 0;
+        const snapshotUnclaimedUsd = hasSnapshot ? snapshotTailUsd(snapshotItems) : 0;
+        const feeTotalLegendUsdFromRow = Math.max(0, Number(outRow?.legend_fee_total_usd || 0));
+        const feeTotalLegendUsd = feeTotalLegendUsdFromRow > 0
+          ? feeTotalLegendUsdFromRow
+          : Math.max(0, collectedTotalUsd + snapshotUnclaimedUsd);
         const aprVals = Array.from(aprByTs.values()).map((x) => Number(x?.aprPct || 0)).filter((x) => x > 0);
         const avgAprPct = aprVals.length ? (aprVals.reduce((a, b) => a + b, 0) / aprVals.length) : 0;
         const legendStats = [];
-        if (collectedTotalUsd > 0) legendStats.push(`Fee $${collectedTotalUsd.toFixed(2)}`);
+        if (feeTotalLegendUsd > 0) legendStats.push(`Fee $${feeTotalLegendUsd.toFixed(2)}`);
         if (avgAprPct > 0) legendStats.push(`avg APR ${avgAprPct.toFixed(1)}%`);
         const legendBaseLabel = legendStats.length ? `${legendBase} [${legendStats.join(" | ")}]` : legendBase;
+        const rowIsSpotOnly = (mode === "row-unclaimed-fallback") || (feePricing === "spot_row_unclaimed");
         collectedPointsTotal += Number(collectedItems.length || 0);
         estimatedPointsTotal += Number(estimatedItems.length || 0);
         snapshotPointsTotal += Number(snapshotItems.length || 0);
@@ -20518,6 +20528,7 @@ def _render_positions_page() -> str:
             marker: singleCollectedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
             name: `${legendBaseLabel} (today USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+            _forceToday: rowIsSpotOnly,
           });
           if (collectedPointX.length) {
             const hasAprLabel = showAprLabels && collectedPointText.some((t) => String(t || "").trim());
@@ -20615,6 +20626,7 @@ def _render_positions_page() -> str:
                   line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
                   name: `${legendBaseLabel} (today USD)`,
                   hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+                  _forceToday: true,
                 });
               }
             }
@@ -20821,7 +20833,6 @@ def _render_positions_page() -> str:
           return pairColorByBase[k];
         };
         const applyFeeTraceStyleByPair = (srcTraces, viewMode, viewOpacity = 1.0) => {
-          const isToday = String(viewMode || "").toLowerCase() === "today";
           return (srcTraces || []).map((t) => {
             const name = String(t?.name || "");
             const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
@@ -20829,6 +20840,7 @@ def _render_positions_page() -> str:
             const modeLower = String(t?.mode || "").toLowerCase();
             const isEstimated = name.toLowerCase().includes("(estimated");
             const isMarkerOnly = modeLower === "markers";
+            const isToday = !!t?._forceToday || (String(viewMode || "").toLowerCase() === "today");
             const base = toLegendBase(name) || name;
             const color = getPairColor(base);
             const feeType = isEstimated ? "estimated" : (isToday ? "today" : "instant");
@@ -20862,6 +20874,11 @@ def _render_positions_page() -> str:
         let overlayTraces = applyFeeTraceStyleByPair(traces, histUsd ? "historical" : "today", 1.0);
         if (histUsd) {
           try {
+            const lastFeePoint = (arr) => {
+              const a = Array.isArray(arr) ? arr : [];
+              if (!a.length) return null;
+              return a.slice().sort((x, y) => Number(x?.ts || 0) - Number(y?.ts || 0)).slice(-1)[0] || null;
+            };
             const isEstimateOnlyRow = (r) => {
               const mode = String(r?.mode || "").trim().toLowerCase();
               if (mode === "row-unclaimed-fallback") return true;
@@ -20877,6 +20894,10 @@ def _render_positions_page() -> str:
                 estimated_items: [],
                 snapshot_items: [],
                 apr_items: [],
+                legend_fee_total_usd: Math.max(
+                  0,
+                  Number(lastFeePoint(r?.alt_collected_items)?.fees_usd || 0) + Number(lastFeePoint(r?.snapshot_items)?.fees_usd || 0),
+                ),
               }));
             const tracesSpot = [];
             const diagSpot = prepared.diag || {};
