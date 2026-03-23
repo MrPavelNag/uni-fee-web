@@ -18606,7 +18606,7 @@ def _render_positions_page() -> str:
     const POS_HISTORY_UI_STATE_KEY = "positions_history_ui_state_v1";
     const POS_HISTORY_LAST_CHART_KEY = "positions_history_last_chart_v1";
     const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v3";
-    const POS_FEE_LAST_CHART_KEY = "positions_fee_last_chart_v1";
+    const POS_FEE_LAST_CHART_KEY = "positions_fee_last_chart_v2";
     const NFT_PM_SNAPSHOT_LABELS = {
       position_snapshot_unavailable: "Could not read position from PM (RPC / ABI — often v4 vs v3 decoder).",
     };
@@ -20690,6 +20690,9 @@ def _render_positions_page() -> str:
             name: `${legendBaseLabel} (today USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
             _forceToday: rowIsSpotOnly,
+            _legendPairBase: legendBase,
+            _legendHeader: legendBaseLabel,
+            _feeType: "today",
           });
           if (collectedPointX.length) {
             const hasAprLabel = showAprLabels && collectedPointText.some((t) => String(t || "").trim());
@@ -20743,6 +20746,9 @@ def _render_positions_page() -> str:
             name: `${legendBaseLabel} (estimated, today USD)`,
             hovertemplate: "%{hovertext}<extra></extra>",
             hovertext: estHover,
+            _legendPairBase: legendBase,
+            _legendHeader: legendBaseLabel,
+            _feeType: "estimated",
           });
         }
         if (hasSnapshot) {
@@ -20788,6 +20794,9 @@ def _render_positions_page() -> str:
                   name: `${legendBaseLabel} (today USD)`,
                   hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
                   _forceToday: true,
+                  _legendPairBase: legendBase,
+                  _legendHeader: legendBaseLabel,
+                  _feeType: "today",
                 });
               }
             }
@@ -20975,6 +20984,8 @@ def _render_positions_page() -> str:
 
         const toLegendBase = (name) => String(name || "")
           .replace(/\s*\[(historical|today)\s*USD\]\s*$/i, "")
+          .replace(/\s*\[Fee[^\]]*\]\s*$/i, "")
+          .replace(/\s*\[avg APR[^\]]*\]\s*$/i, "")
           .replace(/\s*\(today USD\)\s*$/i, "")
           .replace(/\s*\(if sold instantly\)\s*$/i, "")
           .replace(/\s*\(estimated,\s*today USD\)\s*$/i, "")
@@ -21002,12 +21013,13 @@ def _render_positions_page() -> str:
             const isEstimated = name.toLowerCase().includes("(estimated");
             const isMarkerOnly = modeLower === "markers";
             const isToday = !!t?._forceToday || (String(viewMode || "").toLowerCase() === "today");
-            const base = toLegendBase(name) || name;
+            const base = String(t?._legendPairBase || toLegendBase(name) || name);
+            const legendHeader = String(t?._legendHeader || base || "pair");
             const color = getPairColor(base);
             const feeType = isEstimated ? "estimated" : (isToday ? "today" : "instant");
             const legendName = isEstimated
-              ? `${base} (estimated, ${isToday ? "today USD" : "if sold instantly"})`
-              : `${base} (${isToday ? "today USD" : "if sold instantly"})`;
+              ? `${legendHeader} (estimated, ${isToday ? "today USD" : "if sold instantly"})`
+              : `${legendHeader} (${isToday ? "today USD" : "if sold instantly"})`;
             const dash = isEstimated
               ? "longdash"
               : (isToday ? "solid" : "dash");
@@ -21028,6 +21040,8 @@ def _render_positions_page() -> str:
               opacity: Number(viewOpacity),
               _feeType: feeType,
               _feeBase: base,
+              _legendPairBase: base,
+              _legendHeader: legendHeader,
             };
           });
         };
@@ -21099,7 +21113,7 @@ def _render_positions_page() -> str:
             const name = String(t?.name || "");
             const modeLower = String(t?.mode || "").toLowerCase();
             const markerOnly = modeLower.includes("markers") && !modeLower.includes("lines");
-            const base = String(t?._feeBase || toLegendBase(name) || name || "pair");
+            const base = String(t?._legendPairBase || t?._feeBase || toLegendBase(name) || name || "pair");
             const tpRaw = String(t?._feeType || "").trim().toLowerCase();
             const lower = name.toLowerCase();
             const tp = (tpRaw === "today" || tpRaw === "instant" || tpRaw === "estimated")
@@ -21115,8 +21129,11 @@ def _render_positions_page() -> str:
           for (const base of baseOrder) {
             const rows = byBase.get(base) || [];
             rows.sort((a, b) => Number(typeRank[a.type] ?? 99) - Number(typeRank[b.type] ?? 99));
+            const headerFromToday = rows.find((r) => String(r?.type || "") === "today" && String(r?.trace?._legendHeader || "").trim())?.trace?._legendHeader;
+            const headerFromAny = rows.find((r) => String(r?.trace?._legendHeader || "").trim())?.trace?._legendHeader;
+            const header = String(headerFromToday || headerFromAny || base || "pair");
             const seenType = new Set();
-            let baseShown = false;
+            let headerShown = false;
             for (const row of rows) {
               const t = row.trace || {};
               const type = String(row.type || "other");
@@ -21126,9 +21143,9 @@ def _render_positions_page() -> str:
               if (firstOfType) seenType.add(type);
               const showLegend = firstOfType;
               const legendName = firstOfType
-                ? (baseShown ? label : `${base} (${label})`)
+                ? (headerShown ? label : `${header} · ${label}`)
                 : String(t.name || "");
-              if (firstOfType && !baseShown) baseShown = true;
+              if (firstOfType && !headerShown) headerShown = true;
               out.push({
                 ...t,
                 showlegend: showLegend,
