@@ -20406,6 +20406,13 @@ def _render_positions_page() -> str:
         const hasCollected = collectedItems.length > 0;
         const hasEstimated = estimatedItems.length > 0;
         const hasSnapshot = snapshotItems.length > 0;
+        const collectedTotalUsd = hasCollected ? Math.max(0, Number(lastByTs(collectedItems)?.fees_usd || 0)) : 0;
+        const aprVals = aprItems.map((x) => Number(x?.apr_pct || 0)).filter((x) => x > 0);
+        const avgAprPct = aprVals.length ? (aprVals.reduce((a, b) => a + b, 0) / aprVals.length) : 0;
+        const legendStats = [];
+        if (collectedTotalUsd > 0) legendStats.push(`Fee $${collectedTotalUsd.toFixed(2)}`);
+        if (avgAprPct > 0) legendStats.push(`avg APR ${avgAprPct.toFixed(1)}%`);
+        const legendBaseLabel = legendStats.length ? `${legendBase} [${legendStats.join(" | ")}]` : legendBase;
         collectedPointsTotal += Number(collectedItems.length || 0);
         estimatedPointsTotal += Number(estimatedItems.length || 0);
         snapshotPointsTotal += Number(snapshotItems.length || 0);
@@ -20503,7 +20510,7 @@ def _render_positions_page() -> str:
             mode: singleCollectedPoint ? "lines+markers" : "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
             marker: singleCollectedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
-            name: `${legendBase} (today USD)`,
+            name: `${legendBaseLabel} (today USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
           if (collectedPointX.length) {
@@ -20518,7 +20525,7 @@ def _render_positions_page() -> str:
               textfont: hasAprLabel ? {size: 13, color: "#0f172a"} : undefined,
               hovertemplate: "%{hovertext}<extra></extra>",
               hovertext: collectedPointHover,
-              name: `${legendBase} (collect points)`,
+              name: `${legendBaseLabel} (collect points)`,
               showlegend: false,
             });
           }
@@ -20555,7 +20562,7 @@ def _render_positions_page() -> str:
             line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
             marker: singleEstimatedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
             opacity: 0.85,
-            name: `${legendBase} (estimated, today USD)`,
+            name: `${legendBaseLabel} (estimated, today USD)`,
             hovertemplate: "%{hovertext}<extra></extra>",
             hovertext: estHover,
           });
@@ -20600,7 +20607,7 @@ def _render_positions_page() -> str:
                   y: [0, snapMarkerVal],
                   mode: "lines",
                   line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
-                  name: `${legendBase} (today USD)`,
+                  name: `${legendBaseLabel} (today USD)`,
                   hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
                 });
               }
@@ -20611,7 +20618,7 @@ def _render_positions_page() -> str:
               mode: "markers",
               marker: {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"},
               showlegend: false,
-              name: `${legendBase} (collect points)`,
+              name: `${legendBaseLabel} (collect points)`,
               hovertemplate: "%{hovertext}<extra></extra>",
               hovertext: [snapHover],
             });
@@ -26209,6 +26216,35 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     else:
         debug["pool_flow_skipped"] = True
     debug["pool_flow_collect_points"] = 0
+
+    # Current-row unclaimed fees in spot USD (used as confidence anchor for subgraph path).
+    # Must be initialized before exact_confident checks.
+    snapshot_now_usd = 0.0
+    try:
+        owed0_now = max(0.0, _safe_float(getattr(req, "fees_owed0", 0.0)))
+        owed1_now = max(0.0, _safe_float(getattr(req, "fees_owed1", 0.0)))
+        if owed0_now > 0.0 or owed1_now > 0.0:
+            p0_now = 0.0
+            p1_now = 0.0
+            try:
+                tks_now = [x for x in [token0, token1] if _is_eth_address(x)]
+                pmap_now = _get_token_prices_usd(int(chain_id), tks_now) if tks_now else {}
+                p0_now = _safe_float(pmap_now.get(str(token0 or "").strip().lower()))
+                p1_now = _safe_float(pmap_now.get(str(token1 or "").strip().lower()))
+            except Exception:
+                p0_now = 0.0
+                p1_now = 0.0
+            if p0_now <= 0:
+                p0_now = _safe_float(_major_or_stable_price_by_symbol(sym0_hint or str(getattr(req, "token0_symbol", "") or "")))
+            if p1_now <= 0:
+                p1_now = _safe_float(_major_or_stable_price_by_symbol(sym1_hint or str(getattr(req, "token1_symbol", "") or "")))
+            if owed0_now > 0 and p0_now > 0:
+                snapshot_now_usd += float(owed0_now) * float(p0_now)
+            if owed1_now > 0 and p1_now > 0:
+                snapshot_now_usd += float(owed1_now) * float(p1_now)
+    except Exception:
+        snapshot_now_usd = 0.0
+    debug["snapshot_now_usd"] = float(max(0.0, snapshot_now_usd))
 
     sub_max = max(exact_by_day.values()) if exact_by_day else 0.0
     rpc_by_day: dict[int, float] = {}
