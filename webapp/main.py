@@ -18223,6 +18223,27 @@ def _render_positions_page() -> str:
     }
     .fee-toggle-pill:hover { border-color:#93c5fd; background:#eff6ff; }
     .fee-toggle-pill input { margin:0; width:15px; height:15px; }
+    .history-actions { gap:7px; }
+    .history-actions .fee-toggle-pill { padding:4px 8px; font-size:12px; border-radius:999px; min-height:26px; }
+    .history-actions .fee-toggle-pill input { width:13px; height:13px; }
+    #posHistoryDays, #posHistoryBenchA, #posHistoryBenchB {
+      height:26px;
+      border:1px solid #cbd5e1;
+      border-radius:7px;
+      padding:2px 6px;
+      font-size:12px;
+      color:#334155;
+      background:#fff;
+    }
+    #posHistoryBenchA, #posHistoryBenchB { width:48px !important; }
+    #posHistoryDays { width:48px !important; text-align:center; }
+    #posHistoryStatus {
+      font-size:12px;
+      flex:0 1 auto;
+      max-width:420px;
+      line-height:1.25;
+    }
+    .history-actions .search-link-btn { padding:6px 11px; font-size:13px; }
     .fee-card .pos-fee-hist-label { font-size:15px; font-weight:700; color:#334155; }
     .fee-card .search-link-btn { font-size:20px; }
     @media (max-width: 1100px) {
@@ -18272,7 +18293,7 @@ def _render_positions_page() -> str:
       <section class="result-card fee-card">
         <div class="section-head" style="flex-wrap:nowrap;align-items:center">
           <h3 style="white-space:nowrap;flex-shrink:0;margin:0">Uniswap v3 / PancakeSwap v3</h3>
-          <div class="section-actions">
+          <div class="section-actions history-actions">
             <span class="pos-status" id="posStatus">Ready</span>
             <label class="fee-toggle-pill" title="Include closed-position enrich (pair/date) in Scan V3. Usually takes longer.">
               <input type="checkbox" id="posClosedBgEnrich" />
@@ -18334,17 +18355,15 @@ def _render_positions_page() -> str:
           <div class="section-actions">
             <label class="fee-toggle-pill" title="Build chart from pool creation date.">
               <input type="checkbox" id="posHistoryFromCreation" checked onchange="onHistoryRangeModeChange('creation')" />
-              <span class="pos-fee-hist-label">From creation date</span>
+              <span class="pos-fee-hist-label">Greation</span>
             </label>
             <label class="fee-toggle-pill" title="Build chart for the last N days.">
               <input type="checkbox" id="posHistoryUseDays" onchange="onHistoryRangeModeChange('days')" />
-              <span class="pos-fee-hist-label">Last</span>
             </label>
-            <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:72px" />
+            <input id="posHistoryDays" type="number" min="1" max="3650" step="1" value="30" style="width:56px" />
             <span class="hint" style="font-size:12px;color:#475569">days</span>
             <label class="fee-toggle-pill" title="Overlay benchmark lines on history chart.">
               <input type="checkbox" id="posHistoryBenchmarkOn" />
-              <span class="pos-fee-hist-label">Benchmark</span>
             </label>
             <input id="posHistoryBenchA" value="BTC" style="width:58px" />
             <input id="posHistoryBenchB" value="ETH" style="width:58px" />
@@ -19179,22 +19198,22 @@ def _render_positions_page() -> str:
       const el = document.getElementById("posHistoryStatus");
       if (!el) return;
       const state = String(opts.state || "info").toLowerCase();
-      const tone = state === "ok" ? "ok" : (state === "error" ? "err" : (state === "warn" ? "warn" : "info"));
       const title = String(opts.title || "Show history");
-      const pills = [];
       const selected = Number(opts.selected || 0);
       const traces = Number(opts.traces || 0);
       const benchmark = Number(opts.benchmark || 0);
       const mode = String(opts.mode || "").trim();
       const days = Number(opts.days || 0);
-      if (selected > 0 || traces > 0) pills.push(feeStatusPill("Rows", `${traces}/${selected || 0}`, tone));
-      if (benchmark > 0) pills.push(feeStatusPill("Benchmark", benchmark, "info"));
-      if (mode) pills.push(feeStatusPill("Range", mode === "creation" ? "from creation" : `last ${Math.max(1, days)}d`, "info"));
       const msg = String(opts.message || "").trim();
-      if (msg) pills.push(feeStatusPill("Status", msg, tone));
-      el.classList.add("fee-status-bar");
-      el.style.color = "#334155";
-      el.innerHTML = `<span class="fee-status-title">${esc(title)}</span>${pills.join("")}`;
+      const parts = [];
+      if (title) parts.push(title);
+      if (selected > 0 || traces > 0) parts.push(`rows ${traces}/${selected || 0}`);
+      if (mode) parts.push(`range ${mode === "creation" ? "from creation" : `last ${Math.max(1, days)}d`}`);
+      if (benchmark > 0) parts.push(`benchmark ${benchmark}`);
+      if (msg) parts.push(msg);
+      el.classList.remove("fee-status-bar");
+      el.style.color = state === "error" ? "#b91c1c" : (state === "warn" ? "#92400e" : "#475569");
+      el.textContent = parts.join(" | ");
     }
     async function startBackgroundWarmup(reason = "auto") {
       if (posAutoWarmupInFlight) return;
