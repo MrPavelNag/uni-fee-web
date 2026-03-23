@@ -14112,6 +14112,122 @@ def _fetch_position_snapshot_series_exact(
     return out
 
 
+def _fetch_position_snapshot_amounts_series_exact(
+    endpoint: str,
+    position_id: str,
+    *,
+    since_ts: int,
+    chain_id: int,
+) -> list[tuple[int, float, float, float]]:
+    """
+    One point per day (latest snapshot in that day):
+    (day_ts, amount0, amount1, position_tvl_usd)
+    """
+    pid = str(position_id or "").strip()
+    if not pid:
+        return []
+    queries = [
+        (
+            "ID",
+            """
+            query Snapshots($pid: ID!, $since: Int!) {
+              positionSnapshots(
+                first: 500,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { position: $pid, timestamp_gte: $since }
+              ) {
+                timestamp
+                liquidity
+                position { tickLower { tickIdx } tickUpper { tickIdx } }
+                pool { sqrtPrice token0Price token0 { id decimals symbol } token1 { id decimals symbol } }
+              }
+            }
+            """,
+        ),
+        (
+            "String",
+            """
+            query Snapshots($pid: String!, $since: Int!) {
+              positionSnapshots(
+                first: 500,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { position: $pid, timestamp_gte: $since }
+              ) {
+                timestamp
+                liquidity
+                position { tickLower { tickIdx } tickUpper { tickIdx } }
+                pool { sqrtPrice token0Price token0 { id decimals symbol } token1 { id decimals symbol } }
+              }
+            }
+            """,
+        ),
+        (
+            "ID",
+            """
+            query Snapshots($pid: ID!, $since: Int!) {
+              positionSnapshots(
+                first: 500,
+                orderBy: timestamp,
+                orderDirection: asc,
+                where: { position_: { id: $pid }, timestamp_gte: $since }
+              ) {
+                timestamp
+                liquidity
+                position { tickLower { tickIdx } tickUpper { tickIdx } }
+                pool { sqrtPrice token0Price token0 { id decimals symbol } token1 { id decimals symbol } }
+              }
+            }
+            """,
+        ),
+    ]
+    rows: list[dict[str, Any]] = []
+    for _typ, q in queries:
+        try:
+            data = graphql_query(endpoint, q, {"pid": pid, "since": int(since_ts)}, retries=1)
+            rows = ((data.get("data") or {}).get("positionSnapshots") or [])
+            if rows:
+                break
+        except Exception:
+            continue
+    if not rows:
+        return []
+    by_day: dict[int, tuple[int, float, float, float]] = {}
+    for s in rows:
+        try:
+            ts = int((s or {}).get("timestamp") or 0)
+            if ts <= 0:
+                continue
+            liq = str((s or {}).get("liquidity") or "").strip()
+            pos = (s or {}).get("position") or {}
+            pool = (s or {}).get("pool") or {}
+            if not liq:
+                continue
+            p = {
+                "liquidity": liq,
+                "tickLower": (pos.get("tickLower") or {}),
+                "tickUpper": (pos.get("tickUpper") or {}),
+            }
+            amts = _position_amounts_from_detail(p, pool)
+            if not amts:
+                continue
+            a0 = max(0.0, float(amts[0]))
+            a1 = max(0.0, float(amts[1]))
+            tvl = _estimate_position_tvl_usd_from_detail_external(p, pool, int(chain_id))
+            if tvl is None or float(tvl) <= 0.0:
+                continue
+            day_ts = (ts // 86400) * 86400
+            prev = by_day.get(day_ts)
+            if prev is None or ts > prev[0]:
+                by_day[day_ts] = (ts, float(a0), float(a1), float(tvl))
+        except Exception:
+            continue
+    out = [(dts, v[1], v[2], v[3]) for dts, v in by_day.items()]
+    out.sort(key=lambda x: x[0])
+    return out
+
+
 def _fetch_position_fee_series_exact(
     endpoint: str,
     position_id: str,
@@ -19817,6 +19933,8 @@ def _render_positions_page() -> str:
             position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
             position_liquidity: row.liquidity,
             pool_liquidity: row.pool_liquidity,
+            token0_symbol: String(row.position_symbol0 || ""),
+            token1_symbol: String(row.position_symbol1 || ""),
             pool_created_date: String(row.pool_created_date || ""),
             position_created_date: String(row.position_created_date || ""),
             days: rowDays,
@@ -19830,12 +19948,39 @@ def _render_positions_page() -> str:
           if (!res.ok) continue;
           const items = Array.isArray(data.items) ? data.items : [];
           if (!items.length) continue;
+          const baseName = String(row.pair || row.pool_id || `Pool ${i + 1}`);
+          const sym0 = String(data?.token0_symbol || row.position_symbol0 || "token0").trim().toUpperCase();
+          const sym1 = String(data?.token1_symbol || row.position_symbol1 || "token1").trim().toUpperCase();
+          const x = items.map((x) => new Date(Number(x.ts || 0) * 1000));
+          const amount0 = items.map((x) => Number(x.amount0 || 0));
+          const amount1 = items.map((x) => Number(x.amount1 || 0));
+          const tvlUsd = items.map((x) => Number(x.position_tvl_usd || 0));
+          const hasAmounts = amount0.some((v) => Number(v) > 0) || amount1.some((v) => Number(v) > 0);
+          if (hasAmounts) {
+            traces.push({
+              x,
+              y: amount0,
+              mode: "lines",
+              line: {color: palette[i % palette.length], width: 1.9},
+              name: `${baseName} (${sym0})`,
+              hovertemplate: "%{x|%b %d, %Y}<br>%{y:.6f}<extra>%{fullData.name}</extra>",
+            });
+            traces.push({
+              x,
+              y: amount1,
+              mode: "lines",
+              line: {color: palette[i % palette.length], width: 1.9, dash: "dash"},
+              name: `${baseName} (${sym1})`,
+              hovertemplate: "%{x|%b %d, %Y}<br>%{y:.6f}<extra>%{fullData.name}</extra>",
+            });
+          }
           traces.push({
-            x: items.map((x) => new Date(Number(x.ts || 0) * 1000)),
-            y: items.map((x) => Number(x.position_tvl_usd || 0)),
+            x,
+            y: tvlUsd,
             mode: "lines",
-            line: {color: palette[i % palette.length], width: 2},
-            name: String(row.pair || row.pool_id || `Pool ${i + 1}`),
+            line: {color: palette[i % palette.length], width: 2.2, dash: "dot"},
+            yaxis: "y2",
+            name: `${baseName} (TVL USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
         }
@@ -19876,7 +20021,7 @@ def _render_positions_page() -> str:
                 mode: "lines",
                 line: {width: 1.6, dash: "dash"},
                 opacity: 0.9,
-                yaxis: "y2",
+                yaxis: "y3",
                 name: `${String(s.symbol || "?")} benchmark`,
                 hovertemplate: "%{x|%b %d, %Y}<br>%{y:.2f}<extra>%{fullData.name}</extra>",
               });
@@ -19888,16 +20033,24 @@ def _render_positions_page() -> str:
           } catch (_) {}
         }
         Plotly.newPlot("posPoolChart", traces, {
-          title: "Position TVL history",
+          title: "Position history",
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
           xaxis: chartGridX(minCreatedMs, 5),
-          yaxis: chartGridY(true),
+          yaxis: chartGridY(false),
+          yaxis2: {
+            overlaying: "y",
+            side: "right",
+            tickprefix: "$",
+            showgrid: false,
+            title: "TVL (USD)",
+          },
           ...(benchmarkCount > 0 ? {
-            yaxis2: {
+            yaxis3: {
               overlaying: "y",
               side: "right",
+              position: 0.92,
               showgrid: false,
               title: "Benchmark (base=100)",
             },
@@ -19906,7 +20059,7 @@ def _render_positions_page() -> str:
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
         saveHistoryUiState();
-        saveLastHistoryChartCache(traces, "Position TVL history", minCreatedMs, benchmarkCount);
+        saveLastHistoryChartCache(traces, "Position history", minCreatedMs, benchmarkCount);
         if (debugEl) {
           const minDays = usedDays.length ? Math.min(...usedDays) : 0;
           const maxDays = usedDays.length ? Math.max(...usedDays) : 0;
@@ -20019,7 +20172,7 @@ def _render_positions_page() -> str:
           POS_HISTORY_LAST_CHART_KEY,
           JSON.stringify({
             ts: Date.now(),
-            title: String(title || "Position TVL history"),
+            title: String(title || "Position history"),
             traces: safeTraces,
             minCreatedMs: Number(minCreatedMs || 0),
             benchmarkCount: Number(benchmarkCount || 0),
@@ -20044,16 +20197,24 @@ def _render_positions_page() -> str:
         const minCreatedMs = Number(obj.minCreatedMs || 0);
         const benchmarkCount = Number(obj.benchmarkCount || 0);
         Plotly.newPlot("posPoolChart", traces, {
-          title: String(obj.title || "Position TVL history"),
+          title: String(obj.title || "Position history"),
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
           xaxis: chartGridX(minCreatedMs, 5),
-          yaxis: chartGridY(true),
+          yaxis: chartGridY(false),
+          yaxis2: {
+            overlaying: "y",
+            side: "right",
+            tickprefix: "$",
+            showgrid: false,
+            title: "TVL (USD)",
+          },
           ...(benchmarkCount > 0 ? {
-            yaxis2: {
+            yaxis3: {
               overlaying: "y",
               side: "right",
+              position: 0.92,
               showgrid: false,
               title: "Benchmark (base=100)",
             },
@@ -25020,10 +25181,14 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
         chain_key = str(CHAIN_ID_TO_KEY[int(chain_id)]).strip().lower()
     endpoint = get_graph_endpoint(chain_key, version=version)
     position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
+    sym0 = str(getattr(req, "token0_symbol", "") or "").strip().upper()
+    sym1 = str(getattr(req, "token1_symbol", "") or "").strip().upper()
 
     # 1) Try exact snapshots history first (best effort).
     if endpoint and chain_id > 0 and position_ids:
         exact_by_day: dict[int, float] = {}
+        amount0_by_day: dict[int, float] = {}
+        amount1_by_day: dict[int, float] = {}
         for pid in position_ids[:20]:
             series = _fetch_position_snapshot_series_exact(
                 endpoint,
@@ -25033,9 +25198,25 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
             )
             for ts, value in series:
                 exact_by_day[int(ts)] = float(exact_by_day.get(int(ts), 0.0) + float(value))
+            series_amt = _fetch_position_snapshot_amounts_series_exact(
+                endpoint,
+                pid,
+                since_ts=since_ts,
+                chain_id=chain_id,
+            )
+            for ts, a0, a1, _usd in series_amt:
+                dts = int(ts)
+                amount0_by_day[dts] = float(amount0_by_day.get(dts, 0.0) + float(a0))
+                amount1_by_day[dts] = float(amount1_by_day.get(dts, 0.0) + float(a1))
         if exact_by_day:
             items = [
-                {"ts": int(ts), "position_tvl_usd": float(v), "pool_tvl_usd": None}
+                {
+                    "ts": int(ts),
+                    "position_tvl_usd": float(v),
+                    "amount0": float(max(0.0, amount0_by_day.get(int(ts), 0.0))),
+                    "amount1": float(max(0.0, amount1_by_day.get(int(ts), 0.0))),
+                    "pool_tvl_usd": None,
+                }
                 for ts, v in sorted(exact_by_day.items(), key=lambda x: x[0])
             ]
             return {
@@ -25043,6 +25224,8 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                 "count": len(items),
                 "mode": "exact-snapshots",
                 "note": "built from position snapshots",
+                "token0_symbol": sym0,
+                "token1_symbol": sym1,
             }
 
     # 2) Fallback to estimated share-based history.
@@ -25061,13 +25244,15 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
     series_raw = _fetch_pool_tvl_series(chain_key, version, pool_id, days)
     if not series_raw:
         return {"items": [], "count": 0, "share": share, "mode": "estimated-share", "note": "no pool day data"}
-    items = [{"ts": int(ts), "pool_tvl_usd": float(tvl), "position_tvl_usd": float(max(0.0, tvl * share))} for ts, tvl in series_raw]
+    items = [{"ts": int(ts), "pool_tvl_usd": float(tvl), "position_tvl_usd": float(max(0.0, tvl * share)), "amount0": None, "amount1": None} for ts, tvl in series_raw]
     return {
         "items": items,
         "count": len(items),
         "share": share,
         "mode": "estimated-share",
         "note": "fallback: snapshots missing/incomplete",
+        "token0_symbol": sym0,
+        "token1_symbol": sym1,
     }
 
 
