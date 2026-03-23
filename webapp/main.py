@@ -17347,6 +17347,8 @@ class PositionPoolSeriesRequest(BaseModel):
     fee_tier: str = ""
     # When true, NPM Collect log series uses CoinGecko historical prices at each event (stables $1).
     fee_usd_historical: bool = False
+    # Optional benchmarks for history comparison (e.g. BTC, ETH).
+    benchmark_symbols: list[str] = Field(default_factory=list)
 
 
 class PoolFlowCollectRequest(BaseModel):
@@ -18604,7 +18606,7 @@ def _render_positions_page() -> str:
     const POS_POOLS_TAB_KEY = "positions_pools_tab_v2";
     const POS_HEAVY_POOLS_TAB_KEY = "positions_heavy_pools_tab_v1";
     const POS_HISTORY_UI_STATE_KEY = "positions_history_ui_state_v1";
-    const POS_HISTORY_LAST_CHART_KEY = "positions_history_last_chart_v1";
+    const POS_HISTORY_LAST_CHART_KEY = "positions_history_last_chart_v2";
     const POS_FEE_SCAN_CACHE_KEY = "positions_fee_scan_cache_v3";
     const POS_FEE_LAST_CHART_KEY = "positions_fee_last_chart_v2";
     const NFT_PM_SNAPSHOT_LABELS = {
@@ -19881,7 +19883,9 @@ def _render_positions_page() -> str:
       const debugEl = document.getElementById("posHistoryDebug");
       if (!chartEl) return;
       if (debugEl) { debugEl.style.display = "none"; debugEl.innerHTML = ""; }
-      const selected = Array.from(posHistorySelected).sort(cmpHistoryKey).slice(0, 12);
+      const selectedAll = Array.from(posHistorySelected).sort(cmpHistoryKey);
+      const selected = selectedAll.slice(0, 1);
+      const droppedPairs = Math.max(0, selectedAll.length - selected.length);
       if (!selected.length) {
         setPosHistoryStatusBar({
           state: "error",
@@ -19900,7 +19904,7 @@ def _render_positions_page() -> str:
           traces: 0,
           mode: getHistoryRangeMode(),
           days: getHistoryDays(),
-          message: "Loading history",
+          message: droppedPairs > 0 ? `Loading history (limited to 1 pair, skipped ${droppedPairs})` : "Loading history",
         });
         const ok = await ensurePlotly();
         if (!ok) throw new Error("Failed to load chart library");
@@ -19933,11 +19937,16 @@ def _render_positions_page() -> str:
             position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
             position_liquidity: row.liquidity,
             pool_liquidity: row.pool_liquidity,
+            token0_id: String(row.token0_id || row.token0?.id || row.pool?.token0?.id || ""),
+            token1_id: String(row.token1_id || row.token1?.id || row.pool?.token1?.id || ""),
             token0_symbol: String(row.position_symbol0 || ""),
             token1_symbol: String(row.position_symbol1 || ""),
+            position_amount0: Number(row.position_amount0 || row.amount0 || row.position?.amount0 || 0),
+            position_amount1: Number(row.position_amount1 || row.amount1 || row.position?.amount1 || 0),
             pool_created_date: String(row.pool_created_date || ""),
             position_created_date: String(row.position_created_date || ""),
             days: rowDays,
+            benchmark_symbols: benchmarkSymbols,
           };
           const res = await fetch("/api/positions/pool-value-series", {
             method: "POST",
@@ -19949,40 +19958,39 @@ def _render_positions_page() -> str:
           const items = Array.isArray(data.items) ? data.items : [];
           if (!items.length) continue;
           const baseName = String(row.pair || row.pool_id || `Pool ${i + 1}`);
-          const sym0 = String(data?.token0_symbol || row.position_symbol0 || "token0").trim().toUpperCase();
-          const sym1 = String(data?.token1_symbol || row.position_symbol1 || "token1").trim().toUpperCase();
           const x = items.map((x) => new Date(Number(x.ts || 0) * 1000));
-          const amount0 = items.map((x) => Number(x.amount0 || 0));
-          const amount1 = items.map((x) => Number(x.amount1 || 0));
           const tvlUsd = items.map((x) => Number(x.position_tvl_usd || 0));
-          const hasAmounts = amount0.some((v) => Number(v) > 0) || amount1.some((v) => Number(v) > 0);
-          if (hasAmounts) {
-            traces.push({
-              x,
-              y: amount0,
-              mode: "lines",
-              line: {color: palette[i % palette.length], width: 1.9},
-              name: `${baseName} (${sym0})`,
-              hovertemplate: "%{x|%b %d, %Y}<br>%{y:.6f}<extra>%{fullData.name}</extra>",
-            });
-            traces.push({
-              x,
-              y: amount1,
-              mode: "lines",
-              line: {color: palette[i % palette.length], width: 1.9, dash: "dash"},
-              name: `${baseName} (${sym1})`,
-              hovertemplate: "%{x|%b %d, %Y}<br>%{y:.6f}<extra>%{fullData.name}</extra>",
-            });
-          }
+          const holdUsd = items.map((x) => Number(x.hold_usd || 0));
           traces.push({
             x,
             y: tvlUsd,
             mode: "lines",
-            line: {color: palette[i % palette.length], width: 2.2, dash: "dot"},
-            yaxis: "y2",
-            name: `${baseName} (TVL USD)`,
+            line: {color: palette[i % palette.length], width: 2.4},
+            name: `${baseName} (TVL in position)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
+          traces.push({
+            x,
+            y: holdUsd,
+            mode: "lines",
+            line: {color: palette[i % palette.length], width: 2, dash: "dash"},
+            name: `${baseName} (Hold)`,
+            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+          });
+          const benchSeries = Array.isArray(data?.benchmarks) ? data.benchmarks : [];
+          for (const bs of benchSeries) {
+            const bItems = Array.isArray(bs?.items) ? bs.items : [];
+            if (!bItems.length) continue;
+            traces.push({
+              x: bItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
+              y: bItems.map((x) => Number(x.value || 0)),
+              mode: "lines",
+              line: {width: 1.7, dash: "dot"},
+              opacity: 0.95,
+              name: `${baseName} (${String(bs?.symbol || "?")} benchmark)`,
+              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+            });
+          }
         }
         if (!traces.length) {
           chartEl.innerHTML = "<div class='hint'>No historical data found for selected rows.</div>";
@@ -19998,63 +20006,14 @@ def _render_positions_page() -> str:
           });
           return;
         }
-        let benchmarkCount = 0;
-        if (benchmarkSymbols.length) {
-          const benchDays = (mode === "days")
-            ? getHistoryDays()
-            : Math.max(1, Math.min(3650, Math.ceil((Date.now() - Number(minCreatedMs || Date.now())) / 86400000)));
-          try {
-            const benchRes = await fetch("/api/positions/benchmark-series", {
-              method: "POST",
-              headers: {"Content-Type":"application/json"},
-              body: JSON.stringify({symbols: benchmarkSymbols, days: benchDays, base100: true}),
-            });
-            const benchData = await benchRes.json().catch(() => ({}));
-            const benchSeries = Array.isArray(benchData?.series) ? benchData.series : [];
-            for (const s of benchSeries) {
-              const items = Array.isArray(s?.items) ? s.items : [];
-              if (!items.length) continue;
-              benchmarkCount += 1;
-              traces.push({
-                x: items.map((x) => new Date(Number(x.ts || 0) * 1000)),
-                y: items.map((x) => Number(x.value || 0)),
-                mode: "lines",
-                line: {width: 1.6, dash: "dash"},
-                opacity: 0.9,
-                yaxis: "y3",
-                name: `${String(s.symbol || "?")} benchmark`,
-                hovertemplate: "%{x|%b %d, %Y}<br>%{y:.2f}<extra>%{fullData.name}</extra>",
-              });
-            }
-            const benchErr = Array.isArray(benchData?.errors) ? benchData.errors : [];
-            if (debugEl && benchErr.length) {
-              selectedRowsMeta.push(`benchmark_errors: ${benchErr.join(" ; ")}`);
-            }
-          } catch (_) {}
-        }
+        const benchmarkCount = traces.filter((t) => String(t?.name || "").toLowerCase().includes("benchmark")).length;
         Plotly.newPlot("posPoolChart", traces, {
           title: "Position history",
           paper_bgcolor: "#ffffff",
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
           xaxis: chartGridX(minCreatedMs, 5),
-          yaxis: chartGridY(false),
-          yaxis2: {
-            overlaying: "y",
-            side: "right",
-            tickprefix: "$",
-            showgrid: false,
-            title: "TVL (USD)",
-          },
-          ...(benchmarkCount > 0 ? {
-            yaxis3: {
-              overlaying: "y",
-              side: "right",
-              position: 0.92,
-              showgrid: false,
-              title: "Benchmark (base=100)",
-            },
-          } : {}),
+          yaxis: chartGridY(true),
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
@@ -20066,6 +20025,7 @@ def _render_positions_page() -> str:
           const lines = [];
           lines.push(`<b>History chart debug</b>`);
           lines.push(`mode=${esc(mode)} · selected=${Number(selected.length || 0)} · traces=${Number(traces.length || 0)}`);
+          if (droppedPairs > 0) lines.push(`selection_limit=1 · skipped=${Number(droppedPairs || 0)}`);
           lines.push(`benchmark=${esc(benchmarkSymbols.join(",") || "-")} · benchmark_traces=${benchmarkCount}`);
           lines.push(`days_used=${esc(minDays === maxDays ? String(minDays) : `${minDays}..${maxDays}`)} · min_created=${esc(minCreatedMs > 0 ? new Date(minCreatedMs).toISOString().slice(0, 10) : "-")}`);
           if (selectedRowsMeta.length) lines.push(selectedRowsMeta.slice(0, 12).map((x) => `• ${esc(x)}`).join("<br/>"));
@@ -20073,14 +20033,14 @@ def _render_positions_page() -> str:
           debugEl.style.display = "";
         }
         setPosHistoryStatusBar({
-          state: "ok",
+          state: droppedPairs > 0 ? "warn" : "ok",
           title: "Show history",
           selected: selected.length,
           traces: traces.length,
           benchmark: benchmarkCount,
           mode,
           days: getHistoryDays(),
-          message: "History loaded",
+          message: droppedPairs > 0 ? `History loaded (limited to 1 pair, skipped ${droppedPairs})` : "History loaded",
         });
       } catch (e) {
         chartEl.innerHTML = `<div class='hint'>Failed to load chart: ${esc(e?.message || "unknown")}</div>`;
@@ -20202,23 +20162,7 @@ def _render_positions_page() -> str:
           plot_bgcolor: "#f8fbff",
           margin: {t: 34, b: 42, l: 54, r: 12},
           xaxis: chartGridX(minCreatedMs, 5),
-          yaxis: chartGridY(false),
-          yaxis2: {
-            overlaying: "y",
-            side: "right",
-            tickprefix: "$",
-            showgrid: false,
-            title: "TVL (USD)",
-          },
-          ...(benchmarkCount > 0 ? {
-            yaxis3: {
-              overlaying: "y",
-              side: "right",
-              position: 0.92,
-              showgrid: false,
-              title: "Benchmark (base=100)",
-            },
-          } : {}),
+          yaxis: chartGridY(true),
           showlegend: true,
           legend: {orientation: "h", y: -0.2},
         }, {displaylogo: false, responsive: true});
@@ -25202,20 +25146,18 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
     sym0 = str(getattr(req, "token0_symbol", "") or "").strip().upper()
     sym1 = str(getattr(req, "token1_symbol", "") or "").strip().upper()
 
-    # 1) Try exact snapshots history first (best effort).
+    bench_symbols = [
+        str(x or "").strip().upper()
+        for x in list(getattr(req, "benchmark_symbols", []) or [])
+        if str(x or "").strip()
+    ]
+    bench_symbols = list(dict.fromkeys(bench_symbols))[:4]
+
+    # 1) Build strict "in position" daily history from exact snapshots.
     if endpoint and chain_id > 0 and position_ids:
-        exact_by_day: dict[int, float] = {}
         amount0_by_day: dict[int, float] = {}
         amount1_by_day: dict[int, float] = {}
         for pid in position_ids[:20]:
-            series = _fetch_position_snapshot_series_exact(
-                endpoint,
-                pid,
-                since_ts=since_ts,
-                chain_id=chain_id,
-            )
-            for ts, value in series:
-                exact_by_day[int(ts)] = float(exact_by_day.get(int(ts), 0.0) + float(value))
             series_amt = _fetch_position_snapshot_amounts_series_exact(
                 endpoint,
                 pid,
@@ -25226,51 +25168,142 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                 dts = int(ts)
                 amount0_by_day[dts] = float(amount0_by_day.get(dts, 0.0) + float(a0))
                 amount1_by_day[dts] = float(amount1_by_day.get(dts, 0.0) + float(a1))
-        if exact_by_day:
-            items = [
-                {
-                    "ts": int(ts),
-                    "position_tvl_usd": float(v),
-                    "amount0": float(max(0.0, amount0_by_day.get(int(ts), 0.0))),
-                    "amount1": float(max(0.0, amount1_by_day.get(int(ts), 0.0))),
-                    "pool_tvl_usd": None,
-                }
-                for ts, v in sorted(exact_by_day.items(), key=lambda x: x[0])
-            ]
+        if amount0_by_day or amount1_by_day:
+            known_days = sorted(set(amount0_by_day.keys()) | set(amount1_by_day.keys()))
+            if known_days:
+                day_start = max(int((since_ts // 86400) * 86400), int(min(known_days)))
+                day_end = int(max(max(known_days), (now_ts // 86400) * 86400))
+            else:
+                day_start = int((since_ts // 86400) * 86400)
+                day_end = int((now_ts // 86400) * 86400)
+            daily_days = list(range(int(day_start), int(day_end) + 1, 86400))
+
+            # Forward-fill "in position" amounts to get values for each day.
+            pts = sorted(
+                [
+                    (
+                        int(ts),
+                        float(max(0.0, amount0_by_day.get(int(ts), 0.0))),
+                        float(max(0.0, amount1_by_day.get(int(ts), 0.0))),
+                    )
+                    for ts in known_days
+                ],
+                key=lambda x: x[0],
+            )
+            ff_amount0: dict[int, float] = {}
+            ff_amount1: dict[int, float] = {}
+            cur0 = 0.0
+            cur1 = 0.0
+            seen = False
+            pidx = 0
+            for dts in daily_days:
+                while pidx < len(pts) and int(pts[pidx][0]) <= int(dts):
+                    cur0 = float(pts[pidx][1])
+                    cur1 = float(pts[pidx][2])
+                    seen = True
+                    pidx += 1
+                if not seen:
+                    continue
+                ff_amount0[int(dts)] = float(max(0.0, cur0))
+                ff_amount1[int(dts)] = float(max(0.0, cur1))
+
+            token0_addr = str(getattr(req, "token0_id", "") or "").strip().lower()
+            token1_addr = str(getattr(req, "token1_id", "") or "").strip().lower()
+            stable0 = (_fee_position_token_stable_usd_assumption(int(chain_id), token0_addr) is not None) if _is_eth_address(token0_addr) else False
+            stable1 = (_fee_position_token_stable_usd_assumption(int(chain_id), token1_addr) is not None) if _is_eth_address(token1_addr) else False
+            hist0 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token0_addr), int(day_start), int(day_end)) if (_is_eth_address(token0_addr) and not stable0) else []
+            hist1 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token1_addr), int(day_start), int(day_end)) if (_is_eth_address(token1_addr) and not stable1) else []
+            spot_map = _get_token_prices_usd(int(chain_id), [x for x in [token0_addr, token1_addr] if _is_eth_address(x)])
+            p0_spot = float(_safe_float(spot_map.get(token0_addr)))
+            p1_spot = float(_safe_float(spot_map.get(token1_addr)))
+
+            def _price_day(addr: str, is_stable: bool, hist: list[tuple[int, float]], spot_px: float, dts: int) -> float:
+                if is_stable:
+                    return 1.0
+                if _is_eth_address(addr):
+                    p_hist = _price_usd_at_or_before_series(hist, int(dts) + 86399) if hist else None
+                    if p_hist is not None and float(p_hist) > 0:
+                        return float(p_hist)
+                return float(spot_px) if float(spot_px) > 0 else 0.0
+
+            items: list[dict[str, Any]] = []
+            start_tvl_usd = 0.0
+            start_amt0 = 0.0
+            start_amt1 = 0.0
+            start_found = False
+            for dts in sorted(ff_amount0.keys()):
+                a0 = float(max(0.0, ff_amount0.get(int(dts), 0.0)))
+                a1 = float(max(0.0, ff_amount1.get(int(dts), 0.0)))
+                p0 = _price_day(token0_addr, stable0, hist0, p0_spot, int(dts))
+                p1 = _price_day(token1_addr, stable1, hist1, p1_spot, int(dts))
+                tvl_usd = float(max(0.0, (a0 * max(0.0, p0)) + (a1 * max(0.0, p1))))
+                if (not start_found) and tvl_usd > 0:
+                    start_found = True
+                    start_tvl_usd = float(tvl_usd)
+                    start_amt0 = float(a0)
+                    start_amt1 = float(a1)
+                hold_usd = float(max(0.0, (start_amt0 * max(0.0, p0)) + (start_amt1 * max(0.0, p1)))) if start_found else 0.0
+                items.append(
+                    {
+                        "ts": int(dts),
+                        "position_tvl_usd": float(tvl_usd),
+                        "hold_usd": float(hold_usd),
+                        "amount0": float(a0),
+                        "amount1": float(a1),
+                        "pool_tvl_usd": None,
+                    }
+                )
+
+            benchmarks_out: list[dict[str, Any]] = []
+            if bench_symbols and start_tvl_usd > 0 and items:
+                b_days = max(2, min(3650, int(math.ceil((int(day_end) - int(day_start)) / 86400)) + 7))
+                for sym in bench_symbols:
+                    coin_id = _major_coingecko_id_by_symbol(sym)
+                    if not coin_id:
+                        continue
+                    raw = _fetch_coingecko_major_series_days(coin_id, b_days)
+                    if not raw:
+                        continue
+                    p_start = _price_usd_at_or_before_series(raw, int(day_start) + 86399)
+                    if p_start is None or float(p_start) <= 0:
+                        continue
+                    b_items: list[dict[str, Any]] = []
+                    for it in items:
+                        dts = int(it.get("ts") or 0)
+                        if dts <= 0:
+                            continue
+                        p_now = _price_usd_at_or_before_series(raw, int(dts) + 86399)
+                        if p_now is None or float(p_now) <= 0:
+                            continue
+                        v = float(start_tvl_usd) * (float(p_now) / float(p_start))
+                        b_items.append({"ts": int(dts), "value": float(max(0.0, v))})
+                    if b_items:
+                        benchmarks_out.append(
+                            {
+                                "symbol": str(sym),
+                                "mode": "start_price_buy_hold",
+                                "items": b_items,
+                                "count": len(b_items),
+                            }
+                        )
+
             return {
                 "items": items,
                 "count": len(items),
-                "mode": "exact-snapshots",
-                "note": "built from position snapshots",
+                "mode": "exact-snapshots-in-position",
+                "note": "TVL from daily in-position amounts; hold from start amounts; benchmark from start-date buy",
                 "token0_symbol": sym0,
                 "token1_symbol": sym1,
+                "benchmarks": benchmarks_out,
             }
-
-    # 2) Fallback to estimated share-based history.
-    position_liq = _safe_float(req.position_liquidity)
-    pool_liq = _safe_float(req.pool_liquidity)
-    if position_liq <= 0 or pool_liq <= 0:
-        return {
-            "items": [],
-            "count": 0,
-            "mode": "unavailable",
-            "note": "snapshots missing and liquidity share unavailable",
-        }
-    share = position_liq / pool_liq if pool_liq > 0 else 0.0
-    if share <= 0:
-        raise HTTPException(status_code=400, detail="Liquidity share is zero.")
-    series_raw = _fetch_pool_tvl_series(chain_key, version, pool_id, days)
-    if not series_raw:
-        return {"items": [], "count": 0, "share": share, "mode": "estimated-share", "note": "no pool day data"}
-    items = [{"ts": int(ts), "pool_tvl_usd": float(tvl), "position_tvl_usd": float(max(0.0, tvl * share)), "amount0": None, "amount1": None} for ts, tvl in series_raw]
     return {
-        "items": items,
-        "count": len(items),
-        "share": share,
-        "mode": "estimated-share",
-        "note": "fallback: snapshots missing/incomplete",
+        "items": [],
+        "count": 0,
+        "mode": "unavailable",
+        "note": "in-position snapshots unavailable for selected period",
         "token0_symbol": sym0,
         "token1_symbol": sym1,
+        "benchmarks": [],
     }
 
 
