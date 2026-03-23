@@ -19888,6 +19888,7 @@ def _render_positions_page() -> str:
       const selected = selectedAll.slice(0, 12);
       const droppedPairs = Math.max(0, selectedAll.length - selectedLimit);
       if (!selected.length) {
+        chartEl.innerHTML = "<div class='hint'>Select at least one History checkbox in the table.</div>";
         setPosHistoryStatusBar({
           state: "error",
           title: "Show history",
@@ -19962,7 +19963,12 @@ def _render_positions_page() -> str:
           const baseName = String(row.pair || row.pool_id || `Pool ${i + 1}`);
           const x = items.map((x) => new Date(Number(x.ts || 0) * 1000));
           const tvlUsd = items.map((x) => Number(x.position_tvl_usd || 0));
-          const holdUsd = items.map((x) => Number(x.hold_usd || 0));
+          const holdUsdRaw = items.map((x) => x?.hold_usd);
+          const holdUsd = holdUsdRaw.map((v) => {
+            const n = Number(v);
+            return Number.isFinite(n) ? n : null;
+          });
+          const hasHold = holdUsd.some((v) => Number.isFinite(v) && Number(v) > 0);
           traces.push({
             x,
             y: tvlUsd,
@@ -19971,14 +19977,18 @@ def _render_positions_page() -> str:
             name: `${baseName} (TVL in position)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
           });
-          traces.push({
-            x,
-            y: holdUsd,
-            mode: "lines",
-            line: {color: palette[i % palette.length], width: 2, dash: "dash"},
-            name: `${baseName} (Hold)`,
-            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
-          });
+          if (hasHold) {
+            traces.push({
+              x,
+              y: holdUsd,
+              mode: "lines",
+              line: {color: palette[i % palette.length], width: 2, dash: "dash"},
+              name: `${baseName} (Hold)`,
+              hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+            });
+          } else {
+            selectedRowsMeta.push(`${baseName}: hold_hidden(no_amount_history)`);
+          }
           const benchSeries = Array.isArray(data?.benchmarks) ? data.benchmarks : [];
           for (const bs of benchSeries) {
             const bItems = Array.isArray(bs?.items) ? bs.items : [];
@@ -25307,6 +25317,7 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
             start_amt0 = 0.0
             start_amt1 = 0.0
             start_found = False
+            hold_enabled = bool(amount0_by_day or amount1_by_day)
             for dts in sorted(ff_amount0.keys()):
                 a0 = float(max(0.0, ff_amount0.get(int(dts), 0.0)))
                 a1 = float(max(0.0, ff_amount1.get(int(dts), 0.0)))
@@ -25320,12 +25331,14 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                     start_tvl_usd = float(tvl_usd)
                     start_amt0 = float(a0)
                     start_amt1 = float(a1)
-                hold_usd = float(max(0.0, (start_amt0 * max(0.0, p0)) + (start_amt1 * max(0.0, p1)))) if start_found else 0.0
+                hold_usd: float | None = None
+                if hold_enabled and start_found:
+                    hold_usd = float(max(0.0, (start_amt0 * max(0.0, p0)) + (start_amt1 * max(0.0, p1))))
                 items.append(
                     {
                         "ts": int(dts),
                         "position_tvl_usd": float(tvl_usd),
-                        "hold_usd": float(hold_usd),
+                        "hold_usd": (float(hold_usd) if hold_usd is not None else None),
                         "amount0": float(a0),
                         "amount1": float(a1),
                         "pool_tvl_usd": None,
@@ -25372,6 +25385,7 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                 "note": "TVL from exact daily in-position snapshots (amounts when available); hold from start amounts; benchmark from start-date buy",
                 "token0_symbol": sym0,
                 "token1_symbol": sym1,
+                "hold_available": bool(hold_enabled),
                 "benchmarks": benchmarks_out,
             }
     return {
