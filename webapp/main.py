@@ -19990,9 +19990,11 @@ def _render_positions_page() -> str:
             selectedRowsMeta.push(`${baseName}: hold_hidden(no_amount_history)`);
           }
           const benchSeries = Array.isArray(data?.benchmarks) ? data.benchmarks : [];
+          let renderedBench = 0;
           for (const bs of benchSeries) {
             const bItems = Array.isArray(bs?.items) ? bs.items : [];
             if (!bItems.length) continue;
+            renderedBench += 1;
             traces.push({
               x: bItems.map((x) => new Date(Number(x.ts || 0) * 1000)),
               y: bItems.map((x) => Number(x.value || 0)),
@@ -20002,6 +20004,61 @@ def _render_positions_page() -> str:
               name: `${baseName} (${String(bs?.symbol || "?")} benchmark)`,
               hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
             });
+          }
+          if (!renderedBench && benchmarkSymbols.length && tvlUsd.some((v) => Number(v) > 0)) {
+            try {
+              const startIdx = tvlUsd.findIndex((v) => Number(v) > 0);
+              const startTvl = startIdx >= 0 ? Number(tvlUsd[startIdx] || 0) : 0;
+              const startTsSec = startIdx >= 0 ? Math.floor(Number(x[startIdx]?.getTime?.() || 0) / 1000) : 0;
+              if (startTvl > 0 && startTsSec > 0) {
+                const benchRes = await fetch("/api/positions/benchmark-series", {
+                  method: "POST",
+                  headers: {"Content-Type":"application/json"},
+                  body: JSON.stringify({symbols: benchmarkSymbols, days: rowDays, base100: false}),
+                });
+                const benchData = await benchRes.json().catch(() => ({}));
+                const benchFallback = Array.isArray(benchData?.series) ? benchData.series : [];
+                const priceAtOrBefore = (items, tsSec) => {
+                  let p = 0;
+                  for (const it of (Array.isArray(items) ? items : [])) {
+                    const its = Number(it?.ts || 0);
+                    const ip = Number(it?.price_usd || it?.value || 0);
+                    if (its > 0 && its <= tsSec && ip > 0) p = ip;
+                  }
+                  if (p > 0) return p;
+                  const first = (Array.isArray(items) ? items : []).find((it) => Number(it?.price_usd || it?.value || 0) > 0);
+                  return Number(first?.price_usd || first?.value || 0);
+                };
+                for (const s of benchFallback) {
+                  const bItems = Array.isArray(s?.items) ? s.items : [];
+                  if (!bItems.length) continue;
+                  const pStart = Number(priceAtOrBefore(bItems, startTsSec) || 0);
+                  if (!(pStart > 0)) continue;
+                  const out = bItems
+                    .map((it) => {
+                      const ts = Number(it?.ts || 0);
+                      const pNow = Number(it?.price_usd || it?.value || 0);
+                      if (!(ts > 0) || !(pNow > 0) || ts < startTsSec) return null;
+                      return {ts, value: Number(startTvl) * (pNow / pStart)};
+                    })
+                    .filter(Boolean);
+                  if (!out.length) continue;
+                  traces.push({
+                    x: out.map((it) => new Date(Number(it.ts || 0) * 1000)),
+                    y: out.map((it) => Number(it.value || 0)),
+                    mode: "lines",
+                    line: {width: 1.7, dash: "dot"},
+                    opacity: 0.95,
+                    name: `${baseName} (${String(s?.symbol || "?")} benchmark)`,
+                    hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+                  });
+                  renderedBench += 1;
+                }
+              }
+            } catch (_) {}
+          }
+          if (!renderedBench && benchmarkSymbols.length) {
+            selectedRowsMeta.push(`${baseName}: benchmark_missing(${benchmarkSymbols.join(",")})`);
           }
           rowsDrawn += 1;
           if (rowsDrawn >= selectedLimit) break;
@@ -21197,10 +21254,13 @@ def _render_positions_page() -> str:
             elapsedSec: (Date.now() - feeStartedAt) / 1000,
           });
         } else if ((feeState.hasEstimatedShareTrace || feeState.hasSnapshotOnlyTrace) && !feeState.hasCollectedHistoryTrace) {
+          const soldInstantlyNotApplicable = !!histUsd;
           setPosFeeStatusBar({
-            state: "warn",
+            state: "info",
             title: "Fee calculation",
-            message: "Estimate/snapshot only",
+            message: soldInstantlyNotApplicable
+              ? "Ready (if sold instantly N/A: no collected history)"
+              : "Estimate/snapshot only",
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
             collected: Number(feeState.rowsWithCollected || 0),
@@ -25318,6 +25378,7 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
             start_amt1 = 0.0
             start_found = False
             hold_enabled = bool(amount0_by_day or amount1_by_day)
+            hold_scale = 1.0
             for dts in sorted(ff_amount0.keys()):
                 a0 = float(max(0.0, ff_amount0.get(int(dts), 0.0)))
                 a1 = float(max(0.0, ff_amount1.get(int(dts), 0.0)))
@@ -25331,9 +25392,14 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                     start_tvl_usd = float(tvl_usd)
                     start_amt0 = float(a0)
                     start_amt1 = float(a1)
+                    if hold_enabled:
+                        hold_start_raw = float(max(0.0, (start_amt0 * max(0.0, p0)) + (start_amt1 * max(0.0, p1))))
+                        if hold_start_raw > 0:
+                            hold_scale = float(start_tvl_usd / hold_start_raw)
                 hold_usd: float | None = None
                 if hold_enabled and start_found:
-                    hold_usd = float(max(0.0, (start_amt0 * max(0.0, p0)) + (start_amt1 * max(0.0, p1))))
+                    hold_raw = float(max(0.0, (start_amt0 * max(0.0, p0)) + (start_amt1 * max(0.0, p1))))
+                    hold_usd = float(max(0.0, hold_raw * float(hold_scale)))
                 items.append(
                     {
                         "ts": int(dts),
