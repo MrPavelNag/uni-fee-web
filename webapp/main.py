@@ -16222,13 +16222,20 @@ def _scan_aave_merit_rewards(addresses: list[str], chain_ids: list[int]) -> tupl
 
 
 def _parse_pairs_str(raw: str) -> list[tuple[str, str]]:
+    def _norm_sym(s: str) -> str:
+        v = str(s or "").strip().lower()
+        if not v:
+            return ""
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", v):
+            return ""
+        return v
     out = []
     seen = set()
     for part in (raw or "").replace(" ", "").lower().split(";"):
         if "," not in part:
             continue
         a, b = part.split(",", 1)
-        a, b = a.strip(), b.strip()
+        a, b = _norm_sym(a), _norm_sym(b)
         if not a or not b or a == b:
             continue
         key = (a, b)
@@ -16639,7 +16646,13 @@ def _build_token_catalog_from_merged_major(merged: dict[str, dict[str, str]], up
     by_chain_syms: dict[str, list[str]] = {}
     all_syms: set[str] = set()
     for ck, addr_map in merged.items():
-        syms = sorted({str(s).strip().lower() for s in (addr_map or {}).values() if str(s).strip()})
+        syms = sorted(
+            {
+                str(s).strip().lower()
+                for s in (addr_map or {}).values()
+                if _is_clean_symbol(str(s).strip())
+            }
+        )
         by_chain_syms[str(ck).strip().lower()] = syms
         all_syms.update(syms)
     return {
@@ -27889,6 +27902,29 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         req.exclude_suffixes = [str(x).strip() for x in (req.exclude_suffixes or []) if str(x).strip()]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid request payload: {str(e)[:120]}") from e
+    clean_pairs: list[str] = []
+    seen_pairs: set[str] = set()
+    for raw_pair in (req.pairs or []):
+        part = str(raw_pair or "").strip().lower().replace(" ", "")
+        if "," not in part:
+            continue
+        a_raw, b_raw = part.split(",", 1)
+        a = str(a_raw or "").strip().lower()
+        b = str(b_raw or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", a):
+            continue
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", b):
+            continue
+        if a == b:
+            continue
+        pair = f"{a},{b}"
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        clean_pairs.append(pair)
+    req.pairs = clean_pairs
+    if not req.pairs:
+        raise HTTPException(status_code=400, detail="No valid pairs. Use token symbols like eth, usdc, wbtc, usdt (chars: a-z, 0-9, dot, underscore, dash).")
     if not os.environ.get("THE_GRAPH_API_KEY"):
         raise HTTPException(status_code=400, detail="Missing THE_GRAPH_API_KEY on server.")
     if req.days < 1 or req.days > 3650:
@@ -28779,6 +28815,20 @@ HTML_PAGE = """
       saveFormState();
     }
 
+    function escAttr(v) {
+      return String(v == null ? "" : v)
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    function normalizePairToken(v) {
+      const s = String(v || "").trim().toLowerCase();
+      if (!s) return "";
+      return /^[a-z0-9][a-z0-9._-]{0,31}$/.test(s) ? s : "";
+    }
+
     async function parseApiJsonSafe(resp) {
       const txt = await resp.text().catch(() => "");
       try {
@@ -29346,8 +29396,8 @@ HTML_PAGE = """
       for (let i = 1; i <= 4; i++) {
         const aEl = document.getElementById(`pair${i}a`);
         const bEl = document.getElementById(`pair${i}b`);
-        const a = (aEl?.value || "").trim().toLowerCase();
-        const b = (bEl?.value || "").trim().toLowerCase();
+        const a = normalizePairToken(aEl?.value || "");
+        const b = normalizePairToken(bEl?.value || "");
         if (!a && !b) continue;
         if (!a || !b || a === b) {
           if (aEl) aEl.classList.add("invalid-input");
@@ -29571,7 +29621,7 @@ HTML_PAGE = """
         const r = await fetch("/api/meta");
         const meta = await r.json();
         const tokenHints = document.getElementById("tokenHints");
-        tokenHints.innerHTML = (meta.tokens || []).map(t => `<option value="${t}"></option>`).join("");
+        tokenHints.innerHTML = (meta.tokens || []).map((t) => `<option value="${escAttr(t)}"></option>`).join("");
         const topN = Number(meta.token_catalog?.major_top_n || 0);
         const minTvl = Number(meta.token_catalog?.min_tvl_usd || 10000);
         const symCount = Number(meta.token_catalog?.count || 0);
