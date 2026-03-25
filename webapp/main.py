@@ -34,7 +34,7 @@ from typing import Any
 from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -103,6 +103,16 @@ CHAIN_ID_TO_NAME = {
 APP_VERSION = "0.1.6"
 APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
+
+@app.exception_handler(Exception)
+async def _json_api_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    path = str(getattr(request.url, "path", "") or "")
+    if path.startswith("/api/"):
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"internal error: {str(exc)[:260]}"},
+        )
+    return JSONResponse(status_code=500, content={"detail": "internal error"})
 
 
 @app.on_event("startup")
@@ -16216,6 +16226,23 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _json_safe(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, bool)):
+        return obj
+    if isinstance(obj, float):
+        return float(obj) if math.isfinite(obj) else 0.0
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, set):
+        return [_json_safe(v) for v in sorted(obj, key=lambda x: str(x))]
+    try:
+        return float(obj) if isinstance(obj, Decimal) else str(obj)
+    except Exception:
+        return str(obj)
+
+
 def _parse_utc_iso(value: str) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:
@@ -17162,7 +17189,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             job["stage"] = "done"
             job["stage_label"] = "Completed"
             job["progress"] = 100
-            job["result"] = {
+            job["result"] = _json_safe({
                 "request": {
                     "pairs": token_pairs,
                     "days": req.days,
@@ -17177,7 +17204,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 },
                 **result,
                 "logs": logs[-8:],
-            }
+            })
         _push_run_history(
             session_id=session_id,
             status="done",
@@ -26279,19 +26306,11 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 alt_pricing_mode = ("spot" if str(pricing_mode) == "historical" else "historical")
                 cache_hits = 0
                 cache_misses: list[int] = []
+                rebuild_token_ids: list[int] = []
+                scan_needed_token_ids: list[int] = []
                 stale_cached_by_tid: dict[int, dict[int, float]] = {}
                 no_collect_confirmed: list[int] = []
                 for tid in token_ids:
-                    if bool(want_ignore_cache):
-                        cache_misses.append(int(tid))
-                        continue
-                    cached_one = _load_v3_npm_fee_ledger_day_from_cache(
-                        int(chain_id),
-                        str(protocol),
-                        int(tid),
-                        since_ts=int(ledger_since_ts),
-                        pricing_mode=str(pricing_mode),
-                    )
                     scan_done = _is_v3_npm_fee_scan_complete(
                         int(chain_id),
                         str(protocol),
@@ -26310,6 +26329,19 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         if int(ev_count_done) <= 0:
                             no_collect_confirmed.append(int(tid))
                             continue
+                    if bool(want_ignore_cache):
+                        rebuild_token_ids.append(int(tid))
+                        cache_misses.append(int(tid))
+                        if not scan_done:
+                            scan_needed_token_ids.append(int(tid))
+                        continue
+                    cached_one = _load_v3_npm_fee_ledger_day_from_cache(
+                        int(chain_id),
+                        str(protocol),
+                        int(tid),
+                        since_ts=int(ledger_since_ts),
+                        pricing_mode=str(pricing_mode),
+                    )
                     if cached_one and scan_done:
                         cache_hits += 1
                         for ts, val in cached_one.items():
@@ -26328,6 +26360,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         if cached_one:
                             stale_cached_by_tid[int(tid)] = dict(cached_one)
                         cache_misses.append(int(tid))
+                        rebuild_token_ids.append(int(tid))
+                        if not scan_done:
+                            scan_needed_token_ids.append(int(tid))
                 debug["ledger_cache_hits"] = int(cache_hits)
                 debug["ledger_cache_misses"] = int(len(cache_misses))
                 debug["ledger_cache_partial"] = int(len(stale_cached_by_tid))
@@ -26347,11 +26382,13 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 ledger_deadline = time.monotonic() + float(ledger_budget_sec)
                 if single_position_mode:
                     ledger_chunks_cap = max(48, min(260, int(_fee_collect_log_max_chunks())))
-                    scan_token_ids = list(cache_misses[:2])
+                    scan_token_ids = list(scan_needed_token_ids[:2])
+                    build_token_ids = list(rebuild_token_ids[:2])
                 else:
                     ledger_chunks_cap = max(12, min(48, int(_fee_collect_log_max_chunks())))
-                    scan_token_ids = list(cache_misses[:12])
-                if cache_misses:
+                    scan_token_ids = list(scan_needed_token_ids[:12])
+                    build_token_ids = list(rebuild_token_ids[:12])
+                if scan_token_ids:
                     ledger_scan = _scan_v3_npm_fee_events_to_temp(
                         int(chain_id),
                         str(protocol),
@@ -26375,7 +26412,11 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     debug["ledger_explorer_pages"] = int(ledger_scan.get("explorer_pages") or 0)
                     debug["ledger_explorer_status"] = str(ledger_scan.get("explorer_status") or "")
                     debug["ledger_explorer_message"] = str(ledger_scan.get("explorer_message") or "")
-                    for tid in scan_token_ids:
+                elif build_token_ids:
+                    debug["ledger_source"] = "temp_events_reuse"
+                    debug["ledger_budget_sec"] = float(ledger_budget_sec)
+                if build_token_ids:
+                    for tid in build_token_ids:
                         one_day, one_meta = _build_v3_npm_fee_ledger_from_temp(
                             int(chain_id),
                             str(protocol),
@@ -27870,7 +27911,7 @@ def job_status(job_id: str) -> dict[str, Any]:
         job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    return _json_safe(job)
 
 
 @app.get("/api/runs/recent")
@@ -29607,7 +29648,7 @@ HTML_PAGE = """
         startScanTicker();
         const r = await fetch("/api/pools/run", {
           method: "POST",
-          headers: {"Content-Type":"application/json"},
+          headers: {"Content-Type":"application/json", "Accept":"application/json"},
           body: JSON.stringify(payload)
         });
         const parsed = await parseApiJsonSafe(r);
@@ -29638,7 +29679,7 @@ HTML_PAGE = """
 
     async function pollJob(jobId) {
       const timer = setInterval(async () => {
-        const r = await fetch("/api/jobs/" + jobId);
+        const r = await fetch("/api/jobs/" + jobId, {headers: {"Accept":"application/json"}});
         const parsed = await parseApiJsonSafe(r);
         const job = parsed.data || {};
         if (!r.ok) {
