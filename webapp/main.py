@@ -18344,6 +18344,8 @@ def _render_positions_page() -> str:
     .history-actions { gap:7px; }
     .history-actions .fee-toggle-pill { padding:4px 8px; font-size:12px; border-radius:999px; min-height:26px; }
     .history-actions .fee-toggle-pill input { width:13px; height:13px; }
+    .history-head { gap:10px; }
+    .history-head .history-actions { margin-left:auto; justify-content:flex-end; }
     #posHistoryDays, #posHistoryBenchA, #posHistoryBenchB {
       height:26px;
       border:1px solid #cbd5e1;
@@ -18368,6 +18370,7 @@ def _render_positions_page() -> str:
       .address-columns { grid-template-columns:1fr; }
       .positions-form, .result-card { padding: 13px; }
       .section-head { flex-wrap: wrap; align-items: center; }
+      .history-head .history-actions { margin-left:0; width:100%; justify-content:flex-start; }
       .section-head h3 { font-size: 18px; }
       .search-link-btn { font-size: 16px; }
     }
@@ -18468,9 +18471,10 @@ def _render_positions_page() -> str:
         </div>
       </section>
       <section class="result-card">
-        <div class="section-head">
+        <div class="section-head history-head">
           <h3>Show history</h3>
-          <div class="section-actions">
+          <span class="pos-status" id="posHistoryStatus">Select pools and run chart</span>
+          <div class="section-actions history-actions">
             <label class="fee-toggle-pill" title="Build chart from pool creation date.">
               <input type="checkbox" id="posHistoryFromCreation" checked onchange="onHistoryRangeModeChange('creation')" />
               <span class="pos-fee-hist-label">Greation</span>
@@ -18485,7 +18489,6 @@ def _render_positions_page() -> str:
             </label>
             <input id="posHistoryBenchA" value="BTC" style="width:58px" />
             <input id="posHistoryBenchB" value="ETH" style="width:58px" />
-            <span class="pos-status" id="posHistoryStatus">Select pools and run chart</span>
             <button class="search-link-btn" type="button" onclick="showSelectedPoolSeries()">Build chart</button>
             <button class="collapse-btn" id="toggleHistoryBtn" type="button" onclick="togglePosSection('history')" title="Collapse/expand">▾</button>
           </div>
@@ -19326,7 +19329,11 @@ def _render_positions_page() -> str:
       const parts = [];
       if (title) parts.push(title);
       if (selected > 0 || traces > 0) parts.push(`rows ${traces}/${selected || 0}`);
-      if (mode) parts.push(`range ${mode === "creation" ? "from creation" : `last ${Math.max(1, days)}d`}`);
+      if (mode) {
+        if (mode === "creation") parts.push("range from creation");
+        else if (mode === "creation-fallback-days-no-created") parts.push(`range fallback ${Math.max(1, days)}d (no created date)`);
+        else parts.push(`range last ${Math.max(1, days)}d`);
+      }
       if (benchmark > 0) parts.push(`benchmark ${benchmark}`);
       if (msg) parts.push(msg);
       el.classList.remove("fee-status-bar");
@@ -19944,6 +19951,7 @@ def _render_positions_page() -> str:
             pool_id: row.pool_id,
             address: row.address,
             position_ids: Array.isArray(row.position_ids) ? row.position_ids : [],
+            position_id: String(row.position_id || ""),
             position_liquidity: row.liquidity,
             pool_liquidity: row.pool_liquidity,
             token0_id: String(row.token0_id || row.token0?.id || row.pool?.token0?.id || ""),
@@ -19963,9 +19971,18 @@ def _render_positions_page() -> str:
             body: JSON.stringify(payload),
           });
           const data = await res.json().catch(() => ({}));
-          if (!res.ok) continue;
+          if (!res.ok) {
+            const det = String(data?.detail || data?.message || res.status || "request failed");
+            selectedRowsMeta.push(`${baseName}: history_request_failed(${det})`);
+            continue;
+          }
           const items = Array.isArray(data.items) ? data.items : [];
-          if (!items.length) continue;
+          if (!items.length) {
+            const modeTxt = String(data?.mode || "-");
+            const noteTxt = String(data?.note || "empty response");
+            selectedRowsMeta.push(`${baseName}: history_empty(mode=${modeTxt}; note=${noteTxt})`);
+            continue;
+          }
           const baseName = String(row.pair || row.pool_id || `Pool ${i + 1}`);
           const x = items.map((x) => new Date(Number(x.ts || 0) * 1000));
           const tvlUsd = items.map((x) => Number(x.position_tvl_usd || 0));
@@ -20016,6 +20033,7 @@ def _render_positions_page() -> str:
               const startIdx = tvlUsd.findIndex((v) => Number(v) > 0);
               const startTvl = startIdx >= 0 ? Number(tvlUsd[startIdx] || 0) : 0;
               const startTsSec = startIdx >= 0 ? Math.floor(Number(x[startIdx]?.getTime?.() || 0) / 1000) : 0;
+              const chartFromTs = x.length ? Math.floor(Number(x[0]?.getTime?.() || 0) / 1000) : 0;
               if (startTvl > 0 && startTsSec > 0) {
                 const benchRes = await fetch("/api/positions/benchmark-series", {
                   method: "POST",
@@ -20023,7 +20041,14 @@ def _render_positions_page() -> str:
                   body: JSON.stringify({symbols: benchmarkSymbols, days: rowDays, base100: false}),
                 });
                 const benchData = await benchRes.json().catch(() => ({}));
+                if (!benchRes.ok) {
+                  const det = String(benchData?.detail || benchData?.message || benchRes.status || "request failed");
+                  selectedRowsMeta.push(`${baseName}: benchmark_api_failed(${det})`);
+                }
                 const benchFallback = Array.isArray(benchData?.series) ? benchData.series : [];
+                const benchErrors = Array.isArray(benchData?.errors)
+                  ? benchData.errors.map((e) => String(e || "").trim()).filter(Boolean)
+                  : [];
                 const priceAtOrBefore = (items, tsSec) => {
                   let p = 0;
                   for (const it of (Array.isArray(items) ? items : [])) {
@@ -20044,7 +20069,8 @@ def _render_positions_page() -> str:
                     .map((it) => {
                       const ts = Number(it?.ts || 0);
                       const pNow = Number(it?.price_usd || it?.value || 0);
-                      if (!(ts > 0) || !(pNow > 0) || ts < startTsSec) return null;
+                      if (!(ts > 0) || !(pNow > 0)) return null;
+                      if (chartFromTs > 0 && ts < chartFromTs) return null;
                       return {ts, value: Number(startTvl) * (pNow / pStart)};
                     })
                     .filter(Boolean);
@@ -20060,8 +20086,13 @@ def _render_positions_page() -> str:
                   });
                   renderedBench += 1;
                 }
+                if (!renderedBench && benchErrors.length) {
+                  selectedRowsMeta.push(`${baseName}: benchmark_source_errors(${benchErrors.slice(0, 3).join(" ; ")})`);
+                }
               }
-            } catch (_) {}
+            } catch (e) {
+              selectedRowsMeta.push(`${baseName}: benchmark_fallback_error(${String(e?.message || "unknown")})`);
+            }
           }
           if (!renderedBench && benchmarkSymbols.length) {
             selectedRowsMeta.push(`${baseName}: benchmark_missing(${benchmarkSymbols.join(",")})`);
@@ -20069,6 +20100,7 @@ def _render_positions_page() -> str:
           rowsDrawn += 1;
           if (rowsDrawn >= selectedLimit) break;
         }
+        const modeEff = (mode === "creation" && !(minCreatedMs > 0)) ? "creation-fallback-days-no-created" : mode;
         if (!traces.length) {
           chartEl.innerHTML = "<div class='hint'>No historical data found for selected rows.</div>";
           setPosHistoryStatusBar({
@@ -20077,7 +20109,7 @@ def _render_positions_page() -> str:
             selected: selected.length,
             traces: 0,
             benchmark: 0,
-            mode,
+            mode: modeEff,
             days: getHistoryDays(),
             message: "No history data",
           });
@@ -20101,7 +20133,7 @@ def _render_positions_page() -> str:
           const maxDays = usedDays.length ? Math.max(...usedDays) : 0;
           const lines = [];
           lines.push(`<b>History chart debug</b>`);
-          lines.push(`mode=${esc(mode)} · selected=${Number(rowsDrawn || 0)} · traces=${Number(traces.length || 0)}`);
+          lines.push(`mode=${esc(modeEff)} · selected=${Number(rowsDrawn || 0)} · traces=${Number(traces.length || 0)}`);
           if (droppedPairs > 0) lines.push(`selection_limit=1 · skipped=${Number(droppedPairs || 0)}`);
           lines.push(`benchmark=${esc(benchmarkSymbols.join(",") || "-")} · benchmark_traces=${benchmarkCount}`);
           lines.push(`days_used=${esc(minDays === maxDays ? String(minDays) : `${minDays}..${maxDays}`)} · min_created=${esc(minCreatedMs > 0 ? new Date(minCreatedMs).toISOString().slice(0, 10) : "-")}`);
@@ -20115,7 +20147,7 @@ def _render_positions_page() -> str:
           selected: Number(rowsDrawn || Math.min(selectedLimit, selectedAll.length)),
           traces: traces.length,
           benchmark: benchmarkCount,
-          mode,
+          mode: modeEff,
           days: getHistoryDays(),
           message: droppedPairs > 0 ? `History loaded (limited to 1 pair, skipped ${droppedPairs})` : "History loaded",
         });
@@ -20365,6 +20397,17 @@ def _render_positions_page() -> str:
         },
       };
     }
+    function traceMaxMs(arr) {
+      let out = 0;
+      for (const t of (Array.isArray(arr) ? arr : [])) {
+        const xs = Array.isArray(t?.x) ? t.x : [];
+        for (const xv of xs) {
+          const ms = Number(new Date(xv).getTime() || 0);
+          if (ms > out) out = ms;
+        }
+      }
+      return out;
+    }
     async function restoreLastFeeChartFromCache() {
       const chartEl = document.getElementById("posFeeChart");
       if (!chartEl) return false;
@@ -20379,17 +20422,6 @@ def _render_positions_page() -> str:
         if (!traces.length) return false;
         const ok = await ensurePlotly();
         if (!ok) return false;
-        const traceMaxMs = (arr) => {
-          let out = 0;
-          for (const t of (Array.isArray(arr) ? arr : [])) {
-            const xs = Array.isArray(t?.x) ? t.x : [];
-            for (const xv of xs) {
-              const ms = Number(new Date(xv).getTime() || 0);
-              if (ms > out) out = ms;
-            }
-          }
-          return out;
-        };
         Plotly.newPlot("posFeeChart", traces, feeChartLayout(String(obj.title || "Collected & Estimated Fees"), 0, null, traceMaxMs(traces)), {displaylogo: false, responsive: true});
         setPosFeeStatus("Chart restored from cache.", false);
         return true;
@@ -20578,10 +20610,6 @@ def _render_positions_page() -> str:
           ? `${dtLabel}<br>${feeStepLine}<br>${aprPct.toFixed(1)}%${daysLine}<br>Liquidity: ${liqAtPoint}`
           : `${dtLabel}<br>${feeStepLine}${daysLine}<br>Liquidity: ${liqAtPoint}`;
       };
-      const snapshotTailUsd = (snapshotItems) => {
-        const tail = lastByTs(snapshotItems || []);
-        return Math.max(0, Number(tail?.fees_usd || 0));
-      };
       let lastFeePricing = "";
       let hasCollectedHistoryTrace = false;
       let hasEstimatedShareTrace = false;
@@ -20620,19 +20648,22 @@ def _render_positions_page() -> str:
         const collectedItems = Array.isArray(outRow.collected_items) ? outRow.collected_items : [];
         const estimatedItems = Array.isArray(outRow.estimated_items) ? outRow.estimated_items : [];
         const snapshotItems = Array.isArray(outRow.snapshot_items) ? outRow.snapshot_items : [];
+        const collectedSorted = sortByTs(collectedItems);
+        const estimatedSorted = sortByTs(estimatedItems);
+        const snapshotSorted = sortByTs(snapshotItems);
         const aprByTs = buildAprByTs(outRow.apr_items);
         const hasCollected = collectedItems.length > 0;
         const hasEstimated = estimatedItems.length > 0;
         const hasSnapshot = snapshotItems.length > 0;
-        const firstCollectedTs = Number(sortByTs(collectedItems)[0]?.ts || 0);
-        const firstEstimatedTs = Number(sortByTs(estimatedItems)[0]?.ts || 0);
-        const firstSnapshotTs = Number(sortByTs(snapshotItems)[0]?.ts || 0);
+        const firstCollectedTs = Number(collectedSorted[0]?.ts || 0);
+        const firstEstimatedTs = Number(estimatedSorted[0]?.ts || 0);
+        const firstSnapshotTs = Number(snapshotSorted[0]?.ts || 0);
         const firstAnyTs = [firstCollectedTs, firstEstimatedTs, firstSnapshotTs]
           .map((x) => Number(x || 0))
           .filter((x) => x > 0)
           .sort((a, b) => a - b)[0] || 0;
-        const collectedTotalUsd = hasCollected ? Math.max(0, Number(lastByTs(collectedItems)?.fees_usd || 0)) : 0;
-        const snapshotUnclaimedUsd = hasSnapshot ? snapshotTailUsd(snapshotItems) : 0;
+        const collectedTotalUsd = hasCollected ? Math.max(0, Number(collectedSorted[collectedSorted.length - 1]?.fees_usd || 0)) : 0;
+        const snapshotUnclaimedUsd = hasSnapshot ? Math.max(0, Number(snapshotSorted[snapshotSorted.length - 1]?.fees_usd || 0)) : 0;
         const feeTotalLegendUsdFromRow = Math.max(0, Number(outRow?.legend_fee_total_usd || 0));
         const feeTotalLegendUsd = feeTotalLegendUsdFromRow > 0
           ? feeTotalLegendUsdFromRow
@@ -20683,7 +20714,6 @@ def _render_positions_page() -> str:
         if (hasCollected) {
           hasCollectedHistoryTrace = true;
           rowsWithCollected += 1;
-          const collectedSorted = sortByTs(collectedItems);
           const lineX = [];
           const lineY = [];
           const collectedPointX = [];
@@ -20724,7 +20754,7 @@ def _render_positions_page() -> str:
             collectedPointHover.push(formatCollectedHover({dt, val, aprPct, feeDeltaUsd, liqUsd, aprDays, liqHover}));
           }
           if (hasSnapshot) {
-            const snapLast = lastByTs(snapshotItems);
+            const snapLast = snapshotSorted.length ? snapshotSorted[snapshotSorted.length - 1] : null;
             const snapTs = Number(snapLast?.ts || 0);
             const snapVal = Number(snapLast?.fees_usd || 0);
             if (snapTs > 0) {
@@ -20778,9 +20808,9 @@ def _render_positions_page() -> str:
           hasEstimatedShareTrace = true;
           rowsWithEstimated += 1;
           const liqHover = (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-";
-          const estX = estimatedItems.map((x) => new Date(Number(x.ts || 0) * 1000));
-          const estY = estimatedItems.map((x) => Number(x.fees_usd || 0));
-          const estHover = estimatedItems.map((x) => {
+          const estX = estimatedSorted.map((x) => new Date(Number(x.ts || 0) * 1000));
+          const estY = estimatedSorted.map((x) => Number(x.fees_usd || 0));
+          const estHover = estimatedSorted.map((x) => {
             const dt = new Date(Number(x?.ts || 0) * 1000);
             const dtLabel = dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"});
             const val = Number(x?.fees_usd || 0);
@@ -20817,13 +20847,13 @@ def _render_positions_page() -> str:
         if (hasSnapshot) {
           hasSnapshotOnlyTrace = true;
           rowsWithSnapshot += 1;
-          const snapLast = lastByTs(snapshotItems);
+          const snapLast = snapshotSorted.length ? snapshotSorted[snapshotSorted.length - 1] : null;
           const snapTs = Number(snapLast?.ts || 0);
           const snapVal = Number(snapLast?.fees_usd || 0);
           if (snapTs > 0) {
             let snapMarkerVal = Math.max(0, snapVal);
             if (hasCollected) {
-              const lastCollectedVal = Number(lastByTs(collectedItems)?.fees_usd || 0);
+              const lastCollectedVal = Number(collectedSorted[collectedSorted.length - 1]?.fees_usd || 0);
               snapMarkerVal = Math.max(0, lastCollectedVal + Math.max(0, snapVal));
             }
             const snapDt = new Date(snapTs * 1000);
@@ -21224,84 +21254,45 @@ def _render_positions_page() -> str:
           return out;
         };
         overlayTraces = compactLegendByPair(overlayTraces);
-        const traceMaxMs = (arr) => {
-          let out = 0;
-          for (const t of (Array.isArray(arr) ? arr : [])) {
-            const xs = Array.isArray(t?.x) ? t.x : [];
-            for (const xv of xs) {
-              const ms = Number(new Date(xv).getTime() || 0);
-              if (ms > out) out = ms;
-            }
-          }
-          return out;
-        };
         Plotly.newPlot("posFeeChart", overlayTraces, feeChartLayout(mainTitle, minCreatedMs, null, traceMaxMs(overlayTraces)), {displaylogo: false, responsive: true});
         saveLastFeeChartCache(overlayTraces, mainTitle);
         const missing = Math.max(0, Number(diag.selected || 0) - feeState.rowsWithAnySeries);
         const timeoutRows = Number(cmpDebug.timeout_rows || 0);
         const baselineRows = Number(cmpDebug.synthetic_baseline_rows || 0);
         const hasPartialRows = timeoutRows > 0 || missing > 0;
+        const pushFinalFeeStatus = (state, message) => {
+          setPosFeeStatusBar({
+            state,
+            title: "Fee calculation",
+            message,
+            selected: Number(diag.selected || 0),
+            withData: Number(feeState.rowsWithAnySeries || 0),
+            collected: Number(feeState.rowsWithCollected || 0),
+            estimated: Number(feeState.rowsWithEstimated || 0),
+            snapshot: Number(feeState.rowsWithSnapshot || 0),
+            collectedPoints: Number(feeState.collectedPointsTotal || 0),
+            estimatedPoints: Number(feeState.estimatedPointsTotal || 0),
+            snapshotPoints: Number(feeState.snapshotPointsTotal || 0),
+            mode: feeState.lastFeePricing || "",
+            missing,
+            timeoutRows,
+            baselineRows,
+            elapsedSec: (Date.now() - feeStartedAt) / 1000,
+          });
+        };
         stopFeeStatusTimer();
         if (feeState.hasEstimatedShareTrace && feeState.hasCollectedHistoryTrace) {
-          setPosFeeStatusBar({
-            state: hasPartialRows ? "warn" : "ok",
-            title: "Fee calculation",
-            message: hasPartialRows ? "Partial (some rows timed out/missing)" : "Collected & estimated ready",
-            selected: Number(diag.selected || 0),
-            withData: Number(feeState.rowsWithAnySeries || 0),
-            collected: Number(feeState.rowsWithCollected || 0),
-            estimated: Number(feeState.rowsWithEstimated || 0),
-            snapshot: Number(feeState.rowsWithSnapshot || 0),
-            collectedPoints: Number(feeState.collectedPointsTotal || 0),
-            estimatedPoints: Number(feeState.estimatedPointsTotal || 0),
-            snapshotPoints: Number(feeState.snapshotPointsTotal || 0),
-            mode: feeState.lastFeePricing || "",
-            missing,
-            timeoutRows,
-            baselineRows,
-            elapsedSec: (Date.now() - feeStartedAt) / 1000,
-          });
+          pushFinalFeeStatus(hasPartialRows ? "warn" : "ok", hasPartialRows ? "Partial (some rows timed out/missing)" : "Collected & estimated ready");
         } else if ((feeState.hasEstimatedShareTrace || feeState.hasSnapshotOnlyTrace) && !feeState.hasCollectedHistoryTrace) {
           const soldInstantlyNotApplicable = !!histUsd;
-          setPosFeeStatusBar({
-            state: "info",
-            title: "Fee calculation",
-            message: soldInstantlyNotApplicable
+          pushFinalFeeStatus(
+            "info",
+            soldInstantlyNotApplicable
               ? "Ready (if sold instantly N/A: no collected history)"
               : "Estimate/snapshot only",
-            selected: Number(diag.selected || 0),
-            withData: Number(feeState.rowsWithAnySeries || 0),
-            collected: Number(feeState.rowsWithCollected || 0),
-            estimated: Number(feeState.rowsWithEstimated || 0),
-            snapshot: Number(feeState.rowsWithSnapshot || 0),
-            collectedPoints: Number(feeState.collectedPointsTotal || 0),
-            estimatedPoints: Number(feeState.estimatedPointsTotal || 0),
-            snapshotPoints: Number(feeState.snapshotPointsTotal || 0),
-            mode: feeState.lastFeePricing || "",
-            missing,
-            timeoutRows,
-            baselineRows,
-            elapsedSec: (Date.now() - feeStartedAt) / 1000,
-          });
+          );
         } else {
-          setPosFeeStatusBar({
-            state: hasPartialRows ? "warn" : "ok",
-            title: "Fee calculation",
-            message: hasPartialRows ? "Partial (some rows timed out/missing)" : "Done",
-            selected: Number(diag.selected || 0),
-            withData: Number(feeState.rowsWithAnySeries || 0),
-            collected: Number(feeState.rowsWithCollected || 0),
-            estimated: Number(feeState.rowsWithEstimated || 0),
-            snapshot: Number(feeState.rowsWithSnapshot || 0),
-            collectedPoints: Number(feeState.collectedPointsTotal || 0),
-            estimatedPoints: Number(feeState.estimatedPointsTotal || 0),
-            snapshotPoints: Number(feeState.snapshotPointsTotal || 0),
-            mode: feeState.lastFeePricing || "",
-            missing,
-            timeoutRows,
-            baselineRows,
-            elapsedSec: (Date.now() - feeStartedAt) / 1000,
-          });
+          pushFinalFeeStatus(hasPartialRows ? "warn" : "ok", hasPartialRows ? "Partial (some rows timed out/missing)" : "Done");
         }
         renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
       } catch (e) {
@@ -25279,6 +25270,12 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
         chain_key = str(CHAIN_ID_TO_KEY[int(chain_id)]).strip().lower()
     endpoint = get_graph_endpoint(chain_key, version=version)
     position_ids = [str(x).strip() for x in (req.position_ids or []) if str(x).strip()]
+    if not position_ids:
+        pid_single = str(getattr(req, "position_id", "") or "").strip()
+        if pid_single:
+            position_ids = [pid_single]
+    if position_ids:
+        position_ids = list(dict.fromkeys(position_ids))
     sym0 = str(getattr(req, "token0_symbol", "") or "").strip().upper()
     sym1 = str(getattr(req, "token1_symbol", "") or "").strip().upper()
 
@@ -25387,6 +25384,12 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
             start_found = False
             hold_enabled = bool(amount0_by_day or amount1_by_day)
             hold_scale = 1.0
+            exact_days_count = len([1 for v in exact_by_day.values() if float(v) > 0])
+            total_days_count = max(1, len(daily_days))
+            exact_coverage = float(exact_days_count) / float(total_days_count)
+            # Avoid "spiky" chart when exact snapshots are too sparse and get mixed
+            # with amount-based valuation in adjacent days.
+            prefer_exact_series = bool(exact_days_count >= 3 and exact_coverage >= 0.35)
             for dts in sorted(ff_amount0.keys()):
                 a0 = float(max(0.0, ff_amount0.get(int(dts), 0.0)))
                 a1 = float(max(0.0, ff_amount1.get(int(dts), 0.0)))
@@ -25394,7 +25397,7 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                 p1 = _price_day(token1_addr, stable1, hist1, p1_spot, int(dts))
                 tvl_from_amounts = float(max(0.0, (a0 * max(0.0, p0)) + (a1 * max(0.0, p1))))
                 tvl_exact = float(max(0.0, exact_by_day.get(int(dts), 0.0)))
-                tvl_usd = float(tvl_exact if tvl_exact > 0 else tvl_from_amounts)
+                tvl_usd = float(tvl_exact if (prefer_exact_series and tvl_exact > 0) else tvl_from_amounts)
                 if (not start_found) and tvl_usd > 0:
                     start_found = True
                     start_tvl_usd = float(tvl_usd)
@@ -25456,11 +25459,19 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                 "items": items,
                 "count": len(items),
                 "mode": "exact-snapshots-in-position",
-                "note": "TVL from exact daily in-position snapshots (amounts when available); hold from start amounts; benchmark from start-date buy",
+                "note": (
+                    "TVL from exact daily in-position snapshots (amounts when available); hold from start amounts; benchmark from start-date buy"
+                    if prefer_exact_series
+                    else "TVL from in-position amounts/prices (exact snapshots too sparse for stable mix); hold from start amounts; benchmark from start-date buy"
+                ),
                 "token0_symbol": sym0,
                 "token1_symbol": sym1,
                 "hold_available": bool(hold_enabled),
                 "benchmarks": benchmarks_out,
+                "exact_days": int(exact_days_count),
+                "days_total": int(total_days_count),
+                "exact_coverage": float(exact_coverage),
+                "exact_mode": ("prefer_exact" if prefer_exact_series else "amount_only_sparse_exact"),
             }
     return {
         "items": [],
