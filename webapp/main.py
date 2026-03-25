@@ -15621,9 +15621,29 @@ def _build_v3_npm_fee_ledger_from_temp(
         stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
         hist0 = [] if stable0 else _fetch_coingecko_contract_prices_range(cid, t0, t_lo, t_hi)
         hist1 = [] if stable1 else _fetch_coingecko_contract_prices_range(cid, t1, t_lo, t_hi)
+        # Fallback for tokens without contract history: major-asset historical by symbol.
+        days_span = max(2, min(3650, int(math.ceil((int(t_hi) - int(t_lo)) / 86400.0)) + 7))
+        sym0 = str((_fetch_erc20_symbol_onchain(int(cid), str(t0)) or "")).strip().upper()
+        sym1 = str((_fetch_erc20_symbol_onchain(int(cid), str(t1)) or "")).strip().upper()
+        major_hist0: list[tuple[int, float]] = []
+        major_hist1: list[tuple[int, float]] = []
+        if (not stable0) and (not hist0):
+            c0 = _major_coingecko_id_by_symbol(sym0)
+            if c0:
+                major_hist0 = _fetch_coingecko_major_series_days(c0, days_span)
+        if (not stable1) and (not hist1):
+            c1 = _major_coingecko_id_by_symbol(sym1)
+            if c1:
+                major_hist1 = _fetch_coingecko_major_series_days(c1, days_span)
+        # Last-resort fallback preserves fee leg (same fee data), but marks partial pricing.
+        spot_map = _get_token_prices_usd(cid, [t0, t1])
+        sp0 = _safe_float(spot_map.get(t0))
+        sp1 = _safe_float(spot_map.get(t1))
         prev_cf0 = 0.0
         prev_cf1 = 0.0
         cum_usd = 0.0
+        used_spot_fallback = False
+        used_major_fallback = False
         for ts, cf0, cf1 in points:
             d0 = max(0.0, float(cf0) - float(prev_cf0))
             d1 = max(0.0, float(cf1) - float(prev_cf1))
@@ -15633,6 +15653,18 @@ def _build_v3_npm_fee_ledger_from_temp(
                 continue
             p0 = 1.0 if stable0 else (_price_usd_at_or_before_series(hist0, ts) if hist0 else None)
             p1 = 1.0 if stable1 else (_price_usd_at_or_before_series(hist1, ts) if hist1 else None)
+            if (p0 is None or _safe_float(p0) <= 0) and major_hist0:
+                p0 = _price_usd_at_or_before_series(major_hist0, ts)
+                used_major_fallback = True
+            if (p1 is None or _safe_float(p1) <= 0) and major_hist1:
+                p1 = _price_usd_at_or_before_series(major_hist1, ts)
+                used_major_fallback = True
+            if (p0 is None or _safe_float(p0) <= 0) and not stable0 and sp0 > 0:
+                p0 = sp0
+                used_spot_fallback = True
+            if (p1 is None or _safe_float(p1) <= 0) and not stable1 and sp1 > 0:
+                p1 = sp1
+                used_spot_fallback = True
             legs_expected = int(1 if d0 > 0 else 0) + int(1 if d1 > 0 else 0)
             legs_priced = 0
             usd_delta = 0.0
@@ -15649,10 +15681,10 @@ def _build_v3_npm_fee_ledger_from_temp(
             cum_usd += float(usd_delta)
             series_by_ts[int(ts)] = float(max(0.0, cum_usd))
         pricing = "ledger_historical" if not priced_partial else "ledger_historical_partial"
-        if (not stable0) and (not hist0):
-            pricing = "ledger_historical_missing_token0_history"
-        elif (not stable1) and (not hist1):
-            pricing = "ledger_historical_missing_token1_history"
+        if used_major_fallback and (not used_spot_fallback):
+            pricing = "ledger_historical_major_symbol_fallback"
+        if used_spot_fallback:
+            pricing = "ledger_historical_spot_fallback_partial"
     else:
         stable0 = _fee_position_token_stable_usd_assumption(cid, t0) is not None
         stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
