@@ -15611,9 +15611,6 @@ def _build_v3_npm_fee_ledger_from_temp(
         stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
         hist0 = [] if stable0 else _fetch_coingecko_contract_prices_range(cid, t0, t_lo, t_hi)
         hist1 = [] if stable1 else _fetch_coingecko_contract_prices_range(cid, t1, t_lo, t_hi)
-        spot_map = _get_token_prices_usd(cid, [t0, t1])
-        sp0 = _safe_float(spot_map.get(t0))
-        sp1 = _safe_float(spot_map.get(t1))
         prev_cf0 = 0.0
         prev_cf1 = 0.0
         cum_usd = 0.0
@@ -15626,10 +15623,6 @@ def _build_v3_npm_fee_ledger_from_temp(
                 continue
             p0 = 1.0 if stable0 else (_price_usd_at_or_before_series(hist0, ts) if hist0 else None)
             p1 = 1.0 if stable1 else (_price_usd_at_or_before_series(hist1, ts) if hist1 else None)
-            if (p0 is None or _safe_float(p0) <= 0) and not stable0:
-                p0 = sp0
-            if (p1 is None or _safe_float(p1) <= 0) and not stable1:
-                p1 = sp1
             legs_expected = int(1 if d0 > 0 else 0) + int(1 if d1 > 0 else 0)
             legs_priced = 0
             usd_delta = 0.0
@@ -15646,6 +15639,10 @@ def _build_v3_npm_fee_ledger_from_temp(
             cum_usd += float(usd_delta)
             series_by_ts[int(ts)] = float(max(0.0, cum_usd))
         pricing = "ledger_historical" if not priced_partial else "ledger_historical_partial"
+        if (not stable0) and (not hist0):
+            pricing = "ledger_historical_missing_token0_history"
+        elif (not stable1) and (not hist1):
+            pricing = "ledger_historical_missing_token1_history"
     else:
         stable0 = _fee_position_token_stable_usd_assumption(cid, t0) is not None
         stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
@@ -19860,7 +19857,9 @@ def _render_positions_page() -> str:
       else posHistorySelected.delete(k);
     }
     function parseCreatedDateMs(row) {
-      const raw = String(row?.pool_created_date || row?.position_created_date || "").trim();
+      // Prefer position creation date; pool creation can be much earlier and
+      // must not silently override position-level range logic.
+      const raw = String(row?.position_created_date || row?.pool_created_date || "").trim();
       if (!raw || raw === "-") return 0;
       let ms = Date.parse(raw);
       if (!Number.isFinite(ms) || ms <= 0) {
@@ -25806,28 +25805,39 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             "estimated_mode": "none",
         })
 
-    # For on-chain/subgraph collect-history scans, do not go earlier than known creation date.
-    # Use the later known date between pool and position (when both exist).
-    date_candidates: list[tuple[int, str, str]] = []
-    for raw_dt, src in (
-        (str(getattr(req, "pool_created_date", "") or "").strip(), "pool_created_date"),
-        (str(getattr(req, "position_created_date", "") or "").strip(), "position_created_date"),
-    ):
-        if not raw_dt or raw_dt == "-":
-            continue
-        dt = _parse_utc_iso(raw_dt)
-        if dt is None:
-            continue
-        ts = int(dt.timestamp())
-        if ts > 0:
-            date_candidates.append((int(ts), src, raw_dt))
-    if date_candidates:
-        date_candidates.sort(key=lambda x: x[0], reverse=True)
-        best_ts, best_src, best_raw = date_candidates[0]
+    # Prefer position creation date for position-level fee history boundaries.
+    # Pool creation is only a fallback when position date is unavailable.
+    pos_raw = str(getattr(req, "position_created_date", "") or "").strip()
+    pool_raw = str(getattr(req, "pool_created_date", "") or "").strip()
+    pos_ts = 0
+    pool_ts = 0
+    if pos_raw and pos_raw != "-":
+        pos_dt = _parse_utc_iso(pos_raw)
+        if pos_dt is not None:
+            pos_ts = int(pos_dt.timestamp())
+    if pool_raw and pool_raw != "-":
+        pool_dt = _parse_utc_iso(pool_raw)
+        if pool_dt is not None:
+            pool_ts = int(pool_dt.timestamp())
+    best_ts = 0
+    best_src = ""
+    best_raw = ""
+    if pos_ts > 0:
+        best_ts = int(pos_ts)
+        best_src = "position_created_date"
+        best_raw = str(pos_raw)
+    elif pool_ts > 0:
+        best_ts = int(pool_ts)
+        best_src = "pool_created_date_fallback"
+        best_raw = str(pool_raw)
+    if best_ts > 0:
         collect_since_ts = max(int(collect_since_ts), int(best_ts))
         debug["collect_start_source"] = best_src
         debug["collect_start_date"] = best_raw
-        debug["collect_start_candidates"] = [f"{src}:{raw}" for _ts, src, raw in date_candidates[:3]]
+    debug["collect_start_candidates"] = [
+        f"position_created_date:{pos_raw or '-'}",
+        f"pool_created_date:{pool_raw or '-'}",
+    ]
     debug["collect_start_ts"] = int(collect_since_ts)
 
     position_ids = _fee_series_position_ids_from_request(req)
