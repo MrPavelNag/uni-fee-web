@@ -27799,6 +27799,13 @@ def sitemap_xml(request: Request) -> Response:
 @app.post("/api/pools/run")
 def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dict[str, str]:
     session_id = _ensure_session_cookie(request, response)
+    try:
+        req.pairs = [str(x).strip() for x in (req.pairs or []) if str(x).strip()]
+        req.include_chains = [str(x).strip().lower() for x in (req.include_chains or []) if str(x).strip()]
+        req.include_versions = [str(v).strip().lower() for v in (req.include_versions or []) if str(v).strip()]
+        req.exclude_suffixes = [str(x).strip() for x in (req.exclude_suffixes or []) if str(x).strip()]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid request payload: {str(e)[:120]}") from e
     if not os.environ.get("THE_GRAPH_API_KEY"):
         raise HTTPException(status_code=400, detail="Missing THE_GRAPH_API_KEY on server.")
     if req.days < 1 or req.days > 3650:
@@ -27814,21 +27821,20 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
     req.speed_mode = str(req.speed_mode or "normal").strip().lower()
     if req.speed_mode not in {"normal", "fast"}:
         raise HTTPException(status_code=400, detail="speed_mode must be normal or fast")
-    req.include_versions = [str(v).strip().lower() for v in (req.include_versions or []) if str(v).strip()]
     req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
     req.include_versions = list(dict.fromkeys(req.include_versions))
     if not req.include_versions:
         raise HTTPException(status_code=400, detail="Select at least one protocol version (v3 or v4)")
     req.exclude_suffixes = [
         str(x).strip().lower().replace("0x", "")[-4:]
-        for x in req.exclude_suffixes
+        for x in (req.exclude_suffixes or [])
         if str(x).strip()
     ]
     _analytics_log_event(
         session_id=session_id,
         event_type="run_start",
         path="/api/pools/run",
-        payload=_pairs_to_string(_parse_pairs_str(";".join(req.pairs))),
+        payload=_pairs_to_string(_parse_pairs_str(";".join(req.pairs or []))),
     )
 
     job_id = str(uuid.uuid4())
@@ -28688,6 +28694,16 @@ HTML_PAGE = """
     function setDays(v) {
       document.getElementById("days").value = v;
       saveFormState();
+    }
+
+    async function parseApiJsonSafe(resp) {
+      const txt = await resp.text().catch(() => "");
+      try {
+        const data = txt ? JSON.parse(txt) : {};
+        return {data, rawText: txt};
+      } catch (_) {
+        return {data: {}, rawText: String(txt || "")};
+      }
     }
 
     function navigateIntent(path) {
@@ -29584,11 +29600,22 @@ HTML_PAGE = """
           headers: {"Content-Type":"application/json"},
           body: JSON.stringify(payload)
         });
-        const data = await r.json();
+        const parsed = await parseApiJsonSafe(r);
+        const data = parsed.data || {};
         if (!r.ok) {
           stopScanTicker();
           setBusy(false);
-          setStatus("Error: " + (data.detail || "request failed"), "fail");
+          const raw = String(parsed.rawText || "").replace(/\s+/g, " ").trim();
+          const det = String(data.detail || data.info || data.message || "");
+          const isHtml = raw.startsWith("<!DOCTYPE") || raw.startsWith("<html") || raw.startsWith("<");
+          const reason = det || (isHtml ? "server returned HTML instead of JSON" : "request failed");
+          setStatus("Error: " + reason, "fail");
+          return;
+        }
+        if (!String(data?.job_id || "").trim()) {
+          stopScanTicker();
+          setBusy(false);
+          setStatus("Error: backend returned empty job id", "fail");
           return;
         }
         pollJob(data.job_id);
@@ -29602,7 +29629,19 @@ HTML_PAGE = """
     async function pollJob(jobId) {
       const timer = setInterval(async () => {
         const r = await fetch("/api/jobs/" + jobId);
-        const job = await r.json();
+        const parsed = await parseApiJsonSafe(r);
+        const job = parsed.data || {};
+        if (!r.ok) {
+          clearInterval(timer);
+          stopScanTicker();
+          hasScanRun = true;
+          setBusy(false);
+          const raw = String(parsed.rawText || "").replace(/\s+/g, " ").trim();
+          const det = String(job.detail || job.message || "");
+          const isHtml = raw.startsWith("<!DOCTYPE") || raw.startsWith("<html") || raw.startsWith("<");
+          setStatus("Failed: " + (det || (isHtml ? "server returned HTML instead of JSON" : "job status request failed")), "fail");
+          return;
+        }
         updateProgress(job.progress, job.stage_label || job.stage);
         if (job.status === "done") {
           clearInterval(timer);
