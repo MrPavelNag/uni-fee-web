@@ -15614,6 +15614,8 @@ def _build_v3_npm_fee_ledger_from_temp(
     series_by_ts: dict[int, float] = {}
     priced_partial = False
     pricing_mode = "historical" if use_historical_usd else "spot"
+    missing_hist_leg0 = 0
+    missing_hist_leg1 = 0
     if use_historical_usd:
         t_lo = min(t for t, _, _ in points)
         t_hi = max(t for t, _, _ in points)
@@ -15621,29 +15623,9 @@ def _build_v3_npm_fee_ledger_from_temp(
         stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
         hist0 = [] if stable0 else _fetch_coingecko_contract_prices_range(cid, t0, t_lo, t_hi)
         hist1 = [] if stable1 else _fetch_coingecko_contract_prices_range(cid, t1, t_lo, t_hi)
-        # Fallback for tokens without contract history: major-asset historical by symbol.
-        days_span = max(2, min(3650, int(math.ceil((int(t_hi) - int(t_lo)) / 86400.0)) + 7))
-        sym0 = str((_fetch_erc20_symbol_onchain(int(cid), str(t0)) or "")).strip().upper()
-        sym1 = str((_fetch_erc20_symbol_onchain(int(cid), str(t1)) or "")).strip().upper()
-        major_hist0: list[tuple[int, float]] = []
-        major_hist1: list[tuple[int, float]] = []
-        if (not stable0) and (not hist0):
-            c0 = _major_coingecko_id_by_symbol(sym0)
-            if c0:
-                major_hist0 = _fetch_coingecko_major_series_days(c0, days_span)
-        if (not stable1) and (not hist1):
-            c1 = _major_coingecko_id_by_symbol(sym1)
-            if c1:
-                major_hist1 = _fetch_coingecko_major_series_days(c1, days_span)
-        # Last-resort fallback preserves fee leg (same fee data), but marks partial pricing.
-        spot_map = _get_token_prices_usd(cid, [t0, t1])
-        sp0 = _safe_float(spot_map.get(t0))
-        sp1 = _safe_float(spot_map.get(t1))
         prev_cf0 = 0.0
         prev_cf1 = 0.0
         cum_usd = 0.0
-        used_spot_fallback = False
-        used_major_fallback = False
         for ts, cf0, cf1 in points:
             d0 = max(0.0, float(cf0) - float(prev_cf0))
             d1 = max(0.0, float(cf1) - float(prev_cf1))
@@ -15653,18 +15635,10 @@ def _build_v3_npm_fee_ledger_from_temp(
                 continue
             p0 = 1.0 if stable0 else (_price_usd_at_or_before_series(hist0, ts) if hist0 else None)
             p1 = 1.0 if stable1 else (_price_usd_at_or_before_series(hist1, ts) if hist1 else None)
-            if (p0 is None or _safe_float(p0) <= 0) and major_hist0:
-                p0 = _price_usd_at_or_before_series(major_hist0, ts)
-                used_major_fallback = True
-            if (p1 is None or _safe_float(p1) <= 0) and major_hist1:
-                p1 = _price_usd_at_or_before_series(major_hist1, ts)
-                used_major_fallback = True
-            if (p0 is None or _safe_float(p0) <= 0) and not stable0 and sp0 > 0:
-                p0 = sp0
-                used_spot_fallback = True
-            if (p1 is None or _safe_float(p1) <= 0) and not stable1 and sp1 > 0:
-                p1 = sp1
-                used_spot_fallback = True
+            if d0 > 0 and (p0 is None or _safe_float(p0) <= 0):
+                missing_hist_leg0 += 1
+            if d1 > 0 and (p1 is None or _safe_float(p1) <= 0):
+                missing_hist_leg1 += 1
             legs_expected = int(1 if d0 > 0 else 0) + int(1 if d1 > 0 else 0)
             legs_priced = 0
             usd_delta = 0.0
@@ -15681,10 +15655,8 @@ def _build_v3_npm_fee_ledger_from_temp(
             cum_usd += float(usd_delta)
             series_by_ts[int(ts)] = float(max(0.0, cum_usd))
         pricing = "ledger_historical" if not priced_partial else "ledger_historical_partial"
-        if used_major_fallback and (not used_spot_fallback):
-            pricing = "ledger_historical_major_symbol_fallback"
-        if used_spot_fallback:
-            pricing = "ledger_historical_spot_fallback_partial"
+        if missing_hist_leg0 > 0 or missing_hist_leg1 > 0:
+            pricing = "ledger_historical_missing_price_data"
     else:
         stable0 = _fee_position_token_stable_usd_assumption(cid, t0) is not None
         stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
@@ -15731,7 +15703,13 @@ def _build_v3_npm_fee_ledger_from_temp(
             rows_up,
         )
         conn.commit()
-    return out, {"pricing": pricing, "detail": "Position-level NPM ledger (event-level Collect minus Decrease principal)."}
+    detail = "Position-level NPM ledger (event-level Collect minus Decrease principal)."
+    if use_historical_usd and (missing_hist_leg0 > 0 or missing_hist_leg1 > 0):
+        detail = (
+            f"{detail} Historical price missing for collect legs: "
+            f"token0_missing_legs={int(missing_hist_leg0)}, token1_missing_legs={int(missing_hist_leg1)}."
+        )
+    return out, {"pricing": pricing, "detail": detail}
 
 
 def _load_v3_npm_fee_ledger_day_from_cache(
@@ -20072,6 +20050,11 @@ def _render_positions_page() -> str:
             selectedRowsMeta.push(`${baseName}: history_empty(mode=${modeTxt}; note=${noteTxt})`);
             continue;
           }
+          const pricingMode = String(data?.pricing_mode || "").trim();
+          const pricingDetail = String(data?.pricing_detail || "").trim();
+          if (pricingMode && pricingMode !== "historical_only") {
+            selectedRowsMeta.push(`${baseName}: pricing=${pricingMode}${pricingDetail ? `(${pricingDetail})` : ""}`);
+          }
           const baseName = String(row.pair || row.pool_id || `Pool ${i + 1}`);
           const x = items.map((x) => new Date(Number(x.ts || 0) * 1000));
           const tvlUsd = items.map((x) => Number(x.position_tvl_usd || 0));
@@ -20675,7 +20658,10 @@ def _render_positions_page() -> str:
         const perfEstimateMs = Number(d?.perf_estimate_ms || 0);
         const perfLedgerMs = Number(d?.perf_ledger_ms || 0);
         const perfAprMs = Number(d?.perf_apr_ms || 0);
-        return `${meta.pairOrPool}: mode=${String(d?.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_dynamic_used=${estDynamicUsed}, est_dynamic_ff=${estDynamicFf}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, perf_estimate_ms=${perfEstimateMs}, perf_ledger_ms=${perfLedgerMs}, perf_apr_ms=${perfAprMs}, ledger_points=${Number(d?.ledger_points || 0)}, subgraph_points=${Number(d?.subgraph_points || 0)}, rpc_points=${Number(d?.rpc_points || 0)}, pool_flow_source=${pf.source || "-"}, pool_flow_owner_src=${pf.ownerSrc || "-"}, pool_flow_collect_points=${pf.collectPoints}, pool_flow_events=${pf.eventsTotal}, pool_flow_chunks=${pf.chunksUsed}, pool_flow_truncated=${pf.truncated ? 1 : 0}, pool_flow_cached=${pf.cached ? 1 : 0}, pool_flow_explorer_req=${pf.explorerReq}, pool_flow_explorer_pages=${pf.explorerPages}${pf.explorerReason ? `, pool_flow_explorer_reason=${pf.explorerReason}` : ""}${pf.explorerStatus ? `, pool_flow_explorer_status=${pf.explorerStatus}` : ""}${pf.explorerMessage ? `, pool_flow_explorer_message=${pf.explorerMessage}` : ""}${pf.counts ? `, pool_flow_counts=${pf.counts}` : ""}`;
+        const ledgerPricingDetails = Array.isArray(d?.ledger_pricing_details)
+          ? d.ledger_pricing_details.map((x) => String(x || "").trim()).filter(Boolean)
+          : [];
+        return `${meta.pairOrPool}: mode=${String(d?.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_dynamic_used=${estDynamicUsed}, est_dynamic_ff=${estDynamicFf}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, perf_estimate_ms=${perfEstimateMs}, perf_ledger_ms=${perfLedgerMs}, perf_apr_ms=${perfAprMs}, ledger_points=${Number(d?.ledger_points || 0)}, subgraph_points=${Number(d?.subgraph_points || 0)}, rpc_points=${Number(d?.rpc_points || 0)}, pool_flow_source=${pf.source || "-"}, pool_flow_owner_src=${pf.ownerSrc || "-"}, pool_flow_collect_points=${pf.collectPoints}, pool_flow_events=${pf.eventsTotal}, pool_flow_chunks=${pf.chunksUsed}, pool_flow_truncated=${pf.truncated ? 1 : 0}, pool_flow_cached=${pf.cached ? 1 : 0}, pool_flow_explorer_req=${pf.explorerReq}, pool_flow_explorer_pages=${pf.explorerPages}${pf.explorerReason ? `, pool_flow_explorer_reason=${pf.explorerReason}` : ""}${pf.explorerStatus ? `, pool_flow_explorer_status=${pf.explorerStatus}` : ""}${pf.explorerMessage ? `, pool_flow_explorer_message=${pf.explorerMessage}` : ""}${pf.counts ? `, pool_flow_counts=${pf.counts}` : ""}${ledgerPricingDetails.length ? `, ledger_pricing_detail=${ledgerPricingDetails.slice(0, 2).join(" ; ")}` : ""}`;
       };
       const buildAprByTs = (aprItems) => {
         const out = new Map();
@@ -25457,18 +25443,14 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
             stable1 = (_fee_position_token_stable_usd_assumption(int(chain_id), token1_addr) is not None) if _is_eth_address(token1_addr) else False
             hist0 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token0_addr), int(day_start), int(day_end)) if (_is_eth_address(token0_addr) and not stable0) else []
             hist1 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token1_addr), int(day_start), int(day_end)) if (_is_eth_address(token1_addr) and not stable1) else []
-            spot_map = _get_token_prices_usd(int(chain_id), [x for x in [token0_addr, token1_addr] if _is_eth_address(x)])
-            p0_spot = float(_safe_float(spot_map.get(token0_addr)))
-            p1_spot = float(_safe_float(spot_map.get(token1_addr)))
-
-            def _price_day(addr: str, is_stable: bool, hist: list[tuple[int, float]], spot_px: float, dts: int) -> float:
+            def _price_day(addr: str, is_stable: bool, hist: list[tuple[int, float]], dts: int) -> float:
                 if is_stable:
                     return 1.0
                 if _is_eth_address(addr):
                     p_hist = _price_usd_at_or_before_series(hist, int(dts) + 86399) if hist else None
                     if p_hist is not None and float(p_hist) > 0:
                         return float(p_hist)
-                return float(spot_px) if float(spot_px) > 0 else 0.0
+                return 0.0
 
             items: list[dict[str, Any]] = []
             start_tvl_usd = 0.0
@@ -25477,6 +25459,8 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
             start_found = False
             hold_enabled = bool(amount0_by_day or amount1_by_day)
             hold_scale = 1.0
+            missing_hist_token0_days = 0
+            missing_hist_token1_days = 0
             exact_days_count = len([1 for v in exact_by_day.values() if float(v) > 0])
             total_days_count = max(1, len(daily_days))
             exact_coverage = float(exact_days_count) / float(total_days_count)
@@ -25486,8 +25470,12 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
             for dts in sorted(ff_amount0.keys()):
                 a0 = float(max(0.0, ff_amount0.get(int(dts), 0.0)))
                 a1 = float(max(0.0, ff_amount1.get(int(dts), 0.0)))
-                p0 = _price_day(token0_addr, stable0, hist0, p0_spot, int(dts))
-                p1 = _price_day(token1_addr, stable1, hist1, p1_spot, int(dts))
+                p0 = _price_day(token0_addr, stable0, hist0, int(dts))
+                p1 = _price_day(token1_addr, stable1, hist1, int(dts))
+                if a0 > 0 and (not stable0) and p0 <= 0:
+                    missing_hist_token0_days += 1
+                if a1 > 0 and (not stable1) and p1 <= 0:
+                    missing_hist_token1_days += 1
                 tvl_from_amounts = float(max(0.0, (a0 * max(0.0, p0)) + (a1 * max(0.0, p1))))
                 tvl_exact = float(max(0.0, exact_by_day.get(int(dts), 0.0)))
                 tvl_usd = float(tvl_exact if (prefer_exact_series and tvl_exact > 0) else tvl_from_amounts)
@@ -25548,6 +25536,14 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                             }
                         )
 
+            pricing_mode = "historical_only"
+            if missing_hist_token0_days > 0 or missing_hist_token1_days > 0:
+                pricing_mode = "historical_missing_price_data"
+            pricing_detail = (
+                f"token0_missing_days={int(missing_hist_token0_days)}, token1_missing_days={int(missing_hist_token1_days)}"
+                if pricing_mode != "historical_only"
+                else "ok_historical_prices"
+            )
             return {
                 "items": items,
                 "count": len(items),
@@ -25561,6 +25557,8 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
                 "token1_symbol": sym1,
                 "hold_available": bool(hold_enabled),
                 "benchmarks": benchmarks_out,
+                "pricing_mode": pricing_mode,
+                "pricing_detail": pricing_detail,
                 "exact_days": int(exact_days_count),
                 "days_total": int(total_days_count),
                 "exact_coverage": float(exact_coverage),
@@ -26336,6 +26334,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     ledger_by_day: dict[int, float] = {}
     ledger_by_day_alt: dict[int, float] = {}
     ledger_pricing_modes: list[str] = []
+    ledger_pricing_details: list[str] = []
     if protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"} and position_ids:
         try:
             token_ids = []
@@ -26475,6 +26474,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             pmode = str(one_meta.get("pricing") or "").strip()
                             if pmode:
                                 ledger_pricing_modes.append(pmode)
+                            pdet = str(one_meta.get("detail") or "").strip()
+                            if pdet:
+                                ledger_pricing_details.append(pdet[:220])
                         src_map = dict(one_day or {})
                         if not src_map and int(tid) in stale_cached_by_tid:
                             src_map = dict(stale_cached_by_tid.get(int(tid)) or {})
@@ -26511,6 +26513,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["perf_ledger_ms"] = int(max(0.0, (time.monotonic() - perf_ledger_started) * 1000.0))
     debug["ledger_points"] = int(len(ledger_by_day))
     debug["ledger_alt_points"] = int(len(ledger_by_day_alt))
+    if ledger_pricing_details:
+        debug["ledger_pricing_details"] = list(dict.fromkeys(ledger_pricing_details))[:5]
 
     def _pack_fee_items(m: dict[int, float]) -> list[dict[str, Any]]:
         return [{"ts": int(ts), "fees_usd": float(v)} for ts, v in sorted(m.items(), key=lambda x: x[0])]
