@@ -19858,8 +19858,14 @@ def _render_positions_page() -> str:
       const mode = getHistoryRangeMode();
       const padMs = Math.max(0, Number(rightPadDays || 0)) * 86400000;
       const now = new Date(Date.now() + padMs);
-      if (mode === "creation" && Number(minCreatedMs || 0) > 0) {
-        out.range = [new Date(Number(minCreatedMs)), now];
+      if (mode === "creation") {
+        if (Number(minCreatedMs || 0) > 0) {
+          out.range = [new Date(Number(minCreatedMs)), now];
+        } else {
+          const days = getHistoryDays();
+          const from = new Date(Date.now() - (Math.max(1, days) * 86400000));
+          out.range = [from, now];
+        }
       } else if (mode === "days") {
         const days = getHistoryDays();
         const from = new Date(Date.now() - (Math.max(1, days) * 86400000));
@@ -20541,12 +20547,13 @@ def _render_positions_page() -> str:
         const estUsed = Number(d?.estimate_fallback_days_used || 0);
         const estMissing = Number(d?.estimate_fallback_days_missing || 0);
         const estDynamicUsed = Number(d?.estimate_dynamic_share_days_used || 0);
+        const estDynamicFf = Number(d?.estimate_dynamic_share_days_ff || 0);
         const estStatic = Number(d?.estimate_static_share_used || 0);
         const estSrc = String(d?.estimate_share_source || "").trim();
         const perfEstimateMs = Number(d?.perf_estimate_ms || 0);
         const perfLedgerMs = Number(d?.perf_ledger_ms || 0);
         const perfAprMs = Number(d?.perf_apr_ms || 0);
-        return `${meta.pairOrPool}: mode=${String(d?.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_dynamic_used=${estDynamicUsed}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, perf_estimate_ms=${perfEstimateMs}, perf_ledger_ms=${perfLedgerMs}, perf_apr_ms=${perfAprMs}, ledger_points=${Number(d?.ledger_points || 0)}, subgraph_points=${Number(d?.subgraph_points || 0)}, rpc_points=${Number(d?.rpc_points || 0)}, pool_flow_source=${pf.source || "-"}, pool_flow_owner_src=${pf.ownerSrc || "-"}, pool_flow_collect_points=${pf.collectPoints}, pool_flow_events=${pf.eventsTotal}, pool_flow_chunks=${pf.chunksUsed}, pool_flow_truncated=${pf.truncated ? 1 : 0}, pool_flow_cached=${pf.cached ? 1 : 0}, pool_flow_explorer_req=${pf.explorerReq}, pool_flow_explorer_pages=${pf.explorerPages}${pf.explorerReason ? `, pool_flow_explorer_reason=${pf.explorerReason}` : ""}${pf.explorerStatus ? `, pool_flow_explorer_status=${pf.explorerStatus}` : ""}${pf.explorerMessage ? `, pool_flow_explorer_message=${pf.explorerMessage}` : ""}${pf.counts ? `, pool_flow_counts=${pf.counts}` : ""}`;
+        return `${meta.pairOrPool}: mode=${String(d?.result_mode || mode || "-")}, analysis_time=${analysisTimeTxt}, collected_reason=${collectedReason || "-"}, estimated_reason=${estimatedReason || "-"}, est_src=${estSrc || "-"}, est_fee_days=${estFeeDays}, est_pool_tvl_days=${estPoolTvlDays}, est_pos_tvl_days=${estPosTvlDays}, est_dynamic_used=${estDynamicUsed}, est_dynamic_ff=${estDynamicFf}, est_sparse_points=${estSparsePoints}, est_used=${estUsed}, est_missing=${estMissing}, est_static_share=${estStatic}, perf_estimate_ms=${perfEstimateMs}, perf_ledger_ms=${perfLedgerMs}, perf_apr_ms=${perfAprMs}, ledger_points=${Number(d?.ledger_points || 0)}, subgraph_points=${Number(d?.subgraph_points || 0)}, rpc_points=${Number(d?.rpc_points || 0)}, pool_flow_source=${pf.source || "-"}, pool_flow_owner_src=${pf.ownerSrc || "-"}, pool_flow_collect_points=${pf.collectPoints}, pool_flow_events=${pf.eventsTotal}, pool_flow_chunks=${pf.chunksUsed}, pool_flow_truncated=${pf.truncated ? 1 : 0}, pool_flow_cached=${pf.cached ? 1 : 0}, pool_flow_explorer_req=${pf.explorerReq}, pool_flow_explorer_pages=${pf.explorerPages}${pf.explorerReason ? `, pool_flow_explorer_reason=${pf.explorerReason}` : ""}${pf.explorerStatus ? `, pool_flow_explorer_status=${pf.explorerStatus}` : ""}${pf.explorerMessage ? `, pool_flow_explorer_message=${pf.explorerMessage}` : ""}${pf.counts ? `, pool_flow_counts=${pf.counts}` : ""}`;
       };
       const buildAprByTs = (aprItems) => {
         const out = new Map();
@@ -20998,7 +21005,8 @@ def _render_positions_page() -> str:
           const daysArr = (payloadMeta || []).map((m) => Number(m?.days || 0)).filter((x) => x > 0);
           const minD = daysArr.length ? Math.min(...daysArr) : 0;
           const maxD = daysArr.length ? Math.max(...daysArr) : 0;
-          backendHints.push(`chart_range: mode=${mode}, days=${minD === maxD ? minD : `${minD}..${maxD}`}, min_created=${minCreatedMs > 0 ? new Date(minCreatedMs).toISOString().slice(0, 10) : "-"}`);
+          const modeEff = (mode === "creation" && !(minCreatedMs > 0)) ? "creation-fallback-days-no-created" : mode;
+          backendHints.push(`chart_range: mode=${modeEff}, days=${minD === maxD ? minD : `${minD}..${maxD}`}, min_created=${minCreatedMs > 0 ? new Date(minCreatedMs).toISOString().slice(0, 10) : "-"}`);
         }
         const feeState = processFeeCompareRows(
           rowsOut,
@@ -26120,6 +26128,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     pos_tvl_source = "amounts_x_daily_prices"
             pos_days = sorted(int(x) for x in pos_tvl_by_day.keys() if int(x) > 0)
             pool_days = sorted(int(x) for x in pool_tvl_by_day.keys() if int(x) > 0)
+            pos_days_exact = set(pos_days)
+            pool_days_exact = set(pool_days)
             debug["estimate_pos_tvl_days_count"] = int(len(pos_days))
             debug["estimate_pool_tvl_days_count"] = int(len(pool_days))
             debug["estimate_pos_tvl_source"] = str(pos_tvl_source)
@@ -26134,6 +26144,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
             cum_est = 0.0
             dynamic_used = 0
+            dynamic_ff_used = 0
             fallback_used = 0
             fallback_missing = 0
             share_sum = 0.0
@@ -26147,7 +26158,10 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     if pos_tvl_day > 0.0 and pool_tvl_day > 0.0:
                         share_day = max(0.0, min(1.0, pos_tvl_day / pool_tvl_day))
                         liq_day_usd = float(pos_tvl_day)
-                        dynamic_used += 1
+                        if (int(day_ts) in pos_days_exact) and (int(day_ts) in pool_days_exact):
+                            dynamic_used += 1
+                        else:
+                            dynamic_ff_used += 1
                 if share_day <= 0.0:
                     if static_share > 0.0:
                         share_day = float(static_share)
@@ -26167,6 +26181,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             debug["estimate_fallback_days_missing"] = int(fallback_missing)
             debug["estimate_sparse_share_points"] = int(fallback_missing)
             debug["estimate_dynamic_share_days_used"] = int(dynamic_used)
+            debug["estimate_dynamic_share_days_ff"] = int(dynamic_ff_used)
             if fallback_used > 0 and static_share > 0:
                 debug["estimate_static_share_used"] = float(static_share)
             if dynamic_used > 0:
