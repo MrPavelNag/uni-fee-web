@@ -20609,6 +20609,7 @@ def _render_positions_page() -> str:
     }
     function processFeeCompareRows(rowsOut, payloadMeta, palette, traces, rowStatuses, apiFailTop, backendHints, diag, options) {
       const showAprLabels = !(options && options.showAprLabels === false);
+      const disableSnapshotOnlyTodayBridge = !!(options && options.disableSnapshotOnlyTodayBridge === true);
       const sortByTs = (arr) => (Array.isArray(arr) ? arr : []).slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
       const lastByTs = (arr) => {
         const sorted = sortByTs(arr);
@@ -20951,6 +20952,10 @@ def _render_positions_page() -> str:
               aprDays: snapAprDays,
               liqHover: (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-",
             });
+            if (!hasCollected && disableSnapshotOnlyTodayBridge) {
+              appendLastStatusDetail(" | snapshot_bridge_skipped_instantly(no_collected_history)");
+              continue;
+            }
             if (!hasCollected) {
               const snapMs = Number(snapDt.getTime() || 0);
               const anchorMs = (createdMs > 0 && createdMs < snapMs) ? createdMs : Math.max(0, snapMs - 86400000);
@@ -21126,7 +21131,7 @@ def _render_positions_page() -> str:
           apiFailTop,
           backendHints,
           diag,
-          {showAprLabels},
+          {showAprLabels, disableSnapshotOnlyTodayBridge: histUsd},
         );
         if (!traces.length) {
           stopFeeStatusTimer();
