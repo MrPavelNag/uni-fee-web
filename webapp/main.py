@@ -15614,27 +15614,37 @@ def _build_v3_npm_fee_ledger_from_temp(
         spot_map = _get_token_prices_usd(cid, [t0, t1])
         sp0 = _safe_float(spot_map.get(t0))
         sp1 = _safe_float(spot_map.get(t1))
+        prev_cf0 = 0.0
+        prev_cf1 = 0.0
+        cum_usd = 0.0
         for ts, cf0, cf1 in points:
+            d0 = max(0.0, float(cf0) - float(prev_cf0))
+            d1 = max(0.0, float(cf1) - float(prev_cf1))
+            prev_cf0 = float(cf0)
+            prev_cf1 = float(cf1)
+            if d0 <= 0.0 and d1 <= 0.0:
+                continue
             p0 = 1.0 if stable0 else (_price_usd_at_or_before_series(hist0, ts) if hist0 else None)
             p1 = 1.0 if stable1 else (_price_usd_at_or_before_series(hist1, ts) if hist1 else None)
             if (p0 is None or _safe_float(p0) <= 0) and not stable0:
                 p0 = sp0
             if (p1 is None or _safe_float(p1) <= 0) and not stable1:
                 p1 = sp1
-            legs_expected = int(1 if cf0 > 0 else 0) + int(1 if cf1 > 0 else 0)
+            legs_expected = int(1 if d0 > 0 else 0) + int(1 if d1 > 0 else 0)
             legs_priced = 0
-            usd = 0.0
-            if cf0 > 0 and p0 is not None and float(p0) > 0:
-                usd += float(cf0) * float(p0)
+            usd_delta = 0.0
+            if d0 > 0 and p0 is not None and float(p0) > 0:
+                usd_delta += float(d0) * float(p0)
                 legs_priced += 1
-            if cf1 > 0 and p1 is not None and float(p1) > 0:
-                usd += float(cf1) * float(p1)
+            if d1 > 0 and p1 is not None and float(p1) > 0:
+                usd_delta += float(d1) * float(p1)
                 legs_priced += 1
             if legs_priced <= 0:
                 continue
             if legs_priced < legs_expected:
                 priced_partial = True
-            series_by_ts[int(ts)] = float(usd)
+            cum_usd += float(usd_delta)
+            series_by_ts[int(ts)] = float(max(0.0, cum_usd))
         pricing = "ledger_historical" if not priced_partial else "ledger_historical_partial"
     else:
         stable0 = _fee_position_token_stable_usd_assumption(cid, t0) is not None
@@ -17349,6 +17359,8 @@ class PositionPoolSeriesRequest(BaseModel):
     fee_usd_historical: bool = False
     # Optional benchmarks for history comparison (e.g. BTC, ETH).
     benchmark_symbols: list[str] = Field(default_factory=list)
+    # Force live recomputation and bypass cache layers where possible.
+    ignore_cache: bool = False
 
 
 class PoolFlowCollectRequest(BaseModel):
@@ -17366,6 +17378,8 @@ class PositionsFeeCompareDataRequest(BaseModel):
     include_aggregate: bool = True
     include_row_debug: bool = True
     include_debug_summary: bool = True
+    # When true, skip cached compare payload and ask row handlers to bypass caches.
+    ignore_cache: bool = False
 
 
 class PositionsBenchmarkSeriesRequest(BaseModel):
@@ -18363,7 +18377,7 @@ def _render_positions_page() -> str:
       max-width:420px;
       line-height:1.25;
     }
-    .history-actions .search-link-btn { padding:6px 11px; font-size:13px; }
+    .history-actions .search-link-btn { padding:0; font-size:19px; }
     .fee-card .pos-fee-hist-label { font-size:15px; font-weight:700; color:#334155; }
     .fee-card .search-link-btn { font-size:20px; }
     @media (max-width: 1100px) {
@@ -18510,6 +18524,10 @@ def _render_positions_page() -> str:
             <label class="fee-toggle-pill" title="Show annualized return labels next to collect points.">
               <input type="checkbox" id="posFeeAprLabels" checked />
               <span class="pos-fee-hist-label">APR</span>
+            </label>
+            <label class="fee-toggle-pill" title="Force live recalculation and bypass cached fee compare result.">
+              <input type="checkbox" id="posFeeIgnoreCache" />
+              <span class="pos-fee-hist-label">Recalculate (ignore cache)</span>
             </label>
             <button class="search-link-btn" type="button" onclick="showSelectedPositionFees()">Build chart</button>
             <button class="collapse-btn" id="toggleFeeBtn" type="button" onclick="togglePosSection('fees')" title="Collapse/expand">▾</button>
@@ -20290,6 +20308,7 @@ def _render_positions_page() -> str:
       }
     }
     function buildFeeScanCacheKey(rowsPayload, histUsd) {
+      const cacheVer = "v2";
       const src = (rowsPayload || []).map((r) => [
         String(r?.chain_id || ""),
         String(r?.protocol || ""),
@@ -20299,7 +20318,7 @@ def _render_positions_page() -> str:
         Array.isArray(r?.position_ids) ? r.position_ids.join(",") : "",
         Number(!!histUsd),
       ].join("|")).join("||");
-      return src || `empty|${Number(!!histUsd)}`;
+      return `${cacheVer}|${src || `empty|${Number(!!histUsd)}`}`;
     }
     function loadFeeScanCache(key) {
       try {
@@ -20969,6 +20988,7 @@ def _render_positions_page() -> str:
         if (!ok) throw new Error("Failed to load chart library");
         const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
         const showAprLabels = !!(document.getElementById("posFeeAprLabels") && document.getElementById("posFeeAprLabels").checked);
+        const ignoreCache = !!(document.getElementById("posFeeIgnoreCache") && document.getElementById("posFeeIgnoreCache").checked);
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
         const traces = [];
         const apiFailTop = [];
@@ -20992,9 +21012,10 @@ def _render_positions_page() -> str:
           rows: rowsPayload,
           max_rows: rowsPayload.length,
           include_aggregate: false,
+          ignore_cache: ignoreCache,
         };
         const feeCacheKey = buildFeeScanCacheKey(rowsPayload, histUsd);
-        const cachedCompare = loadFeeScanCache(feeCacheKey);
+        const cachedCompare = ignoreCache ? null : loadFeeScanCache(feeCacheKey);
         let res = null;
         let data = null;
         if (cachedCompare) {
@@ -21005,6 +21026,7 @@ def _render_positions_page() -> str:
           const fetched = await postJsonWithRetry("/api/positions/position-fee-compare-data", compareReq, 3);
           res = fetched.res;
           data = fetched.data;
+          if (backendHints.length < 8) backendHints.push(ignoreCache ? "compare_source=live(forced_ignore_cache)" : "compare_source=live");
         }
         if (!res?.ok) {
           stopFeeStatusTimer();
@@ -25864,6 +25886,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     except Exception:
         token1 = ""
     want_hist_usd = bool(getattr(req, "fee_usd_historical", False))
+    want_ignore_cache = bool(getattr(req, "ignore_cache", False))
     endpoint = get_graph_endpoint(chain_key, version=version)
     if (not _is_eth_address(token0) or not _is_eth_address(token1)) and endpoint and str(req.pool_id or "").strip():
         p0, p1 = _fetch_pool_token_ids(endpoint, str(req.pool_id or ""))
@@ -25945,6 +25968,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["rpc_enabled"] = bool(_position_fee_rpc_fallback_enabled())
     debug["rpc_force"] = bool(_position_fee_rpc_force_onchain())
     debug["fee_usd_historical"] = bool(want_hist_usd)
+    debug["ignore_cache"] = bool(want_ignore_cache)
     debug["rpc_protocol_supported"] = bool(protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"})
     debug["rpc_tokens_ready"] = bool(_is_eth_address(token0) and _is_eth_address(token1))
 
@@ -26248,6 +26272,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 stale_cached_by_tid: dict[int, dict[int, float]] = {}
                 no_collect_confirmed: list[int] = []
                 for tid in token_ids:
+                    if bool(want_ignore_cache):
+                        cache_misses.append(int(tid))
+                        continue
                     cached_one = _load_v3_npm_fee_ledger_day_from_cache(
                         int(chain_id),
                         str(protocol),
@@ -26295,6 +26322,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                 debug["ledger_cache_misses"] = int(len(cache_misses))
                 debug["ledger_cache_partial"] = int(len(stale_cached_by_tid))
                 debug["ledger_no_collect_confirmed"] = int(len(no_collect_confirmed))
+                debug["ledger_cache_bypass"] = bool(want_ignore_cache)
                 if no_collect_confirmed and not cache_misses and not ledger_by_day:
                     debug["ledger_fastpath_skip"] = "no_collect_confirmed"
                 elapsed_now = max(0.0, time.monotonic() - started_mono)
@@ -26357,13 +26385,15 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         for ts, val in src_map.items():
                             ledger_by_day[int(ts)] = float(ledger_by_day.get(int(ts), 0.0) + float(val))
                         if bool(want_hist_usd):
-                            src_alt = _load_v3_npm_fee_ledger_day_from_cache(
-                                int(chain_id),
-                                str(protocol),
-                                int(tid),
-                                since_ts=int(ledger_since_ts),
-                                pricing_mode=str(alt_pricing_mode),
-                            )
+                            src_alt = {}
+                            if not bool(want_ignore_cache):
+                                src_alt = _load_v3_npm_fee_ledger_day_from_cache(
+                                    int(chain_id),
+                                    str(protocol),
+                                    int(tid),
+                                    since_ts=int(ledger_since_ts),
+                                    pricing_mode=str(alt_pricing_mode),
+                                )
                             if not src_alt:
                                 one_day_alt, _one_meta_alt = _build_v3_npm_fee_ledger_from_temp(
                                     int(chain_id),
@@ -26980,6 +27010,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
         "yes",
         "on",
     )
+    force_ignore_cache = bool(getattr(req, "ignore_cache", False))
 
     def _norm_fee_items(raw: Any) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -27055,7 +27086,10 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
     def _process_row(src_idx: int, row_req: PositionPoolSeriesRequest) -> dict[str, Any]:
         row_started = time.monotonic()
         try:
-            one = positions_position_fee_series(row_req)
+            row_req_eff = row_req
+            if force_ignore_cache and not bool(getattr(row_req, "ignore_cache", False)):
+                row_req_eff = row_req.copy(update={"ignore_cache": True})
+            one = positions_position_fee_series(row_req_eff)
             mode = str(one.get("mode") or "").strip().lower()
             adapter = str((one.get("debug") or {}).get("adapter") or _fee_series_adapter_name(str(getattr(row_req, "protocol", "") or "")))
             collected_reason = str(one.get("collected_reason") or "").strip().lower() or "unknown"
@@ -27348,6 +27382,7 @@ def positions_position_fee_compare_data(req: PositionsFeeCompareDataRequest) -> 
         out["debug"] = {
             "request_max_rows": int(lim),
             "include_row_debug": bool(include_row_debug),
+            "ignore_cache": bool(force_ignore_cache),
             "rows_in": int(len(rows_in)),
             "rows_work": int(len(prepared_rows)),
             "rows_input_capped": int(len(rows_in[:lim])),
