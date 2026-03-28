@@ -495,11 +495,16 @@ def main() -> None:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: skipped (no endpoint)"
         day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower())
         series = compute_fee_series(pool, endpoint, day_rows=day_rows)
+        try:
+            pool_tvl_now_usd = float(pool.get("totalValueLockedUSD") or 0.0)
+        except Exception:
+            pool_tvl_now_usd = 0.0
         payload = {
             **series,
             "pool_id": pool_id,
             "fee_pct": fee_pct,
             "raw_fee_tier": raw_fee_tier,
+            "pool_tvl_now_usd": pool_tvl_now_usd,
             "pair": pair_label,
             "chain": chain,
             "version": "v4",

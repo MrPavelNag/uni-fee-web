@@ -17009,6 +17009,10 @@ def _merge_for_web(
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
+        try:
+            pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
+        except (TypeError, ValueError):
+            pool_tvl_now_usd = 0.0
         if excluded_by_suffix(v, pool_id):
             status = "filtered_suffix"
         elif in_fee_range(v):
@@ -17028,7 +17032,7 @@ def _merge_for_web(
             "pair": v.get("pair", ""),
             "fee_pct": float(v.get("fee_pct") or 0),
             "final_income": _final_income(v),
-            "last_tvl": float(tvl[-1][1]) if tvl else 0.0,
+            "last_tvl": pool_tvl_now_usd if pool_tvl_now_usd > 0 else (float(tvl[-1][1]) if tvl else 0.0),
             "status": status,
         }
         rows.append(row)
@@ -29812,6 +29816,12 @@ HTML_PAGE = """
         // Always start with one visible pair row.
         pairRowsVisible = 1;
         updatePairRows();
+        for (let i = 2; i <= 4; i++) {
+          for (const side of ["a", "b"]) {
+            const el = document.getElementById(`pair${i}${side}`);
+            if (el) el.value = "";
+          }
+        }
       } catch (e) {
         console.warn("load form state failed", e);
       }
@@ -29888,6 +29898,7 @@ HTML_PAGE = """
       const out = [];
       let hasError = false;
       for (let i = 1; i <= 4; i++) {
+        if (i > pairRowsVisible) continue;
         const aEl = document.getElementById(`pair${i}a`);
         const bEl = document.getElementById(`pair${i}b`);
         const a = normalizePairToken(aEl?.value || "");
