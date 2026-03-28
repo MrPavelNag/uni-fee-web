@@ -100,7 +100,7 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.65"
 APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
@@ -178,6 +178,9 @@ POSITIONS_INDEX_STOP = threading.Event()
 POSITIONS_INDEX_WORKERS: list[threading.Thread] = []
 RUN_HISTORY: dict[str, list[dict[str, Any]]] = {}
 RUN_HISTORY_LIMIT = 10
+RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
+RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
+RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
 SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", str(30 * 24 * 60 * 60)))
 CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
@@ -17172,6 +17175,14 @@ def _build_run_job_env(
         "WEB_POOL_SERIES_WORKERS_FAST" if speed_mode == "fast" else "WEB_POOL_SERIES_WORKERS_NORMAL",
         "16" if speed_mode == "fast" else "8",
     )
+    env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get(
+        "WEB_V3_DISCOVERY_CHAIN_WORKERS_FAST" if speed_mode == "fast" else "WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL",
+        "6" if speed_mode == "fast" else "4",
+    )
+    env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get(
+        "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL",
+        "12" if speed_mode == "fast" else "24",
+    )
     env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get(
         "WEB_MAX_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL",
         "20" if speed_mode == "fast" else "40",
@@ -17274,6 +17285,53 @@ def _push_run_history(
         path="/api/pools/run",
         payload=token_pairs,
     )
+
+
+def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
+    pairs = sorted(str(x).strip().lower() for x in (req.pairs or []) if str(x).strip())
+    chains = sorted(str(x).strip().lower() for x in (req.include_chains or []) if str(x).strip())
+    versions = sorted(str(x).strip().lower() for x in (req.include_versions or []) if str(x).strip())
+    suffixes = sorted(str(x).strip().lower() for x in (req.exclude_suffixes or []) if str(x).strip())
+    payload = {
+        "pairs": pairs,
+        "chains": chains,
+        "versions": versions,
+        "days": int(req.days or 0),
+        "min_tvl": float(req.min_tvl or 0.0),
+        "speed_mode": str(req.speed_mode or "normal").strip().lower(),
+        "min_fee_pct": float(req.min_fee_pct or 0.0),
+        "max_fee_pct": float(req.max_fee_pct or 0.0),
+        "exclude_suffixes": suffixes,
+    }
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(payload)
+
+
+def _run_result_cache_get(key: str) -> dict[str, Any] | None:
+    now = time.time()
+    with JOB_LOCK:
+        rec = RUN_RESULT_CACHE.get(str(key))
+        if not rec:
+            return None
+        ts = float(rec.get("ts") or 0.0)
+        if ts <= 0 or (now - ts) > float(RUN_RESULT_CACHE_TTL_SEC):
+            RUN_RESULT_CACHE.pop(str(key), None)
+            return None
+        return dict(rec.get("result") or {})
+
+
+def _run_result_cache_put(key: str, result: dict[str, Any]) -> None:
+    now = time.time()
+    with JOB_LOCK:
+        RUN_RESULT_CACHE[str(key)] = {"ts": now, "result": _json_safe(result or {})}
+        if len(RUN_RESULT_CACHE) > int(RUN_RESULT_CACHE_LIMIT):
+            items = sorted(RUN_RESULT_CACHE.items(), key=lambda kv: float((kv[1] or {}).get("ts") or 0.0), reverse=True)
+            keep = {k for k, _ in items[: int(RUN_RESULT_CACHE_LIMIT)]}
+            for k in list(RUN_RESULT_CACHE.keys()):
+                if k not in keep:
+                    RUN_RESULT_CACHE.pop(k, None)
 
 
 def _recent_failed_runs(limit: int = 50) -> list[dict[str, Any]]:
@@ -17481,28 +17539,32 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         if isinstance(stage_ms, dict):
             slow_stage = max(stage_ms.items(), key=lambda kv: int(kv[1] or 0)) if stage_ms else ("", 0)
             logs.append(f"[timing] slowest_stage={str(slow_stage[0])} {int(slow_stage[1] or 0)}ms")
+        result_payload = _json_safe({
+            "request": {
+                "pairs": token_pairs,
+                "days": req.days,
+                "min_tvl": req.min_tvl,
+                "include_chains": include_chains,
+                "include_versions": include_versions,
+                "speed_mode": speed_mode,
+                "min_fee_pct": req.min_fee_pct,
+                "max_fee_pct": req.max_fee_pct,
+                "exclude_suffixes": req.exclude_suffixes,
+                "lp_allocation_usd": float(env.get("LP_ALLOCATION_USD", "1000")),
+                "ignore_cache": bool(getattr(req, "ignore_cache", False)),
+            },
+            **result,
+            "debug_timing": timing_debug,
+            "logs": logs[-8:],
+        })
         with JOB_LOCK:
             job["status"] = "done"
             job["stage"] = "done"
             job["stage_label"] = "Completed"
             job["progress"] = 100
-            job["result"] = _json_safe({
-                "request": {
-                    "pairs": token_pairs,
-                    "days": req.days,
-                    "min_tvl": req.min_tvl,
-                    "include_chains": include_chains,
-                    "include_versions": include_versions,
-                    "speed_mode": speed_mode,
-                    "min_fee_pct": req.min_fee_pct,
-                    "max_fee_pct": req.max_fee_pct,
-                    "exclude_suffixes": req.exclude_suffixes,
-                    "lp_allocation_usd": float(env.get("LP_ALLOCATION_USD", "1000")),
-                },
-                **result,
-                "debug_timing": timing_debug,
-                "logs": logs[-8:],
-            })
+            job["result"] = result_payload
+        if not bool(getattr(req, "ignore_cache", False)):
+            _run_result_cache_put(_pool_run_cache_key(req), result_payload)
         _push_run_history(
             session_id=session_id,
             status="done",
@@ -17556,6 +17618,7 @@ class PoolsRunRequest(BaseModel):
     min_fee_pct: float = 0.0
     max_fee_pct: float = 2.0
     exclude_suffixes: list[str] = Field(default_factory=list, description="Exclude pool ids by last 4 chars")
+    ignore_cache: bool = False
 
 
 class AuthNonceRequest(BaseModel):
@@ -26280,7 +26343,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["endpoint_configured"] = bool(endpoint)
     debug["rpc_enabled"] = bool(_position_fee_rpc_fallback_enabled())
     debug["rpc_force"] = bool(_position_fee_rpc_force_onchain())
-    debug["fee_usd_historical"] = bool(want_hist_usd)
+    debug["fee_usd_historical"] = False
     debug["ignore_cache"] = bool(want_ignore_cache)
     debug["rpc_protocol_supported"] = bool(protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"})
     debug["rpc_tokens_ready"] = bool(_is_eth_address(token0) and _is_eth_address(token1))
@@ -26732,7 +26795,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             since_ts=int(ledger_since_ts),
                             token0_addr=str(token0 or ""),
                             token1_addr=str(token1 or ""),
-                            use_historical_usd=bool(want_hist_usd),
+                            use_historical_usd=False,
                         )
                         if one_meta:
                             pmode = str(one_meta.get("pricing") or "").strip()
@@ -27121,7 +27184,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                     since_ts=collect_since_ts,
                     token0_addr=token0,
                     token1_addr=token1,
-                    use_historical_usd=want_hist_usd,
+                    use_historical_usd=False,
                 )
                 try:
                     rpc_by_day, rpc_meta = fut.result(timeout=float(rpc_timeout))
@@ -27157,7 +27220,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                                     since_ts=retry_since_ts,
                                     token0_addr=token0,
                                     token1_addr=token1,
-                                    use_historical_usd=want_hist_usd,
+                                    use_historical_usd=False,
                                 )
                                 try:
                                     rpc_by_day2, rpc_meta2 = fut2.result(timeout=float(max(1.0, min(rem2, rpc_budget_sec))))
@@ -27216,8 +27279,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         debug["apr_items_count"] = int(len(apr_items_payload))
         collected_reason = "ok_subgraph_exact_snapshots"
         snap_note = "Subgraph positionSnapshots collectedFees, valued in USD."
-        if want_hist_usd:
-            snap_note += " (Historical USD applies only to the NPM Collect log series; subgraph series unchanged.)"
         debug["result_mode"] = "exact-snapshots"
         debug["result_count"] = len(exact_by_day)
         return _with_debug({
@@ -27268,8 +27329,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         debug["apr_items_count"] = int(len(apr_items_payload))
         collected_reason = ("subgraph_low_confidence_force_rpc_no_logs" if force_rpc else "subgraph_low_confidence")
         low_note = "Subgraph collectedFees (USD); may be incomplete where subgraph indexing is wrong."
-        if want_hist_usd:
-            low_note += " (Historical USD applies only to the NPM Collect log series.)"
         debug["result_mode"] = "exact-snapshots"
         debug["result_count"] = len(exact_by_day)
         return _with_debug({
@@ -28180,6 +28239,25 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         path="/api/pools/run",
         payload=_pairs_to_string(_parse_pairs_str(";".join(req.pairs or []))),
     )
+    cache_key = _pool_run_cache_key(req)
+    if not bool(getattr(req, "ignore_cache", False)):
+        cached_result = _run_result_cache_get(cache_key)
+        if isinstance(cached_result, dict) and cached_result:
+            job_id = str(uuid.uuid4())
+            with JOB_LOCK:
+                JOBS[job_id] = {
+                    "id": job_id,
+                    "status": "done",
+                    "stage": "done",
+                    "stage_label": "Completed (cache)",
+                    "progress": 100,
+                    "created_at": time.time(),
+                    "started_at": time.time(),
+                    "finished_at": time.time(),
+                    "result": _json_safe(cached_result),
+                    "error": None,
+                }
+            return {"job_id": job_id}
 
     job_id = str(uuid.uuid4())
     with JOB_LOCK:
@@ -28486,6 +28564,8 @@ HTML_PAGE = """
       align-items: center;
       margin-left: auto;
       justify-content: flex-end;
+      flex-wrap: wrap;
+      min-width: 0;
     }
     .scan-progress {
       width: 140px;
@@ -28565,11 +28645,13 @@ HTML_PAGE = """
       font-size: 13px;
       color: #111111;
       display: inline-block;
-      width: 280px;
-      text-align: right;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      width: auto;
+      max-width: min(760px, 72vw);
+      text-align: left;
+      white-space: normal;
+      overflow: visible;
+      text-overflow: clip;
+      line-height: 1.3;
     }
     .progress-wrap { width: 100%; margin-top: 10px; }
     .control-card .progress-wrap {
@@ -28932,6 +29014,10 @@ HTML_PAGE = """
           <div class="section-actions">
             <div id="scanProgress" class="scan-progress"><div class="bar"></div></div>
             <span id="status" class="status">Ready</span>
+            <label class="check" style="white-space:nowrap">
+              <input id="runIgnoreCache" type="checkbox"/>
+              Ignore cache
+            </label>
             <button class="search-link-btn" type="button" id="scanBtn" onclick="runJob()">Scan</button>
             <button class="collapse-btn" id="toggleFeeHistoryBtn" type="button" onclick="toggleHomeSection('feeHistory')" title="Collapse/expand">▾</button>
           </div>
@@ -28991,7 +29077,7 @@ HTML_PAGE = """
     let sortDesc = true;
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
-    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "speedMode", "allChains"];
+    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "speedMode", "allChains", "runIgnoreCache"];
     let availableChains = [];
     let colorMap = {};
     let dashMap = {};
@@ -29005,6 +29091,7 @@ HTML_PAGE = """
     let scanStartedAt = 0;
     let scanStageLabel = "waiting";
     let scanProgressPct = 0;
+    let scanProgressTargetPct = 0;
     const homeSectionState = { feeHistory: false, poolsTable: false };
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
 
@@ -29468,7 +29555,7 @@ HTML_PAGE = """
       setHomeSectionCollapsed(key, !homeSectionState[key]);
     }
 
-    function setScanProgressVisible(flag) {
+    function setScanProgressVisible() {
       const el = document.getElementById("scanProgress");
       if (!el) return;
       el.style.display = "none";
@@ -29482,6 +29569,7 @@ HTML_PAGE = """
       scanStartedAt = 0;
       scanStageLabel = "waiting";
       scanProgressPct = 0;
+      scanProgressTargetPct = 0;
     }
 
     function startScanTicker() {
@@ -29491,6 +29579,14 @@ HTML_PAGE = """
       const chainHints = selected.length ? selected : (availableChains.length ? availableChains : ["all chains"]);
       const tick = () => {
         const elapsed = Math.max(0, Math.floor((Date.now() - scanStartedAt) / 1000));
+        const target = Math.max(0, Math.min(99, Number(scanProgressTargetPct || 0)));
+        const current = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
+        if (target > current) {
+          const step = (current < 12) ? 2 : 3;
+          scanProgressPct = Math.min(target, current + step);
+        } else if (target < current) {
+          scanProgressPct = target;
+        }
         const pct = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
         const chainHint = chainHints[Math.floor(elapsed / 4) % chainHints.length];
         const el = document.getElementById("status");
@@ -29507,17 +29603,13 @@ HTML_PAGE = """
       if (!btn) return;
       btn.disabled = flag;
       btn.style.opacity = flag ? "0.7" : "1";
-      setScanProgressVisible(flag);
-      if (flag) {
-        btn.textContent = "Scan again";
-      } else {
-        btn.textContent = hasScanRun ? "Scan again" : "Scan";
-      }
+      setScanProgressVisible();
+      btn.textContent = "Scan";
     }
 
     function updateProgress(progress, stageLabel) {
       scanStageLabel = String(stageLabel || "running");
-      scanProgressPct = Math.max(0, Math.min(100, Number(progress || 0)));
+      scanProgressTargetPct = Math.max(0, Math.min(100, Number(progress || 0)));
     }
 
     function scanElapsedSecFromJob(job) {
@@ -29835,13 +29927,15 @@ HTML_PAGE = """
         const poolIdDisplay = (r.version === "v4" && (r.pool_id || "").length > 24)
           ? `${r.pool_id.slice(0, 12)}...${r.pool_id.slice(-8)}`
           : r.pool_id;
+        const poolIdRaw = String(r.pool_id || "");
+        const poolIdCopyArg = escAttr(poolIdRaw.replace(/\\/g, "\\\\").replace(/'/g, "\\'"));
         html += `<tr class="${cls}">`;
         html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};"></span></td>`;
         html += `<td><input type="checkbox" data-pool-id="${r.pool_id}" ${visible ? "checked" : ""} ${disabled} onchange="togglePoolVisibility(this)"/></td>`;
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
         html += `<td>${r.pair}</td>`;
-        html += `<td class="mono">${poolIdDisplay}</td>`;
+        html += `<td class="mono">${escAttr(poolIdDisplay)}<button class='copy-btn' type='button' onclick="copyText('${poolIdCopyArg}')" title='Copy pool id'>⧉</button></td>`;
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
@@ -29974,6 +30068,7 @@ HTML_PAGE = """
           speed_mode: String(document.getElementById("speedMode")?.value || "normal").trim().toLowerCase(),
           max_fee_pct: Number(maxFeeRaw),
           min_fee_pct: Number(minFeeRaw),
+          ignore_cache: !!document.getElementById("runIgnoreCache")?.checked,
         };
         if (!payload.include_versions.length) {
           setStatus("Select at least one protocol (V3/V4).", "fail");

@@ -10,6 +10,7 @@ Agent 1: Uniswap v3 (базовая версия).
 
 import argparse
 import os
+import threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -94,69 +95,90 @@ def discover_pools_v3(
     """Discover v3 pools only."""
     pairs = parse_token_pairs(token_pairs_str)
     dynamic_tokens = load_dynamic_tokens()
-    all_pools = []
+    all_pools: list[dict] = []
     chains = set(UNISWAP_V3_SUBGRAPHS.keys()) | set(GOLDSKY_ENDPOINTS.keys())
     include = {c.strip().lower() for c in os.environ.get("INCLUDE_CHAINS", "").split(",") if c.strip()}
     if include:
         chains = {c for c in chains if c.lower() in include}
+    discovery_cap = max(0, _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN", 0))
+    chain_workers = max(1, min(_env_int("V3_DISCOVERY_CHAIN_WORKERS", 4), len(chains) or 1))
+    dyn_lock = threading.Lock()
 
-    for chain in chains:
+    def _discover_for_chain(chain: str) -> list[dict]:
+        out_chain: list[dict] = []
         endpoint = get_graph_endpoint(chain, "v3")
         if not endpoint:
-            continue
+            return out_chain
+
+        def _resolve_with_cache(sym: str) -> list[str]:
+            out: list[str] = []
+            for c in [chain, "ethereum"]:
+                with dyn_lock:
+                    out.extend(get_token_addresses(c, sym, dynamic_tokens))
+            out = list(dict.fromkeys(out))[:1]
+            if not out:
+                addr = query_token_by_symbol(endpoint, sym)
+                if addr:
+                    with dyn_lock:
+                        save_dynamic_token(chain, sym, addr)
+                        dynamic_tokens.setdefault(chain, {})[sym.lower()] = addr
+                    out = [addr]
+            return out
+
         for base, quote in pairs:
             base_addrs, quote_addrs = [], []
 
             if fresh_token_lookup:
-                def resolve(sym: str) -> list:
-                    out = []
-                    for c in [chain, "ethereum"]:
-                        out.extend(get_token_addresses(c, sym, dynamic_tokens))
-                    out = list(dict.fromkeys(out))[:1]
-                    if not out:
-                        addr = query_token_by_symbol(endpoint, sym)
-                        if addr:
-                            save_dynamic_token(chain, sym, addr)
-                            dynamic_tokens.setdefault(chain, {})[sym.lower()] = addr
-                            out = [addr]
-                    return out
-                base_addrs = resolve(base)
-                quote_addrs = resolve(quote)
+                base_addrs = _resolve_with_cache(base)
+                quote_addrs = _resolve_with_cache(quote)
             else:
                 for c in [chain, "ethereum"]:
-                    base_addrs.extend(get_token_addresses(c, base, dynamic_tokens))
-                    quote_addrs.extend(get_token_addresses(c, quote, dynamic_tokens))
+                    with dyn_lock:
+                        base_addrs.extend(get_token_addresses(c, base, dynamic_tokens))
+                        quote_addrs.extend(get_token_addresses(c, quote, dynamic_tokens))
                 base_addrs = list(dict.fromkeys(base_addrs))[:1]
                 quote_addrs = list(dict.fromkeys(quote_addrs))[:1]
                 if not base_addrs:
-                    addr = query_token_by_symbol(endpoint, base)
-                    if addr:
-                        save_dynamic_token(chain, base, addr)
-                        dynamic_tokens.setdefault(chain, {})[base.lower()] = addr
-                        base_addrs = [addr]
+                    base_addrs = _resolve_with_cache(base)
                 if not quote_addrs:
-                    addr = query_token_by_symbol(endpoint, quote)
-                    if addr:
-                        save_dynamic_token(chain, quote, addr)
-                        dynamic_tokens.setdefault(chain, {})[quote.lower()] = addr
-                        quote_addrs = [addr]
+                    quote_addrs = _resolve_with_cache(quote)
 
             if not base_addrs or not quote_addrs:
                 continue
             try:
                 pools = query_pools_containing_both_tokens(
-                    endpoint, base_addrs[0], quote_addrs[0], _min_tvl(min_tvl)
+                    endpoint,
+                    base_addrs[0],
+                    quote_addrs[0],
+                    _min_tvl(min_tvl),
+                    max_results=int(discovery_cap),
                 )
                 if not pools:
                     # Fallback for ambiguous symbol->address mappings (e.g. multiple tokens with same symbol).
-                    pools = query_pools_by_token_symbols(endpoint, base, quote, _min_tvl(min_tvl))
+                    pools = query_pools_by_token_symbols(
+                        endpoint,
+                        base,
+                        quote,
+                        _min_tvl(min_tvl),
+                        max_results=int(discovery_cap),
+                    )
                 for p in pools:
                     p["chain"] = chain
                     p["version"] = "v3"
                     p["pair_label"] = f"{base}/{quote}"
-                    all_pools.append(p)
+                    out_chain.append(p)
             except Exception as e:
                 print(f"  [{chain}] v3 {base}/{quote}: {e}")
+        return out_chain
+
+    if chains:
+        with ThreadPoolExecutor(max_workers=chain_workers) as ex:
+            futs = [ex.submit(_discover_for_chain, c) for c in sorted(chains)]
+            for fut in as_completed(futs):
+                try:
+                    all_pools.extend(fut.result() or [])
+                except Exception as e:
+                    print(f"  [v3-discovery] chain worker error: {e}")
     seen = set()
     unique = []
     for p in all_pools:

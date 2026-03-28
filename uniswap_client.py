@@ -116,7 +116,7 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
 
 
 def query_pools_containing_both_tokens(
-    endpoint: str, token_a: str, token_b: str, min_tvl: float
+    endpoint: str, token_a: str, token_b: str, min_tvl: float, max_results: int = 0
 ) -> list[dict]:
     """
     Find pools containing BOTH token_a and token_b (in either order).
@@ -169,6 +169,8 @@ def query_pools_containing_both_tokens(
         p1 = data.get("data", {}).get("pools1", [])
         result.extend(p0)
         result.extend(p1)
+        if int(max_results or 0) > 0 and len(result) >= int(max_results):
+            return result[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
@@ -177,7 +179,7 @@ def query_pools_containing_both_tokens(
 
 
 def query_pools_by_token_symbols(
-    endpoint: str, symbol_a: str, symbol_b: str, min_tvl: float
+    endpoint: str, symbol_a: str, symbol_b: str, min_tvl: float, max_results: int = 0
 ) -> list[dict]:
     """
     Fallback search by token symbols (when address resolution is ambiguous).
@@ -230,6 +232,8 @@ def query_pools_by_token_symbols(
         p1 = data.get("data", {}).get("pools1", [])
         result.extend(p0)
         result.extend(p1)
+        if int(max_results or 0) > 0 and len(result) >= int(max_results):
+            return result[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
