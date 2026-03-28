@@ -13,6 +13,7 @@ import os
 import threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Optional
 
 from config import (
@@ -135,6 +136,16 @@ def _min_tvl(cli_value: Optional[float] = None) -> float:
         except ValueError:
             pass
     return MIN_TVL_USD
+
+
+def _resolve_output_dir() -> Path:
+    raw = str(os.environ.get("RUN_OUTPUT_DIR", "")).strip()
+    if raw:
+        p = Path(raw).expanduser()
+    else:
+        p = Path("data")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def discover_pools_v3(
@@ -336,7 +347,7 @@ def main() -> None:
     token_pairs = os.environ.get("TOKEN_PAIRS", DEFAULT_TOKEN_PAIRS)
     min_tvl_val = _min_tvl(args.min_tvl)
     suffix = pairs_to_filename_suffix(token_pairs)
-    os.makedirs("data", exist_ok=True)
+    output_dir = _resolve_output_dir()
 
     print("Agent 1: Uniswap v3 (базовая версия)")
     print("Token pairs:", token_pairs, "| Min TVL: $%s" % f"{min_tvl_val:,.0f}".replace(",", " "))
@@ -356,7 +367,7 @@ def main() -> None:
     print(f"Found {len(pools)} v3 pools")
 
     if os.environ.get("DISABLE_PDF_OUTPUT", "").strip().lower() not in ("1", "true", "yes", "on"):
-        save_pdf(pools, f"data/available_pairs_v3_{suffix}.pdf")
+        save_pdf(pools, str(output_dir / f"available_pairs_v3_{suffix}.pdf"))
     else:
         print("PDF output disabled (DISABLE_PDF_OUTPUT=1)")
 
@@ -420,9 +431,9 @@ def main() -> None:
                 except Exception as e:
                     print(f"  [series] error - {e}")
 
-    out_json = f"data/pools_v3_{suffix}.json"
-    save_chart_data_json(pool_chart_data, out_json)
-    print("Done. Output:", out_json)
+    out_json = output_dir / f"pools_v3_{suffix}.json"
+    save_chart_data_json(pool_chart_data, str(out_json))
+    print("Done. Output:", str(out_json))
 
 
 if __name__ == "__main__":

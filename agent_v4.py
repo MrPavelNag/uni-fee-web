@@ -11,6 +11,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Optional
 
 from config import (
@@ -117,9 +118,29 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _resolve_output_dir() -> Path:
+    raw = str(os.environ.get("RUN_OUTPUT_DIR", "")).strip()
+    if raw:
+        p = Path(raw).expanduser()
+    else:
+        p = Path("data")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _is_timeout_error(err: Exception) -> bool:
     msg = str(err or "").lower()
     return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
+
+
+def _normalize_day_timestamp(day_value: int) -> int:
+    d = int(day_value or 0)
+    if d <= 0:
+        return 0
+    # Subgraph day index is a small integer; unix day timestamps are already large.
+    if d < 200_000:
+        return d * 86400
+    return d
 
 
 def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
@@ -300,7 +321,7 @@ def compute_fee_series(pool: dict, endpoint: str, day_rows: Optional[list[dict]]
             cumul += fees * (LP_ALLOCATION_USD / tvl)
         # date может быть Unix или day index — для оси времени нужен Unix
         d = int(r["date"])
-        ts = d if d > 1e9 else d * 86400
+        ts = _normalize_day_timestamp(d)
         fee_series.append((ts, cumul))
         tvl_series.append((ts, tvl))
     return {"fees": fee_series, "tvl": tvl_series}
@@ -406,7 +427,7 @@ def main() -> None:
     pairs_str = os.environ.get("TOKEN_PAIRS", DEFAULT_TOKEN_PAIRS)
     pairs = parse_pairs(pairs_str)
     suffix = pairs_to_filename_suffix(pairs_str)
-    os.makedirs("data", exist_ok=True)
+    output_dir = _resolve_output_dir()
 
     print("Uniswap v4 Agent")
     print("Пары:", pairs_str, "| Min TVL: $%.0f" % min_tvl)
@@ -427,7 +448,7 @@ def main() -> None:
 
     # PDF-список пулов (аналогично v3)
     if os.environ.get("DISABLE_PDF_OUTPUT", "").strip().lower() not in ("1", "true", "yes", "on"):
-        save_pdf(pools, f"data/available_pairs_v4_{suffix}.pdf")
+        save_pdf(pools, str(output_dir / f"available_pairs_v4_{suffix}.pdf"))
     else:
         print("PDF output disabled (DISABLE_PDF_OUTPUT=1)")
 
@@ -492,9 +513,9 @@ def main() -> None:
                 except Exception as e:
                     print(f"  [series] error - {e}")
 
-    out_path = f"data/pools_v4_{suffix}.json"
-    save_chart_data_json(chart_data, out_path)
-    print("Готово:", out_path)
+    out_path = output_dir / f"pools_v4_{suffix}.json"
+    save_chart_data_json(chart_data, str(out_path))
+    print("Готово:", str(out_path))
 
 
 if __name__ == "__main__":

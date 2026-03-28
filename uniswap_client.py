@@ -17,6 +17,41 @@ _TOKEN_BY_SYMBOL_CACHE_LOCK = threading.Lock()
 _TOKEN_BY_SYMBOL_CACHE: dict[tuple[str, str], Optional[str]] = {}
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _pool_day_cache_limit() -> int:
+    return max(200, _env_int("GRAPHQL_POOL_DAY_CACHE_LIMIT", 8000))
+
+
+def _token_cache_limit() -> int:
+    return max(100, _env_int("GRAPHQL_TOKEN_CACHE_LIMIT", 2000))
+
+
+def _sort_pools_by_tvl_desc(items: list[dict]) -> list[dict]:
+    def _tvl(x: dict) -> float:
+        try:
+            return float((x or {}).get("totalValueLockedUSD") or 0.0)
+        except Exception:
+            return 0.0
+    return sorted(items or [], key=_tvl, reverse=True)
+
+
+def _trim_cache_dict(d: dict, limit: int) -> None:
+    if len(d) <= int(limit):
+        return
+    over = max(0, len(d) - int(limit))
+    if over <= 0:
+        return
+    # Keep implementation simple and deterministic.
+    for k in list(d.keys())[:over]:
+        d.pop(k, None)
+
+
 def _page_delay_sec() -> float:
     try:
         return max(0.0, float(os.environ.get("GRAPHQL_PAGE_DELAY_SEC", "0")))
@@ -104,8 +139,6 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
                         continue
                 raise RuntimeError(f"GraphQL errors: {data['errors']}")
             return data
-        except requests.exceptions.ConnectionError:
-            raise  # DNS/connection errors: no retry
         except (requests.RequestException, RuntimeError) as e:
             last_err = e
             if attempt < retries - 1:
@@ -170,12 +203,15 @@ def query_pools_containing_both_tokens(
         result.extend(p0)
         result.extend(p1)
         if int(max_results or 0) > 0 and len(result) >= int(max_results):
-            return result[: int(max_results)]
+            return _sort_pools_by_tvl_desc(result)[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
         _maybe_page_delay()
-    return result
+    out = _sort_pools_by_tvl_desc(result)
+    if int(max_results or 0) > 0:
+        out = out[: int(max_results)]
+    return out
 
 
 def query_pools_by_token_symbols(
@@ -233,12 +269,15 @@ def query_pools_by_token_symbols(
         result.extend(p0)
         result.extend(p1)
         if int(max_results or 0) > 0 and len(result) >= int(max_results):
-            return result[: int(max_results)]
+            return _sort_pools_by_tvl_desc(result)[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
         _maybe_page_delay()
-    return result
+    out = _sort_pools_by_tvl_desc(result)
+    if int(max_results or 0) > 0:
+        out = out[: int(max_results)]
+    return out
 
 
 def query_pools_containing_both_tokens_no_tvl_filter(
@@ -397,6 +436,7 @@ def query_pool_day_data_batch(
             cache_key = (str(endpoint), str(pid), int(start_ts), int(end_ts))
             with _POOL_DAY_CACHE_LOCK:
                 _POOL_DAY_CACHE[cache_key] = rows
+                _trim_cache_dict(_POOL_DAY_CACHE, _pool_day_cache_limit())
     return out
 
 
@@ -416,8 +456,8 @@ def query_token_by_symbol(endpoint: str, symbol: str) -> Optional[str]:
     if symbol.lower() == "eth":
         syms_to_try.append("WETH")
     query = """
-    query TokenBySymbol($symbol: String!) {
-      tokens(first: 20, where: { symbol: $symbol }) {
+    query TokenBySymbol($symbol: String!, $skip: Int!) {
+      tokens(first: 100, skip: $skip, where: { symbol: $symbol }, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id
         symbol
         totalValueLockedUSD
@@ -427,26 +467,34 @@ def query_token_by_symbol(endpoint: str, symbol: str) -> Optional[str]:
     """
     for sym in syms_to_try:
         try:
-            data = graphql_query(endpoint, query, {"symbol": sym})
-            tokens = data.get("data", {}).get("tokens", [])
-            if not tokens:
-                continue
-            # Pick token with highest TVL (real token, not scam copy)
-            def tvl(t):
-                try:
-                    return float(t.get("totalValueLockedUSD") or 0)
-                except (ValueError, TypeError):
-                    return 0.0
-            best = max(tokens, key=tvl)
-            addr = best["id"].lower()
-            # Reject zero address (invalid)
-            if addr == "0x0000000000000000000000000000000000000000":
-                continue
-            with _TOKEN_BY_SYMBOL_CACHE_LOCK:
-                _TOKEN_BY_SYMBOL_CACHE[cache_key] = addr
-            return addr
+            best_addr: Optional[str] = None
+            best_tvl = -1.0
+            for skip in (0, 100, 200):
+                data = graphql_query(endpoint, query, {"symbol": sym, "skip": int(skip)})
+                tokens = data.get("data", {}).get("tokens", [])
+                if not tokens:
+                    break
+                for t in tokens:
+                    try:
+                        tvl = float((t or {}).get("totalValueLockedUSD") or 0.0)
+                    except (ValueError, TypeError):
+                        tvl = 0.0
+                    addr = str((t or {}).get("id") or "").lower()
+                    if not addr or addr == "0x0000000000000000000000000000000000000000":
+                        continue
+                    if tvl > best_tvl:
+                        best_tvl = tvl
+                        best_addr = addr
+                if len(tokens) < 100:
+                    break
+            if best_addr:
+                with _TOKEN_BY_SYMBOL_CACHE_LOCK:
+                    _TOKEN_BY_SYMBOL_CACHE[cache_key] = best_addr
+                    _trim_cache_dict(_TOKEN_BY_SYMBOL_CACHE, _token_cache_limit())
+                return best_addr
         except Exception:
             continue
     with _TOKEN_BY_SYMBOL_CACHE_LOCK:
         _TOKEN_BY_SYMBOL_CACHE[cache_key] = None
+        _trim_cache_dict(_TOKEN_BY_SYMBOL_CACHE, _token_cache_limit())
     return None

@@ -342,5 +342,11 @@ def load_chart_data_json(path: str) -> dict[str, dict]:
     """Load pool_chart_data from JSON."""
     if not os.path.isfile(path):
         return {}
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        print(f"[warn] failed to load JSON {path}: {e}")
+    return {}

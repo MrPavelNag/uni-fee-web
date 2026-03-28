@@ -134,7 +134,6 @@ def _on_shutdown() -> None:
 # Simple in-memory job storage (MVP)
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCK = threading.Lock()
-RUN_LOCK = threading.Lock()  # prevent collisions in shared data/*.json files
 INDEXER_LOCK = threading.Lock()
 INDEXER_ACTIVITY_LOCK = threading.Lock()
 INDEXER_ACTIVITY: dict[str, Any] = {
@@ -181,7 +180,9 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v2"
+RUN_RESULT_CACHE_VER = "run_v3"
+RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
+RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
 SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", str(30 * 24 * 60 * 60)))
 CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
@@ -17111,10 +17112,16 @@ def _parse_run_pair_tuples(clean_pairs: list[str], *, limit: int = 4) -> list[tu
     return list(dict.fromkeys(pairs))
 
 
-def _agent_data_path(script_name: str, pair_suffix: str) -> Path:
+def _run_output_dir(job_id: str) -> Path:
+    root = DATA_DIR / "run_tmp" / str(job_id)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _agent_data_path(script_name: str, pair_suffix: str, run_output_dir: Path) -> Path:
     if str(script_name) == "agent_v3.py":
-        return DATA_DIR / f"pools_v3_{pair_suffix}.json"
-    return DATA_DIR / f"pools_v4_{pair_suffix}.json"
+        return run_output_dir / f"pools_v3_{pair_suffix}.json"
+    return run_output_dir / f"pools_v4_{pair_suffix}.json"
 
 
 def _run_agent_and_load_timed(
@@ -17124,11 +17131,12 @@ def _run_agent_and_load_timed(
     min_tvl: float,
     logs: list[str],
     pair_suffix: str,
+    run_output_dir: Path,
 ) -> tuple[dict[str, dict], dict[str, Any]]:
     t0 = time.perf_counter()
     subprocess_ms = _run_subprocess(script_name, env, min_tvl, logs)
     t_load0 = time.perf_counter()
-    data = load_chart_data_json(str(_agent_data_path(script_name, pair_suffix)))
+    data = load_chart_data_json(str(_agent_data_path(script_name, pair_suffix, run_output_dir)))
     load_json_ms = int(round(max(0.0, time.perf_counter() - t_load0) * 1000.0))
     total_ms = int(round(max(0.0, time.perf_counter() - t0) * 1000.0))
     dbg = {
@@ -17148,7 +17156,6 @@ def _run_agent_and_load_timed(
 def _build_run_job_env(
     *,
     req: "PoolsRunRequest",
-    speed_mode: str,
     token_pairs: str,
     include_chains: list[str],
     run_v4: bool,
@@ -17164,50 +17171,20 @@ def _build_run_job_env(
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
     env["DISABLE_PDF_OUTPUT"] = "1"
     env["DISABLE_DYNAMIC_TOKEN_PERSIST"] = os.environ.get("WEB_DISABLE_DYNAMIC_TOKEN_PERSIST", "1")
-    env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "1")
-    env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get(
-        "WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL",
-        "5" if speed_mode == "fast" else "8",
-    )
-    env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get(
-        "WEB_GRAPHQL_READ_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL",
-        "8" if speed_mode == "fast" else "15",
-    )
-    env["POOL_SERIES_WORKERS"] = os.environ.get(
-        "WEB_POOL_SERIES_WORKERS_FAST" if speed_mode == "fast" else "WEB_POOL_SERIES_WORKERS_NORMAL",
-        "16" if speed_mode == "fast" else "8",
-    )
-    env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get(
-        "WEB_V3_DISCOVERY_CHAIN_WORKERS_FAST" if speed_mode == "fast" else "WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL",
-        "6" if speed_mode == "fast" else "4",
-    )
-    env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get(
-        "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL",
-        "60" if speed_mode == "fast" else "120",
-    )
-    env["POOL_DAY_BATCH_SIZE"] = os.environ.get(
-        "WEB_POOL_DAY_BATCH_SIZE_FAST" if speed_mode == "fast" else "WEB_POOL_DAY_BATCH_SIZE_NORMAL",
-        "14" if speed_mode == "fast" else "12",
-    )
-    env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get(
-        "WEB_MAX_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL",
-        "20" if speed_mode == "fast" else "40",
-    )
-    env["MAX_POOLS_TOTAL"] = os.environ.get(
-        "WEB_MAX_POOLS_TOTAL_FAST" if speed_mode == "fast" else "WEB_MAX_POOLS_TOTAL_NORMAL",
-        "120" if speed_mode == "fast" else "240",
-    )
-    env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get(
-        "WEB_GRAPHQL_PAGE_DELAY_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL",
-        "0",
-    )
-    env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get(
-        "WEB_DISABLE_V4_SYMBOL_FALLBACK_FAST" if speed_mode == "fast" else "WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL",
-        "1" if speed_mode == "fast" else "0",
-    )
+    env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "3")
+    env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL", "8")
+    env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "15")
+    env["POOL_SERIES_WORKERS"] = os.environ.get("WEB_POOL_SERIES_WORKERS_NORMAL", "8")
+    env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get("WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL", "4")
+    env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL", "120")
+    env["POOL_DAY_BATCH_SIZE"] = os.environ.get("WEB_POOL_DAY_BATCH_SIZE_NORMAL", "12")
+    env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL", "40")
+    env["MAX_POOLS_TOTAL"] = os.environ.get("WEB_MAX_POOLS_TOTAL_NORMAL", "240")
+    env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get("WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL", "0")
+    env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL", "0")
     env["V4_SKIP_CHAIN_AFTER_TIMEOUT"] = os.environ.get(
         "WEB_V4_SKIP_CHAIN_AFTER_TIMEOUT",
-        "1",
+        "0",
     )
     # v4 endpoint config uses this list at import-time.
     if run_v4 and include_chains:
@@ -17257,7 +17234,6 @@ def _push_run_history(
     min_tvl: float,
     days: int,
     include_versions: list[str],
-    speed_mode: str,
     min_fee_pct: float,
     max_fee_pct: float,
     exclude_suffixes: list[str],
@@ -17273,7 +17249,6 @@ def _push_run_history(
             "min_tvl": min_tvl,
             "days": days,
             "include_versions": include_versions,
-            "speed_mode": speed_mode,
             "min_fee_pct": min_fee_pct,
             "max_fee_pct": max_fee_pct,
             "exclude_suffixes": exclude_suffixes,
@@ -17305,7 +17280,7 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
         "versions": versions,
         "days": int(req.days or 0),
         "min_tvl": float(req.min_tvl or 0.0),
-        "speed_mode": str(req.speed_mode or "normal").strip().lower(),
+        "lp_allocation_usd": float(os.environ.get("LP_ALLOCATION_USD", "1000") or 1000),
         "min_fee_pct": float(req.min_fee_pct or 0.0),
         "max_fee_pct": float(req.max_fee_pct or 0.0),
         "exclude_suffixes": suffixes,
@@ -17339,6 +17314,27 @@ def _run_result_cache_put(key: str, result: dict[str, Any]) -> None:
             for k in list(RUN_RESULT_CACHE.keys()):
                 if k not in keep:
                     RUN_RESULT_CACHE.pop(k, None)
+
+
+def _prune_run_jobs_locked(now: float | None = None) -> None:
+    ts_now = float(now or time.time())
+    stale_ids = [
+        jid
+        for jid, rec in JOBS.items()
+        if (ts_now - float((rec or {}).get("created_at") or ts_now)) > float(RUN_JOB_TTL_SEC)
+    ]
+    for jid in stale_ids:
+        JOBS.pop(str(jid), None)
+    if len(JOBS) > int(RUN_JOB_LIMIT):
+        items = sorted(
+            JOBS.items(),
+            key=lambda kv: float(((kv[1] or {}).get("created_at") or 0.0)),
+            reverse=True,
+        )
+        keep = {k for k, _ in items[: int(RUN_JOB_LIMIT)]}
+        for k in list(JOBS.keys()):
+            if k not in keep:
+                JOBS.pop(k, None)
 
 
 def _logs_indicate_incomplete_discovery(logs: list[str]) -> bool:
@@ -17401,16 +17397,12 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     }
 
     t_prepare0 = time.perf_counter()
-    speed_mode = str(req.speed_mode or "normal").strip().lower()
-    if speed_mode not in {"normal", "fast"}:
-        speed_mode = "normal"
-
     with JOB_LOCK:
         job = JOBS[job_id]
         job["status"] = "running"
         job["started_at"] = time.time()
         job["stage"] = "prepare"
-        job["stage_label"] = f"Preparing parameters ({speed_mode})"
+        job["stage_label"] = "Preparing parameters (full)"
         job["progress"] = 5
 
     # Build up to 4 selected token pairs.
@@ -17439,98 +17431,115 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     logs: list[str] = []
     env = _build_run_job_env(
         req=req,
-        speed_mode=speed_mode,
         token_pairs=token_pairs,
         include_chains=include_chains,
         run_v4=run_v4,
     )
+    run_output_dir = _run_output_dir(job_id)
+    env["RUN_OUTPUT_DIR"] = str(run_output_dir)
     timing_debug["stage_ms"]["build_env"] = int(round(max(0.0, time.perf_counter() - t_env0) * 1000.0))
     timing_debug["stage_ms"]["prepare"] = int(round(max(0.0, time.perf_counter() - t_prepare0) * 1000.0))
 
     try:
         merged_raw: dict[str, dict] = {}
-        t_lock_wait0 = time.perf_counter()
-        with RUN_LOCK:
-            timing_debug["stage_ms"]["run_lock_wait"] = int(round(max(0.0, time.perf_counter() - t_lock_wait0) * 1000.0))
-            t_agents_total0 = time.perf_counter()
-            total_pairs = max(1, len(pairs))
-            for idx, (a, b) in enumerate(pairs, start=1):
-                t_pair0 = time.perf_counter()
-                pair_str = f"{a},{b}"
-                pair_suffix = pairs_to_filename_suffix(pair_str)
-                env["TOKEN_PAIRS"] = pair_str
-                pair_dbg: dict[str, Any] = {
-                    "pair": pair_str,
-                    "index": int(idx),
-                    "agents": [],
-                    "merged_before": int(len(merged_raw)),
-                }
+        timing_debug["stage_ms"]["run_lock_wait"] = 0
+        t_agents_total0 = time.perf_counter()
+        total_pairs = max(1, len(pairs))
+        for idx, (a, b) in enumerate(pairs, start=1):
+            t_pair0 = time.perf_counter()
+            pair_str = f"{a},{b}"
+            pair_suffix = pairs_to_filename_suffix(pair_str)
+            env["TOKEN_PAIRS"] = pair_str
+            pair_dbg: dict[str, Any] = {
+                "pair": pair_str,
+                "index": int(idx),
+                "agents": [],
+                "merged_before": int(len(merged_raw)),
+            }
 
-                base_progress = int(10 + (idx - 1) * (65 / total_pairs))
-                if run_v3 and run_v4:
-                    _set_stage("v3v4", f"Running v3+v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 18))
+            base_progress = int(10 + (idx - 1) * (65 / total_pairs))
+            if run_v3 and run_v4:
+                _set_stage("v3v4", f"Running v3+v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 18))
 
-                    with ThreadPoolExecutor(max_workers=2) as ex:
-                        f_v3 = ex.submit(
-                            _run_agent_and_load_timed,
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    f_v3 = ex.submit(
+                        _run_agent_and_load_timed,
+                        script_name="agent_v3.py",
+                        env=dict(env),
+                        min_tvl=req.min_tvl,
+                        logs=logs,
+                        pair_suffix=pair_suffix,
+                        run_output_dir=run_output_dir,
+                    )
+                    f_v4 = ex.submit(
+                        _run_agent_and_load_timed,
+                        script_name="agent_v4.py",
+                        env=dict(env),
+                        min_tvl=req.min_tvl,
+                        logs=logs,
+                        pair_suffix=pair_suffix,
+                        run_output_dir=run_output_dir,
+                    )
+                    data_v3, dbg_v3 = f_v3.result()
+                    data_v4, dbg_v4 = f_v4.result()
+                    pair_dbg["agents"].append(dbg_v3)
+                    pair_dbg["agents"].append(dbg_v4)
+                    merged_raw.update(data_v3)
+                    merged_raw.update(data_v4)
+            else:
+                if run_v3:
+                    _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
+                    data_v3, dbg_v3 = _run_agent_and_load_timed(
                             script_name="agent_v3.py",
-                            env=dict(env),
+                            env=env,
                             min_tvl=req.min_tvl,
                             logs=logs,
                             pair_suffix=pair_suffix,
+                            run_output_dir=run_output_dir,
                         )
-                        f_v4 = ex.submit(
-                            _run_agent_and_load_timed,
+                    pair_dbg["agents"].append(dbg_v3)
+                    merged_raw.update(data_v3)
+                if run_v4:
+                    _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
+                    data_v4, dbg_v4 = _run_agent_and_load_timed(
                             script_name="agent_v4.py",
-                            env=dict(env),
+                            env=env,
                             min_tvl=req.min_tvl,
                             logs=logs,
                             pair_suffix=pair_suffix,
+                            run_output_dir=run_output_dir,
                         )
-                        data_v3, dbg_v3 = f_v3.result()
-                        data_v4, dbg_v4 = f_v4.result()
-                        pair_dbg["agents"].append(dbg_v3)
-                        pair_dbg["agents"].append(dbg_v4)
-                        merged_raw.update(data_v3)
-                        merged_raw.update(data_v4)
-                else:
-                    if run_v3:
-                        _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
-                        data_v3, dbg_v3 = _run_agent_and_load_timed(
-                                script_name="agent_v3.py",
-                                env=env,
-                                min_tvl=req.min_tvl,
-                                logs=logs,
-                                pair_suffix=pair_suffix,
-                            )
-                        pair_dbg["agents"].append(dbg_v3)
-                        merged_raw.update(data_v3)
-                    if run_v4:
-                        _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
-                        data_v4, dbg_v4 = _run_agent_and_load_timed(
-                                script_name="agent_v4.py",
-                                env=env,
-                                min_tvl=req.min_tvl,
-                                logs=logs,
-                                pair_suffix=pair_suffix,
-                            )
-                        pair_dbg["agents"].append(dbg_v4)
-                        merged_raw.update(data_v4)
-                pair_dbg["merged_after"] = int(len(merged_raw))
-                pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
-                pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
-                timing_debug["pairs"].append(pair_dbg)
-            timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
+                    pair_dbg["agents"].append(dbg_v4)
+                    merged_raw.update(data_v4)
+            pair_dbg["merged_after"] = int(len(merged_raw))
+            pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
+            pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
+            timing_debug["pairs"].append(pair_dbg)
+        timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
 
         # Keep only pools that really match requested pairs.
         # Protects against occasional cross-token resolution artifacts (e.g. POL instead of ETH).
         t_filter0 = time.perf_counter()
         if requested_pair_keys:
-            merged_raw = {
-                k: v
-                for k, v in merged_raw.items()
-                if (_pair_label_key(str(v.get("pair") or "")) in requested_pair_keys)
-            }
+            filtered_raw: dict[str, dict] = {}
+            unresolved_pair_count = 0
+            dropped_pair_mismatch = 0
+            for k, v in merged_raw.items():
+                pair_key = _pair_label_key(str(v.get("pair") or ""))
+                if pair_key is None:
+                    # Keep unresolved pair labels to avoid silent pool loss.
+                    unresolved_pair_count += 1
+                    filtered_raw[k] = v
+                    continue
+                if pair_key in requested_pair_keys:
+                    filtered_raw[k] = v
+                else:
+                    dropped_pair_mismatch += 1
+            merged_raw = filtered_raw
+            if unresolved_pair_count > 0:
+                logs.append(f"[warn] pair_filter_unresolved_labels={int(unresolved_pair_count)} (kept)")
+            if dropped_pair_mismatch > 0:
+                logs.append(f"[warn] pair_filter_mismatch_dropped={int(dropped_pair_mismatch)}")
         timing_debug["stage_ms"]["pair_filter"] = int(round(max(0.0, time.perf_counter() - t_filter0) * 1000.0))
 
         _set_stage("merge", "Merging results for web", 85)
@@ -17571,7 +17580,6 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 "min_tvl": req.min_tvl,
                 "include_chains": include_chains,
                 "include_versions": include_versions,
-                "speed_mode": speed_mode,
                 "min_fee_pct": req.min_fee_pct,
                 "max_fee_pct": req.max_fee_pct,
                 "exclude_suffixes": req.exclude_suffixes,
@@ -17604,7 +17612,6 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             min_tvl=req.min_tvl,
             days=req.days,
             include_versions=include_versions,
-            speed_mode=speed_mode,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
@@ -17627,7 +17634,6 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             min_tvl=req.min_tvl,
             days=req.days,
             include_versions=include_versions,
-            speed_mode=speed_mode,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
@@ -17635,6 +17641,10 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             error=str(e),
         )
     finally:
+        try:
+            shutil.rmtree(run_output_dir, ignore_errors=True)
+        except Exception:
+            pass
         with JOB_LOCK:
             job["finished_at"] = time.time()
 
@@ -17645,7 +17655,6 @@ class PoolsRunRequest(BaseModel):
     include_versions: list[str] = Field(default_factory=lambda: ["v3", "v4"])
     min_tvl: float = 1000.0
     days: int = 30
-    speed_mode: str = "normal"
     min_fee_pct: float = 0.0
     max_fee_pct: float = 2.0
     exclude_suffixes: list[str] = Field(default_factory=list, description="Exclude pool ids by last 4 chars")
@@ -28270,9 +28279,6 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         raise HTTPException(status_code=400, detail="max_fee_pct must be in range 1..3")
     if req.min_fee_pct >= req.max_fee_pct:
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
-    req.speed_mode = str(req.speed_mode or "normal").strip().lower()
-    if req.speed_mode not in {"normal", "fast"}:
-        raise HTTPException(status_code=400, detail="speed_mode must be normal or fast")
     req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
     req.include_versions = list(dict.fromkeys(req.include_versions))
     if not req.include_versions:
@@ -28293,7 +28299,15 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         cached_result = _run_result_cache_get(cache_key)
         if isinstance(cached_result, dict) and cached_result:
             job_id = str(uuid.uuid4())
+            cached_payload = _json_safe(cached_result)
+            try:
+                flags = dict(cached_payload.get("result_flags") or {})
+                flags["from_cache"] = True
+                cached_payload["result_flags"] = flags
+            except Exception:
+                pass
             with JOB_LOCK:
+                _prune_run_jobs_locked()
                 JOBS[job_id] = {
                     "id": job_id,
                     "status": "done",
@@ -28303,13 +28317,14 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
                     "created_at": time.time(),
                     "started_at": time.time(),
                     "finished_at": time.time(),
-                    "result": _json_safe(cached_result),
+                    "result": cached_payload,
                     "error": None,
                 }
             return {"job_id": job_id}
 
     job_id = str(uuid.uuid4())
     with JOB_LOCK:
+        _prune_run_jobs_locked()
         JOBS[job_id] = {
             "id": job_id,
             "status": "queued",
@@ -28328,6 +28343,7 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str) -> dict[str, Any]:
     with JOB_LOCK:
+        _prune_run_jobs_locked()
         job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -29064,11 +29080,8 @@ HTML_PAGE = """
                   </div>
                 </div>
                 <div class="filter-item">
-                  <div class="hint">Speed<br/>mode</div>
-                  <select id="speedMode">
-                    <option value="normal" selected>Normal</option>
-                    <option value="fast">Fast</option>
-                  </select>
+                  <div class="hint">Coverage<br/>mode</div>
+                  <div class="hint" style="font-weight:700;color:#15803d">Full only</div>
                 </div>
               </div>
             </div>
@@ -29146,7 +29159,7 @@ HTML_PAGE = """
     let sortDesc = true;
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
-    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "speedMode", "allChains", "runIgnoreCache"];
+    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "allChains", "runIgnoreCache"];
     let availableChains = [];
     let colorMap = {};
     let dashMap = {};
@@ -29157,6 +29170,8 @@ HTML_PAGE = """
     let authState = {authenticated: false};
     let hasScanRun = false;
     let scanTicker = null;
+    let activePollTimer = null;
+    let activeJobId = "";
     let scanStartedAt = 0;
     let scanStageLabel = "waiting";
     let scanProgressPct = 0;
@@ -29567,12 +29582,32 @@ HTML_PAGE = """
       el.className = "status " + (cssClass || "");
     }
 
+    async function copyText(value) {
+      const txt = String(value || "").trim();
+      if (!txt) return;
+      try {
+        await navigator.clipboard.writeText(txt);
+        setStatus("Copied", "ok");
+      } catch (e) {
+        setStatus("Copy failed", "fail");
+      }
+    }
+
+    function stopActivePoll() {
+      if (activePollTimer) {
+        clearInterval(activePollTimer);
+        activePollTimer = null;
+      }
+      activeJobId = "";
+    }
+
     function renderPoolRunDebug(result) {
       const el = document.getElementById("poolRunDebug");
       if (!el) return;
       const dbg = (result && typeof result.debug_timing === "object" && result.debug_timing) ? result.debug_timing : null;
+      const flags = (result && typeof result.result_flags === "object" && result.result_flags) ? result.result_flags : {};
       const logs = Array.isArray(result?.logs) ? result.logs.map((x) => String(x || "").trim()).filter(Boolean) : [];
-      if (!dbg && !logs.length) {
+      if (!dbg && !logs.length && !Object.keys(flags).length) {
         el.style.display = "none";
         el.innerHTML = "";
         return;
@@ -29587,6 +29622,12 @@ HTML_PAGE = """
         : null;
       const lines = [];
       lines.push("<b>Pool Fee Performance debug</b>");
+      if (flags?.incomplete_discovery) {
+        lines.push("<span style='color:#b45309;font-weight:800'>warning: incomplete_discovery=1 (result not cached)</span>");
+      }
+      if (flags?.from_cache) {
+        lines.push("<span style='color:#0369a1;font-weight:800'>info: served_from_cache=1</span>");
+      }
       if (dbg) {
         lines.push(`total_ms=${Number(dbg.total_ms || 0)}`);
         if (stagePairs.length) {
@@ -29661,7 +29702,7 @@ HTML_PAGE = """
         const el = document.getElementById("status");
         if (!el) return;
         el.className = "status running";
-        el.innerHTML = `Scanning positions... <span class="status-live-num">${pct}%</span> | ${escAttr(scanStageLabel)} (${escAttr(chainHint)}) · <span class="status-live-num">${elapsed}s</span>`;
+        el.innerHTML = `Scanning pools... <span class="status-live-num">${pct}%</span> | ${escAttr(scanStageLabel)} (${escAttr(chainHint)}) · <span class="status-live-num">${elapsed}s</span>`;
       };
       tick();
       scanTicker = setInterval(tick, 900);
@@ -30133,7 +30174,6 @@ HTML_PAGE = """
           include_versions: getSelectedProtocols(),
           min_tvl: Number(minTvlRaw),
           days: Number(daysRaw),
-          speed_mode: String(document.getElementById("speedMode")?.value || "normal").trim().toLowerCase(),
           max_fee_pct: Number(maxFeeRaw),
           min_fee_pct: Number(minFeeRaw),
           ignore_cache: !!document.getElementById("runIgnoreCache")?.checked,
@@ -30160,10 +30200,6 @@ HTML_PAGE = """
         }
         if (payload.min_fee_pct >= payload.max_fee_pct) {
           setStatus("Exclude below must be lower than Exclude above.", "fail");
-          return;
-        }
-        if (!["normal", "fast"].includes(payload.speed_mode)) {
-          setStatus("Speed mode must be Normal or Fast.", "fail");
           return;
         }
         if (!pairCheck.valid) {
