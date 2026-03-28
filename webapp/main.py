@@ -28925,6 +28925,7 @@ HTML_PAGE = """
             <div id="feesChart" class="plot"></div>
             <div id="tvlChart" class="plot"></div>
           </div>
+          <div id="poolRunDebug" class="info-box" style="display:none"></div>
         </div>
       </section>
 
@@ -29392,6 +29393,48 @@ HTML_PAGE = """
       const el = document.getElementById("status");
       el.textContent = text;
       el.className = "status " + (cssClass || "");
+    }
+
+    function renderPoolRunDebug(result) {
+      const el = document.getElementById("poolRunDebug");
+      if (!el) return;
+      const dbg = (result && typeof result.debug_timing === "object" && result.debug_timing) ? result.debug_timing : null;
+      const logs = Array.isArray(result?.logs) ? result.logs.map((x) => String(x || "").trim()).filter(Boolean) : [];
+      if (!dbg && !logs.length) {
+        el.style.display = "none";
+        el.innerHTML = "";
+        return;
+      }
+      const stage = (dbg && typeof dbg.stage_ms === "object" && dbg.stage_ms) ? dbg.stage_ms : {};
+      const stagePairs = Object.entries(stage)
+        .filter(([k, v]) => String(k || "") && Number.isFinite(Number(v)))
+        .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
+      const pairs = Array.isArray(dbg?.pairs) ? dbg.pairs : [];
+      const slowPair = pairs.length
+        ? pairs.slice().sort((a, b) => Number(b?.total_ms || 0) - Number(a?.total_ms || 0))[0]
+        : null;
+      const lines = [];
+      lines.push("<b>Pool Fee Performance debug</b>");
+      if (dbg) {
+        lines.push(`total_ms=${Number(dbg.total_ms || 0)}`);
+        if (stagePairs.length) {
+          lines.push(`stage_ms: ${stagePairs.map(([k, v]) => `${k}=${Number(v || 0)}`).join(" | ")}`);
+        }
+        if (slowPair) {
+          lines.push(`slowest_pair: ${escAttr(String(slowPair?.pair || "-"))} ${Number(slowPair?.total_ms || 0)}ms`);
+          const agents = Array.isArray(slowPair?.agents) ? slowPair.agents : [];
+          if (agents.length) {
+            lines.push(
+              `slow_pair_agents: ${agents.map((a) => `${escAttr(String(a?.script || "-"))}=${Number(a?.total_ms || 0)}ms (subprocess=${Number(a?.subprocess_ms || 0)}ms, pools=${Number(a?.pools_loaded || 0)})`).join(" | ")}`
+            );
+          }
+        }
+      }
+      if (logs.length) {
+        lines.push(`logs: ${logs.map((x) => escAttr(x)).join(" || ")}`);
+      }
+      el.innerHTML = lines.join("<br/>");
+      el.style.display = "";
     }
 
     function setHomeSectionCollapsed(key, collapsed) {
@@ -29896,6 +29939,7 @@ HTML_PAGE = """
 
     async function runJob() {
       try {
+        renderPoolRunDebug(null);
         const pairCheck = validatePairs();
         const minTvlRaw = String(document.getElementById("minTvl").value ?? "").trim();
         const daysRaw = String(document.getElementById("days").value ?? "").trim();
@@ -30055,6 +30099,7 @@ HTML_PAGE = """
         return {...r, apy_pct: apyPct};
       });
       redrawCharts();
+      renderPoolRunDebug(result);
       sortKey = "final_income";
       sortDesc = true;
       sortBy("final_income");
