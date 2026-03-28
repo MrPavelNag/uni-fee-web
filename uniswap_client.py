@@ -160,11 +160,11 @@ def query_pools_containing_both_tokens(
     result = []
 
     query_tmpl = """
-    query Pools($minTvl: BigDecimal!, $skip: Int!) {
+    query Pools($skip: Int!) {
       pools0: pools(
         first: 100,
         skip: $skip,
-        where: { token0: "%s", token1: "%s", totalValueLockedUSD_gte: $minTvl },
+        where: { token0: "%s", token1: "%s" },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
@@ -177,7 +177,7 @@ def query_pools_containing_both_tokens(
       pools1: pools(
         first: 100,
         skip: $skip,
-        where: { token0: "%s", token1: "%s", totalValueLockedUSD_gte: $minTvl },
+        where: { token0: "%s", token1: "%s" },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
@@ -190,6 +190,7 @@ def query_pools_containing_both_tokens(
     }
     """
     query = query_tmpl % (token_a, token_b, token_b, token_a)
+    min_tvl_num = float(min_tvl or 0.0)
     try:
         discovery_retries = max(1, int(os.environ.get("GRAPHQL_DISCOVERY_RETRIES", "1")))
     except Exception:
@@ -199,13 +200,22 @@ def query_pools_containing_both_tokens(
         data = graphql_query(
             endpoint,
             query,
-            {"minTvl": str(min_tvl), "skip": skip},
+            {"skip": skip},
             retries=discovery_retries,
         )
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])
-        result.extend(p0)
-        result.extend(p1)
+        combined = list(p0 or []) + list(p1 or [])
+        if min_tvl_num > 0:
+            filtered = []
+            for p in combined:
+                try:
+                    if float((p or {}).get("totalValueLockedUSD") or 0.0) >= min_tvl_num:
+                        filtered.append(p)
+                except Exception:
+                    continue
+            combined = filtered
+        result.extend(combined)
         if int(max_results or 0) > 0 and len(result) >= int(max_results):
             return _sort_pools_by_tvl_desc(result)[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
@@ -231,11 +241,11 @@ def query_pools_by_token_symbols(
         return []
     result = []
     query_tmpl = """
-    query PoolsBySymbols($minTvl: BigDecimal!, $skip: Int!) {
+    query PoolsBySymbols($skip: Int!) {
       pools0: pools(
         first: 100,
         skip: $skip,
-        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl },
+        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
@@ -248,7 +258,7 @@ def query_pools_by_token_symbols(
       pools1: pools(
         first: 100,
         skip: $skip,
-        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl },
+        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
@@ -261,6 +271,7 @@ def query_pools_by_token_symbols(
     }
     """
     query = query_tmpl % (sa, sb, sb, sa)
+    min_tvl_num = float(min_tvl or 0.0)
     try:
         discovery_retries = max(1, int(os.environ.get("GRAPHQL_DISCOVERY_RETRIES", "1")))
     except Exception:
@@ -270,13 +281,22 @@ def query_pools_by_token_symbols(
         data = graphql_query(
             endpoint,
             query,
-            {"minTvl": str(min_tvl), "skip": skip},
+            {"skip": skip},
             retries=discovery_retries,
         )
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])
-        result.extend(p0)
-        result.extend(p1)
+        combined = list(p0 or []) + list(p1 or [])
+        if min_tvl_num > 0:
+            filtered = []
+            for p in combined:
+                try:
+                    if float((p or {}).get("totalValueLockedUSD") or 0.0) >= min_tvl_num:
+                        filtered.append(p)
+                except Exception:
+                    continue
+            combined = filtered
+        result.extend(combined)
         if int(max_results or 0) > 0 and len(result) >= int(max_results):
             return _sort_pools_by_tvl_desc(result)[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
