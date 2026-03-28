@@ -17003,6 +17003,8 @@ def _merge_for_web(
     rows = []
     chart_series = []
     filtered_out = 0
+    filtered_fee_range = 0
+    filtered_suffix = 0
     default_visible = 0
     for pool_id, v in all_items:
         fees = v.get("fees") or []
@@ -17015,6 +17017,10 @@ def _merge_for_web(
             status = "filtered_fee_range"
         if status != "ok":
             filtered_out += 1
+            if status == "filtered_fee_range":
+                filtered_fee_range += 1
+            elif status == "filtered_suffix":
+                filtered_suffix += 1
         row = {
             "pool_id": v.get("pool_id", pool_id),
             "chain": v.get("chain", ""),
@@ -17048,6 +17054,8 @@ def _merge_for_web(
         "total": len(merged),
         "chart_pools": default_visible,
         "error_pools": filtered_out,
+        "filtered_fee_range": filtered_fee_range,
+        "filtered_suffix": filtered_suffix,
         "rows": rows,
         "series": chart_series,
     }
@@ -18644,6 +18652,7 @@ def _render_positions_page() -> str:
     .section-body.collapsed { display:none; }
     .copy-btn {
       border: none !important;
+      border-radius: 0 !important;
       background: transparent !important;
       outline: none !important;
       box-shadow: none !important;
@@ -18652,6 +18661,8 @@ def _render_positions_page() -> str:
       color: #2563eb;
       cursor: pointer;
       font-size: 13px;
+      min-width: 0;
+      height: auto;
       padding: 0 0 0 4px;
       line-height: 1;
     }
@@ -28708,7 +28719,7 @@ HTML_PAGE = """
     }
     .status {
       font-size: 17px;
-      font-weight: 600;
+      font-weight: 400;
       color: #111111;
       display: inline-block;
       width: auto;
@@ -29078,10 +29089,6 @@ HTML_PAGE = """
                     <label><input id="protoV3" type="checkbox" checked/> V3</label>
                     <label><input id="protoV4" type="checkbox" checked/> V4</label>
                   </div>
-                </div>
-                <div class="filter-item">
-                  <div class="hint">Coverage<br/>mode</div>
-                  <div class="hint" style="font-weight:700;color:#15803d">Full only</div>
                 </div>
               </div>
             </div>
@@ -29723,6 +29730,7 @@ HTML_PAGE = """
     }
 
     function scanElapsedSecFromJob(job) {
+      if (job?.result?.result_flags?.from_cache) return 0;
       const dbg = (job && job.result && typeof job.result.debug_timing === "object" && job.result.debug_timing) ? job.result.debug_timing : null;
       const totalMs = Number(dbg?.total_ms || 0);
       if (totalMs > 0) return Math.max(0, Math.round(totalMs / 1000));
@@ -29755,6 +29763,7 @@ HTML_PAGE = """
           chart_pools: Number(result.chart_pools || 0),
           error_pools: Number(result.error_pools || 0),
           request: result.request || {},
+          result_flags: (result && typeof result.result_flags === "object") ? result.result_flags : {},
           rows: Array.isArray(result.rows) ? result.rows : [],
           series: Array.isArray(result.series) ? result.series : [],
         };
@@ -30044,7 +30053,7 @@ HTML_PAGE = """
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
         html += `<td>${r.pair}</td>`;
-        html += `<td class="mono">${escAttr(poolIdDisplay)}<button class='copy-btn' type='button' data-copy="${escAttr(poolIdRaw)}" onclick="copyText(this.dataset.copy || '')" title='Copy pool id'>⧉</button></td>`;
+        html += `<td class="mono">${escAttr(poolIdDisplay)}<button class='copy-btn' style="border:none;background:transparent;box-shadow:none;outline:none;padding:0 0 0 4px;color:#2563eb" type='button' data-copy="${escAttr(poolIdRaw)}" onclick="copyText(this.dataset.copy || '')" title='Copy pool id'>⧉</button></td>`;
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
@@ -30158,6 +30167,7 @@ HTML_PAGE = """
 
     async function runJob() {
       try {
+        stopActivePoll();
         renderPoolRunDebug(null);
         const pairCheck = validatePairs();
         const minTvlRaw = String(document.getElementById("minTvl").value ?? "").trim();
@@ -30219,6 +30229,7 @@ HTML_PAGE = """
         const parsed = await parseApiJsonSafe(r);
         const data = parsed.data || {};
         if (!r.ok) {
+          stopActivePoll();
           stopScanTicker();
           setBusy(false);
           const raw = String(parsed.rawText || "").replace(/\s+/g, " ").trim();
@@ -30229,6 +30240,7 @@ HTML_PAGE = """
           return;
         }
         if (!String(data?.job_id || "").trim()) {
+          stopActivePoll();
           stopScanTicker();
           setBusy(false);
           setStatus("Error: backend returned empty job id", "fail");
@@ -30236,6 +30248,7 @@ HTML_PAGE = """
         }
         pollJob(data.job_id);
       } catch (e) {
+        stopActivePoll();
         stopScanTicker();
         setBusy(false);
         setStatus("Frontend error: " + (e?.message || "unknown"), "fail");
@@ -30243,43 +30256,71 @@ HTML_PAGE = """
     }
 
     async function pollJob(jobId) {
-      const timer = setInterval(async () => {
-        const r = await fetch("/api/jobs/" + jobId, {headers: {"Accept":"application/json"}});
-        const parsed = await parseApiJsonSafe(r);
-        const job = parsed.data || {};
-        if (!r.ok) {
-          clearInterval(timer);
+      stopActivePoll();
+      activeJobId = String(jobId || "");
+      const tick = async () => {
+        try {
+          if (!activeJobId || activeJobId !== String(jobId || "")) return;
+          const r = await fetch("/api/jobs/" + jobId, {headers: {"Accept":"application/json"}});
+          const parsed = await parseApiJsonSafe(r);
+          const job = parsed.data || {};
+          if (!r.ok) {
+            stopActivePoll();
+            stopScanTicker();
+            hasScanRun = true;
+            setBusy(false);
+            const raw = String(parsed.rawText || "").replace(/\s+/g, " ").trim();
+            const det = String(job.detail || job.message || "");
+            const isHtml = raw.startsWith("<!DOCTYPE") || raw.startsWith("<html") || raw.startsWith("<");
+            setStatus("Failed: " + (det || (isHtml ? "server returned HTML instead of JSON" : "job status request failed")), "fail");
+            return;
+          }
+          updateProgress(job.progress, job.stage_label || job.stage);
+          if (job.status === "done") {
+            const elapsedSec = scanElapsedSecFromJob(job);
+            stopActivePoll();
+            stopScanTicker();
+            hasScanRun = true;
+            setBusy(false);
+            const fromCache = !!job?.result?.result_flags?.from_cache || String(job?.stage_label || "").toLowerCase().includes("cache");
+            const incomplete = !!job?.result?.result_flags?.incomplete_discovery;
+            if (fromCache) {
+              setStatus("Completed (cache)", "ok");
+            } else if (incomplete) {
+              setStatus(`Completed in ${elapsedSec}s (warning: incomplete discovery)`, "fail");
+            } else {
+              setStatus(`Completed in ${elapsedSec}s`, "ok");
+            }
+            renderResult(job.result);
+          } else if (job.status === "failed") {
+            stopActivePoll();
+            stopScanTicker();
+            hasScanRun = true;
+            setBusy(false);
+            setStatus("Failed: " + (job.error || "unknown"), "fail");
+            renderPoolRunDebug(job.result || null);
+          } else {
+            scanStageLabel = String(job.stage_label || job.status || "running");
+          }
+        } catch (e) {
+          stopActivePoll();
           stopScanTicker();
           hasScanRun = true;
           setBusy(false);
-          const raw = String(parsed.rawText || "").replace(/\s+/g, " ").trim();
-          const det = String(job.detail || job.message || "");
-          const isHtml = raw.startsWith("<!DOCTYPE") || raw.startsWith("<html") || raw.startsWith("<");
-          setStatus("Failed: " + (det || (isHtml ? "server returned HTML instead of JSON" : "job status request failed")), "fail");
-          return;
+          setStatus("Failed: job polling error", "fail");
         }
-        updateProgress(job.progress, job.stage_label || job.stage);
-        if (job.status === "done") {
-          const elapsedSec = scanElapsedSecFromJob(job);
-          clearInterval(timer);
-          stopScanTicker();
-          hasScanRun = true;
-          setBusy(false);
-          setStatus(`Completed in ${elapsedSec}s`, "ok");
-          renderResult(job.result);
-        } else if (job.status === "failed") {
-          clearInterval(timer);
-          stopScanTicker();
-          hasScanRun = true;
-          setBusy(false);
-          setStatus("Failed: " + (job.error || "unknown"), "fail");
-        } else {
-          scanStageLabel = String(job.stage_label || job.status || "running");
-        }
-      }, 2000);
+      };
+      await tick();
+      if (activeJobId === String(jobId || "")) {
+        activePollTimer = setInterval(tick, 2000);
+      }
     }
 
     function renderResult(result) {
+      if (!result || typeof result !== "object") {
+        renderPoolRunDebug(null);
+        return;
+      }
       const mSuffix = document.getElementById("mSuffix");
       const mTotal = document.getElementById("mTotal");
       const mChart = document.getElementById("mChart");
@@ -30352,7 +30393,13 @@ HTML_PAGE = """
         hasScanRun = true;
         setBusy(false);
         renderResult(cached);
-        setStatus("Restored last result", "ok");
+        if (cached?.result_flags?.incomplete_discovery) {
+          setStatus("Restored last result (warning: incomplete discovery)", "fail");
+        } else if (cached?.result_flags?.from_cache) {
+          setStatus("Restored last result (cache)", "ok");
+        } else {
+          setStatus("Restored last result", "ok");
+        }
       }
     });
   </script>

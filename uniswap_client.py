@@ -196,7 +196,6 @@ def query_pools_containing_both_tokens(
             endpoint,
             query,
             {"minTvl": str(min_tvl), "skip": skip},
-            retries=1,  # fallback path: fail fast on bad indexers
         )
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])
@@ -413,18 +412,36 @@ def query_pool_day_data_batch(
         active = list(chunk)
         skip = 0
         while active:
-            query, alias_map = _build_query(active)
-            data = graphql_query(endpoint, query, {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)})
-            payload = data.get("data", {}) if isinstance(data, dict) else {}
             next_active: list[str] = []
-            for alias, pid in alias_map.items():
-                items = payload.get(alias, []) if isinstance(payload, dict) else []
-                if not isinstance(items, list):
-                    items = []
-                if items:
-                    out[pid].extend(items)
-                if len(items) >= 100:
-                    next_active.append(pid)
+            try:
+                query, alias_map = _build_query(active)
+                data = graphql_query(endpoint, query, {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)})
+                payload = data.get("data", {}) if isinstance(data, dict) else {}
+                for alias, pid in alias_map.items():
+                    items = payload.get(alias, []) if isinstance(payload, dict) else []
+                    if not isinstance(items, list):
+                        items = []
+                    if items:
+                        out[pid].extend(items)
+                    if len(items) >= 100:
+                        next_active.append(pid)
+            except Exception:
+                # Degrade gracefully: isolate failing pool(s) instead of dropping entire batch.
+                for pid in list(active):
+                    try:
+                        q1, alias1 = _build_query([pid])
+                        d1 = graphql_query(endpoint, q1, {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)})
+                        p1 = d1.get("data", {}) if isinstance(d1, dict) else {}
+                        alias = next(iter(alias1.keys())) if alias1 else "p0"
+                        items = p1.get(alias, []) if isinstance(p1, dict) else []
+                        if not isinstance(items, list):
+                            items = []
+                        if items:
+                            out[pid].extend(items)
+                        if len(items) >= 100:
+                            next_active.append(pid)
+                    except Exception:
+                        continue
             if not next_active:
                 break
             active = next_active
