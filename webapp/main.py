@@ -18528,6 +18528,10 @@ def _render_positions_page() -> str:
       line-height: 1.35;
       vertical-align: middle;
     }
+    .status-live-num {
+      color: #15803d;
+      font-weight: 800;
+    }
     .table-wrap {
       overflow-x:auto;
       -webkit-overflow-scrolling: touch;
@@ -18809,7 +18813,7 @@ def _render_positions_page() -> str:
       </section>
       <section class="result-card">
         <div class="section-head">
-          <h3>Fee calculation</h3>
+          <h3>Position Fee calculation</h3>
           <div class="section-actions">
             <span class="pos-status" id="posFeeStatus">Select History checkboxes, then run chart</span>
             <label class="fee-toggle-pill" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
@@ -18912,6 +18916,7 @@ def _render_positions_page() -> str:
     let posHeavyHasScannedOnce = false;
     let posHeavyLastStatusText = "";
     let posHeavyLastStatusErr = false;
+    let posHeavyLastStatusLive = false;
     const posHistorySelected = new Set();
     const POS_RESULTS_STORAGE_KEY = "positions_scan_results_v1";
     const POS_CLOSED_BG_ENRICH_KEY = "positions_v3_closed_bg_enrich_v1";
@@ -19174,6 +19179,7 @@ def _render_positions_page() -> str:
     let posScanPlannedOwnerChainTotal = 0;
     let posLastStatusText = "";
     let posLastStatusErr = false;
+    let posLastStatusLive = false;
     let posAutoWarmupTimer = null;
     let posAutoWarmupInFlight = false;
     let posClosedBgEnrichInFlight = false;
@@ -19371,6 +19377,24 @@ def _render_positions_page() -> str:
         posStatusRuntimeTimer = null;
       }
     }
+    function statusLiveMarkup(text) {
+      const safe = esc(String(text || ""));
+      let out = safe.replace(/(\d+(?:\.\d+)?)%/g, '<span class="status-live-num">$1%</span>');
+      out = out.replace(/(\d+(?:\.\d+)?)s\b/g, '<span class="status-live-num">$1s</span>');
+      return out;
+    }
+    function applyStatusText(el, text, isErr, normalColor, liveMode) {
+      if (!el) return;
+      const raw = String(text || "");
+      const err = !!isErr;
+      const live = !!liveMode && !err;
+      if (live) {
+        el.innerHTML = statusLiveMarkup(raw);
+      } else {
+        el.textContent = raw;
+      }
+      el.style.color = err ? "#b91c1c" : String(normalColor || "#475569");
+    }
     function renderPosStatus() {
       const el = document.getElementById("posStatus");
       if (!el) return;
@@ -19387,11 +19411,12 @@ def _render_positions_page() -> str:
       const full = parts.length ? (base ? `${base} | ${parts.join(" | ")}` : parts.join(" | ")) : base;
       const nextText = String(full || "");
       const nextErr = !!posStatusBaseErr;
-      if (nextText === posLastStatusText && nextErr === posLastStatusErr) return;
+      const nextLive = Object.values(posStatusLanes || {}).some((x) => !!x && !!x.running);
+      if (nextText === posLastStatusText && nextErr === posLastStatusErr && nextLive === !!posLastStatusLive) return;
       posLastStatusText = nextText;
       posLastStatusErr = nextErr;
-      el.textContent = nextText;
-      el.style.color = nextErr ? "#b91c1c" : "#475569";
+      posLastStatusLive = !!nextLive;
+      applyStatusText(el, nextText, nextErr, "#475569", nextLive);
     }
     function startPosStatusLane(name) {
       const lane = posStatusLanes[name];
@@ -19490,11 +19515,12 @@ def _render_positions_page() -> str:
       if (!el) return;
       const nextText = String(text || "");
       const nextErr = !!isErr;
-      if (nextText === posHeavyLastStatusText && nextErr === posHeavyLastStatusErr) return;
+      const nextLive = !!posHeavyScanInProgress;
+      if (nextText === posHeavyLastStatusText && nextErr === posHeavyLastStatusErr && nextLive === !!posHeavyLastStatusLive) return;
       posHeavyLastStatusText = nextText;
       posHeavyLastStatusErr = nextErr;
-      el.textContent = nextText;
-      el.style.color = nextErr ? "#b91c1c" : "#475569";
+      posHeavyLastStatusLive = !!nextLive;
+      applyStatusText(el, nextText, nextErr, "#475569", nextLive);
     }
     function setHeavyBusy(flag) {
       const el = document.getElementById("posHeavyProgress");
@@ -19571,8 +19597,7 @@ def _render_positions_page() -> str:
       const el = document.getElementById("posFeeStatus");
       if (!el) return;
       el.classList.remove("fee-status-bar");
-      el.textContent = String(text || "");
-      el.style.color = isErr ? "#b91c1c" : "#475569";
+      applyStatusText(el, String(text || ""), !!isErr, "#475569", false);
     }
     function feeStatusPill(label, value, tone = "info") {
       const l = esc(String(label || "").trim());
@@ -19583,7 +19608,7 @@ def _render_positions_page() -> str:
       const el = document.getElementById("posFeeStatus");
       if (!el) return;
       const state = String(opts.state || "info").toLowerCase();
-      const title = String(opts.title || "Fee calculation");
+      const title = String(opts.title || "Position Fee calculation");
       const selected = Number(opts.selected || 0);
       const withData = Number(opts.withData || 0);
       const collected = Number(opts.collected || 0);
@@ -19607,8 +19632,7 @@ def _render_positions_page() -> str:
         if (stage) parts.push(stage);
         if (selected > 0) parts.push(`rows ${withData}/${selected}`);
         el.classList.remove("fee-status-bar");
-        el.style.color = "#475569";
-        el.textContent = parts.join(" | ");
+        applyStatusText(el, parts.join(" | "), false, "#475569", true);
         return;
       }
       parts.push(`${title}: ${msg || (state === "ok" ? "Done" : (state === "warn" ? "Partial" : "Error"))}`);
@@ -19618,15 +19642,15 @@ def _render_positions_page() -> str:
       if (missing > 0) parts.push(`missing ${Math.max(0, missing)}`);
       if (elapsedSec > 0) parts.push(`${Math.round(elapsedSec)}s`);
       el.classList.remove("fee-status-bar");
-      el.style.color = state === "error" ? "#b91c1c" : (state === "warn" ? "#92400e" : "#475569");
-      el.textContent = parts.join(" | ");
+      const isErr = state === "error";
+      const normalColor = state === "warn" ? "#92400e" : "#475569";
+      applyStatusText(el, parts.join(" | "), isErr, normalColor, false);
     }
     function setPosHistoryStatus(text, isErr) {
       const el = document.getElementById("posHistoryStatus");
       if (!el) return;
       el.classList.remove("fee-status-bar");
-      el.textContent = text || "";
-      el.style.color = isErr ? "#b91c1c" : "#475569";
+      applyStatusText(el, String(text || ""), !!isErr, "#475569", false);
     }
     function setPosHistoryStatusBar(opts = {}) {
       const el = document.getElementById("posHistoryStatus");
@@ -19650,8 +19674,10 @@ def _render_positions_page() -> str:
       if (benchmark > 0) parts.push(`benchmark ${benchmark}`);
       if (msg) parts.push(msg);
       el.classList.remove("fee-status-bar");
-      el.style.color = state === "error" ? "#b91c1c" : (state === "warn" ? "#92400e" : "#475569");
-      el.textContent = parts.join(" | ");
+      const isErr = state === "error";
+      const normalColor = state === "warn" ? "#92400e" : "#475569";
+      const isLive = state === "loading";
+      applyStatusText(el, parts.join(" | "), isErr, normalColor, isLive);
     }
     async function startBackgroundWarmup(reason = "auto") {
       if (posAutoWarmupInFlight) return;
@@ -21041,6 +21067,7 @@ def _render_positions_page() -> str:
           rowsWithCollected += 1;
           const lineX = [];
           const lineY = [];
+          const lineHover = [];
           const collectedPointX = [];
           const collectedPointY = [];
           const collectedPointText = [];
@@ -21059,6 +21086,7 @@ def _render_positions_page() -> str:
           if (anchorMs > 0) {
             lineX.push(new Date(anchorMs));
             lineY.push(0);
+            lineHover.push(`${new Date(anchorMs).toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"})}<br>$0.00<br>Liquidity: ${String(liqHover)}`);
           }
           for (const it of collectedSorted) {
             const ts = Number(it?.ts || 0);
@@ -21076,7 +21104,9 @@ def _render_positions_page() -> str:
             const aprDays = Number(aprMeta?.days || 0);
             const aprText = (showAprLabels && aprPct > 0) ? `<b>${aprPct.toFixed(1)}%</b>` : "";
             collectedPointText.push(aprText);
-            collectedPointHover.push(formatCollectedHover({dt, val, aprPct, feeDeltaUsd, liqUsd, aprDays, liqHover}));
+            const htxt = formatCollectedHover({dt, val, aprPct, feeDeltaUsd, liqUsd, aprDays, liqHover});
+            collectedPointHover.push(htxt);
+            lineHover.push(htxt);
           }
           if (hasSnapshot) {
             const snapLast = snapshotSorted.length ? snapshotSorted[snapshotSorted.length - 1] : null;
@@ -21084,18 +21114,41 @@ def _render_positions_page() -> str:
             const snapVal = Number(snapLast?.fees_usd || 0);
             if (snapTs > 0) {
               const lastCollected = lineY.length ? Number(lineY[lineY.length - 1] || 0) : 0;
-              lineX.push(new Date(snapTs * 1000));
-              lineY.push(Math.max(0, lastCollected + Math.max(0, snapVal)));
+              const snapDt = new Date(snapTs * 1000);
+              const snapMarkerVal = Math.max(0, lastCollected + Math.max(0, snapVal));
+              lineX.push(snapDt);
+              lineY.push(snapMarkerVal);
+              const snapAprMeta = aprByTs.get(snapTs);
+              const snapAprPct = Number(snapAprMeta?.aprPct || 0);
+              const snapFeeDelta = Number(snapAprMeta?.feeDelta || 0);
+              const snapLiqUsd = Number(snapAprMeta?.liquidityUsd || 0);
+              const snapAprDays = Number(snapAprMeta?.days || 0);
+              lineHover.push(formatCollectedHover({
+                dt: snapDt,
+                val: snapMarkerVal,
+                aprPct: snapAprPct,
+                feeDeltaUsd: snapFeeDelta > 0 ? snapFeeDelta : snapVal,
+                liqUsd: snapLiqUsd,
+                aprDays: snapAprDays,
+                liqHover,
+              }));
             }
           }
           const useLineX = lineX.length ? lineX : collectedItems.map((x) => new Date(Number(x.ts || 0) * 1000));
           const useLineY = lineY.length ? lineY : collectedItems.map((x) => Number(x.fees_usd || 0));
+          const useLineHover = lineHover.length === useLineX.length
+            ? lineHover
+            : useLineX.map((dt, idx) => {
+              const val = Number(useLineY[idx] || 0);
+              return `${dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"})}<br>$${val.toFixed(2)}<br>Liquidity: ${String(liqHover)}`;
+            });
           if (useLineX.length === 1) {
             const onlyTs = Number(useLineX[0]?.getTime?.() || 0);
             const anchorTs = (createdMs > 0 && createdMs < onlyTs) ? createdMs : Math.max(0, onlyTs - 86400000);
             if (anchorTs > 0) {
               useLineX.unshift(new Date(anchorTs));
               useLineY.unshift(0);
+              useLineHover.unshift(`${new Date(anchorTs).toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"})}<br>$0.00<br>Liquidity: ${String(liqHover)}`);
             }
           }
           const singleCollectedPoint = useLineX.length === 1;
@@ -21106,7 +21159,8 @@ def _render_positions_page() -> str:
             line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
             marker: singleCollectedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
             name: `${legendBaseLabel} (today USD)`,
-            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
+            hovertemplate: "%{hovertext}<extra></extra>",
+            hovertext: useLineHover,
             _forceToday: rowIsSpotOnly,
             _legendPairBase: legendBase,
             _legendHeader: legendBaseLabel,
@@ -21281,7 +21335,7 @@ def _render_positions_page() -> str:
           const stageIdx = Math.min(stages.length - 1, Math.floor((pct / 100) * stages.length));
           setPosFeeStatusBar({
             state: "loading",
-            title: "Fee calculation",
+            title: "Position Fee calculation",
             selected: selected.length,
             withData: 0,
             progress: pct,
@@ -21314,7 +21368,7 @@ def _render_positions_page() -> str:
           stopFeeStatusTimer();
           chartEl.innerHTML = "<div class='hint'>No valid selected rows for fee data.</div>";
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
-          setPosFeeStatusBar({state: "error", title: "Fee calculation", message: "No valid selected rows", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
+          setPosFeeStatusBar({state: "error", title: "Position Fee calculation", message: "No valid selected rows", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
 
@@ -21342,7 +21396,7 @@ def _render_positions_page() -> str:
           stopFeeStatusTimer();
           const det = (data && (data.detail || data.message)) ? String(data.detail || data.message) : res.status;
           chartEl.innerHTML = `<div class='hint'>Failed to load compare data: ${esc(det)}</div>`;
-          setPosFeeStatusBar({state: "error", title: "Fee calculation", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
+          setPosFeeStatusBar({state: "error", title: "Position Fee calculation", message: `Failed to load compare data: ${det}`, selected: rowsPayload.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
           return;
         }
 
@@ -21395,7 +21449,7 @@ def _render_positions_page() -> str:
           renderFeeDiagnosticsBlock(debugEl, diag, rowStatuses, apiFailTop, backendHints);
           setPosFeeStatusBar({
             state: "warn",
-            title: "Fee calculation",
+            title: "Position Fee calculation",
             message: `No fee data · ${reasonLine}`,
             selected: Number(diag.selected || 0),
             withData: 0,
@@ -21471,7 +21525,7 @@ def _render_positions_page() -> str:
             };
           });
         };
-        const mainTitle = "Collected & Estimated Fees";
+        let mainTitle = "Collected & Estimated Fees";
         let overlayTraces = applyFeeTraceStyleByPair(traces, histUsd ? "historical" : "today", 1.0);
         if (histUsd) {
           try {
@@ -21495,7 +21549,8 @@ def _render_positions_page() -> str:
                 estimated_items: [],
                 // Keep current unclaimed snapshot so "today USD" reaches the latest point.
                 snapshot_items: Array.isArray(r?.snapshot_items) ? r.snapshot_items : [],
-                apr_items: [],
+                // Keep APR/day metadata so hover fields match "if sold instantly" set.
+                apr_items: Array.isArray(r?.apr_items) ? r.apr_items : [],
                 legend_fee_total_usd: Math.max(
                   0,
                   Number(lastFeePoint(r?.alt_collected_items)?.fees_usd || 0) + Number(lastFeePoint(r?.snapshot_items)?.fees_usd || 0),
@@ -21575,8 +21630,25 @@ def _render_positions_page() -> str:
                 ? (headerShown ? label : `${header} · ${label}`)
                 : String(t.name || "");
               if (firstOfType && !headerShown) headerShown = true;
+              const tMode = String(t?.mode || "");
+              const modeHasLines = tMode.includes("lines");
+              const markerIn = (t && typeof t.marker === "object" && t.marker) ? t.marker : {};
+              const lineColor = String((t?.line && t.line.color) || markerIn.color || "#2563eb");
+              const legendMode = (showLegend && modeHasLines && !tMode.includes("markers"))
+                ? "lines+markers"
+                : tMode;
               out.push({
                 ...t,
+                mode: legendMode,
+                marker: (showLegend && modeHasLines)
+                  ? {
+                      ...markerIn,
+                      symbol: "square",
+                      size: Math.max(7, Number(markerIn.size || 0) || 7),
+                      color: lineColor,
+                      maxdisplayed: 1,
+                    }
+                  : markerIn,
                 showlegend: showLegend,
                 name: legendName,
                 legendgroup: String(base || "pair"),
@@ -21595,7 +21667,7 @@ def _render_positions_page() -> str:
         const pushFinalFeeStatus = (state, message) => {
           setPosFeeStatusBar({
             state,
-            title: "Fee calculation",
+            title: "Position Fee calculation",
             message,
             selected: Number(diag.selected || 0),
             withData: Number(feeState.rowsWithAnySeries || 0),
@@ -21616,12 +21688,16 @@ def _render_positions_page() -> str:
         if (feeState.hasEstimatedShareTrace && feeState.hasCollectedHistoryTrace) {
           pushFinalFeeStatus(hasPartialRows ? "warn" : "ok", hasPartialRows ? "Partial (some rows timed out/missing)" : "Collected & estimated ready");
         } else if ((feeState.hasEstimatedShareTrace || feeState.hasSnapshotOnlyTrace) && !feeState.hasCollectedHistoryTrace) {
+          mainTitle = "Estimated Fees Only (no real collected fee history)";
+          try {
+            Plotly.relayout("posFeeChart", {title: {text: mainTitle}});
+          } catch (_) {}
           const soldInstantlyNotApplicable = !!histUsd;
           pushFinalFeeStatus(
-            "info",
+            "warn",
             soldInstantlyNotApplicable
-              ? "Ready (if sold instantly N/A: no collected history)"
-              : "Estimate/snapshot only",
+              ? "No real fee data: estimate-only (if sold instantly N/A: no collected history)"
+              : "No real fee data: estimate/snapshot only",
           );
         } else {
           pushFinalFeeStatus(hasPartialRows ? "warn" : "ok", hasPartialRows ? "Partial (some rows timed out/missing)" : "Done");
@@ -21634,7 +21710,7 @@ def _render_positions_page() -> str:
           debugEl.innerHTML = `<b>Debug</b><br/>Unexpected UI error: ${esc(e?.message || "unknown")}`;
           debugEl.style.display = "";
         }
-        setPosFeeStatusBar({state: "error", title: "Fee calculation", message: "Failed to build chart", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
+        setPosFeeStatusBar({state: "error", title: "Position Fee calculation", message: "Failed to build chart", selected: selected.length, withData: 0, elapsedSec: (Date.now() - feeStartedAt) / 1000});
       }
     }
     function normPosSym(v) {
@@ -22854,7 +22930,7 @@ def _render_positions_page() -> str:
         days: getHistoryDays(),
         message: "Cached results restored",
       });
-      setPosFeeStatus("Cache restored — open Fee calculation when ready.", false);
+      setPosFeeStatus("Cache restored — open Position Fee calculation when ready.", false);
     } else {
       updatePosSearchButton();
       setPosStatus("Ready", false);
@@ -26304,6 +26380,49 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["ignore_cache"] = bool(want_ignore_cache)
     debug["rpc_protocol_supported"] = bool(protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"})
     debug["rpc_tokens_ready"] = bool(_is_eth_address(token0) and _is_eth_address(token1))
+    owed0_effective = max(0.0, _safe_float(getattr(req, "fees_owed0", 0.0)))
+    owed1_effective = max(0.0, _safe_float(getattr(req, "fees_owed1", 0.0)))
+    if (
+        owed0_effective <= 0.0
+        and owed1_effective <= 0.0
+        and protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"}
+        and position_ids
+    ):
+        for pid in position_ids[:3]:
+            try:
+                tid = _position_token_id_from_raw(pid)
+                if tid <= 0:
+                    continue
+                snap_owed = _fetch_v3_position_contract_snapshot(
+                    int(chain_id),
+                    str(protocol),
+                    int(tid),
+                    str(req.address or ""),
+                    include_quotes=False,
+                ) or {}
+                if not snap_owed:
+                    continue
+                raw0 = max(0, _parse_int_like(snap_owed.get("tokens_owed0_raw") or 0))
+                raw1 = max(0, _parse_int_like(snap_owed.get("tokens_owed1_raw") or 0))
+                dec0 = _parse_int_like(snap_owed.get("token0_decimals") or 18)
+                dec1 = _parse_int_like(snap_owed.get("token1_decimals") or 18)
+                if dec0 <= 0 or dec0 > 36:
+                    dec0 = 18
+                if dec1 <= 0 or dec1 > 36:
+                    dec1 = 18
+                owed0_snap = float(Decimal(int(raw0)) / (Decimal(10) ** int(dec0))) if raw0 > 0 else 0.0
+                owed1_snap = float(Decimal(int(raw1)) / (Decimal(10) ** int(dec1))) if raw1 > 0 else 0.0
+                if owed0_snap > 0.0 or owed1_snap > 0.0:
+                    owed0_effective = float(max(owed0_effective, owed0_snap))
+                    owed1_effective = float(max(owed1_effective, owed1_snap))
+                    debug["fees_owed_source"] = "position_manager_snapshot_tokens_owed"
+                    break
+            except Exception:
+                continue
+    if not str(debug.get("fees_owed_source") or "").strip():
+        debug["fees_owed_source"] = "row"
+    debug["fees_owed0_effective"] = float(max(0.0, owed0_effective))
+    debug["fees_owed1_effective"] = float(max(0.0, owed1_effective))
 
     # Estimated series requires real pool address. Some catalog rows can carry PM address in pool_id.
     try:
@@ -26918,8 +27037,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         # Build optional snapshot point from current row unclaimed fees (same logic as fallback),
         # so frontend can extend collected path to "now".
         snapshot_items_payload: list[dict[str, Any]] = []
-        owed0_led = max(0.0, _safe_float(getattr(req, "fees_owed0", 0.0)))
-        owed1_led = max(0.0, _safe_float(getattr(req, "fees_owed1", 0.0)))
+        owed0_led = float(max(0.0, owed0_effective))
+        owed1_led = float(max(0.0, owed1_effective))
         if owed0_led > 0.0 or owed1_led > 0.0:
             p0_led = 0.0
             p1_led = 0.0
@@ -27065,8 +27184,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
     debug["pool_flow_collect_points"] = 0
 
     def _row_unclaimed_spot_usd() -> float:
-        owed0_now = max(0.0, _safe_float(getattr(req, "fees_owed0", 0.0)))
-        owed1_now = max(0.0, _safe_float(getattr(req, "fees_owed1", 0.0)))
+        owed0_now = float(max(0.0, owed0_effective))
+        owed1_now = float(max(0.0, owed1_effective))
         if owed0_now <= 0.0 and owed1_now <= 0.0:
             return 0.0
         p0_now = 0.0
@@ -27296,8 +27415,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         })
 
     # Final best-effort fallback: current row unclaimed fees (single point, spot USD).
-    owed0 = max(0.0, _safe_float(getattr(req, "fees_owed0", 0.0)))
-    owed1 = max(0.0, _safe_float(getattr(req, "fees_owed1", 0.0)))
+    owed0 = float(max(0.0, owed0_effective))
+    owed1 = float(max(0.0, owed1_effective))
     debug["row_fees_owed0"] = float(owed0)
     debug["row_fees_owed1"] = float(owed1)
     if owed0 > 0.0 or owed1 > 0.0:
