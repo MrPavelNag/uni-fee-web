@@ -29480,7 +29480,7 @@ HTML_PAGE = """
         const el = document.getElementById("status");
         if (!el) return;
         el.className = "status running";
-        el.innerHTML = `Scanning positions... <span class="status-live-num">${pct}%</span> | ${esc(scanStageLabel)} (${esc(chainHint)}) · ${elapsed}s`;
+        el.innerHTML = `Scanning positions... <span class="status-live-num">${pct}%</span> | ${escAttr(scanStageLabel)} (${escAttr(chainHint)}) · ${elapsed}s`;
       };
       tick();
       scanTicker = setInterval(tick, 900);
