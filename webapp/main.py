@@ -29929,14 +29929,13 @@ HTML_PAGE = """
           ? `${r.pool_id.slice(0, 12)}...${r.pool_id.slice(-8)}`
           : r.pool_id;
         const poolIdRaw = String(r.pool_id || "");
-        const poolIdCopyArg = escAttr(poolIdRaw.replace(/\\/g, "\\\\").replace(/'/g, "\\'"));
         html += `<tr class="${cls}">`;
         html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};"></span></td>`;
         html += `<td><input type="checkbox" data-pool-id="${r.pool_id}" ${visible ? "checked" : ""} ${disabled} onchange="togglePoolVisibility(this)"/></td>`;
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
         html += `<td>${r.pair}</td>`;
-        html += `<td class="mono">${escAttr(poolIdDisplay)}<button class='copy-btn' type='button' onclick="copyText('${poolIdCopyArg}')" title='Copy pool id'>⧉</button></td>`;
+        html += `<td class="mono">${escAttr(poolIdDisplay)}<button class='copy-btn' type='button' data-copy="${escAttr(poolIdRaw)}" onclick="copyText(this.dataset.copy || '')" title='Copy pool id'>⧉</button></td>`;
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
