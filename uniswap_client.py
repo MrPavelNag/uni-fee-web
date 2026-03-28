@@ -190,12 +190,17 @@ def query_pools_containing_both_tokens(
     }
     """
     query = query_tmpl % (token_a, token_b, token_b, token_a)
+    try:
+        discovery_retries = max(1, int(os.environ.get("GRAPHQL_DISCOVERY_RETRIES", "1")))
+    except Exception:
+        discovery_retries = 1
     skip = 0
     while True:
         data = graphql_query(
             endpoint,
             query,
             {"minTvl": str(min_tvl), "skip": skip},
+            retries=discovery_retries,
         )
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])
@@ -256,12 +261,17 @@ def query_pools_by_token_symbols(
     }
     """
     query = query_tmpl % (sa, sb, sb, sa)
+    try:
+        discovery_retries = max(1, int(os.environ.get("GRAPHQL_DISCOVERY_RETRIES", "1")))
+    except Exception:
+        discovery_retries = 1
     skip = 0
     while True:
         data = graphql_query(
             endpoint,
             query,
             {"minTvl": str(min_tvl), "skip": skip},
+            retries=discovery_retries,
         )
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])

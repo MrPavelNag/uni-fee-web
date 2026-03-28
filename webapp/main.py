@@ -17184,6 +17184,7 @@ def _build_run_job_env(
     env["DISABLE_PDF_OUTPUT"] = "1"
     env["DISABLE_DYNAMIC_TOKEN_PERSIST"] = os.environ.get("WEB_DISABLE_DYNAMIC_TOKEN_PERSIST", "1")
     env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "2")
+    env["GRAPHQL_DISCOVERY_RETRIES"] = os.environ.get("WEB_GRAPHQL_DISCOVERY_RETRIES", "1")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL", "8")
     env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "15")
     env["POOL_SERIES_WORKERS"] = os.environ.get("WEB_POOL_SERIES_WORKERS_NORMAL", "8")
@@ -17457,76 +17458,98 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         timing_debug["stage_ms"]["run_lock_wait"] = 0
         t_agents_total0 = time.perf_counter()
         total_pairs = max(1, len(pairs))
-        for idx, (a, b) in enumerate(pairs, start=1):
+        def _run_one_pair(idx: int, a: str, b: str) -> tuple[int, dict[str, Any], dict[str, dict], list[str]]:
             t_pair0 = time.perf_counter()
             pair_str = f"{a},{b}"
             pair_suffix = pairs_to_filename_suffix(pair_str)
-            env["TOKEN_PAIRS"] = pair_str
+            pair_logs: list[str] = []
+            pair_env = dict(env)
+            pair_env["TOKEN_PAIRS"] = pair_str
+            pair_out_dir = run_output_dir / f"pair_{idx}"
+            pair_out_dir.mkdir(parents=True, exist_ok=True)
+            pair_env["RUN_OUTPUT_DIR"] = str(pair_out_dir)
             pair_dbg: dict[str, Any] = {
                 "pair": pair_str,
                 "index": int(idx),
                 "agents": [],
-                "merged_before": int(len(merged_raw)),
+                "merged_before": 0,
             }
-
-            base_progress = int(10 + (idx - 1) * (65 / total_pairs))
+            pair_data: dict[str, dict] = {}
             if run_v3 and run_v4:
-                _set_stage("v3v4", f"Running v3+v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 18))
-
                 with ThreadPoolExecutor(max_workers=2) as ex:
                     f_v3 = ex.submit(
                         _run_agent_and_load_timed,
                         script_name="agent_v3.py",
-                        env=dict(env),
+                        env=dict(pair_env),
                         min_tvl=req.min_tvl,
-                        logs=logs,
+                        logs=pair_logs,
                         pair_suffix=pair_suffix,
-                        run_output_dir=run_output_dir,
+                        run_output_dir=pair_out_dir,
                     )
                     f_v4 = ex.submit(
                         _run_agent_and_load_timed,
                         script_name="agent_v4.py",
-                        env=dict(env),
+                        env=dict(pair_env),
                         min_tvl=req.min_tvl,
-                        logs=logs,
+                        logs=pair_logs,
                         pair_suffix=pair_suffix,
-                        run_output_dir=run_output_dir,
+                        run_output_dir=pair_out_dir,
                     )
                     data_v3, dbg_v3 = f_v3.result()
                     data_v4, dbg_v4 = f_v4.result()
                     pair_dbg["agents"].append(dbg_v3)
                     pair_dbg["agents"].append(dbg_v4)
-                    merged_raw.update(data_v3)
-                    merged_raw.update(data_v4)
+                    pair_data.update(data_v3)
+                    pair_data.update(data_v4)
             else:
                 if run_v3:
-                    _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
                     data_v3, dbg_v3 = _run_agent_and_load_timed(
-                            script_name="agent_v3.py",
-                            env=env,
-                            min_tvl=req.min_tvl,
-                            logs=logs,
-                            pair_suffix=pair_suffix,
-                            run_output_dir=run_output_dir,
-                        )
+                        script_name="agent_v3.py",
+                        env=pair_env,
+                        min_tvl=req.min_tvl,
+                        logs=pair_logs,
+                        pair_suffix=pair_suffix,
+                        run_output_dir=pair_out_dir,
+                    )
                     pair_dbg["agents"].append(dbg_v3)
-                    merged_raw.update(data_v3)
+                    pair_data.update(data_v3)
                 if run_v4:
-                    _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
                     data_v4, dbg_v4 = _run_agent_and_load_timed(
-                            script_name="agent_v4.py",
-                            env=env,
-                            min_tvl=req.min_tvl,
-                            logs=logs,
-                            pair_suffix=pair_suffix,
-                            run_output_dir=run_output_dir,
-                        )
+                        script_name="agent_v4.py",
+                        env=pair_env,
+                        min_tvl=req.min_tvl,
+                        logs=pair_logs,
+                        pair_suffix=pair_suffix,
+                        run_output_dir=pair_out_dir,
+                    )
                     pair_dbg["agents"].append(dbg_v4)
-                    merged_raw.update(data_v4)
+                    pair_data.update(data_v4)
+            pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
+            return idx, pair_dbg, pair_data, pair_logs
+
+        pair_results: list[tuple[int, dict[str, Any], dict[str, dict], list[str]]] = []
+        pair_workers = max(1, min(int(total_pairs), int(os.environ.get("WEB_PAIR_WORKERS", "2"))))
+        _set_stage("pairs", f"Running pairs ({total_pairs})", 12)
+        if total_pairs <= 1 or pair_workers <= 1:
+            idx, (a, b) = 1, pairs[0]
+            pair_results.append(_run_one_pair(idx, a, b))
+            _set_stage("pairs", "Running pairs (1/1)", 78)
+        else:
+            completed = 0
+            with ThreadPoolExecutor(max_workers=pair_workers) as ex:
+                futs = [ex.submit(_run_one_pair, i, a, b) for i, (a, b) in enumerate(pairs, start=1)]
+                for fut in as_completed(futs):
+                    pair_results.append(fut.result())
+                    completed += 1
+                    _set_stage("pairs", f"Running pairs ({completed}/{total_pairs})", min(78, 10 + int((completed / total_pairs) * 68)))
+
+        for _, pair_dbg, pair_data, pair_logs in sorted(pair_results, key=lambda x: int(x[0])):
+            pair_dbg["merged_before"] = int(len(merged_raw))
+            merged_raw.update(pair_data)
             pair_dbg["merged_after"] = int(len(merged_raw))
             pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
-            pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
             timing_debug["pairs"].append(pair_dbg)
+            logs.extend(pair_logs)
         timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
 
         # Keep only pools that really match requested pairs.
