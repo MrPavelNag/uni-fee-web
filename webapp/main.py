@@ -18828,10 +18828,6 @@ def _render_positions_page() -> str:
           <h3>Position Fee calculation</h3>
           <div class="section-actions">
             <span class="pos-status" id="posFeeStatus">Select History checkboxes, then run chart</span>
-            <label class="fee-toggle-pill" title="For the NPM Collect log series: value each event in USD using CoinGecko historical prices (stables $1). Subgraph-based series are unchanged.">
-              <input type="checkbox" id="posFeeHistoricalUsd" />
-              <span class="pos-fee-hist-label">If sold instantly</span>
-            </label>
             <label class="fee-toggle-pill" title="Show annualized return labels next to collect points.">
               <input type="checkbox" id="posFeeAprLabels" checked />
               <span class="pos-fee-hist-label">APR</span>
@@ -20647,7 +20643,7 @@ def _render_positions_page() -> str:
         return false;
       }
     }
-    function buildFeeScanCacheKey(rowsPayload, histUsd) {
+    function buildFeeScanCacheKey(rowsPayload) {
       const cacheVer = "v2";
       const src = (rowsPayload || []).map((r) => [
         String(r?.chain_id || ""),
@@ -20656,9 +20652,8 @@ def _render_positions_page() -> str:
         String(r?.address || ""),
         String(r?.position_id || ""),
         Array.isArray(r?.position_ids) ? r.position_ids.join(",") : "",
-        Number(!!histUsd),
       ].join("|")).join("||");
-      return `${cacheVer}|${src || `empty|${Number(!!histUsd)}`}`;
+      return `${cacheVer}|${src || "empty"}`;
     }
     function loadFeeScanCache(key) {
       try {
@@ -20788,7 +20783,7 @@ def _render_positions_page() -> str:
         return false;
       }
     }
-    function buildFeeCompareSelection(selected, histUsd) {
+    function buildFeeCompareSelection(selected) {
       const numOrZero = (v) => {
         const n = Number(v);
         return Number.isFinite(n) ? n : 0;
@@ -20879,7 +20874,7 @@ def _render_positions_page() -> str:
           pool_token0_price: Number(row.pool_token0_price || 0),
           fee_tier_raw: strOrEmpty(row.fee_tier_raw, row.feeTier, row.fee_tier),
           fee_tier: strOrEmpty(row.fee_tier, row.feeTier, row.fee_tier_raw),
-          fee_usd_historical: histUsd,
+          fee_usd_historical: false,
         });
         payloadMeta.push({
           colorIdx: i,
@@ -20895,7 +20890,6 @@ def _render_positions_page() -> str:
     }
     function processFeeCompareRows(rowsOut, payloadMeta, palette, traces, rowStatuses, apiFailTop, backendHints, diag, options) {
       const showAprLabels = !(options && options.showAprLabels === false);
-      const disableSnapshotOnlyTodayBridge = !!(options && options.disableSnapshotOnlyTodayBridge === true);
       const sortByTs = (arr) => (Array.isArray(arr) ? arr : []).slice().sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
       const lastByTs = (arr) => {
         const sorted = sortByTs(arr);
@@ -21143,7 +21137,7 @@ def _render_positions_page() -> str:
             mode: singleCollectedPoint ? "lines+markers" : "lines",
             line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
             marker: singleCollectedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
-            name: `${legendBaseLabel} (today USD)`,
+            name: `${legendBaseLabel} (USD)`,
             hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
             _forceToday: rowIsSpotOnly,
             _legendPairBase: legendBase,
@@ -21199,7 +21193,7 @@ def _render_positions_page() -> str:
             line: {color: palette[meta.colorIdx % palette.length], width: 1.5, dash: "dot"},
             marker: singleEstimatedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
             opacity: 0.85,
-            name: `${legendBaseLabel} (estimated, today USD)`,
+            name: `${legendBaseLabel} (estimated, USD)`,
             hovertemplate: "%{hovertext}<extra></extra>",
             hovertext: estHover,
             _legendPairBase: legendBase,
@@ -21238,10 +21232,6 @@ def _render_positions_page() -> str:
               aprDays: snapAprDays,
               liqHover: (liqLabel && liqLabel !== "-") ? String(liqLabel) : "-",
             });
-            if (!hasCollected && disableSnapshotOnlyTodayBridge) {
-              appendLastStatusDetail(" | snapshot_bridge_skipped_instantly(no_collected_history)");
-              continue;
-            }
             if (!hasCollected) {
               const snapMs = Number(snapDt.getTime() || 0);
               const anchorMs = (createdMs > 0 && createdMs < snapMs) ? createdMs : Math.max(0, snapMs - 86400000);
@@ -21251,7 +21241,7 @@ def _render_positions_page() -> str:
                   y: [0, snapMarkerVal],
                   mode: "lines",
                   line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
-                  name: `${legendBaseLabel} (today USD)`,
+                  name: `${legendBaseLabel} (USD)`,
                   hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
                   _forceToday: true,
                   _legendPairBase: legendBase,
@@ -21334,7 +21324,6 @@ def _render_positions_page() -> str:
         startFeeStatusTimer();
         const ok = await ensurePlotly();
         if (!ok) throw new Error("Failed to load chart library");
-        const histUsd = !!(document.getElementById("posFeeHistoricalUsd") && document.getElementById("posFeeHistoricalUsd").checked);
         const showAprLabels = !!(document.getElementById("posFeeAprLabels") && document.getElementById("posFeeAprLabels").checked);
         const ignoreCache = !!(document.getElementById("posFeeIgnoreCache") && document.getElementById("posFeeIgnoreCache").checked);
         const palette = ["#1d4ed8", "#7c3aed", "#059669", "#dc2626", "#0f766e", "#b45309", "#4338ca", "#be123c"];
@@ -21342,7 +21331,7 @@ def _render_positions_page() -> str:
         const apiFailTop = [];
         const backendHints = [];
 
-        const prepared = buildFeeCompareSelection(selected, histUsd);
+        const prepared = buildFeeCompareSelection(selected);
         const diag = prepared.diag;
         const rowStatuses = prepared.rowStatuses;
         const rowsPayload = prepared.rowsPayload;
@@ -21362,7 +21351,7 @@ def _render_positions_page() -> str:
           include_aggregate: false,
           ignore_cache: ignoreCache,
         };
-        const feeCacheKey = buildFeeScanCacheKey(rowsPayload, histUsd);
+        const feeCacheKey = buildFeeScanCacheKey(rowsPayload);
         const cachedCompare = ignoreCache ? null : loadFeeScanCache(feeCacheKey);
         let res = null;
         let data = null;
@@ -21417,7 +21406,7 @@ def _render_positions_page() -> str:
           apiFailTop,
           backendHints,
           diag,
-          {showAprLabels, disableSnapshotOnlyTodayBridge: histUsd},
+          {showAprLabels},
         );
         if (!traces.length) {
           stopFeeStatusTimer();
@@ -21450,10 +21439,8 @@ def _render_positions_page() -> str:
           .replace(/\s*\[(historical|today)\s*USD\]\s*$/i, "")
           .replace(/\s*\[Fee[^\]]*\]\s*$/i, "")
           .replace(/\s*\[avg APR[^\]]*\]\s*$/i, "")
-          .replace(/\s*\(today USD\)\s*$/i, "")
-          .replace(/\s*\(if sold instantly\)\s*$/i, "")
-          .replace(/\s*\(estimated,\s*today USD\)\s*$/i, "")
-          .replace(/\s*\(estimated,\s*if sold instantly\)\s*$/i, "")
+          .replace(/\s*\((today\s+)?USD\)\s*$/i, "")
+          .replace(/\s*\(estimated,\s*(today\s+)?USD\)\s*$/i, "")
           .replace(/\s*\(estimated\)\s*$/i, "")
           .replace(/\s*\(collect points.*\)\s*$/i, "")
           .trim();
@@ -21468,7 +21455,7 @@ def _render_positions_page() -> str:
           }
           return pairColorByBase[k];
         };
-        const applyFeeTraceStyleByPair = (srcTraces, viewMode, viewOpacity = 1.0) => {
+        const applyFeeTraceStyleByPair = (srcTraces, viewOpacity = 1.0) => {
           return (srcTraces || []).map((t) => {
             const name = String(t?.name || "");
             const lineIn = (t && typeof t === "object" && t.line && typeof t.line === "object") ? t.line : {};
@@ -21476,17 +21463,16 @@ def _render_positions_page() -> str:
             const modeLower = String(t?.mode || "").toLowerCase();
             const isEstimated = name.toLowerCase().includes("(estimated");
             const isMarkerOnly = modeLower === "markers";
-            const isToday = !!t?._forceToday || (String(viewMode || "").toLowerCase() === "today");
             const base = String(t?._legendPairBase || toLegendBase(name) || name);
             const legendHeader = String(t?._legendHeader || base || "pair");
             const color = getPairColor(base);
-            const feeType = isEstimated ? "estimated" : (isToday ? "today" : "instant");
+            const feeType = isEstimated ? "estimated" : "today";
             const legendName = isEstimated
-              ? `${legendHeader} (estimated, ${isToday ? "today USD" : "if sold instantly"})`
-              : `${legendHeader} (${isToday ? "today USD" : "if sold instantly"})`;
+              ? `${legendHeader} (estimated, USD)`
+              : `${legendHeader} (USD)`;
             const dash = isEstimated
               ? "longdash"
-              : (isToday ? "solid" : "dash");
+              : "solid";
             return {
               ...t,
               name: legendName,
@@ -21499,7 +21485,7 @@ def _render_positions_page() -> str:
               marker: {
                 ...markerIn,
                 color,
-                symbol: (isToday && isMarkerOnly) ? "circle-open" : markerIn.symbol,
+                symbol: isMarkerOnly ? "circle-open" : markerIn.symbol,
               },
               opacity: Number(viewOpacity),
               _feeType: feeType,
@@ -21510,69 +21496,10 @@ def _render_positions_page() -> str:
           });
         };
         let mainTitle = "Collected & Estimated Fees";
-        let overlayTraces = applyFeeTraceStyleByPair(traces, histUsd ? "historical" : "today", 1.0);
-        if (histUsd) {
-          try {
-            const lastFeePoint = (arr) => {
-              const a = Array.isArray(arr) ? arr : [];
-              if (!a.length) return null;
-              return a.slice().sort((x, y) => Number(x?.ts || 0) - Number(y?.ts || 0)).slice(-1)[0] || null;
-            };
-            const isEstimateOnlyRow = (r) => {
-              const mode = String(r?.mode || "").trim().toLowerCase();
-              if (mode === "row-unclaimed-fallback") return true;
-              const hasCollected = Array.isArray(r?.collected_items) && r.collected_items.length > 0;
-              const hasSnapshot = Array.isArray(r?.snapshot_items) && r.snapshot_items.length > 0;
-              return (!hasCollected && hasSnapshot);
-            };
-            const rowsOutSpot = (rowsOut || [])
-              .filter((r) => !isEstimateOnlyRow(r))
-              .map((r) => ({
-                ...(r && typeof r === "object" ? r : {}),
-                collected_items: Array.isArray(r?.alt_collected_items) ? r.alt_collected_items : [],
-                estimated_items: [],
-                // Keep current unclaimed snapshot so "today USD" reaches the latest point.
-                snapshot_items: Array.isArray(r?.snapshot_items) ? r.snapshot_items : [],
-                apr_items: [],
-                legend_fee_total_usd: Math.max(
-                  0,
-                  Number(lastFeePoint(r?.alt_collected_items)?.fees_usd || 0) + Number(lastFeePoint(r?.snapshot_items)?.fees_usd || 0),
-                ),
-              }));
-            const tracesSpot = [];
-            const diagSpot = prepared.diag || {};
-            // Keep diagnostics for the main run only: spot overlay must not
-            // append duplicate status rows to the same array.
-            const rowStatusesSpot = [];
-            const apiFailTopSpot = [];
-            const backendHintsSpot = [];
-            const feeStateSpot = processFeeCompareRows(
-              rowsOutSpot,
-              payloadMeta,
-              palette,
-              tracesSpot,
-              rowStatusesSpot,
-              apiFailTopSpot,
-              backendHintsSpot,
-              diagSpot,
-              {showAprLabels: false},
-            );
-            if (tracesSpot.length) {
-              const spotOverlay = applyFeeTraceStyleByPair(tracesSpot, "today", 0.78)
-                .filter((t) => !String(t?.name || "").toLowerCase().includes("(estimated)"));
-              overlayTraces = overlayTraces.concat(spotOverlay);
-              if (backendHints.length < 8) {
-                backendHints.push(`dual_view_spot_local_reprice: collected=${Number(feeStateSpot.rowsWithCollected || 0)}`);
-              }
-            } else if (backendHints.length < 8) {
-              backendHints.push("dual_view_spot_local_reprice: skipped_for_estimate_only");
-            }
-          } catch (_) {
-          }
-        }
+        let overlayTraces = applyFeeTraceStyleByPair(traces, 1.0);
         const compactLegendByPair = (srcTraces) => {
-          const typeRank = {today: 0, instant: 1, estimated: 2, other: 3};
-          const typeLabel = {instant: "if sold instantly", today: "today USD", estimated: "estimated", other: "series"};
+          const typeRank = {today: 0, estimated: 1, other: 2};
+          const typeLabel = {today: "USD", estimated: "estimated", other: "series"};
           const byBase = new Map();
           const baseOrder = [];
           for (const t of (srcTraces || [])) {
@@ -21583,9 +21510,9 @@ def _render_positions_page() -> str:
             const base = String(t?._legendPairBase || t?._feeBase || toLegendBase(name) || name || "pair");
             const tpRaw = String(t?._feeType || "").trim().toLowerCase();
             const lower = name.toLowerCase();
-            const tp = (tpRaw === "today" || tpRaw === "instant" || tpRaw === "estimated")
+            const tp = (tpRaw === "today" || tpRaw === "estimated")
               ? tpRaw
-              : (lower.includes("(estimated") ? "estimated" : (lower.includes("(today usd)") ? "today" : "instant"));
+              : (lower.includes("(estimated") ? "estimated" : "today");
             if (!byBase.has(base)) {
               byBase.set(base, []);
               baseOrder.push(base);
@@ -21658,13 +21585,7 @@ def _render_positions_page() -> str:
           try {
             Plotly.relayout("posFeeChart", {title: {text: mainTitle}});
           } catch (_) {}
-          const soldInstantlyNotApplicable = !!histUsd;
-          pushFinalFeeStatus(
-            "warn",
-            soldInstantlyNotApplicable
-              ? "No real fee data: estimate-only (if sold instantly N/A: no collected history)"
-              : "No real fee data: estimate/snapshot only",
-          );
+          pushFinalFeeStatus("warn", "No real fee data: estimate/snapshot only");
         } else {
           pushFinalFeeStatus(hasPartialRows ? "warn" : "ok", hasPartialRows ? "Partial (some rows timed out/missing)" : "Done");
         }
@@ -26260,7 +26181,8 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             token1 = _token_addr_by_symbol_for_chain(chain_key, sym1_hint or str(getattr(req, "token1_symbol", "") or ""))
     except Exception:
         token1 = ""
-    want_hist_usd = bool(getattr(req, "fee_usd_historical", False))
+    # Position fee chart supports only one pricing mode: current spot USD.
+    want_hist_usd = False
     want_ignore_cache = bool(getattr(req, "ignore_cache", False))
     endpoint = get_graph_endpoint(chain_key, version=version)
     if (not _is_eth_address(token0) or not _is_eth_address(token1)) and endpoint and str(req.pool_id or "").strip():
@@ -26670,7 +26592,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
 
     perf_ledger_started = time.monotonic()
     ledger_by_day: dict[int, float] = {}
-    ledger_by_day_alt: dict[int, float] = {}
     ledger_pricing_modes: list[str] = []
     ledger_pricing_details: list[str] = []
     if protocol in {"uniswap_v3", "pancake_v3", "pancake_v3_staked"} and position_ids:
@@ -26684,8 +26605,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             if token_ids:
                 ledger_since_ts = int((int(collect_since_ts) // 86400) * 86400)
                 debug["ledger_since_ts"] = int(ledger_since_ts)
-                pricing_mode = ("historical" if bool(want_hist_usd) else "spot")
-                alt_pricing_mode = ("spot" if str(pricing_mode) == "historical" else "historical")
+                pricing_mode = "spot"
                 cache_hits = 0
                 cache_misses: list[int] = []
                 rebuild_token_ids: list[int] = []
@@ -26728,16 +26648,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                         cache_hits += 1
                         for ts, val in cached_one.items():
                             ledger_by_day[int(ts)] = float(ledger_by_day.get(int(ts), 0.0) + float(val))
-                        if bool(want_hist_usd):
-                            cached_alt = _load_v3_npm_fee_ledger_day_from_cache(
-                                int(chain_id),
-                                str(protocol),
-                                int(tid),
-                                since_ts=int(ledger_since_ts),
-                                pricing_mode=str(alt_pricing_mode),
-                            )
-                            for ts, val in dict(cached_alt or {}).items():
-                                ledger_by_day_alt[int(ts)] = float(ledger_by_day_alt.get(int(ts), 0.0) + float(val))
                     else:
                         if cached_one:
                             stale_cached_by_tid[int(tid)] = dict(cached_one)
@@ -26820,29 +26730,6 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
                             src_map = dict(stale_cached_by_tid.get(int(tid)) or {})
                         for ts, val in src_map.items():
                             ledger_by_day[int(ts)] = float(ledger_by_day.get(int(ts), 0.0) + float(val))
-                        if bool(want_hist_usd):
-                            src_alt = {}
-                            if not bool(want_ignore_cache):
-                                src_alt = _load_v3_npm_fee_ledger_day_from_cache(
-                                    int(chain_id),
-                                    str(protocol),
-                                    int(tid),
-                                    since_ts=int(ledger_since_ts),
-                                    pricing_mode=str(alt_pricing_mode),
-                                )
-                            if not src_alt:
-                                one_day_alt, _one_meta_alt = _build_v3_npm_fee_ledger_from_temp(
-                                    int(chain_id),
-                                    str(protocol),
-                                    int(tid),
-                                    since_ts=int(ledger_since_ts),
-                                    token0_addr=str(token0 or ""),
-                                    token1_addr=str(token1 or ""),
-                                    use_historical_usd=(str(alt_pricing_mode) == "historical"),
-                                )
-                                src_alt = dict(one_day_alt or {})
-                            for ts, val in dict(src_alt or {}).items():
-                                ledger_by_day_alt[int(ts)] = float(ledger_by_day_alt.get(int(ts), 0.0) + float(val))
                 else:
                     debug["ledger_source"] = "cache"
                     debug["ledger_budget_sec"] = 0.0
@@ -26850,7 +26737,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             ledger_by_day = {}
     debug["perf_ledger_ms"] = int(max(0.0, (time.monotonic() - perf_ledger_started) * 1000.0))
     debug["ledger_points"] = int(len(ledger_by_day))
-    debug["ledger_alt_points"] = int(len(ledger_by_day_alt))
+    debug["ledger_alt_points"] = 0
     if ledger_pricing_details:
         debug["ledger_pricing_details"] = list(dict.fromkeys(ledger_pricing_details))[:5]
 
@@ -27032,7 +26919,7 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
         debug["apr_items_count"] = int(len(apr_items_payload))
         return _with_debug({
             "items": _pack_fee_items(ledger_by_day),
-            "alt_collected_items": _pack_fee_items(ledger_by_day_alt) if ledger_by_day_alt else [],
+            "alt_collected_items": [],
             "snapshot_items": snapshot_items_payload,
             "apr_items": apr_items_payload,
             "count": len(ledger_by_day),
