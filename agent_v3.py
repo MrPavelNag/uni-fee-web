@@ -40,6 +40,40 @@ from uniswap_client import (
 )
 
 
+def _pool_tvl_usd(pool: dict) -> float:
+    try:
+        return float(pool.get("totalValueLockedUSD") or 0)
+    except Exception:
+        return 0.0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
+    if not pools:
+        return []
+    out: list[dict] = []
+    if max_per_pair_chain > 0:
+        by_key: dict[tuple[str, str], list[dict]] = {}
+        for p in pools:
+            key = (str(p.get("chain") or ""), str(p.get("pair_label") or ""))
+            by_key.setdefault(key, []).append(p)
+        for items in by_key.values():
+            items.sort(key=_pool_tvl_usd, reverse=True)
+            out.extend(items[:max_per_pair_chain])
+    else:
+        out = list(pools)
+    if max_total > 0 and len(out) > max_total:
+        out.sort(key=_pool_tvl_usd, reverse=True)
+        out = out[:max_total]
+    return out
+
+
 def _min_tvl(cli_value: Optional[float] = None) -> float:
     if cli_value is not None:
         return float(cli_value)
@@ -216,6 +250,9 @@ def main() -> None:
     print("Discovering v3 pools...")
     fresh = "TOKEN_PAIRS" in os.environ
     pools = discover_pools_v3(token_pairs, args.min_tvl, fresh_token_lookup=fresh)
+    max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 40))
+    max_total = max(0, _env_int("MAX_POOLS_TOTAL", 300))
+    pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)
     print(f"Found {len(pools)} v3 pools")
 
     if os.environ.get("DISABLE_PDF_OUTPUT", "").strip().lower() not in ("1", "true", "yes", "on"):

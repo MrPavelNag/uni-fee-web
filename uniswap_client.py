@@ -4,10 +4,30 @@ Uses The Graph (requires API key) or Goldsky public endpoints where available.
 """
 
 import os
+import threading
 import time
 from typing import Optional
 
 import requests
+
+
+_POOL_DAY_CACHE_LOCK = threading.Lock()
+_POOL_DAY_CACHE: dict[tuple[str, str, int, int], list[dict]] = {}
+_TOKEN_BY_SYMBOL_CACHE_LOCK = threading.Lock()
+_TOKEN_BY_SYMBOL_CACHE: dict[tuple[str, str], Optional[str]] = {}
+
+
+def _page_delay_sec() -> float:
+    try:
+        return max(0.0, float(os.environ.get("GRAPHQL_PAGE_DELAY_SEC", "0")))
+    except Exception:
+        return 0.0
+
+
+def _maybe_page_delay() -> None:
+    d = _page_delay_sec()
+    if d > 0:
+        time.sleep(d)
 
 
 def _canonical_graph_chain(chain: str) -> str:
@@ -152,7 +172,7 @@ def query_pools_containing_both_tokens(
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
-        time.sleep(0.3)
+        _maybe_page_delay()
     return result
 
 
@@ -213,7 +233,7 @@ def query_pools_by_token_symbols(
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
-        time.sleep(0.3)
+        _maybe_page_delay()
     return result
 
 
@@ -269,7 +289,7 @@ def query_pools_containing_both_tokens_no_tvl_filter(
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
-        time.sleep(0.3)
+        _maybe_page_delay()
     return result
 
 
@@ -295,6 +315,11 @@ def query_pool_day_data(
       }
     }
     """
+    cache_key = (str(endpoint), str(pool_id).lower(), int(start_ts), int(end_ts))
+    with _POOL_DAY_CACHE_LOCK:
+        cached = _POOL_DAY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     all_data = []
     skip = 0
     while True:
@@ -310,8 +335,11 @@ def query_pool_day_data(
         if len(items) < 100:
             break
         skip += 100
-        time.sleep(0.2)
-    return sorted(all_data, key=lambda x: int(x["date"]))
+        _maybe_page_delay()
+    out = sorted(all_data, key=lambda x: int(x["date"]))
+    with _POOL_DAY_CACHE_LOCK:
+        _POOL_DAY_CACHE[cache_key] = out
+    return out
 
 
 def query_token_by_symbol(endpoint: str, symbol: str) -> Optional[str]:
@@ -320,6 +348,12 @@ def query_token_by_symbol(endpoint: str, symbol: str) -> Optional[str]:
     Scam/fake tokens usually have low TVL; real CVX, CRV, WBTC etc. have high TVL.
     For 'eth' also tries 'WETH' (subgraphs often use WETH).
     """
+    endpoint_key = str(endpoint).strip().lower()
+    symbol_key = str(symbol).strip().upper()
+    cache_key = (endpoint_key, symbol_key)
+    with _TOKEN_BY_SYMBOL_CACHE_LOCK:
+        if cache_key in _TOKEN_BY_SYMBOL_CACHE:
+            return _TOKEN_BY_SYMBOL_CACHE[cache_key]
     syms_to_try = [symbol.upper()]
     if symbol.lower() == "eth":
         syms_to_try.append("WETH")
@@ -350,7 +384,11 @@ def query_token_by_symbol(endpoint: str, symbol: str) -> Optional[str]:
             # Reject zero address (invalid)
             if addr == "0x0000000000000000000000000000000000000000":
                 continue
+            with _TOKEN_BY_SYMBOL_CACHE_LOCK:
+                _TOKEN_BY_SYMBOL_CACHE[cache_key] = addr
             return addr
         except Exception:
             continue
+    with _TOKEN_BY_SYMBOL_CACHE_LOCK:
+        _TOKEN_BY_SYMBOL_CACHE[cache_key] = None
     return None

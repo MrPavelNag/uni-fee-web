@@ -17164,6 +17164,18 @@ def _build_run_job_env(
         "WEB_POOL_SERIES_WORKERS_FAST" if speed_mode == "fast" else "WEB_POOL_SERIES_WORKERS_NORMAL",
         "16" if speed_mode == "fast" else "8",
     )
+    env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get(
+        "WEB_MAX_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL",
+        "20" if speed_mode == "fast" else "40",
+    )
+    env["MAX_POOLS_TOTAL"] = os.environ.get(
+        "WEB_MAX_POOLS_TOTAL_FAST" if speed_mode == "fast" else "WEB_MAX_POOLS_TOTAL_NORMAL",
+        "120" if speed_mode == "fast" else "240",
+    )
+    env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get(
+        "WEB_GRAPHQL_PAGE_DELAY_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL",
+        "0",
+    )
     # v4 endpoint config uses this list at import-time.
     if run_v4 and include_chains:
         v4_supported = {c for c in include_chains if c in UNISWAP_V4_SUBGRAPHS}

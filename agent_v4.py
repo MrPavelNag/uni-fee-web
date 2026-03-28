@@ -84,6 +84,53 @@ def save_pdf(pools: list[dict], path: str) -> None:
 NATIVE_ETH = "0x0000000000000000000000000000000000000000"
 
 
+def _page_delay_sec() -> float:
+    try:
+        return max(0.0, float(os.environ.get("GRAPHQL_PAGE_DELAY_SEC", "0")))
+    except Exception:
+        return 0.0
+
+
+def _maybe_page_delay() -> None:
+    d = _page_delay_sec()
+    if d > 0:
+        time.sleep(d)
+
+
+def _pool_tvl_usd(pool: dict) -> float:
+    try:
+        return float(pool.get("totalValueLockedUSD") or 0)
+    except Exception:
+        return 0.0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
+    if not pools:
+        return []
+    out: list[dict] = []
+    if max_per_pair_chain > 0:
+        by_key: dict[tuple[str, str], list[dict]] = {}
+        for p in pools:
+            key = (str(p.get("chain") or ""), str(p.get("pair_label") or ""))
+            by_key.setdefault(key, []).append(p)
+        for items in by_key.values():
+            items.sort(key=_pool_tvl_usd, reverse=True)
+            out.extend(items[:max_per_pair_chain])
+    else:
+        out = list(pools)
+    if max_total > 0 and len(out) > max_total:
+        out.sort(key=_pool_tvl_usd, reverse=True)
+        out = out[:max_total]
+    return out
+
+
 def parse_pairs(s: str) -> list[tuple[str, str]]:
     """Parse 'uni,eth;fluid,usdc' -> [(uni,eth), (fluid,usdc)]. Нормализует дубли (fluid,eth)==(eth,fluid)."""
     seen = set()
@@ -156,7 +203,7 @@ def query_pools(endpoint: str, token_a: str, token_b: str, min_tvl: float) -> li
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
-        time.sleep(0.2)
+        _maybe_page_delay()
     return result
 
 
@@ -190,7 +237,7 @@ def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str, min_tvl:
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
-        time.sleep(0.2)
+        _maybe_page_delay()
     return result
 
 
@@ -216,7 +263,7 @@ def query_pool_day_data(endpoint: str, pool_id: str, start_ts: int, end_ts: int)
         if len(items) < 100:
             break
         skip += 100
-        time.sleep(0.15)
+        _maybe_page_delay()
     return sorted(out, key=lambda x: int(x["date"]))
 
 
@@ -336,6 +383,9 @@ def main() -> None:
     print("Поиск пулов...")
 
     pools = discover_pools(pairs, min_tvl)
+    max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 40))
+    max_total = max(0, _env_int("MAX_POOLS_TOTAL", 300))
+    pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)
     print(f"Найдено {len(pools)} v4 пулов")
 
     # PDF-список пулов (аналогично v3)
