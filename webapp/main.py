@@ -17160,6 +17160,14 @@ def _build_run_job_env(
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
     env["DISABLE_PDF_OUTPUT"] = "1"
     env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "1")
+    env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get(
+        "WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL",
+        "5" if speed_mode == "fast" else "8",
+    )
+    env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get(
+        "WEB_GRAPHQL_READ_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL",
+        "8" if speed_mode == "fast" else "15",
+    )
     env["POOL_SERIES_WORKERS"] = os.environ.get(
         "WEB_POOL_SERIES_WORKERS_FAST" if speed_mode == "fast" else "WEB_POOL_SERIES_WORKERS_NORMAL",
         "16" if speed_mode == "fast" else "8",
@@ -17175,6 +17183,14 @@ def _build_run_job_env(
     env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get(
         "WEB_GRAPHQL_PAGE_DELAY_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL",
         "0",
+    )
+    env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get(
+        "WEB_DISABLE_V4_SYMBOL_FALLBACK_FAST" if speed_mode == "fast" else "WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL",
+        "1" if speed_mode == "fast" else "0",
+    )
+    env["V4_SKIP_CHAIN_AFTER_TIMEOUT"] = os.environ.get(
+        "WEB_V4_SKIP_CHAIN_AFTER_TIMEOUT",
+        "1",
     )
     # v4 endpoint config uses this list at import-time.
     if run_v4 and include_chains:
@@ -29455,7 +29471,7 @@ HTML_PAGE = """
     function setScanProgressVisible(flag) {
       const el = document.getElementById("scanProgress");
       if (!el) return;
-      el.style.display = flag ? "block" : "none";
+      el.style.display = "none";
     }
 
     function stopScanTicker() {
@@ -29480,7 +29496,7 @@ HTML_PAGE = """
         const el = document.getElementById("status");
         if (!el) return;
         el.className = "status running";
-        el.innerHTML = `Scanning positions... <span class="status-live-num">${pct}%</span> | ${escAttr(scanStageLabel)} (${escAttr(chainHint)}) · ${elapsed}s`;
+        el.innerHTML = `Scanning positions... <span class="status-live-num">${pct}%</span> | ${escAttr(scanStageLabel)} (${escAttr(chainHint)}) · <span class="status-live-num">${elapsed}s</span>`;
       };
       tick();
       scanTicker = setInterval(tick, 900);

@@ -111,6 +111,16 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _is_timeout_error(err: Exception) -> bool:
+    msg = str(err or "").lower()
+    return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
+
+
 def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
     if not pools:
         return []
@@ -302,14 +312,23 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
         chains = [c for c in chains if c.lower() in include]
     dynamic = load_dynamic_tokens()
     all_pools = []
+    disable_symbol_fallback = _env_flag("DISABLE_V4_SYMBOL_FALLBACK", False)
+    skip_chain_after_timeout = _env_flag("V4_SKIP_CHAIN_AFTER_TIMEOUT", True)
+    timeout_chains: set[str] = set()
 
     for chain in chains:
+        if chain in timeout_chains:
+            print(f"  [{chain}] skip: timeout blacklist")
+            continue
         endpoint = get_endpoint(chain)
         if not endpoint:
             print(f"  [{chain}] skip: no endpoint")
             continue
 
+        chain_abort = False
         for base, quote in pairs:
+            if chain_abort:
+                break
             addr_a = resolve_token(chain, base, endpoint, dynamic)
             addr_b = resolve_token(chain, quote, endpoint, dynamic)
             if not addr_a or not addr_b:
@@ -323,6 +342,7 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 addrs_b.append(NATIVE_ETH)
 
             pools = []
+            timed_out = False
             for a in addrs_a:
                 for b in addrs_b:
                     if a.lower() == b.lower():
@@ -331,12 +351,20 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                         pools.extend(query_pools(endpoint, a, b, min_tvl))
                     except Exception as e:
                         print(f"  [{chain}] {base}/{quote}: {e}")
+                        if _is_timeout_error(e):
+                            timed_out = True
                         continue
-            if not pools:
+            if (not pools) and (not disable_symbol_fallback) and (not timed_out):
                 try:
                     pools.extend(query_pools_by_symbols(endpoint, base, quote, min_tvl))
                 except Exception as e:
                     print(f"  [{chain}] {base}/{quote} (symbol fallback): {e}")
+                    if _is_timeout_error(e):
+                        timed_out = True
+            if timed_out and skip_chain_after_timeout:
+                timeout_chains.add(chain)
+                chain_abort = True
+                print(f"  [{chain}] timeout detected: skipping remaining pairs on this chain")
 
             for p in pools:
                 p["chain"] = chain
