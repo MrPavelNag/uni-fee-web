@@ -28987,6 +28987,7 @@ HTML_PAGE = """
     let scanTicker = null;
     let scanStartedAt = 0;
     let scanStageLabel = "waiting";
+    let scanProgressPct = 0;
     const homeSectionState = { feeHistory: false, poolsTable: false };
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
 
@@ -29421,6 +29422,7 @@ HTML_PAGE = """
       }
       scanStartedAt = 0;
       scanStageLabel = "waiting";
+      scanProgressPct = 0;
     }
 
     function startScanTicker() {
@@ -29430,8 +29432,12 @@ HTML_PAGE = """
       const chainHints = selected.length ? selected : (availableChains.length ? availableChains : ["all chains"]);
       const tick = () => {
         const elapsed = Math.max(0, Math.floor((Date.now() - scanStartedAt) / 1000));
+        const pct = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
         const chainHint = chainHints[Math.floor(elapsed / 4) % chainHints.length];
-        setStatus(`Scanning positions... ${elapsed}s | ${scanStageLabel} (${chainHint})`, "running");
+        const el = document.getElementById("status");
+        if (!el) return;
+        el.className = "status running";
+        el.innerHTML = `Scanning positions... <span class="status-live-num">${pct}%</span> | ${esc(scanStageLabel)} (${esc(chainHint)}) · ${elapsed}s`;
       };
       tick();
       scanTicker = setInterval(tick, 900);
@@ -29452,6 +29458,15 @@ HTML_PAGE = """
 
     function updateProgress(progress, stageLabel) {
       scanStageLabel = String(stageLabel || "running");
+      scanProgressPct = Math.max(0, Math.min(100, Number(progress || 0)));
+    }
+
+    function scanElapsedSecFromJob(job) {
+      const dbg = (job && job.result && typeof job.result.debug_timing === "object" && job.result.debug_timing) ? job.result.debug_timing : null;
+      const totalMs = Number(dbg?.total_ms || 0);
+      if (totalMs > 0) return Math.max(0, Math.round(totalMs / 1000));
+      if (scanStartedAt > 0) return Math.max(0, Math.round((Date.now() - scanStartedAt) / 1000));
+      return 0;
     }
 
     function saveFormState() {
@@ -29986,11 +30001,12 @@ HTML_PAGE = """
         }
         updateProgress(job.progress, job.stage_label || job.stage);
         if (job.status === "done") {
+          const elapsedSec = scanElapsedSecFromJob(job);
           clearInterval(timer);
           stopScanTicker();
           hasScanRun = true;
           setBusy(false);
-          setStatus("Completed", "ok");
+          setStatus(`Completed in ${elapsedSec}s`, "ok");
           renderResult(job.result);
         } else if (job.status === "failed") {
           clearInterval(timer);
