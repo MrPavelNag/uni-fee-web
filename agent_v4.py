@@ -262,7 +262,8 @@ def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str, min_tvl:
     result = []
     skip = 0
     while True:
-        data = graphql_query(endpoint, q, {"minTvl": str(min_tvl), "skip": skip})
+        # Symbol fallback is best-effort; keep retries low to avoid long stalls.
+        data = graphql_query(endpoint, q, {"minTvl": str(min_tvl), "skip": skip}, retries=1)
         d = data.get("data", {})
         p0, p1 = d.get("pools0", []), d.get("pools1", [])
         result.extend(p0)
@@ -356,6 +357,8 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
             addr_b = resolve_token(chain, quote, endpoint, dynamic)
             if not addr_a or not addr_b:
                 continue
+            known_a = bool(get_token_addresses(chain, base, dynamic) or get_token_addresses("ethereum", base, dynamic))
+            known_b = bool(get_token_addresses(chain, quote, dynamic) or get_token_addresses("ethereum", quote, dynamic))
 
             addrs_a = [addr_a]
             if base.lower() in ("eth", "weth") and addr_a.lower() != NATIVE_ETH:
@@ -377,13 +380,16 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                         if _is_timeout_error(e):
                             timed_out = True
                         continue
-            if (not pools) and (not disable_symbol_fallback) and (not timed_out):
+            should_try_symbol_fallback = (not disable_symbol_fallback) and (not timed_out) and (not (known_a and known_b))
+            if (not pools) and should_try_symbol_fallback:
                 try:
                     pools.extend(query_pools_by_symbols(endpoint, base, quote, min_tvl))
                 except Exception as e:
                     print(f"  [{chain}] {base}/{quote} (symbol fallback): {e}")
                     if _is_timeout_error(e):
                         timed_out = True
+            elif (not pools) and (known_a and known_b):
+                print(f"  [{chain}] {base}/{quote}: skip symbol fallback (known token addresses)")
             if timed_out and skip_chain_after_timeout:
                 timeout_chains.add(chain)
                 chain_abort = True

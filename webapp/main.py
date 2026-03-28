@@ -17179,7 +17179,7 @@ def _build_run_job_env(
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
     env["DISABLE_PDF_OUTPUT"] = "1"
     env["DISABLE_DYNAMIC_TOKEN_PERSIST"] = os.environ.get("WEB_DISABLE_DYNAMIC_TOKEN_PERSIST", "1")
-    env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "3")
+    env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "2")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL", "8")
     env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "15")
     env["POOL_SERIES_WORKERS"] = os.environ.get("WEB_POOL_SERIES_WORKERS_NORMAL", "8")
