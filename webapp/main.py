@@ -29639,9 +29639,10 @@ HTML_PAGE = """
       const el = document.getElementById("poolRunDebug");
       if (!el) return;
       const dbg = (result && typeof result.debug_timing === "object" && result.debug_timing) ? result.debug_timing : null;
+      const req = (result && typeof result.request === "object" && result.request) ? result.request : null;
       const flags = (result && typeof result.result_flags === "object" && result.result_flags) ? result.result_flags : {};
       const logs = Array.isArray(result?.logs) ? result.logs.map((x) => String(x || "").trim()).filter(Boolean) : [];
-      if (!dbg && !logs.length && !Object.keys(flags).length) {
+      if (!dbg && !logs.length && !Object.keys(flags).length && !req) {
         el.style.display = "none";
         el.innerHTML = "";
         return;
@@ -29661,6 +29662,13 @@ HTML_PAGE = """
       }
       if (flags?.from_cache) {
         lines.push("<span style='color:#0369a1;font-weight:800'>info: served_from_cache=1</span>");
+      }
+      if (req) {
+        const rqPairs = escAttr(String(req.pairs || "-"));
+        const rqMin = Number(req.min_tvl || 0);
+        const rqChains = Array.isArray(req.include_chains) ? req.include_chains.join(",") : "";
+        const rqVers = Array.isArray(req.include_versions) ? req.include_versions.join(",") : "";
+        lines.push(`request: pairs=${rqPairs} | min_tvl=${rqMin} | chains=${escAttr(rqChains || "all")} | versions=${escAttr(rqVers || "-")}`);
       }
       if (dbg) {
         lines.push(`total_ms=${Number(dbg.total_ms || 0)}`);
