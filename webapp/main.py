@@ -17162,6 +17162,7 @@ def _build_run_job_env(
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
     env["DISABLE_PDF_OUTPUT"] = "1"
+    env["DISABLE_DYNAMIC_TOKEN_PERSIST"] = os.environ.get("WEB_DISABLE_DYNAMIC_TOKEN_PERSIST", "1")
     env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "1")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get(
         "WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL",

@@ -179,7 +179,8 @@ def resolve_token(chain: str, symbol: str, endpoint: str, dynamic: dict) -> Opti
     from uniswap_client import query_token_by_symbol
     addr = query_token_by_symbol(endpoint, symbol)
     if addr:
-        save_dynamic_token(chain, sym, addr)
+        if not _env_flag("DISABLE_DYNAMIC_TOKEN_PERSIST", False):
+            save_dynamic_token(chain, sym, addr)
         dynamic.setdefault(chain, {})[sym] = addr
     return addr
 

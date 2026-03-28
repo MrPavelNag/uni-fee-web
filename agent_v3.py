@@ -55,6 +55,11 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
     if not pools:
         return []
@@ -95,6 +100,7 @@ def discover_pools_v3(
     """Discover v3 pools only."""
     pairs = parse_token_pairs(token_pairs_str)
     dynamic_tokens = load_dynamic_tokens()
+    persist_dynamic_tokens = not _env_flag("DISABLE_DYNAMIC_TOKEN_PERSIST", False)
     all_pools: list[dict] = []
     chains = set(UNISWAP_V3_SUBGRAPHS.keys()) | set(GOLDSKY_ENDPOINTS.keys())
     include = {c.strip().lower() for c in os.environ.get("INCLUDE_CHAINS", "").split(",") if c.strip()}
@@ -120,7 +126,8 @@ def discover_pools_v3(
                 addr = query_token_by_symbol(endpoint, sym)
                 if addr:
                     with dyn_lock:
-                        save_dynamic_token(chain, sym, addr)
+                        if persist_dynamic_tokens:
+                            save_dynamic_token(chain, sym, addr)
                         dynamic_tokens.setdefault(chain, {})[sym.lower()] = addr
                     out = [addr]
             return out
