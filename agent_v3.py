@@ -61,6 +61,50 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _discover_cap_hard(default_from_soft: int) -> int:
+    env_v = _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_HARD", 0)
+    if env_v > 0:
+        return max(env_v, default_from_soft)
+    # Safety ceiling: allow automatic cap growth only for boundary-hit cases.
+    return max(default_from_soft, 300)
+
+
+def _discover_with_auto_expand(
+    fetch_fn,
+    *,
+    soft_cap: int,
+    hard_cap: int,
+    chain: str,
+    pair_label: str,
+    source: str,
+) -> tuple[list[dict], bool]:
+    """
+    Fetch pools with adaptive cap growth when result size hits the cap boundary.
+    Returns (pools, truncated_flag).
+    """
+    cap = max(0, int(soft_cap or 0))
+    if cap <= 0:
+        return list(fetch_fn(0) or []), False
+    hard = max(cap, int(hard_cap or cap))
+    cur = cap
+    while True:
+        pools = list(fetch_fn(cur) or [])
+        if len(pools) < cur:
+            return pools, False
+        if cur >= hard:
+            print(
+                f"[warn] DISCOVERY_CAP_HIT chain={chain} pair={pair_label} source={source} "
+                f"kept={len(pools)} cap={cur} hard_cap={hard}"
+            )
+            return pools[:hard], True
+        nxt = min(hard, max(cur * 2, cur + 50))
+        print(
+            f"[info] DISCOVERY_CAP_EXPAND chain={chain} pair={pair_label} source={source} "
+            f"from={cur} to={nxt}"
+        )
+        cur = nxt
+
+
 def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
     if not pools:
         return []
@@ -108,6 +152,7 @@ def discover_pools_v3(
     if include:
         chains = {c for c in chains if c.lower() in include}
     discovery_cap = max(0, _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN", 0))
+    discovery_cap_hard = _discover_cap_hard(max(1, discovery_cap) * 6 if discovery_cap > 0 else 0)
     chain_workers = max(1, min(_env_int("V3_DISCOVERY_CHAIN_WORKERS", 4), len(chains) or 1))
     dyn_lock = threading.Lock()
 
@@ -154,22 +199,39 @@ def discover_pools_v3(
             if not base_addrs or not quote_addrs:
                 continue
             try:
-                pools = query_pools_containing_both_tokens(
-                    endpoint,
-                    base_addrs[0],
-                    quote_addrs[0],
-                    _min_tvl(min_tvl),
-                    max_results=int(discovery_cap),
+                pools, truncated = _discover_with_auto_expand(
+                    lambda cap: query_pools_containing_both_tokens(
+                        endpoint,
+                        base_addrs[0],
+                        quote_addrs[0],
+                        _min_tvl(min_tvl),
+                        max_results=int(cap),
+                    ),
+                    soft_cap=discovery_cap,
+                    hard_cap=discovery_cap_hard,
+                    chain=chain,
+                    pair_label=f"{base}/{quote}",
+                    source="address",
                 )
                 if not pools:
                     # Fallback for ambiguous symbol->address mappings (e.g. multiple tokens with same symbol).
-                    pools = query_pools_by_token_symbols(
-                        endpoint,
-                        base,
-                        quote,
-                        _min_tvl(min_tvl),
-                        max_results=int(discovery_cap),
+                    pools, trunc_sym = _discover_with_auto_expand(
+                        lambda cap: query_pools_by_token_symbols(
+                            endpoint,
+                            base,
+                            quote,
+                            _min_tvl(min_tvl),
+                            max_results=int(cap),
+                        ),
+                        soft_cap=discovery_cap,
+                        hard_cap=discovery_cap_hard,
+                        chain=chain,
+                        pair_label=f"{base}/{quote}",
+                        source="symbol",
                     )
+                    truncated = truncated or trunc_sym
+                if truncated:
+                    print(f"[warn] DISCOVERY_POTENTIALLY_TRUNCATED chain={chain} pair={base}/{quote}")
                 for p in pools:
                     p["chain"] = chain
                     p["version"] = "v3"
@@ -281,9 +343,16 @@ def main() -> None:
     print("Discovering v3 pools...")
     fresh = "TOKEN_PAIRS" in os.environ
     pools = discover_pools_v3(token_pairs, args.min_tvl, fresh_token_lookup=fresh)
+    discovered_count = len(pools)
     max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 40))
     max_total = max(0, _env_int("MAX_POOLS_TOTAL", 300))
     pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)
+    if len(pools) < discovered_count:
+        print(
+            "[warn] CAP_TRIM_APPLIED "
+            f"discovered={discovered_count} kept={len(pools)} "
+            f"max_per_pair_chain={max_per_pair_chain} max_total={max_total}"
+        )
     print(f"Found {len(pools)} v3 pools")
 
     if os.environ.get("DISABLE_PDF_OUTPUT", "").strip().lower() not in ("1", "true", "yes", "on"):

@@ -181,6 +181,7 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
+RUN_RESULT_CACHE_VER = "run_v2"
 SESSION_COOKIE_NAME = "uni_fee_sid"
 SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", str(30 * 24 * 60 * 60)))
 CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
@@ -17182,7 +17183,7 @@ def _build_run_job_env(
     )
     env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get(
         "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL",
-        "12" if speed_mode == "fast" else "24",
+        "60" if speed_mode == "fast" else "120",
     )
     env["POOL_DAY_BATCH_SIZE"] = os.environ.get(
         "WEB_POOL_DAY_BATCH_SIZE_FAST" if speed_mode == "fast" else "WEB_POOL_DAY_BATCH_SIZE_NORMAL",
@@ -17298,6 +17299,7 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
     versions = sorted(str(x).strip().lower() for x in (req.include_versions or []) if str(x).strip())
     suffixes = sorted(str(x).strip().lower() for x in (req.exclude_suffixes or []) if str(x).strip())
     payload = {
+        "cache_ver": RUN_RESULT_CACHE_VER,
         "pairs": pairs,
         "chains": chains,
         "versions": versions,
@@ -17337,6 +17339,21 @@ def _run_result_cache_put(key: str, result: dict[str, Any]) -> None:
             for k in list(RUN_RESULT_CACHE.keys()):
                 if k not in keep:
                     RUN_RESULT_CACHE.pop(k, None)
+
+
+def _logs_indicate_incomplete_discovery(logs: list[str]) -> bool:
+    if not logs:
+        return False
+    try:
+        txt = "\n".join(str(x or "") for x in logs).lower()
+    except Exception:
+        return False
+    markers = (
+        "discovery_cap_hit",
+        "discovery_potentially_truncated",
+        "cap_trim_applied",
+    )
+    return any(m in txt for m in markers)
 
 
 def _recent_failed_runs(limit: int = 50) -> list[dict[str, Any]]:
@@ -17544,6 +17561,9 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         if isinstance(stage_ms, dict):
             slow_stage = max(stage_ms.items(), key=lambda kv: int(kv[1] or 0)) if stage_ms else ("", 0)
             logs.append(f"[timing] slowest_stage={str(slow_stage[0])} {int(slow_stage[1] or 0)}ms")
+        incomplete_discovery = _logs_indicate_incomplete_discovery(logs)
+        if incomplete_discovery:
+            logs.append("[cache] skipped: incomplete_discovery")
         result_payload = _json_safe({
             "request": {
                 "pairs": token_pairs,
@@ -17562,13 +17582,19 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             "debug_timing": timing_debug,
             "logs": logs[-8:],
         })
+        if incomplete_discovery:
+            try:
+                result_payload["result_flags"] = dict(result_payload.get("result_flags") or {})
+                result_payload["result_flags"]["incomplete_discovery"] = True
+            except Exception:
+                pass
         with JOB_LOCK:
             job["status"] = "done"
             job["stage"] = "done"
             job["stage_label"] = "Completed"
             job["progress"] = 100
             job["result"] = result_payload
-        if not bool(getattr(req, "ignore_cache", False)):
+        if (not bool(getattr(req, "ignore_cache", False))) and (not incomplete_discovery):
             _run_result_cache_put(_pool_run_cache_key(req), result_payload)
         _push_run_history(
             session_id=session_id,

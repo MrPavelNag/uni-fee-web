@@ -413,9 +413,16 @@ def main() -> None:
     print("Поиск пулов...")
 
     pools = discover_pools(pairs, min_tvl)
+    discovered_count = len(pools)
     max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 40))
     max_total = max(0, _env_int("MAX_POOLS_TOTAL", 300))
     pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)
+    if len(pools) < discovered_count:
+        print(
+            "[warn] CAP_TRIM_APPLIED "
+            f"discovered={discovered_count} kept={len(pools)} "
+            f"max_per_pair_chain={max_per_pair_chain} max_total={max_total}"
+        )
     print(f"Найдено {len(pools)} v4 пулов")
 
     # PDF-список пулов (аналогично v3)
