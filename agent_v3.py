@@ -38,6 +38,7 @@ from uniswap_client import (
     query_pool_day_data,
     query_pool_day_data_batch,
     query_pools_containing_both_tokens,
+    query_pools_containing_both_tokens_no_tvl_filter,
     query_pools_by_token_symbols,
     query_token_by_symbol,
 )
@@ -241,6 +242,26 @@ def discover_pools_v3(
                         source="symbol",
                     )
                     truncated = truncated or trunc_sym
+                if not pools:
+                    # Safety fallback for subgraphs where totalValueLockedUSD_gte behaves inconsistently.
+                    try:
+                        raw_no_tvl = query_pools_containing_both_tokens_no_tvl_filter(
+                            endpoint,
+                            base_addrs[0],
+                            quote_addrs[0],
+                        )
+                        min_tvl_now = _min_tvl(min_tvl)
+                        pools = [
+                            p for p in (raw_no_tvl or [])
+                            if _pool_tvl_usd(p) >= float(min_tvl_now)
+                        ]
+                        if pools:
+                            pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
+                            if discovery_cap_hard > 0:
+                                pools = pools[: int(discovery_cap_hard)]
+                            print(f"[info] v3_no_tvl_fallback_hit chain={chain} pair={base}/{quote} pools={len(pools)}")
+                    except Exception as e:
+                        print(f"  [{chain}] v3 no-tvl fallback {base}/{quote}: {e}")
                 if truncated:
                     print(f"[warn] DISCOVERY_POTENTIALLY_TRUNCATED chain={chain} pair={base}/{quote}")
                 for p in pools:
