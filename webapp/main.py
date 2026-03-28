@@ -21067,7 +21067,6 @@ def _render_positions_page() -> str:
           rowsWithCollected += 1;
           const lineX = [];
           const lineY = [];
-          const lineHover = [];
           const collectedPointX = [];
           const collectedPointY = [];
           const collectedPointText = [];
@@ -21086,7 +21085,6 @@ def _render_positions_page() -> str:
           if (anchorMs > 0) {
             lineX.push(new Date(anchorMs));
             lineY.push(0);
-            lineHover.push(`${new Date(anchorMs).toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"})}<br>$0.00<br>Liquidity: ${String(liqHover)}`);
           }
           for (const it of collectedSorted) {
             const ts = Number(it?.ts || 0);
@@ -21104,9 +21102,7 @@ def _render_positions_page() -> str:
             const aprDays = Number(aprMeta?.days || 0);
             const aprText = (showAprLabels && aprPct > 0) ? `<b>${aprPct.toFixed(1)}%</b>` : "";
             collectedPointText.push(aprText);
-            const htxt = formatCollectedHover({dt, val, aprPct, feeDeltaUsd, liqUsd, aprDays, liqHover});
-            collectedPointHover.push(htxt);
-            lineHover.push(htxt);
+            collectedPointHover.push(formatCollectedHover({dt, val, aprPct, feeDeltaUsd, liqUsd, aprDays, liqHover}));
           }
           if (hasSnapshot) {
             const snapLast = snapshotSorted.length ? snapshotSorted[snapshotSorted.length - 1] : null;
@@ -21114,41 +21110,18 @@ def _render_positions_page() -> str:
             const snapVal = Number(snapLast?.fees_usd || 0);
             if (snapTs > 0) {
               const lastCollected = lineY.length ? Number(lineY[lineY.length - 1] || 0) : 0;
-              const snapDt = new Date(snapTs * 1000);
-              const snapMarkerVal = Math.max(0, lastCollected + Math.max(0, snapVal));
-              lineX.push(snapDt);
-              lineY.push(snapMarkerVal);
-              const snapAprMeta = aprByTs.get(snapTs);
-              const snapAprPct = Number(snapAprMeta?.aprPct || 0);
-              const snapFeeDelta = Number(snapAprMeta?.feeDelta || 0);
-              const snapLiqUsd = Number(snapAprMeta?.liquidityUsd || 0);
-              const snapAprDays = Number(snapAprMeta?.days || 0);
-              lineHover.push(formatCollectedHover({
-                dt: snapDt,
-                val: snapMarkerVal,
-                aprPct: snapAprPct,
-                feeDeltaUsd: snapFeeDelta > 0 ? snapFeeDelta : snapVal,
-                liqUsd: snapLiqUsd,
-                aprDays: snapAprDays,
-                liqHover,
-              }));
+              lineX.push(new Date(snapTs * 1000));
+              lineY.push(Math.max(0, lastCollected + Math.max(0, snapVal)));
             }
           }
           const useLineX = lineX.length ? lineX : collectedItems.map((x) => new Date(Number(x.ts || 0) * 1000));
           const useLineY = lineY.length ? lineY : collectedItems.map((x) => Number(x.fees_usd || 0));
-          const useLineHover = lineHover.length === useLineX.length
-            ? lineHover
-            : useLineX.map((dt, idx) => {
-              const val = Number(useLineY[idx] || 0);
-              return `${dt.toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"})}<br>$${val.toFixed(2)}<br>Liquidity: ${String(liqHover)}`;
-            });
           if (useLineX.length === 1) {
             const onlyTs = Number(useLineX[0]?.getTime?.() || 0);
             const anchorTs = (createdMs > 0 && createdMs < onlyTs) ? createdMs : Math.max(0, onlyTs - 86400000);
             if (anchorTs > 0) {
               useLineX.unshift(new Date(anchorTs));
               useLineY.unshift(0);
-              useLineHover.unshift(`${new Date(anchorTs).toLocaleDateString("en-US", {year: "numeric", month: "short", day: "2-digit"})}<br>$0.00<br>Liquidity: ${String(liqHover)}`);
             }
           }
           const singleCollectedPoint = useLineX.length === 1;
@@ -21159,8 +21132,7 @@ def _render_positions_page() -> str:
             line: {color: palette[meta.colorIdx % palette.length], width: 2, shape: "hv"},
             marker: singleCollectedPoint ? {size: 6, color: palette[meta.colorIdx % palette.length], symbol: "circle"} : undefined,
             name: `${legendBaseLabel} (today USD)`,
-            hovertemplate: "%{hovertext}<extra></extra>",
-            hovertext: useLineHover,
+            hovertemplate: "%{x|%b %d, %Y}<br>$%{y:.2f}<extra>%{fullData.name}</extra>",
             _forceToday: rowIsSpotOnly,
             _legendPairBase: legendBase,
             _legendHeader: legendBaseLabel,
@@ -21549,8 +21521,7 @@ def _render_positions_page() -> str:
                 estimated_items: [],
                 // Keep current unclaimed snapshot so "today USD" reaches the latest point.
                 snapshot_items: Array.isArray(r?.snapshot_items) ? r.snapshot_items : [],
-                // Keep APR/day metadata so hover fields match "if sold instantly" set.
-                apr_items: Array.isArray(r?.apr_items) ? r.apr_items : [],
+                apr_items: [],
                 legend_fee_total_usd: Math.max(
                   0,
                   Number(lastFeePoint(r?.alt_collected_items)?.fees_usd || 0) + Number(lastFeePoint(r?.snapshot_items)?.fees_usd || 0),
@@ -21630,25 +21601,8 @@ def _render_positions_page() -> str:
                 ? (headerShown ? label : `${header} · ${label}`)
                 : String(t.name || "");
               if (firstOfType && !headerShown) headerShown = true;
-              const tMode = String(t?.mode || "");
-              const modeHasLines = tMode.includes("lines");
-              const markerIn = (t && typeof t.marker === "object" && t.marker) ? t.marker : {};
-              const lineColor = String((t?.line && t.line.color) || markerIn.color || "#2563eb");
-              const legendMode = (showLegend && modeHasLines && !tMode.includes("markers"))
-                ? "lines+markers"
-                : tMode;
               out.push({
                 ...t,
-                mode: legendMode,
-                marker: (showLegend && modeHasLines)
-                  ? {
-                      ...markerIn,
-                      symbol: "square",
-                      size: Math.max(7, Number(markerIn.size || 0) || 7),
-                      color: lineColor,
-                      maxdisplayed: 1,
-                    }
-                  : markerIn,
                 showlegend: showLegend,
                 name: legendName,
                 legendgroup: String(base || "pair"),
