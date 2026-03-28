@@ -300,49 +300,103 @@ def query_pools_containing_both_tokens_no_tvl_filter(
 def query_pool_day_data(
     endpoint: str, pool_id: str, start_ts: int, end_ts: int
 ) -> list[dict]:
-    """Fetch PoolDayData for a pool for the given date range (date = unix/86400)."""
-    query = """
-    query PoolDayData($pool: String!, $start: Int!, $end: Int!, $skip: Int!) {
-      poolDayDatas(
+    """Fetch PoolDayData for one pool."""
+    pid = str(pool_id or "").strip().lower()
+    if not pid:
+        return []
+    return query_pool_day_data_batch(endpoint, [pid], start_ts, end_ts).get(pid, [])
+
+
+def _pool_day_batch_size() -> int:
+    try:
+        return max(1, min(40, int(os.environ.get("GRAPHQL_POOL_DAY_BATCH_SIZE", "12"))))
+    except Exception:
+        return 12
+
+
+def query_pool_day_data_batch(
+    endpoint: str,
+    pool_ids: list[str],
+    start_ts: int,
+    end_ts: int,
+    batch_size: int = 0,
+) -> dict[str, list[dict]]:
+    """
+    Fetch PoolDayData for many pools using batched GraphQL aliases.
+    Returns mapping {pool_id_lower: sorted_rows}.
+    """
+    uniq_ids = list(dict.fromkeys([str(x or "").strip().lower() for x in (pool_ids or []) if str(x or "").strip()]))
+    if not uniq_ids:
+        return {}
+    out: dict[str, list[dict]] = {pid: [] for pid in uniq_ids}
+    missing: list[str] = []
+    for pid in uniq_ids:
+        cache_key = (str(endpoint), str(pid), int(start_ts), int(end_ts))
+        with _POOL_DAY_CACHE_LOCK:
+            cached = _POOL_DAY_CACHE.get(cache_key)
+        if cached is not None:
+            out[pid] = list(cached)
+        else:
+            missing.append(pid)
+    if not missing:
+        return out
+
+    bsz = int(batch_size or _pool_day_batch_size())
+    bsz = max(1, min(40, bsz))
+
+    def _build_query(active_ids: list[str]) -> tuple[str, dict[str, str]]:
+        alias_to_pool: dict[str, str] = {}
+        parts: list[str] = []
+        for i, pid in enumerate(active_ids):
+            alias = f"p{i}"
+            alias_to_pool[alias] = pid
+            parts.append(
+                f"""{alias}: poolDayDatas(
         first: 100,
         skip: $skip,
         orderBy: date,
         orderDirection: asc,
-        where: { pool: $pool, date_gte: $start, date_lte: $end }
-      ) {
+        where: {{ pool: "{pid}", date_gte: $start, date_lte: $end }}
+      ) {{
         id
         date
         tvlUSD
         volumeUSD
         feesUSD
         liquidity
-      }
-    }
-    """
-    cache_key = (str(endpoint), str(pool_id).lower(), int(start_ts), int(end_ts))
-    with _POOL_DAY_CACHE_LOCK:
-        cached = _POOL_DAY_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    all_data = []
-    skip = 0
-    while True:
-        data = graphql_query(
-            endpoint,
-            query,
-            {"pool": pool_id, "start": start_ts, "end": end_ts, "skip": skip},
-        )
-        items = data.get("data", {}).get("poolDayDatas", [])
-        if not items:
-            break
-        all_data.extend(items)
-        if len(items) < 100:
-            break
-        skip += 100
-        _maybe_page_delay()
-    out = sorted(all_data, key=lambda x: int(x["date"]))
-    with _POOL_DAY_CACHE_LOCK:
-        _POOL_DAY_CACHE[cache_key] = out
+      }}"""
+            )
+        query = "query PoolDayDataBatch($start: Int!, $end: Int!, $skip: Int!) {\n" + "\n".join(parts) + "\n}"
+        return query, alias_to_pool
+
+    for off in range(0, len(missing), bsz):
+        chunk = missing[off : off + bsz]
+        active = list(chunk)
+        skip = 0
+        while active:
+            query, alias_map = _build_query(active)
+            data = graphql_query(endpoint, query, {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)})
+            payload = data.get("data", {}) if isinstance(data, dict) else {}
+            next_active: list[str] = []
+            for alias, pid in alias_map.items():
+                items = payload.get(alias, []) if isinstance(payload, dict) else []
+                if not isinstance(items, list):
+                    items = []
+                if items:
+                    out[pid].extend(items)
+                if len(items) >= 100:
+                    next_active.append(pid)
+            if not next_active:
+                break
+            active = next_active
+            skip += 100
+            _maybe_page_delay()
+        for pid in chunk:
+            rows = sorted(out.get(pid, []), key=lambda x: int(x.get("date") or 0))
+            out[pid] = rows
+            cache_key = (str(endpoint), str(pid), int(start_ts), int(end_ts))
+            with _POOL_DAY_CACHE_LOCK:
+                _POOL_DAY_CACHE[cache_key] = rows
     return out
 
 

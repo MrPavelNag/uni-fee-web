@@ -17184,6 +17184,10 @@ def _build_run_job_env(
         "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL",
         "12" if speed_mode == "fast" else "24",
     )
+    env["POOL_DAY_BATCH_SIZE"] = os.environ.get(
+        "WEB_POOL_DAY_BATCH_SIZE_FAST" if speed_mode == "fast" else "WEB_POOL_DAY_BATCH_SIZE_NORMAL",
+        "14" if speed_mode == "fast" else "12",
+    )
     env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get(
         "WEB_MAX_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL",
         "20" if speed_mode == "fast" else "40",
@@ -18603,7 +18607,25 @@ def _render_positions_page() -> str:
     .pos-fee-hist-label input { margin:0; width:16px; height:16px; accent-color:#2563eb; flex-shrink:0; }
     .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
-    .copy-btn { border:none; background:transparent; color:#2563eb; cursor:pointer; font-size:13px; padding:0 0 0 4px; }
+    .copy-btn {
+      border: none !important;
+      background: transparent !important;
+      outline: none !important;
+      box-shadow: none !important;
+      appearance: none;
+      -webkit-appearance: none;
+      color: #2563eb;
+      cursor: pointer;
+      font-size: 13px;
+      padding: 0 0 0 4px;
+      line-height: 1;
+    }
+    .copy-btn:hover { color:#1d4ed8; }
+    .copy-btn:focus,
+    .copy-btn:focus-visible {
+      outline: none !important;
+      box-shadow: none !important;
+    }
     .pos-progress { width: 154px; height: 7px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; position: relative; }
     .pos-progress .bar { height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); width: 0%; transition: width 0.35s ease-out; }
     .pos-progress.pos-progress-indeterminate .bar { width: 40%; animation: posLoad 1s linear infinite; }
@@ -28643,7 +28665,8 @@ HTML_PAGE = """
       cursor: pointer;
     }
     .status {
-      font-size: 13px;
+      font-size: 17px;
+      font-weight: 600;
       color: #111111;
       display: inline-block;
       width: auto;
@@ -28653,6 +28676,25 @@ HTML_PAGE = """
       overflow: visible;
       text-overflow: clip;
       line-height: 1.3;
+    }
+    .status-live-num {
+      color: #15803d;
+      font-weight: 800;
+    }
+    .run-ignore-cache {
+      margin-left: 8px;
+      padding: 5px 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      background: #f8fafc;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+      font-weight: 600;
+      color: #334155;
+      white-space: nowrap;
+    }
+    .run-ignore-cache input[type="checkbox"] {
+      accent-color: #2563eb;
+      transform: translateY(-1px);
     }
     .progress-wrap { width: 100%; margin-top: 10px; }
     .control-card .progress-wrap {
@@ -29015,7 +29057,7 @@ HTML_PAGE = """
           <div class="section-actions">
             <div id="scanProgress" class="scan-progress"><div class="bar"></div></div>
             <span id="status" class="status">Ready</span>
-            <label class="check" style="white-space:nowrap">
+            <label class="check run-ignore-cache">
               <input id="runIgnoreCache" type="checkbox"/>
               Ignore cache
             </label>

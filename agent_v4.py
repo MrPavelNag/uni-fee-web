@@ -29,6 +29,7 @@ from agent_common import (
     save_dynamic_token,
     _normalize_fee_pct,
 )
+from uniswap_client import query_pool_day_data_batch
 
 
 def save_pdf(pools: list[dict], path: str) -> None:
@@ -278,7 +279,7 @@ def query_pool_day_data(endpoint: str, pool_id: str, start_ts: int, end_ts: int)
     return sorted(out, key=lambda x: int(x["date"]))
 
 
-def compute_fee_series(pool: dict, endpoint: str) -> dict:
+def compute_fee_series(pool: dict, endpoint: str, day_rows: Optional[list[dict]] = None) -> dict:
     """Серии fees и tvl для графика."""
     end = datetime.utcnow()
     start = end - timedelta(days=FEE_DAYS)
@@ -286,7 +287,7 @@ def compute_fee_series(pool: dict, endpoint: str) -> dict:
     start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
-    rows = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
+    rows = day_rows if day_rows is not None else query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
     fee_tier = int(pool.get("feeTier") or 3000)
     fee_series, tvl_series = [], []
     cumul = 0.0
@@ -425,6 +426,27 @@ def main() -> None:
 
     chart_data = {}
     max_workers = max(1, min(16, int(os.environ.get("POOL_SERIES_WORKERS", "8"))))
+    batch_size = max(1, min(40, _env_int("POOL_DAY_BATCH_SIZE", 12)))
+    day_data_by_pool: dict[str, list[dict]] = {}
+    if pools:
+        end = datetime.utcnow()
+        start = end - timedelta(days=FEE_DAYS)
+        start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        ids_by_endpoint: dict[str, list[str]] = {}
+        for p in pools:
+            chain = p.get("chain", "?")
+            endpoint = get_endpoint(chain)
+            pid = str(p.get("id") or "").strip().lower()
+            if endpoint and pid:
+                ids_by_endpoint.setdefault(endpoint, []).append(pid)
+        for endpoint, ids in ids_by_endpoint.items():
+            try:
+                fetched = query_pool_day_data_batch(endpoint, ids, start_ts, end_ts, batch_size=batch_size)
+                for pid, rows in fetched.items():
+                    day_data_by_pool[str(pid).lower()] = rows
+            except Exception as e:
+                print(f"  [v4-batch-daydata] {e}")
 
     def _process_pool(idx: int, pool: dict) -> tuple[int, str | None, dict | None, str]:
         chain = pool.get("chain", "?")
@@ -437,7 +459,8 @@ def main() -> None:
         endpoint = get_endpoint(chain)
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: skipped (no endpoint)"
-        series = compute_fee_series(pool, endpoint)
+        day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower())
+        series = compute_fee_series(pool, endpoint, day_rows=day_rows)
         payload = {
             **series,
             "pool_id": pool_id,
