@@ -3131,6 +3131,30 @@ def _fetch_coingecko_contract_prices_range(
         return []
 
 
+def _series_daily_avg(series: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    """Compress price series to one average USD price per UTC day."""
+    if not series:
+        return []
+    by_day: dict[int, tuple[float, int]] = {}
+    for ts, px in series:
+        try:
+            t = int(ts)
+            p = float(px)
+        except Exception:
+            continue
+        if t <= 0 or not math.isfinite(p) or p <= 0:
+            continue
+        d = (int(t) // 86400) * 86400
+        s, c = by_day.get(d, (0.0, 0))
+        by_day[d] = (float(s + p), int(c + 1))
+    out: list[tuple[int, float]] = []
+    for d, (s, c) in by_day.items():
+        if c > 0 and s > 0:
+            out.append((int(d), float(s / float(c))))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
 def _price_usd_at_or_before_series(series: list[tuple[int, float]], ts: int) -> float | None:
     """Last price in *series* with timestamp <= *ts* (seconds)."""
     if not series or ts <= 0:
@@ -15621,8 +15645,8 @@ def _build_v3_npm_fee_ledger_from_temp(
         t_hi = max(t for t, _, _ in points)
         stable0 = _fee_position_token_stable_usd_assumption(cid, t0) is not None
         stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
-        hist0 = [] if stable0 else _fetch_coingecko_contract_prices_range(cid, t0, t_lo, t_hi)
-        hist1 = [] if stable1 else _fetch_coingecko_contract_prices_range(cid, t1, t_lo, t_hi)
+        hist0 = [] if stable0 else _series_daily_avg(_fetch_coingecko_contract_prices_range(cid, t0, t_lo, t_hi))
+        hist1 = [] if stable1 else _series_daily_avg(_fetch_coingecko_contract_prices_range(cid, t1, t_lo, t_hi))
         prev_cf0 = 0.0
         prev_cf1 = 0.0
         cum_usd = 0.0
@@ -15945,27 +15969,24 @@ def _fetch_v3_position_fees_by_collect_logs(
         t_hi = max(t for t, _, _ in evs)
         stable0 = _fee_position_token_stable_usd_assumption(cid, t0) is not None
         stable1 = _fee_position_token_stable_usd_assumption(cid, t1) is not None
-        hist0 = [] if stable0 else _fetch_coingecko_contract_prices_range(cid, t0, t_lo, t_hi)
-        hist1 = [] if stable1 else _fetch_coingecko_contract_prices_range(cid, t1, t_lo, t_hi)
-        spot_map = _get_token_prices_usd(cid, [t0, t1])
-        sp0 = spot_map.get(t0)
-        sp1 = spot_map.get(t1)
-        partial0 = not stable0 and not hist0
-        partial1 = not stable1 and not hist1
+        hist0 = [] if stable0 else _series_daily_avg(_fetch_coingecko_contract_prices_range(cid, t0, t_lo, t_hi))
+        hist1 = [] if stable1 else _series_daily_avg(_fetch_coingecko_contract_prices_range(cid, t1, t_lo, t_hi))
+        missing_leg0 = 0
+        missing_leg1 = 0
         cum_usd = 0.0
         for ts, dh0, dh1 in evs:
             if stable0:
                 p0 = 1.0
             else:
                 p0 = _price_usd_at_or_before_series(hist0, ts) if hist0 else None
-                if p0 is None or p0 <= 0:
-                    p0 = sp0
             if stable1:
                 p1 = 1.0
             else:
                 p1 = _price_usd_at_or_before_series(hist1, ts) if hist1 else None
-                if p1 is None or p1 <= 0:
-                    p1 = sp1
+            if float(dh0) > 0 and (p0 is None or p0 <= 0):
+                missing_leg0 += 1
+            if float(dh1) > 0 and (p1 is None or p1 <= 0):
+                missing_leg1 += 1
             legs_expected = int(1 if float(dh0) > 0 else 0) + int(1 if float(dh1) > 0 else 0)
             legs_priced = 0
             inc_usd = 0.0
@@ -15985,16 +16006,16 @@ def _fetch_v3_position_fees_by_collect_logs(
             if prev is None or ts > prev[0]:
                 by_day[day_ts] = (int(ts), float(cum_usd))
         pricing = "onchain_historical"
-        if partial0 or partial1 or priced_partial:
-            pricing = "onchain_historical_mixed"
+        if missing_leg0 > 0 or missing_leg1 > 0 or priced_partial:
+            pricing = "onchain_historical_missing_price_data"
         detail = (
-            "Collect logs: USD per event via CoinGecko contract historical range; "
-            "stables=$1; missing historical series uses spot for that token."
+            "Collect logs: USD per event via CoinGecko contract historical daily prices; "
+            "stables=$1."
         )
         if truncated_window:
             detail += " Log scan window was truncated due to RPC range budget; recent blocks prioritized."
-        if partial0 or partial1:
-            detail += " Some tokens had no CG history — spot used for those legs."
+        if missing_leg0 > 0 or missing_leg1 > 0:
+            detail += f" Missing historical price legs: token0={int(missing_leg0)}, token1={int(missing_leg1)}."
         if priced_partial:
             detail += " Some events were valued by one known token leg only."
         return {int(d): float(v) for d, (_ts, v) in by_day.items()}, {"pricing": pricing, "detail": detail}
@@ -25446,8 +25467,8 @@ def positions_pool_value_series(req: PositionPoolSeriesRequest) -> dict[str, Any
             token1_addr = str(getattr(req, "token1_id", "") or "").strip().lower()
             stable0 = (_fee_position_token_stable_usd_assumption(int(chain_id), token0_addr) is not None) if _is_eth_address(token0_addr) else False
             stable1 = (_fee_position_token_stable_usd_assumption(int(chain_id), token1_addr) is not None) if _is_eth_address(token1_addr) else False
-            hist0 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token0_addr), int(day_start), int(day_end)) if (_is_eth_address(token0_addr) and not stable0) else []
-            hist1 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token1_addr), int(day_start), int(day_end)) if (_is_eth_address(token1_addr) and not stable1) else []
+            hist0 = _series_daily_avg(_fetch_coingecko_contract_prices_range(int(chain_id), str(token0_addr), int(day_start), int(day_end))) if (_is_eth_address(token0_addr) and not stable0) else []
+            hist1 = _series_daily_avg(_fetch_coingecko_contract_prices_range(int(chain_id), str(token1_addr), int(day_start), int(day_end))) if (_is_eth_address(token1_addr) and not stable1) else []
             def _price_day(addr: str, is_stable: bool, hist: list[tuple[int, float]], dts: int) -> float:
                 if is_stable:
                     return 1.0
@@ -26139,9 +26160,9 @@ def positions_position_fee_series(req: PositionPoolSeriesRequest) -> dict[str, A
             hist0: list[tuple[int, float]] = []
             hist1: list[tuple[int, float]] = []
             if stable0 is None and _is_eth_address(str(token0 or "")):
-                hist0 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token0 or ""), int(day_min), int(day_max))
+                hist0 = _series_daily_avg(_fetch_coingecko_contract_prices_range(int(chain_id), str(token0 or ""), int(day_min), int(day_max)))
             if stable1 is None and _is_eth_address(str(token1 or "")):
-                hist1 = _fetch_coingecko_contract_prices_range(int(chain_id), str(token1 or ""), int(day_min), int(day_max))
+                hist1 = _series_daily_avg(_fetch_coingecko_contract_prices_range(int(chain_id), str(token1 or ""), int(day_min), int(day_max)))
             spot_map = _get_token_prices_usd(int(chain_id), [x for x in [str(token0 or ""), str(token1 or "")] if _is_eth_address(x)])
             p0_spot = _safe_float(spot_map.get(str(token0 or "").strip().lower()))
             p1_spot = _safe_float(spot_map.get(str(token1 or "").strip().lower()))
