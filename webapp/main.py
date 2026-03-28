@@ -30398,7 +30398,7 @@ HTML_PAGE = """
       });
       redrawCharts();
       renderPoolRunDebug(result);
-      sortKey = "final_income";
+      sortKey = "";
       sortDesc = true;
       sortBy("final_income");
       saveResultState(result);

@@ -243,6 +243,36 @@ def discover_pools_v3(
                     )
                     truncated = truncated or trunc_sym
                 if not pools:
+                    # Safety fallback: symbol query without TVL filter, then TVL filter in Python.
+                    try:
+                        raw_by_symbol, trunc_sym0 = _discover_with_auto_expand(
+                            lambda cap: query_pools_by_token_symbols(
+                                endpoint,
+                                base,
+                                quote,
+                                0.0,
+                                max_results=int(cap),
+                            ),
+                            soft_cap=discovery_cap,
+                            hard_cap=discovery_cap_hard,
+                            chain=chain,
+                            pair_label=f"{base}/{quote}",
+                            source="symbol_no_tvl",
+                        )
+                        min_tvl_now = _min_tvl(min_tvl)
+                        pools = [
+                            p for p in (raw_by_symbol or [])
+                            if _pool_tvl_usd(p) >= float(min_tvl_now)
+                        ]
+                        truncated = truncated or trunc_sym0
+                        if pools:
+                            pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
+                            if discovery_cap_hard > 0:
+                                pools = pools[: int(discovery_cap_hard)]
+                            print(f"[info] v3_symbol_no_tvl_fallback_hit chain={chain} pair={base}/{quote} pools={len(pools)}")
+                    except Exception as e:
+                        print(f"  [{chain}] v3 symbol-no-tvl fallback {base}/{quote}: {e}")
+                if not pools:
                     # Safety fallback for subgraphs where totalValueLockedUSD_gte behaves inconsistently.
                     try:
                         raw_no_tvl = query_pools_containing_both_tokens_no_tvl_filter(
