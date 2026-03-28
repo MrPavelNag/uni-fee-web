@@ -419,6 +419,19 @@ POSITIONS_EXPLORER_NFTTX_RPS_SCOPE = (
 )
 _TOKENNFTTX_RPS_LOCK = threading.Lock()
 _TOKENNFTTX_RPS_NEXT_TS_BY_KEY: dict[str, float] = {}
+# Etherscan-family hard rate cap (free tier friendly, default < 3 req/s).
+# Applied across etherscan-like hosts (etherscan/bscscan/basescan/arbiscan/polygonscan/optimistic/uniscan).
+POSITIONS_ETHERSCAN_RPS_LIMIT = max(
+    0.0,
+    min(10.0, float(os.environ.get("POSITIONS_ETHERSCAN_RPS_LIMIT", "2.5"))),
+)
+POSITIONS_ETHERSCAN_RPS_SCOPE = (
+    "global"
+    if str(os.environ.get("POSITIONS_ETHERSCAN_RPS_SCOPE", "global")).strip().lower() == "global"
+    else "per_host"
+)
+_ETHERSCAN_RPS_LOCK = threading.Lock()
+_ETHERSCAN_RPS_NEXT_TS_BY_KEY: dict[str, float] = {}
 # Etherscan API V2 free tier does not support tokennfttx for these chains.
 # Skip api.etherscan.io/v2 for them and use native explorers / blockscout / RPC fallbacks.
 _ETHERSCAN_V2_TOKENNFTTX_UNSUPPORTED_FREE_CHAIN_IDS: frozenset[int] = frozenset(
@@ -431,6 +444,51 @@ def _etherscan_v2_tokennfttx_enabled_for_chain(chain_id: int) -> bool:
     if cid <= 0:
         return False
     return cid not in _ETHERSCAN_V2_TOKENNFTTX_UNSUPPORTED_FREE_CHAIN_IDS
+
+
+def _url_host(url: str) -> str:
+    u = str(url or "")
+    try:
+        if "://" in u:
+            return u.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].strip().lower()
+    except Exception:
+        return ""
+    return ""
+
+
+def _is_etherscan_like_host(host: str) -> bool:
+    h = str(host or "").strip().lower()
+    if not h:
+        return False
+    return (
+        "etherscan" in h
+        or "bscscan" in h
+        or "basescan" in h
+        or "arbiscan" in h
+        or "polygonscan" in h
+        or "uniscan" in h
+    )
+
+
+def _wait_etherscan_rps_slot(url: str) -> None:
+    lim = float(POSITIONS_ETHERSCAN_RPS_LIMIT)
+    if lim <= 0:
+        return
+    host = _url_host(url)
+    if not _is_etherscan_like_host(host):
+        return
+    key = "*" if POSITIONS_ETHERSCAN_RPS_SCOPE == "global" else (host or "*")
+    min_interval = max(0.001, 1.0 / lim)
+    while True:
+        wait_sec = 0.0
+        with _ETHERSCAN_RPS_LOCK:
+            now = time.monotonic()
+            next_ts = float(_ETHERSCAN_RPS_NEXT_TS_BY_KEY.get(key) or 0.0)
+            if now >= next_ts:
+                _ETHERSCAN_RPS_NEXT_TS_BY_KEY[key] = now + min_interval
+                return
+            wait_sec = max(0.001, next_ts - now)
+        time.sleep(min(0.05, wait_sec))
 # True: call api.etherscan.io/v2 (chainid) before bscscan/basescan/optimistic. Same ETHERSCAN_API_KEY
 # works on v2 for mapped chains. For native hosts: BSC/Base may reject a pure Etherscan key; Arbitrum
 # Arbiscan accepts the same multi-chain Etherscan key — we fall back ARBISCAN_API_KEY → ETHERSCAN_API_KEY.
@@ -4665,6 +4723,7 @@ def _explorer_contract_creation_block(chain_id: int, contract_address: str) -> i
     for url in urls:
         try:
             req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+            _wait_etherscan_rps_slot(url)
             with urlopen(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             rows = (payload or {}).get("result")
@@ -5909,6 +5968,7 @@ def _explorer_nfttx_rows(
     def _fetch_rows(url: str) -> list[dict[str, Any]]:
         try:
             req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+            _wait_etherscan_rps_slot(url)
             with urlopen(req, timeout=float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             result_rows = _etherscan_api_coerce_result_rows((payload or {}).get("result"))
@@ -6319,6 +6379,8 @@ def _explorer_owner_nfttx_rows(
         debug_out["page_workers"] = int(page_workers)
         debug_out["rps_limit"] = float(POSITIONS_EXPLORER_NFTTX_RPS_LIMIT)
         debug_out["rps_scope"] = str(POSITIONS_EXPLORER_NFTTX_RPS_SCOPE)
+        debug_out["etherscan_rps_limit"] = float(POSITIONS_ETHERSCAN_RPS_LIMIT)
+        debug_out["etherscan_rps_scope"] = str(POSITIONS_ETHERSCAN_RPS_SCOPE)
 
     def _append_from_result(rows_raw: Any) -> str:
         """Return 'empty', 'ok', or 'full'."""
@@ -6373,6 +6435,7 @@ def _explorer_owner_nfttx_rows(
         req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
         try:
             _wait_tokennfttx_rps_slot(url)
+            _wait_etherscan_rps_slot(url)
             with _TOKENNFTTX_HTTP_SEM:
                 with urlopen(req, timeout=http_timeout) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -6831,6 +6894,7 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     for url in urls:
         try:
             req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+            _wait_etherscan_rps_slot(url)
             with urlopen(req, timeout=12) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             rows = (payload or {}).get("result")
@@ -14659,6 +14723,7 @@ def _explorer_get_logs_for_pool_events(
                 payload: dict[str, Any] = {}
                 try:
                     req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+                    _wait_etherscan_rps_slot(url)
                     with urlopen(req, timeout=float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)) as resp:
                         payload = json.loads(resp.read().decode("utf-8"))
                 except Exception:
@@ -14780,6 +14845,7 @@ def _explorer_get_logs_for_npm_token_events(
                 payload: dict[str, Any] = {}
                 try:
                     req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+                    _wait_etherscan_rps_slot(url)
                     with urlopen(req, timeout=float(POSITIONS_EXPLORER_HTTP_TIMEOUT_SEC)) as resp:
                         payload = json.loads(resp.read().decode("utf-8"))
                 except Exception:
@@ -16999,10 +17065,117 @@ def _pair_label_key(pair_label: str) -> tuple[str, str] | None:
     return _requested_pair_key(a, b)
 
 
-def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs: list[str]) -> None:
+_TOKEN_SYMBOL_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
+
+
+def _clean_run_pairs(raw_pairs: list[str], *, limit: int = 4) -> list[str]:
+    """Normalize and validate input pairs in form 'tokenA,tokenB'."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_pair in (raw_pairs or [])[: max(1, int(limit))]:
+        part = str(raw_pair or "").strip().lower().replace(" ", "")
+        if "," not in part:
+            continue
+        a_raw, b_raw = part.split(",", 1)
+        a = str(a_raw or "").strip().lower()
+        b = str(b_raw or "").strip().lower()
+        if not _TOKEN_SYMBOL_RE.fullmatch(a):
+            continue
+        if not _TOKEN_SYMBOL_RE.fullmatch(b):
+            continue
+        if a == b:
+            continue
+        pair = f"{a},{b}"
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+    return out
+
+
+def _parse_run_pair_tuples(clean_pairs: list[str], *, limit: int = 4) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for pair in (clean_pairs or [])[: max(1, int(limit))]:
+        part = str(pair or "").strip().lower()
+        if "," not in part:
+            continue
+        a, b = part.split(",", 1)
+        a = a.strip()
+        b = b.strip()
+        if a and b and a != b:
+            pairs.append((a, b))
+    return list(dict.fromkeys(pairs))
+
+
+def _agent_data_path(script_name: str, pair_suffix: str) -> Path:
+    if str(script_name) == "agent_v3.py":
+        return DATA_DIR / f"pools_v3_{pair_suffix}.json"
+    return DATA_DIR / f"pools_v4_{pair_suffix}.json"
+
+
+def _run_agent_and_load_timed(
+    *,
+    script_name: str,
+    env: dict[str, str],
+    min_tvl: float,
+    logs: list[str],
+    pair_suffix: str,
+) -> tuple[dict[str, dict], dict[str, Any]]:
+    t0 = time.perf_counter()
+    subprocess_ms = _run_subprocess(script_name, env, min_tvl, logs)
+    t_load0 = time.perf_counter()
+    data = load_chart_data_json(str(_agent_data_path(script_name, pair_suffix)))
+    load_json_ms = int(round(max(0.0, time.perf_counter() - t_load0) * 1000.0))
+    total_ms = int(round(max(0.0, time.perf_counter() - t0) * 1000.0))
+    dbg = {
+        "script": str(script_name),
+        "subprocess_ms": int(subprocess_ms),
+        "load_json_ms": int(load_json_ms),
+        "total_ms": int(total_ms),
+        "pools_loaded": int(len(data)),
+    }
+    logs.append(
+        f"[timing] {script_name}: subprocess={int(subprocess_ms)}ms "
+        f"load_json={int(load_json_ms)}ms total={int(total_ms)}ms pools={int(len(data))}"
+    )
+    return data, dbg
+
+
+def _build_run_job_env(
+    *,
+    req: "PoolsRunRequest",
+    speed_mode: str,
+    token_pairs: str,
+    include_chains: list[str],
+    run_v4: bool,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    # Agents resolve symbols via the same top-N cache as site catalog.
+    try:
+        env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH.resolve())
+    except Exception:
+        env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH)
+    env["TOKEN_PAIRS"] = token_pairs
+    env["FEE_DAYS"] = str(req.days)
+    env["INCLUDE_CHAINS"] = ",".join(include_chains)
+    env["DISABLE_PDF_OUTPUT"] = "1"
+    env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "1")
+    env["POOL_SERIES_WORKERS"] = os.environ.get(
+        "WEB_POOL_SERIES_WORKERS_FAST" if speed_mode == "fast" else "WEB_POOL_SERIES_WORKERS_NORMAL",
+        "16" if speed_mode == "fast" else "8",
+    )
+    # v4 endpoint config uses this list at import-time.
+    if run_v4 and include_chains:
+        v4_supported = {c for c in include_chains if c in UNISWAP_V4_SUBGRAPHS}
+        env["V4_CHAINS"] = ",".join(sorted(v4_supported))
+    return env
+
+
+def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs: list[str]) -> int:
     cmd = [sys.executable, str(BASE_DIR / script_name), "--min-tvl", str(min_tvl)]
     timeout_sec = int(env.get("AGENT_TIMEOUT_SEC", "480"))
     logs.append(f"$ {' '.join(cmd)}  # timeout={timeout_sec}s")
+    t0 = time.perf_counter()
     try:
         proc = subprocess.run(
             cmd,
@@ -17018,6 +17191,7 @@ def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs:
             logs.append(proc.stderr[-4000:])
         if proc.returncode != 0:
             raise RuntimeError(f"{script_name} failed with code {proc.returncode}")
+        return int(round(max(0.0, time.perf_counter() - t0) * 1000.0))
     except subprocess.TimeoutExpired as e:
         if e.stdout:
             logs.append(str(e.stdout)[-4000:])
@@ -17101,6 +17275,8 @@ def _recent_failed_runs(limit: int = 50) -> list[dict[str, Any]]:
 
 
 def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
+    job_t0 = time.perf_counter()
+
     def _set_stage(stage: str, label: str, progress: int) -> None:
         with JOB_LOCK:
             j = JOBS.get(job_id)
@@ -17110,6 +17286,13 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             j["stage_label"] = label
             j["progress"] = max(0, min(100, progress))
 
+    timing_debug: dict[str, Any] = {
+        "total_ms": 0,
+        "stage_ms": {},
+        "pairs": [],
+    }
+
+    t_prepare0 = time.perf_counter()
     speed_mode = str(req.speed_mode or "normal").strip().lower()
     if speed_mode not in {"normal", "fast"}:
         speed_mode = "normal"
@@ -17122,17 +17305,10 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         job["stage_label"] = f"Preparing parameters ({speed_mode})"
         job["progress"] = 5
 
-    # Build up to 4 selected token pairs
-    pairs = []
-    for pair in req.pairs[:4]:
-        part = (pair or "").strip().lower()
-        if "," not in part:
-            continue
-        a, b = part.split(",", 1)
-        a, b = a.strip(), b.strip()
-        if a and b and a != b:
-            pairs.append((a, b))
-    pairs = list(dict.fromkeys(pairs))
+    # Build up to 4 selected token pairs.
+    t_pairs_parse0 = time.perf_counter()
+    pairs = _parse_run_pair_tuples(req.pairs, limit=4)
+    timing_debug["stage_ms"]["parse_pairs"] = int(round(max(0.0, time.perf_counter() - t_pairs_parse0) * 1000.0))
     if not pairs:
         with JOB_LOCK:
             job["status"] = "failed"
@@ -17140,6 +17316,8 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             job["stage"] = "failed"
             job["stage_label"] = "Validation failed"
             job["progress"] = 100
+            timing_debug["total_ms"] = int(round(max(0.0, time.perf_counter() - job_t0) * 1000.0))
+            job["result"] = {"logs": [], "debug_timing": timing_debug}
         return
     token_pairs = _pairs_to_string(pairs)
     requested_pair_keys = {_requested_pair_key(a, b) for a, b in pairs}
@@ -17149,77 +17327,106 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     run_v3 = "v3" in include_versions
     run_v4 = "v4" in include_versions
 
+    t_env0 = time.perf_counter()
     logs: list[str] = []
-    env = os.environ.copy()
-    # Агенты резолвят символы через тот же кэш топ-N, что и каталог сайта.
-    try:
-        env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH.resolve())
-    except Exception:
-        env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH)
-    env["TOKEN_PAIRS"] = token_pairs
-    env["FEE_DAYS"] = str(req.days)
-    env["INCLUDE_CHAINS"] = ",".join(include_chains)
-    env["DISABLE_PDF_OUTPUT"] = "1"
-    env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "1")
-    env["POOL_SERIES_WORKERS"] = os.environ.get(
-        "WEB_POOL_SERIES_WORKERS_FAST" if speed_mode == "fast" else "WEB_POOL_SERIES_WORKERS_NORMAL",
-        "16" if speed_mode == "fast" else "8",
+    env = _build_run_job_env(
+        req=req,
+        speed_mode=speed_mode,
+        token_pairs=token_pairs,
+        include_chains=include_chains,
+        run_v4=run_v4,
     )
-
-    # v4 endpoint config uses this list at import-time
-    if run_v4 and include_chains:
-        v4_supported = {c for c in include_chains if c in UNISWAP_V4_SUBGRAPHS}
-        env["V4_CHAINS"] = ",".join(sorted(v4_supported))
+    timing_debug["stage_ms"]["build_env"] = int(round(max(0.0, time.perf_counter() - t_env0) * 1000.0))
+    timing_debug["stage_ms"]["prepare"] = int(round(max(0.0, time.perf_counter() - t_prepare0) * 1000.0))
 
     try:
         merged_raw: dict[str, dict] = {}
+        t_lock_wait0 = time.perf_counter()
         with RUN_LOCK:
+            timing_debug["stage_ms"]["run_lock_wait"] = int(round(max(0.0, time.perf_counter() - t_lock_wait0) * 1000.0))
+            t_agents_total0 = time.perf_counter()
             total_pairs = max(1, len(pairs))
             for idx, (a, b) in enumerate(pairs, start=1):
+                t_pair0 = time.perf_counter()
                 pair_str = f"{a},{b}"
                 pair_suffix = pairs_to_filename_suffix(pair_str)
                 env["TOKEN_PAIRS"] = pair_str
+                pair_dbg: dict[str, Any] = {
+                    "pair": pair_str,
+                    "index": int(idx),
+                    "agents": [],
+                    "merged_before": int(len(merged_raw)),
+                }
 
                 base_progress = int(10 + (idx - 1) * (65 / total_pairs))
                 if run_v3 and run_v4:
                     _set_stage("v3v4", f"Running v3+v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 18))
 
-                    def _run_agent(script_name: str) -> dict[str, dict]:
-                        env_local = dict(env)
-                        _run_subprocess(script_name, env_local, req.min_tvl, logs)
-                        if script_name == "agent_v3.py":
-                            p = DATA_DIR / f"pools_v3_{pair_suffix}.json"
-                        else:
-                            p = DATA_DIR / f"pools_v4_{pair_suffix}.json"
-                        return load_chart_data_json(str(p))
-
                     with ThreadPoolExecutor(max_workers=2) as ex:
-                        f_v3 = ex.submit(_run_agent, "agent_v3.py")
-                        f_v4 = ex.submit(_run_agent, "agent_v4.py")
-                        merged_raw.update(f_v3.result())
-                        merged_raw.update(f_v4.result())
+                        f_v3 = ex.submit(
+                            _run_agent_and_load_timed,
+                            script_name="agent_v3.py",
+                            env=dict(env),
+                            min_tvl=req.min_tvl,
+                            logs=logs,
+                            pair_suffix=pair_suffix,
+                        )
+                        f_v4 = ex.submit(
+                            _run_agent_and_load_timed,
+                            script_name="agent_v4.py",
+                            env=dict(env),
+                            min_tvl=req.min_tvl,
+                            logs=logs,
+                            pair_suffix=pair_suffix,
+                        )
+                        data_v3, dbg_v3 = f_v3.result()
+                        data_v4, dbg_v4 = f_v4.result()
+                        pair_dbg["agents"].append(dbg_v3)
+                        pair_dbg["agents"].append(dbg_v4)
+                        merged_raw.update(data_v3)
+                        merged_raw.update(data_v4)
                 else:
                     if run_v3:
                         _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
-                        _run_subprocess("agent_v3.py", env, req.min_tvl, logs)
-                        v3_path = DATA_DIR / f"pools_v3_{pair_suffix}.json"
-                        merged_raw.update(load_chart_data_json(str(v3_path)))
+                        data_v3, dbg_v3 = _run_agent_and_load_timed(
+                                script_name="agent_v3.py",
+                                env=env,
+                                min_tvl=req.min_tvl,
+                                logs=logs,
+                                pair_suffix=pair_suffix,
+                            )
+                        pair_dbg["agents"].append(dbg_v3)
+                        merged_raw.update(data_v3)
                     if run_v4:
                         _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
-                        _run_subprocess("agent_v4.py", env, req.min_tvl, logs)
-                        v4_path = DATA_DIR / f"pools_v4_{pair_suffix}.json"
-                        merged_raw.update(load_chart_data_json(str(v4_path)))
+                        data_v4, dbg_v4 = _run_agent_and_load_timed(
+                                script_name="agent_v4.py",
+                                env=env,
+                                min_tvl=req.min_tvl,
+                                logs=logs,
+                                pair_suffix=pair_suffix,
+                            )
+                        pair_dbg["agents"].append(dbg_v4)
+                        merged_raw.update(data_v4)
+                pair_dbg["merged_after"] = int(len(merged_raw))
+                pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
+                pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
+                timing_debug["pairs"].append(pair_dbg)
+            timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
 
         # Keep only pools that really match requested pairs.
         # Protects against occasional cross-token resolution artifacts (e.g. POL instead of ETH).
+        t_filter0 = time.perf_counter()
         if requested_pair_keys:
             merged_raw = {
                 k: v
                 for k, v in merged_raw.items()
                 if (_pair_label_key(str(v.get("pair") or "")) in requested_pair_keys)
             }
+        timing_debug["stage_ms"]["pair_filter"] = int(round(max(0.0, time.perf_counter() - t_filter0) * 1000.0))
 
         _set_stage("merge", "Merging results for web", 85)
+        t_merge0 = time.perf_counter()
         result = _merge_for_web(
             token_pairs,
             include_chains=include_chains,
@@ -17228,6 +17435,24 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             exclude_suffixes=req.exclude_suffixes,
             merged_override=merged_raw,
         )
+        timing_debug["stage_ms"]["merge_for_web"] = int(round(max(0.0, time.perf_counter() - t_merge0) * 1000.0))
+        timing_debug["stage_ms"]["merged_rows"] = int(len(result.get("rows") or []))
+        timing_debug["stage_ms"]["merged_series"] = int(len(result.get("series") or []))
+        timing_debug["total_ms"] = int(round(max(0.0, time.perf_counter() - job_t0) * 1000.0))
+        if timing_debug["pairs"]:
+            slow_pair = max(
+                timing_debug["pairs"],
+                key=lambda x: int((x or {}).get("total_ms") or 0),
+            )
+            logs.append(
+                "[timing] slowest_pair="
+                f"{str((slow_pair or {}).get('pair') or '')} "
+                f"{int((slow_pair or {}).get('total_ms') or 0)}ms"
+            )
+        stage_ms = timing_debug.get("stage_ms") or {}
+        if isinstance(stage_ms, dict):
+            slow_stage = max(stage_ms.items(), key=lambda kv: int(kv[1] or 0)) if stage_ms else ("", 0)
+            logs.append(f"[timing] slowest_stage={str(slow_stage[0])} {int(slow_stage[1] or 0)}ms")
         with JOB_LOCK:
             job["status"] = "done"
             job["stage"] = "done"
@@ -17247,6 +17472,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     "lp_allocation_usd": float(env.get("LP_ALLOCATION_USD", "1000")),
                 },
                 **result,
+                "debug_timing": timing_debug,
                 "logs": logs[-8:],
             })
         _push_run_history(
@@ -17264,13 +17490,14 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             logs=logs,
         )
     except Exception as e:
+        timing_debug["total_ms"] = int(round(max(0.0, time.perf_counter() - job_t0) * 1000.0))
         with JOB_LOCK:
             job["status"] = "failed"
             job["error"] = str(e)
             job["stage"] = "failed"
             job["stage_label"] = "Failed"
             job["progress"] = 100
-            job["result"] = {"logs": logs[-8:]}
+            job["result"] = {"logs": logs[-8:], "debug_timing": timing_debug}
         _push_run_history(
             session_id=session_id,
             status="failed",
@@ -27932,27 +28159,7 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         req.exclude_suffixes = [str(x).strip() for x in (req.exclude_suffixes or []) if str(x).strip()]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid request payload: {str(e)[:120]}") from e
-    clean_pairs: list[str] = []
-    seen_pairs: set[str] = set()
-    for raw_pair in (req.pairs or []):
-        part = str(raw_pair or "").strip().lower().replace(" ", "")
-        if "," not in part:
-            continue
-        a_raw, b_raw = part.split(",", 1)
-        a = str(a_raw or "").strip().lower()
-        b = str(b_raw or "").strip().lower()
-        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", a):
-            continue
-        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", b):
-            continue
-        if a == b:
-            continue
-        pair = f"{a},{b}"
-        if pair in seen_pairs:
-            continue
-        seen_pairs.add(pair)
-        clean_pairs.append(pair)
-    req.pairs = clean_pairs
+    req.pairs = _clean_run_pairs(req.pairs, limit=4)
     if not req.pairs:
         raise HTTPException(status_code=400, detail="No valid pairs. Use token symbols like eth, usdc, wbtc, usdt (chars: a-z, 0-9, dot, underscore, dash).")
     if not os.environ.get("THE_GRAPH_API_KEY"):
@@ -28733,7 +28940,7 @@ HTML_PAGE = """
 
       <section class="card">
         <div class="section-head">
-          <h3>Fee Performance History</h3>
+          <h3>Pool Fee Performance</h3>
           <div class="section-actions">
             <div id="scanProgress" class="scan-progress"><div class="bar"></div></div>
             <span id="status" class="status">Ready</span>
