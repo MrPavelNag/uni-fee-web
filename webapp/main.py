@@ -30449,12 +30449,14 @@ HTML_PAGE = """
     async function pollJob(jobId) {
       stopActivePoll();
       activeJobId = String(jobId || "");
+      let pollErrStreak = 0;
       const tick = async () => {
         try {
           if (!activeJobId || activeJobId !== String(jobId || "")) return;
           const r = await fetch("/api/jobs/" + jobId, {headers: {"Accept":"application/json"}});
           const parsed = await parseApiJsonSafe(r);
           const job = parsed.data || {};
+          pollErrStreak = 0;
           if (!r.ok) {
             stopActivePoll();
             stopScanTicker();
@@ -30494,11 +30496,18 @@ HTML_PAGE = """
             scanStageLabel = String(job.stage_label || job.status || "running");
           }
         } catch (e) {
+          pollErrStreak += 1;
+          if (pollErrStreak < 3) {
+            const msg = String(e?.message || "transient polling error");
+            setStatus(`Polling retry ${pollErrStreak}/2: ${msg}`, "running");
+            return;
+          }
           stopActivePoll();
           stopScanTicker();
           hasScanRun = true;
           setBusy(false);
-          setStatus("Failed: job polling error", "fail");
+          const msg = String(e?.message || "job polling error");
+          setStatus("Failed: " + msg, "fail");
         }
       };
       await tick();

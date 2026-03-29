@@ -34,6 +34,12 @@ from agent_common import (
 from uniswap_client import query_pool_day_data_batch
 
 
+# V4 pools on some chains can be indexed under native ETH zero-address.
+# Keep this only for ETH-like chains; exclude Polygon to avoid POL/USDC noise for eth requests.
+NATIVE_ETH = "0x0000000000000000000000000000000000000000"
+NATIVE_ETH_QUERY_CHAINS = {"ethereum", "arbitrum", "optimism", "base", "unichain"}
+
+
 def save_pdf(pools: list[dict], path: str) -> None:
     """Сохранить список v4 пулов в PDF (аналогично v3)."""
     from reportlab.lib import colors
@@ -342,6 +348,7 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
     include = {c.strip().lower() for c in os.environ.get("INCLUDE_CHAINS", "").split(",") if c.strip()}
     if include:
         chains = [c for c in chains if c.lower() in include]
+    print(f"V4 chains active: {','.join(chains) if chains else '-'}")
     dynamic = load_dynamic_tokens()
     all_pools = []
     disable_symbol_fallback = _env_flag("DISABLE_V4_SYMBOL_FALLBACK", False)
@@ -368,9 +375,12 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
             known_a = bool(get_token_addresses(chain, base, dynamic) or get_token_addresses("ethereum", base, dynamic))
             known_b = bool(get_token_addresses(chain, quote, dynamic) or get_token_addresses("ethereum", quote, dynamic))
 
-            # Strict symbol mapping: eth/weth discovery is address-based via resolved WETH only.
             addrs_a = [addr_a]
+            if chain in NATIVE_ETH_QUERY_CHAINS and base.lower() in ("eth", "weth") and addr_a.lower() != NATIVE_ETH:
+                addrs_a.append(NATIVE_ETH)
             addrs_b = [addr_b]
+            if chain in NATIVE_ETH_QUERY_CHAINS and quote.lower() in ("eth", "weth") and addr_b.lower() != NATIVE_ETH:
+                addrs_b.append(NATIVE_ETH)
 
             pools = []
             timed_out = False
