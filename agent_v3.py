@@ -96,7 +96,7 @@ def _abi_word_uint(x: int) -> str:
     return f"{int(x):064x}"
 
 
-def _probe_unichain_v3_pool_ids(token_a: str, token_b: str) -> list[str]:
+def _probe_unichain_v3_pool_ids(token_a: str, token_b: str) -> list[tuple[str, int]]:
     """
     Backward-compatible wrapper. Prefer _probe_v3_pool_ids(chain,...).
     """
@@ -123,7 +123,7 @@ _V3_RPC_BY_CHAIN: dict[str, str] = {
 }
 
 
-def _probe_v3_pool_ids(chain: str, token_a: str, token_b: str) -> list[str]:
+def _probe_v3_pool_ids(chain: str, token_a: str, token_b: str) -> list[tuple[str, int]]:
     chain_key = str(chain or "").strip().lower()
     cu = chain_key.upper().replace("-", "_")
     rpc = os.environ.get(f"V3_RPC_URL_{cu}", _V3_RPC_BY_CHAIN.get(chain_key, "")).strip()
@@ -136,7 +136,7 @@ def _probe_v3_pool_ids(chain: str, token_a: str, token_b: str) -> list[str]:
         return []
     selector = "1698ee82"  # getPool(address,address,uint24)
     fees = [100, 500, 3000, 10000]
-    out: list[str] = []
+    out: list[tuple[str, int]] = []
     seen: set[str] = set()
     for a, b in ((t0, t1), (t1, t0)):
         wa = _abi_word_address(a)
@@ -154,7 +154,7 @@ def _probe_v3_pool_ids(chain: str, token_a: str, token_b: str) -> list[str]:
                     continue
                 if pid not in seen:
                     seen.add(pid)
-                    out.append(pid)
+                    out.append((pid, int(fee)))
             except Exception:
                 continue
     return out
@@ -339,27 +339,66 @@ def discover_pools_v3(
                     print(f"  [{chain}] v3 {base}/{quote}: symbol_fallback_pools={len(pools)}")
                 # Root robustness: probe canonical V3 factory onchain and merge missing pool ids.
                 try:
-                    probed_ids = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
-                    if probed_ids:
+                    probed_items = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
+                    if probed_items:
                         have_ids = {str((p or {}).get("id") or "").strip().lower() for p in (pools or [])}
                         min_tvl_now = _min_tvl(min_tvl)
                         added = 0
-                        for pid in probed_ids:
+                        missing_in_subgraph = 0
+                        below_tvl = 0
+                        for pid, fee_tier in probed_items:
                             if pid in have_ids:
                                 continue
                             p = query_pool_by_id(endpoint, pid)
-                            if not p:
+                            if p:
+                                if _pool_tvl_usd(p) < float(min_tvl_now):
+                                    below_tvl += 1
+                                    continue
+                                pools.append(p)
+                                have_ids.add(pid)
+                                added += 1
                                 continue
-                            if _pool_tvl_usd(p) < float(min_tvl_now):
+                            # Subgraph can miss pool entity while still serving poolDayDatas by pool id.
+                            missing_in_subgraph += 1
+                            try:
+                                now = datetime.utcnow()
+                                start_ts = int((now - timedelta(days=max(10, int(FEE_DAYS) + 5))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+                                end_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+                                day_rows = query_pool_day_data(endpoint, pid, start_ts, end_ts)
+                            except Exception:
+                                day_rows = []
+                            try:
+                                tvl_est = float((day_rows[-1] or {}).get("tvlUSD") or 0.0) if day_rows else 0.0
+                            except Exception:
+                                tvl_est = 0.0
+                            if tvl_est < float(min_tvl_now):
+                                below_tvl += 1
                                 continue
-                            pools.append(p)
+                            synth = {
+                                "id": pid,
+                                "feeTier": int(fee_tier),
+                                "liquidity": "0",
+                                "token0": {"id": str(base_addrs[0]).lower(), "symbol": str(base).upper(), "decimals": "18", "name": str(base).upper()},
+                                "token1": {"id": str(quote_addrs[0]).lower(), "symbol": str(quote).upper(), "decimals": "18", "name": str(quote).upper()},
+                                "totalValueLockedUSD": float(tvl_est),
+                                "totalValueLockedToken0": "0",
+                                "totalValueLockedToken1": "0",
+                                "volumeUSD": "0",
+                                "feesUSD": "0",
+                                "txCount": "0",
+                            }
+                            pools.append(synth)
                             have_ids.add(pid)
                             added += 1
-                        if added > 0:
+                        if added > 0 or missing_in_subgraph > 0 or below_tvl > 0:
                             pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
                             if discovery_cap_hard > 0:
                                 pools = pools[: int(discovery_cap_hard)]
-                            print(f"[probe] {chain} getPool merged pair={base}/{quote} added={added} total={len(pools)}")
+                            print(
+                                f"[probe] {chain} getPool pair={base}/{quote} "
+                                f"probed={len(probed_items)} added={added} "
+                                f"missing_in_subgraph={missing_in_subgraph} below_tvl={below_tvl} total={len(pools)}"
+                            )
                 except Exception as e:
                     print(f"  [{chain}] v3 onchain probe {base}/{quote}: {e}")
                 if truncated:
