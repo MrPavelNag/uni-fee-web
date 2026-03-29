@@ -208,7 +208,7 @@ def resolve_token(chain: str, symbol: str, endpoint: str, dynamic: dict) -> Opti
     return addr
 
 
-def query_pools(endpoint: str, token_a: str, token_b: str, min_tvl: float) -> list[dict]:
+def query_pools(endpoint: str, token_a: str, token_b: str) -> list[dict]:
     """Найти пулы с обоими токенами (в любом порядке)."""
     from uniswap_client import graphql_query
 
@@ -241,7 +241,7 @@ def query_pools(endpoint: str, token_a: str, token_b: str, min_tvl: float) -> li
     return result
 
 
-def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str, min_tvl: float) -> list[dict]:
+def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str) -> list[dict]:
     """Fallback: find pools by token symbols in either order."""
     from uniswap_client import graphql_query
 
@@ -381,7 +381,7 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                     if a.lower() == b.lower():
                         continue
                     try:
-                        pools.extend(query_pools(endpoint, a, b, min_tvl))
+                        pools.extend(query_pools(endpoint, a, b))
                     except Exception as e:
                         print(f"  [{chain}] {base}/{quote}: {e}")
                         if _is_timeout_error(e):
@@ -390,7 +390,7 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
             should_try_symbol_fallback = (not disable_symbol_fallback) and (not timed_out) and (not (known_a and known_b))
             if (not pools) and should_try_symbol_fallback:
                 try:
-                    pools.extend(query_pools_by_symbols(endpoint, base, quote, min_tvl))
+                    pools.extend(query_pools_by_symbols(endpoint, base, quote))
                 except Exception as e:
                     print(f"  [{chain}] {base}/{quote} (symbol fallback): {e}")
                     if _is_timeout_error(e):

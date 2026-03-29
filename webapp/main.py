@@ -180,7 +180,7 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v3"
+RUN_RESULT_CACHE_VER = "run_v5"
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -17365,6 +17365,54 @@ def _logs_indicate_incomplete_discovery(logs: list[str]) -> bool:
     return any(m in txt for m in markers)
 
 
+def _extract_price_drop_stats(logs: list[str]) -> dict[str, Any]:
+    """
+    Parse agent logs and collect strict-price exclusion counters for UI/debug.
+    """
+    stats: dict[str, Any] = {
+        "dropped_no_reserves_by_chain": {},
+        "price_unavailable_missing_reserves_by_chain": {},
+    }
+    if not logs:
+        return stats
+    pat_unavail = re.compile(
+        r"PRICE_UNAVAILABLE\s+chain=(?P<chain>[a-z0-9_-]+).*?reason=(?P<reason>[a-z0-9_:-]+)",
+        re.IGNORECASE,
+    )
+    pat_dropped = re.compile(
+        r"PRICE_FILTER_DROPPED\s+chain=(?P<chain>[a-z0-9_-]+).*?count=(?P<count>\d+)",
+        re.IGNORECASE,
+    )
+    dropped: dict[str, int] = {}
+    unavailable_missing: dict[str, int] = {}
+    try:
+        chunks = [str(x or "") for x in logs]
+    except Exception:
+        chunks = []
+    for chunk in chunks:
+        for line in str(chunk).splitlines():
+            m_drop = pat_dropped.search(line)
+            if m_drop:
+                ch = str(m_drop.group("chain") or "").strip().lower()
+                cnt = int(m_drop.group("count") or 0)
+                if ch and cnt > 0:
+                    dropped[ch] = int(dropped.get(ch, 0)) + int(cnt)
+            m_un = pat_unavail.search(line)
+            if m_un:
+                ch = str(m_un.group("chain") or "").strip().lower()
+                rs = str(m_un.group("reason") or "").strip().lower()
+                if ch and rs == "missing_pool_reserves":
+                    unavailable_missing[ch] = int(unavailable_missing.get(ch, 0)) + 1
+    # Prefer explicit dropped counters; fill holes from per-pool unavailable counters.
+    merged = dict(dropped)
+    for ch, cnt in unavailable_missing.items():
+        if ch not in merged and int(cnt) > 0:
+            merged[ch] = int(cnt)
+    stats["dropped_no_reserves_by_chain"] = merged
+    stats["price_unavailable_missing_reserves_by_chain"] = unavailable_missing
+    return stats
+
+
 def _recent_failed_runs(limit: int = 50) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with JOB_LOCK:
@@ -17606,6 +17654,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             slow_stage = max(stage_ms.items(), key=lambda kv: int(kv[1] or 0)) if stage_ms else ("", 0)
             logs.append(f"[timing] slowest_stage={str(slow_stage[0])} {int(slow_stage[1] or 0)}ms")
         incomplete_discovery = _logs_indicate_incomplete_discovery(logs)
+        price_drop_stats = _extract_price_drop_stats(logs)
         if incomplete_discovery:
             logs.append("[cache] skipped: incomplete_discovery")
         result_payload = _json_safe({
@@ -17625,6 +17674,13 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             "debug_timing": timing_debug,
             "logs": logs[-8:],
         })
+        try:
+            result_payload["result_flags"] = dict(result_payload.get("result_flags") or {})
+            dropped_map = dict(price_drop_stats.get("dropped_no_reserves_by_chain") or {})
+            if dropped_map:
+                result_payload["result_flags"]["dropped_no_reserves_by_chain"] = dropped_map
+        except Exception:
+            pass
         if incomplete_discovery:
             try:
                 result_payload["result_flags"] = dict(result_payload.get("result_flags") or {})
@@ -29662,6 +29718,19 @@ HTML_PAGE = """
       }
       if (flags?.from_cache) {
         lines.push("<span style='color:#0369a1;font-weight:800'>info: served_from_cache=1</span>");
+      }
+      const droppedNoReserves = (flags && typeof flags.dropped_no_reserves_by_chain === "object" && flags.dropped_no_reserves_by_chain)
+        ? flags.dropped_no_reserves_by_chain
+        : {};
+      const droppedEntries = Object.entries(droppedNoReserves)
+        .filter(([k, v]) => String(k || "").trim() && Number(v) > 0)
+        .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
+      if (droppedEntries.length) {
+        lines.push(
+          `<span style='color:#92400e'>excluded_no_reserves: ${
+            droppedEntries.map(([k, v]) => `${escAttr(String(k))}=${Number(v)}`).join(" | ")
+          }</span>`
+        );
       }
       if (req) {
         const rqPairs = escAttr(String(req.pairs || "-"));

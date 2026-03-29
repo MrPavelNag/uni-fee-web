@@ -343,11 +343,10 @@ def discover_pools_v3(
                     probed_items = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
                     if probed_items:
                         have_ids = {str((p or {}).get("id") or "").strip().lower() for p in (pools or [])}
-                        min_tvl_now = _min_tvl(min_tvl)
                         added = 0
                         missing_in_subgraph = 0
-                        below_tvl = 0
-                        for pid, fee_tier in probed_items:
+                        skipped_no_entity = 0
+                        for pid, _fee_tier in probed_items:
                             if pid in have_ids:
                                 continue
                             p = query_pool_by_id(endpoint, pid)
@@ -356,17 +355,18 @@ def discover_pools_v3(
                                 have_ids.add(pid)
                                 added += 1
                                 continue
-                            # Subgraph can miss pool entity while still serving poolDayDatas by pool id.
+                            # Pool exists onchain but is absent in subgraph pool(id) response.
                             missing_in_subgraph += 1
-                            below_tvl += 1
-                        if added > 0 or missing_in_subgraph > 0 or below_tvl > 0:
+                            skipped_no_entity += 1
+                        if added > 0 or missing_in_subgraph > 0 or skipped_no_entity > 0:
                             pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
                             if discovery_cap_hard > 0:
                                 pools = pools[: int(discovery_cap_hard)]
                             print(
                                 f"[probe] {chain} getPool pair={base}/{quote} "
                                 f"probed={len(probed_items)} added={added} "
-                                f"missing_in_subgraph={missing_in_subgraph} below_tvl={below_tvl} total={len(pools)}"
+                                f"missing_in_subgraph={missing_in_subgraph} "
+                                f"skipped_no_entity={skipped_no_entity} total={len(pools)}"
                             )
                 except Exception as e:
                     print(f"  [{chain}] v3 onchain probe {base}/{quote}: {e}")
