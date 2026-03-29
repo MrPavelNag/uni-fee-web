@@ -4,8 +4,12 @@ Shared logic for Uniswap pool fee agents (v3, v4, merge).
 
 import json
 import os
+import threading
+import time
 from datetime import datetime
 from typing import Any, Optional
+
+import requests
 
 from config import FEE_DAYS, LP_ALLOCATION_USD, TOKEN_ADDRESSES
 
@@ -15,6 +19,8 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 # Webapp writes top-N-by-TVL token addresses here; agents read via get_token_addresses.
 # Override absolute path when spawned from webapp: MAJOR_TOKENS_CACHE_PATH
 _MAJOR_SYM_BY_CHAIN: dict[str, dict[str, list[str]]] | None = None
+_TOKEN_PRICE_CACHE_LOCK = threading.Lock()
+_TOKEN_PRICE_CACHE: dict[tuple[str, str], tuple[float, float]] = {}
 
 
 def _major_tokens_cache_path() -> str:
@@ -141,6 +147,98 @@ def get_token_addresses(
     if a and a.lower() != ZERO_ADDRESS and a not in addrs:
         addrs.append(a)
     return addrs
+
+
+def _coingecko_platform_for_chain(chain: str) -> str:
+    c = str(chain or "").strip().lower()
+    mapping = {
+        "ethereum": "ethereum",
+        "arbitrum": "arbitrum-one",
+        "optimism": "optimistic-ethereum",
+        "polygon": "polygon-pos",
+        "base": "base",
+        "bsc": "binance-smart-chain",
+        "avalanche": "avalanche",
+        "celo": "celo",
+        "unichain": "unichain",
+    }
+    return mapping.get(c, "")
+
+
+def _safe_float(v: Any) -> float:
+    try:
+        return float(v or 0.0)
+    except Exception:
+        return 0.0
+
+
+def get_token_prices_usd_external(chain: str, token_addresses: list[str]) -> dict[str, float]:
+    """
+    Contract prices in USD from CoinGecko simple/token_price endpoint with short TTL cache.
+    """
+    platform = _coingecko_platform_for_chain(chain)
+    if not platform:
+        return {}
+    addrs = [str(a or "").strip().lower() for a in (token_addresses or []) if str(a or "").strip()]
+    addrs = list(dict.fromkeys(addrs))
+    if not addrs:
+        return {}
+    now = time.time()
+    ttl_sec = max(30.0, float(os.environ.get("TOKEN_PRICE_CACHE_TTL_SEC", "180")))
+    out: dict[str, float] = {}
+    miss: list[str] = []
+    with _TOKEN_PRICE_CACHE_LOCK:
+        for a in addrs:
+            rec = _TOKEN_PRICE_CACHE.get((platform, a))
+            if rec and (now - float(rec[0])) <= ttl_sec and float(rec[1]) > 0:
+                out[a] = float(rec[1])
+            else:
+                miss.append(a)
+    if miss:
+        try:
+            qs = ",".join(miss)
+            url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}"
+            r = requests.get(url, params={"contract_addresses": qs, "vs_currencies": "usd"}, timeout=8)
+            r.raise_for_status()
+            payload = r.json() if isinstance(r.json(), dict) else {}
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+        with _TOKEN_PRICE_CACHE_LOCK:
+            for a in miss:
+                px = _safe_float((payload.get(a) or {}).get("usd") if isinstance(payload.get(a), dict) else 0.0)
+                if px > 0:
+                    _TOKEN_PRICE_CACHE[(platform, a)] = (now, px)
+                    out[a] = px
+    return out
+
+
+def estimate_pool_tvl_usd_external(pool: dict, chain: str) -> float:
+    """
+    Canonical TVL estimate from reserve amounts * external USD prices.
+    """
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    if not token0 or not token1:
+        return 0.0
+    amt0 = _safe_float(pool.get("totalValueLockedToken0"))
+    amt1 = _safe_float(pool.get("totalValueLockedToken1"))
+    if amt0 <= 0 and amt1 <= 0:
+        return 0.0
+    prices = get_token_prices_usd_external(chain, [token0, token1])
+    p0 = _safe_float(prices.get(token0))
+    p1 = _safe_float(prices.get(token1))
+    if p0 <= 0 and p1 <= 0:
+        return 0.0
+    # If one leg price is missing, infer by pool ratio when available.
+    ratio01 = _safe_float(pool.get("token0Price"))  # token1 per token0
+    if p0 <= 0 and p1 > 0 and ratio01 > 0:
+        p0 = p1 * ratio01
+    if p1 <= 0 and p0 > 0 and ratio01 > 0:
+        p1 = p0 / ratio01
+    tvl = max(0.0, amt0 * p0) + max(0.0, amt1 * p1)
+    return float(tvl)
 
 
 def save_chart(pool_chart_data: dict[str, dict], path: str) -> None:

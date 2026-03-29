@@ -177,7 +177,7 @@ def query_pools_containing_both_tokens(
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
         volumeUSD feesUSD txCount
       }
       pools1: pools(
@@ -190,13 +190,12 @@ def query_pools_containing_both_tokens(
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
         volumeUSD feesUSD txCount
       }
     }
     """
     query = query_tmpl % (token_a, token_b, token_b, token_a)
-    min_tvl_num = float(min_tvl or 0.0)
     try:
         discovery_retries = max(1, int(os.environ.get("GRAPHQL_DISCOVERY_RETRIES", "1")))
     except Exception:
@@ -212,15 +211,6 @@ def query_pools_containing_both_tokens(
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])
         combined = list(p0 or []) + list(p1 or [])
-        if min_tvl_num > 0:
-            filtered = []
-            for p in combined:
-                try:
-                    if float((p or {}).get("totalValueLockedUSD") or 0.0) >= min_tvl_num:
-                        filtered.append(p)
-                except Exception:
-                    continue
-            combined = filtered
         result.extend(combined)
         if int(max_results or 0) > 0 and len(result) >= int(max_results):
             return _sort_pools_by_tvl_desc(result)[: int(max_results)]
@@ -258,7 +248,7 @@ def query_pools_by_token_symbols(
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
         volumeUSD feesUSD txCount
       }
       pools1: pools(
@@ -271,13 +261,12 @@ def query_pools_by_token_symbols(
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
         volumeUSD feesUSD txCount
       }
     }
     """
     query = query_tmpl % (sa, sb, sb, sa)
-    min_tvl_num = float(min_tvl or 0.0)
     try:
         discovery_retries = max(1, int(os.environ.get("GRAPHQL_DISCOVERY_RETRIES", "1")))
     except Exception:
@@ -293,15 +282,6 @@ def query_pools_by_token_symbols(
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])
         combined = list(p0 or []) + list(p1 or [])
-        if min_tvl_num > 0:
-            filtered = []
-            for p in combined:
-                try:
-                    if float((p or {}).get("totalValueLockedUSD") or 0.0) >= min_tvl_num:
-                        filtered.append(p)
-                except Exception:
-                    continue
-            combined = filtered
         result.extend(combined)
         if int(max_results or 0) > 0 and len(result) >= int(max_results):
             return _sort_pools_by_tvl_desc(result)[: int(max_results)]
@@ -396,6 +376,8 @@ def query_pool_by_id(endpoint: str, pool_id: str) -> Optional[dict]:
         totalValueLockedUSD
         totalValueLockedToken0
         totalValueLockedToken1
+        token0Price
+        token1Price
         volumeUSD
         feesUSD
         txCount
@@ -405,6 +387,37 @@ def query_pool_by_id(endpoint: str, pool_id: str) -> Optional[dict]:
     data = graphql_query(endpoint, q, {"id": pid}, retries=1)
     pool = (data.get("data", {}) or {}).get("pool")
     return dict(pool) if isinstance(pool, dict) else None
+
+
+def query_pool_last_tvl_usd(endpoint: str, pool_id: str) -> float:
+    """
+    Fetch latest poolDayData tvlUSD without date filters.
+    Useful when pool entity totalValueLockedUSD is stale.
+    """
+    pid = str(pool_id or "").strip().lower()
+    if not pid:
+        return 0.0
+    q = """
+    query PoolLastDay($pool: String!) {
+      poolDayDatas(
+        first: 1,
+        orderBy: date,
+        orderDirection: desc,
+        where: { pool: $pool }
+      ) {
+        date
+        tvlUSD
+      }
+    }
+    """
+    try:
+        data = graphql_query(endpoint, q, {"pool": pid}, retries=1)
+        rows = ((data or {}).get("data") or {}).get("poolDayDatas") or []
+        if not rows:
+            return 0.0
+        return float((rows[0] or {}).get("tvlUSD") or 0.0)
+    except Exception:
+        return 0.0
 
 
 def _pool_day_batch_size() -> int:

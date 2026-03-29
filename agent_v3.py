@@ -27,6 +27,7 @@ from config import (
 )
 
 from agent_common import (
+    estimate_pool_tvl_usd_external,
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
@@ -36,6 +37,7 @@ from agent_common import (
 )
 from uniswap_client import (
     get_graph_endpoint,
+    query_pool_last_tvl_usd,
     query_pool_day_data,
     query_pool_day_data_batch,
     query_pool_by_id,
@@ -355,11 +357,7 @@ def discover_pools_v3(
                                 eff_tvl = float(raw_tvl)
                                 if raw_tvl < float(min_tvl_now):
                                     try:
-                                        now = datetime.utcnow()
-                                        start_ts = int((now - timedelta(days=max(10, int(FEE_DAYS) + 5))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-                                        end_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-                                        day_rows = query_pool_day_data(endpoint, pid, start_ts, end_ts)
-                                        day_tvl = float((day_rows[-1] or {}).get("tvlUSD") or 0.0) if day_rows else 0.0
+                                        day_tvl = float(query_pool_last_tvl_usd(endpoint, pid) or 0.0)
                                         eff_tvl = max(float(raw_tvl), float(day_tvl))
                                     except Exception:
                                         eff_tvl = float(raw_tvl)
@@ -416,6 +414,15 @@ def discover_pools_v3(
                     print(f"  [{chain}] v3 onchain probe {base}/{quote}: {e}")
                 if truncated:
                     print(f"[warn] DISCOVERY_POTENTIALLY_TRUNCATED chain={chain} pair={base}/{quote}")
+                min_tvl_now = _min_tvl(min_tvl)
+                filtered_pools: list[dict] = []
+                for p in pools:
+                    ext_tvl = estimate_pool_tvl_usd_external(p, chain)
+                    eff_tvl = ext_tvl if ext_tvl > 0 else _pool_tvl_usd(p)
+                    p["effectiveTvlUSD"] = float(eff_tvl)
+                    if float(eff_tvl) >= float(min_tvl_now):
+                        filtered_pools.append(p)
+                pools = filtered_pools
                 for p in pools:
                     p["chain"] = chain
                     p["version"] = "v3"
@@ -443,7 +450,12 @@ def discover_pools_v3(
     return unique
 
 
-def compute_fee_and_tvl_series(pool: dict, endpoint: str, day_data: Optional[list[dict]] = None) -> dict:
+def compute_fee_and_tvl_series(
+    pool: dict,
+    endpoint: str,
+    day_data: Optional[list[dict]] = None,
+    tvl_multiplier: float = 1.0,
+) -> dict:
     end = datetime.utcnow()
     start = end - timedelta(days=FEE_DAYS)
     # v3 subgraph ожидает Unix timestamps для date_gte/date_lte
@@ -455,8 +467,9 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str, day_data: Optional[lis
     fee_tier = int(pool.get("feeTier") or 3000)
     fee_series, tvl_series = [], []
     cumul = 0.0
+    mult = max(0.01, float(tvl_multiplier or 1.0))
     for d in day_data:
-        tvl = float(d.get("tvlUSD") or 0)
+        tvl = float(d.get("tvlUSD") or 0) * mult
         fees = float(d.get("feesUSD") or 0)
         # feesUSD=0: не оцениваем из volume — subgraph иногда возвращает неверный volume
         if fees <= 0:
@@ -580,17 +593,34 @@ def main() -> None:
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair}: skipped (no endpoint)"
         day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower())
-        data = compute_fee_and_tvl_series(pool, endpoint, day_data=day_rows)
         try:
-            pool_tvl_now_usd = float(pool.get("totalValueLockedUSD") or 0.0)
+            pool_tvl_now_usd = float(pool.get("effectiveTvlUSD") or 0.0)
         except Exception:
             pool_tvl_now_usd = 0.0
+        if pool_tvl_now_usd <= 0:
+            pool_tvl_now_usd = float(estimate_pool_tvl_usd_external(pool, chain) or 0.0)
+        raw_last_tvl = 0.0
+        if day_rows:
+            try:
+                raw_last_tvl = float((day_rows[-1] or {}).get("tvlUSD") or 0.0)
+            except Exception:
+                raw_last_tvl = 0.0
+        tvl_multiplier = 1.0
+        if raw_last_tvl > 0 and pool_tvl_now_usd > 0:
+            tvl_multiplier = max(0.05, min(20.0, float(pool_tvl_now_usd) / float(raw_last_tvl)))
+        data = compute_fee_and_tvl_series(pool, endpoint, day_data=day_rows, tvl_multiplier=tvl_multiplier)
+        try:
+            raw_pool_tvl = float(pool.get("totalValueLockedUSD") or 0.0)
+        except Exception:
+            raw_pool_tvl = 0.0
         payload = {
             **data,
             "pool_id": pool_id,
             "fee_pct": fee_pct,
             "raw_fee_tier": raw_fee_tier,
             "pool_tvl_now_usd": pool_tvl_now_usd,
+            "pool_tvl_subgraph_usd": raw_pool_tvl,
+            "tvl_multiplier": float(tvl_multiplier),
             "pair": pair,
             "chain": chain,
             "version": "v3",

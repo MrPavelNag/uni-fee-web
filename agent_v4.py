@@ -23,6 +23,7 @@ from config import (
     V4_CHAINS,
 )
 from agent_common import (
+    estimate_pool_tvl_usd_external,
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
@@ -213,14 +214,14 @@ def query_pools(endpoint: str, token_a: str, token_b: str, min_tvl: float) -> li
 
     a, b = token_a.lower(), token_b.lower()
     q = """
-    query Pools($minTvl: BigDecimal!, $skip: Int!) {
-      pools0: pools(first: 100, skip: $skip, where: { token0: "%s", token1: "%s", totalValueLockedUSD_gte: $minTvl }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+    query Pools($skip: Int!) {
+      pools0: pools(first: 100, skip: $skip, where: { token0: "%s", token1: "%s" }, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id feeTier liquidity token0 { id symbol } token1 { id symbol }
-        totalValueLockedUSD volumeUSD feesUSD
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price volumeUSD feesUSD
       }
-      pools1: pools(first: 100, skip: $skip, where: { token0: "%s", token1: "%s", totalValueLockedUSD_gte: $minTvl }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+      pools1: pools(first: 100, skip: $skip, where: { token0: "%s", token1: "%s" }, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id feeTier liquidity token0 { id symbol } token1 { id symbol }
-        totalValueLockedUSD volumeUSD feesUSD
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price volumeUSD feesUSD
       }
     }
     """ % (a, b, b, a)
@@ -228,7 +229,7 @@ def query_pools(endpoint: str, token_a: str, token_b: str, min_tvl: float) -> li
     result = []
     skip = 0
     while True:
-        data = graphql_query(endpoint, q, {"minTvl": str(min_tvl), "skip": skip})
+        data = graphql_query(endpoint, q, {"skip": skip})
         d = data.get("data", {})
         p0, p1 = d.get("pools0", []), d.get("pools1", [])
         result.extend(p0)
@@ -248,14 +249,14 @@ def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str, min_tvl:
     if not sa or not sb:
         return []
     q = """
-    query PoolsBySymbols($minTvl: BigDecimal!, $skip: Int!) {
-      pools0: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+    query PoolsBySymbols($skip: Int!) {
+      pools0: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } }, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id feeTier liquidity token0 { id symbol } token1 { id symbol }
-        totalValueLockedUSD volumeUSD feesUSD
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price volumeUSD feesUSD
       }
-      pools1: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+      pools1: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } }, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id feeTier liquidity token0 { id symbol } token1 { id symbol }
-        totalValueLockedUSD volumeUSD feesUSD
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price volumeUSD feesUSD
       }
     }
     """ % (sa, sb, sb, sa)
@@ -263,7 +264,7 @@ def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str, min_tvl:
     skip = 0
     while True:
         # Symbol fallback is best-effort; keep retries low to avoid long stalls.
-        data = graphql_query(endpoint, q, {"minTvl": str(min_tvl), "skip": skip}, retries=1)
+        data = graphql_query(endpoint, q, {"skip": skip}, retries=1)
         d = data.get("data", {})
         p0, p1 = d.get("pools0", []), d.get("pools1", [])
         result.extend(p0)
@@ -301,7 +302,12 @@ def query_pool_day_data(endpoint: str, pool_id: str, start_ts: int, end_ts: int)
     return sorted(out, key=lambda x: int(x["date"]))
 
 
-def compute_fee_series(pool: dict, endpoint: str, day_rows: Optional[list[dict]] = None) -> dict:
+def compute_fee_series(
+    pool: dict,
+    endpoint: str,
+    day_rows: Optional[list[dict]] = None,
+    tvl_multiplier: float = 1.0,
+) -> dict:
     """Серии fees и tvl для графика."""
     end = datetime.utcnow()
     start = end - timedelta(days=FEE_DAYS)
@@ -313,8 +319,9 @@ def compute_fee_series(pool: dict, endpoint: str, day_rows: Optional[list[dict]]
     fee_tier = int(pool.get("feeTier") or 3000)
     fee_series, tvl_series = [], []
     cumul = 0.0
+    mult = max(0.01, float(tvl_multiplier or 1.0))
     for r in rows:
-        tvl = float(r.get("tvlUSD") or 0)
+        tvl = float(r.get("tvlUSD") or 0) * mult
         fees = float(r.get("feesUSD") or 0)
         if fees <= 0:
             fees = 0.0
@@ -395,13 +402,20 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 chain_abort = True
                 print(f"  [{chain}] timeout detected: skipping remaining pairs on this chain")
 
+            kept = 0
             for p in pools:
+                ext_tvl = estimate_pool_tvl_usd_external(p, chain)
+                eff_tvl = ext_tvl if ext_tvl > 0 else _pool_tvl_usd(p)
+                p["effectiveTvlUSD"] = float(eff_tvl)
+                if float(eff_tvl) < float(min_tvl):
+                    continue
                 p["chain"] = chain
                 p["version"] = "v4"
                 p["pair_label"] = f"{base}/{quote}"
-            all_pools.extend(pools)
+                all_pools.append(p)
+                kept += 1
             if pools:
-                print(f"  [{chain}] {base}/{quote}: {len(pools)} pools")
+                print(f"  [{chain}] {base}/{quote}: {kept} pools")
 
     # дедупликация по (chain, id)
     seen = set()
@@ -494,17 +508,34 @@ def main() -> None:
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: skipped (no endpoint)"
         day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower())
-        series = compute_fee_series(pool, endpoint, day_rows=day_rows)
         try:
-            pool_tvl_now_usd = float(pool.get("totalValueLockedUSD") or 0.0)
+            pool_tvl_now_usd = float(pool.get("effectiveTvlUSD") or 0.0)
         except Exception:
             pool_tvl_now_usd = 0.0
+        if pool_tvl_now_usd <= 0:
+            pool_tvl_now_usd = float(estimate_pool_tvl_usd_external(pool, chain) or 0.0)
+        raw_last_tvl = 0.0
+        if day_rows:
+            try:
+                raw_last_tvl = float((day_rows[-1] or {}).get("tvlUSD") or 0.0)
+            except Exception:
+                raw_last_tvl = 0.0
+        tvl_multiplier = 1.0
+        if raw_last_tvl > 0 and pool_tvl_now_usd > 0:
+            tvl_multiplier = max(0.05, min(20.0, float(pool_tvl_now_usd) / float(raw_last_tvl)))
+        series = compute_fee_series(pool, endpoint, day_rows=day_rows, tvl_multiplier=tvl_multiplier)
+        try:
+            raw_pool_tvl = float(pool.get("totalValueLockedUSD") or 0.0)
+        except Exception:
+            raw_pool_tvl = 0.0
         payload = {
             **series,
             "pool_id": pool_id,
             "fee_pct": fee_pct,
             "raw_fee_tier": raw_fee_tier,
             "pool_tvl_now_usd": pool_tvl_now_usd,
+            "pool_tvl_subgraph_usd": raw_pool_tvl,
+            "tvl_multiplier": float(tvl_multiplier),
             "pair": pair_label,
             "chain": chain,
             "version": "v4",
