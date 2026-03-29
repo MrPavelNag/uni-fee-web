@@ -352,15 +352,20 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
     dynamic = load_dynamic_tokens()
     all_pools = []
     disable_symbol_fallback = _env_flag("DISABLE_V4_SYMBOL_FALLBACK", False)
+    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", True)
     skip_chain_after_timeout = _env_flag("V4_SKIP_CHAIN_AFTER_TIMEOUT", True)
     timeout_chains: set[str] = set()
 
     for chain in chains:
         if chain in timeout_chains:
+            if strict_errors:
+                raise RuntimeError(f"[{chain}] timeout blacklist activated")
             print(f"  [{chain}] skip: timeout blacklist")
             continue
         endpoint = get_endpoint(chain)
         if not endpoint:
+            if strict_errors:
+                raise RuntimeError(f"[{chain}] v4: no endpoint")
             print(f"  [{chain}] skip: no endpoint")
             continue
 
@@ -394,6 +399,8 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                     try:
                         pools.extend(query_pools(endpoint, a, b))
                     except Exception as e:
+                        if strict_errors:
+                            raise RuntimeError(f"[{chain}] {base}/{quote}: {e}") from e
                         print(f"  [{chain}] {base}/{quote}: {e}")
                         if _is_timeout_error(e):
                             timed_out = True
@@ -406,6 +413,8 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 try:
                     pools.extend(query_pools_by_symbols(endpoint, base, quote))
                 except Exception as e:
+                    if strict_errors:
+                        raise RuntimeError(f"[{chain}] {base}/{quote} (symbol fallback): {e}") from e
                     print(f"  [{chain}] {base}/{quote} (symbol fallback): {e}")
                     if _is_timeout_error(e):
                         timed_out = True
@@ -414,10 +423,14 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
             elif (not pools) and (known_a and known_b):
                 print(f"  [{chain}] {base}/{quote}: skip symbol fallback (known token addresses)")
             if bad_indexer:
+                if strict_errors:
+                    raise RuntimeError(f"[{chain}] {base}/{quote}: bad indexer route detected")
                 print(f"  [{chain}] {base}/{quote}: bad indexer route detected, stopped retries for this pair")
             if timed_out and skip_chain_after_timeout:
                 timeout_chains.add(chain)
                 chain_abort = True
+                if strict_errors:
+                    raise RuntimeError(f"[{chain}] {base}/{quote}: timeout detected")
                 print(f"  [{chain}] timeout detected: skipping remaining pairs on this chain")
 
             kept = 0
@@ -517,6 +530,7 @@ def main() -> None:
     max_workers = max(1, min(16, int(os.environ.get("POOL_SERIES_WORKERS", "8"))))
     batch_size = max(1, min(40, _env_int("POOL_DAY_BATCH_SIZE", 12)))
     day_data_by_pool: dict[str, list[dict]] = {}
+    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", True)
     if pools:
         end = datetime.utcnow()
         start = end - timedelta(days=FEE_DAYS)
@@ -535,6 +549,8 @@ def main() -> None:
                 for pid, rows in fetched.items():
                     day_data_by_pool[str(pid).lower()] = rows
             except Exception as e:
+                if strict_errors:
+                    raise RuntimeError(f"[v4-batch-daydata] {e}") from e
                 print(f"  [v4-batch-daydata] {e}")
 
     def _process_pool(idx: int, pool: dict) -> tuple[int, str | None, dict | None, str]:
@@ -547,8 +563,12 @@ def main() -> None:
         pair_label = f"{t0}/{t1}"
         endpoint = get_endpoint(chain)
         if not endpoint:
+            if strict_errors:
+                raise RuntimeError(f"[{chain}] v4 {pair_label}: no endpoint")
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: skipped (no endpoint)"
-        day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower())
+        # Strict batch-only mode: do not fallback to per-pool daydata queries.
+        # Missing batch rows become empty series (0 days) instead of slow extra network calls.
+        day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower(), [])
         try:
             pool_tvl_now_usd = float(pool.get("effectiveTvlUSD") or 0.0)
         except Exception:
@@ -556,6 +576,10 @@ def main() -> None:
         if pool_tvl_now_usd <= 0:
             pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
             if float(pool_tvl_now_usd) <= 0:
+                if strict_errors:
+                    raise RuntimeError(
+                        f"[{chain}] v4 {pair_label}: external TVL unavailable: {price_err or 'unknown'}"
+                    )
                 msg = (
                     f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: "
                     f"skipped (external TVL unavailable: {price_err or 'unknown'})"
@@ -602,6 +626,8 @@ def main() -> None:
                         chart_data[pool_id] = payload
                     print(msg)
                 except Exception as e:
+                    if strict_errors:
+                        raise RuntimeError(f"[v4-series] {e}") from e
                     print(f"  [series] error - {e}")
 
     out_path = output_dir / f"pools_v4_{suffix}.json"

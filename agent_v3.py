@@ -141,7 +141,9 @@ def _probe_v3_pool_ids(chain: str, token_a: str, token_b: str) -> list[tuple[str
     if len(t0) != 42 or len(t1) != 42:
         return []
     selector = "1698ee82"  # getPool(address,address,uint24)
-    fees = [100, 500, 3000, 10000]
+    # Include common non-default tiers used by some deployments to avoid pool flapping
+    # when subgraph intermittently misses an otherwise valid pool.
+    fees = [100, 200, 250, 300, 400, 500, 1000, 2000, 2500, 3000, 4000, 10000]
     out: list[tuple[str, int]] = []
     seen: set[str] = set()
     for a, b in ((t0, t1), (t1, t0)):
@@ -262,6 +264,7 @@ def discover_pools_v3(
     discovery_cap_hard = _discover_cap_hard(max(1, discovery_cap) * 6 if discovery_cap > 0 else 0)
     chain_workers = max(1, min(_env_int("V3_DISCOVERY_CHAIN_WORKERS", 4), len(chains) or 1))
     disable_symbol_fallback = _env_flag("DISABLE_V3_SYMBOL_FALLBACK", True)
+    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", True)
     dyn_lock = threading.Lock()
 
     def _discover_for_chain(chain: str) -> list[dict]:
@@ -386,6 +389,8 @@ def discover_pools_v3(
                                 f"skipped_no_entity={skipped_no_entity} total={len(pools)}"
                             )
                 except Exception as e:
+                    if strict_errors:
+                        raise RuntimeError(f"[{chain}] v3 onchain probe {base}/{quote}: {e}") from e
                     print(f"  [{chain}] v3 onchain probe {base}/{quote}: {e}")
                 if truncated:
                     print(f"[warn] DISCOVERY_POTENTIALLY_TRUNCATED chain={chain} pair={base}/{quote}")
@@ -418,6 +423,8 @@ def discover_pools_v3(
                     p["pair_label"] = f"{base}/{quote}"
                     out_chain.append(p)
             except Exception as e:
+                if strict_errors:
+                    raise RuntimeError(f"[{chain}] v3 {base}/{quote}: {e}") from e
                 print(f"  [{chain}] v3 {base}/{quote}: {e}")
         return out_chain
 
@@ -428,6 +435,8 @@ def discover_pools_v3(
                 try:
                     all_pools.extend(fut.result() or [])
                 except Exception as e:
+                    if strict_errors:
+                        raise RuntimeError(f"[v3-discovery] chain worker error: {e}") from e
                     print(f"  [v3-discovery] chain worker error: {e}")
     seen = set()
     unique = []
@@ -550,6 +559,7 @@ def main() -> None:
     max_workers = max(1, min(16, int(os.environ.get("POOL_SERIES_WORKERS", "8"))))
     batch_size = max(1, min(40, _env_int("POOL_DAY_BATCH_SIZE", 12)))
     day_data_by_pool: dict[str, list[dict]] = {}
+    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", True)
     if pools:
         end = datetime.utcnow()
         start = end - timedelta(days=FEE_DAYS)
@@ -568,6 +578,8 @@ def main() -> None:
                 for pid, rows in fetched.items():
                     day_data_by_pool[str(pid).lower()] = rows
             except Exception as e:
+                if strict_errors:
+                    raise RuntimeError(f"[v3-batch-daydata] {e}") from e
                 print(f"  [v3-batch-daydata] {e}")
 
     def _process_pool(idx: int, pool: dict) -> tuple[int, str | None, dict | None, str]:
@@ -580,8 +592,11 @@ def main() -> None:
         pair = f"{t0}/{t1}"
         endpoint = get_graph_endpoint(chain, "v3")
         if not endpoint:
+            if strict_errors:
+                raise RuntimeError(f"[{chain}] v3 {pair}: no endpoint")
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair}: skipped (no endpoint)"
-        day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower())
+        # Strict batch-only mode: avoid per-pool GraphQL fallback requests.
+        day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower(), [])
         try:
             pool_tvl_now_usd = float(pool.get("effectiveTvlUSD") or 0.0)
         except Exception:
@@ -589,6 +604,10 @@ def main() -> None:
         if pool_tvl_now_usd <= 0:
             pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
             if float(pool_tvl_now_usd) <= 0:
+                if strict_errors:
+                    raise RuntimeError(
+                        f"[{chain}] v3 {pair}: external TVL unavailable: {price_err or 'unknown'}"
+                    )
                 msg = (
                     f"  [{idx+1}/{len(pools)}] {chain} {pair}: "
                     f"skipped (external TVL unavailable: {price_err or 'unknown'})"
@@ -634,6 +653,8 @@ def main() -> None:
                         pool_chart_data[pool_id] = payload
                     print(msg)
                 except Exception as e:
+                    if strict_errors:
+                        raise RuntimeError(f"[v3-series] {e}") from e
                     print(f"  [series] error - {e}")
 
     out_json = output_dir / f"pools_v3_{suffix}.json"

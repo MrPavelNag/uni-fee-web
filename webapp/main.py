@@ -180,7 +180,7 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v13"
+RUN_RESULT_CACHE_VER = "run_v14"
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -16965,6 +16965,7 @@ def _merge_for_web(
     min_fee_pct: float,
     max_fee_pct: float,
     exclude_suffixes: list[str],
+    min_tvl_usd: float = 0.0,
     merged_override: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     suffix = pairs_to_filename_suffix(token_pairs)
@@ -17013,6 +17014,16 @@ def _merge_for_web(
             pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
         except (TypeError, ValueError):
             pool_tvl_now_usd = 0.0
+        if pool_tvl_now_usd <= 0:
+            raise RuntimeError(
+                f"Pool {str(v.get('pool_id') or pool_id)} has no current TVL (pool_tvl_now_usd<=0). "
+                "Strict mode requires explicit current TVL."
+            )
+        if float(min_tvl_usd or 0.0) > 0 and pool_tvl_now_usd + 1e-9 < float(min_tvl_usd):
+            raise RuntimeError(
+                f"Pool {str(v.get('pool_id') or pool_id)} violates min_tvl: "
+                f"{pool_tvl_now_usd:.6f} < {float(min_tvl_usd):.6f}"
+            )
         if excluded_by_suffix(v, pool_id):
             status = "filtered_suffix"
         elif in_fee_range(v):
@@ -17032,7 +17043,8 @@ def _merge_for_web(
             "pair": v.get("pair", ""),
             "fee_pct": float(v.get("fee_pct") or 0),
             "final_income": _final_income(v),
-            "last_tvl": pool_tvl_now_usd if pool_tvl_now_usd > 0 else (float(tvl[-1][1]) if tvl else 0.0),
+            # Always use current external TVL basis; historical tail tvl is not a min_tvl filter input.
+            "last_tvl": pool_tvl_now_usd,
             "status": status,
         }
         rows.append(row)
@@ -17195,6 +17207,7 @@ def _build_run_job_env(
     env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL", "40")
     env["MAX_POOLS_TOTAL"] = os.environ.get("WEB_MAX_POOLS_TOTAL_NORMAL", "240")
     env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get("WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL", "0")
+    env["STRICT_DISCOVERY_ERRORS"] = os.environ.get("WEB_STRICT_DISCOVERY_ERRORS", "1")
     env["DISABLE_V3_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V3_SYMBOL_FALLBACK_NORMAL", "1")
     env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL", "1")
     env["V4_SKIP_CHAIN_AFTER_TIMEOUT"] = os.environ.get(
@@ -17635,6 +17648,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
+            min_tvl_usd=req.min_tvl,
             merged_override=merged_raw,
         )
         timing_debug["stage_ms"]["merge_for_web"] = int(round(max(0.0, time.perf_counter() - t_merge0) * 1000.0))
@@ -30457,14 +30471,12 @@ HTML_PAGE = """
     async function pollJob(jobId) {
       stopActivePoll();
       activeJobId = String(jobId || "");
-      let pollErrStreak = 0;
       const tick = async () => {
         try {
           if (!activeJobId || activeJobId !== String(jobId || "")) return;
           const r = await fetch("/api/jobs/" + jobId, {headers: {"Accept":"application/json"}});
           const parsed = await parseApiJsonSafe(r);
           const job = parsed.data || {};
-          pollErrStreak = 0;
           if (!r.ok) {
             stopActivePoll();
             stopScanTicker();
@@ -30504,12 +30516,6 @@ HTML_PAGE = """
             scanStageLabel = String(job.stage_label || job.status || "running");
           }
         } catch (e) {
-          pollErrStreak += 1;
-          if (pollErrStreak < 3) {
-            const msg = String(e?.message || "transient polling error");
-            setStatus(`Polling retry ${pollErrStreak}/2: ${msg}`, "running");
-            return;
-          }
           stopActivePoll();
           stopScanTicker();
           hasScanRun = true;
