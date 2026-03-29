@@ -224,6 +224,11 @@ def discover_pools_v3(
                     pair_label=f"{base}/{quote}",
                     source="address",
                 )
+                print(
+                    f"  [{chain}] v3 {base}/{quote}: "
+                    f"resolved={str(base_addrs[0])[:10]}..,{str(quote_addrs[0])[:10]}.. "
+                    f"pools={len(pools)}"
+                )
                 if not pools:
                     # Fallback for ambiguous symbol->address mappings (e.g. multiple tokens with same symbol).
                     pools, trunc_sym = _discover_with_auto_expand(
@@ -241,6 +246,7 @@ def discover_pools_v3(
                         source="symbol",
                     )
                     truncated = truncated or trunc_sym
+                    print(f"  [{chain}] v3 {base}/{quote}: symbol_fallback_pools={len(pools)}")
                 if truncated:
                     print(f"[warn] DISCOVERY_POTENTIALLY_TRUNCATED chain={chain} pair={base}/{quote}")
                 for p in pools:

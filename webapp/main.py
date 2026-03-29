@@ -17221,17 +17221,17 @@ def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs:
             timeout=timeout_sec,
         )
         if proc.stdout:
-            logs.append(proc.stdout[-4000:])
+            logs.append(proc.stdout[-20000:])
         if proc.stderr:
-            logs.append(proc.stderr[-4000:])
+            logs.append(proc.stderr[-20000:])
         if proc.returncode != 0:
             raise RuntimeError(f"{script_name} failed with code {proc.returncode}")
         return int(round(max(0.0, time.perf_counter() - t0) * 1000.0))
     except subprocess.TimeoutExpired as e:
         if e.stdout:
-            logs.append(str(e.stdout)[-4000:])
+            logs.append(str(e.stdout)[-20000:])
         if e.stderr:
-            logs.append(str(e.stderr)[-4000:])
+            logs.append(str(e.stderr)[-20000:])
         raise RuntimeError(
             f"{script_name} timed out after {timeout_sec}s. "
             "Try fewer chains or smaller history window."
