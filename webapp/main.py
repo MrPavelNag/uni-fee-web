@@ -180,7 +180,7 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v9"
+RUN_RESULT_CACHE_VER = "run_v10"
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -17187,6 +17187,9 @@ def _build_run_job_env(
     env["GRAPHQL_DISCOVERY_RETRIES"] = os.environ.get("WEB_GRAPHQL_DISCOVERY_RETRIES", "1")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL", "8")
     env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "8")
+    env["GRAPHQL_CONNECT_TIMEOUT_SEC_BASE"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_BASE", "8")
+    env["GRAPHQL_READ_TIMEOUT_SEC_BASE"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_BASE", "20")
+    env["GRAPHQL_RETRIES_BASE"] = os.environ.get("WEB_GRAPHQL_RETRIES_BASE", "2")
     env["MESSARI_GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_MESSARI_GRAPHQL_CONNECT_TIMEOUT_SEC", "6")
     env["MESSARI_GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_MESSARI_GRAPHQL_READ_TIMEOUT_SEC", "20")
     env["POOL_SERIES_WORKERS"] = os.environ.get("WEB_POOL_SERIES_WORKERS_NORMAL", "8")
@@ -29009,20 +29012,27 @@ HTML_PAGE = """
       display: grid;
       grid-template-rows: repeat(2, minmax(22px, auto));
       grid-auto-flow: column;
-      grid-auto-columns: minmax(110px, max-content);
-      gap: 4px 8px;
+      grid-auto-columns: minmax(92px, max-content);
+      gap: 3px 6px;
       margin-top: 2px;
     }
     .check {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 4px;
       font-size: 12px;
       color: #334155;
     }
     .check input {
       width: auto;
       padding: 0;
+    }
+    .chain-note {
+      font-size: 11px;
+      color: #64748b;
+      margin-left: auto;
+      text-align: right;
+      white-space: nowrap;
     }
     
     .inline-grid { display: grid; grid-template-columns: 90px 90px 120px 120px 220px 130px; gap: 6px; align-items: end; }
@@ -29143,6 +29153,7 @@ HTML_PAGE = """
             <div>
               <div class="top-line">
                 <span class="meta-badge" id="chainsMeta">chains: -</span>
+                <span class="chain-note" id="chainChecksNote" style="display:none;"></span>
               </div>
               <div class="chain-grid" id="chainChecks"></div>
             </div>
@@ -30287,10 +30298,22 @@ HTML_PAGE = """
         availableChains = meta.chains || [];
         document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;
         const checks = document.getElementById("chainChecks");
+        const chainNote = document.getElementById("chainChecksNote");
         checks.innerHTML = [
-          `<label class="check"><input type="checkbox" id="allChains" checked onchange="toggleAllChains()"> all</label>`,
-          ...availableChains.map(c => `<label class="check"><input type="checkbox" id="chain_${c}" checked onchange="onChainToggle()"> ${c}</label>`)
+          `<label class="check"><input type="checkbox" id="allChains" onchange="toggleAllChains()"> all</label>`,
+          ...availableChains.map(c => {
+            const lbl = String(c) === "unichain" ? "unichain*" : String(c);
+            const isCheckedByDefault = String(c) !== "unichain";
+            return `<label class="check"><input type="checkbox" id="chain_${c}" ${isCheckedByDefault ? "checked" : ""} onchange="onChainToggle()"> ${lbl}</label>`;
+          })
         ].join("");
+        if (chainNote) {
+          const hasUnichain = availableChains.includes("unichain");
+          chainNote.textContent = hasUnichain
+            ? "* Unichain scans may take longer due to substantial protocol noise on V4."
+            : "";
+          chainNote.style.display = hasUnichain ? "" : "none";
+        }
         loadFormState();
         if (document.getElementById("allChains").checked) toggleAllChains();
         else onChainToggle();

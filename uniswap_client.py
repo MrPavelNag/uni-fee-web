@@ -10,6 +10,8 @@ from typing import Optional
 
 import requests
 
+from config import GOLDSKY_ENDPOINTS, UNISWAP_V3_SUBGRAPHS, UNISWAP_V4_SUBGRAPHS
+
 
 _POOL_DAY_CACHE_LOCK = threading.Lock()
 _POOL_DAY_CACHE: dict[tuple[str, str, int, int], list[dict]] = {}
@@ -116,11 +118,31 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
     """Execute GraphQL query. Retries on 'bad indexers' (The Graph transient errors)."""
     payload = {"query": query, "variables": variables or {}}
     last_err = None
+    endpoint_l = str(endpoint or "").strip().lower()
+    base_v3_id = str(UNISWAP_V3_SUBGRAPHS.get("base") or "").strip().lower()
+    base_v4_id = str(UNISWAP_V4_SUBGRAPHS.get("base") or "").strip().lower()
+    base_goldsky = str(GOLDSKY_ENDPOINTS.get("base") or "").strip().lower()
+    is_base_endpoint = False
+    if endpoint_l:
+        if base_v3_id and base_v3_id in endpoint_l:
+            is_base_endpoint = True
+        if base_v4_id and base_v4_id in endpoint_l:
+            is_base_endpoint = True
+        if base_goldsky and base_goldsky in endpoint_l:
+            is_base_endpoint = True
+        if ("goldsky.com" in endpoint_l) and ("uniswap-v3-base" in endpoint_l):
+            is_base_endpoint = True
+
     if retries is None:
         try:
             retries = int(os.environ.get("GRAPHQL_RETRIES", "4"))
         except ValueError:
             retries = 4
+    if is_base_endpoint:
+        try:
+            retries = int(os.environ.get("GRAPHQL_RETRIES_BASE", str(retries)))
+        except Exception:
+            pass
     retries = max(1, retries)
     try:
         connect_timeout = float(os.environ.get("GRAPHQL_CONNECT_TIMEOUT_SEC", "8"))
@@ -130,6 +152,15 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
         read_timeout = float(os.environ.get("GRAPHQL_READ_TIMEOUT_SEC", "15"))
     except Exception:
         read_timeout = 15.0
+    if is_base_endpoint:
+        try:
+            connect_timeout = float(os.environ.get("GRAPHQL_CONNECT_TIMEOUT_SEC_BASE", str(connect_timeout)))
+        except Exception:
+            pass
+        try:
+            read_timeout = float(os.environ.get("GRAPHQL_READ_TIMEOUT_SEC_BASE", str(read_timeout)))
+        except Exception:
+            pass
     connect_timeout = max(2.0, connect_timeout)
     read_timeout = max(5.0, read_timeout)
     for attempt in range(retries):
