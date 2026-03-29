@@ -17195,7 +17195,8 @@ def _build_run_job_env(
     env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL", "40")
     env["MAX_POOLS_TOTAL"] = os.environ.get("WEB_MAX_POOLS_TOTAL_NORMAL", "240")
     env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get("WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL", "0")
-    env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL", "0")
+    env["DISABLE_V3_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V3_SYMBOL_FALLBACK_NORMAL", "1")
+    env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL", "1")
     env["V4_SKIP_CHAIN_AFTER_TIMEOUT"] = os.environ.get(
         "WEB_V4_SKIP_CHAIN_AFTER_TIMEOUT",
         "0",
@@ -30208,6 +30209,13 @@ HTML_PAGE = """
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
+    }
+
+    function shortStartEnd4(value) {
+      const v = String(value || "").trim();
+      if (!v) return "";
+      if (v.length <= 8) return v;
+      return `${v.slice(0, 4)}...${v.slice(-4)}`;
     }
 
     function renderTable(rows) {

@@ -261,6 +261,7 @@ def discover_pools_v3(
     discovery_cap = max(0, _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN", 0))
     discovery_cap_hard = _discover_cap_hard(max(1, discovery_cap) * 6 if discovery_cap > 0 else 0)
     chain_workers = max(1, min(_env_int("V3_DISCOVERY_CHAIN_WORKERS", 4), len(chains) or 1))
+    disable_symbol_fallback = _env_flag("DISABLE_V3_SYMBOL_FALLBACK", True)
     dyn_lock = threading.Lock()
 
     def _discover_for_chain(chain: str) -> list[dict]:
@@ -308,7 +309,7 @@ def discover_pools_v3(
 
             known_a = bool(get_token_addresses(chain, base, dynamic_tokens) or get_token_addresses("ethereum", base, dynamic_tokens))
             known_b = bool(get_token_addresses(chain, quote, dynamic_tokens) or get_token_addresses("ethereum", quote, dynamic_tokens))
-            allow_symbol_fallback = not (known_a and known_b)
+            allow_symbol_fallback = (not disable_symbol_fallback) and (not (known_a and known_b))
 
             def _discover_on_endpoint(ep: str, *, allow_symbol_fallback_local: bool) -> tuple[list[dict], bool]:
                 pools, truncated = _discover_with_auto_expand(
