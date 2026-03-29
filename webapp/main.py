@@ -20002,6 +20002,12 @@ def _render_positions_page() -> str:
       if (!v) return "";
       return v.length <= 4 ? v : ("..." + v.slice(-4));
     }
+    function shortStartEnd4(value) {
+      const v = String(value || "").trim();
+      if (!v) return "";
+      if (v.length <= 8) return v;
+      return `${v.slice(0, 4)}...${v.slice(-4)}`;
+    }
     function getTrustedSpamKeys() {
       try {
         const raw = localStorage.getItem("positions_trusted_spam_keys");
@@ -30226,9 +30232,7 @@ HTML_PAGE = """
         const visible = !!visibilityMap[r.pool_id];
         const hasSeries = !!seriesByPool[r.pool_id];
         const disabled = hasSeries ? "" : "disabled";
-        const poolIdDisplay = (r.version === "v4" && (r.pool_id || "").length > 24)
-          ? `${r.pool_id.slice(0, 12)}...${r.pool_id.slice(-8)}`
-          : r.pool_id;
+        const poolIdDisplay = shortStartEnd4(r.pool_id || "");
         const poolIdRaw = String(r.pool_id || "");
         html += `<tr class="${cls}">`;
         html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};"></span></td>`;

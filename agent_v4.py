@@ -83,10 +83,6 @@ def save_pdf(pools: list[dict], path: str) -> None:
     doc.build(story)
     print(f"Saved: {path}")
 
-# v4 может использовать native ETH (0x0) вместо WETH
-NATIVE_ETH = "0x0000000000000000000000000000000000000000"
-
-
 def _page_delay_sec() -> float:
     try:
         return max(0.0, float(os.environ.get("GRAPHQL_PAGE_DELAY_SEC", "0")))
@@ -372,12 +368,9 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
             known_a = bool(get_token_addresses(chain, base, dynamic) or get_token_addresses("ethereum", base, dynamic))
             known_b = bool(get_token_addresses(chain, quote, dynamic) or get_token_addresses("ethereum", quote, dynamic))
 
+            # Strict symbol mapping: eth/weth discovery is address-based via resolved WETH only.
             addrs_a = [addr_a]
-            if base.lower() in ("eth", "weth") and addr_a.lower() != NATIVE_ETH:
-                addrs_a.append(NATIVE_ETH)
             addrs_b = [addr_b]
-            if quote.lower() in ("eth", "weth") and addr_b.lower() != NATIVE_ETH:
-                addrs_b.append(NATIVE_ETH)
 
             pools = []
             timed_out = False
