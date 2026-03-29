@@ -191,3 +191,72 @@ def query_pool_day_data_batch_messari(
         except Exception:
             out[key] = []
     return out
+
+
+def query_pools_by_token_addresses_messari(
+    endpoint: str,
+    token_a: str,
+    token_b: str,
+    *,
+    page_size: int = 100,
+    max_scan: int = 400,
+) -> list[dict]:
+    """
+    Discover pools by scanning top liquidityPools and filtering by inputTokens.
+    This avoids expensive where-filters that may timeout on some Messari endpoints.
+    """
+    a = str(token_a or "").strip().lower()
+    b = str(token_b or "").strip().lower()
+    if not a or not b:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    first = max(10, min(200, int(page_size or 100)))
+    limit = max(first, int(max_scan or 400))
+    skip = 0
+    while skip < limit:
+        q = """
+        query PoolsPage($first: Int!, $skip: Int!) {
+          liquidityPools(
+            first: $first,
+            skip: $skip,
+            orderBy: totalValueLockedUSD,
+            orderDirection: desc
+          ) {
+            id
+            name
+            symbol
+            totalValueLockedUSD
+            totalLiquidity
+            cumulativeVolumeUSD
+            cumulativeSupplySideRevenueUSD
+            cumulativeSwapCount
+            inputTokenBalances
+            inputTokens { id symbol decimals name }
+            fees { feePercentage }
+          }
+        }
+        """
+        data = graphql_query(endpoint, q, {"first": int(first), "skip": int(skip)}, retries=1)
+        rows = ((data or {}).get("data") or {}).get("liquidityPools") or []
+        if not rows:
+            break
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            toks = raw.get("inputTokens") if isinstance(raw.get("inputTokens"), list) else []
+            ids = {str((t or {}).get("id") or "").strip().lower() for t in toks if isinstance(t, dict)}
+            if a not in ids or b not in ids:
+                continue
+            p = _normalize_pool_entity(raw)
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get("id") or "").strip().lower()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            out.append(p)
+        if len(rows) < first:
+            break
+        skip += first
+    return out

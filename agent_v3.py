@@ -37,6 +37,7 @@ from agent_common import (
 )
 from messari_adapter import (
     is_messari_schema_endpoint,
+    query_pools_by_token_addresses_messari,
     query_pool_by_id_messari,
     query_pool_day_data_batch_messari,
 )
@@ -424,57 +425,57 @@ def discover_pools_v3(
                         )
                         endpoint_used = fallback_endpoint
                         endpoint_kind = "messari"
-                        probed_items = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
-                        pools = []
-                        for pid, _fee_tier in probed_items:
-                            try:
-                                p = query_pool_by_id_messari(endpoint_used, pid)
-                            except Exception:
-                                p = None
-                            if isinstance(p, dict):
-                                pools.append(p)
+                        page_size = max(20, min(200, _env_int("MESSARI_DISCOVERY_PAGE_SIZE", 100)))
+                        max_scan = max(page_size, _env_int("MESSARI_DISCOVERY_MAX_SCAN", 400))
+                        pools = query_pools_by_token_addresses_messari(
+                            endpoint_used,
+                            base_addrs[0],
+                            quote_addrs[0],
+                            page_size=page_size,
+                            max_scan=max_scan,
+                        )
                         truncated = False
-                        print(f"  [{chain}] v3 {base}/{quote}: messari_probe_pools={len(pools)}")
+                        print(f"  [{chain}] v3 {base}/{quote}: messari_pools={len(pools)} scanned={max_scan}")
                     else:
                         raise
                 else:
                     raise
             try:
                 # Root robustness: probe canonical V3 factory onchain and merge missing pool ids.
-                try:
-                    probed_items = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
-                    if probed_items:
-                        have_ids = {str((p or {}).get("id") or "").strip().lower() for p in (pools or [])}
-                        added = 0
-                        missing_in_subgraph = 0
-                        skipped_no_entity = 0
-                        for pid, _fee_tier in probed_items:
-                            if pid in have_ids:
-                                continue
-                            if endpoint_kind == "messari":
-                                p = query_pool_by_id_messari(endpoint_used, pid)
-                            else:
+                if endpoint_kind != "messari":
+                    try:
+                        probed_items = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
+                        if probed_items:
+                            have_ids = {str((p or {}).get("id") or "").strip().lower() for p in (pools or [])}
+                            added = 0
+                            missing_in_subgraph = 0
+                            skipped_no_entity = 0
+                            for pid, _fee_tier in probed_items:
+                                if pid in have_ids:
+                                    continue
                                 p = query_pool_by_id(endpoint_used, pid)
-                            if p:
-                                pools.append(p)
-                                have_ids.add(pid)
-                                added += 1
-                                continue
-                            # Pool exists onchain but is absent in subgraph pool(id) response.
-                            missing_in_subgraph += 1
-                            skipped_no_entity += 1
-                        if added > 0 or missing_in_subgraph > 0 or skipped_no_entity > 0:
-                            pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
-                            if discovery_cap_hard > 0:
-                                pools = pools[: int(discovery_cap_hard)]
-                            print(
-                                f"[probe] {chain} getPool pair={base}/{quote} "
-                                f"probed={len(probed_items)} added={added} "
-                                f"missing_in_subgraph={missing_in_subgraph} "
-                                f"skipped_no_entity={skipped_no_entity} total={len(pools)}"
-                            )
-                except Exception as e:
-                    print(f"  [{chain}] v3 onchain probe {base}/{quote}: {e}")
+                                if p:
+                                    pools.append(p)
+                                    have_ids.add(pid)
+                                    added += 1
+                                    continue
+                                # Pool exists onchain but is absent in subgraph pool(id) response.
+                                missing_in_subgraph += 1
+                                skipped_no_entity += 1
+                            if added > 0 or missing_in_subgraph > 0 or skipped_no_entity > 0:
+                                pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
+                                if discovery_cap_hard > 0:
+                                    pools = pools[: int(discovery_cap_hard)]
+                                print(
+                                    f"[probe] {chain} getPool pair={base}/{quote} "
+                                    f"probed={len(probed_items)} added={added} "
+                                    f"missing_in_subgraph={missing_in_subgraph} "
+                                    f"skipped_no_entity={skipped_no_entity} total={len(pools)}"
+                                )
+                    except Exception as e:
+                        print(f"  [{chain}] v3 onchain probe {base}/{quote}: {e}")
+                else:
+                    print(f"  [{chain}] v3 {base}/{quote}: skip onchain probe in Messari mode")
                 if truncated:
                     print(f"[warn] DISCOVERY_POTENTIALLY_TRUNCATED chain={chain} pair={base}/{quote}")
                 min_tvl_now = _min_tvl(min_tvl)

@@ -180,7 +180,7 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v7"
+RUN_RESULT_CACHE_VER = "run_v8"
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -30030,6 +30030,38 @@ HTML_PAGE = """
       return validatePairs().pairs;
     }
 
+    function getChartScopeSuffix() {
+      let reqPairs = [];
+      const rp = currentRequest?.pairs;
+      if (Array.isArray(rp)) {
+        reqPairs = rp.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean);
+      } else if (typeof rp === "string") {
+        reqPairs = rp.split(";").map((x) => String(x || "").trim().toLowerCase()).filter(Boolean);
+      }
+      if (!reqPairs.length) reqPairs = getSelectedPairs();
+      const pairLabels = reqPairs
+        .map((p) => {
+          const [a, b] = String(p || "").split(",", 2).map((x) => String(x || "").trim());
+          if (!a || !b) return "";
+          return `${a.toUpperCase()}/${b.toUpperCase()}`;
+        })
+        .filter(Boolean);
+
+      let minTvl = Number(currentRequest?.min_tvl);
+      if (!Number.isFinite(minTvl)) {
+        minTvl = Number(document.getElementById("minTvl")?.value || 0);
+      }
+
+      const parts = [];
+      if (pairLabels.length) {
+        parts.push(pairLabels.length > 1 ? `pairs: ${pairLabels.join("; ")}` : `pair: ${pairLabels[0]}`);
+      }
+      if (Number.isFinite(minTvl) && minTvl >= 0) {
+        parts.push(`Min TVL: $${formatUsd(minTvl)}`);
+      }
+      return parts.length ? ` | ${parts.join(" | ")}` : "";
+    }
+
     function getSelectedProtocols() {
       const out = [];
       if (document.getElementById("protoV3")?.checked) out.push("v3");
@@ -30118,10 +30150,11 @@ HTML_PAGE = """
 
       const alloc = Number(currentRequest?.lp_allocation_usd || 1000);
       const days = Number(currentRequest?.days || getDaysValue());
+      const scopeSuffix = getChartScopeSuffix();
       const endDate = maxTs > 0 ? new Date(maxTs * 1000) : new Date();
       const startDate = new Date(endDate.getTime() - days * 24 * 3600 * 1000);
       Plotly.newPlot("feesChart", feeTraces, {
-        title: `Cumulative Fees (LP allocation: $${formatUsd(alloc)})`,
+        title: `Cumulative Fees (LP allocation: $${formatUsd(alloc)})${scopeSuffix}`,
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
@@ -30131,7 +30164,7 @@ HTML_PAGE = """
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
       }, {displaylogo: false, responsive: true});
       Plotly.newPlot("tvlChart", tvlTraces, {
-        title: "TVL dynamics (thousands USD)",
+        title: `TVL dynamics (thousands USD)${scopeSuffix}`,
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
@@ -30497,8 +30530,9 @@ HTML_PAGE = """
         yaxis: {title: "Value", showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, range: [0, 1]},
         annotations: [{text: "Scan to load data", x: 0.5, y: 0.5, xref: "paper", yref: "paper", showarrow: false, font: {color: "#64748b"}}],
       };
-      Plotly.newPlot("feesChart", baseline, {title: "Cumulative Fees", ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "Cumulative fee (USD)"}}, {displaylogo: false, responsive: true});
-      Plotly.newPlot("tvlChart", baseline, {title: "TVL dynamics (thousands USD)", ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "TVL (k USD)"}}, {displaylogo: false, responsive: true});
+      const scopeSuffix = getChartScopeSuffix();
+      Plotly.newPlot("feesChart", baseline, {title: `Cumulative Fees${scopeSuffix}`, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "Cumulative fee (USD)"}}, {displaylogo: false, responsive: true});
+      Plotly.newPlot("tvlChart", baseline, {title: `TVL dynamics (thousands USD)${scopeSuffix}`, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "TVL (k USD)"}}, {displaylogo: false, responsive: true});
     }
 
     attachAutosave();
