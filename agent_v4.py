@@ -215,11 +215,11 @@ def query_pools(endpoint: str, token_a: str, token_b: str) -> list[dict]:
     a, b = token_a.lower(), token_b.lower()
     q = """
     query Pools($skip: Int!) {
-      pools0: pools(first: 100, skip: $skip, where: { token0: "%s", token1: "%s" }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+      pools0: pools(first: 100, skip: $skip, where: { token0: "%s", token1: "%s", totalValueLockedToken0_gt: "0", totalValueLockedToken1_gt: "0" }, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id feeTier liquidity token0 { id symbol } token1 { id symbol }
         totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price volumeUSD feesUSD
       }
-      pools1: pools(first: 100, skip: $skip, where: { token0: "%s", token1: "%s" }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+      pools1: pools(first: 100, skip: $skip, where: { token0: "%s", token1: "%s", totalValueLockedToken0_gt: "0", totalValueLockedToken1_gt: "0" }, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id feeTier liquidity token0 { id symbol } token1 { id symbol }
         totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price volumeUSD feesUSD
       }
@@ -250,11 +250,11 @@ def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str) -> list[
         return []
     q = """
     query PoolsBySymbols($skip: Int!) {
-      pools0: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+      pools0: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedToken0_gt: "0", totalValueLockedToken1_gt: "0" }, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id feeTier liquidity token0 { id symbol } token1 { id symbol }
         totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price volumeUSD feesUSD
       }
-      pools1: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+      pools1: pools(first: 100, skip: $skip, where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedToken0_gt: "0", totalValueLockedToken1_gt: "0" }, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id feeTier liquidity token0 { id symbol } token1 { id symbol }
         totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price volumeUSD feesUSD
       }
@@ -404,15 +404,18 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
 
             kept = 0
             skipped_missing_price = 0
+            miss_reason_counts: dict[str, int] = {}
+            miss_reason_samples: dict[str, list[str]] = {}
             for p in pools:
                 ext_tvl, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(p, chain)
                 if float(ext_tvl) <= 0:
                     skipped_missing_price += 1
                     pid = str((p or {}).get("id") or "")
-                    print(
-                        f"[warn] PRICE_UNAVAILABLE chain={chain} pair={base}/{quote} "
-                        f"pool={pid} reason={price_err or 'unknown'}"
-                    )
+                    reason = str(price_err or "unknown").strip().lower()
+                    miss_reason_counts[reason] = int(miss_reason_counts.get(reason, 0)) + 1
+                    bucket = miss_reason_samples.setdefault(reason, [])
+                    if pid and len(bucket) < 3:
+                        bucket.append(pid)
                     continue
                 p["effectiveTvlUSD"] = float(ext_tvl)
                 p["tvl_price_source"] = str(price_source or "external")
@@ -430,6 +433,12 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                     f"[warn] PRICE_FILTER_DROPPED chain={chain} pair={base}/{quote} "
                     f"count={skipped_missing_price}"
                 )
+                for reason, count in sorted(miss_reason_counts.items(), key=lambda kv: int(kv[1]), reverse=True):
+                    sample = ",".join(miss_reason_samples.get(reason) or [])
+                    print(
+                        f"[warn] PRICE_UNAVAILABLE_SUMMARY chain={chain} pair={base}/{quote} "
+                        f"reason={reason} count={int(count)} samples={sample}"
+                    )
 
     # дедупликация по (chain, id)
     seen = set()

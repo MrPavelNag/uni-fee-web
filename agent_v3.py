@@ -35,7 +35,13 @@ from agent_common import (
     save_chart_data_json,
     save_dynamic_token,
 )
+from messari_adapter import (
+    is_messari_schema_endpoint,
+    query_pool_by_id_messari,
+    query_pool_day_data_batch_messari,
+)
 from uniswap_client import (
+    graphql_query,
     get_graph_endpoint,
     query_pool_day_data,
     query_pool_day_data_batch,
@@ -68,6 +74,46 @@ def _env_flag(name: str, default: bool = False) -> bool:
 def _is_timeout_error(err: Exception) -> bool:
     msg = str(err or "").lower()
     return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
+
+
+_ENDPOINT_SCHEMA_COMPAT_LOCK = threading.Lock()
+_ENDPOINT_SUPPORTS_POOLS_CACHE: dict[str, bool] = {}
+_ENDPOINT_IS_MESSARI_CACHE: dict[str, bool] = {}
+
+
+def _endpoint_supports_v3_pools(endpoint: str) -> bool:
+    ep = str(endpoint or "").strip()
+    if not ep:
+        return False
+    with _ENDPOINT_SCHEMA_COMPAT_LOCK:
+        cached = _ENDPOINT_SUPPORTS_POOLS_CACHE.get(ep)
+    if cached is not None:
+        return bool(cached)
+    ok = True
+    try:
+        graphql_query(ep, "query Q { pools(first: 1) { id } }", retries=1)
+        ok = True
+    except Exception as e:
+        msg = str(e or "").lower()
+        if "has no field `pools`" in msg or "has no field 'pools'" in msg:
+            ok = False
+    with _ENDPOINT_SCHEMA_COMPAT_LOCK:
+        _ENDPOINT_SUPPORTS_POOLS_CACHE[ep] = bool(ok)
+    return bool(ok)
+
+
+def _endpoint_is_messari(endpoint: str) -> bool:
+    ep = str(endpoint or "").strip()
+    if not ep:
+        return False
+    with _ENDPOINT_SCHEMA_COMPAT_LOCK:
+        cached = _ENDPOINT_IS_MESSARI_CACHE.get(ep)
+    if cached is not None:
+        return bool(cached)
+    ok = bool(is_messari_schema_endpoint(ep))
+    with _ENDPOINT_SCHEMA_COMPAT_LOCK:
+        _ENDPOINT_IS_MESSARI_CACHE[ep] = bool(ok)
+    return bool(ok)
 
 
 def _discover_cap_hard(default_from_soft: int) -> int:
@@ -267,8 +313,18 @@ def discover_pools_v3(
         out_chain: list[dict] = []
         primary_endpoint = get_graph_endpoint(chain, "v3")
         fallback_endpoint = str(GOLDSKY_ENDPOINTS.get(chain) or "").strip() if chain in GOLDSKY_ENDPOINTS else ""
+        fallback_kind = "none"
         if fallback_endpoint and fallback_endpoint == primary_endpoint:
             fallback_endpoint = ""
+        if fallback_endpoint:
+            if _endpoint_supports_v3_pools(fallback_endpoint):
+                fallback_kind = "v3"
+            elif _endpoint_is_messari(fallback_endpoint):
+                fallback_kind = "messari"
+            else:
+                print(f"  [{chain}] v3 fallback endpoint skipped: incompatible schema")
+                fallback_endpoint = ""
+                fallback_kind = "none"
         if not primary_endpoint:
             return out_chain
 
@@ -350,15 +406,37 @@ def discover_pools_v3(
                 return pools, truncated
 
             endpoint_used = primary_endpoint
+            endpoint_kind = "v3"
             try:
                 pools, truncated = _discover_on_endpoint(endpoint_used)
             except Exception as e:
                 if fallback_endpoint and _is_timeout_error(e):
-                    print(
-                        f"  [{chain}] v3 {base}/{quote}: primary timeout, retry via fallback endpoint"
-                    )
-                    endpoint_used = fallback_endpoint
-                    pools, truncated = _discover_on_endpoint(endpoint_used)
+                    if fallback_kind == "v3":
+                        print(
+                            f"  [{chain}] v3 {base}/{quote}: primary timeout, retry via fallback endpoint"
+                        )
+                        endpoint_used = fallback_endpoint
+                        endpoint_kind = "v3"
+                        pools, truncated = _discover_on_endpoint(endpoint_used)
+                    elif fallback_kind == "messari":
+                        print(
+                            f"  [{chain}] v3 {base}/{quote}: primary timeout, retry via Messari adapter"
+                        )
+                        endpoint_used = fallback_endpoint
+                        endpoint_kind = "messari"
+                        probed_items = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
+                        pools = []
+                        for pid, _fee_tier in probed_items:
+                            try:
+                                p = query_pool_by_id_messari(endpoint_used, pid)
+                            except Exception:
+                                p = None
+                            if isinstance(p, dict):
+                                pools.append(p)
+                        truncated = False
+                        print(f"  [{chain}] v3 {base}/{quote}: messari_probe_pools={len(pools)}")
+                    else:
+                        raise
                 else:
                     raise
             try:
@@ -373,7 +451,10 @@ def discover_pools_v3(
                         for pid, _fee_tier in probed_items:
                             if pid in have_ids:
                                 continue
-                            p = query_pool_by_id(endpoint_used, pid)
+                            if endpoint_kind == "messari":
+                                p = query_pool_by_id_messari(endpoint_used, pid)
+                            else:
+                                p = query_pool_by_id(endpoint_used, pid)
                             if p:
                                 pools.append(p)
                                 have_ids.add(pid)
@@ -424,6 +505,7 @@ def discover_pools_v3(
                     p["version"] = "v3"
                     p["pair_label"] = f"{base}/{quote}"
                     p["_endpoint"] = endpoint_used
+                    p["_endpoint_kind"] = endpoint_kind
                     out_chain.append(p)
             except Exception as e:
                 print(f"  [{chain}] v3 {base}/{quote}: {e}")
@@ -563,16 +645,20 @@ def main() -> None:
         start = end - timedelta(days=FEE_DAYS)
         start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        ids_by_endpoint: dict[str, list[str]] = {}
+        ids_by_endpoint_kind: dict[tuple[str, str], list[str]] = {}
         for p in pools:
             chain = p.get("chain", "unknown")
             endpoint = str(p.get("_endpoint") or "").strip() or get_graph_endpoint(chain, "v3")
+            endpoint_kind = str(p.get("_endpoint_kind") or "v3").strip().lower() or "v3"
             pid = str(p.get("id") or "").strip().lower()
             if endpoint and pid:
-                ids_by_endpoint.setdefault(endpoint, []).append(pid)
-        for endpoint, ids in ids_by_endpoint.items():
+                ids_by_endpoint_kind.setdefault((endpoint, endpoint_kind), []).append(pid)
+        for (endpoint, endpoint_kind), ids in ids_by_endpoint_kind.items():
             try:
-                fetched = query_pool_day_data_batch(endpoint, ids, start_ts, end_ts, batch_size=batch_size)
+                if endpoint_kind == "messari":
+                    fetched = query_pool_day_data_batch_messari(endpoint, ids, start_ts, end_ts)
+                else:
+                    fetched = query_pool_day_data_batch(endpoint, ids, start_ts, end_ts, batch_size=batch_size)
                 for pid, rows in fetched.items():
                     day_data_by_pool[str(pid).lower()] = rows
             except Exception as e:
@@ -587,9 +673,12 @@ def main() -> None:
         fee_pct = raw_fee_tier / 10000
         pair = f"{t0}/{t1}"
         endpoint = str(pool.get("_endpoint") or "").strip() or get_graph_endpoint(chain, "v3")
+        endpoint_kind = str(pool.get("_endpoint_kind") or "v3").strip().lower() or "v3"
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair}: skipped (no endpoint)"
         day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower())
+        if endpoint_kind == "messari" and day_rows is None:
+            day_rows = []
         try:
             pool_tvl_now_usd = float(pool.get("effectiveTvlUSD") or 0.0)
         except Exception:
