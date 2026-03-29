@@ -23,7 +23,7 @@ from config import (
     V4_CHAINS,
 )
 from agent_common import (
-    estimate_pool_tvl_usd_external,
+    estimate_pool_tvl_usd_external_with_meta,
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
@@ -403,11 +403,20 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 print(f"  [{chain}] timeout detected: skipping remaining pairs on this chain")
 
             kept = 0
+            skipped_missing_price = 0
             for p in pools:
-                ext_tvl = estimate_pool_tvl_usd_external(p, chain)
-                eff_tvl = ext_tvl if ext_tvl > 0 else _pool_tvl_usd(p)
-                p["effectiveTvlUSD"] = float(eff_tvl)
-                if float(eff_tvl) < float(min_tvl):
+                ext_tvl, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                if float(ext_tvl) <= 0:
+                    skipped_missing_price += 1
+                    pid = str((p or {}).get("id") or "")
+                    print(
+                        f"[warn] PRICE_UNAVAILABLE chain={chain} pair={base}/{quote} "
+                        f"pool={pid} reason={price_err or 'unknown'}"
+                    )
+                    continue
+                p["effectiveTvlUSD"] = float(ext_tvl)
+                p["tvl_price_source"] = str(price_source or "external")
+                if float(ext_tvl) < float(min_tvl):
                     continue
                 p["chain"] = chain
                 p["version"] = "v4"
@@ -416,6 +425,11 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 kept += 1
             if pools:
                 print(f"  [{chain}] {base}/{quote}: {kept} pools")
+            if skipped_missing_price > 0:
+                print(
+                    f"[warn] PRICE_FILTER_DROPPED chain={chain} pair={base}/{quote} "
+                    f"count={skipped_missing_price}"
+                )
 
     # дедупликация по (chain, id)
     seen = set()
@@ -513,7 +527,14 @@ def main() -> None:
         except Exception:
             pool_tvl_now_usd = 0.0
         if pool_tvl_now_usd <= 0:
-            pool_tvl_now_usd = float(estimate_pool_tvl_usd_external(pool, chain) or 0.0)
+            pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
+            if float(pool_tvl_now_usd) <= 0:
+                msg = (
+                    f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: "
+                    f"skipped (external TVL unavailable: {price_err or 'unknown'})"
+                )
+                return idx, None, None, msg
+            pool["tvl_price_source"] = str(price_source or "external")
         raw_last_tvl = 0.0
         if day_rows:
             try:
@@ -536,6 +557,7 @@ def main() -> None:
             "pool_tvl_now_usd": pool_tvl_now_usd,
             "pool_tvl_subgraph_usd": raw_pool_tvl,
             "tvl_multiplier": float(tvl_multiplier),
+            "tvl_price_source": str(pool.get("tvl_price_source") or ""),
             "pair": pair_label,
             "chain": chain,
             "version": "v4",

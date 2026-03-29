@@ -27,7 +27,7 @@ from config import (
 )
 
 from agent_common import (
-    estimate_pool_tvl_usd_external,
+    estimate_pool_tvl_usd_external_with_meta,
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
@@ -37,7 +37,6 @@ from agent_common import (
 )
 from uniswap_client import (
     get_graph_endpoint,
-    query_pool_last_tvl_usd,
     query_pool_day_data,
     query_pool_day_data_batch,
     query_pool_by_id,
@@ -353,54 +352,13 @@ def discover_pools_v3(
                                 continue
                             p = query_pool_by_id(endpoint, pid)
                             if p:
-                                raw_tvl = _pool_tvl_usd(p)
-                                eff_tvl = float(raw_tvl)
-                                if raw_tvl < float(min_tvl_now):
-                                    try:
-                                        day_tvl = float(query_pool_last_tvl_usd(endpoint, pid) or 0.0)
-                                        eff_tvl = max(float(raw_tvl), float(day_tvl))
-                                    except Exception:
-                                        eff_tvl = float(raw_tvl)
-                                if eff_tvl < float(min_tvl_now):
-                                    below_tvl += 1
-                                    continue
-                                p["totalValueLockedUSD"] = float(eff_tvl)
                                 pools.append(p)
                                 have_ids.add(pid)
                                 added += 1
                                 continue
                             # Subgraph can miss pool entity while still serving poolDayDatas by pool id.
                             missing_in_subgraph += 1
-                            try:
-                                now = datetime.utcnow()
-                                start_ts = int((now - timedelta(days=max(10, int(FEE_DAYS) + 5))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-                                end_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-                                day_rows = query_pool_day_data(endpoint, pid, start_ts, end_ts)
-                            except Exception:
-                                day_rows = []
-                            try:
-                                tvl_est = float((day_rows[-1] or {}).get("tvlUSD") or 0.0) if day_rows else 0.0
-                            except Exception:
-                                tvl_est = 0.0
-                            if tvl_est < float(min_tvl_now):
-                                below_tvl += 1
-                                continue
-                            synth = {
-                                "id": pid,
-                                "feeTier": int(fee_tier),
-                                "liquidity": "0",
-                                "token0": {"id": str(base_addrs[0]).lower(), "symbol": str(base).upper(), "decimals": "18", "name": str(base).upper()},
-                                "token1": {"id": str(quote_addrs[0]).lower(), "symbol": str(quote).upper(), "decimals": "18", "name": str(quote).upper()},
-                                "totalValueLockedUSD": float(tvl_est),
-                                "totalValueLockedToken0": "0",
-                                "totalValueLockedToken1": "0",
-                                "volumeUSD": "0",
-                                "feesUSD": "0",
-                                "txCount": "0",
-                            }
-                            pools.append(synth)
-                            have_ids.add(pid)
-                            added += 1
+                            below_tvl += 1
                         if added > 0 or missing_in_subgraph > 0 or below_tvl > 0:
                             pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
                             if discovery_cap_hard > 0:
@@ -416,13 +374,27 @@ def discover_pools_v3(
                     print(f"[warn] DISCOVERY_POTENTIALLY_TRUNCATED chain={chain} pair={base}/{quote}")
                 min_tvl_now = _min_tvl(min_tvl)
                 filtered_pools: list[dict] = []
+                skipped_missing_price = 0
                 for p in pools:
-                    ext_tvl = estimate_pool_tvl_usd_external(p, chain)
-                    eff_tvl = ext_tvl if ext_tvl > 0 else _pool_tvl_usd(p)
-                    p["effectiveTvlUSD"] = float(eff_tvl)
-                    if float(eff_tvl) >= float(min_tvl_now):
+                    ext_tvl, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                    if float(ext_tvl) <= 0:
+                        skipped_missing_price += 1
+                        pid = str((p or {}).get("id") or "")
+                        print(
+                            f"[warn] PRICE_UNAVAILABLE chain={chain} pair={base}/{quote} "
+                            f"pool={pid} reason={price_err or 'unknown'}"
+                        )
+                        continue
+                    p["effectiveTvlUSD"] = float(ext_tvl)
+                    p["tvl_price_source"] = str(price_source or "external")
+                    if float(ext_tvl) >= float(min_tvl_now):
                         filtered_pools.append(p)
                 pools = filtered_pools
+                if skipped_missing_price > 0:
+                    print(
+                        f"[warn] PRICE_FILTER_DROPPED chain={chain} pair={base}/{quote} "
+                        f"count={skipped_missing_price}"
+                    )
                 for p in pools:
                     p["chain"] = chain
                     p["version"] = "v3"
@@ -598,7 +570,14 @@ def main() -> None:
         except Exception:
             pool_tvl_now_usd = 0.0
         if pool_tvl_now_usd <= 0:
-            pool_tvl_now_usd = float(estimate_pool_tvl_usd_external(pool, chain) or 0.0)
+            pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
+            if float(pool_tvl_now_usd) <= 0:
+                msg = (
+                    f"  [{idx+1}/{len(pools)}] {chain} {pair}: "
+                    f"skipped (external TVL unavailable: {price_err or 'unknown'})"
+                )
+                return idx, None, None, msg
+            pool["tvl_price_source"] = str(price_source or "external")
         raw_last_tvl = 0.0
         if day_rows:
             try:
@@ -621,6 +600,7 @@ def main() -> None:
             "pool_tvl_now_usd": pool_tvl_now_usd,
             "pool_tvl_subgraph_usd": raw_pool_tvl,
             "tvl_multiplier": float(tvl_multiplier),
+            "tvl_price_source": str(pool.get("tvl_price_source") or ""),
             "pair": pair,
             "chain": chain,
             "version": "v3",
