@@ -351,9 +351,22 @@ def discover_pools_v3(
                                 continue
                             p = query_pool_by_id(endpoint, pid)
                             if p:
-                                if _pool_tvl_usd(p) < float(min_tvl_now):
+                                raw_tvl = _pool_tvl_usd(p)
+                                eff_tvl = float(raw_tvl)
+                                if raw_tvl < float(min_tvl_now):
+                                    try:
+                                        now = datetime.utcnow()
+                                        start_ts = int((now - timedelta(days=max(10, int(FEE_DAYS) + 5))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+                                        end_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+                                        day_rows = query_pool_day_data(endpoint, pid, start_ts, end_ts)
+                                        day_tvl = float((day_rows[-1] or {}).get("tvlUSD") or 0.0) if day_rows else 0.0
+                                        eff_tvl = max(float(raw_tvl), float(day_tvl))
+                                    except Exception:
+                                        eff_tvl = float(raw_tvl)
+                                if eff_tvl < float(min_tvl_now):
                                     below_tvl += 1
                                     continue
+                                p["totalValueLockedUSD"] = float(eff_tvl)
                                 pools.append(p)
                                 have_ids.add(pid)
                                 added += 1

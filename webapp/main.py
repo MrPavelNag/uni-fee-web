@@ -29731,7 +29731,17 @@ HTML_PAGE = """
       const chainHints = selected.length ? selected : (availableChains.length ? availableChains : ["all chains"]);
       const tick = () => {
         const elapsed = Math.max(0, Math.floor((Date.now() - scanStartedAt) / 1000));
-        const target = Math.max(0, Math.min(99, Number(scanProgressTargetPct || 0)));
+        const backendTarget = Math.max(0, Math.min(99, Number(scanProgressTargetPct || 0)));
+        // Keep UI progress believable during long single-stage runs:
+        // progress can move even when backend stage percent updates are sparse.
+        let timeFloor = 10;
+        if (elapsed <= 20) {
+          timeFloor = 10 + elapsed * 3;       // quick warm-up to ~70% by 20s
+        } else {
+          timeFloor = 70 + Math.floor((elapsed - 20) / 3); // then slower climb
+        }
+        timeFloor = Math.max(0, Math.min(94, Number(timeFloor || 0)));
+        const target = Math.max(backendTarget, timeFloor);
         const current = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
         if (target > current) {
           const step = (current < 12) ? 2 : 3;
