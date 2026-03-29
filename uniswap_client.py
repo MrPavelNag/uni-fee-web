@@ -130,6 +130,29 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
         read_timeout = float(os.environ.get("GRAPHQL_READ_TIMEOUT_SEC", "15"))
     except Exception:
         read_timeout = 15.0
+    # Base endpoint can be slower/more volatile; allow separate read-timeout profile.
+    try:
+        endpoint_l = str(endpoint or "").strip().lower()
+    except Exception:
+        endpoint_l = ""
+    is_base_endpoint = False
+    if endpoint_l:
+        try:
+            from config import GOLDSKY_ENDPOINTS, UNISWAP_V3_SUBGRAPHS, UNISWAP_V4_SUBGRAPHS
+            base_v3_id = str(UNISWAP_V3_SUBGRAPHS.get("base") or "").strip().lower()
+            base_v4_id = str(UNISWAP_V4_SUBGRAPHS.get("base") or "").strip().lower()
+            base_goldsky = str(GOLDSKY_ENDPOINTS.get("base") or "").strip().lower()
+            if (base_v3_id and base_v3_id in endpoint_l) or (base_v4_id and base_v4_id in endpoint_l):
+                is_base_endpoint = True
+            if base_goldsky and base_goldsky in endpoint_l:
+                is_base_endpoint = True
+        except Exception:
+            is_base_endpoint = False
+    if is_base_endpoint:
+        try:
+            read_timeout = float(os.environ.get("GRAPHQL_READ_TIMEOUT_SEC_BASE", "20"))
+        except Exception:
+            pass
     connect_timeout = max(2.0, connect_timeout)
     read_timeout = max(5.0, read_timeout)
     for attempt in range(retries):

@@ -17187,6 +17187,7 @@ def _build_run_job_env(
     env["GRAPHQL_DISCOVERY_RETRIES"] = os.environ.get("WEB_GRAPHQL_DISCOVERY_RETRIES", "1")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL", "8")
     env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "8")
+    env["GRAPHQL_READ_TIMEOUT_SEC_BASE"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_BASE", "20")
     env["POOL_SERIES_WORKERS"] = os.environ.get("WEB_POOL_SERIES_WORKERS_NORMAL", "8")
     env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get("WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL", "4")
     env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL", "120")
@@ -29042,18 +29043,7 @@ HTML_PAGE = """
       flex: 0 0 auto;
       min-width: 240px;
     }
-    .chain-note {
-      font-size: 11px;
-      color: #7c2d12;
-      background: #fff4cc;
-      border: 1px solid #f0b429;
-      border-radius: 8px;
-      padding: 5px 8px;
-      text-align: left;
-      line-height: 1.3;
-      width: 100%;
-      box-sizing: border-box;
-    }
+    .chain-note { display: none; }
     .chains-meta-badge {
       white-space: nowrap;
     }
@@ -29179,7 +29169,6 @@ HTML_PAGE = """
                   <div class="chain-grid" id="chainChecks"></div>
                 </div>
                 <div class="chains-side">
-                  <div class="chain-note" id="chainChecksNote" style="display:none;"></div>
                   <span class="meta-badge chains-meta-badge" id="chainsMeta">chains: -</span>
                 </div>
               </div>
@@ -30325,22 +30314,14 @@ HTML_PAGE = """
         availableChains = meta.chains || [];
         document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;
         const checks = document.getElementById("chainChecks");
-        const chainNote = document.getElementById("chainChecksNote");
         checks.innerHTML = [
           `<label class="check"><input type="checkbox" id="allChains" onchange="toggleAllChains()"> all</label>`,
           ...availableChains.map(c => {
-            const lbl = String(c) === "unichain" ? "unichain*" : String(c);
-            const isCheckedByDefault = String(c) !== "unichain";
+            const lbl = String(c);
+            const isCheckedByDefault = true;
             return `<label class="check"><input type="checkbox" id="chain_${c}" ${isCheckedByDefault ? "checked" : ""} onchange="onChainToggle()"> ${lbl}</label>`;
           })
         ].join("");
-        if (chainNote) {
-          const hasUnichain = availableChains.includes("unichain");
-          chainNote.textContent = hasUnichain
-            ? "* Unichain scans may take longer due to substantial protocol noise on V4."
-            : "";
-          chainNote.style.display = hasUnichain ? "" : "none";
-        }
         loadFormState();
         if (document.getElementById("allChains").checked) toggleAllChains();
         else onChainToggle();
