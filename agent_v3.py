@@ -11,6 +11,7 @@ Agent 1: Uniswap v3 (базовая версия).
 import argparse
 import os
 import threading
+import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -37,6 +38,7 @@ from uniswap_client import (
     get_graph_endpoint,
     query_pool_day_data,
     query_pool_day_data_batch,
+    query_pool_by_id,
     query_pools_containing_both_tokens,
     query_pools_by_token_symbols,
     query_token_by_symbol,
@@ -68,6 +70,94 @@ def _discover_cap_hard(default_from_soft: int) -> int:
         return max(env_v, default_from_soft)
     # Safety ceiling: allow automatic cap growth only for boundary-hit cases.
     return max(default_from_soft, 300)
+
+
+def _eth_call_hex(rpc_url: str, to: str, data_hex: str, timeout_sec: float = 8.0) -> str:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{"to": str(to), "data": str(data_hex)}, "latest"],
+    }
+    r = requests.post(str(rpc_url), json=payload, timeout=max(2.0, float(timeout_sec)))
+    r.raise_for_status()
+    out = (r.json() or {}).get("result")
+    return str(out or "")
+
+
+def _abi_word_address(addr: str) -> str:
+    a = str(addr or "").strip().lower().replace("0x", "")
+    if len(a) != 40:
+        return ""
+    return "0" * 24 + a
+
+
+def _abi_word_uint(x: int) -> str:
+    return f"{int(x):064x}"
+
+
+def _probe_unichain_v3_pool_ids(token_a: str, token_b: str) -> list[str]:
+    """
+    Backward-compatible wrapper. Prefer _probe_v3_pool_ids(chain,...).
+    """
+    return _probe_v3_pool_ids("unichain", token_a, token_b)
+
+
+_V3_FACTORY_BY_CHAIN: dict[str, str] = {
+    "ethereum": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    "arbitrum": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    "optimism": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    "polygon": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    "base": "0x33128a8fc17869897dce68ed026d694621f6fdfd",
+    "bsc": "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865",
+    "unichain": "0x1f98400000000000000000000000000000000003",
+}
+_V3_RPC_BY_CHAIN: dict[str, str] = {
+    "ethereum": "https://ethereum-rpc.publicnode.com",
+    "arbitrum": "https://arbitrum-one-rpc.publicnode.com",
+    "optimism": "https://optimism-rpc.publicnode.com",
+    "polygon": "https://polygon-bor-rpc.publicnode.com",
+    "base": "https://base-rpc.publicnode.com",
+    "bsc": "https://bsc-rpc.publicnode.com",
+    "unichain": "https://unichain-rpc.publicnode.com",
+}
+
+
+def _probe_v3_pool_ids(chain: str, token_a: str, token_b: str) -> list[str]:
+    chain_key = str(chain or "").strip().lower()
+    cu = chain_key.upper().replace("-", "_")
+    rpc = os.environ.get(f"V3_RPC_URL_{cu}", _V3_RPC_BY_CHAIN.get(chain_key, "")).strip()
+    factory = os.environ.get(f"V3_FACTORY_OVERRIDE_{cu}", _V3_FACTORY_BY_CHAIN.get(chain_key, "")).strip()
+    if not rpc or not factory:
+        return []
+    t0 = str(token_a or "").strip().lower()
+    t1 = str(token_b or "").strip().lower()
+    if len(t0) != 42 or len(t1) != 42:
+        return []
+    selector = "1698ee82"  # getPool(address,address,uint24)
+    fees = [100, 500, 3000, 10000]
+    out: list[str] = []
+    seen: set[str] = set()
+    for a, b in ((t0, t1), (t1, t0)):
+        wa = _abi_word_address(a)
+        wb = _abi_word_address(b)
+        if not wa or not wb:
+            continue
+        for fee in fees:
+            data = "0x" + selector + wa + wb + _abi_word_uint(fee)
+            try:
+                raw = _eth_call_hex(rpc, factory, data, timeout_sec=5.0)
+                if not raw.startswith("0x") or len(raw) < 66:
+                    continue
+                pid = ("0x" + raw[-40:]).lower()
+                if pid == "0x0000000000000000000000000000000000000000":
+                    continue
+                if pid not in seen:
+                    seen.add(pid)
+                    out.append(pid)
+            except Exception:
+                continue
+    return out
 
 
 def _discover_with_auto_expand(
@@ -247,6 +337,31 @@ def discover_pools_v3(
                     )
                     truncated = truncated or trunc_sym
                     print(f"  [{chain}] v3 {base}/{quote}: symbol_fallback_pools={len(pools)}")
+                # Root robustness: probe canonical V3 factory onchain and merge missing pool ids.
+                try:
+                    probed_ids = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
+                    if probed_ids:
+                        have_ids = {str((p or {}).get("id") or "").strip().lower() for p in (pools or [])}
+                        min_tvl_now = _min_tvl(min_tvl)
+                        added = 0
+                        for pid in probed_ids:
+                            if pid in have_ids:
+                                continue
+                            p = query_pool_by_id(endpoint, pid)
+                            if not p:
+                                continue
+                            if _pool_tvl_usd(p) < float(min_tvl_now):
+                                continue
+                            pools.append(p)
+                            have_ids.add(pid)
+                            added += 1
+                        if added > 0:
+                            pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
+                            if discovery_cap_hard > 0:
+                                pools = pools[: int(discovery_cap_hard)]
+                            print(f"[probe] {chain} getPool merged pair={base}/{quote} added={added} total={len(pools)}")
+                except Exception as e:
+                    print(f"  [{chain}] v3 onchain probe {base}/{quote}: {e}")
                 if truncated:
                     print(f"[warn] DISCOVERY_POTENTIALLY_TRUNCATED chain={chain} pair={base}/{quote}")
                 for p in pools:

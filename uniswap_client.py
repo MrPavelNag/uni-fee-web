@@ -99,6 +99,12 @@ def get_graph_endpoint(chain: str, version: str = "v3") -> Optional[str]:
         return None
 
     # v3
+    cu = chain.upper().replace("-", "_")
+    override_v3 = os.environ.get(f"V3_OVERRIDE_{cu}")
+    if not override_v3 and chain == "arbitrum":
+        override_v3 = os.environ.get("V3_OVERRIDE_ARBITRUM_ONE")
+    if override_v3:
+        return override_v3
     if chain in UNISWAP_V3_SUBGRAPHS:
         return f"https://gateway.thegraph.com/api/{api_key}/subgraphs/id/{UNISWAP_V3_SUBGRAPHS[chain]}"
     if chain in GOLDSKY_ENDPOINTS:
@@ -373,6 +379,32 @@ def query_pool_day_data(
     if not pid:
         return []
     return query_pool_day_data_batch(endpoint, [pid], start_ts, end_ts).get(pid, [])
+
+
+def query_pool_by_id(endpoint: str, pool_id: str) -> Optional[dict]:
+    pid = str(pool_id or "").strip().lower()
+    if not pid:
+        return None
+    q = """
+    query PoolById($id: ID!) {
+      pool(id: $id) {
+        id
+        feeTier
+        liquidity
+        token0 { id symbol decimals name }
+        token1 { id symbol decimals name }
+        totalValueLockedUSD
+        totalValueLockedToken0
+        totalValueLockedToken1
+        volumeUSD
+        feesUSD
+        txCount
+      }
+    }
+    """
+    data = graphql_query(endpoint, q, {"id": pid}, retries=1)
+    pool = (data.get("data", {}) or {}).get("pool")
+    return dict(pool) if isinstance(pool, dict) else None
 
 
 def _pool_day_batch_size() -> int:
