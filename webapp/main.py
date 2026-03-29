@@ -180,7 +180,7 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v5"
+RUN_RESULT_CACHE_VER = "run_v6"
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -17186,7 +17186,7 @@ def _build_run_job_env(
     env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "2")
     env["GRAPHQL_DISCOVERY_RETRIES"] = os.environ.get("WEB_GRAPHQL_DISCOVERY_RETRIES", "1")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL", "8")
-    env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "15")
+    env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "8")
     env["POOL_SERIES_WORKERS"] = os.environ.get("WEB_POOL_SERIES_WORKERS_NORMAL", "8")
     env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get("WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL", "4")
     env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL", "120")

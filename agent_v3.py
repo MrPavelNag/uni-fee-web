@@ -65,6 +65,11 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _is_timeout_error(err: Exception) -> bool:
+    msg = str(err or "").lower()
+    return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
+
+
 def _discover_cap_hard(default_from_soft: int) -> int:
     env_v = _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_HARD", 0)
     if env_v > 0:
@@ -260,8 +265,11 @@ def discover_pools_v3(
 
     def _discover_for_chain(chain: str) -> list[dict]:
         out_chain: list[dict] = []
-        endpoint = get_graph_endpoint(chain, "v3")
-        if not endpoint:
+        primary_endpoint = get_graph_endpoint(chain, "v3")
+        fallback_endpoint = str(GOLDSKY_ENDPOINTS.get(chain) or "").strip() if chain in GOLDSKY_ENDPOINTS else ""
+        if fallback_endpoint and fallback_endpoint == primary_endpoint:
+            fallback_endpoint = ""
+        if not primary_endpoint:
             return out_chain
 
         def _resolve_with_cache(sym: str) -> list[str]:
@@ -271,7 +279,7 @@ def discover_pools_v3(
                     out.extend(get_token_addresses(c, sym, dynamic_tokens))
             out = list(dict.fromkeys(out))[:1]
             if not out:
-                addr = query_token_by_symbol(endpoint, sym)
+                addr = query_token_by_symbol(primary_endpoint, sym)
                 if addr:
                     with dyn_lock:
                         if persist_dynamic_tokens:
@@ -300,10 +308,11 @@ def discover_pools_v3(
 
             if not base_addrs or not quote_addrs:
                 continue
-            try:
+
+            def _discover_on_endpoint(ep: str) -> tuple[list[dict], bool]:
                 pools, truncated = _discover_with_auto_expand(
                     lambda cap: query_pools_containing_both_tokens(
-                        endpoint,
+                        ep,
                         base_addrs[0],
                         quote_addrs[0],
                         _min_tvl(min_tvl),
@@ -324,7 +333,7 @@ def discover_pools_v3(
                     # Fallback for ambiguous symbol->address mappings (e.g. multiple tokens with same symbol).
                     pools, trunc_sym = _discover_with_auto_expand(
                         lambda cap: query_pools_by_token_symbols(
-                            endpoint,
+                            ep,
                             base,
                             quote,
                             _min_tvl(min_tvl),
@@ -338,6 +347,21 @@ def discover_pools_v3(
                     )
                     truncated = truncated or trunc_sym
                     print(f"  [{chain}] v3 {base}/{quote}: symbol_fallback_pools={len(pools)}")
+                return pools, truncated
+
+            endpoint_used = primary_endpoint
+            try:
+                pools, truncated = _discover_on_endpoint(endpoint_used)
+            except Exception as e:
+                if fallback_endpoint and _is_timeout_error(e):
+                    print(
+                        f"  [{chain}] v3 {base}/{quote}: primary timeout, retry via fallback endpoint"
+                    )
+                    endpoint_used = fallback_endpoint
+                    pools, truncated = _discover_on_endpoint(endpoint_used)
+                else:
+                    raise
+            try:
                 # Root robustness: probe canonical V3 factory onchain and merge missing pool ids.
                 try:
                     probed_items = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
@@ -349,7 +373,7 @@ def discover_pools_v3(
                         for pid, _fee_tier in probed_items:
                             if pid in have_ids:
                                 continue
-                            p = query_pool_by_id(endpoint, pid)
+                            p = query_pool_by_id(endpoint_used, pid)
                             if p:
                                 pools.append(p)
                                 have_ids.add(pid)
@@ -399,6 +423,7 @@ def discover_pools_v3(
                     p["chain"] = chain
                     p["version"] = "v3"
                     p["pair_label"] = f"{base}/{quote}"
+                    p["_endpoint"] = endpoint_used
                     out_chain.append(p)
             except Exception as e:
                 print(f"  [{chain}] v3 {base}/{quote}: {e}")
@@ -541,7 +566,7 @@ def main() -> None:
         ids_by_endpoint: dict[str, list[str]] = {}
         for p in pools:
             chain = p.get("chain", "unknown")
-            endpoint = get_graph_endpoint(chain, "v3")
+            endpoint = str(p.get("_endpoint") or "").strip() or get_graph_endpoint(chain, "v3")
             pid = str(p.get("id") or "").strip().lower()
             if endpoint and pid:
                 ids_by_endpoint.setdefault(endpoint, []).append(pid)
@@ -561,7 +586,7 @@ def main() -> None:
         raw_fee_tier = int(pool.get("feeTier") or 0)
         fee_pct = raw_fee_tier / 10000
         pair = f"{t0}/{t1}"
-        endpoint = get_graph_endpoint(chain, "v3")
+        endpoint = str(pool.get("_endpoint") or "").strip() or get_graph_endpoint(chain, "v3")
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair}: skipped (no endpoint)"
         day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower())
