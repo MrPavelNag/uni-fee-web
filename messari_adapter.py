@@ -4,9 +4,11 @@ Adapter for Messari-style subgraph schema.
 Provides reusable mapping into internal v3-like pool/day-data structures.
 """
 
+import os
+import time
 from typing import Any, Optional
 
-from uniswap_client import graphql_query
+import requests
 
 
 def _safe_float(v: Any) -> float:
@@ -21,6 +23,39 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(v)
     except Exception:
         return int(default)
+
+
+def _messari_graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, retries: int = 1) -> dict:
+    payload = {"query": query, "variables": variables or {}}
+    tries = max(1, int(retries or 1))
+    try:
+        connect_timeout = float(os.environ.get("MESSARI_GRAPHQL_CONNECT_TIMEOUT_SEC", "6"))
+    except Exception:
+        connect_timeout = 6.0
+    try:
+        read_timeout = float(os.environ.get("MESSARI_GRAPHQL_READ_TIMEOUT_SEC", "20"))
+    except Exception:
+        read_timeout = 20.0
+    connect_timeout = max(2.0, connect_timeout)
+    read_timeout = max(8.0, read_timeout)
+    last_err: Exception | None = None
+    for i in range(tries):
+        try:
+            r = requests.post(endpoint, json=payload, timeout=(connect_timeout, read_timeout))
+            r.raise_for_status()
+            data = r.json() if isinstance(r.json(), dict) else {}
+            if not isinstance(data, dict):
+                data = {}
+            if "errors" in data:
+                raise RuntimeError(f"GraphQL errors: {data['errors']}")
+            return data
+        except Exception as e:
+            last_err = e
+            if i < tries - 1:
+                time.sleep(0.5 * (i + 1))
+                continue
+            raise
+    raise last_err or RuntimeError("Messari GraphQL request failed")
 
 
 def _normalize_pool_entity(raw: dict) -> Optional[dict]:
@@ -84,7 +119,7 @@ def is_messari_schema_endpoint(endpoint: str) -> bool:
         return False
     q = '{ __type(name:"Query"){ fields { name } } }'
     try:
-        data = graphql_query(ep, q, retries=1)
+        data = _messari_graphql_query(ep, q, retries=1)
         fields = (((data or {}).get("data") or {}).get("__type") or {}).get("fields") or []
         names = {str((x or {}).get("name") or "").strip() for x in fields if isinstance(x, dict)}
         return ("liquidityPools" in names) and ("pools" not in names)
@@ -113,7 +148,7 @@ def query_pool_by_id_messari(endpoint: str, pool_id: str) -> Optional[dict]:
       }
     }
     """
-    data = graphql_query(endpoint, q, {"id": pid}, retries=1)
+    data = _messari_graphql_query(endpoint, q, {"id": pid}, retries=1)
     raw = ((data or {}).get("data") or {}).get("liquidityPool")
     return _normalize_pool_entity(raw if isinstance(raw, dict) else {})
 
@@ -142,7 +177,7 @@ def query_pool_day_data_messari(endpoint: str, pool_id: str, start_ts: int, end_
           }
         }
         """
-        data = graphql_query(
+        data = _messari_graphql_query(
             endpoint,
             q,
             {"pool": pid, "start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
@@ -237,7 +272,7 @@ def query_pools_by_token_addresses_messari(
           }
         }
         """
-        data = graphql_query(endpoint, q, {"first": int(first), "skip": int(skip)}, retries=1)
+        data = _messari_graphql_query(endpoint, q, {"first": int(first), "skip": int(skip)}, retries=1)
         rows = ((data or {}).get("data") or {}).get("liquidityPools") or []
         if not rows:
             break

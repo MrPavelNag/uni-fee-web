@@ -98,6 +98,8 @@ def _endpoint_supports_v3_pools(endpoint: str) -> bool:
         msg = str(e or "").lower()
         if "has no field `pools`" in msg or "has no field 'pools'" in msg:
             ok = False
+        else:
+            ok = False
     with _ENDPOINT_SCHEMA_COMPAT_LOCK:
         _ENDPOINT_SUPPORTS_POOLS_CACHE[ep] = bool(ok)
     return bool(ok)
@@ -107,6 +109,9 @@ def _endpoint_is_messari(endpoint: str) -> bool:
     ep = str(endpoint or "").strip()
     if not ep:
         return False
+    # Fast heuristic to avoid expensive schema probes.
+    if "goldsky.com" in ep and "/subgraphs/uniswap-v3-base/" in ep:
+        return True
     with _ENDPOINT_SCHEMA_COMPAT_LOCK:
         cached = _ENDPOINT_IS_MESSARI_CACHE.get(ep)
     if cached is not None:
@@ -366,7 +371,11 @@ def discover_pools_v3(
             if not base_addrs or not quote_addrs:
                 continue
 
-            def _discover_on_endpoint(ep: str) -> tuple[list[dict], bool]:
+            known_a = bool(get_token_addresses(chain, base, dynamic_tokens) or get_token_addresses("ethereum", base, dynamic_tokens))
+            known_b = bool(get_token_addresses(chain, quote, dynamic_tokens) or get_token_addresses("ethereum", quote, dynamic_tokens))
+            allow_symbol_fallback = not (known_a and known_b)
+
+            def _discover_on_endpoint(ep: str, *, allow_symbol_fallback_local: bool) -> tuple[list[dict], bool]:
                 pools, truncated = _discover_with_auto_expand(
                     lambda cap: query_pools_containing_both_tokens(
                         ep,
@@ -386,7 +395,7 @@ def discover_pools_v3(
                     f"resolved={str(base_addrs[0])[:10]}..,{str(quote_addrs[0])[:10]}.. "
                     f"pools={len(pools)}"
                 )
-                if not pools:
+                if (not pools) and allow_symbol_fallback_local:
                     # Fallback for ambiguous symbol->address mappings (e.g. multiple tokens with same symbol).
                     pools, trunc_sym = _discover_with_auto_expand(
                         lambda cap: query_pools_by_token_symbols(
@@ -404,12 +413,14 @@ def discover_pools_v3(
                     )
                     truncated = truncated or trunc_sym
                     print(f"  [{chain}] v3 {base}/{quote}: symbol_fallback_pools={len(pools)}")
+                elif (not pools) and (not allow_symbol_fallback_local):
+                    print(f"  [{chain}] v3 {base}/{quote}: skip symbol fallback (known token addresses)")
                 return pools, truncated
 
             endpoint_used = primary_endpoint
             endpoint_kind = "v3"
             try:
-                pools, truncated = _discover_on_endpoint(endpoint_used)
+                pools, truncated = _discover_on_endpoint(endpoint_used, allow_symbol_fallback_local=allow_symbol_fallback)
             except Exception as e:
                 if fallback_endpoint and _is_timeout_error(e):
                     if fallback_kind == "v3":
@@ -418,7 +429,7 @@ def discover_pools_v3(
                         )
                         endpoint_used = fallback_endpoint
                         endpoint_kind = "v3"
-                        pools, truncated = _discover_on_endpoint(endpoint_used)
+                        pools, truncated = _discover_on_endpoint(endpoint_used, allow_symbol_fallback_local=allow_symbol_fallback)
                     elif fallback_kind == "messari":
                         print(
                             f"  [{chain}] v3 {base}/{quote}: primary timeout, retry via Messari adapter"
@@ -427,13 +438,17 @@ def discover_pools_v3(
                         endpoint_kind = "messari"
                         page_size = max(20, min(200, _env_int("MESSARI_DISCOVERY_PAGE_SIZE", 100)))
                         max_scan = max(page_size, _env_int("MESSARI_DISCOVERY_MAX_SCAN", 400))
-                        pools = query_pools_by_token_addresses_messari(
-                            endpoint_used,
-                            base_addrs[0],
-                            quote_addrs[0],
-                            page_size=page_size,
-                            max_scan=max_scan,
-                        )
+                        try:
+                            pools = query_pools_by_token_addresses_messari(
+                                endpoint_used,
+                                base_addrs[0],
+                                quote_addrs[0],
+                                page_size=page_size,
+                                max_scan=max_scan,
+                            )
+                        except Exception as me:
+                            print(f"  [{chain}] v3 {base}/{quote}: Messari adapter fallback failed: {me}")
+                            pools = []
                         truncated = False
                         print(f"  [{chain}] v3 {base}/{quote}: messari_pools={len(pools)} scanned={max_scan}")
                     else:
