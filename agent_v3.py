@@ -35,14 +35,7 @@ from agent_common import (
     save_chart_data_json,
     save_dynamic_token,
 )
-from messari_adapter import (
-    is_messari_schema_endpoint,
-    query_pools_by_token_addresses_messari,
-    query_pool_by_id_messari,
-    query_pool_day_data_batch_messari,
-)
 from uniswap_client import (
-    graphql_query,
     get_graph_endpoint,
     query_pool_day_data,
     query_pool_day_data_batch,
@@ -75,56 +68,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
 def _is_timeout_error(err: Exception) -> bool:
     msg = str(err or "").lower()
     return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
-
-
-def _is_bad_indexer_error(err: Exception) -> bool:
-    msg = str(err or "").lower()
-    return ("bad indexers" in msg) or ("badresponse" in msg) or ("indexer not available" in msg)
-
-
-_ENDPOINT_SCHEMA_COMPAT_LOCK = threading.Lock()
-_ENDPOINT_SUPPORTS_POOLS_CACHE: dict[str, bool] = {}
-_ENDPOINT_IS_MESSARI_CACHE: dict[str, bool] = {}
-
-
-def _endpoint_supports_v3_pools(endpoint: str) -> bool:
-    ep = str(endpoint or "").strip()
-    if not ep:
-        return False
-    with _ENDPOINT_SCHEMA_COMPAT_LOCK:
-        cached = _ENDPOINT_SUPPORTS_POOLS_CACHE.get(ep)
-    if cached is not None:
-        return bool(cached)
-    ok = True
-    try:
-        graphql_query(ep, "query Q { pools(first: 1) { id } }", retries=1)
-        ok = True
-    except Exception as e:
-        msg = str(e or "").lower()
-        if "has no field `pools`" in msg or "has no field 'pools'" in msg:
-            ok = False
-        else:
-            ok = False
-    with _ENDPOINT_SCHEMA_COMPAT_LOCK:
-        _ENDPOINT_SUPPORTS_POOLS_CACHE[ep] = bool(ok)
-    return bool(ok)
-
-
-def _endpoint_is_messari(endpoint: str) -> bool:
-    ep = str(endpoint or "").strip()
-    if not ep:
-        return False
-    # Fast heuristic to avoid expensive schema probes.
-    if "goldsky.com" in ep and "/subgraphs/uniswap-v3-base/" in ep:
-        return True
-    with _ENDPOINT_SCHEMA_COMPAT_LOCK:
-        cached = _ENDPOINT_IS_MESSARI_CACHE.get(ep)
-    if cached is not None:
-        return bool(cached)
-    ok = bool(is_messari_schema_endpoint(ep))
-    with _ENDPOINT_SCHEMA_COMPAT_LOCK:
-        _ENDPOINT_IS_MESSARI_CACHE[ep] = bool(ok)
-    return bool(ok)
 
 
 def _discover_cap_hard(default_from_soft: int) -> int:
@@ -322,21 +265,8 @@ def discover_pools_v3(
 
     def _discover_for_chain(chain: str) -> list[dict]:
         out_chain: list[dict] = []
-        primary_endpoint = get_graph_endpoint(chain, "v3")
-        fallback_endpoint = str(GOLDSKY_ENDPOINTS.get(chain) or "").strip() if chain in GOLDSKY_ENDPOINTS else ""
-        fallback_kind = "none"
-        if fallback_endpoint and fallback_endpoint == primary_endpoint:
-            fallback_endpoint = ""
-        if fallback_endpoint:
-            if _endpoint_supports_v3_pools(fallback_endpoint):
-                fallback_kind = "v3"
-            elif _endpoint_is_messari(fallback_endpoint):
-                fallback_kind = "messari"
-            else:
-                print(f"  [{chain}] v3 fallback endpoint skipped: incompatible schema")
-                fallback_endpoint = ""
-                fallback_kind = "none"
-        if not primary_endpoint:
+        endpoint = get_graph_endpoint(chain, "v3")
+        if not endpoint:
             return out_chain
 
         def _resolve_with_cache(sym: str) -> list[str]:
@@ -346,7 +276,7 @@ def discover_pools_v3(
                     out.extend(get_token_addresses(c, sym, dynamic_tokens))
             out = list(dict.fromkeys(out))[:1]
             if not out:
-                addr = query_token_by_symbol(primary_endpoint, sym)
+                addr = query_token_by_symbol(endpoint, sym)
                 if addr:
                     with dyn_lock:
                         if persist_dynamic_tokens:
@@ -422,80 +352,40 @@ def discover_pools_v3(
                     print(f"  [{chain}] v3 {base}/{quote}: skip symbol fallback (known token addresses)")
                 return pools, truncated
 
-            endpoint_used = primary_endpoint
-            endpoint_kind = "v3"
             try:
-                pools, truncated = _discover_on_endpoint(endpoint_used, allow_symbol_fallback_local=allow_symbol_fallback)
-            except Exception as e:
-                if fallback_endpoint and (_is_timeout_error(e) or _is_bad_indexer_error(e)):
-                    if fallback_kind == "v3":
-                        print(
-                            f"  [{chain}] v3 {base}/{quote}: primary endpoint failed, retry via fallback endpoint"
-                        )
-                        endpoint_used = fallback_endpoint
-                        endpoint_kind = "v3"
-                        pools, truncated = _discover_on_endpoint(endpoint_used, allow_symbol_fallback_local=allow_symbol_fallback)
-                    elif fallback_kind == "messari":
-                        print(
-                            f"  [{chain}] v3 {base}/{quote}: primary endpoint failed, retry via Messari adapter"
-                        )
-                        endpoint_used = fallback_endpoint
-                        endpoint_kind = "messari"
-                        page_size = max(20, min(200, _env_int("MESSARI_DISCOVERY_PAGE_SIZE", 100)))
-                        max_scan = max(page_size, _env_int("MESSARI_DISCOVERY_MAX_SCAN", 400))
-                        try:
-                            pools = query_pools_by_token_addresses_messari(
-                                endpoint_used,
-                                base_addrs[0],
-                                quote_addrs[0],
-                                page_size=page_size,
-                                max_scan=max_scan,
-                            )
-                        except Exception as me:
-                            print(f"  [{chain}] v3 {base}/{quote}: Messari adapter fallback failed: {me}")
-                            pools = []
-                        truncated = False
-                        print(f"  [{chain}] v3 {base}/{quote}: messari_pools={len(pools)} scanned={max_scan}")
-                    else:
-                        raise
-                else:
-                    raise
-            try:
+                pools, truncated = _discover_on_endpoint(endpoint, allow_symbol_fallback_local=allow_symbol_fallback)
                 # Root robustness: probe canonical V3 factory onchain and merge missing pool ids.
-                if endpoint_kind != "messari":
-                    try:
-                        probed_items = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
-                        if probed_items:
-                            have_ids = {str((p or {}).get("id") or "").strip().lower() for p in (pools or [])}
-                            added = 0
-                            missing_in_subgraph = 0
-                            skipped_no_entity = 0
-                            for pid, _fee_tier in probed_items:
-                                if pid in have_ids:
-                                    continue
-                                p = query_pool_by_id(endpoint_used, pid)
-                                if p:
-                                    pools.append(p)
-                                    have_ids.add(pid)
-                                    added += 1
-                                    continue
-                                # Pool exists onchain but is absent in subgraph pool(id) response.
-                                missing_in_subgraph += 1
-                                skipped_no_entity += 1
-                            if added > 0 or missing_in_subgraph > 0 or skipped_no_entity > 0:
-                                pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
-                                if discovery_cap_hard > 0:
-                                    pools = pools[: int(discovery_cap_hard)]
-                                print(
-                                    f"[probe] {chain} getPool pair={base}/{quote} "
-                                    f"probed={len(probed_items)} added={added} "
-                                    f"missing_in_subgraph={missing_in_subgraph} "
-                                    f"skipped_no_entity={skipped_no_entity} total={len(pools)}"
-                                )
-                    except Exception as e:
-                        print(f"  [{chain}] v3 onchain probe {base}/{quote}: {e}")
-                else:
-                    print(f"  [{chain}] v3 {base}/{quote}: skip onchain probe in Messari mode")
+                try:
+                    probed_items = _probe_v3_pool_ids(chain, base_addrs[0], quote_addrs[0])
+                    if probed_items:
+                        have_ids = {str((p or {}).get("id") or "").strip().lower() for p in (pools or [])}
+                        added = 0
+                        missing_in_subgraph = 0
+                        skipped_no_entity = 0
+                        for pid, _fee_tier in probed_items:
+                            if pid in have_ids:
+                                continue
+                            p = query_pool_by_id(endpoint, pid)
+                            if p:
+                                pools.append(p)
+                                have_ids.add(pid)
+                                added += 1
+                                continue
+                            # Pool exists onchain but is absent in subgraph pool(id) response.
+                            missing_in_subgraph += 1
+                            skipped_no_entity += 1
+                        if added > 0 or missing_in_subgraph > 0 or skipped_no_entity > 0:
+                            pools = sorted(pools, key=_pool_tvl_usd, reverse=True)
+                            if discovery_cap_hard > 0:
+                                pools = pools[: int(discovery_cap_hard)]
+                            print(
+                                f"[probe] {chain} getPool pair={base}/{quote} "
+                                f"probed={len(probed_items)} added={added} "
+                                f"missing_in_subgraph={missing_in_subgraph} "
+                                f"skipped_no_entity={skipped_no_entity} total={len(pools)}"
+                            )
+                except Exception as e:
+                    print(f"  [{chain}] v3 onchain probe {base}/{quote}: {e}")
                 if truncated:
                     print(f"[warn] DISCOVERY_POTENTIALLY_TRUNCATED chain={chain} pair={base}/{quote}")
                 min_tvl_now = _min_tvl(min_tvl)
@@ -525,8 +415,6 @@ def discover_pools_v3(
                     p["chain"] = chain
                     p["version"] = "v3"
                     p["pair_label"] = f"{base}/{quote}"
-                    p["_endpoint"] = endpoint_used
-                    p["_endpoint_kind"] = endpoint_kind
                     out_chain.append(p)
             except Exception as e:
                 print(f"  [{chain}] v3 {base}/{quote}: {e}")
@@ -666,20 +554,16 @@ def main() -> None:
         start = end - timedelta(days=FEE_DAYS)
         start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        ids_by_endpoint_kind: dict[tuple[str, str], list[str]] = {}
+        ids_by_endpoint: dict[str, list[str]] = {}
         for p in pools:
             chain = p.get("chain", "unknown")
-            endpoint = str(p.get("_endpoint") or "").strip() or get_graph_endpoint(chain, "v3")
-            endpoint_kind = str(p.get("_endpoint_kind") or "v3").strip().lower() or "v3"
+            endpoint = get_graph_endpoint(chain, "v3")
             pid = str(p.get("id") or "").strip().lower()
             if endpoint and pid:
-                ids_by_endpoint_kind.setdefault((endpoint, endpoint_kind), []).append(pid)
-        for (endpoint, endpoint_kind), ids in ids_by_endpoint_kind.items():
+                ids_by_endpoint.setdefault(endpoint, []).append(pid)
+        for endpoint, ids in ids_by_endpoint.items():
             try:
-                if endpoint_kind == "messari":
-                    fetched = query_pool_day_data_batch_messari(endpoint, ids, start_ts, end_ts)
-                else:
-                    fetched = query_pool_day_data_batch(endpoint, ids, start_ts, end_ts, batch_size=batch_size)
+                fetched = query_pool_day_data_batch(endpoint, ids, start_ts, end_ts, batch_size=batch_size)
                 for pid, rows in fetched.items():
                     day_data_by_pool[str(pid).lower()] = rows
             except Exception as e:
@@ -693,13 +577,10 @@ def main() -> None:
         raw_fee_tier = int(pool.get("feeTier") or 0)
         fee_pct = raw_fee_tier / 10000
         pair = f"{t0}/{t1}"
-        endpoint = str(pool.get("_endpoint") or "").strip() or get_graph_endpoint(chain, "v3")
-        endpoint_kind = str(pool.get("_endpoint_kind") or "v3").strip().lower() or "v3"
+        endpoint = get_graph_endpoint(chain, "v3")
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair}: skipped (no endpoint)"
         day_rows = day_data_by_pool.get(str(pool_id or "").strip().lower())
-        if endpoint_kind == "messari" and day_rows is None:
-            day_rows = []
         try:
             pool_tvl_now_usd = float(pool.get("effectiveTvlUSD") or 0.0)
         except Exception:
