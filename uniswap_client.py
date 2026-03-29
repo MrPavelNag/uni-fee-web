@@ -143,8 +143,6 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
             retries = int(os.environ.get("GRAPHQL_RETRIES_BASE", str(retries)))
         except Exception:
             pass
-        # Base can intermittently return "bad indexers"; give it a wider retry window by default.
-        retries = max(int(retries), int(os.environ.get("GRAPHQL_RETRIES_BASE_MIN", "6")))
     retries = max(1, retries)
     try:
         connect_timeout = float(os.environ.get("GRAPHQL_CONNECT_TIMEOUT_SEC", "8"))
@@ -186,7 +184,22 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
         except (requests.RequestException, RuntimeError) as e:
             last_err = e
             if attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
+                msg = str(e or "").lower()
+                try:
+                    bad_indexer_sleep = float(os.environ.get("GRAPHQL_BAD_INDEXER_RETRY_SLEEP_SEC", "1.0"))
+                except Exception:
+                    bad_indexer_sleep = 1.0
+                try:
+                    base_sleep = float(os.environ.get("GRAPHQL_RETRY_SLEEP_SEC_BASE", "0.8"))
+                except Exception:
+                    base_sleep = 0.8
+                if is_base_endpoint:
+                    sleep_s = max(0.2, base_sleep * (attempt + 1))
+                elif ("bad indexers" in msg) or ("badresponse" in msg):
+                    sleep_s = max(0.2, bad_indexer_sleep * (attempt + 1))
+                else:
+                    sleep_s = 5 * (attempt + 1)
+                time.sleep(sleep_s)
             else:
                 raise
     raise last_err or RuntimeError("GraphQL query failed")

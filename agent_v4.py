@@ -134,6 +134,11 @@ def _is_timeout_error(err: Exception) -> bool:
     return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
 
 
+def _is_bad_indexer_error(err: Exception) -> bool:
+    msg = str(err or "").lower()
+    return ("bad indexers" in msg) or ("badresponse" in msg) or ("indexer not available" in msg)
+
+
 def _normalize_day_timestamp(day_value: int) -> int:
     d = int(day_value or 0)
     if d <= 0:
@@ -376,7 +381,10 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
 
             pools = []
             timed_out = False
+            bad_indexer = False
             for a in addrs_a:
+                if bad_indexer:
+                    break
                 for b in addrs_b:
                     if a.lower() == b.lower():
                         continue
@@ -386,8 +394,11 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                         print(f"  [{chain}] {base}/{quote}: {e}")
                         if _is_timeout_error(e):
                             timed_out = True
+                        if _is_bad_indexer_error(e):
+                            bad_indexer = True
+                            break
                         continue
-            should_try_symbol_fallback = (not disable_symbol_fallback) and (not timed_out) and (not (known_a and known_b))
+            should_try_symbol_fallback = (not disable_symbol_fallback) and (not timed_out) and (not bad_indexer) and (not (known_a and known_b))
             if (not pools) and should_try_symbol_fallback:
                 try:
                     pools.extend(query_pools_by_symbols(endpoint, base, quote))
@@ -395,8 +406,12 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                     print(f"  [{chain}] {base}/{quote} (symbol fallback): {e}")
                     if _is_timeout_error(e):
                         timed_out = True
+                    if _is_bad_indexer_error(e):
+                        bad_indexer = True
             elif (not pools) and (known_a and known_b):
                 print(f"  [{chain}] {base}/{quote}: skip symbol fallback (known token addresses)")
+            if bad_indexer:
+                print(f"  [{chain}] {base}/{quote}: bad indexer route detected, stopped retries for this pair")
             if timed_out and skip_chain_after_timeout:
                 timeout_chains.add(chain)
                 chain_abort = True

@@ -180,7 +180,7 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v11"
+RUN_RESULT_CACHE_VER = "run_v12"
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -17189,11 +17189,11 @@ def _build_run_job_env(
     env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "8")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC_BASE"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_BASE", "8")
     env["GRAPHQL_READ_TIMEOUT_SEC_BASE"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_BASE", "20")
-    env["GRAPHQL_RETRIES_BASE"] = os.environ.get("WEB_GRAPHQL_RETRIES_BASE", "6")
-    env["GRAPHQL_RETRIES_BASE_MIN"] = os.environ.get("WEB_GRAPHQL_RETRIES_BASE_MIN", "6")
+    env["GRAPHQL_RETRIES_BASE"] = os.environ.get("WEB_GRAPHQL_RETRIES_BASE", "2")
+    env["GRAPHQL_RETRY_SLEEP_SEC_BASE"] = os.environ.get("WEB_GRAPHQL_RETRY_SLEEP_SEC_BASE", "0.8")
     env["GRAPHQL_BAD_INDEXER_RETRY_SLEEP_SEC"] = os.environ.get("WEB_GRAPHQL_BAD_INDEXER_RETRY_SLEEP_SEC", "1.0")
     env["MESSARI_GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_MESSARI_GRAPHQL_CONNECT_TIMEOUT_SEC", "6")
-    env["MESSARI_GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_MESSARI_GRAPHQL_READ_TIMEOUT_SEC", "20")
+    env["MESSARI_GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_MESSARI_GRAPHQL_READ_TIMEOUT_SEC", "12")
     env["POOL_SERIES_WORKERS"] = os.environ.get("WEB_POOL_SERIES_WORKERS_NORMAL", "8")
     env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get("WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL", "4")
     env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL", "120")
@@ -28989,10 +28989,6 @@ HTML_PAGE = """
       box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18);
     }
     .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
-    .chain-meta-line {
-      justify-content: flex-end;
-      margin-bottom: 6px;
-    }
     .meta-badge { border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #475569; background: #f8fafc; }
     .info-chip {
       border: 1px solid #cbd5e1;
@@ -29016,33 +29012,57 @@ HTML_PAGE = """
 
     .chain-grid {
       display: grid;
-      grid-template-rows: repeat(2, minmax(22px, auto));
+      grid-template-rows: repeat(2, minmax(20px, auto));
       grid-auto-flow: column;
-      grid-auto-columns: minmax(92px, max-content);
-      gap: 3px 6px;
-      margin-top: 2px;
+      grid-auto-columns: minmax(86px, max-content);
+      gap: 2px 5px;
+      margin-top: 0;
     }
     .check {
       display: flex;
       align-items: center;
       gap: 4px;
-      font-size: 12px;
+      font-size: 11px;
       color: #334155;
+      line-height: 1.1;
     }
     .check input {
       width: auto;
       padding: 0;
     }
+    .chains-wrap {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: nowrap;
+    }
+    .chains-main {
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+    .chains-side {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+      flex: 0 0 auto;
+      min-width: 240px;
+    }
     .chain-note {
-      margin-top: 6px;
       font-size: 11px;
-      color: #92400e;
-      background: #fffbeb;
-      border: 1px solid #fcd34d;
+      color: #7c2d12;
+      background: #fff4cc;
+      border: 1px solid #f0b429;
       border-radius: 8px;
-      padding: 6px 8px;
+      padding: 5px 8px;
       text-align: left;
       line-height: 1.3;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .chains-meta-badge {
+      white-space: nowrap;
     }
     
     .inline-grid { display: grid; grid-template-columns: 90px 90px 120px 120px 220px 130px; gap: 6px; align-items: end; }
@@ -29161,11 +29181,15 @@ HTML_PAGE = """
           <div class="row">
             <label title="Choose chains for analysis">Include chains</label>
             <div>
-              <div class="top-line chain-meta-line">
-                <span class="meta-badge" id="chainsMeta">chains: -</span>
+              <div class="chains-wrap">
+                <div class="chains-main">
+                  <div class="chain-grid" id="chainChecks"></div>
+                </div>
+                <div class="chains-side">
+                  <div class="chain-note" id="chainChecksNote" style="display:none;"></div>
+                  <span class="meta-badge chains-meta-badge" id="chainsMeta">chains: -</span>
+                </div>
               </div>
-              <div class="chain-grid" id="chainChecks"></div>
-              <div class="chain-note" id="chainChecksNote" style="display:none;"></div>
             </div>
           </div>
 
