@@ -180,7 +180,7 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v10"
+RUN_RESULT_CACHE_VER = "run_v11"
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -17189,7 +17189,9 @@ def _build_run_job_env(
     env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "8")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC_BASE"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_BASE", "8")
     env["GRAPHQL_READ_TIMEOUT_SEC_BASE"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_BASE", "20")
-    env["GRAPHQL_RETRIES_BASE"] = os.environ.get("WEB_GRAPHQL_RETRIES_BASE", "2")
+    env["GRAPHQL_RETRIES_BASE"] = os.environ.get("WEB_GRAPHQL_RETRIES_BASE", "6")
+    env["GRAPHQL_RETRIES_BASE_MIN"] = os.environ.get("WEB_GRAPHQL_RETRIES_BASE_MIN", "6")
+    env["GRAPHQL_BAD_INDEXER_RETRY_SLEEP_SEC"] = os.environ.get("WEB_GRAPHQL_BAD_INDEXER_RETRY_SLEEP_SEC", "1.0")
     env["MESSARI_GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_MESSARI_GRAPHQL_CONNECT_TIMEOUT_SEC", "6")
     env["MESSARI_GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_MESSARI_GRAPHQL_READ_TIMEOUT_SEC", "20")
     env["POOL_SERIES_WORKERS"] = os.environ.get("WEB_POOL_SERIES_WORKERS_NORMAL", "8")
@@ -28987,6 +28989,10 @@ HTML_PAGE = """
       box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18);
     }
     .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .chain-meta-line {
+      justify-content: flex-end;
+      margin-bottom: 6px;
+    }
     .meta-badge { border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #475569; background: #f8fafc; }
     .info-chip {
       border: 1px solid #cbd5e1;
@@ -29028,11 +29034,15 @@ HTML_PAGE = """
       padding: 0;
     }
     .chain-note {
+      margin-top: 6px;
       font-size: 11px;
-      color: #64748b;
-      margin-left: auto;
-      text-align: right;
-      white-space: nowrap;
+      color: #92400e;
+      background: #fffbeb;
+      border: 1px solid #fcd34d;
+      border-radius: 8px;
+      padding: 6px 8px;
+      text-align: left;
+      line-height: 1.3;
     }
     
     .inline-grid { display: grid; grid-template-columns: 90px 90px 120px 120px 220px 130px; gap: 6px; align-items: end; }
@@ -29151,11 +29161,11 @@ HTML_PAGE = """
           <div class="row">
             <label title="Choose chains for analysis">Include chains</label>
             <div>
-              <div class="top-line">
+              <div class="top-line chain-meta-line">
                 <span class="meta-badge" id="chainsMeta">chains: -</span>
-                <span class="chain-note" id="chainChecksNote" style="display:none;"></span>
               </div>
               <div class="chain-grid" id="chainChecks"></div>
+              <div class="chain-note" id="chainChecksNote" style="display:none;"></div>
             </div>
           </div>
 

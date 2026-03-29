@@ -77,6 +77,11 @@ def _is_timeout_error(err: Exception) -> bool:
     return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
 
 
+def _is_bad_indexer_error(err: Exception) -> bool:
+    msg = str(err or "").lower()
+    return ("bad indexers" in msg) or ("badresponse" in msg) or ("indexer not available" in msg)
+
+
 _ENDPOINT_SCHEMA_COMPAT_LOCK = threading.Lock()
 _ENDPOINT_SUPPORTS_POOLS_CACHE: dict[str, bool] = {}
 _ENDPOINT_IS_MESSARI_CACHE: dict[str, bool] = {}
@@ -422,17 +427,17 @@ def discover_pools_v3(
             try:
                 pools, truncated = _discover_on_endpoint(endpoint_used, allow_symbol_fallback_local=allow_symbol_fallback)
             except Exception as e:
-                if fallback_endpoint and _is_timeout_error(e):
+                if fallback_endpoint and (_is_timeout_error(e) or _is_bad_indexer_error(e)):
                     if fallback_kind == "v3":
                         print(
-                            f"  [{chain}] v3 {base}/{quote}: primary timeout, retry via fallback endpoint"
+                            f"  [{chain}] v3 {base}/{quote}: primary endpoint failed, retry via fallback endpoint"
                         )
                         endpoint_used = fallback_endpoint
                         endpoint_kind = "v3"
                         pools, truncated = _discover_on_endpoint(endpoint_used, allow_symbol_fallback_local=allow_symbol_fallback)
                     elif fallback_kind == "messari":
                         print(
-                            f"  [{chain}] v3 {base}/{quote}: primary timeout, retry via Messari adapter"
+                            f"  [{chain}] v3 {base}/{quote}: primary endpoint failed, retry via Messari adapter"
                         )
                         endpoint_used = fallback_endpoint
                         endpoint_kind = "messari"
