@@ -17703,6 +17703,7 @@ class PoolsRunRequest(BaseModel):
     pairs: list[str] = Field(default_factory=list, description="Up to 4 pairs: tokenA,tokenB")
     include_chains: list[str] = Field(default_factory=list)
     include_versions: list[str] = Field(default_factory=lambda: ["v3", "v4"])
+    speed_mode: str = "normal"
     min_tvl: float = 1000.0
     days: int = 30
     min_fee_pct: float = 0.0
