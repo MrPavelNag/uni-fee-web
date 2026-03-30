@@ -17204,8 +17204,9 @@ def _build_run_job_env(
     env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get("WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL", "4")
     env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL", "120")
     env["POOL_DAY_BATCH_SIZE"] = os.environ.get("WEB_POOL_DAY_BATCH_SIZE_NORMAL", "12")
-    env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL", "40")
-    env["MAX_POOLS_TOTAL"] = os.environ.get("WEB_MAX_POOLS_TOTAL_NORMAL", "240")
+    # Accuracy-first defaults: no hard trimming unless explicitly configured.
+    env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL", "0")
+    env["MAX_POOLS_TOTAL"] = os.environ.get("WEB_MAX_POOLS_TOTAL_NORMAL", "0")
     env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get("WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL", "0")
     env["STRICT_DISCOVERY_ERRORS"] = os.environ.get("WEB_STRICT_DISCOVERY_ERRORS", "1")
     env["DISABLE_V3_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V3_SYMBOL_FALLBACK_NORMAL", "1")
@@ -17240,6 +17241,25 @@ def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs:
         if proc.stderr:
             logs.append(proc.stderr[-20000:])
         if proc.returncode != 0:
+            def _tail_reason(txt: str) -> str:
+                try:
+                    lines = [str(x).strip() for x in str(txt or "").splitlines() if str(x).strip()]
+                except Exception:
+                    lines = []
+                if not lines:
+                    return ""
+                for ln in reversed(lines):
+                    l = ln.lower()
+                    if l.startswith("traceback"):
+                        continue
+                    if ln.startswith("File ") and ", line " in ln:
+                        continue
+                    return ln
+                return lines[-1]
+
+            reason = _tail_reason(proc.stderr or "") or _tail_reason(proc.stdout or "")
+            if reason:
+                raise RuntimeError(f"{script_name} failed with code {proc.returncode}: {reason}")
             raise RuntimeError(f"{script_name} failed with code {proc.returncode}")
         return int(round(max(0.0, time.perf_counter() - t0) * 1000.0))
     except subprocess.TimeoutExpired as e:

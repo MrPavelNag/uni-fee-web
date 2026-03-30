@@ -539,10 +539,17 @@ def main() -> None:
     fresh = "TOKEN_PAIRS" in os.environ
     pools = discover_pools_v3(token_pairs, args.min_tvl, fresh_token_lookup=fresh)
     discovered_count = len(pools)
-    max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 40))
-    max_total = max(0, _env_int("MAX_POOLS_TOTAL", 300))
+    max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 0))
+    max_total = max(0, _env_int("MAX_POOLS_TOTAL", 0))
     pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)
+    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", True)
     if len(pools) < discovered_count:
+        if strict_errors:
+            raise RuntimeError(
+                "CAP_TRIM_APPLIED: trimming pools is forbidden in strict mode "
+                f"(discovered={discovered_count}, kept={len(pools)}, "
+                f"max_per_pair_chain={max_per_pair_chain}, max_total={max_total})"
+            )
         print(
             "[warn] CAP_TRIM_APPLIED "
             f"discovered={discovered_count} kept={len(pools)} "
