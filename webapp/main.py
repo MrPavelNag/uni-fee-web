@@ -17273,6 +17273,52 @@ def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs:
         )
 
 
+def _graphql_endpoint_for_chain_version(chain: str, version: str, env: dict[str, str]) -> str:
+    ch = str(chain or "").strip().lower()
+    ver = str(version or "").strip().lower()
+    if not ch or ver not in {"v3", "v4"}:
+        return ""
+    if ver == "v4":
+        ov_key = f"V4_OVERRIDE_{ch.upper().replace('-', '_')}"
+        ov = str(env.get(ov_key) or "").strip()
+        if ov:
+            return ov
+    api_key = str(env.get("THE_GRAPH_API_KEY") or "").strip()
+    if ver == "v3":
+        sub_id = str(UNISWAP_V3_SUBGRAPHS.get(ch) or "").strip()
+        if api_key and sub_id:
+            return f"https://gateway.thegraph.com/api/{api_key}/subgraphs/id/{sub_id}"
+        return str(GOLDSKY_ENDPOINTS.get(ch) or "").strip()
+    sub_id = str(UNISWAP_V4_SUBGRAPHS.get(ch) or "").strip()
+    if api_key and sub_id:
+        return f"https://gateway.thegraph.com/api/{api_key}/subgraphs/id/{sub_id}"
+    return ""
+
+
+def _quick_graphql_healthcheck(endpoint: str, timeout_sec: float = 4.0) -> tuple[bool, str]:
+    ep = str(endpoint or "").strip()
+    if not ep:
+        return False, "no_endpoint"
+    payload = {"query": "query Health { pools(first: 1) { id } }", "variables": {}}
+    body = json.dumps(payload).encode("utf-8")
+    req = UrlRequest(
+        ep,
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": APP_USER_AGENT},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=max(1.0, float(timeout_sec))) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw or "{}") if raw else {}
+        errs = (data or {}).get("errors")
+        if errs:
+            return False, f"graphql_errors={str(errs)[:240]}"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def _push_run_history(
     *,
     session_id: str,
@@ -17558,55 +17604,72 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 "merged_before": 0,
             }
             pair_data: dict[str, dict] = {}
-            if run_v3 and run_v4:
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    f_v3 = ex.submit(
-                        _run_agent_and_load_timed,
-                        script_name="agent_v3.py",
-                        env=dict(pair_env),
-                        min_tvl=req.min_tvl,
-                        logs=pair_logs,
-                        pair_suffix=pair_suffix,
-                        run_output_dir=pair_out_dir,
-                    )
-                    f_v4 = ex.submit(
-                        _run_agent_and_load_timed,
-                        script_name="agent_v4.py",
-                        env=dict(pair_env),
-                        min_tvl=req.min_tvl,
-                        logs=pair_logs,
-                        pair_suffix=pair_suffix,
-                        run_output_dir=pair_out_dir,
-                    )
-                    data_v3, dbg_v3 = f_v3.result()
-                    data_v4, dbg_v4 = f_v4.result()
-                    pair_dbg["agents"].append(dbg_v3)
-                    pair_dbg["agents"].append(dbg_v4)
-                    pair_data.update(data_v3)
-                    pair_data.update(data_v4)
-            else:
-                if run_v3:
-                    data_v3, dbg_v3 = _run_agent_and_load_timed(
-                        script_name="agent_v3.py",
-                        env=pair_env,
-                        min_tvl=req.min_tvl,
-                        logs=pair_logs,
-                        pair_suffix=pair_suffix,
-                        run_output_dir=pair_out_dir,
-                    )
-                    pair_dbg["agents"].append(dbg_v3)
-                    pair_data.update(data_v3)
+            failed_chains: dict[str, list[str]] = {}
+
+            def _env_for_chains(chains_sel: list[str]) -> dict[str, str]:
+                e = dict(pair_env)
+                clean = [str(c).strip().lower() for c in (chains_sel or []) if str(c).strip()]
+                e["INCLUDE_CHAINS"] = ",".join(clean)
                 if run_v4:
-                    data_v4, dbg_v4 = _run_agent_and_load_timed(
-                        script_name="agent_v4.py",
-                        env=pair_env,
-                        min_tvl=req.min_tvl,
-                        logs=pair_logs,
-                        pair_suffix=pair_suffix,
-                        run_output_dir=pair_out_dir,
-                    )
-                    pair_dbg["agents"].append(dbg_v4)
-                    pair_data.update(data_v4)
+                    v4_supported = [c for c in clean if c in UNISWAP_V4_SUBGRAPHS]
+                    e["V4_CHAINS"] = ",".join(v4_supported)
+                return e
+
+            def _run_agent(script_name: str, env_local: dict[str, str]) -> None:
+                data_x, dbg_x = _run_agent_and_load_timed(
+                    script_name=script_name,
+                    env=env_local,
+                    min_tvl=req.min_tvl,
+                    logs=pair_logs,
+                    pair_suffix=pair_suffix,
+                    run_output_dir=pair_out_dir,
+                )
+                pair_dbg["agents"].append(dbg_x)
+                pair_data.update(data_x)
+
+            # 1) Main scan without base (stable chains).
+            wanted_chains = [str(c).strip().lower() for c in include_chains if str(c).strip()]
+            main_chains = [c for c in wanted_chains if c != "base"]
+            wants_base = "base" in wanted_chains
+            if main_chains:
+                main_env = _env_for_chains(main_chains)
+                if run_v3 and run_v4:
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        f_v3 = ex.submit(_run_agent, "agent_v3.py", dict(main_env))
+                        f_v4 = ex.submit(_run_agent, "agent_v4.py", dict(main_env))
+                        f_v3.result()
+                        f_v4.result()
+                else:
+                    if run_v3:
+                        _run_agent("agent_v3.py", main_env)
+                    if run_v4:
+                        _run_agent("agent_v4.py", main_env)
+
+            # 2) Base scan isolated: never breaks whole pair if base indexers are unhealthy.
+            if wants_base:
+                base_env = _env_for_chains(["base"])
+
+                def _run_base_agent_if_healthy(script_name: str, version: str) -> None:
+                    endpoint = _graphql_endpoint_for_chain_version("base", version, base_env)
+                    ok, reason = _quick_graphql_healthcheck(endpoint, timeout_sec=4.0)
+                    if not ok:
+                        msg = f"base healthcheck failed for {script_name}: {reason}"
+                        pair_logs.append(f"[warn] chain_failed chain=base agent={script_name} reason={reason}")
+                        failed_chains.setdefault("base", []).append(msg)
+                        return
+                    try:
+                        _run_agent(script_name, base_env)
+                    except Exception as e:
+                        pair_logs.append(f"[warn] chain_failed chain=base agent={script_name} reason={e}")
+                        failed_chains.setdefault("base", []).append(str(e))
+
+                if run_v3:
+                    _run_base_agent_if_healthy("agent_v3.py", "v3")
+                if run_v4:
+                    _run_base_agent_if_healthy("agent_v4.py", "v4")
+
+            if failed_chains:
+                pair_dbg["failed_chains"] = failed_chains
             pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
             return idx, pair_dbg, pair_data, pair_logs
 
@@ -17715,6 +17778,19 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             dropped_map = dict(price_drop_stats.get("dropped_no_reserves_by_chain") or {})
             if dropped_map:
                 result_payload["result_flags"]["dropped_no_reserves_by_chain"] = dropped_map
+            failed_chains_acc: dict[str, list[str]] = {}
+            for p_dbg in (timing_debug.get("pairs") or []):
+                fc = dict((p_dbg or {}).get("failed_chains") or {})
+                for ch, items in fc.items():
+                    if not items:
+                        continue
+                    bucket = failed_chains_acc.setdefault(str(ch), [])
+                    for it in (items or []):
+                        s = str(it or "").strip()
+                        if s and s not in bucket:
+                            bucket.append(s)
+            if failed_chains_acc:
+                result_payload["result_flags"]["failed_chains"] = failed_chains_acc
         except Exception:
             pass
         if incomplete_discovery:
