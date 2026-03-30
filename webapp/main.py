@@ -17015,6 +17015,10 @@ def _merge_for_web(
             status = "filtered_fee_range"
         if status != "ok":
             filtered_out += 1
+        try:
+            pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
+        except (TypeError, ValueError):
+            pool_tvl_now_usd = 0.0
         row = {
             "pool_id": v.get("pool_id", pool_id),
             "chain": v.get("chain", ""),
@@ -17022,7 +17026,7 @@ def _merge_for_web(
             "pair": v.get("pair", ""),
             "fee_pct": float(v.get("fee_pct") or 0),
             "final_income": _final_income(v),
-            "last_tvl": float(tvl[-1][1]) if tvl else 0.0,
+            "last_tvl": pool_tvl_now_usd,
             "status": status,
         }
         rows.append(row)

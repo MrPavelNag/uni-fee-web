@@ -25,6 +25,7 @@ from config import (
 )
 
 from agent_common import (
+    estimate_pool_tvl_usd_external_with_meta,
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
@@ -162,6 +163,29 @@ def discover_pools_v3(
                         _min_tvl(min_tvl),
                         max_results=int(discovery_cap),
                     )
+                min_tvl_now = _min_tvl(min_tvl)
+                filtered_pools: list[dict] = []
+                skipped_missing_price = 0
+                for p in pools:
+                    ext_tvl, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                    if float(ext_tvl) <= 0:
+                        skipped_missing_price += 1
+                        pid = str((p or {}).get("id") or "")
+                        print(
+                            f"[warn] PRICE_UNAVAILABLE chain={chain} pair={base}/{quote} "
+                            f"pool={pid} reason={price_err or 'unknown'}"
+                        )
+                        continue
+                    p["effectiveTvlUSD"] = float(ext_tvl)
+                    p["tvl_price_source"] = str(price_source or "external")
+                    if float(ext_tvl) >= float(min_tvl_now):
+                        filtered_pools.append(p)
+                pools = filtered_pools
+                if skipped_missing_price > 0:
+                    print(
+                        f"[warn] PRICE_FILTER_DROPPED chain={chain} pair={base}/{quote} "
+                        f"count={skipped_missing_price}"
+                    )
                 for p in pools:
                     p["chain"] = chain
                     p["version"] = "v3"
@@ -297,11 +321,46 @@ def main() -> None:
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair}: skipped (no endpoint)"
         data = compute_fee_and_tvl_series(pool, endpoint)
+        try:
+            pool_tvl_now_usd = float(pool.get("effectiveTvlUSD") or 0.0)
+        except Exception:
+            pool_tvl_now_usd = 0.0
+        if pool_tvl_now_usd <= 0:
+            pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
+            if float(pool_tvl_now_usd) <= 0:
+                msg = (
+                    f"  [{idx+1}/{len(pools)}] {chain} {pair}: "
+                    f"skipped (external TVL unavailable: {price_err or 'unknown'})"
+                )
+                return idx, None, None, msg
+            pool["tvl_price_source"] = str(price_source or "external")
+        raw_last_tvl = 0.0
+        if data.get("tvl"):
+            try:
+                raw_last_tvl = float((data.get("tvl") or [])[-1][1] or 0.0)
+            except Exception:
+                raw_last_tvl = 0.0
+        tvl_multiplier = 1.0
+        if raw_last_tvl > 0 and pool_tvl_now_usd > 0:
+            tvl_multiplier = max(0.05, min(20.0, float(pool_tvl_now_usd) / float(raw_last_tvl)))
+            if abs(tvl_multiplier - 1.0) > 1e-9:
+                try:
+                    data["tvl"] = [(int(ts), float(val) * float(tvl_multiplier)) for ts, val in (data.get("tvl") or [])]
+                except Exception:
+                    pass
+        try:
+            raw_pool_tvl = float(pool.get("totalValueLockedUSD") or 0.0)
+        except Exception:
+            raw_pool_tvl = 0.0
         payload = {
             **data,
             "pool_id": pool_id,
             "fee_pct": fee_pct,
             "raw_fee_tier": raw_fee_tier,
+            "pool_tvl_now_usd": pool_tvl_now_usd,
+            "pool_tvl_subgraph_usd": raw_pool_tvl,
+            "tvl_multiplier": float(tvl_multiplier),
+            "tvl_price_source": str(pool.get("tvl_price_source") or ""),
             "pair": pair,
             "chain": chain,
             "version": "v3",

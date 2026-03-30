@@ -4,10 +4,12 @@ Shared logic for Uniswap pool fee agents (v3, v4, merge).
 
 import json
 import os
+import math
 from datetime import datetime
 from typing import Any, Optional
 
 from config import FEE_DAYS, LP_ALLOCATION_USD, TOKEN_ADDRESSES
+from price_oracle import get_token_prices_usd
 
 DYNAMIC_TOKENS_PATH = "data/dynamic_tokens.json"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -143,6 +145,57 @@ def get_token_addresses(
     return addrs
 
 
+def _safe_float(v: Any) -> float:
+    try:
+        x = float(v or 0.0)
+        if not math.isfinite(x):
+            return 0.0
+        return x
+    except Exception:
+        return 0.0
+
+
+def estimate_pool_tvl_usd_external_with_meta(pool: dict, chain: str) -> tuple[float, str, str]:
+    """
+    Canonical TVL estimate from reserve amounts * external USD prices.
+    """
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    if not token0 or not token1:
+        return 0.0, "", "missing_pool_tokens"
+    amt0 = _safe_float(pool.get("totalValueLockedToken0"))
+    amt1 = _safe_float(pool.get("totalValueLockedToken1"))
+    if amt0 <= 0 and amt1 <= 0:
+        return 0.0, "", "missing_pool_reserves"
+    prices, sources, errors = get_token_prices_usd(chain, [token0, token1])
+    p0 = _safe_float(prices.get(token0))
+    p1 = _safe_float(prices.get(token1))
+    if p0 <= 0 and p1 <= 0:
+        err = "; ".join([e for e in errors if e]) or "external_price_not_found"
+        return 0.0, "", err
+    # If one leg price is missing, infer by pool ratio when available.
+    ratio01 = _safe_float(pool.get("token0Price"))  # token1 per token0
+    if p0 <= 0 and p1 > 0 and ratio01 > 0:
+        p0 = p1 * ratio01
+    if p1 <= 0 and p0 > 0 and ratio01 > 0:
+        p1 = p0 / ratio01
+    tvl = max(0.0, amt0 * p0) + max(0.0, amt1 * p1)
+    source = str(sources.get(token0) or sources.get(token1) or "")
+    if p0 > 0 and p1 > 0:
+        s0 = str(sources.get(token0) or "")
+        s1 = str(sources.get(token1) or "")
+        if s0 and s1 and s0 != s1:
+            source = f"{s0}+{s1}"
+        elif s0 and s1:
+            source = s0
+    return float(tvl), source, ""
+
+
+def estimate_pool_tvl_usd_external(pool: dict, chain: str) -> float:
+    tvl, _, _ = estimate_pool_tvl_usd_external_with_meta(pool, chain)
+    return float(tvl)
+
+
 def save_chart(pool_chart_data: dict[str, dict], path: str) -> None:
     """Plot cumulative fees and TVL. pool_chart_data: {pool_id -> {fees, tvl, pool_id, fee_pct, pair, chain, version}}."""
     import matplotlib.dates as mdates
@@ -216,6 +269,10 @@ def save_chart_data_json(pool_chart_data: dict[str, dict], path: str) -> None:
             "pool_id": v.get("pool_id", k),
             "fee_pct": v.get("fee_pct", 0),
             "raw_fee_tier": v.get("raw_fee_tier"),
+            "pool_tvl_now_usd": v.get("pool_tvl_now_usd"),
+            "pool_tvl_subgraph_usd": v.get("pool_tvl_subgraph_usd"),
+            "tvl_multiplier": v.get("tvl_multiplier"),
+            "tvl_price_source": v.get("tvl_price_source"),
             "pair": v.get("pair", ""),
             "chain": v.get("chain", ""),
             "version": v.get("version", "v3"),

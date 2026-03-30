@@ -127,31 +127,31 @@ def query_pools_containing_both_tokens(
     result = []
 
     query_tmpl = """
-    query Pools($minTvl: BigDecimal!, $skip: Int!) {
+    query Pools($skip: Int!) {
       pools0: pools(
         first: 100,
         skip: $skip,
-        where: { token0: "%s", token1: "%s", totalValueLockedUSD_gte: $minTvl },
+        where: { token0: "%s", token1: "%s" },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
         volumeUSD feesUSD txCount
       }
       pools1: pools(
         first: 100,
         skip: $skip,
-        where: { token0: "%s", token1: "%s", totalValueLockedUSD_gte: $minTvl },
+        where: { token0: "%s", token1: "%s" },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
         volumeUSD feesUSD txCount
       }
     }
@@ -162,7 +162,7 @@ def query_pools_containing_both_tokens(
         data = graphql_query(
             endpoint,
             query,
-            {"minTvl": str(min_tvl), "skip": skip},
+            {"skip": skip},
             retries=1,  # fallback path: fail fast on bad indexers
         )
         p0 = data.get("data", {}).get("pools0", [])
@@ -191,31 +191,31 @@ def query_pools_by_token_symbols(
         return []
     result = []
     query_tmpl = """
-    query PoolsBySymbols($minTvl: BigDecimal!, $skip: Int!) {
+    query PoolsBySymbols($skip: Int!) {
       pools0: pools(
         first: 100,
         skip: $skip,
-        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl },
+        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
         volumeUSD feesUSD txCount
       }
       pools1: pools(
         first: 100,
         skip: $skip,
-        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl },
+        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
         volumeUSD feesUSD txCount
       }
     }
@@ -226,7 +226,7 @@ def query_pools_by_token_symbols(
         data = graphql_query(
             endpoint,
             query,
-            {"minTvl": str(min_tvl), "skip": skip},
+            {"skip": skip},
         )
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])
