@@ -505,9 +505,19 @@ def main() -> None:
 
     print("Uniswap v4 Agent")
     print("Пары:", pairs_str, "| Min TVL: $%.0f" % min_tvl)
+    print(
+        "[perf] pool_day_batch_size=%s pool_day_retries=%s per_id_fallback=%s"
+        % (
+            str(max(1, min(40, _env_int("POOL_DAY_BATCH_SIZE", 12)))),
+            str(os.environ.get("GRAPHQL_POOL_DAY_RETRIES", "1")),
+            str(os.environ.get("GRAPHQL_POOL_DAY_DISABLE_PER_ID_FALLBACK", "1")),
+        )
+    )
     print("Поиск пулов...")
 
+    t_discover0 = time.perf_counter()
     pools = discover_pools(pairs, min_tvl)
+    discover_ms = int(round(max(0.0, time.perf_counter() - t_discover0) * 1000.0))
     discovered_count = len(pools)
     max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 0))
     max_total = max(0, _env_int("MAX_POOLS_TOTAL", 0))
@@ -538,6 +548,7 @@ def main() -> None:
     batch_size = max(1, min(40, _env_int("POOL_DAY_BATCH_SIZE", 12)))
     day_data_by_pool: dict[str, list[dict]] = {}
     strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", False)
+    t_daydata0 = time.perf_counter()
     if pools:
         end = datetime.utcnow()
         start = end - timedelta(days=FEE_DAYS)
@@ -559,6 +570,7 @@ def main() -> None:
                 if strict_errors:
                     raise RuntimeError(f"[v4-batch-daydata] {e}") from e
                 print(f"  [v4-batch-daydata] {e}")
+    daydata_ms = int(round(max(0.0, time.perf_counter() - t_daydata0) * 1000.0))
 
     def _process_pool(idx: int, pool: dict) -> tuple[int, str | None, dict | None, str]:
         chain = pool.get("chain", "?")
@@ -623,6 +635,7 @@ def main() -> None:
         n_days = len(series.get("fees") or [])
         return idx, pool_id, payload, f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: {n_days} days"
 
+    t_series0 = time.perf_counter()
     if pools:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [ex.submit(_process_pool, i, p) for i, p in enumerate(pools)]
@@ -636,9 +649,13 @@ def main() -> None:
                     if strict_errors:
                         raise RuntimeError(f"[v4-series] {e}") from e
                     print(f"  [series] error - {e}")
+    series_ms = int(round(max(0.0, time.perf_counter() - t_series0) * 1000.0))
 
     out_path = output_dir / f"pools_v4_{suffix}.json"
     save_chart_data_json(chart_data, str(out_path))
+    print(
+        f"[timing] v4 stages: discover={discover_ms}ms daydata_batch={daydata_ms}ms series={series_ms}ms total={discover_ms + daydata_ms + series_ms}ms"
+    )
     print("Готово:", str(out_path))
 
 

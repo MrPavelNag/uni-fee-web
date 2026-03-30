@@ -8,6 +8,7 @@ Priority:
 """
 
 import os
+import math
 import threading
 import time
 from typing import Any
@@ -20,7 +21,10 @@ _PRICE_CACHE: dict[tuple[str, str], tuple[float, float, str]] = {}
 
 def _safe_float(v: Any) -> float:
     try:
-        return float(v or 0.0)
+        x = float(v or 0.0)
+        if not math.isfinite(x):
+            return 0.0
+        return x
     except Exception:
         return 0.0
 

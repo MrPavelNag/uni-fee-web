@@ -4,6 +4,7 @@ Shared logic for Uniswap pool fee agents (v3, v4, merge).
 
 import json
 import os
+import math
 from datetime import datetime
 from typing import Any, Optional
 
@@ -146,7 +147,10 @@ def get_token_addresses(
 
 def _safe_float(v: Any) -> float:
     try:
-        return float(v or 0.0)
+        x = float(v or 0.0)
+        if not math.isfinite(x):
+            return 0.0
+        return x
     except Exception:
         return 0.0
 

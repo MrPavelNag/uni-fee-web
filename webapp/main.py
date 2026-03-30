@@ -29385,6 +29385,32 @@ HTML_PAGE = """
       }
     }
 
+    async function apiFetchJson(url, opts = {}) {
+      const maxAttempts = 2;
+      let lastResp = null;
+      let lastParsed = {data: {}, rawText: ""};
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const resp = await fetch(url, {
+          cache: "no-store",
+          ...opts,
+          headers: {"Accept": "application/json", ...(opts?.headers || {})},
+        });
+        const parsed = await parseApiJsonSafe(resp);
+        lastResp = resp;
+        lastParsed = parsed;
+        const raw = String(parsed.rawText || "").trim();
+        const isHtml = raw.startsWith("<!DOCTYPE") || raw.startsWith("<html") || raw.startsWith("<");
+        const status = Number(resp.status || 0);
+        const isTransientHtml = isHtml && status >= 500 && status <= 599;
+        if (isTransientHtml && attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 700));
+          continue;
+        }
+        return {resp, parsed};
+      }
+      return {resp: lastResp, parsed: lastParsed};
+    }
+
     function navigateIntent(path) {
       if (!path) return;
       window.location.href = path;
@@ -30442,12 +30468,11 @@ HTML_PAGE = """
         setBusy(true);
         scanStageLabel = "Submitting job";
         startScanTicker();
-        const r = await fetch("/api/pools/run", {
+        const {resp: r, parsed} = await apiFetchJson("/api/pools/run", {
           method: "POST",
-          headers: {"Content-Type":"application/json", "Accept":"application/json"},
+          headers: {"Content-Type":"application/json"},
           body: JSON.stringify(payload)
         });
-        const parsed = await parseApiJsonSafe(r);
         const data = parsed.data || {};
         if (!r.ok) {
           stopActivePoll();
@@ -30456,7 +30481,7 @@ HTML_PAGE = """
           const raw = String(parsed.rawText || "").replace(/\s+/g, " ").trim();
           const det = String(data.detail || data.info || data.message || "");
           const isHtml = raw.startsWith("<!DOCTYPE") || raw.startsWith("<html") || raw.startsWith("<");
-          const reason = det || (isHtml ? "server returned HTML instead of JSON" : "request failed");
+          const reason = det || (isHtml ? `server returned HTML instead of JSON (HTTP ${r.status})` : `request failed (HTTP ${r.status})`);
           setStatus("Error: " + reason, "fail");
           return;
         }
@@ -30482,8 +30507,7 @@ HTML_PAGE = """
       const tick = async () => {
         try {
           if (!activeJobId || activeJobId !== String(jobId || "")) return;
-          const r = await fetch("/api/jobs/" + jobId, {headers: {"Accept":"application/json"}});
-          const parsed = await parseApiJsonSafe(r);
+          const {resp: r, parsed} = await apiFetchJson("/api/jobs/" + jobId);
           const job = parsed.data || {};
           if (!r.ok) {
             stopActivePoll();
@@ -30493,7 +30517,7 @@ HTML_PAGE = """
             const raw = String(parsed.rawText || "").replace(/\s+/g, " ").trim();
             const det = String(job.detail || job.message || "");
             const isHtml = raw.startsWith("<!DOCTYPE") || raw.startsWith("<html") || raw.startsWith("<");
-            setStatus("Failed: " + (det || (isHtml ? "server returned HTML instead of JSON" : "job status request failed")), "fail");
+            setStatus("Failed: " + (det || (isHtml ? `server returned HTML instead of JSON (HTTP ${r.status})` : `job status request failed (HTTP ${r.status})`)), "fail");
             return;
           }
           updateProgress(job.progress, job.stage_label || job.stage);
