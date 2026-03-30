@@ -17628,7 +17628,12 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 pair_data.update(data_x)
 
             # 1) Main scan without base (stable chains).
+            # Empty include_chains means "all" (legacy API behavior).
             wanted_chains = [str(c).strip().lower() for c in include_chains if str(c).strip()]
+            if not wanted_chains:
+                wanted_chains = sorted(
+                    set(UNISWAP_V3_SUBGRAPHS.keys()) | set(UNISWAP_V4_SUBGRAPHS.keys()) | set(GOLDSKY_ENDPOINTS.keys())
+                )
             main_chains = [c for c in wanted_chains if c != "base"]
             wants_base = "base" in wanted_chains
             if main_chains:
