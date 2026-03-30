@@ -180,7 +180,7 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v14"
+RUN_RESULT_CACHE_VER = "run_v15"
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -17007,6 +17007,7 @@ def _merge_for_web(
     filtered_fee_range = 0
     filtered_suffix = 0
     default_visible = 0
+    filtered_invalid_tvl = 0
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
@@ -17014,16 +17015,14 @@ def _merge_for_web(
             pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
         except (TypeError, ValueError):
             pool_tvl_now_usd = 0.0
+        # Do not fail whole job because of a single malformed row;
+        # explicitly drop rows with invalid/current TVL issues.
         if pool_tvl_now_usd <= 0:
-            raise RuntimeError(
-                f"Pool {str(v.get('pool_id') or pool_id)} has no current TVL (pool_tvl_now_usd<=0). "
-                "Strict mode requires explicit current TVL."
-            )
+            filtered_invalid_tvl += 1
+            continue
         if float(min_tvl_usd or 0.0) > 0 and pool_tvl_now_usd + 1e-9 < float(min_tvl_usd):
-            raise RuntimeError(
-                f"Pool {str(v.get('pool_id') or pool_id)} violates min_tvl: "
-                f"{pool_tvl_now_usd:.6f} < {float(min_tvl_usd):.6f}"
-            )
+            filtered_invalid_tvl += 1
+            continue
         if excluded_by_suffix(v, pool_id):
             status = "filtered_suffix"
         elif in_fee_range(v):
@@ -17072,6 +17071,7 @@ def _merge_for_web(
         "error_pools": filtered_out,
         "filtered_fee_range": filtered_fee_range,
         "filtered_suffix": filtered_suffix,
+        "filtered_invalid_tvl": filtered_invalid_tvl,
         "rows": rows,
         "series": chart_series,
     }
@@ -17739,6 +17739,12 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             min_tvl_usd=req.min_tvl,
             merged_override=merged_raw,
         )
+        try:
+            bad_tvl_cnt = int(result.get("filtered_invalid_tvl") or 0)
+        except Exception:
+            bad_tvl_cnt = 0
+        if bad_tvl_cnt > 0:
+            logs.append(f"[warn] merge_dropped_invalid_tvl={bad_tvl_cnt}")
         timing_debug["stage_ms"]["merge_for_web"] = int(round(max(0.0, time.perf_counter() - t_merge0) * 1000.0))
         timing_debug["stage_ms"]["merged_rows"] = int(len(result.get("rows") or []))
         timing_debug["stage_ms"]["merged_series"] = int(len(result.get("series") or []))
