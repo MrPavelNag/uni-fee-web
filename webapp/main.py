@@ -17192,6 +17192,8 @@ def _build_run_job_env(
     env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get("WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL", "4")
     env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL", "120")
     env["POOL_DAY_BATCH_SIZE"] = os.environ.get("WEB_POOL_DAY_BATCH_SIZE_NORMAL", "12")
+    env["GRAPHQL_POOL_DAY_RETRIES"] = os.environ.get("WEB_GRAPHQL_POOL_DAY_RETRIES", "1")
+    env["GRAPHQL_POOL_DAY_DISABLE_PER_ID_FALLBACK"] = os.environ.get("WEB_GRAPHQL_POOL_DAY_DISABLE_PER_ID_FALLBACK", "1")
     # Accuracy-first defaults: no hard trimming unless explicitly configured.
     env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL", "0")
     env["MAX_POOLS_TOTAL"] = os.environ.get("WEB_MAX_POOLS_TOTAL_NORMAL", "0")

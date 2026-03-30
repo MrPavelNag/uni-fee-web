@@ -455,6 +455,18 @@ def _pool_day_batch_size() -> int:
         return 12
 
 
+def _pool_day_retries() -> int:
+    try:
+        return max(1, int(os.environ.get("GRAPHQL_POOL_DAY_RETRIES", "1")))
+    except Exception:
+        return 1
+
+
+def _pool_day_disable_per_id_fallback() -> bool:
+    raw = str(os.environ.get("GRAPHQL_POOL_DAY_DISABLE_PER_ID_FALLBACK", "1")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def query_pool_day_data_batch(
     endpoint: str,
     pool_ids: list[str],
@@ -484,6 +496,8 @@ def query_pool_day_data_batch(
 
     bsz = int(batch_size or _pool_day_batch_size())
     bsz = max(1, min(40, bsz))
+    retries_pd = _pool_day_retries()
+    disable_per_id_fb = _pool_day_disable_per_id_fallback()
 
     def _build_query(active_ids: list[str]) -> tuple[str, dict[str, str]]:
         alias_to_pool: dict[str, str] = {}
@@ -518,7 +532,12 @@ def query_pool_day_data_batch(
             next_active: list[str] = []
             try:
                 query, alias_map = _build_query(active)
-                data = graphql_query(endpoint, query, {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)})
+                data = graphql_query(
+                    endpoint,
+                    query,
+                    {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
+                    retries=retries_pd,
+                )
                 payload = data.get("data", {}) if isinstance(data, dict) else {}
                 for alias, pid in alias_map.items():
                     items = payload.get(alias, []) if isinstance(payload, dict) else []
@@ -529,11 +548,18 @@ def query_pool_day_data_batch(
                     if len(items) >= 100:
                         next_active.append(pid)
             except Exception:
+                if disable_per_id_fb:
+                    break
                 # Degrade gracefully: isolate failing pool(s) instead of dropping entire batch.
                 for pid in list(active):
                     try:
                         q1, alias1 = _build_query([pid])
-                        d1 = graphql_query(endpoint, q1, {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)})
+                        d1 = graphql_query(
+                            endpoint,
+                            q1,
+                            {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
+                            retries=retries_pd,
+                        )
                         p1 = d1.get("data", {}) if isinstance(d1, dict) else {}
                         alias = next(iter(alias1.keys())) if alias1 else "p0"
                         items = p1.get(alias, []) if isinstance(p1, dict) else []
