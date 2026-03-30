@@ -264,7 +264,7 @@ def discover_pools_v3(
     discovery_cap_hard = _discover_cap_hard(max(1, discovery_cap) * 6 if discovery_cap > 0 else 0)
     chain_workers = max(1, min(_env_int("V3_DISCOVERY_CHAIN_WORKERS", 4), len(chains) or 1))
     disable_symbol_fallback = _env_flag("DISABLE_V3_SYMBOL_FALLBACK", True)
-    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", True)
+    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", False)
     dyn_lock = threading.Lock()
 
     def _discover_for_chain(chain: str) -> list[dict]:
@@ -542,7 +542,7 @@ def main() -> None:
     max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 0))
     max_total = max(0, _env_int("MAX_POOLS_TOTAL", 0))
     pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)
-    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", True)
+    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", False)
     if len(pools) < discovered_count:
         if strict_errors:
             raise RuntimeError(
@@ -566,7 +566,7 @@ def main() -> None:
     max_workers = max(1, min(16, int(os.environ.get("POOL_SERIES_WORKERS", "8"))))
     batch_size = max(1, min(40, _env_int("POOL_DAY_BATCH_SIZE", 12)))
     day_data_by_pool: dict[str, list[dict]] = {}
-    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", True)
+    strict_errors = _env_flag("STRICT_DISCOVERY_ERRORS", False)
     if pools:
         end = datetime.utcnow()
         start = end - timedelta(days=FEE_DAYS)
