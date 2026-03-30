@@ -17,41 +17,6 @@ _TOKEN_BY_SYMBOL_CACHE_LOCK = threading.Lock()
 _TOKEN_BY_SYMBOL_CACHE: dict[tuple[str, str], Optional[str]] = {}
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except Exception:
-        return int(default)
-
-
-def _pool_day_cache_limit() -> int:
-    return max(200, _env_int("GRAPHQL_POOL_DAY_CACHE_LIMIT", 8000))
-
-
-def _token_cache_limit() -> int:
-    return max(100, _env_int("GRAPHQL_TOKEN_CACHE_LIMIT", 2000))
-
-
-def _sort_pools_by_tvl_desc(items: list[dict]) -> list[dict]:
-    def _tvl(x: dict) -> float:
-        try:
-            return float((x or {}).get("totalValueLockedUSD") or 0.0)
-        except Exception:
-            return 0.0
-    return sorted(items or [], key=_tvl, reverse=True)
-
-
-def _trim_cache_dict(d: dict, limit: int) -> None:
-    if len(d) <= int(limit):
-        return
-    over = max(0, len(d) - int(limit))
-    if over <= 0:
-        return
-    # Keep implementation simple and deterministic.
-    for k in list(d.keys())[:over]:
-        d.pop(k, None)
-
-
 def _page_delay_sec() -> float:
     try:
         return max(0.0, float(os.environ.get("GRAPHQL_PAGE_DELAY_SEC", "0")))
@@ -99,12 +64,6 @@ def get_graph_endpoint(chain: str, version: str = "v3") -> Optional[str]:
         return None
 
     # v3
-    cu = chain.upper().replace("-", "_")
-    override_v3 = os.environ.get(f"V3_OVERRIDE_{cu}")
-    if not override_v3 and chain == "arbitrum":
-        override_v3 = os.environ.get("V3_OVERRIDE_ARBITRUM_ONE")
-    if override_v3:
-        return override_v3
     if chain in UNISWAP_V3_SUBGRAPHS:
         return f"https://gateway.thegraph.com/api/{api_key}/subgraphs/id/{UNISWAP_V3_SUBGRAPHS[chain]}"
     if chain in GOLDSKY_ENDPOINTS:
@@ -130,29 +89,6 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
         read_timeout = float(os.environ.get("GRAPHQL_READ_TIMEOUT_SEC", "15"))
     except Exception:
         read_timeout = 15.0
-    # Base endpoint can be slower/more volatile; allow separate read-timeout profile.
-    try:
-        endpoint_l = str(endpoint or "").strip().lower()
-    except Exception:
-        endpoint_l = ""
-    is_base_endpoint = False
-    if endpoint_l:
-        try:
-            from config import GOLDSKY_ENDPOINTS, UNISWAP_V3_SUBGRAPHS, UNISWAP_V4_SUBGRAPHS
-            base_v3_id = str(UNISWAP_V3_SUBGRAPHS.get("base") or "").strip().lower()
-            base_v4_id = str(UNISWAP_V4_SUBGRAPHS.get("base") or "").strip().lower()
-            base_goldsky = str(GOLDSKY_ENDPOINTS.get("base") or "").strip().lower()
-            if (base_v3_id and base_v3_id in endpoint_l) or (base_v4_id and base_v4_id in endpoint_l):
-                is_base_endpoint = True
-            if base_goldsky and base_goldsky in endpoint_l:
-                is_base_endpoint = True
-        except Exception:
-            is_base_endpoint = False
-    if is_base_endpoint:
-        try:
-            read_timeout = float(os.environ.get("GRAPHQL_READ_TIMEOUT_SEC_BASE", "20"))
-        except Exception:
-            pass
     connect_timeout = max(2.0, connect_timeout)
     read_timeout = max(5.0, read_timeout)
     for attempt in range(retries):
@@ -164,15 +100,12 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
                 err_msg = str(data["errors"]).lower()
                 if "bad indexers" in err_msg or "badresponse" in err_msg:
                     if attempt < retries - 1:
-                        # Faster retry cadence for transient indexer routing failures.
-                        try:
-                            base_sleep = float(os.environ.get("GRAPHQL_BAD_INDEXER_RETRY_SLEEP_SEC", "1.0"))
-                        except Exception:
-                            base_sleep = 1.0
-                        time.sleep(max(0.2, base_sleep) * (attempt + 1))
+                        time.sleep(5 * (attempt + 1))
                         continue
                 raise RuntimeError(f"GraphQL errors: {data['errors']}")
             return data
+        except requests.exceptions.ConnectionError:
+            raise  # DNS/connection errors: no retry
         except (requests.RequestException, RuntimeError) as e:
             last_err = e
             if attempt < retries - 1:
@@ -194,62 +127,55 @@ def query_pools_containing_both_tokens(
     result = []
 
     query_tmpl = """
-    query Pools($skip: Int!) {
+    query Pools($minTvl: BigDecimal!, $skip: Int!) {
       pools0: pools(
         first: 100,
         skip: $skip,
-        where: { token0: "%s", token1: "%s" },
+        where: { token0: "%s", token1: "%s", totalValueLockedUSD_gte: $minTvl },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
         volumeUSD feesUSD txCount
       }
       pools1: pools(
         first: 100,
         skip: $skip,
-        where: { token0: "%s", token1: "%s" },
+        where: { token0: "%s", token1: "%s", totalValueLockedUSD_gte: $minTvl },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
         volumeUSD feesUSD txCount
       }
     }
     """
     query = query_tmpl % (token_a, token_b, token_b, token_a)
-    try:
-        discovery_retries = max(1, int(os.environ.get("GRAPHQL_DISCOVERY_RETRIES", "1")))
-    except Exception:
-        discovery_retries = 1
     skip = 0
     while True:
         data = graphql_query(
             endpoint,
             query,
-            {"skip": skip},
-            retries=discovery_retries,
+            {"minTvl": str(min_tvl), "skip": skip},
+            retries=1,  # fallback path: fail fast on bad indexers
         )
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])
-        combined = list(p0 or []) + list(p1 or [])
-        result.extend(combined)
+        result.extend(p0)
+        result.extend(p1)
         if int(max_results or 0) > 0 and len(result) >= int(max_results):
-            return _sort_pools_by_tvl_desc(result)[: int(max_results)]
+            return result[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
         _maybe_page_delay()
-    out = _sort_pools_by_tvl_desc(result)
-    if int(max_results or 0) > 0:
-        out = out[: int(max_results)]
-    return out
+    return result
 
 
 def query_pools_by_token_symbols(
@@ -265,62 +191,54 @@ def query_pools_by_token_symbols(
         return []
     result = []
     query_tmpl = """
-    query PoolsBySymbols($skip: Int!) {
+    query PoolsBySymbols($minTvl: BigDecimal!, $skip: Int!) {
       pools0: pools(
         first: 100,
         skip: $skip,
-        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } },
+        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
         volumeUSD feesUSD txCount
       }
       pools1: pools(
         first: 100,
         skip: $skip,
-        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" } },
+        where: { token0_: { symbol: "%s" }, token1_: { symbol: "%s" }, totalValueLockedUSD_gte: $minTvl },
         orderBy: totalValueLockedUSD,
         orderDirection: desc
       ) {
         id feeTier liquidity
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
-        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1 token0Price token1Price
+        totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
         volumeUSD feesUSD txCount
       }
     }
     """
     query = query_tmpl % (sa, sb, sb, sa)
-    try:
-        discovery_retries = max(1, int(os.environ.get("GRAPHQL_DISCOVERY_RETRIES", "1")))
-    except Exception:
-        discovery_retries = 1
     skip = 0
     while True:
         data = graphql_query(
             endpoint,
             query,
-            {"skip": skip},
-            retries=discovery_retries,
+            {"minTvl": str(min_tvl), "skip": skip},
         )
         p0 = data.get("data", {}).get("pools0", [])
         p1 = data.get("data", {}).get("pools1", [])
-        combined = list(p0 or []) + list(p1 or [])
-        result.extend(combined)
+        result.extend(p0)
+        result.extend(p1)
         if int(max_results or 0) > 0 and len(result) >= int(max_results):
-            return _sort_pools_by_tvl_desc(result)[: int(max_results)]
+            return result[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
         _maybe_page_delay()
-    out = _sort_pools_by_tvl_desc(result)
-    if int(max_results or 0) > 0:
-        out = out[: int(max_results)]
-    return out
+    return result
 
 
 def query_pools_containing_both_tokens_no_tvl_filter(
@@ -382,207 +300,49 @@ def query_pools_containing_both_tokens_no_tvl_filter(
 def query_pool_day_data(
     endpoint: str, pool_id: str, start_ts: int, end_ts: int
 ) -> list[dict]:
-    """Fetch PoolDayData for one pool."""
-    pid = str(pool_id or "").strip().lower()
-    if not pid:
-        return []
-    return query_pool_day_data_batch(endpoint, [pid], start_ts, end_ts).get(pid, [])
-
-
-def query_pool_by_id(endpoint: str, pool_id: str) -> Optional[dict]:
-    pid = str(pool_id or "").strip().lower()
-    if not pid:
-        return None
-    q = """
-    query PoolById($id: ID!) {
-      pool(id: $id) {
-        id
-        feeTier
-        liquidity
-        token0 { id symbol decimals name }
-        token1 { id symbol decimals name }
-        totalValueLockedUSD
-        totalValueLockedToken0
-        totalValueLockedToken1
-        token0Price
-        token1Price
-        volumeUSD
-        feesUSD
-        txCount
-      }
-    }
-    """
-    data = graphql_query(endpoint, q, {"id": pid}, retries=1)
-    pool = (data.get("data", {}) or {}).get("pool")
-    return dict(pool) if isinstance(pool, dict) else None
-
-
-def query_pool_last_tvl_usd(endpoint: str, pool_id: str) -> float:
-    """
-    Fetch latest poolDayData tvlUSD without date filters.
-    Useful when pool entity totalValueLockedUSD is stale.
-    """
-    pid = str(pool_id or "").strip().lower()
-    if not pid:
-        return 0.0
-    q = """
-    query PoolLastDay($pool: String!) {
+    """Fetch PoolDayData for a pool for the given date range (date = unix/86400)."""
+    query = """
+    query PoolDayData($pool: String!, $start: Int!, $end: Int!, $skip: Int!) {
       poolDayDatas(
-        first: 1,
-        orderBy: date,
-        orderDirection: desc,
-        where: { pool: $pool }
-      ) {
-        date
-        tvlUSD
-      }
-    }
-    """
-    try:
-        data = graphql_query(endpoint, q, {"pool": pid}, retries=1)
-        rows = ((data or {}).get("data") or {}).get("poolDayDatas") or []
-        if not rows:
-            return 0.0
-        return float((rows[0] or {}).get("tvlUSD") or 0.0)
-    except Exception:
-        return 0.0
-
-
-def _pool_day_batch_size() -> int:
-    try:
-        return max(1, min(40, int(os.environ.get("GRAPHQL_POOL_DAY_BATCH_SIZE", "12"))))
-    except Exception:
-        return 12
-
-
-def _pool_day_retries() -> int:
-    try:
-        return max(1, int(os.environ.get("GRAPHQL_POOL_DAY_RETRIES", "1")))
-    except Exception:
-        return 1
-
-
-def _pool_day_disable_per_id_fallback() -> bool:
-    raw = str(os.environ.get("GRAPHQL_POOL_DAY_DISABLE_PER_ID_FALLBACK", "1")).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def query_pool_day_data_batch(
-    endpoint: str,
-    pool_ids: list[str],
-    start_ts: int,
-    end_ts: int,
-    batch_size: int = 0,
-) -> dict[str, list[dict]]:
-    """
-    Fetch PoolDayData for many pools using batched GraphQL aliases.
-    Returns mapping {pool_id_lower: sorted_rows}.
-    """
-    uniq_ids = list(dict.fromkeys([str(x or "").strip().lower() for x in (pool_ids or []) if str(x or "").strip()]))
-    if not uniq_ids:
-        return {}
-    out: dict[str, list[dict]] = {pid: [] for pid in uniq_ids}
-    missing: list[str] = []
-    for pid in uniq_ids:
-        cache_key = (str(endpoint), str(pid), int(start_ts), int(end_ts))
-        with _POOL_DAY_CACHE_LOCK:
-            cached = _POOL_DAY_CACHE.get(cache_key)
-        if cached is not None:
-            out[pid] = list(cached)
-        else:
-            missing.append(pid)
-    if not missing:
-        return out
-
-    bsz = int(batch_size or _pool_day_batch_size())
-    bsz = max(1, min(40, bsz))
-    retries_pd = _pool_day_retries()
-    disable_per_id_fb = _pool_day_disable_per_id_fallback()
-
-    def _build_query(active_ids: list[str]) -> tuple[str, dict[str, str]]:
-        alias_to_pool: dict[str, str] = {}
-        parts: list[str] = []
-        for i, pid in enumerate(active_ids):
-            alias = f"p{i}"
-            alias_to_pool[alias] = pid
-            parts.append(
-                f"""{alias}: poolDayDatas(
         first: 100,
         skip: $skip,
         orderBy: date,
         orderDirection: asc,
-        where: {{ pool: "{pid}", date_gte: $start, date_lte: $end }}
-      ) {{
+        where: { pool: $pool, date_gte: $start, date_lte: $end }
+      ) {
         id
         date
         tvlUSD
         volumeUSD
         feesUSD
         liquidity
-      }}"""
-            )
-        query = "query PoolDayDataBatch($start: Int!, $end: Int!, $skip: Int!) {\n" + "\n".join(parts) + "\n}"
-        return query, alias_to_pool
-
-    for off in range(0, len(missing), bsz):
-        chunk = missing[off : off + bsz]
-        active = list(chunk)
-        skip = 0
-        while active:
-            next_active: list[str] = []
-            try:
-                query, alias_map = _build_query(active)
-                data = graphql_query(
-                    endpoint,
-                    query,
-                    {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
-                    retries=retries_pd,
-                )
-                payload = data.get("data", {}) if isinstance(data, dict) else {}
-                for alias, pid in alias_map.items():
-                    items = payload.get(alias, []) if isinstance(payload, dict) else []
-                    if not isinstance(items, list):
-                        items = []
-                    if items:
-                        out[pid].extend(items)
-                    if len(items) >= 100:
-                        next_active.append(pid)
-            except Exception:
-                if disable_per_id_fb:
-                    break
-                # Degrade gracefully: isolate failing pool(s) instead of dropping entire batch.
-                for pid in list(active):
-                    try:
-                        q1, alias1 = _build_query([pid])
-                        d1 = graphql_query(
-                            endpoint,
-                            q1,
-                            {"start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
-                            retries=retries_pd,
-                        )
-                        p1 = d1.get("data", {}) if isinstance(d1, dict) else {}
-                        alias = next(iter(alias1.keys())) if alias1 else "p0"
-                        items = p1.get(alias, []) if isinstance(p1, dict) else []
-                        if not isinstance(items, list):
-                            items = []
-                        if items:
-                            out[pid].extend(items)
-                        if len(items) >= 100:
-                            next_active.append(pid)
-                    except Exception:
-                        continue
-            if not next_active:
-                break
-            active = next_active
-            skip += 100
-            _maybe_page_delay()
-        for pid in chunk:
-            rows = sorted(out.get(pid, []), key=lambda x: int(x.get("date") or 0))
-            out[pid] = rows
-            cache_key = (str(endpoint), str(pid), int(start_ts), int(end_ts))
-            with _POOL_DAY_CACHE_LOCK:
-                _POOL_DAY_CACHE[cache_key] = rows
-                _trim_cache_dict(_POOL_DAY_CACHE, _pool_day_cache_limit())
+      }
+    }
+    """
+    cache_key = (str(endpoint), str(pool_id).lower(), int(start_ts), int(end_ts))
+    with _POOL_DAY_CACHE_LOCK:
+        cached = _POOL_DAY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    all_data = []
+    skip = 0
+    while True:
+        data = graphql_query(
+            endpoint,
+            query,
+            {"pool": pool_id, "start": start_ts, "end": end_ts, "skip": skip},
+        )
+        items = data.get("data", {}).get("poolDayDatas", [])
+        if not items:
+            break
+        all_data.extend(items)
+        if len(items) < 100:
+            break
+        skip += 100
+        _maybe_page_delay()
+    out = sorted(all_data, key=lambda x: int(x["date"]))
+    with _POOL_DAY_CACHE_LOCK:
+        _POOL_DAY_CACHE[cache_key] = out
     return out
 
 
@@ -602,8 +362,8 @@ def query_token_by_symbol(endpoint: str, symbol: str) -> Optional[str]:
     if symbol.lower() == "eth":
         syms_to_try.append("WETH")
     query = """
-    query TokenBySymbol($symbol: String!, $skip: Int!) {
-      tokens(first: 100, skip: $skip, where: { symbol: $symbol }, orderBy: totalValueLockedUSD, orderDirection: desc) {
+    query TokenBySymbol($symbol: String!) {
+      tokens(first: 20, where: { symbol: $symbol }) {
         id
         symbol
         totalValueLockedUSD
@@ -613,34 +373,26 @@ def query_token_by_symbol(endpoint: str, symbol: str) -> Optional[str]:
     """
     for sym in syms_to_try:
         try:
-            best_addr: Optional[str] = None
-            best_tvl = -1.0
-            for skip in (0, 100, 200):
-                data = graphql_query(endpoint, query, {"symbol": sym, "skip": int(skip)})
-                tokens = data.get("data", {}).get("tokens", [])
-                if not tokens:
-                    break
-                for t in tokens:
-                    try:
-                        tvl = float((t or {}).get("totalValueLockedUSD") or 0.0)
-                    except (ValueError, TypeError):
-                        tvl = 0.0
-                    addr = str((t or {}).get("id") or "").lower()
-                    if not addr or addr == "0x0000000000000000000000000000000000000000":
-                        continue
-                    if tvl > best_tvl:
-                        best_tvl = tvl
-                        best_addr = addr
-                if len(tokens) < 100:
-                    break
-            if best_addr:
-                with _TOKEN_BY_SYMBOL_CACHE_LOCK:
-                    _TOKEN_BY_SYMBOL_CACHE[cache_key] = best_addr
-                    _trim_cache_dict(_TOKEN_BY_SYMBOL_CACHE, _token_cache_limit())
-                return best_addr
+            data = graphql_query(endpoint, query, {"symbol": sym})
+            tokens = data.get("data", {}).get("tokens", [])
+            if not tokens:
+                continue
+            # Pick token with highest TVL (real token, not scam copy)
+            def tvl(t):
+                try:
+                    return float(t.get("totalValueLockedUSD") or 0)
+                except (ValueError, TypeError):
+                    return 0.0
+            best = max(tokens, key=tvl)
+            addr = best["id"].lower()
+            # Reject zero address (invalid)
+            if addr == "0x0000000000000000000000000000000000000000":
+                continue
+            with _TOKEN_BY_SYMBOL_CACHE_LOCK:
+                _TOKEN_BY_SYMBOL_CACHE[cache_key] = addr
+            return addr
         except Exception:
             continue
     with _TOKEN_BY_SYMBOL_CACHE_LOCK:
         _TOKEN_BY_SYMBOL_CACHE[cache_key] = None
-        _trim_cache_dict(_TOKEN_BY_SYMBOL_CACHE, _token_cache_limit())
     return None

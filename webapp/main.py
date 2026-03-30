@@ -180,7 +180,6 @@ RUN_HISTORY_LIMIT = 10
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
-RUN_RESULT_CACHE_VER = "run_v16"
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
 SESSION_COOKIE_NAME = "uni_fee_sid"
@@ -17003,16 +17002,10 @@ def _merge_for_web(
     rows = []
     chart_series = []
     filtered_out = 0
-    filtered_fee_range = 0
-    filtered_suffix = 0
     default_visible = 0
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
-        try:
-            pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
-        except (TypeError, ValueError):
-            pool_tvl_now_usd = 0.0
         if excluded_by_suffix(v, pool_id):
             status = "filtered_suffix"
         elif in_fee_range(v):
@@ -17021,10 +17014,6 @@ def _merge_for_web(
             status = "filtered_fee_range"
         if status != "ok":
             filtered_out += 1
-            if status == "filtered_fee_range":
-                filtered_fee_range += 1
-            elif status == "filtered_suffix":
-                filtered_suffix += 1
         row = {
             "pool_id": v.get("pool_id", pool_id),
             "chain": v.get("chain", ""),
@@ -17032,7 +17021,7 @@ def _merge_for_web(
             "pair": v.get("pair", ""),
             "fee_pct": float(v.get("fee_pct") or 0),
             "final_income": _final_income(v),
-            "last_tvl": pool_tvl_now_usd if pool_tvl_now_usd > 0 else (float(tvl[-1][1]) if tvl else 0.0),
+            "last_tvl": float(tvl[-1][1]) if tvl else 0.0,
             "status": status,
         }
         rows.append(row)
@@ -17058,8 +17047,6 @@ def _merge_for_web(
         "total": len(merged),
         "chart_pools": default_visible,
         "error_pools": filtered_out,
-        "filtered_fee_range": filtered_fee_range,
-        "filtered_suffix": filtered_suffix,
         "rows": rows,
         "series": chart_series,
     }
@@ -17130,10 +17117,10 @@ def _run_output_dir(job_id: str) -> Path:
     return root
 
 
-def _agent_data_path(script_name: str, pair_suffix: str, run_output_dir: Path) -> Path:
+def _agent_data_path(script_name: str, pair_suffix: str) -> Path:
     if str(script_name) == "agent_v3.py":
-        return run_output_dir / f"pools_v3_{pair_suffix}.json"
-    return run_output_dir / f"pools_v4_{pair_suffix}.json"
+        return DATA_DIR / f"pools_v3_{pair_suffix}.json"
+    return DATA_DIR / f"pools_v4_{pair_suffix}.json"
 
 
 def _run_agent_and_load_timed(
@@ -17143,12 +17130,11 @@ def _run_agent_and_load_timed(
     min_tvl: float,
     logs: list[str],
     pair_suffix: str,
-    run_output_dir: Path,
 ) -> tuple[dict[str, dict], dict[str, Any]]:
     t0 = time.perf_counter()
     subprocess_ms = _run_subprocess(script_name, env, min_tvl, logs)
     t_load0 = time.perf_counter()
-    data = load_chart_data_json(str(_agent_data_path(script_name, pair_suffix, run_output_dir)))
+    data = load_chart_data_json(str(_agent_data_path(script_name, pair_suffix)))
     load_json_ms = int(round(max(0.0, time.perf_counter() - t_load0) * 1000.0))
     total_ms = int(round(max(0.0, time.perf_counter() - t0) * 1000.0))
     dbg = {
@@ -17168,6 +17154,7 @@ def _run_agent_and_load_timed(
 def _build_run_job_env(
     *,
     req: "PoolsRunRequest",
+    speed_mode: str,
     token_pairs: str,
     include_chains: list[str],
     run_v4: bool,
@@ -17182,27 +17169,46 @@ def _build_run_job_env(
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
     env["DISABLE_PDF_OUTPUT"] = "1"
-    env["DISABLE_DYNAMIC_TOKEN_PERSIST"] = os.environ.get("WEB_DISABLE_DYNAMIC_TOKEN_PERSIST", "1")
-    env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "2")
-    env["GRAPHQL_DISCOVERY_RETRIES"] = os.environ.get("WEB_GRAPHQL_DISCOVERY_RETRIES", "1")
-    env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL", "8")
-    env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL", "8")
-    env["GRAPHQL_READ_TIMEOUT_SEC_BASE"] = os.environ.get("WEB_GRAPHQL_READ_TIMEOUT_SEC_BASE", "20")
-    env["POOL_SERIES_WORKERS"] = os.environ.get("WEB_POOL_SERIES_WORKERS_NORMAL", "8")
-    env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get("WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL", "4")
-    env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL", "120")
-    env["POOL_DAY_BATCH_SIZE"] = os.environ.get("WEB_POOL_DAY_BATCH_SIZE_NORMAL", "12")
-    env["GRAPHQL_POOL_DAY_RETRIES"] = os.environ.get("WEB_GRAPHQL_POOL_DAY_RETRIES", "1")
-    env["GRAPHQL_POOL_DAY_DISABLE_PER_ID_FALLBACK"] = os.environ.get("WEB_GRAPHQL_POOL_DAY_DISABLE_PER_ID_FALLBACK", "1")
-    # Accuracy-first defaults: no hard trimming unless explicitly configured.
-    env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL", "0")
-    env["MAX_POOLS_TOTAL"] = os.environ.get("WEB_MAX_POOLS_TOTAL_NORMAL", "0")
-    env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get("WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL", "0")
-    env["DISABLE_V3_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V3_SYMBOL_FALLBACK_NORMAL", "1")
-    env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL", "1")
+    env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "1")
+    env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get(
+        "WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_CONNECT_TIMEOUT_SEC_NORMAL",
+        "5" if speed_mode == "fast" else "8",
+    )
+    env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get(
+        "WEB_GRAPHQL_READ_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL",
+        "8" if speed_mode == "fast" else "15",
+    )
+    env["POOL_SERIES_WORKERS"] = os.environ.get(
+        "WEB_POOL_SERIES_WORKERS_FAST" if speed_mode == "fast" else "WEB_POOL_SERIES_WORKERS_NORMAL",
+        "16" if speed_mode == "fast" else "8",
+    )
+    env["V3_DISCOVERY_CHAIN_WORKERS"] = os.environ.get(
+        "WEB_V3_DISCOVERY_CHAIN_WORKERS_FAST" if speed_mode == "fast" else "WEB_V3_DISCOVERY_CHAIN_WORKERS_NORMAL",
+        "6" if speed_mode == "fast" else "4",
+    )
+    env["MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN"] = os.environ.get(
+        "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN_NORMAL",
+        "12" if speed_mode == "fast" else "24",
+    )
+    env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get(
+        "WEB_MAX_POOLS_PER_PAIR_CHAIN_FAST" if speed_mode == "fast" else "WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL",
+        "20" if speed_mode == "fast" else "40",
+    )
+    env["MAX_POOLS_TOTAL"] = os.environ.get(
+        "WEB_MAX_POOLS_TOTAL_FAST" if speed_mode == "fast" else "WEB_MAX_POOLS_TOTAL_NORMAL",
+        "120" if speed_mode == "fast" else "240",
+    )
+    env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get(
+        "WEB_GRAPHQL_PAGE_DELAY_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL",
+        "0",
+    )
+    env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get(
+        "WEB_DISABLE_V4_SYMBOL_FALLBACK_FAST" if speed_mode == "fast" else "WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL",
+        "1" if speed_mode == "fast" else "0",
+    )
     env["V4_SKIP_CHAIN_AFTER_TIMEOUT"] = os.environ.get(
         "WEB_V4_SKIP_CHAIN_AFTER_TIMEOUT",
-        "0",
+        "1",
     )
     # v4 endpoint config uses this list at import-time.
     if run_v4 and include_chains:
@@ -17226,36 +17232,17 @@ def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs:
             timeout=timeout_sec,
         )
         if proc.stdout:
-            logs.append(proc.stdout[-20000:])
+            logs.append(proc.stdout[-4000:])
         if proc.stderr:
-            logs.append(proc.stderr[-20000:])
+            logs.append(proc.stderr[-4000:])
         if proc.returncode != 0:
-            def _tail_reason(txt: str) -> str:
-                try:
-                    lines = [str(x).strip() for x in str(txt or "").splitlines() if str(x).strip()]
-                except Exception:
-                    lines = []
-                if not lines:
-                    return ""
-                for ln in reversed(lines):
-                    l = ln.lower()
-                    if l.startswith("traceback"):
-                        continue
-                    if ln.startswith("File ") and ", line " in ln:
-                        continue
-                    return ln
-                return lines[-1]
-
-            reason = _tail_reason(proc.stderr or "") or _tail_reason(proc.stdout or "")
-            if reason:
-                raise RuntimeError(f"{script_name} failed with code {proc.returncode}: {reason}")
             raise RuntimeError(f"{script_name} failed with code {proc.returncode}")
         return int(round(max(0.0, time.perf_counter() - t0) * 1000.0))
     except subprocess.TimeoutExpired as e:
         if e.stdout:
-            logs.append(str(e.stdout)[-20000:])
+            logs.append(str(e.stdout)[-4000:])
         if e.stderr:
-            logs.append(str(e.stderr)[-20000:])
+            logs.append(str(e.stderr)[-4000:])
         raise RuntimeError(
             f"{script_name} timed out after {timeout_sec}s. "
             "Try fewer chains or smaller history window."
@@ -17271,6 +17258,7 @@ def _push_run_history(
     min_tvl: float,
     days: int,
     include_versions: list[str],
+    speed_mode: str,
     min_fee_pct: float,
     max_fee_pct: float,
     exclude_suffixes: list[str],
@@ -17286,6 +17274,7 @@ def _push_run_history(
             "min_tvl": min_tvl,
             "days": days,
             "include_versions": include_versions,
+            "speed_mode": speed_mode,
             "min_fee_pct": min_fee_pct,
             "max_fee_pct": max_fee_pct,
             "exclude_suffixes": exclude_suffixes,
@@ -17311,13 +17300,12 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
     versions = sorted(str(x).strip().lower() for x in (req.include_versions or []) if str(x).strip())
     suffixes = sorted(str(x).strip().lower() for x in (req.exclude_suffixes or []) if str(x).strip())
     payload = {
-        "cache_ver": RUN_RESULT_CACHE_VER,
         "pairs": pairs,
         "chains": chains,
         "versions": versions,
         "days": int(req.days or 0),
         "min_tvl": float(req.min_tvl or 0.0),
-        "lp_allocation_usd": float(os.environ.get("LP_ALLOCATION_USD", "1000") or 1000),
+        "speed_mode": str(req.speed_mode or "normal").strip().lower(),
         "min_fee_pct": float(req.min_fee_pct or 0.0),
         "max_fee_pct": float(req.max_fee_pct or 0.0),
         "exclude_suffixes": suffixes,
@@ -17482,12 +17470,16 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     }
 
     t_prepare0 = time.perf_counter()
+    speed_mode = str(req.speed_mode or "normal").strip().lower()
+    if speed_mode not in {"normal", "fast"}:
+        speed_mode = "normal"
+
     with JOB_LOCK:
         job = JOBS[job_id]
         job["status"] = "running"
         job["started_at"] = time.time()
         job["stage"] = "prepare"
-        job["stage_label"] = "Preparing parameters (full)"
+        job["stage_label"] = f"Preparing parameters ({speed_mode})"
         job["progress"] = 5
 
     # Build up to 4 selected token pairs.
@@ -17516,137 +17508,98 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     logs: list[str] = []
     env = _build_run_job_env(
         req=req,
+        speed_mode=speed_mode,
         token_pairs=token_pairs,
         include_chains=include_chains,
         run_v4=run_v4,
     )
-    run_output_dir = _run_output_dir(job_id)
-    env["RUN_OUTPUT_DIR"] = str(run_output_dir)
     timing_debug["stage_ms"]["build_env"] = int(round(max(0.0, time.perf_counter() - t_env0) * 1000.0))
     timing_debug["stage_ms"]["prepare"] = int(round(max(0.0, time.perf_counter() - t_prepare0) * 1000.0))
 
     try:
         merged_raw: dict[str, dict] = {}
-        timing_debug["stage_ms"]["run_lock_wait"] = 0
-        t_agents_total0 = time.perf_counter()
-        total_pairs = max(1, len(pairs))
-        def _run_one_pair(idx: int, a: str, b: str) -> tuple[int, dict[str, Any], dict[str, dict], list[str]]:
-            t_pair0 = time.perf_counter()
-            pair_str = f"{a},{b}"
-            pair_suffix = pairs_to_filename_suffix(pair_str)
-            pair_logs: list[str] = []
-            pair_env = dict(env)
-            pair_env["TOKEN_PAIRS"] = pair_str
-            pair_out_dir = run_output_dir / f"pair_{idx}"
-            pair_out_dir.mkdir(parents=True, exist_ok=True)
-            pair_env["RUN_OUTPUT_DIR"] = str(pair_out_dir)
-            pair_dbg: dict[str, Any] = {
-                "pair": pair_str,
-                "index": int(idx),
-                "agents": [],
-                "merged_before": 0,
-            }
-            pair_data: dict[str, dict] = {}
-            if run_v3 and run_v4:
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    f_v3 = ex.submit(
-                        _run_agent_and_load_timed,
-                        script_name="agent_v3.py",
-                        env=dict(pair_env),
-                        min_tvl=req.min_tvl,
-                        logs=pair_logs,
-                        pair_suffix=pair_suffix,
-                        run_output_dir=pair_out_dir,
-                    )
-                    f_v4 = ex.submit(
-                        _run_agent_and_load_timed,
-                        script_name="agent_v4.py",
-                        env=dict(pair_env),
-                        min_tvl=req.min_tvl,
-                        logs=pair_logs,
-                        pair_suffix=pair_suffix,
-                        run_output_dir=pair_out_dir,
-                    )
-                    data_v3, dbg_v3 = f_v3.result()
-                    data_v4, dbg_v4 = f_v4.result()
-                    pair_dbg["agents"].append(dbg_v3)
-                    pair_dbg["agents"].append(dbg_v4)
-                    pair_data.update(data_v3)
-                    pair_data.update(data_v4)
-            else:
-                if run_v3:
-                    data_v3, dbg_v3 = _run_agent_and_load_timed(
-                        script_name="agent_v3.py",
-                        env=pair_env,
-                        min_tvl=req.min_tvl,
-                        logs=pair_logs,
-                        pair_suffix=pair_suffix,
-                        run_output_dir=pair_out_dir,
-                    )
-                    pair_dbg["agents"].append(dbg_v3)
-                    pair_data.update(data_v3)
-                if run_v4:
-                    data_v4, dbg_v4 = _run_agent_and_load_timed(
-                        script_name="agent_v4.py",
-                        env=pair_env,
-                        min_tvl=req.min_tvl,
-                        logs=pair_logs,
-                        pair_suffix=pair_suffix,
-                        run_output_dir=pair_out_dir,
-                    )
-                    pair_dbg["agents"].append(dbg_v4)
-                    pair_data.update(data_v4)
-            pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
-            return idx, pair_dbg, pair_data, pair_logs
+        t_lock_wait0 = time.perf_counter()
+        with RUN_LOCK:
+            timing_debug["stage_ms"]["run_lock_wait"] = int(round(max(0.0, time.perf_counter() - t_lock_wait0) * 1000.0))
+            t_agents_total0 = time.perf_counter()
+            total_pairs = max(1, len(pairs))
+            for idx, (a, b) in enumerate(pairs, start=1):
+                t_pair0 = time.perf_counter()
+                pair_str = f"{a},{b}"
+                pair_suffix = pairs_to_filename_suffix(pair_str)
+                env["TOKEN_PAIRS"] = pair_str
+                pair_dbg: dict[str, Any] = {
+                    "pair": pair_str,
+                    "index": int(idx),
+                    "agents": [],
+                    "merged_before": int(len(merged_raw)),
+                }
 
-        pair_results: list[tuple[int, dict[str, Any], dict[str, dict], list[str]]] = []
-        pair_workers = max(1, min(int(total_pairs), int(os.environ.get("WEB_PAIR_WORKERS", "2"))))
-        _set_stage("pairs", f"Running pairs ({total_pairs})", 12)
-        if total_pairs <= 1 or pair_workers <= 1:
-            idx, (a, b) = 1, pairs[0]
-            pair_results.append(_run_one_pair(idx, a, b))
-            _set_stage("pairs", "Running pairs (1/1)", 78)
-        else:
-            completed = 0
-            with ThreadPoolExecutor(max_workers=pair_workers) as ex:
-                futs = [ex.submit(_run_one_pair, i, a, b) for i, (a, b) in enumerate(pairs, start=1)]
-                for fut in as_completed(futs):
-                    pair_results.append(fut.result())
-                    completed += 1
-                    _set_stage("pairs", f"Running pairs ({completed}/{total_pairs})", min(78, 10 + int((completed / total_pairs) * 68)))
+                base_progress = int(10 + (idx - 1) * (65 / total_pairs))
+                if run_v3 and run_v4:
+                    _set_stage("v3v4", f"Running v3+v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 18))
 
-        for _, pair_dbg, pair_data, pair_logs in sorted(pair_results, key=lambda x: int(x[0])):
-            pair_dbg["merged_before"] = int(len(merged_raw))
-            merged_raw.update(pair_data)
-            pair_dbg["merged_after"] = int(len(merged_raw))
-            pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
-            timing_debug["pairs"].append(pair_dbg)
-            logs.extend(pair_logs)
-        timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        f_v3 = ex.submit(
+                            _run_agent_and_load_timed,
+                            script_name="agent_v3.py",
+                            env=dict(env),
+                            min_tvl=req.min_tvl,
+                            logs=logs,
+                            pair_suffix=pair_suffix,
+                        )
+                        f_v4 = ex.submit(
+                            _run_agent_and_load_timed,
+                            script_name="agent_v4.py",
+                            env=dict(env),
+                            min_tvl=req.min_tvl,
+                            logs=logs,
+                            pair_suffix=pair_suffix,
+                        )
+                        data_v3, dbg_v3 = f_v3.result()
+                        data_v4, dbg_v4 = f_v4.result()
+                        pair_dbg["agents"].append(dbg_v3)
+                        pair_dbg["agents"].append(dbg_v4)
+                        merged_raw.update(data_v3)
+                        merged_raw.update(data_v4)
+                else:
+                    if run_v3:
+                        _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
+                        data_v3, dbg_v3 = _run_agent_and_load_timed(
+                                script_name="agent_v3.py",
+                                env=env,
+                                min_tvl=req.min_tvl,
+                                logs=logs,
+                                pair_suffix=pair_suffix,
+                            )
+                        pair_dbg["agents"].append(dbg_v3)
+                        merged_raw.update(data_v3)
+                    if run_v4:
+                        _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
+                        data_v4, dbg_v4 = _run_agent_and_load_timed(
+                                script_name="agent_v4.py",
+                                env=env,
+                                min_tvl=req.min_tvl,
+                                logs=logs,
+                                pair_suffix=pair_suffix,
+                            )
+                        pair_dbg["agents"].append(dbg_v4)
+                        merged_raw.update(data_v4)
+                pair_dbg["merged_after"] = int(len(merged_raw))
+                pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
+                pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
+                timing_debug["pairs"].append(pair_dbg)
+            timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
 
         # Keep only pools that really match requested pairs.
         # Protects against occasional cross-token resolution artifacts (e.g. POL instead of ETH).
         t_filter0 = time.perf_counter()
         if requested_pair_keys:
-            filtered_raw: dict[str, dict] = {}
-            unresolved_pair_count = 0
-            dropped_pair_mismatch = 0
-            for k, v in merged_raw.items():
-                pair_key = _pair_label_key(str(v.get("pair") or ""))
-                if pair_key is None:
-                    # Keep unresolved pair labels to avoid silent pool loss.
-                    unresolved_pair_count += 1
-                    filtered_raw[k] = v
-                    continue
-                if pair_key in requested_pair_keys:
-                    filtered_raw[k] = v
-                else:
-                    dropped_pair_mismatch += 1
-            merged_raw = filtered_raw
-            if unresolved_pair_count > 0:
-                logs.append(f"[warn] pair_filter_unresolved_labels={int(unresolved_pair_count)} (kept)")
-            if dropped_pair_mismatch > 0:
-                logs.append(f"[warn] pair_filter_mismatch_dropped={int(dropped_pair_mismatch)}")
+            merged_raw = {
+                k: v
+                for k, v in merged_raw.items()
+                if (_pair_label_key(str(v.get("pair") or "")) in requested_pair_keys)
+            }
         timing_debug["stage_ms"]["pair_filter"] = int(round(max(0.0, time.perf_counter() - t_filter0) * 1000.0))
 
         _set_stage("merge", "Merging results for web", 85)
@@ -17677,10 +17630,6 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         if isinstance(stage_ms, dict):
             slow_stage = max(stage_ms.items(), key=lambda kv: int(kv[1] or 0)) if stage_ms else ("", 0)
             logs.append(f"[timing] slowest_stage={str(slow_stage[0])} {int(slow_stage[1] or 0)}ms")
-        incomplete_discovery = _logs_indicate_incomplete_discovery(logs)
-        price_drop_stats = _extract_price_drop_stats(logs)
-        if incomplete_discovery:
-            logs.append("[cache] skipped: incomplete_discovery")
         result_payload = _json_safe({
             "request": {
                 "pairs": token_pairs,
@@ -17688,6 +17637,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 "min_tvl": req.min_tvl,
                 "include_chains": include_chains,
                 "include_versions": include_versions,
+                "speed_mode": speed_mode,
                 "min_fee_pct": req.min_fee_pct,
                 "max_fee_pct": req.max_fee_pct,
                 "exclude_suffixes": req.exclude_suffixes,
@@ -17698,26 +17648,13 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             "debug_timing": timing_debug,
             "logs": logs[-8:],
         })
-        try:
-            result_payload["result_flags"] = dict(result_payload.get("result_flags") or {})
-            dropped_map = dict(price_drop_stats.get("dropped_no_reserves_by_chain") or {})
-            if dropped_map:
-                result_payload["result_flags"]["dropped_no_reserves_by_chain"] = dropped_map
-        except Exception:
-            pass
-        if incomplete_discovery:
-            try:
-                result_payload["result_flags"] = dict(result_payload.get("result_flags") or {})
-                result_payload["result_flags"]["incomplete_discovery"] = True
-            except Exception:
-                pass
         with JOB_LOCK:
             job["status"] = "done"
             job["stage"] = "done"
             job["stage_label"] = "Completed"
             job["progress"] = 100
             job["result"] = result_payload
-        if (not bool(getattr(req, "ignore_cache", False))) and (not incomplete_discovery):
+        if not bool(getattr(req, "ignore_cache", False)):
             _run_result_cache_put(_pool_run_cache_key(req), result_payload)
         _push_run_history(
             session_id=session_id,
@@ -17727,6 +17664,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             min_tvl=req.min_tvl,
             days=req.days,
             include_versions=include_versions,
+            speed_mode=speed_mode,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
@@ -17749,6 +17687,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             min_tvl=req.min_tvl,
             days=req.days,
             include_versions=include_versions,
+            speed_mode=speed_mode,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             exclude_suffixes=req.exclude_suffixes,
@@ -17756,10 +17695,6 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             error=str(e),
         )
     finally:
-        try:
-            shutil.rmtree(run_output_dir, ignore_errors=True)
-        except Exception:
-            pass
         with JOB_LOCK:
             job["finished_at"] = time.time()
 

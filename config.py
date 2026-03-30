@@ -150,7 +150,7 @@ UNISWAP_V4_SUBGRAPHS = {
     "polygon": "CwpebM66AH5uqS5sreKij8yEkkPcHvmyEs7EwFtdM5ND",
 }
 
-# Сети для v4 по умолчанию
+# Сети для v4 (base исключён — bad indexers)
 def _normalize_v4_chain_slug(raw: str) -> str:
     s = (raw or "").strip()
     if s == "arbitrum-one":
@@ -158,7 +158,7 @@ def _normalize_v4_chain_slug(raw: str) -> str:
     return s
 
 
-_V4_CHAINS_RAW = [c.strip() for c in os.environ.get("V4_CHAINS", "ethereum,arbitrum,base,unichain,polygon").split(",") if c.strip()]
+_V4_CHAINS_RAW = [c.strip() for c in os.environ.get("V4_CHAINS", "ethereum,arbitrum,unichain,polygon").split(",") if c.strip()]
 V4_CHAINS = [_normalize_v4_chain_slug(c) for c in _V4_CHAINS_RAW]
 
 # Goldsky public endpoints (no API key, rate limited) - alternative to The Graph
