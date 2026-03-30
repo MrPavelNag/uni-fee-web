@@ -134,6 +134,7 @@ def _on_shutdown() -> None:
 # Simple in-memory job storage (MVP)
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCK = threading.Lock()
+RUN_LOCK = threading.Lock()
 INDEXER_LOCK = threading.Lock()
 INDEXER_ACTIVITY_LOCK = threading.Lock()
 INDEXER_ACTIVITY: dict[str, Any] = {
