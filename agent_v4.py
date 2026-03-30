@@ -279,7 +279,7 @@ def query_pool_day_data(endpoint: str, pool_id: str, start_ts: int, end_ts: int)
 
 
 def compute_fee_series(pool: dict, endpoint: str) -> dict:
-    """Серии fees и tvl для графика."""
+    """Load day-level fees; TVL/income are rebuilt from external TVL later."""
     end = datetime.utcnow()
     start = end - timedelta(days=FEE_DAYS)
     # v4 subgraph: пробуем Unix timestamps (как v3)
@@ -287,8 +287,8 @@ def compute_fee_series(pool: dict, endpoint: str) -> dict:
     end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
     rows = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
-    fee_series, tvl_series = [], []
     fees_usd_series = []
+    raw_tvl_series = []
     for r in rows:
         fees = float(r.get("feesUSD") or 0)
         if fees <= 0:
@@ -296,11 +296,13 @@ def compute_fee_series(pool: dict, endpoint: str) -> dict:
         # date может быть Unix или day index — для оси времени нужен Unix
         d = int(r["date"])
         ts = d if d > 1e9 else d * 86400
-        # TVL/income are rebuilt from external TVL in _process_pool.
-        fee_series.append((ts, 0.0))
-        tvl_series.append((ts, 0.0))
         fees_usd_series.append((ts, fees))
-    return {"fees": fee_series, "tvl": tvl_series, "_fees_usd": fees_usd_series}
+        try:
+            raw_tvl = float(r.get("tvlUSD") or 0.0)
+        except Exception:
+            raw_tvl = 0.0
+        raw_tvl_series.append((ts, max(0.0, raw_tvl)))
+    return {"_fees_usd": fees_usd_series, "_raw_tvl_usd": raw_tvl_series}
 
 
 def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
@@ -466,20 +468,44 @@ def main() -> None:
                 return idx, None, None, msg
             pool["tvl_price_source"] = str(price_source or "external")
         # Build TVL and profitability strictly from external TVL (no subgraph TVL dependency).
+        series["fees"] = []
+        series["tvl"] = []
         try:
             fees_usd = series.get("_fees_usd") or []
+            raw_tvl = series.get("_raw_tvl_usd") or []
             if fees_usd and pool_tvl_now_usd > 0:
-                series["tvl"] = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                tvl_series = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                if raw_tvl and len(raw_tvl) == len(fees_usd):
+                    anchor = 0.0
+                    for _, rv in reversed(raw_tvl):
+                        rvf = float(rv or 0.0)
+                        if rvf > 0:
+                            anchor = rvf
+                            break
+                    if anchor > 0:
+                        shaped: list[tuple[int, float]] = []
+                        for i, (ts, _) in enumerate(fees_usd):
+                            rv = float(raw_tvl[i][1] or 0.0)
+                            if rv > 0:
+                                day_tvl = float(pool_tvl_now_usd) * (rv / anchor)
+                                day_tvl = max(float(pool_tvl_now_usd) * 0.2, min(float(pool_tvl_now_usd) * 5.0, day_tvl))
+                            else:
+                                day_tvl = float(pool_tvl_now_usd)
+                            shaped.append((int(ts), float(day_tvl)))
+                        tvl_series = shaped
+                series["tvl"] = tvl_series
                 cumul = 0.0
                 fees_rebuilt = []
-                for ts, fees_day in fees_usd:
+                for i, (ts, fees_day) in enumerate(fees_usd):
+                    tvl_day = float(series["tvl"][i][1] or 0.0) if i < len(series["tvl"]) else float(pool_tvl_now_usd)
                     if float(fees_day) > 0:
-                        cumul += float(fees_day) * (LP_ALLOCATION_USD / float(pool_tvl_now_usd))
+                        cumul += float(fees_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day))
                     fees_rebuilt.append((ts, cumul))
                 series["fees"] = fees_rebuilt
         except Exception:
             pass
         series.pop("_fees_usd", None)
+        series.pop("_raw_tvl_usd", None)
         try:
             raw_pool_tvl = float(pool.get("totalValueLockedUSD") or 0.0)
         except Exception:

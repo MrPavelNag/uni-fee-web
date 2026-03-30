@@ -24,6 +24,13 @@ from config import (
     UNISWAP_V3_SUBGRAPHS,
     UNISWAP_V4_SUBGRAPHS,
 )
+from agent_common import estimate_pool_tvl_usd_external_with_meta, get_token_addresses
+from uniswap_client import (
+    get_graph_endpoint,
+    query_pool_day_data,
+    query_pools_containing_both_tokens,
+    query_token_by_symbol,
+)
 
 
 def _min_tvl(cli_value: Optional[float] = None) -> float:
@@ -37,13 +44,6 @@ def _min_tvl(cli_value: Optional[float] = None) -> float:
         except ValueError:
             pass
     return MIN_TVL_USD
-from agent_common import estimate_pool_tvl_usd_external_with_meta, get_token_addresses
-from uniswap_client import (
-    get_graph_endpoint,
-    query_pool_day_data,
-    query_pools_containing_both_tokens,
-    query_token_by_symbol,
-)
 
 DYNAMIC_TOKENS_PATH = "data/dynamic_tokens.json"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -173,7 +173,7 @@ def discover_pools(
                     print(f"  [{chain}] {version} {base}/{quote}: {e}")
                     pools = []
                 for p in pools:
-                    ext_tvl, src, err = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                    ext_tvl, src, _ = estimate_pool_tvl_usd_external_with_meta(p, chain)
                     if float(ext_tvl) <= 0:
                         continue
                     if float(ext_tvl) < float(min_tvl_val):
@@ -198,9 +198,8 @@ def discover_pools(
 
 def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
     """
-    Get daily fees for $10k allocation and TVL over 6 months.
-    When feesUSD is 0, derive from volumeUSD * (feeTier/1e6) — some subgraphs don't populate feesUSD.
-    Returns {"fees": [(ts, cumul_fee), ...], "tvl": [(ts, tvl_usd), ...]}.
+    Get daily fees series over configured period.
+    TVL and cumulative income are rebuilt later from external TVL.
     """
     end = datetime.utcnow()
     start = end - timedelta(days=FEE_DAYS)
@@ -208,18 +207,20 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
     end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
     day_data = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
-    fee_series = []
-    tvl_series = []
     fees_usd_series = []
+    raw_tvl_series = []
     for d in day_data:
         fees = float(d.get("feesUSD") or 0)
         if fees <= 0:
             fees = 0.0
         ts = int(d["date"])
-        fee_series.append((ts, 0.0))
-        tvl_series.append((ts, 0.0))
         fees_usd_series.append((ts, fees))
-    return {"fees": fee_series, "tvl": tvl_series, "_fees_usd": fees_usd_series}
+        try:
+            raw_tvl = float(d.get("tvlUSD") or 0.0)
+        except Exception:
+            raw_tvl = 0.0
+        raw_tvl_series.append((ts, max(0.0, raw_tvl)))
+    return {"_fees_usd": fees_usd_series, "_raw_tvl_usd": raw_tvl_series}
 
 
 def save_pdf(pools: list[dict], path: str) -> None:
@@ -377,19 +378,43 @@ def main() -> None:
         if endpoint:
             try:
                 data = compute_fee_and_tvl_series(p, endpoint)
-                pool_tvl_now_usd, src, err = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                pool_tvl_now_usd, _, _ = estimate_pool_tvl_usd_external_with_meta(p, chain)
                 if float(pool_tvl_now_usd) <= 0:
                     continue
                 fees_usd = data.get("_fees_usd") or []
-                data["tvl"] = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                raw_tvl = data.get("_raw_tvl_usd") or []
+                data["fees"] = []
+                data["tvl"] = []
+                tvl_series = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                if raw_tvl and len(raw_tvl) == len(fees_usd):
+                    anchor = 0.0
+                    for _, rv in reversed(raw_tvl):
+                        rvf = float(rv or 0.0)
+                        if rvf > 0:
+                            anchor = rvf
+                            break
+                    if anchor > 0:
+                        shaped: list[tuple[int, float]] = []
+                        for i, (ts, _) in enumerate(fees_usd):
+                            rv = float(raw_tvl[i][1] or 0.0)
+                            if rv > 0:
+                                day_tvl = float(pool_tvl_now_usd) * (rv / anchor)
+                                day_tvl = max(float(pool_tvl_now_usd) * 0.2, min(float(pool_tvl_now_usd) * 5.0, day_tvl))
+                            else:
+                                day_tvl = float(pool_tvl_now_usd)
+                            shaped.append((int(ts), float(day_tvl)))
+                        tvl_series = shaped
+                data["tvl"] = tvl_series
                 cumul = 0.0
                 rebuilt = []
-                for ts, fees_day in fees_usd:
+                for i, (ts, fees_day) in enumerate(fees_usd):
+                    tvl_day = float(data["tvl"][i][1] or 0.0) if i < len(data["tvl"]) else float(pool_tvl_now_usd)
                     if float(fees_day) > 0:
-                        cumul += float(fees_day) * (LP_ALLOCATION_USD / float(pool_tvl_now_usd))
+                        cumul += float(fees_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day))
                     rebuilt.append((int(ts), cumul))
                 data["fees"] = rebuilt
                 data.pop("_fees_usd", None)
+                data.pop("_raw_tvl_usd", None)
                 pool_chart_data[key] = {
                     **data,
                     "pool_id": pool_id,
