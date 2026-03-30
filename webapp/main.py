@@ -17208,7 +17208,7 @@ def _build_run_job_env(
     env["MAX_POOLS_PER_PAIR_CHAIN"] = os.environ.get("WEB_MAX_POOLS_PER_PAIR_CHAIN_NORMAL", "0")
     env["MAX_POOLS_TOTAL"] = os.environ.get("WEB_MAX_POOLS_TOTAL_NORMAL", "0")
     env["GRAPHQL_PAGE_DELAY_SEC"] = os.environ.get("WEB_GRAPHQL_PAGE_DELAY_SEC_NORMAL", "0")
-    env["STRICT_DISCOVERY_ERRORS"] = os.environ.get("WEB_STRICT_DISCOVERY_ERRORS", "1")
+    env["STRICT_DISCOVERY_ERRORS"] = os.environ.get("WEB_STRICT_DISCOVERY_ERRORS", "0")
     env["DISABLE_V3_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V3_SYMBOL_FALLBACK_NORMAL", "1")
     env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get("WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL", "1")
     env["V4_SKIP_CHAIN_AFTER_TIMEOUT"] = os.environ.get(
