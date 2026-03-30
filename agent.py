@@ -37,7 +37,7 @@ def _min_tvl(cli_value: Optional[float] = None) -> float:
         except ValueError:
             pass
     return MIN_TVL_USD
-from agent_common import get_token_addresses
+from agent_common import estimate_pool_tvl_usd_external_with_meta, get_token_addresses
 from uniswap_client import (
     get_graph_endpoint,
     query_pool_day_data,
@@ -167,12 +167,19 @@ def discover_pools(
                 min_tvl_val = _min_tvl(min_tvl)
                 try:
                     pools = query_pools_containing_both_tokens(
-                        endpoint, base_addrs[0], quote_addrs[0], min_tvl_val
+                        endpoint, base_addrs[0], quote_addrs[0], 0.0
                     )
                 except Exception as e:
                     print(f"  [{chain}] {version} {base}/{quote}: {e}")
                     pools = []
                 for p in pools:
+                    ext_tvl, src, err = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                    if float(ext_tvl) <= 0:
+                        continue
+                    if float(ext_tvl) < float(min_tvl_val):
+                        continue
+                    p["effectiveTvlUSD"] = float(ext_tvl)
+                    p["tvl_price_source"] = str(src or "external")
                     p["chain"] = chain
                     p["version"] = version
                     p["pair_label"] = f"{base}/{quote}"
@@ -201,21 +208,18 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
     end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
     day_data = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
-    fee_tier = int(pool.get("feeTier") or 3000)  # 3000 = 0.3%, 10000 = 1%
     fee_series = []
     tvl_series = []
-    cumul = 0.0
+    fees_usd_series = []
     for d in day_data:
-        tvl = float(d.get("tvlUSD") or 0)
         fees = float(d.get("feesUSD") or 0)
         if fees <= 0:
             fees = 0.0
-        if tvl > 0 and fees > 0:
-            cumul += fees * (LP_ALLOCATION_USD / tvl)
         ts = int(d["date"])
-        fee_series.append((ts, cumul))
-        tvl_series.append((ts, tvl))
-    return {"fees": fee_series, "tvl": tvl_series}
+        fee_series.append((ts, 0.0))
+        tvl_series.append((ts, 0.0))
+        fees_usd_series.append((ts, fees))
+    return {"fees": fee_series, "tvl": tvl_series, "_fees_usd": fees_usd_series}
 
 
 def save_pdf(pools: list[dict], path: str) -> None:
@@ -242,7 +246,7 @@ def save_pdf(pools: list[dict], path: str) -> None:
             fee_bps = int(p.get("feeTier") or 0)
             # feeTier: 500=0.05%, 3000=0.3%, 10000=1% (value/10000 = %)
             fee_pct = fee_bps / 10000 if fee_bps else 0
-            tvl = float(p.get("totalValueLockedUSD") or 0)
+            tvl = float(p.get("effectiveTvlUSD") or p.get("pool_tvl_now_usd") or p.get("totalValueLockedUSD") or 0)
             vol = float(p.get("volumeUSD") or 0)
             data.append([
                 p.get("chain", ""),
@@ -373,10 +377,24 @@ def main() -> None:
         if endpoint:
             try:
                 data = compute_fee_and_tvl_series(p, endpoint)
+                pool_tvl_now_usd, src, err = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                if float(pool_tvl_now_usd) <= 0:
+                    continue
+                fees_usd = data.get("_fees_usd") or []
+                data["tvl"] = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                cumul = 0.0
+                rebuilt = []
+                for ts, fees_day in fees_usd:
+                    if float(fees_day) > 0:
+                        cumul += float(fees_day) * (LP_ALLOCATION_USD / float(pool_tvl_now_usd))
+                    rebuilt.append((int(ts), cumul))
+                data["fees"] = rebuilt
+                data.pop("_fees_usd", None)
                 pool_chart_data[key] = {
                     **data,
                     "pool_id": pool_id,
                     "fee_pct": fee_pct,
+                    "pool_tvl_now_usd": float(pool_tvl_now_usd),
                     "pair": pair,
                     "chain": chain,
                     "version": p.get("version", "v3"),

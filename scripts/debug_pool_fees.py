@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import FEE_DAYS, LP_ALLOCATION_USD
+from config import FEE_DAYS
 from uniswap_client import get_graph_endpoint, graphql_query
 
 # v3 pool Arbitrum FLUID/ETH
@@ -78,23 +78,19 @@ def main():
     print("-" * 60)
 
     total_vol = total_fees = 0.0
-    cumul_proj = 0.0
     for r in rows:
-        tvl = float(r.get("tvlUSD") or 0)
         vol = float(r.get("volumeUSD") or 0)
         fees = float(r.get("feesUSD") or 0)
         total_vol += vol
         total_fees += fees
-        if tvl > 0 and fees > 0:
-            day_proj = fees * (LP_ALLOCATION_USD / tvl)
-            cumul_proj += day_proj
         dt = datetime.utcfromtimestamp(int(r["date"]) * 86400).strftime("%Y-%m-%d")
+        tvl = float(r.get("tvlUSD") or 0)
         print(f"  {dt}  vol=${vol:,.0f}  fees=${fees:,.2f}  tvl=${tvl:,.0f}")
 
     print("-" * 60)
     print(f"Итого за {FEE_DAYS} дней: volume=${total_vol:,.0f}  fees=${total_fees:,.2f}")
     print(f"Ожидаемо: fees ≈ volume × 0.003 = ${total_vol * 0.003:,.2f}")
-    print(f"Проекция LP $10k: ${cumul_proj:,.2f}")
+    print("Проекция LP $10k: disabled in this debug script (subgraph TVL denominator removed)")
     if total_vol > 0 and total_fees > total_vol * 0.01:
         print("⚠ Возможная ошибка: fees >> volume×1% — данные subgraph под вопросом")
 

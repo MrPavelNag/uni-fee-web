@@ -50,7 +50,7 @@ def save_pdf(pools: list[dict], path: str) -> None:
             t0 = (p.get("token0") or {}).get("symbol", "?")
             t1 = (p.get("token1") or {}).get("symbol", "?")
             fee_pct = _normalize_fee_pct(int(p.get("feeTier") or 0), "v4")
-            tvl = float(p.get("totalValueLockedUSD") or 0)
+            tvl = float(p.get("effectiveTvlUSD") or p.get("pool_tvl_now_usd") or p.get("totalValueLockedUSD") or 0)
             vol = float(p.get("volumeUSD") or 0)
             pid = p.get("id", "")
             data.append(
@@ -100,7 +100,7 @@ def _maybe_page_delay() -> None:
 
 def _pool_tvl_usd(pool: dict) -> float:
     try:
-        return float(pool.get("totalValueLockedUSD") or 0)
+        return float(pool.get("effectiveTvlUSD") or pool.get("pool_tvl_now_usd") or pool.get("totalValueLockedUSD") or 0)
     except Exception:
         return 0.0
 
@@ -287,22 +287,20 @@ def compute_fee_series(pool: dict, endpoint: str) -> dict:
     end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
     rows = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
-    fee_tier = int(pool.get("feeTier") or 3000)
     fee_series, tvl_series = [], []
-    cumul = 0.0
+    fees_usd_series = []
     for r in rows:
-        tvl = float(r.get("tvlUSD") or 0)
         fees = float(r.get("feesUSD") or 0)
         if fees <= 0:
             fees = 0.0
-        if tvl > 0 and fees > 0:
-            cumul += fees * (LP_ALLOCATION_USD / tvl)
         # date может быть Unix или day index — для оси времени нужен Unix
         d = int(r["date"])
         ts = d if d > 1e9 else d * 86400
-        fee_series.append((ts, cumul))
-        tvl_series.append((ts, tvl))
-    return {"fees": fee_series, "tvl": tvl_series}
+        # TVL/income are rebuilt from external TVL in _process_pool.
+        fee_series.append((ts, 0.0))
+        tvl_series.append((ts, 0.0))
+        fees_usd_series.append((ts, fees))
+    return {"fees": fee_series, "tvl": tvl_series, "_fees_usd": fees_usd_series}
 
 
 def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
@@ -467,20 +465,21 @@ def main() -> None:
                 )
                 return idx, None, None, msg
             pool["tvl_price_source"] = str(price_source or "external")
-        raw_last_tvl = 0.0
-        if series.get("tvl"):
-            try:
-                raw_last_tvl = float((series.get("tvl") or [])[-1][1] or 0.0)
-            except Exception:
-                raw_last_tvl = 0.0
-        tvl_multiplier = 1.0
-        if raw_last_tvl > 0 and pool_tvl_now_usd > 0:
-            tvl_multiplier = max(0.05, min(20.0, float(pool_tvl_now_usd) / float(raw_last_tvl)))
-            if abs(tvl_multiplier - 1.0) > 1e-9:
-                try:
-                    series["tvl"] = [(int(ts), float(val) * float(tvl_multiplier)) for ts, val in (series.get("tvl") or [])]
-                except Exception:
-                    pass
+        # Build TVL and profitability strictly from external TVL (no subgraph TVL dependency).
+        try:
+            fees_usd = series.get("_fees_usd") or []
+            if fees_usd and pool_tvl_now_usd > 0:
+                series["tvl"] = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                cumul = 0.0
+                fees_rebuilt = []
+                for ts, fees_day in fees_usd:
+                    if float(fees_day) > 0:
+                        cumul += float(fees_day) * (LP_ALLOCATION_USD / float(pool_tvl_now_usd))
+                    fees_rebuilt.append((ts, cumul))
+                series["fees"] = fees_rebuilt
+        except Exception:
+            pass
+        series.pop("_fees_usd", None)
         try:
             raw_pool_tvl = float(pool.get("totalValueLockedUSD") or 0.0)
         except Exception:
@@ -492,7 +491,7 @@ def main() -> None:
             "raw_fee_tier": raw_fee_tier,
             "pool_tvl_now_usd": pool_tvl_now_usd,
             "pool_tvl_subgraph_usd": raw_pool_tvl,
-            "tvl_multiplier": float(tvl_multiplier),
+            "tvl_multiplier": 1.0,
             "tvl_price_source": str(pool.get("tvl_price_source") or ""),
             "pair": pair_label,
             "chain": chain,
