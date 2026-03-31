@@ -29145,7 +29145,7 @@ HTML_PAGE = """
                 </div>
                 <div class="chains-side">
                   <span class="meta-badge chains-meta-badge" id="chainsMeta">chains: -</span>
-                  <div class="hint" id="chainsNote" style="margin-top:6px">* base V4 не работает</div>
+                  <div class="hint" id="chainsNote" style="margin-top:6px">* Base on V4 is currently unavailable due to upstream indexer instability.</div>
                 </div>
               </div>
             </div>
