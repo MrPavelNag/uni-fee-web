@@ -10,6 +10,7 @@ import argparse
 import os
 import time
 import requests
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -155,6 +156,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
 def _is_timeout_error(err: Exception) -> bool:
     msg = str(err or "").lower()
     return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
+
+
+def _endpoint_host(endpoint: str) -> str:
+    try:
+        return str(urlparse(str(endpoint or "")).netloc or "")
+    except Exception:
+        return ""
 
 
 def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
@@ -357,23 +365,47 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
     discovery_cap = max(0, _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN", 0))
     native_eth_chains = _native_eth_query_chains()
     timeout_chains: set[str] = set()
+
     def _scan_chain(chain: str, endpoint: str) -> None:
+        chain_t0 = time.perf_counter()
         if chain in timeout_chains:
             print(f"  [{chain}] skip: timeout blacklist")
             return
         if not endpoint:
             print(f"  [{chain}] skip: no endpoint")
             return
-        if _v4_endpoint_healthcheck_enabled() and not _quick_graphql_healthcheck(endpoint):
+        endpoint_host = _endpoint_host(endpoint)
+        if chain == "base":
+            print(
+                f"  [base][debug] endpoint_host={endpoint_host or '-'} "
+                f"skip_chain_after_timeout={int(bool(skip_chain_after_timeout))} "
+                f"symbol_fallback={int(not disable_symbol_fallback)}"
+            )
+        healthcheck_enabled = _v4_endpoint_healthcheck_enabled()
+        health_ok = True
+        if healthcheck_enabled:
+            health_ok = _quick_graphql_healthcheck(endpoint)
+        if chain == "base":
+            print(
+                f"  [base][debug] endpoint_healthcheck enabled={int(bool(healthcheck_enabled))} "
+                f"ok={int(bool(health_ok))}"
+            )
+        if healthcheck_enabled and not health_ok:
             print(f"  [{chain}] skip: endpoint healthcheck failed")
             return
         chain_abort = False
         for base, quote in pairs:
+            pair_t0 = time.perf_counter()
             if chain_abort:
                 break
             addr_a = resolve_token(chain, base, endpoint, dynamic)
             addr_b = resolve_token(chain, quote, endpoint, dynamic)
             if not addr_a or not addr_b:
+                if chain == "base":
+                    print(
+                        f"  [base][debug] unresolved token address "
+                        f"{base}={addr_a or '-'} {quote}={addr_b or '-'}"
+                    )
                 continue
             addrs_a = [addr_a]
             if (
@@ -389,6 +421,11 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 and addr_b.lower() != NATIVE_ETH
             ):
                 addrs_b.append(NATIVE_ETH)
+            if chain == "base":
+                print(
+                    f"  [base][debug] token_addrs {base}={','.join(addrs_a)} "
+                    f"{quote}={','.join(addrs_b)}"
+                )
             pools = []
             timed_out = False
             for a in addrs_a:
@@ -403,7 +440,16 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                         print(f"  [{chain}] {base}/{quote}: {e}")
                         if _is_timeout_error(e):
                             timed_out = True
+                            if skip_chain_after_timeout:
+                                if chain == "base":
+                                    print(
+                                        f"  [base][debug] timeout on token combo a={a} b={b}; "
+                                        "aborting remaining combos on this chain"
+                                    )
+                                break
                         continue
+                if timed_out and skip_chain_after_timeout:
+                    break
                 if int(discovery_cap) > 0 and len(pools) >= int(discovery_cap):
                     break
             if (not pools) and (not disable_symbol_fallback) and (not timed_out):
@@ -447,6 +493,15 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                     f"[warn] PRICE_FILTER_DROPPED chain={chain} pair={base}/{quote} "
                     f"count={skipped_missing_price}"
                 )
+            pair_ms = int(round(max(0.0, time.perf_counter() - pair_t0) * 1000.0))
+            if chain == "base":
+                print(
+                    f"  [base][debug] pair={base}/{quote} elapsed_ms={pair_ms} "
+                    f"timed_out={int(bool(timed_out))} pools_raw={len(pools)}"
+                )
+        chain_ms = int(round(max(0.0, time.perf_counter() - chain_t0) * 1000.0))
+        if chain == "base":
+            print(f"  [base][debug] chain_total_ms={chain_ms}")
 
     isolated_base = _base_v4_isolated_enabled() and ("base" in chains)
     base_override_active = False
@@ -455,10 +510,13 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
         base_override_ep = _base_v4_override_endpoint()
         if not base_override_ep:
             print("  [base] v4 isolated: override not set, fallback to default endpoint")
+            print("  [base][debug] isolated_override=0 reason=not_set")
         elif not _quick_graphql_healthcheck(base_override_ep):
             print("  [base] v4 isolated: override healthcheck failed, fallback to default endpoint")
+            print(f"  [base][debug] isolated_override=0 reason=healthcheck_failed host={_endpoint_host(base_override_ep) or '-'}")
         else:
             base_override_active = True
+            print(f"  [base][debug] isolated_override=1 host={_endpoint_host(base_override_ep) or '-'}")
 
     for chain in chains:
         if base_override_active and chain == "base":
