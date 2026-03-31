@@ -17182,7 +17182,7 @@ def _build_run_job_env(
     )
     env["GRAPHQL_READ_TIMEOUT_SEC"] = os.environ.get(
         "WEB_GRAPHQL_READ_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL",
-        "8" if speed_mode == "fast" else "15",
+        "8" if speed_mode == "fast" else "10",
     )
     env["POOL_SERIES_WORKERS"] = os.environ.get(
         "WEB_POOL_SERIES_WORKERS_FAST" if speed_mode == "fast" else "WEB_POOL_SERIES_WORKERS_NORMAL",

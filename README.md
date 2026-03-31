@@ -41,7 +41,19 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-Перед запуском установите API ключ:
+### Проектные env-переменные (рекомендуется)
+
+В репозитории есть шаблон `\.env.example` и локальный файл `\.env` (игнорируется git).
+
+```bash
+cp .env.example .env
+# заполните THE_GRAPH_API_KEY в .env
+set -a
+source .env
+set +a
+```
+
+Перед запуском можно также установить API ключ вручную:
 
 ```bash
 export THE_GRAPH_API_KEY="ваш_ключ"
@@ -128,8 +140,15 @@ python3 scripts/check_inline_js_guardrails.py webapp/main.py
 2. В Render: **New +** → **Blueprint**.
 3. Подключите ваш GitHub-репозиторий.
 4. Render прочитает `render.yaml` и создаст web service `uni-fee-web`.
-5. В переменных окружения задайте секрет:
+5. В переменных окружения задайте секрет и проектные флаги:
    - `THE_GRAPH_API_KEY=...`
+   - `ENABLE_BASE_CHAIN=1`
+   - `BASE_V3_ISOLATED_PIPELINE=0`
+   - `V3_BASE_LIGHT_SCAN_PAGES=3`
+   - `WEB_GRAPHQL_RETRIES=2`
+   - `WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL=30`
+   - `WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL=1`
+   - `WEB_V4_SKIP_CHAIN_AFTER_TIMEOUT=1`
 6. Нажмите Deploy.
 
 После деплоя сайт будет доступен по URL Render, healthcheck:

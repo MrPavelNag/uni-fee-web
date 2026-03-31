@@ -101,6 +101,12 @@ def _is_base_v3_isolated_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _is_base_chain_enabled() -> bool:
+    # Base is disabled by default due to frequent endpoint instability in production runs.
+    raw = str(os.environ.get("ENABLE_BASE_CHAIN", "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _endpoint_host(endpoint: str) -> str:
     try:
         return str(urlparse(str(endpoint or "")).netloc or "")
@@ -267,6 +273,132 @@ def _query_base_v3_goldsky_day_data(endpoint: str, pool_id: str, start_ts: int, 
     return out
 
 
+def _normalize_light_pool_shape(pool: dict) -> dict:
+    """
+    Ensure pools returned by light discovery query have fields expected by downstream code.
+    """
+    p = dict(pool or {})
+    p.setdefault("liquidity", "0")
+    p.setdefault("token0Price", "0")
+    p.setdefault("token1Price", "0")
+    p.setdefault("volumeUSD", "0")
+    p.setdefault("feesUSD", "0")
+    p.setdefault("txCount", "0")
+    return p
+
+
+def _query_base_v3_pools_light(
+    endpoint: str,
+    token_a: str,
+    token_b: str,
+    max_results: int = 0,
+) -> list[dict]:
+    """
+    Base v3 light discovery query for The Graph route.
+    Uses reduced field set to avoid flaky indexer responses on heavy pool selections.
+    """
+    a = str(token_a or "").strip().lower()
+    b = str(token_b or "").strip().lower()
+    if not a or not b or a == b:
+        return []
+    q = """
+    query PoolsLight($skip: Int!) {
+      pools0: pools(
+        first: 100,
+        skip: $skip,
+        where: { token0: "%s", token1: "%s" },
+        orderBy: totalValueLockedUSD,
+        orderDirection: desc
+      ) {
+        id
+        feeTier
+        token0 { id symbol decimals name }
+        token1 { id symbol decimals name }
+        totalValueLockedUSD
+        totalValueLockedToken0
+        totalValueLockedToken1
+      }
+      pools1: pools(
+        first: 100,
+        skip: $skip,
+        where: { token0: "%s", token1: "%s" },
+        orderBy: totalValueLockedUSD,
+        orderDirection: desc
+      ) {
+        id
+        feeTier
+        token0 { id symbol decimals name }
+        token1 { id symbol decimals name }
+        totalValueLockedUSD
+        totalValueLockedToken0
+        totalValueLockedToken1
+      }
+    }
+    """ % (a, b, b, a)
+    q_unfiltered = """
+    query PoolsLightUnfiltered($skip: Int!) {
+      pools(
+        first: 100,
+        skip: $skip,
+        orderBy: totalValueLockedUSD,
+        orderDirection: desc
+      ) {
+        id
+        feeTier
+        token0 { id symbol decimals name }
+        token1 { id symbol decimals name }
+        totalValueLockedUSD
+        totalValueLockedToken0
+        totalValueLockedToken1
+      }
+    }
+    """
+
+    def _is_match(row: dict) -> bool:
+        t0 = str(((row.get("token0") or {}).get("id") or "")).strip().lower()
+        t1 = str(((row.get("token1") or {}).get("id") or "")).strip().lower()
+        return (t0 == a and t1 == b) or (t0 == b and t1 == a)
+
+    out: list[dict] = []
+    skip = 0
+    try:
+        while True:
+            data = graphql_query(endpoint, q, {"skip": int(skip)}, retries=1)
+            d = data.get("data", {}) or {}
+            p0 = d.get("pools0", []) or []
+            p1 = d.get("pools1", []) or []
+            for row in p0 + p1:
+                out.append(_normalize_light_pool_shape(row))
+            if int(max_results or 0) > 0 and len(out) >= int(max_results):
+                return out[: int(max_results)]
+            if len(p0) < 100 and len(p1) < 100:
+                break
+            skip += 100
+        return out
+    except Exception as e:
+        # Some indexers fail on filtered pool queries for Base; retry with unfiltered scan and local filtering.
+        print(f"  [base][debug] v3 light filtered query failed: {e}")
+    out = []
+    skip = 0
+    max_scan_pages = max(1, _env_int("V3_BASE_LIGHT_SCAN_PAGES", 3))
+    pages = 0
+    while pages < max_scan_pages:
+        data = graphql_query(endpoint, q_unfiltered, {"skip": int(skip)}, retries=1)
+        rows = (data.get("data", {}) or {}).get("pools", []) or []
+        if not rows:
+            break
+        for row in rows:
+            if _is_match(row):
+                out.append(_normalize_light_pool_shape(row))
+        if int(max_results or 0) > 0 and len(out) >= int(max_results):
+            return out[: int(max_results)]
+        if len(rows) < 100:
+            break
+        skip += 100
+        pages += 1
+    return out
+
+
 def discover_pools_v3(
     token_pairs_str: str,
     min_tvl: Optional[float] = None,
@@ -280,6 +412,9 @@ def discover_pools_v3(
     include = {c.strip().lower() for c in os.environ.get("INCLUDE_CHAINS", "").split(",") if c.strip()}
     if include:
         chains = {c for c in chains if c.lower() in include}
+    if "base" in chains and not _is_base_chain_enabled():
+        chains = {c for c in chains if c.lower() != "base"}
+        print("  [base] v3: excluded by default (set ENABLE_BASE_CHAIN=1 to include)")
     discovery_cap = max(0, _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN", 0))
     chain_workers = max(1, min(_env_int("V3_DISCOVERY_CHAIN_WORKERS", 4), len(chains) or 1))
     dyn_lock = threading.Lock()
@@ -363,29 +498,49 @@ def discover_pools_v3(
                         if _is_timeout_error(ge):
                             graph_ep = get_graph_endpoint("base", "v3")
                             if graph_ep and graph_ep != endpoint:
+                                try:
+                                    fb_read_timeout = max(3.0, float(os.environ.get("V3_BASE_FALLBACK_READ_TIMEOUT_SEC", "6")))
+                                except Exception:
+                                    fb_read_timeout = 6.0
                                 print(
                                     "  [base][debug] v3 fallback: goldsky timeout; trying thegraph endpoint "
-                                    f"host={_endpoint_host(graph_ep) or '-'}"
+                                    f"host={_endpoint_host(graph_ep) or '-'} read_timeout={fb_read_timeout:.1f}s"
                                 )
-                                pools = query_pools_containing_both_tokens(
-                                    graph_ep,
-                                    base_addrs[0],
-                                    quote_addrs[0],
-                                    _min_tvl(min_tvl),
-                                    max_results=int(discovery_cap),
-                                )
+                                prev_read_timeout = os.environ.get("GRAPHQL_READ_TIMEOUT_SEC")
+                                try:
+                                    os.environ["GRAPHQL_READ_TIMEOUT_SEC"] = str(fb_read_timeout)
+                                    pools = _query_base_v3_pools_light(
+                                        graph_ep,
+                                        base_addrs[0],
+                                        quote_addrs[0],
+                                        max_results=int(discovery_cap),
+                                    )
+                                finally:
+                                    if prev_read_timeout is None:
+                                        os.environ.pop("GRAPHQL_READ_TIMEOUT_SEC", None)
+                                    else:
+                                        os.environ["GRAPHQL_READ_TIMEOUT_SEC"] = prev_read_timeout
                             else:
                                 raise
                         else:
                             raise
                 else:
-                    pools = query_pools_containing_both_tokens(
-                        endpoint,
-                        base_addrs[0],
-                        quote_addrs[0],
-                        _min_tvl(min_tvl),
-                        max_results=int(discovery_cap),
-                    )
+                    if chain == "base":
+                        # For Base on The Graph route use lightweight query shape first.
+                        pools = _query_base_v3_pools_light(
+                            endpoint,
+                            base_addrs[0],
+                            quote_addrs[0],
+                            max_results=int(discovery_cap),
+                        )
+                    else:
+                        pools = query_pools_containing_both_tokens(
+                            endpoint,
+                            base_addrs[0],
+                            quote_addrs[0],
+                            _min_tvl(min_tvl),
+                            max_results=int(discovery_cap),
+                        )
                     if not pools:
                         # Fallback for ambiguous symbol->address mappings (e.g. multiple tokens with same symbol).
                         pools = query_pools_by_token_symbols(

@@ -97,6 +97,12 @@ def _base_v4_isolated_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _is_base_chain_enabled() -> bool:
+    # Base is disabled by default due to frequent endpoint/indexer instability in production runs.
+    raw = str(os.environ.get("ENABLE_BASE_CHAIN", "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _base_v4_override_endpoint() -> str:
     return str(os.environ.get("V4_OVERRIDE_BASE") or "").strip()
 
@@ -355,6 +361,9 @@ def compute_fee_series(pool: dict, endpoint: str) -> dict:
 def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
     """Найти v4 пулы по всем сетям и парам."""
     chains = [c for c in V4_CHAINS if c in UNISWAP_V4_SUBGRAPHS]
+    if "base" in chains and not _is_base_chain_enabled():
+        chains = [c for c in chains if c != "base"]
+        print("  [base] v4: excluded by default (set ENABLE_BASE_CHAIN=1 to include)")
     include = {c.strip().lower() for c in os.environ.get("INCLUDE_CHAINS", "").split(",") if c.strip()}
     if include:
         chains = [c for c in chains if c.lower() in include]
