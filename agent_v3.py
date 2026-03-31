@@ -124,6 +124,11 @@ def _quick_graphql_healthcheck(endpoint: str) -> bool:
         return False
 
 
+def _is_timeout_error(err: Exception) -> bool:
+    msg = str(err or "").lower()
+    return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
+
+
 def _discover_base_v3_goldsky_pools(
     endpoint: str,
     token_a: str,
@@ -345,12 +350,34 @@ def discover_pools_v3(
                 continue
             try:
                 if use_base_goldsky:
-                    pools = _discover_base_v3_goldsky_pools(
-                        endpoint,
-                        base_addrs[0],
-                        quote_addrs[0],
-                        max_results=int(discovery_cap),
-                    )
+                    pools = []
+                    try:
+                        pools = _discover_base_v3_goldsky_pools(
+                            endpoint,
+                            base_addrs[0],
+                            quote_addrs[0],
+                            max_results=int(discovery_cap),
+                        )
+                    except Exception as ge:
+                        # Goldsky Base v3 can time out intermittently; fallback to The Graph endpoint when available.
+                        if _is_timeout_error(ge):
+                            graph_ep = get_graph_endpoint("base", "v3")
+                            if graph_ep and graph_ep != endpoint:
+                                print(
+                                    "  [base][debug] v3 fallback: goldsky timeout; trying thegraph endpoint "
+                                    f"host={_endpoint_host(graph_ep) or '-'}"
+                                )
+                                pools = query_pools_containing_both_tokens(
+                                    graph_ep,
+                                    base_addrs[0],
+                                    quote_addrs[0],
+                                    _min_tvl(min_tvl),
+                                    max_results=int(discovery_cap),
+                                )
+                            else:
+                                raise
+                        else:
+                            raise
                 else:
                     pools = query_pools_containing_both_tokens(
                         endpoint,
