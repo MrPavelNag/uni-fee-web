@@ -11,6 +11,7 @@ Agent 1: Uniswap v3 (базовая версия).
 import argparse
 import os
 import threading
+import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -96,6 +97,22 @@ def _base_v3_goldsky_endpoint() -> str:
 def _is_base_v3_isolated_enabled() -> bool:
     raw = str(os.environ.get("BASE_V3_ISOLATED_PIPELINE", "1")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _quick_graphql_healthcheck(endpoint: str) -> bool:
+    if not endpoint:
+        return False
+    try:
+        timeout_sec = max(2.0, float(os.environ.get("V3_ENDPOINT_HEALTHCHECK_TIMEOUT_SEC", "4")))
+    except Exception:
+        timeout_sec = 4.0
+    try:
+        r = requests.post(endpoint, json={"query": "query { __typename }"}, timeout=(3.0, timeout_sec))
+        r.raise_for_status()
+        data = r.json() if isinstance(r.json(), dict) else {}
+        return bool(isinstance(data, dict) and ("data" in data) and not data.get("errors"))
+    except Exception:
+        return False
 
 
 def _discover_base_v3_goldsky_pools(
@@ -262,6 +279,10 @@ def discover_pools_v3(
         )
         endpoint = _base_v3_goldsky_endpoint() if use_base_goldsky else get_graph_endpoint(chain, "v3")
         if not endpoint:
+            return out_chain
+        check_enabled = str(os.environ.get("V3_ENDPOINT_HEALTHCHECK", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        if check_enabled and not _quick_graphql_healthcheck(endpoint):
+            print(f"  [{chain}] v3: skip (endpoint healthcheck failed)")
             return out_chain
 
         def _resolve_with_cache(sym: str) -> list[str]:

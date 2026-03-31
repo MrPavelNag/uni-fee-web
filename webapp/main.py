@@ -17217,8 +17217,12 @@ def _build_run_job_env(
         "1",
     )
     # v4 endpoint config uses this list at import-time.
-    if run_v4 and include_chains:
-        v4_supported = {c for c in include_chains if c in UNISWAP_V4_SUBGRAPHS}
+    # When UI sends "all chains", include_chains is empty; in that case force all known v4 chains.
+    if run_v4:
+        if include_chains:
+            v4_supported = {c for c in include_chains if c in UNISWAP_V4_SUBGRAPHS}
+        else:
+            v4_supported = set(UNISWAP_V4_SUBGRAPHS.keys())
         env["V4_CHAINS"] = ",".join(sorted(v4_supported))
     return env
 

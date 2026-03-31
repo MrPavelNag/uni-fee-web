@@ -116,6 +116,10 @@ def _quick_graphql_healthcheck(endpoint: str) -> bool:
         return False
 
 
+def _v4_endpoint_healthcheck_enabled() -> bool:
+    return _env_flag("V4_ENDPOINT_HEALTHCHECK", True)
+
+
 def _page_delay_sec() -> float:
     try:
         return max(0.0, float(os.environ.get("GRAPHQL_PAGE_DELAY_SEC", "0")))
@@ -360,6 +364,9 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
         if not endpoint:
             print(f"  [{chain}] skip: no endpoint")
             return
+        if _v4_endpoint_healthcheck_enabled() and not _quick_graphql_healthcheck(endpoint):
+            print(f"  [{chain}] skip: endpoint healthcheck failed")
+            return
         chain_abort = False
         for base, quote in pairs:
             if chain_abort:
@@ -442,20 +449,25 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 )
 
     isolated_base = _base_v4_isolated_enabled() and ("base" in chains)
+    base_override_active = False
+    base_override_ep = ""
+    if isolated_base:
+        base_override_ep = _base_v4_override_endpoint()
+        if not base_override_ep:
+            print("  [base] v4 isolated: override not set, fallback to default endpoint")
+        elif not _quick_graphql_healthcheck(base_override_ep):
+            print("  [base] v4 isolated: override healthcheck failed, fallback to default endpoint")
+        else:
+            base_override_active = True
+
     for chain in chains:
-        if isolated_base and chain == "base":
+        if base_override_active and chain == "base":
             continue
         _scan_chain(chain, get_endpoint(chain))
 
-    if isolated_base:
-        base_ep = _base_v4_override_endpoint()
-        if not base_ep:
-            print("  [base] v4 isolated: skip (V4_OVERRIDE_BASE is not set)")
-        elif not _quick_graphql_healthcheck(base_ep):
-            print("  [base] v4 isolated: skip (override healthcheck failed)")
-        else:
-            print("  [base] v4 isolated pipeline: enabled")
-            _scan_chain("base", base_ep)
+    if base_override_active:
+        print("  [base] v4 isolated pipeline: enabled")
+        _scan_chain("base", base_override_ep)
 
     # дедупликация по (chain, id)
     seen = set()
