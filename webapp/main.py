@@ -17210,7 +17210,7 @@ def _build_run_job_env(
     )
     env["DISABLE_V4_SYMBOL_FALLBACK"] = os.environ.get(
         "WEB_DISABLE_V4_SYMBOL_FALLBACK_FAST" if speed_mode == "fast" else "WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL",
-        "1" if speed_mode == "fast" else "0",
+        "1" if speed_mode == "fast" else "1",
     )
     env["V4_SKIP_CHAIN_AFTER_TIMEOUT"] = os.environ.get(
         "WEB_V4_SKIP_CHAIN_AFTER_TIMEOUT",

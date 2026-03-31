@@ -12,8 +12,6 @@ import argparse
 import os
 import threading
 import requests
-import time
-from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -105,13 +103,6 @@ def _is_base_chain_enabled() -> bool:
     # Base is disabled by default due to frequent endpoint instability in production runs.
     raw = str(os.environ.get("ENABLE_BASE_CHAIN", "0")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
-
-
-def _endpoint_host(endpoint: str) -> str:
-    try:
-        return str(urlparse(str(endpoint or "")).netloc or "")
-    except Exception:
-        return ""
 
 
 def _quick_graphql_healthcheck(endpoint: str) -> bool:
@@ -312,8 +303,8 @@ def _query_base_v3_pools_light(
       ) {
         id
         feeTier
-        token0 { id symbol decimals name }
-        token1 { id symbol decimals name }
+        token0 { id symbol }
+        token1 { id symbol }
         totalValueLockedUSD
         totalValueLockedToken0
         totalValueLockedToken1
@@ -327,8 +318,8 @@ def _query_base_v3_pools_light(
       ) {
         id
         feeTier
-        token0 { id symbol decimals name }
-        token1 { id symbol decimals name }
+        token0 { id symbol }
+        token1 { id symbol }
         totalValueLockedUSD
         totalValueLockedToken0
         totalValueLockedToken1
@@ -345,8 +336,8 @@ def _query_base_v3_pools_light(
       ) {
         id
         feeTier
-        token0 { id symbol decimals name }
-        token1 { id symbol decimals name }
+        token0 { id symbol }
+        token1 { id symbol }
         totalValueLockedUSD
         totalValueLockedToken0
         totalValueLockedToken1
@@ -375,9 +366,9 @@ def _query_base_v3_pools_light(
                 break
             skip += 100
         return out
-    except Exception as e:
+    except Exception:
         # Some indexers fail on filtered pool queries for Base; retry with unfiltered scan and local filtering.
-        print(f"  [base][debug] v3 light filtered query failed: {e}")
+        pass
     out = []
     skip = 0
     max_scan_pages = max(1, _env_int("V3_BASE_LIGHT_SCAN_PAGES", 3))
@@ -387,11 +378,17 @@ def _query_base_v3_pools_light(
         rows = (data.get("data", {}) or {}).get("pools", []) or []
         if not rows:
             break
+        added_this_page = 0
         for row in rows:
             if _is_match(row):
                 out.append(_normalize_light_pool_shape(row))
+                added_this_page += 1
         if int(max_results or 0) > 0 and len(out) >= int(max_results):
             return out[: int(max_results)]
+        if out and added_this_page == 0:
+            # Sorted by TVL desc: if current page brought no matches after we already found some,
+            # the next pages are unlikely to add useful results; stop early to cut tail latency.
+            break
         if len(rows) < 100:
             break
         skip += 100
@@ -420,7 +417,6 @@ def discover_pools_v3(
     dyn_lock = threading.Lock()
 
     def _discover_for_chain(chain: str) -> list[dict]:
-        chain_t0 = time.perf_counter()
         out_chain: list[dict] = []
         use_base_goldsky = bool(
             chain == "base"
@@ -430,20 +426,10 @@ def discover_pools_v3(
         endpoint = _base_v3_goldsky_endpoint() if use_base_goldsky else get_graph_endpoint(chain, "v3")
         if not endpoint:
             return out_chain
-        if chain == "base":
-            print(
-                f"  [base][debug] v3 isolated={int(bool(use_base_goldsky))} "
-                f"endpoint_host={_endpoint_host(endpoint) or '-'}"
-            )
         check_enabled = str(os.environ.get("V3_ENDPOINT_HEALTHCHECK", "1")).strip().lower() in {"1", "true", "yes", "on"}
         health_ok = True
         if check_enabled:
             health_ok = _quick_graphql_healthcheck(endpoint)
-        if chain == "base":
-            print(
-                f"  [base][debug] v3 endpoint_healthcheck enabled={int(bool(check_enabled))} "
-                f"ok={int(bool(health_ok))}"
-            )
         if check_enabled and not health_ok:
             print(f"  [{chain}] v3: skip (endpoint healthcheck failed)")
             return out_chain
@@ -502,10 +488,7 @@ def discover_pools_v3(
                                     fb_read_timeout = max(3.0, float(os.environ.get("V3_BASE_FALLBACK_READ_TIMEOUT_SEC", "6")))
                                 except Exception:
                                     fb_read_timeout = 6.0
-                                print(
-                                    "  [base][debug] v3 fallback: goldsky timeout; trying thegraph endpoint "
-                                    f"host={_endpoint_host(graph_ep) or '-'} read_timeout={fb_read_timeout:.1f}s"
-                                )
+                                print("  [base] v3 fallback: goldsky timeout; trying thegraph endpoint")
                                 prev_read_timeout = os.environ.get("GRAPHQL_READ_TIMEOUT_SEC")
                                 try:
                                     os.environ["GRAPHQL_READ_TIMEOUT_SEC"] = str(fb_read_timeout)
@@ -580,14 +563,6 @@ def discover_pools_v3(
                     out_chain.append(p)
             except Exception as e:
                 print(f"  [{chain}] v3 {base}/{quote}: {e}")
-                if chain == "base":
-                    print(
-                        f"  [base][debug] v3 error pair={base}/{quote} "
-                        f"endpoint_host={_endpoint_host(endpoint) or '-'}"
-                    )
-        if chain == "base":
-            chain_ms = int(round(max(0.0, time.perf_counter() - chain_t0) * 1000.0))
-            print(f"  [base][debug] v3 chain_total_ms={chain_ms}")
         return out_chain
 
     if chains:

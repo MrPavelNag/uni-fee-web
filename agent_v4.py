@@ -10,7 +10,6 @@ import argparse
 import os
 import time
 import requests
-from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -107,6 +106,11 @@ def _base_v4_override_endpoint() -> str:
     return str(os.environ.get("V4_OVERRIDE_BASE") or "").strip()
 
 
+def _skip_base_v4_without_override() -> bool:
+    # Default: avoid costly known-bad base v4 route when override is absent.
+    return _env_flag("V4_SKIP_BASE_WITHOUT_OVERRIDE", True)
+
+
 def _quick_graphql_healthcheck(endpoint: str) -> bool:
     if not endpoint:
         return False
@@ -162,13 +166,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
 def _is_timeout_error(err: Exception) -> bool:
     msg = str(err or "").lower()
     return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
-
-
-def _endpoint_host(endpoint: str) -> str:
-    try:
-        return str(urlparse(str(endpoint or "")).netloc or "")
-    except Exception:
-        return ""
 
 
 def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
@@ -374,68 +371,28 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
     discovery_cap = max(0, _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN", 0))
     native_eth_chains = _native_eth_query_chains()
     timeout_chains: set[str] = set()
-    base_debug: dict[str, object] = {
-        "enabled": False,
-        "endpoint_host": "",
-        "health_enabled": False,
-        "health_ok": None,
-        "timed_out": False,
-        "chain_ms": 0,
-        "pairs_scanned": 0,
-        "pools_kept": 0,
-        "isolated_override": False,
-        "override_host": "",
-        "override_reason": "",
-    }
 
     def _scan_chain(chain: str, endpoint: str) -> None:
-        chain_t0 = time.perf_counter()
         if chain in timeout_chains:
             print(f"  [{chain}] skip: timeout blacklist")
             return
         if not endpoint:
             print(f"  [{chain}] skip: no endpoint")
             return
-        endpoint_host = _endpoint_host(endpoint)
-        if chain == "base":
-            base_debug["enabled"] = True
-            base_debug["endpoint_host"] = endpoint_host
-            print(
-                f"  [base][debug] endpoint_host={endpoint_host or '-'} "
-                f"skip_chain_after_timeout={int(bool(skip_chain_after_timeout))} "
-                f"symbol_fallback={int(not disable_symbol_fallback)}"
-            )
         healthcheck_enabled = _v4_endpoint_healthcheck_enabled()
         health_ok = True
-        if chain == "base":
-            base_debug["health_enabled"] = bool(healthcheck_enabled)
         if healthcheck_enabled:
             health_ok = _quick_graphql_healthcheck(endpoint)
-        if chain == "base":
-            base_debug["health_ok"] = bool(health_ok)
-        if chain == "base":
-            print(
-                f"  [base][debug] endpoint_healthcheck enabled={int(bool(healthcheck_enabled))} "
-                f"ok={int(bool(health_ok))}"
-            )
         if healthcheck_enabled and not health_ok:
             print(f"  [{chain}] skip: endpoint healthcheck failed")
             return
         chain_abort = False
         for base, quote in pairs:
-            pair_t0 = time.perf_counter()
-            if chain == "base":
-                base_debug["pairs_scanned"] = int(base_debug.get("pairs_scanned") or 0) + 1
             if chain_abort:
                 break
             addr_a = resolve_token(chain, base, endpoint, dynamic)
             addr_b = resolve_token(chain, quote, endpoint, dynamic)
             if not addr_a or not addr_b:
-                if chain == "base":
-                    print(
-                        f"  [base][debug] unresolved token address "
-                        f"{base}={addr_a or '-'} {quote}={addr_b or '-'}"
-                    )
                 continue
             addrs_a = [addr_a]
             if (
@@ -451,11 +408,6 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 and addr_b.lower() != NATIVE_ETH
             ):
                 addrs_b.append(NATIVE_ETH)
-            if chain == "base":
-                print(
-                    f"  [base][debug] token_addrs {base}={','.join(addrs_a)} "
-                    f"{quote}={','.join(addrs_b)}"
-                )
             pools = []
             timed_out = False
             for a in addrs_a:
@@ -470,14 +422,7 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                         print(f"  [{chain}] {base}/{quote}: {e}")
                         if _is_timeout_error(e):
                             timed_out = True
-                            if chain == "base":
-                                base_debug["timed_out"] = True
                             if skip_chain_after_timeout:
-                                if chain == "base":
-                                    print(
-                                        f"  [base][debug] timeout on token combo a={a} b={b}; "
-                                        "aborting remaining combos on this chain"
-                                    )
                                 break
                         continue
                 if timed_out and skip_chain_after_timeout:
@@ -502,11 +447,6 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 timeout_chains.add(chain)
                 chain_abort = True
                 print(f"  [{chain}] timeout detected: skipping remaining pairs on this chain")
-                if chain == "base":
-                    print(
-                        "  [base][debug] action_hint: set V4_OVERRIDE_BASE to a healthy GraphQL endpoint "
-                        "to recover base pools"
-                    )
             kept = 0
             skipped_missing_price = 0
             for p in pools:
@@ -523,8 +463,6 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 p["pair_label"] = f"{base}/{quote}"
                 all_pools.append(p)
                 kept += 1
-                if chain == "base":
-                    base_debug["pools_kept"] = int(base_debug.get("pools_kept") or 0) + 1
             if pools:
                 print(f"  [{chain}] {base}/{quote}: {kept} pools")
             if skipped_missing_price > 0:
@@ -532,16 +470,6 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                     f"[warn] PRICE_FILTER_DROPPED chain={chain} pair={base}/{quote} "
                     f"count={skipped_missing_price}"
                 )
-            pair_ms = int(round(max(0.0, time.perf_counter() - pair_t0) * 1000.0))
-            if chain == "base":
-                print(
-                    f"  [base][debug] pair={base}/{quote} elapsed_ms={pair_ms} "
-                    f"timed_out={int(bool(timed_out))} pools_raw={len(pools)}"
-                )
-        chain_ms = int(round(max(0.0, time.perf_counter() - chain_t0) * 1000.0))
-        if chain == "base":
-            base_debug["chain_ms"] = int(chain_ms)
-            print(f"  [base][debug] chain_total_ms={chain_ms}")
 
     isolated_base = _base_v4_isolated_enabled() and ("base" in chains)
     base_override_active = False
@@ -549,22 +477,15 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
     if isolated_base:
         base_override_ep = _base_v4_override_endpoint()
         if not base_override_ep:
-            print("  [base] v4 isolated: override not set, fallback to default endpoint")
-            print("  [base][debug] isolated_override=0 reason=not_set")
-            base_debug["isolated_override"] = False
-            base_debug["override_reason"] = "not_set"
+            if _skip_base_v4_without_override():
+                print("  [base] v4 isolated: override not set, skipping base discovery")
+                chains = [c for c in chains if c != "base"]
+            else:
+                print("  [base] v4 isolated: override not set, fallback to default endpoint")
         elif not _quick_graphql_healthcheck(base_override_ep):
             print("  [base] v4 isolated: override healthcheck failed, fallback to default endpoint")
-            print(f"  [base][debug] isolated_override=0 reason=healthcheck_failed host={_endpoint_host(base_override_ep) or '-'}")
-            base_debug["isolated_override"] = False
-            base_debug["override_reason"] = "healthcheck_failed"
-            base_debug["override_host"] = _endpoint_host(base_override_ep)
         else:
             base_override_active = True
-            print(f"  [base][debug] isolated_override=1 host={_endpoint_host(base_override_ep) or '-'}")
-            base_debug["isolated_override"] = True
-            base_debug["override_reason"] = "ok"
-            base_debug["override_host"] = _endpoint_host(base_override_ep)
 
     for chain in chains:
         if base_override_active and chain == "base":
@@ -574,26 +495,6 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
     if base_override_active:
         print("  [base] v4 isolated pipeline: enabled")
         _scan_chain("base", base_override_ep)
-
-    base_present = "base" in chains
-    if base_present:
-        health_ok = base_debug.get("health_ok")
-        health_ok_str = "-"
-        if isinstance(health_ok, bool):
-            health_ok_str = str(int(health_ok))
-        print(
-            "  [base][debug-summary] "
-            f"endpoint_host={str(base_debug.get('endpoint_host') or '-')}"
-            f" isolated_override={int(bool(base_debug.get('isolated_override')))}"
-            f" override_host={str(base_debug.get('override_host') or '-')}"
-            f" override_reason={str(base_debug.get('override_reason') or '-')}"
-            f" health_enabled={int(bool(base_debug.get('health_enabled')))}"
-            f" health_ok={health_ok_str}"
-            f" timed_out={int(bool(base_debug.get('timed_out')))}"
-            f" pairs_scanned={int(base_debug.get('pairs_scanned') or 0)}"
-            f" pools_kept={int(base_debug.get('pools_kept') or 0)}"
-            f" chain_ms={int(base_debug.get('chain_ms') or 0)}"
-        )
 
     # дедупликация по (chain, id)
     seen = set()
