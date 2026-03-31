@@ -85,6 +85,11 @@ def save_pdf(pools: list[dict], path: str) -> None:
 NATIVE_ETH = "0x0000000000000000000000000000000000000000"
 
 
+def _native_eth_query_chains() -> set[str]:
+    raw = os.environ.get("NATIVE_ETH_QUERY_CHAINS", "ethereum,arbitrum,base,optimism,unichain")
+    return {c.strip().lower() for c in str(raw or "").split(",") if c.strip()}
+
+
 def _page_delay_sec() -> float:
     try:
         return max(0.0, float(os.environ.get("GRAPHQL_PAGE_DELAY_SEC", "0")))
@@ -185,7 +190,7 @@ def resolve_token(chain: str, symbol: str, endpoint: str, dynamic: dict) -> Opti
     return addr
 
 
-def query_pools(endpoint: str, token_a: str, token_b: str) -> list[dict]:
+def query_pools(endpoint: str, token_a: str, token_b: str, max_results: int = 0) -> list[dict]:
     """Найти пулы с обоими токенами (в любом порядке)."""
     from uniswap_client import graphql_query
 
@@ -211,6 +216,8 @@ def query_pools(endpoint: str, token_a: str, token_b: str) -> list[dict]:
         p0, p1 = d.get("pools0", []), d.get("pools1", [])
         result.extend(p0)
         result.extend(p1)
+        if int(max_results or 0) > 0 and len(result) >= int(max_results):
+            return result[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
@@ -218,7 +225,7 @@ def query_pools(endpoint: str, token_a: str, token_b: str) -> list[dict]:
     return result
 
 
-def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str) -> list[dict]:
+def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str, max_results: int = 0) -> list[dict]:
     """Fallback: find pools by token symbols in either order."""
     from uniswap_client import graphql_query
 
@@ -245,6 +252,8 @@ def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str) -> list[
         p0, p1 = d.get("pools0", []), d.get("pools1", [])
         result.extend(p0)
         result.extend(p1)
+        if int(max_results or 0) > 0 and len(result) >= int(max_results):
+            return result[: int(max_results)]
         if len(p0) < 100 and len(p1) < 100:
             break
         skip += 100
@@ -315,6 +324,8 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
     all_pools = []
     disable_symbol_fallback = _env_flag("DISABLE_V4_SYMBOL_FALLBACK", False)
     skip_chain_after_timeout = _env_flag("V4_SKIP_CHAIN_AFTER_TIMEOUT", True)
+    discovery_cap = max(0, _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN", 0))
+    native_eth_chains = _native_eth_query_chains()
     timeout_chains: set[str] = set()
 
     for chain in chains:
@@ -336,10 +347,18 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 continue
 
             addrs_a = [addr_a]
-            if base.lower() in ("eth", "weth") and addr_a.lower() != NATIVE_ETH:
+            if (
+                chain.lower() in native_eth_chains
+                and base.lower() in ("eth", "weth")
+                and addr_a.lower() != NATIVE_ETH
+            ):
                 addrs_a.append(NATIVE_ETH)
             addrs_b = [addr_b]
-            if quote.lower() in ("eth", "weth") and addr_b.lower() != NATIVE_ETH:
+            if (
+                chain.lower() in native_eth_chains
+                and quote.lower() in ("eth", "weth")
+                and addr_b.lower() != NATIVE_ETH
+            ):
                 addrs_b.append(NATIVE_ETH)
 
             pools = []
@@ -349,15 +368,26 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                     if a.lower() == b.lower():
                         continue
                     try:
-                        pools.extend(query_pools(endpoint, a, b))
+                        pools.extend(query_pools(endpoint, a, b, max_results=int(discovery_cap)))
+                        if int(discovery_cap) > 0 and len(pools) >= int(discovery_cap):
+                            break
                     except Exception as e:
                         print(f"  [{chain}] {base}/{quote}: {e}")
                         if _is_timeout_error(e):
                             timed_out = True
                         continue
+                if int(discovery_cap) > 0 and len(pools) >= int(discovery_cap):
+                    break
             if (not pools) and (not disable_symbol_fallback) and (not timed_out):
                 try:
-                    pools.extend(query_pools_by_symbols(endpoint, base, quote))
+                    pools.extend(
+                        query_pools_by_symbols(
+                            endpoint,
+                            base,
+                            quote,
+                            max_results=int(discovery_cap),
+                        )
+                    )
                 except Exception as e:
                     print(f"  [{chain}] {base}/{quote} (symbol fallback): {e}")
                     if _is_timeout_error(e):

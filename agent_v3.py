@@ -34,6 +34,7 @@ from agent_common import (
     save_dynamic_token,
 )
 from uniswap_client import (
+    graphql_query,
     get_graph_endpoint,
     query_pool_day_data,
     query_pools_containing_both_tokens,
@@ -88,6 +89,128 @@ def _min_tvl(cli_value: Optional[float] = None) -> float:
     return MIN_TVL_USD
 
 
+def _base_v3_goldsky_endpoint() -> str:
+    return str(GOLDSKY_ENDPOINTS.get("base") or "").strip()
+
+
+def _is_base_v3_isolated_enabled() -> bool:
+    raw = str(os.environ.get("BASE_V3_ISOLATED_PIPELINE", "1")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _discover_base_v3_goldsky_pools(
+    endpoint: str,
+    token_a: str,
+    token_b: str,
+    max_results: int,
+) -> list[dict]:
+    # Goldsky Base v3 uses Messari-like schema (liquidityPools / inputTokens / inputTokenBalances).
+    token_a = str(token_a or "").strip().lower()
+    token_b = str(token_b or "").strip().lower()
+    if not token_a or not token_b or token_a == token_b:
+        return []
+    q = """
+    query BasePools($skip: Int!) {
+      liquidityPools(first: 100, skip: $skip, orderBy: totalValueLockedUSD, orderDirection: desc) {
+        id
+        totalValueLockedUSD
+        inputTokenBalances
+        inputTokens { id symbol decimals }
+      }
+    }
+    """
+    out: list[dict] = []
+    skip = 0
+    while True:
+        data = graphql_query(endpoint, q, {"skip": skip}, retries=1)
+        rows = data.get("data", {}).get("liquidityPools", []) or []
+        if not rows:
+            break
+        for r in rows:
+            toks = r.get("inputTokens") or []
+            if not isinstance(toks, list) or len(toks) < 2:
+                continue
+            ids = [str((t or {}).get("id") or "").strip().lower() for t in toks[:2]]
+            if token_a not in ids or token_b not in ids:
+                continue
+            balances = r.get("inputTokenBalances") or []
+            bal0 = float(balances[0] or 0.0) if len(balances) > 0 else 0.0
+            bal1 = float(balances[1] or 0.0) if len(balances) > 1 else 0.0
+            p = {
+                "id": str(r.get("id") or ""),
+                "feeTier": 3000,  # fallback for alternative schema
+                "token0": {
+                    "id": ids[0],
+                    "symbol": str((toks[0] or {}).get("symbol") or "?"),
+                    "decimals": str((toks[0] or {}).get("decimals") or "18"),
+                    "name": "",
+                },
+                "token1": {
+                    "id": ids[1],
+                    "symbol": str((toks[1] or {}).get("symbol") or "?"),
+                    "decimals": str((toks[1] or {}).get("decimals") or "18"),
+                    "name": "",
+                },
+                "totalValueLockedUSD": str(r.get("totalValueLockedUSD") or "0"),
+                "totalValueLockedToken0": str(bal0),
+                "totalValueLockedToken1": str(bal1),
+                "volumeUSD": "0",
+                "feesUSD": "0",
+                "_base_schema": "goldsky_v3_alt",
+            }
+            if p["id"]:
+                out.append(p)
+                if int(max_results or 0) > 0 and len(out) >= int(max_results):
+                    return out[: int(max_results)]
+        if len(rows) < 100:
+            break
+        skip += 100
+    return out
+
+
+def _query_base_v3_goldsky_day_data(endpoint: str, pool_id: str, start_ts: int, end_ts: int) -> list[dict]:
+    q = """
+    query BasePoolDays($pool: String!, $start: Int!, $end: Int!, $skip: Int!) {
+      liquidityPoolDailySnapshots(
+        first: 100,
+        skip: $skip,
+        orderBy: timestamp,
+        orderDirection: asc,
+        where: { pool: $pool, timestamp_gte: $start, timestamp_lte: $end }
+      ) {
+        timestamp
+        totalValueLockedUSD
+        dailySupplySideRevenueUSD
+      }
+    }
+    """
+    out: list[dict] = []
+    skip = 0
+    while True:
+        data = graphql_query(
+            endpoint,
+            q,
+            {"pool": str(pool_id or "").strip().lower(), "start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
+            retries=1,
+        )
+        rows = data.get("data", {}).get("liquidityPoolDailySnapshots", []) or []
+        if not rows:
+            break
+        for r in rows:
+            ts = int(float(r.get("timestamp") or 0))
+            out.append(
+                {
+                    "date": ts,
+                    "tvlUSD": float(r.get("totalValueLockedUSD") or 0.0),
+                    "feesUSD": float(r.get("dailySupplySideRevenueUSD") or 0.0),
+                }
+            )
+        if len(rows) < 100:
+            break
+        skip += 100
+    return out
+
+
 def discover_pools_v3(
     token_pairs_str: str,
     min_tvl: Optional[float] = None,
@@ -107,7 +230,12 @@ def discover_pools_v3(
 
     def _discover_for_chain(chain: str) -> list[dict]:
         out_chain: list[dict] = []
-        endpoint = get_graph_endpoint(chain, "v3")
+        use_base_goldsky = bool(
+            chain == "base"
+            and _is_base_v3_isolated_enabled()
+            and _base_v3_goldsky_endpoint()
+        )
+        endpoint = _base_v3_goldsky_endpoint() if use_base_goldsky else get_graph_endpoint(chain, "v3")
         if not endpoint:
             return out_chain
 
@@ -147,22 +275,30 @@ def discover_pools_v3(
             if not base_addrs or not quote_addrs:
                 continue
             try:
-                pools = query_pools_containing_both_tokens(
-                    endpoint,
-                    base_addrs[0],
-                    quote_addrs[0],
-                    _min_tvl(min_tvl),
-                    max_results=int(discovery_cap),
-                )
-                if not pools:
-                    # Fallback for ambiguous symbol->address mappings (e.g. multiple tokens with same symbol).
-                    pools = query_pools_by_token_symbols(
+                if use_base_goldsky:
+                    pools = _discover_base_v3_goldsky_pools(
                         endpoint,
-                        base,
-                        quote,
+                        base_addrs[0],
+                        quote_addrs[0],
+                        max_results=int(discovery_cap),
+                    )
+                else:
+                    pools = query_pools_containing_both_tokens(
+                        endpoint,
+                        base_addrs[0],
+                        quote_addrs[0],
                         _min_tvl(min_tvl),
                         max_results=int(discovery_cap),
                     )
+                    if not pools:
+                        # Fallback for ambiguous symbol->address mappings (e.g. multiple tokens with same symbol).
+                        pools = query_pools_by_token_symbols(
+                            endpoint,
+                            base,
+                            quote,
+                            _min_tvl(min_tvl),
+                            max_results=int(discovery_cap),
+                        )
                 min_tvl_now = _min_tvl(min_tvl)
                 filtered_pools: list[dict] = []
                 skipped_missing_price = 0
@@ -221,7 +357,10 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
     start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
-    day_data = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
+    if str(pool.get("_base_schema") or "") == "goldsky_v3_alt":
+        day_data = _query_base_v3_goldsky_day_data(endpoint, pool["id"], start_ts, end_ts)
+    else:
+        day_data = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
     fees_usd_series = []
     raw_tvl_series = []
     for d in day_data:
@@ -318,7 +457,10 @@ def main() -> None:
         raw_fee_tier = int(pool.get("feeTier") or 0)
         fee_pct = raw_fee_tier / 10000
         pair = f"{t0}/{t1}"
-        endpoint = get_graph_endpoint(chain, "v3")
+        if chain == "base" and str(pool.get("_base_schema") or "") == "goldsky_v3_alt" and _base_v3_goldsky_endpoint():
+            endpoint = _base_v3_goldsky_endpoint()
+        else:
+            endpoint = get_graph_endpoint(chain, "v3")
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair}: skipped (no endpoint)"
         data = compute_fee_and_tvl_series(pool, endpoint)
