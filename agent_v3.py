@@ -109,7 +109,23 @@ def _discover_base_v3_goldsky_pools(
     token_b = str(token_b or "").strip().lower()
     if not token_a or not token_b or token_a == token_b:
         return []
-    q = """
+    q_filtered = """
+    query BasePools($skip: Int!) {
+      liquidityPools(
+        first: 100,
+        skip: $skip,
+        orderBy: totalValueLockedUSD,
+        orderDirection: desc,
+        where: { inputTokens_contains: ["%s", "%s"] }
+      ) {
+        id
+        totalValueLockedUSD
+        inputTokenBalances
+        inputTokens { id symbol decimals }
+      }
+    }
+    """ % (token_a, token_b)
+    q_unfiltered = """
     query BasePools($skip: Int!) {
       liquidityPools(first: 100, skip: $skip, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id
@@ -119,10 +135,19 @@ def _discover_base_v3_goldsky_pools(
       }
     }
     """
+    query_text = q_filtered
+    used_unfiltered = False
     out: list[dict] = []
     skip = 0
     while True:
-        data = graphql_query(endpoint, q, {"skip": skip}, retries=1)
+        try:
+            data = graphql_query(endpoint, query_text, {"skip": skip}, retries=1)
+        except Exception as e:
+            if (not used_unfiltered) and "inputtokens_contains" in str(e).lower():
+                query_text = q_unfiltered
+                used_unfiltered = True
+                continue
+            raise
         rows = data.get("data", {}).get("liquidityPools", []) or []
         if not rows:
             break

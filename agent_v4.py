@@ -9,6 +9,7 @@ Uniswap v4 Agent: поиск пулов, расчёт LP-комиссий, со�
 import argparse
 import os
 import time
+import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -88,6 +89,31 @@ NATIVE_ETH = "0x0000000000000000000000000000000000000000"
 def _native_eth_query_chains() -> set[str]:
     raw = os.environ.get("NATIVE_ETH_QUERY_CHAINS", "ethereum,arbitrum,base,optimism,unichain")
     return {c.strip().lower() for c in str(raw or "").split(",") if c.strip()}
+
+
+def _base_v4_isolated_enabled() -> bool:
+    raw = str(os.environ.get("BASE_V4_ISOLATED_PIPELINE", "1")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _base_v4_override_endpoint() -> str:
+    return str(os.environ.get("V4_OVERRIDE_BASE") or "").strip()
+
+
+def _quick_graphql_healthcheck(endpoint: str) -> bool:
+    if not endpoint:
+        return False
+    try:
+        timeout_sec = max(2.0, float(os.environ.get("BASE_V4_HEALTHCHECK_TIMEOUT_SEC", "4")))
+    except Exception:
+        timeout_sec = 4.0
+    try:
+        r = requests.post(endpoint, json={"query": "query { __typename }"}, timeout=(3.0, timeout_sec))
+        r.raise_for_status()
+        data = r.json() if isinstance(r.json(), dict) else {}
+        return bool(isinstance(data, dict) and ("data" in data) and not data.get("errors"))
+    except Exception:
+        return False
 
 
 def _page_delay_sec() -> float:
@@ -327,16 +353,13 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
     discovery_cap = max(0, _env_int("MAX_DISCOVERY_POOLS_PER_PAIR_CHAIN", 0))
     native_eth_chains = _native_eth_query_chains()
     timeout_chains: set[str] = set()
-
-    for chain in chains:
+    def _scan_chain(chain: str, endpoint: str) -> None:
         if chain in timeout_chains:
             print(f"  [{chain}] skip: timeout blacklist")
-            continue
-        endpoint = get_endpoint(chain)
+            return
         if not endpoint:
             print(f"  [{chain}] skip: no endpoint")
-            continue
-
+            return
         chain_abort = False
         for base, quote in pairs:
             if chain_abort:
@@ -345,7 +368,6 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
             addr_b = resolve_token(chain, quote, endpoint, dynamic)
             if not addr_a or not addr_b:
                 continue
-
             addrs_a = [addr_a]
             if (
                 chain.lower() in native_eth_chains
@@ -360,7 +382,6 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 and addr_b.lower() != NATIVE_ETH
             ):
                 addrs_b.append(NATIVE_ETH)
-
             pools = []
             timed_out = False
             for a in addrs_a:
@@ -396,7 +417,6 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 timeout_chains.add(chain)
                 chain_abort = True
                 print(f"  [{chain}] timeout detected: skipping remaining pairs on this chain")
-
             kept = 0
             skipped_missing_price = 0
             for p in pools:
@@ -420,6 +440,22 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                     f"[warn] PRICE_FILTER_DROPPED chain={chain} pair={base}/{quote} "
                     f"count={skipped_missing_price}"
                 )
+
+    isolated_base = _base_v4_isolated_enabled() and ("base" in chains)
+    for chain in chains:
+        if isolated_base and chain == "base":
+            continue
+        _scan_chain(chain, get_endpoint(chain))
+
+    if isolated_base:
+        base_ep = _base_v4_override_endpoint()
+        if not base_ep:
+            print("  [base] v4 isolated: skip (V4_OVERRIDE_BASE is not set)")
+        elif not _quick_graphql_healthcheck(base_ep):
+            print("  [base] v4 isolated: skip (override healthcheck failed)")
+        else:
+            print("  [base] v4 isolated pipeline: enabled")
+            _scan_chain("base", base_ep)
 
     # дедупликация по (chain, id)
     seen = set()
