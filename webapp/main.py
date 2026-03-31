@@ -29145,6 +29145,7 @@ HTML_PAGE = """
                 </div>
                 <div class="chains-side">
                   <span class="meta-badge chains-meta-badge" id="chainsMeta">chains: -</span>
+                  <div class="hint" id="chainsNote" style="margin-top:6px">* base V4 не работает</div>
                 </div>
               </div>
             </div>
@@ -29173,8 +29174,8 @@ HTML_PAGE = """
                 <div class="filter-item">
                   <div class="hint">Protocol<br/>version</div>
                   <div class="proto-checks">
-                    <label><input id="protoV3" type="checkbox" checked/> V3</label>
-                    <label><input id="protoV4" type="checkbox" checked/> V4</label>
+                    <label><input id="protoV3" type="checkbox" checked onchange="updateChainsNote()"/> V3</label>
+                    <label><input id="protoV4" type="checkbox" checked onchange="updateChainsNote()"/> V4</label>
                   </div>
                 </div>
               </div>
@@ -30099,6 +30100,13 @@ HTML_PAGE = """
       return out;
     }
 
+    function updateChainsNote() {
+      const el = document.getElementById("chainsNote");
+      if (!el) return;
+      const v4On = !!document.getElementById("protoV4")?.checked;
+      el.style.display = v4On ? "" : "none";
+    }
+
     function getSelectedChains() {
       const allEl = document.getElementById("allChains");
       if (!allEl) return [];
@@ -30323,7 +30331,8 @@ HTML_PAGE = """
         checks.innerHTML = [
           `<label class="check"><input type="checkbox" id="allChains" onchange="toggleAllChains()"> all</label>`,
           ...availableChains.map(c => {
-            const lbl = String(c);
+            const raw = String(c);
+            const lbl = raw.toLowerCase() === "base" ? "base*" : raw;
             const isCheckedByDefault = true;
             return `<label class="check"><input type="checkbox" id="chain_${c}" ${isCheckedByDefault ? "checked" : ""} onchange="onChainToggle()"> ${lbl}</label>`;
           })
@@ -30331,6 +30340,7 @@ HTML_PAGE = """
         loadFormState();
         if (document.getElementById("allChains").checked) toggleAllChains();
         else onChainToggle();
+        updateChainsNote();
       } catch (e) {
         console.warn("meta load failed", e);
       }
