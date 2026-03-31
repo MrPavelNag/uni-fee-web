@@ -29204,7 +29204,6 @@ HTML_PAGE = """
             <div id="feesChart" class="plot"></div>
             <div id="tvlChart" class="plot"></div>
           </div>
-          <div id="poolRunDebug" class="info-box" style="display:none"></div>
         </div>
       </section>
 
@@ -29725,71 +29724,8 @@ HTML_PAGE = """
     function renderPoolRunDebug(result) {
       const el = document.getElementById("poolRunDebug");
       if (!el) return;
-      const dbg = (result && typeof result.debug_timing === "object" && result.debug_timing) ? result.debug_timing : null;
-      const req = (result && typeof result.request === "object" && result.request) ? result.request : null;
-      const flags = (result && typeof result.result_flags === "object" && result.result_flags) ? result.result_flags : {};
-      const logs = Array.isArray(result?.logs) ? result.logs.map((x) => String(x || "").trim()).filter(Boolean) : [];
-      if (!dbg && !logs.length && !Object.keys(flags).length && !req) {
-        el.style.display = "none";
-        el.innerHTML = "";
-        return;
-      }
-      const stage = (dbg && typeof dbg.stage_ms === "object" && dbg.stage_ms) ? dbg.stage_ms : {};
-      const stagePairs = Object.entries(stage)
-        .filter(([k, v]) => String(k || "") && Number.isFinite(Number(v)))
-        .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
-      const pairs = Array.isArray(dbg?.pairs) ? dbg.pairs : [];
-      const slowPair = pairs.length
-        ? pairs.slice().sort((a, b) => Number(b?.total_ms || 0) - Number(a?.total_ms || 0))[0]
-        : null;
-      const lines = [];
-      lines.push("<b>Pool Fee Performance debug</b>");
-      if (flags?.incomplete_discovery) {
-        lines.push("<span style='color:#b45309;font-weight:800'>warning: incomplete_discovery=1 (result not cached)</span>");
-      }
-      if (flags?.from_cache) {
-        lines.push("<span style='color:#0369a1;font-weight:800'>info: served_from_cache=1</span>");
-      }
-      const droppedNoReserves = (flags && typeof flags.dropped_no_reserves_by_chain === "object" && flags.dropped_no_reserves_by_chain)
-        ? flags.dropped_no_reserves_by_chain
-        : {};
-      const droppedEntries = Object.entries(droppedNoReserves)
-        .filter(([k, v]) => String(k || "").trim() && Number(v) > 0)
-        .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
-      if (droppedEntries.length) {
-        lines.push(
-          `<span style='color:#92400e'>excluded_no_reserves: ${
-            droppedEntries.map(([k, v]) => `${escAttr(String(k))}=${Number(v)}`).join(" | ")
-          }</span>`
-        );
-      }
-      if (req) {
-        const rqPairs = escAttr(String(req.pairs || "-"));
-        const rqMin = Number(req.min_tvl || 0);
-        const rqChains = Array.isArray(req.include_chains) ? req.include_chains.join(",") : "";
-        const rqVers = Array.isArray(req.include_versions) ? req.include_versions.join(",") : "";
-        lines.push(`request: pairs=${rqPairs} | min_tvl=${rqMin} | chains=${escAttr(rqChains || "all")} | versions=${escAttr(rqVers || "-")}`);
-      }
-      if (dbg) {
-        lines.push(`total_ms=${Number(dbg.total_ms || 0)}`);
-        if (stagePairs.length) {
-          lines.push(`stage_ms: ${stagePairs.map(([k, v]) => `${k}=${Number(v || 0)}`).join(" | ")}`);
-        }
-        if (slowPair) {
-          lines.push(`slowest_pair: ${escAttr(String(slowPair?.pair || "-"))} ${Number(slowPair?.total_ms || 0)}ms`);
-          const agents = Array.isArray(slowPair?.agents) ? slowPair.agents : [];
-          if (agents.length) {
-            lines.push(
-              `slow_pair_agents: ${agents.map((a) => `${escAttr(String(a?.script || "-"))}=${Number(a?.total_ms || 0)}ms (subprocess=${Number(a?.subprocess_ms || 0)}ms, pools=${Number(a?.pools_loaded || 0)})`).join(" | ")}`
-            );
-          }
-        }
-      }
-      if (logs.length) {
-        lines.push(`logs: ${logs.map((x) => escAttr(x)).join(" || ")}`);
-      }
-      el.innerHTML = lines.join("<br/>");
-      el.style.display = "";
+      el.style.display = "none";
+      el.innerHTML = "";
     }
 
     function setHomeSectionCollapsed(key, collapsed) {
