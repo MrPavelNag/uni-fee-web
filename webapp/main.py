@@ -78,6 +78,7 @@ except Exception:
     CATALOG_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
+PAIR_LISTS_CATALOG_PATH = CATALOG_DIR / "pair_lists_catalog.json"
 MAJOR_TOKENS_CACHE_PATH = CATALOG_DIR / "major_tokens_by_chain.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
 TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000000"))
@@ -16738,6 +16739,64 @@ def _build_token_catalog_from_merged_major(merged: dict[str, dict[str, str]], up
     }
 
 
+def _is_stablecoin_symbol(sym: str) -> bool:
+    s = str(sym or "").strip().lower()
+    if not s:
+        return False
+    return s in _STABLECOIN_SYMBOLS
+
+
+def _build_pair_lists_catalog_from_major(raw_major: dict[str, Any], updated_at: str) -> dict[str, Any]:
+    """
+    Build ranked stablecoin/token lists from the same major token cache used by token catalog.
+    Ranking is based on per-chain TVL order proxy (higher placement -> higher score).
+    """
+    score: dict[str, int] = {}
+    by_chain = raw_major.get("by_chain") if isinstance(raw_major, dict) else None
+    if isinstance(by_chain, dict):
+        for _chain, addr_to_sym in by_chain.items():
+            if not isinstance(addr_to_sym, dict):
+                continue
+            items = list(addr_to_sym.items())
+            n = len(items)
+            if n <= 0:
+                continue
+            for idx, (_addr, sym_raw) in enumerate(items):
+                sym = str(sym_raw or "").strip().lower()
+                if not _is_clean_symbol(sym):
+                    continue
+                # Earlier in the list means higher TVL on that chain/version.
+                weight = max(1, n - idx)
+                score[sym] = int(score.get(sym, 0)) + int(weight)
+
+    ranked = sorted(score.items(), key=lambda kv: (-int(kv[1] or 0), kv[0]))
+    stable_ranked = [sym for sym, _ in ranked if _is_stablecoin_symbol(sym)]
+    token_ranked = [sym for sym, _ in ranked if not _is_stablecoin_symbol(sym)]
+    return {
+        "updated_at": str(updated_at or _iso_now()),
+        "source": "major_tokens_top_n_rank_proxy",
+        "stablecoins": stable_ranked[:20],
+        "tokens": token_ranked[:20],
+        "stablecoins_full": stable_ranked[:200],
+        "tokens_full": token_ranked[:200],
+    }
+
+
+def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
+    cached = _read_json(PAIR_LISTS_CATALOG_PATH)
+    if not refresh and isinstance(cached, dict):
+        if isinstance(cached.get("stablecoins"), list) and isinstance(cached.get("tokens"), list):
+            return cached
+    raw_major = _read_json(MAJOR_TOKENS_CACHE_PATH) or {}
+    updated_at = str(raw_major.get("updated_at") or _iso_now())
+    out = _build_pair_lists_catalog_from_major(raw_major, updated_at)
+    try:
+        _write_json(PAIR_LISTS_CATALOG_PATH, out)
+    except Exception:
+        pass
+    return out
+
+
 def _fetch_tokens_by_chain_tvl(min_tvl_usd: float) -> tuple[set[str], dict[str, list[str]]]:
     all_tokens: set[str] = set()
     by_chain: dict[str, set[str]] = {}
@@ -16841,6 +16900,10 @@ def _refresh_catalogs_once() -> None:
         _load_token_catalog(refresh=True)
     except Exception as e:
         print(f"[catalog-refresh] tokens refresh failed: {e}")
+    try:
+        _load_pair_lists_catalog(refresh=True)
+    except Exception as e:
+        print(f"[catalog-refresh] pair lists refresh failed: {e}")
 
 
 def _catalog_stale(path: Path, max_age_sec: int) -> bool:
@@ -16866,6 +16929,7 @@ def _catalog_refresh_loop(interval_sec: int, run_on_startup: bool) -> None:
         not CHAIN_CATALOG_PATH.is_file()
         or (int(TOKENS_MAJOR_TOP_N or 0) > 0 and not MAJOR_TOKENS_CACHE_PATH.is_file())
         or not TOKEN_CATALOG_PATH.is_file()
+        or not PAIR_LISTS_CATALOG_PATH.is_file()
     ):
         _refresh_catalogs_once()
     while not CATALOG_REFRESH_STOP.wait(interval_sec):
@@ -17076,9 +17140,15 @@ def _pair_label_key(pair_label: str) -> tuple[str, str] | None:
 
 
 _TOKEN_SYMBOL_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
+RUN_PAIRS_LIMIT = max(1, min(400, int(os.environ.get("RUN_PAIRS_LIMIT", "120"))))
+
+_STABLECOIN_SYMBOLS = {
+    "usdc", "usdt", "dai", "frax", "fdusd", "pyusd", "usde", "susde", "usdp", "tusd", "gusd",
+    "lusd", "usdd", "usdbc", "usdt0", "rlusd", "eurc", "ageur", "usds", "usd0", "usdm",
+}
 
 
-def _clean_run_pairs(raw_pairs: list[str], *, limit: int = 4) -> list[str]:
+def _clean_run_pairs(raw_pairs: list[str], *, limit: int = RUN_PAIRS_LIMIT) -> list[str]:
     """Normalize and validate input pairs in form 'tokenA,tokenB'."""
     out: list[str] = []
     seen: set[str] = set()
@@ -17103,7 +17173,7 @@ def _clean_run_pairs(raw_pairs: list[str], *, limit: int = 4) -> list[str]:
     return out
 
 
-def _parse_run_pair_tuples(clean_pairs: list[str], *, limit: int = 4) -> list[tuple[str, str]]:
+def _parse_run_pair_tuples(clean_pairs: list[str], *, limit: int = RUN_PAIRS_LIMIT) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
     for pair in (clean_pairs or [])[: max(1, int(limit))]:
         part = str(pair or "").strip().lower()
@@ -17492,9 +17562,9 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         job["stage_label"] = f"Preparing parameters ({speed_mode})"
         job["progress"] = 5
 
-    # Build up to 4 selected token pairs.
+    # Build selected token pairs (bounded by RUN_PAIRS_LIMIT).
     t_pairs_parse0 = time.perf_counter()
-    pairs = _parse_run_pair_tuples(req.pairs, limit=4)
+    pairs = _parse_run_pair_tuples(req.pairs, limit=RUN_PAIRS_LIMIT)
     timing_debug["stage_ms"]["parse_pairs"] = int(round(max(0.0, time.perf_counter() - t_pairs_parse0) * 1000.0))
     if not pairs:
         with JOB_LOCK:
@@ -28242,9 +28312,18 @@ def admin_faq_publish(req: AdminFaqPublish, request: Request, response: Response
 def meta() -> dict[str, Any]:
     token_catalog = _load_token_catalog(refresh=False)
     chain_catalog = _load_chain_catalog(refresh=False)
+    pair_lists_catalog = _load_pair_lists_catalog(refresh=False)
     return {
         "tokens": token_catalog.get("items", []),
         "chains": chain_catalog.get("items", []),
+        "pair_lists": {
+            "updated_at": pair_lists_catalog.get("updated_at"),
+            "source": pair_lists_catalog.get("source", ""),
+            "stablecoins": pair_lists_catalog.get("stablecoins", []),
+            "tokens": pair_lists_catalog.get("tokens", []),
+            "stablecoins_full": pair_lists_catalog.get("stablecoins_full", []),
+            "tokens_full": pair_lists_catalog.get("tokens_full", []),
+        },
         "token_catalog": {
             "count": token_catalog.get("count", 0),
             "updated_at": token_catalog.get("updated_at"),
@@ -28334,7 +28413,7 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         req.exclude_suffixes = [str(x).strip() for x in (req.exclude_suffixes or []) if str(x).strip()]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid request payload: {str(e)[:120]}") from e
-    req.pairs = _clean_run_pairs(req.pairs, limit=4)
+    req.pairs = _clean_run_pairs(req.pairs, limit=RUN_PAIRS_LIMIT)
     if not req.pairs:
         raise HTTPException(status_code=400, detail="No valid pairs. Use token symbols like eth, usdc, wbtc, usdt (chars: a-z, 0-9, dot, underscore, dash).")
     if not os.environ.get("THE_GRAPH_API_KEY"):
@@ -28958,6 +29037,27 @@ HTML_PAGE = """
       box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18);
     }
     .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .pair-mode-line { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+    .pair-mode-line .check { font-size: 12px; }
+    .pair-builder-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      padding: 8px;
+      background: #f8fbff;
+      margin-bottom: 8px;
+    }
+    .pair-bucket {
+      border: 1px solid #dbe3ef;
+      border-radius: 8px;
+      padding: 8px;
+      background: #ffffff;
+    }
+    .pair-bucket .hint { margin-bottom: 6px; }
+    .pair-bucket select { margin-bottom: 6px; }
+    .pair-bucket input { margin-top: 4px; }
     .meta-badge { border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #475569; background: #f8fafc; }
     .info-chip {
       border: 1px solid #cbd5e1;
@@ -29106,13 +29206,41 @@ HTML_PAGE = """
       <section class="card control-card">
         <div class="form-grid">
           <div class="row">
-            <label title="Select up to 4 pairs for analysis">Pairs</label>
+            <label title="Manual: up to 4 pairs. Presets: each-to-each expansion">Pairs</label>
             <div>
+              <div class="pair-mode-line">
+                <label class="check"><input id="useManualPairs" type="checkbox" checked onchange="setPairInputMode('manual')"/> use pairs</label>
+                <label class="check"><input id="usePresetPairs" type="checkbox" onchange="setPairInputMode('preset')"/> use dropdown sets</label>
+              </div>
               <div class="top-line">
-                <button class="small-btn" onclick="addPairRow()">+ pair</button>
+                <button class="small-btn" id="addPairBtn" onclick="addPairRow()">+ pair</button>
                 <button class="small-btn" id="removePairBtn" onclick="removePairRow()">- pair</button>
                 <span class="meta-badge" id="tokensMeta">Top 500 tokens · …</span>
                 <span class="info-chip">Top-500 by token TVL (same as pool lookup) — manual symbols still work</span>
+              </div>
+              <div class="pair-builder-row" id="pairBuilderRow" style="display:none">
+                <div class="pair-bucket">
+                  <div class="hint">Stablecoin set</div>
+                  <select id="stableBucketMode" onchange="updatePairBuilderUi()">
+                    <option value="manual">stablecoin (manual)</option>
+                    <option value="top5">top 5 stablecoins</option>
+                    <option value="top10">top 10 stablecoins</option>
+                    <option value="top15">top 15 stablecoins</option>
+                    <option value="top20">top 20 stablecoins</option>
+                  </select>
+                  <input id="stableBucketManual" list="tokenHints" placeholder="e.g. usdt,usdc,dai"/>
+                </div>
+                <div class="pair-bucket">
+                  <div class="hint">Token set</div>
+                  <select id="tokenBucketMode" onchange="updatePairBuilderUi()">
+                    <option value="manual">token (manual)</option>
+                    <option value="top5">top 5 tokens</option>
+                    <option value="top10">top 10 tokens</option>
+                    <option value="top15">top 15 tokens</option>
+                    <option value="top20">top 20 tokens</option>
+                  </select>
+                  <input id="tokenBucketManual" list="tokenHints" placeholder="e.g. eth,wbtc,sol"/>
+                </div>
               </div>
               <div class="pair-row" id="pairRows">
                 <div class="pair-item" id="pairRow1">
@@ -29253,7 +29381,11 @@ HTML_PAGE = """
     let sortDesc = true;
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
-    const FIELD_IDS = ["pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b", "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "allChains", "runIgnoreCache"];
+    const FIELD_IDS = [
+      "pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b",
+      "useManualPairs", "usePresetPairs", "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
+      "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "allChains", "runIgnoreCache"
+    ];
     let availableChains = [];
     let colorMap = {};
     let dashMap = {};
@@ -29261,6 +29393,7 @@ HTML_PAGE = """
     let seriesByPool = {};
     let currentRequest = {};
     let pairRowsVisible = 1;
+    let pairPresetCatalog = {stablecoins: [], tokens: []};
     let authState = {authenticated: false};
     let hasScanRun = false;
     let scanTicker = null;
@@ -29332,7 +29465,7 @@ HTML_PAGE = """
     }
 
     async function apiFetchJson(url, opts = {}) {
-      const maxAttempts = 2;
+      const maxAttempts = 3;
       let lastResp = null;
       let lastParsed = {data: {}, rawText: ""};
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -29347,9 +29480,11 @@ HTML_PAGE = """
         const raw = String(parsed.rawText || "").trim();
         const isHtml = raw.startsWith("<!DOCTYPE") || raw.startsWith("<html") || raw.startsWith("<");
         const status = Number(resp.status || 0);
-        const isTransientHtml = isHtml && status >= 500 && status <= 599;
-        if (isTransientHtml && attempt < maxAttempts) {
-          await new Promise((r) => setTimeout(r, 700));
+        const isGatewayStatus = status === 502 || status === 503 || status === 504;
+        const isTransient = isGatewayStatus || (isHtml && status >= 500 && status <= 599);
+        if (isTransient && attempt < maxAttempts) {
+          const backoffMs = 700 * attempt;
+          await new Promise((r) => setTimeout(r, backoffMs));
           continue;
         }
         return {resp, parsed};
@@ -29899,6 +30034,16 @@ HTML_PAGE = """
             if (el) el.value = "";
           }
         }
+        const useManual = !!document.getElementById("useManualPairs")?.checked;
+        const usePreset = !!document.getElementById("usePresetPairs")?.checked;
+        if (!useManual && !usePreset) {
+          const manualEl = document.getElementById("useManualPairs");
+          if (manualEl) manualEl.checked = true;
+        } else if (useManual && usePreset) {
+          const presetEl = document.getElementById("usePresetPairs");
+          if (presetEl) presetEl.checked = false;
+        }
+        updatePairBuilderUi();
       } catch (e) {
         console.warn("load form state failed", e);
       }
@@ -29915,16 +30060,20 @@ HTML_PAGE = """
     }
 
     function updatePairRows() {
+      const useManual = !!document.getElementById("useManualPairs")?.checked;
       for (let i = 1; i <= 4; i++) {
         const row = document.getElementById(`pairRow${i}`);
         if (!row) continue;
         row.style.display = i <= pairRowsVisible ? "grid" : "none";
       }
+      const addBtn = document.getElementById("addPairBtn");
       const removeBtn = document.getElementById("removePairBtn");
-      if (removeBtn) removeBtn.disabled = pairRowsVisible <= 1;
+      if (addBtn) addBtn.disabled = !useManual;
+      if (removeBtn) removeBtn.disabled = !useManual || pairRowsVisible <= 1;
     }
 
     function addPairRow() {
+      if (!document.getElementById("useManualPairs")?.checked) return;
       if (pairRowsVisible < 4) {
         pairRowsVisible += 1;
         updatePairRows();
@@ -29933,6 +30082,7 @@ HTML_PAGE = """
     }
 
     function removePairRow() {
+      if (!document.getElementById("useManualPairs")?.checked) return;
       if (pairRowsVisible <= 1) return;
       for (const side of ["a", "b"]) {
         const el = document.getElementById(`pair${pairRowsVisible}${side}`);
@@ -29961,6 +30111,95 @@ HTML_PAGE = """
       saveFormState();
     }
 
+    function setPairInputMode(mode) {
+      const manualEl = document.getElementById("useManualPairs");
+      const presetEl = document.getElementById("usePresetPairs");
+      if (!manualEl || !presetEl) return;
+      if (mode === "preset") {
+        manualEl.checked = false;
+        presetEl.checked = true;
+      } else {
+        manualEl.checked = true;
+        presetEl.checked = false;
+      }
+      if (!manualEl.checked && !presetEl.checked) manualEl.checked = true;
+      updatePairBuilderUi();
+      saveFormState();
+    }
+
+    function updatePairBuilderUi() {
+      const useManual = !!document.getElementById("useManualPairs")?.checked;
+      const rowManual = document.getElementById("pairRows");
+      const rowBuilder = document.getElementById("pairBuilderRow");
+      if (rowManual) rowManual.style.display = useManual ? "grid" : "none";
+      if (rowBuilder) rowBuilder.style.display = useManual ? "none" : "grid";
+      const addBtn = document.getElementById("addPairBtn");
+      const remBtn = document.getElementById("removePairBtn");
+      if (addBtn) addBtn.disabled = !useManual;
+      if (remBtn) remBtn.disabled = !useManual || pairRowsVisible <= 1;
+      const stableMode = String(document.getElementById("stableBucketMode")?.value || "manual");
+      const tokenMode = String(document.getElementById("tokenBucketMode")?.value || "manual");
+      const stableInput = document.getElementById("stableBucketManual");
+      const tokenInput = document.getElementById("tokenBucketManual");
+      if (stableInput) stableInput.style.display = stableMode === "manual" ? "" : "none";
+      if (tokenInput) tokenInput.style.display = tokenMode === "manual" ? "" : "none";
+    }
+
+    function parseManualSymbols(text) {
+      return Array.from(new Set(
+        String(text || "")
+          .split(/[,\s;]+/g)
+          .map((x) => normalizePairToken(x))
+          .filter(Boolean)
+      ));
+    }
+
+    function sliceTopByMode(items, mode) {
+      const m = String(mode || "manual");
+      if (m === "top5") return (items || []).slice(0, 5);
+      if (m === "top10") return (items || []).slice(0, 10);
+      if (m === "top15") return (items || []).slice(0, 15);
+      if (m === "top20") return (items || []).slice(0, 20);
+      return [];
+    }
+
+    function resolvePairBucket(kind) {
+      const isStable = kind === "stable";
+      const mode = String(document.getElementById(isStable ? "stableBucketMode" : "tokenBucketMode")?.value || "manual");
+      if (mode === "manual") {
+        const input = document.getElementById(isStable ? "stableBucketManual" : "tokenBucketManual");
+        return parseManualSymbols(input?.value || "");
+      }
+      const source = isStable ? (pairPresetCatalog.stablecoins || []) : (pairPresetCatalog.tokens || []);
+      return sliceTopByMode(source, mode).map((x) => normalizePairToken(x)).filter(Boolean);
+    }
+
+    function validateBucketPairs() {
+      const stableInput = document.getElementById("stableBucketManual");
+      const tokenInput = document.getElementById("tokenBucketManual");
+      if (stableInput) stableInput.classList.remove("invalid-input");
+      if (tokenInput) tokenInput.classList.remove("invalid-input");
+      const left = resolvePairBucket("stable");
+      const right = resolvePairBucket("token");
+      if (!left.length || !right.length) {
+        if (!left.length && stableInput && String(document.getElementById("stableBucketMode")?.value || "") === "manual") stableInput.classList.add("invalid-input");
+        if (!right.length && tokenInput && String(document.getElementById("tokenBucketMode")?.value || "") === "manual") tokenInput.classList.add("invalid-input");
+        return {pairs: [], valid: false};
+      }
+      const out = [];
+      const seen = new Set();
+      for (const a of left) {
+        for (const b of right) {
+          if (!a || !b || a === b) continue;
+          const k = [a, b].sort().join("|");
+          if (seen.has(k)) continue;
+          seen.add(k);
+          out.push(`${a},${b}`);
+        }
+      }
+      return {pairs: out, valid: out.length > 0};
+    }
+
     function clearPairErrors() {
       for (let i = 1; i <= 4; i++) {
         for (const side of ["a", "b"]) {
@@ -29968,6 +30207,10 @@ HTML_PAGE = """
           if (el) el.classList.remove("invalid-input");
         }
       }
+      const stableInput = document.getElementById("stableBucketManual");
+      const tokenInput = document.getElementById("tokenBucketManual");
+      if (stableInput) stableInput.classList.remove("invalid-input");
+      if (tokenInput) tokenInput.classList.remove("invalid-input");
     }
 
     function validatePairs() {
@@ -29994,7 +30237,8 @@ HTML_PAGE = """
     }
 
     function getSelectedPairs() {
-      return validatePairs().pairs;
+      const useManual = !!document.getElementById("useManualPairs")?.checked;
+      return useManual ? validatePairs().pairs : validateBucketPairs().pairs;
     }
 
     function getChartScopeSuffix() {
@@ -30260,6 +30504,14 @@ HTML_PAGE = """
           document.getElementById("tokensMeta").textContent =
             `Popular tokens (TVL>${formatUsdShort(minTvl)}): ${symCount}, updated: ${meta.token_catalog?.updated_at || "-"}`;
         }
+        pairPresetCatalog = {
+          stablecoins: Array.isArray(meta?.pair_lists?.stablecoins_full) && meta.pair_lists.stablecoins_full.length
+            ? meta.pair_lists.stablecoins_full
+            : (meta?.pair_lists?.stablecoins || []),
+          tokens: Array.isArray(meta?.pair_lists?.tokens_full) && meta.pair_lists.tokens_full.length
+            ? meta.pair_lists.tokens_full
+            : (meta?.pair_lists?.tokens || []),
+        };
 
         availableChains = meta.chains || [];
         document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;
@@ -30277,6 +30529,7 @@ HTML_PAGE = """
         if (document.getElementById("allChains").checked) toggleAllChains();
         else onChainToggle();
         updateChainsNote();
+        updatePairBuilderUi();
       } catch (e) {
         console.warn("meta load failed", e);
       }
@@ -30308,7 +30561,13 @@ HTML_PAGE = """
       try {
         stopActivePoll();
         renderPoolRunDebug(null);
-        const pairCheck = validatePairs();
+        const useManual = !!document.getElementById("useManualPairs")?.checked;
+        const usePreset = !!document.getElementById("usePresetPairs")?.checked;
+        if ((useManual && usePreset) || (!useManual && !usePreset)) {
+          setStatus("Enable exactly one pair input mode.", "fail");
+          return;
+        }
+        const pairCheck = useManual ? validatePairs() : validateBucketPairs();
         const minTvlRaw = String(document.getElementById("minTvl").value ?? "").trim();
         const daysRaw = String(document.getElementById("days").value ?? "").trim();
         const maxFeeRaw = String(document.getElementById("maxFeePct").value ?? "").trim();
@@ -30352,7 +30611,10 @@ HTML_PAGE = """
           return;
         }
         if (!pairCheck.valid) {
-          setStatus("Invalid pairs: fill both tokens and avoid duplicates in a pair.", "fail");
+          setStatus(useManual
+            ? "Invalid pairs: fill both tokens and avoid duplicates in a pair."
+            : "Invalid dropdown sets: choose non-empty stable/token sets.",
+          "fail");
           return;
         }
 
