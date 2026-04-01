@@ -29211,6 +29211,7 @@ HTML_PAGE = """
               <div class="pair-mode-line">
                 <label class="check"><input id="useManualPairs" type="checkbox" checked onchange="setPairInputMode('manual')"/> use pairs</label>
                 <label class="check"><input id="usePresetPairs" type="checkbox" onchange="setPairInputMode('preset')"/> use dropdown sets</label>
+                <span class="meta-badge" id="pairListsMeta">pair lists: -</span>
               </div>
               <div class="top-line">
                 <button class="small-btn" id="addPairBtn" onclick="addPairRow()">+ pair</button>
@@ -29220,24 +29221,34 @@ HTML_PAGE = """
               </div>
               <div class="pair-builder-row" id="pairBuilderRow" style="display:none">
                 <div class="pair-bucket">
-                  <div class="hint">Stablecoin set</div>
+                  <div class="hint">Set A</div>
                   <select id="stableBucketMode" onchange="updatePairBuilderUi()">
-                    <option value="manual">stablecoin (manual)</option>
-                    <option value="top5">top 5 stablecoins</option>
-                    <option value="top10">top 10 stablecoins</option>
-                    <option value="top15">top 15 stablecoins</option>
-                    <option value="top20">top 20 stablecoins</option>
+                    <option value="stable_manual">stablecoin (manual)</option>
+                    <option value="stable_top5">top 5 stablecoins</option>
+                    <option value="stable_top10">top 10 stablecoins</option>
+                    <option value="stable_top15">top 15 stablecoins</option>
+                    <option value="stable_top20">top 20 stablecoins</option>
+                    <option value="token_manual">token (manual)</option>
+                    <option value="token_top5">top 5 tokens</option>
+                    <option value="token_top10">top 10 tokens</option>
+                    <option value="token_top15">top 15 tokens</option>
+                    <option value="token_top20">top 20 tokens</option>
                   </select>
                   <input id="stableBucketManual" list="tokenHints" placeholder="e.g. usdt,usdc,dai"/>
                 </div>
                 <div class="pair-bucket">
-                  <div class="hint">Token set</div>
+                  <div class="hint">Set B</div>
                   <select id="tokenBucketMode" onchange="updatePairBuilderUi()">
-                    <option value="manual">token (manual)</option>
-                    <option value="top5">top 5 tokens</option>
-                    <option value="top10">top 10 tokens</option>
-                    <option value="top15">top 15 tokens</option>
-                    <option value="top20">top 20 tokens</option>
+                    <option value="token_manual">token (manual)</option>
+                    <option value="token_top5">top 5 tokens</option>
+                    <option value="token_top10">top 10 tokens</option>
+                    <option value="token_top15">top 15 tokens</option>
+                    <option value="token_top20">top 20 tokens</option>
+                    <option value="stable_manual">stablecoin (manual)</option>
+                    <option value="stable_top5">top 5 stablecoins</option>
+                    <option value="stable_top10">top 10 stablecoins</option>
+                    <option value="stable_top15">top 15 stablecoins</option>
+                    <option value="stable_top20">top 20 stablecoins</option>
                   </select>
                   <input id="tokenBucketManual" list="tokenHints" placeholder="e.g. eth,wbtc,sol"/>
                 </div>
@@ -30137,12 +30148,20 @@ HTML_PAGE = """
       const remBtn = document.getElementById("removePairBtn");
       if (addBtn) addBtn.disabled = !useManual;
       if (remBtn) remBtn.disabled = !useManual || pairRowsVisible <= 1;
-      const stableMode = String(document.getElementById("stableBucketMode")?.value || "manual");
-      const tokenMode = String(document.getElementById("tokenBucketMode")?.value || "manual");
+      const stableMode = String(document.getElementById("stableBucketMode")?.value || "stable_manual");
+      const tokenMode = String(document.getElementById("tokenBucketMode")?.value || "token_manual");
       const stableInput = document.getElementById("stableBucketManual");
       const tokenInput = document.getElementById("tokenBucketManual");
-      if (stableInput) stableInput.style.display = stableMode === "manual" ? "" : "none";
-      if (tokenInput) tokenInput.style.display = tokenMode === "manual" ? "" : "none";
+      if (stableInput) {
+        const isStableManual = String(stableMode).startsWith("stable_");
+        stableInput.style.display = isManualMode(stableMode) ? "" : "none";
+        stableInput.placeholder = isStableManual ? "e.g. usdt,usdc,dai" : "e.g. eth,wbtc,sol";
+      }
+      if (tokenInput) {
+        const isStableManual = String(tokenMode).startsWith("stable_");
+        tokenInput.style.display = isManualMode(tokenMode) ? "" : "none";
+        tokenInput.placeholder = isStableManual ? "e.g. usdt,usdc,dai" : "e.g. eth,wbtc,sol";
+      }
     }
 
     function parseManualSymbols(text) {
@@ -30154,24 +30173,37 @@ HTML_PAGE = """
       ));
     }
 
-    function sliceTopByMode(items, mode) {
-      const m = String(mode || "manual");
-      if (m === "top5") return (items || []).slice(0, 5);
-      if (m === "top10") return (items || []).slice(0, 10);
-      if (m === "top15") return (items || []).slice(0, 15);
-      if (m === "top20") return (items || []).slice(0, 20);
-      return [];
+    function topCountFromMode(mode) {
+      const m = String(mode || "");
+      if (m.endsWith("_top5")) return 5;
+      if (m.endsWith("_top10")) return 10;
+      if (m.endsWith("_top15")) return 15;
+      if (m.endsWith("_top20")) return 20;
+      return 0;
     }
 
-    function resolvePairBucket(kind) {
-      const isStable = kind === "stable";
-      const mode = String(document.getElementById(isStable ? "stableBucketMode" : "tokenBucketMode")?.value || "manual");
-      if (mode === "manual") {
-        const input = document.getElementById(isStable ? "stableBucketManual" : "tokenBucketManual");
-        return parseManualSymbols(input?.value || "");
+    function isManualMode(mode) {
+      return String(mode || "").endsWith("_manual");
+    }
+
+    function parseBucketSource(mode) {
+      return String(mode || "").startsWith("stable_") ? "stable" : "token";
+    }
+
+    function resolvePairBucket(side) {
+      const isLeft = side === "left";
+      const modeEl = document.getElementById(isLeft ? "stableBucketMode" : "tokenBucketMode");
+      const inputEl = document.getElementById(isLeft ? "stableBucketManual" : "tokenBucketManual");
+      const mode = String(modeEl?.value || "token_manual");
+      if (isManualMode(mode)) {
+        return parseManualSymbols(inputEl?.value || "");
       }
-      const source = isStable ? (pairPresetCatalog.stablecoins || []) : (pairPresetCatalog.tokens || []);
-      return sliceTopByMode(source, mode).map((x) => normalizePairToken(x)).filter(Boolean);
+      const sourceKind = parseBucketSource(mode);
+      const source = sourceKind === "stable"
+        ? (pairPresetCatalog.stablecoins || [])
+        : (pairPresetCatalog.tokens || []);
+      const count = topCountFromMode(mode);
+      return (source || []).slice(0, count).map((x) => normalizePairToken(x)).filter(Boolean);
     }
 
     function validateBucketPairs() {
@@ -30179,11 +30211,13 @@ HTML_PAGE = """
       const tokenInput = document.getElementById("tokenBucketManual");
       if (stableInput) stableInput.classList.remove("invalid-input");
       if (tokenInput) tokenInput.classList.remove("invalid-input");
-      const left = resolvePairBucket("stable");
-      const right = resolvePairBucket("token");
+      const leftMode = String(document.getElementById("stableBucketMode")?.value || "stable_manual");
+      const rightMode = String(document.getElementById("tokenBucketMode")?.value || "token_manual");
+      const left = resolvePairBucket("left");
+      const right = resolvePairBucket("right");
       if (!left.length || !right.length) {
-        if (!left.length && stableInput && String(document.getElementById("stableBucketMode")?.value || "") === "manual") stableInput.classList.add("invalid-input");
-        if (!right.length && tokenInput && String(document.getElementById("tokenBucketMode")?.value || "") === "manual") tokenInput.classList.add("invalid-input");
+        if (!left.length && stableInput && isManualMode(leftMode)) stableInput.classList.add("invalid-input");
+        if (!right.length && tokenInput && isManualMode(rightMode)) tokenInput.classList.add("invalid-input");
         return {pairs: [], valid: false};
       }
       const out = [];
@@ -30512,6 +30546,13 @@ HTML_PAGE = """
             ? meta.pair_lists.tokens_full
             : (meta?.pair_lists?.tokens || []),
         };
+        const stCount = Number((meta?.pair_lists?.stablecoins_full || meta?.pair_lists?.stablecoins || []).length || 0);
+        const tkCount = Number((meta?.pair_lists?.tokens_full || meta?.pair_lists?.tokens || []).length || 0);
+        const plUpdated = String(meta?.pair_lists?.updated_at || "-");
+        const plBadge = document.getElementById("pairListsMeta");
+        if (plBadge) {
+          plBadge.textContent = `pair lists: stable ${stCount}, tokens ${tkCount}, updated: ${plUpdated}`;
+        }
 
         availableChains = meta.chains || [];
         document.getElementById("chainsMeta").textContent = `chains: ${meta.chain_catalog?.count || 0}, updated: ${meta.chain_catalog?.updated_at || "-"}`;
