@@ -16746,12 +16746,27 @@ def _is_stablecoin_symbol(sym: str) -> bool:
     return s in _STABLECOIN_SYMBOLS
 
 
-def _build_pair_lists_catalog_from_major(raw_major: dict[str, Any], updated_at: str) -> dict[str, Any]:
+def _curated_token_symbols() -> set[str]:
+    return {
+        str(sym or "").strip().lower()
+        for sym in _supported_tokens()
+        if _is_clean_symbol(str(sym or "").strip())
+    }
+
+
+def _build_pair_lists_catalog_from_major(
+    raw_major: dict[str, Any],
+    updated_at: str,
+    *,
+    allowed_symbols: set[str] | None = None,
+    source: str = "major_tokens_top_n_rank_proxy",
+) -> dict[str, Any]:
     """
     Build ranked stablecoin/token lists from the same major token cache used by token catalog.
     Ranking is based on per-chain TVL order proxy (higher placement -> higher score).
     """
     score: dict[str, int] = {}
+    allowed = {str(s).strip().lower() for s in (allowed_symbols or set()) if _is_clean_symbol(str(s).strip())}
     by_chain = raw_major.get("by_chain") if isinstance(raw_major, dict) else None
     if isinstance(by_chain, dict):
         for _chain, addr_to_sym in by_chain.items():
@@ -16765,6 +16780,8 @@ def _build_pair_lists_catalog_from_major(raw_major: dict[str, Any], updated_at: 
                 sym = str(sym_raw or "").strip().lower()
                 if not _is_clean_symbol(sym):
                     continue
+                if allowed and sym not in allowed:
+                    continue
                 # Earlier in the list means higher TVL on that chain/version.
                 weight = max(1, n - idx)
                 score[sym] = int(score.get(sym, 0)) + int(weight)
@@ -16774,7 +16791,7 @@ def _build_pair_lists_catalog_from_major(raw_major: dict[str, Any], updated_at: 
     token_ranked = [sym for sym, _ in ranked if not _is_stablecoin_symbol(sym)]
     return {
         "updated_at": str(updated_at or _iso_now()),
-        "source": "major_tokens_top_n_rank_proxy",
+        "source": str(source or "major_tokens_top_n_rank_proxy"),
         "stablecoins": stable_ranked[:20],
         "tokens": token_ranked[:20],
         "stablecoins_full": stable_ranked[:200],
@@ -16789,7 +16806,27 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
             return cached
     raw_major = _read_json(MAJOR_TOKENS_CACHE_PATH) or {}
     updated_at = str(raw_major.get("updated_at") or _iso_now())
-    out = _build_pair_lists_catalog_from_major(raw_major, updated_at)
+    allowed = _curated_token_symbols()
+    source_parts = ["major_tokens_top_n_rank_proxy", "curated"]
+    try:
+        verified_all, _ = _fetch_uniswap_verified_tokens()
+        verified_clean = {
+            str(s).strip().lower()
+            for s in (verified_all or set())
+            if _is_clean_symbol(str(s).strip())
+        }
+        if verified_clean:
+            allowed.update(verified_clean)
+            source_parts.append("verified")
+    except Exception:
+        # Keep working with curated-only allowlist when verified list fetch fails.
+        pass
+    out = _build_pair_lists_catalog_from_major(
+        raw_major,
+        updated_at,
+        allowed_symbols=allowed,
+        source="+".join(source_parts),
+    )
     try:
         _write_json(PAIR_LISTS_CATALOG_PATH, out)
     except Exception:
@@ -29221,7 +29258,6 @@ HTML_PAGE = """
               </div>
               <div class="pair-builder-row" id="pairBuilderRow" style="display:none">
                 <div class="pair-bucket">
-                  <div class="hint">Set A</div>
                   <select id="stableBucketMode" onchange="updatePairBuilderUi()">
                     <option value="stable_manual">stablecoin (manual)</option>
                     <option value="stable_top5">top 5 stablecoins</option>
@@ -29237,7 +29273,6 @@ HTML_PAGE = """
                   <input id="stableBucketManual" list="tokenHints" placeholder="e.g. usdt,usdc,dai"/>
                 </div>
                 <div class="pair-bucket">
-                  <div class="hint">Set B</div>
                   <select id="tokenBucketMode" onchange="updatePairBuilderUi()">
                     <option value="token_manual">token (manual)</option>
                     <option value="token_top5">top 5 tokens</option>

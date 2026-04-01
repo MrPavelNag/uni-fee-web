@@ -1,0 +1,7 @@
+{
+  "updated_at": "2026-04-01T23:26:15Z",
+  "top_n": 500,
+  "min_tvl_usd": 0.0,
+  "by_chain": {},
+  "source": "subgraph_v3_v4_top_n"
+}
