@@ -79,7 +79,7 @@ except Exception:
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 PAIR_LISTS_CATALOG_PATH = CATALOG_DIR / "pair_lists_catalog.json"
-PAIR_LISTS_SCHEMA_VERSION = 11
+PAIR_LISTS_SCHEMA_VERSION = 14
 MAJOR_TOKENS_CACHE_PATH = CATALOG_DIR / "major_tokens_by_chain.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
 TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000000"))
@@ -16783,6 +16783,18 @@ _COINS_PROTECT_ALLOWLIST = {
 _PAIR_LIST_BLOCKED_SYMBOLS = {"test", "unknown"}
 
 
+def _normalize_pair_list_symbol_key(sym: str) -> str:
+    s = str(sym or "").strip().lower()
+    if not s:
+        return ""
+    alias = {
+        "weth": "eth",
+        "weth.e": "eth",
+        "weth9": "eth",
+    }
+    return alias.get(s, s)
+
+
 def _fetch_coingecko_category_symbols(category_id: str, *, max_pages: int = 2, per_page: int = 250) -> set[str]:
     import json
 
@@ -16856,7 +16868,7 @@ def _fetch_coinpaprika_tag_symbols(tag_id: str) -> set[str]:
     return out
 
 
-def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], list[str], set[str], set[str]]:
+def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], list[str], list[str], set[str], set[str]]:
     import json
 
     req = UrlRequest(_DEFI_LLAMA_STABLECOINS_API, headers={"User-Agent": APP_USER_AGENT, "Accept": "application/json"})
@@ -16868,6 +16880,7 @@ def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], li
     usd_fiat_backed: set[str] = set()
     usd_algo_crypto_backed: set[str] = set()
     usd_ranked_pairs: list[tuple[float, str]] = []
+    nonusd_ranked_pairs: list[tuple[float, str]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -16902,15 +16915,39 @@ def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], li
             usd_ranked_pairs.append((circ, sym))
         elif peg.startswith("pegged") and peg not in {"peggedusd", "peggedvar"}:
             nonusd_stables.add(sym)
+            circ_raw = row.get("circulating")
+            circ = 0.0
+            if isinstance(circ_raw, dict):
+                for k, v in circ_raw.items():
+                    if str(k or "").strip().lower() == peg:
+                        try:
+                            circ = float(v or 0.0)
+                        except (TypeError, ValueError):
+                            circ = 0.0
+                        break
+            else:
+                try:
+                    circ = float(circ_raw or 0.0)
+                except (TypeError, ValueError):
+                    circ = 0.0
+            nonusd_ranked_pairs.append((circ, sym))
     usd_ranked_pairs.sort(key=lambda x: (-float(x[0]), x[1]))
+    nonusd_ranked_pairs.sort(key=lambda x: (-float(x[0]), x[1]))
     usd_ranked: list[str] = []
+    nonusd_ranked: list[str] = []
     seen: set[str] = set()
     for _circ, sym in usd_ranked_pairs:
         if sym in seen:
             continue
         seen.add(sym)
         usd_ranked.append(sym)
-    return usd_stables, nonusd_stables, usd_ranked, usd_fiat_backed, usd_algo_crypto_backed
+    seen2: set[str] = set()
+    for _circ, sym in nonusd_ranked_pairs:
+        if sym in seen2:
+            continue
+        seen2.add(sym)
+        nonusd_ranked.append(sym)
+    return usd_stables, nonusd_stables, usd_ranked, nonusd_ranked, usd_fiat_backed, usd_algo_crypto_backed
 
 
 def _classify_ranked_symbols(
@@ -16922,13 +16959,19 @@ def _classify_ranked_symbols(
     commodity_symbols: set[str] | None = None,
     nonusd_fiat_symbols: set[str] | None = None,
     meme_symbols: set[str] | None = None,
+    meme_excluded_symbols: set[str] | None = None,
 ) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str]]:
-    usd_stables = {str(s).strip().lower() for s in (usd_stable_symbols or set()) if _is_clean_symbol(str(s).strip())}
-    fiat_usd = {str(s).strip().lower() for s in (fiat_usd_stable_symbols or set()) if _is_clean_symbol(str(s).strip())}
-    algo_usd = {str(s).strip().lower() for s in (algo_crypto_usd_stable_symbols or set()) if _is_clean_symbol(str(s).strip())}
-    commodity_syms = {str(s).strip().lower() for s in (commodity_symbols or set()) if _is_clean_symbol(str(s).strip())}
-    nonusd_syms = {str(s).strip().lower() for s in (nonusd_fiat_symbols or set()) if _is_clean_symbol(str(s).strip())}
-    meme_syms = {str(s).strip().lower() for s in (meme_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    usd_stables = {_normalize_pair_list_symbol_key(s) for s in (usd_stable_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    fiat_usd = {_normalize_pair_list_symbol_key(s) for s in (fiat_usd_stable_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    algo_usd = {_normalize_pair_list_symbol_key(s) for s in (algo_crypto_usd_stable_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    commodity_syms = {_normalize_pair_list_symbol_key(s) for s in (commodity_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    nonusd_syms = {_normalize_pair_list_symbol_key(s) for s in (nonusd_fiat_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    meme_syms = {_normalize_pair_list_symbol_key(s) for s in (meme_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    meme_excluded = {
+        _normalize_pair_list_symbol_key(s)
+        for s in (meme_excluded_symbols or set())
+        if _is_clean_symbol(str(s).strip())
+    }
     stable_fiat_ranked: list[str] = []
     stable_algo_ranked: list[str] = []
     token_ranked: list[str] = []
@@ -16941,12 +16984,13 @@ def _classify_ranked_symbols(
             continue
         if s in _PAIR_LIST_BLOCKED_SYMBOLS:
             continue
-        is_commodity = s in commodity_syms
-        is_nonusd = s in nonusd_syms
-        is_usd_stable = _is_stablecoin_symbol(s) or s in usd_stables
-        is_algo_usd = s in algo_usd
-        is_fiat_usd = (s in fiat_usd) or (is_usd_stable and not is_algo_usd)
-        is_meme = s in meme_syms
+        s_norm = _normalize_pair_list_symbol_key(s)
+        is_commodity = s_norm in commodity_syms
+        is_nonusd = s_norm in nonusd_syms
+        is_usd_stable = _is_stablecoin_symbol(s_norm) or (s_norm in usd_stables)
+        is_algo_usd = s_norm in algo_usd
+        is_fiat_usd = (s_norm in fiat_usd) or (is_usd_stable and not is_algo_usd)
+        is_meme = (s_norm in meme_syms) and (s_norm not in meme_excluded)
         # Meme bucket must not absorb symbols that are already classified as stable/commodity/non-USD.
         if is_meme and (not is_usd_stable) and (not is_commodity) and (not is_nonusd):
             meme_ranked.append(s)
@@ -16973,8 +17017,8 @@ def _build_pair_lists_catalog_from_major(
     updated_at: str,
     *,
     allowed_symbols: set[str] | None = None,
-    stable_fallback_ranked: list[str] | None = None,
     preferred_coin_symbols: set[str] | None = None,
+    meme_excluded_symbols: set[str] | None = None,
     usd_stable_symbols: set[str] | None = None,
     fiat_usd_stable_symbols: set[str] | None = None,
     algo_crypto_usd_stable_symbols: set[str] | None = None,
@@ -16989,8 +17033,21 @@ def _build_pair_lists_catalog_from_major(
     """
     score: dict[str, int] = {}
     allowed = None
+    stable_like_bypass: set[str] = set()
     if allowed_symbols:
         allowed = {str(s).strip().lower() for s in (allowed_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    # Keep stable/pegged categories TVL-ranked even when verified token list is incomplete.
+    for sset in (
+        usd_stable_symbols or set(),
+        fiat_usd_stable_symbols or set(),
+        algo_crypto_usd_stable_symbols or set(),
+        nonusd_fiat_symbols or set(),
+        commodity_symbols or set(),
+    ):
+        for s in sset:
+            ss = str(s or "").strip().lower()
+            if _is_clean_symbol(ss):
+                stable_like_bypass.add(ss)
     by_chain = raw_major.get("by_chain") if isinstance(raw_major, dict) else None
     if isinstance(by_chain, dict):
         for _chain, addr_to_sym in by_chain.items():
@@ -17004,19 +17061,13 @@ def _build_pair_lists_catalog_from_major(
                 sym = str(sym_raw or "").strip().lower()
                 if not _is_clean_symbol(sym):
                     continue
-                if allowed is not None and sym not in allowed:
+                if allowed is not None and sym not in allowed and sym not in stable_like_bypass:
                     continue
                 # Earlier in the list means higher TVL on that chain/version.
                 weight = max(1, n - idx)
                 score[sym] = int(score.get(sym, 0)) + int(weight)
 
     ranked = [str(sym or "").strip().lower() for sym, _ in sorted(score.items(), key=lambda kv: (-int(kv[1] or 0), kv[0]))]
-    if (not ranked) and stable_fallback_ranked:
-        ranked = [
-            str(sym or "").strip().lower()
-            for sym in (stable_fallback_ranked or [])
-            if _is_clean_symbol(str(sym or "").strip()) and str(sym or "").strip().lower() not in _PAIR_LIST_BLOCKED_SYMBOLS
-        ]
     stable_fiat_ranked, stable_algo_ranked, token_ranked, commodity_ranked, fiat_nonusd_ranked, meme_ranked = _classify_ranked_symbols(
         ranked,
         usd_stable_symbols=usd_stable_symbols,
@@ -17025,29 +17076,8 @@ def _build_pair_lists_catalog_from_major(
         commodity_symbols=commodity_symbols,
         nonusd_fiat_symbols=nonusd_fiat_symbols,
         meme_symbols=meme_symbols,
+        meme_excluded_symbols=meme_excluded_symbols,
     )
-    if stable_fallback_ranked and (len(stable_fiat_ranked) + len(stable_algo_ranked) < 200):
-        # TVL rank from major cache is primary. DefiLlama USD-peg rank is only a
-        # fallback filler when TVL-ranked stables are missing/insufficient.
-        seen_stable = set(stable_fiat_ranked) | set(stable_algo_ranked)
-        algo_set = {
-            str(s).strip().lower()
-            for s in (algo_crypto_usd_stable_symbols or set())
-            if _is_clean_symbol(str(s).strip())
-        }
-        for sym in stable_fallback_ranked:
-            s = str(sym or "").strip().lower()
-            if (not _is_clean_symbol(s)) or (s in _PAIR_LIST_BLOCKED_SYMBOLS):
-                continue
-            if s in seen_stable:
-                continue
-            if s in algo_set:
-                stable_algo_ranked.append(s)
-            else:
-                stable_fiat_ranked.append(s)
-            seen_stable.add(s)
-            if (len(stable_fiat_ranked) + len(stable_algo_ranked)) >= 200:
-                break
     if preferred_coin_symbols:
         preferred = {
             str(s).strip().lower()
@@ -17062,12 +17092,6 @@ def _build_pair_lists_catalog_from_major(
         filtered_tokens = [s for s in token_ranked if (s in preferred) or (s in allow_keep)]
         if filtered_tokens:
             token_ranked = filtered_tokens
-    for sym in sorted(_COMMODITY_STABLE_SYMBOLS):
-        if sym not in commodity_ranked:
-            commodity_ranked.append(sym)
-    for sym in sorted(_NON_USD_FIAT_STABLE_SYMBOLS):
-        if sym not in fiat_nonusd_ranked:
-            fiat_nonusd_ranked.append(sym)
     return {
         "schema_version": int(PAIR_LISTS_SCHEMA_VERSION),
         "updated_at": str(updated_at or _iso_now()),
@@ -17103,7 +17127,7 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
     raw_major = _read_json(MAJOR_TOKENS_CACHE_PATH) or {}
     updated_at = str(raw_major.get("updated_at") or _iso_now())
     allowed = None
-    stable_fallback_ranked: list[str] = []
+    meme_excluded_symbols: set[str] = set(_COINS_PROTECT_ALLOWLIST)
     preferred_coin_symbols: set[str] | None = None
     usd_stable_symbols: set[str] = set(_STABLECOIN_SYMBOLS)
     fiat_usd_stable_symbols: set[str] = set(_STABLECOIN_SYMBOLS)
@@ -17132,6 +17156,7 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         )
         if cg_top:
             preferred_coin_symbols = set(cg_top)
+            meme_excluded_symbols.update(cg_top)
             source_parts.append("coingecko_top_mcap")
         else:
             source_parts.append("coingecko_top_mcap_empty")
@@ -17181,14 +17206,13 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         (
             usd_from_llama,
             nonusd_from_llama,
-            usd_ranked_from_llama,
+            _usd_ranked_from_llama,
+            _nonusd_ranked_from_llama,
             fiat_from_llama,
             algo_from_llama,
         ) = _fetch_defillama_stablecoin_symbol_classes()
         if usd_from_llama:
             usd_stable_symbols.update(usd_from_llama)
-        if usd_ranked_from_llama:
-            stable_fallback_ranked = list(usd_ranked_from_llama)
         if fiat_from_llama:
             fiat_usd_stable_symbols.update(fiat_from_llama)
         if algo_from_llama:
@@ -17202,8 +17226,8 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         raw_major,
         updated_at,
         allowed_symbols=allowed,
-        stable_fallback_ranked=stable_fallback_ranked,
         preferred_coin_symbols=preferred_coin_symbols,
+        meme_excluded_symbols=meme_excluded_symbols,
         usd_stable_symbols=usd_stable_symbols,
         fiat_usd_stable_symbols=fiat_usd_stable_symbols,
         algo_crypto_usd_stable_symbols=algo_crypto_usd_stable_symbols,
