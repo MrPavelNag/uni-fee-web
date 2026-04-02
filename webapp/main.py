@@ -101,7 +101,7 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-APP_VERSION = "0.1.67"
+APP_VERSION = "0.1.71"
 APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
@@ -17357,6 +17357,96 @@ def _run_agent_and_load_timed(
     return data, dbg
 
 
+def _pair_worker_count(speed_mode: str, total_pairs: int) -> int:
+    key = "WEB_MAX_PAIR_WORKERS_FAST" if str(speed_mode) == "fast" else "WEB_MAX_PAIR_WORKERS_NORMAL"
+    default_val = "3" if str(speed_mode) == "fast" else "2"
+    try:
+        cfg = int(os.environ.get(key, default_val))
+    except Exception:
+        cfg = int(default_val)
+    return max(1, min(max(1, int(total_pairs or 1)), max(1, min(6, int(cfg)))))
+
+
+def _run_single_pair_scan(
+    *,
+    pair_index: int,
+    total_pairs: int,
+    pair_tokens: tuple[str, str],
+    base_env: dict[str, str],
+    min_tvl: float,
+    run_v3: bool,
+    run_v4: bool,
+) -> tuple[dict[str, dict], dict[str, Any], list[str]]:
+    a, b = pair_tokens
+    t_pair0 = time.perf_counter()
+    pair_str = f"{a},{b}"
+    pair_suffix = pairs_to_filename_suffix(pair_str)
+    env = dict(base_env)
+    env["TOKEN_PAIRS"] = pair_str
+    pair_logs: list[str] = []
+    pair_dbg: dict[str, Any] = {
+        "pair": pair_str,
+        "index": int(pair_index),
+        "agents": [],
+        "merged_before": 0,
+        "merged_after": 0,
+        "merged_added": 0,
+    }
+    merged_piece: dict[str, dict] = {}
+    if run_v3 and run_v4:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_v3 = ex.submit(
+                _run_agent_and_load_timed,
+                script_name="agent_v3.py",
+                env=dict(env),
+                min_tvl=min_tvl,
+                logs=pair_logs,
+                pair_suffix=pair_suffix,
+            )
+            f_v4 = ex.submit(
+                _run_agent_and_load_timed,
+                script_name="agent_v4.py",
+                env=dict(env),
+                min_tvl=min_tvl,
+                logs=pair_logs,
+                pair_suffix=pair_suffix,
+            )
+            data_v3, dbg_v3 = f_v3.result()
+            data_v4, dbg_v4 = f_v4.result()
+            pair_dbg["agents"].append(dbg_v3)
+            pair_dbg["agents"].append(dbg_v4)
+            merged_piece.update(data_v3)
+            merged_piece.update(data_v4)
+    else:
+        if run_v3:
+            data_v3, dbg_v3 = _run_agent_and_load_timed(
+                script_name="agent_v3.py",
+                env=env,
+                min_tvl=min_tvl,
+                logs=pair_logs,
+                pair_suffix=pair_suffix,
+            )
+            pair_dbg["agents"].append(dbg_v3)
+            merged_piece.update(data_v3)
+        if run_v4:
+            data_v4, dbg_v4 = _run_agent_and_load_timed(
+                script_name="agent_v4.py",
+                env=env,
+                min_tvl=min_tvl,
+                logs=pair_logs,
+                pair_suffix=pair_suffix,
+            )
+            pair_dbg["agents"].append(dbg_v4)
+            merged_piece.update(data_v4)
+    pair_dbg["merged_after"] = int(len(merged_piece))
+    pair_dbg["merged_added"] = int(len(merged_piece))
+    pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
+    pair_logs.append(
+        f"[timing] pair {pair_index}/{max(1, total_pairs)} {pair_str}: total={int(pair_dbg['total_ms'])}ms merged={int(len(merged_piece))}"
+    )
+    return merged_piece, pair_dbg, pair_logs
+
+
 def _build_run_job_env(
     *,
     req: "PoolsRunRequest",
@@ -17415,6 +17505,25 @@ def _build_run_job_env(
     env["V4_SKIP_CHAIN_AFTER_TIMEOUT"] = os.environ.get(
         "WEB_V4_SKIP_CHAIN_AFTER_TIMEOUT",
         "1",
+    )
+    # Fail-fast package: tighter endpoint checks and smaller Base fallback scan window.
+    env["V3_ENDPOINT_HEALTHCHECK"] = os.environ.get("WEB_V3_ENDPOINT_HEALTHCHECK", "1")
+    env["V4_ENDPOINT_HEALTHCHECK"] = os.environ.get("WEB_V4_ENDPOINT_HEALTHCHECK", "1")
+    env["V3_ENDPOINT_HEALTHCHECK_TIMEOUT_SEC"] = os.environ.get(
+        "WEB_V3_ENDPOINT_HEALTHCHECK_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_V3_ENDPOINT_HEALTHCHECK_TIMEOUT_SEC_NORMAL",
+        "3" if speed_mode == "fast" else "4",
+    )
+    env["BASE_V4_HEALTHCHECK_TIMEOUT_SEC"] = os.environ.get(
+        "WEB_BASE_V4_HEALTHCHECK_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_BASE_V4_HEALTHCHECK_TIMEOUT_SEC_NORMAL",
+        "3" if speed_mode == "fast" else "4",
+    )
+    env["V3_BASE_LIGHT_SCAN_PAGES"] = os.environ.get(
+        "WEB_V3_BASE_LIGHT_SCAN_PAGES_FAST" if speed_mode == "fast" else "WEB_V3_BASE_LIGHT_SCAN_PAGES_NORMAL",
+        "2" if speed_mode == "fast" else "3",
+    )
+    env["V3_BASE_FALLBACK_READ_TIMEOUT_SEC"] = os.environ.get(
+        "WEB_V3_BASE_FALLBACK_READ_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_V3_BASE_FALLBACK_READ_TIMEOUT_SEC_NORMAL",
+        "4" if speed_mode == "fast" else "6",
     )
     # v4 endpoint config uses this list at import-time.
     # When UI sends "all chains", include_chains is empty; in that case force all known v4 chains.
@@ -17736,72 +17845,56 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             timing_debug["stage_ms"]["run_lock_wait"] = int(round(max(0.0, time.perf_counter() - t_lock_wait0) * 1000.0))
             t_agents_total0 = time.perf_counter()
             total_pairs = max(1, len(pairs))
-            for idx, (a, b) in enumerate(pairs, start=1):
-                t_pair0 = time.perf_counter()
-                pair_str = f"{a},{b}"
-                pair_suffix = pairs_to_filename_suffix(pair_str)
-                env["TOKEN_PAIRS"] = pair_str
-                pair_dbg: dict[str, Any] = {
-                    "pair": pair_str,
-                    "index": int(idx),
-                    "agents": [],
-                    "merged_before": int(len(merged_raw)),
-                }
-
-                base_progress = int(10 + (idx - 1) * (65 / total_pairs))
-                if run_v3 and run_v4:
-                    _set_stage("v3v4", f"Running v3+v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 18))
-
-                    with ThreadPoolExecutor(max_workers=2) as ex:
-                        f_v3 = ex.submit(
-                            _run_agent_and_load_timed,
-                            script_name="agent_v3.py",
-                            env=dict(env),
+            pair_workers = _pair_worker_count(speed_mode, total_pairs)
+            _set_stage(
+                "pairs",
+                f"Running pair scans ({total_pairs} pair(s), workers={pair_workers})",
+                12,
+            )
+            pair_results: list[tuple[dict[str, dict], dict[str, Any], list[str]]] = []
+            if pair_workers <= 1 or total_pairs <= 1:
+                for idx, pair_tokens in enumerate(pairs, start=1):
+                    pair_results.append(
+                        _run_single_pair_scan(
+                            pair_index=idx,
+                            total_pairs=total_pairs,
+                            pair_tokens=pair_tokens,
+                            base_env=env,
                             min_tvl=req.min_tvl,
-                            logs=logs,
-                            pair_suffix=pair_suffix,
+                            run_v3=run_v3,
+                            run_v4=run_v4,
                         )
-                        f_v4 = ex.submit(
-                            _run_agent_and_load_timed,
-                            script_name="agent_v4.py",
-                            env=dict(env),
+                    )
+                    _set_stage("pairs", f"Running pair scans ({idx}/{total_pairs})", int(10 + (65 * idx / total_pairs)))
+            else:
+                with ThreadPoolExecutor(max_workers=pair_workers) as pair_ex:
+                    future_to_idx = {
+                        pair_ex.submit(
+                            _run_single_pair_scan,
+                            pair_index=idx,
+                            total_pairs=total_pairs,
+                            pair_tokens=pair_tokens,
+                            base_env=env,
                             min_tvl=req.min_tvl,
-                            logs=logs,
-                            pair_suffix=pair_suffix,
-                        )
-                        data_v3, dbg_v3 = f_v3.result()
-                        data_v4, dbg_v4 = f_v4.result()
-                        pair_dbg["agents"].append(dbg_v3)
-                        pair_dbg["agents"].append(dbg_v4)
-                        merged_raw.update(data_v3)
-                        merged_raw.update(data_v4)
-                else:
-                    if run_v3:
-                        _set_stage("v3", f"Running v3 ({idx}/{total_pairs}): {pair_str}", min(70, base_progress + 10))
-                        data_v3, dbg_v3 = _run_agent_and_load_timed(
-                                script_name="agent_v3.py",
-                                env=env,
-                                min_tvl=req.min_tvl,
-                                logs=logs,
-                                pair_suffix=pair_suffix,
-                            )
-                        pair_dbg["agents"].append(dbg_v3)
-                        merged_raw.update(data_v3)
-                    if run_v4:
-                        _set_stage("v4", f"Running v4 ({idx}/{total_pairs}): {pair_str}", min(78, base_progress + 20))
-                        data_v4, dbg_v4 = _run_agent_and_load_timed(
-                                script_name="agent_v4.py",
-                                env=env,
-                                min_tvl=req.min_tvl,
-                                logs=logs,
-                                pair_suffix=pair_suffix,
-                            )
-                        pair_dbg["agents"].append(dbg_v4)
-                        merged_raw.update(data_v4)
+                            run_v3=run_v3,
+                            run_v4=run_v4,
+                        ): idx
+                        for idx, pair_tokens in enumerate(pairs, start=1)
+                    }
+                    done_n = 0
+                    for fut in as_completed(list(future_to_idx.keys())):
+                        pair_results.append(fut.result())
+                        done_n += 1
+                        _set_stage("pairs", f"Running pair scans ({done_n}/{total_pairs})", int(10 + (65 * done_n / total_pairs)))
+
+            pair_results.sort(key=lambda x: int((x[1] or {}).get("index") or 0))
+            for merged_piece, pair_dbg, pair_logs in pair_results:
+                pair_dbg["merged_before"] = int(len(merged_raw))
+                merged_raw.update(merged_piece or {})
                 pair_dbg["merged_after"] = int(len(merged_raw))
                 pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
-                pair_dbg["total_ms"] = int(round(max(0.0, time.perf_counter() - t_pair0) * 1000.0))
                 timing_debug["pairs"].append(pair_dbg)
+                logs.extend(pair_logs or [])
             timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
 
         # Keep only pools that really match requested pairs.
@@ -29147,35 +29240,6 @@ HTML_PAGE = """
       color: #334155;
       font-size: 12px;
     }
-    .pair-row { display: grid; grid-template-columns: repeat(4, minmax(160px, 1fr)); gap: 6px; }
-    .pair-item {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 0;
-      border: 1px solid #cbd5e1;
-      border-radius: 10px;
-      overflow: hidden;
-      background: #eef2f7;
-    }
-    .token-input-wrap { display: flex; align-items: center; gap: 0; }
-    .token-input-wrap:first-child { border-right: 1px solid #cbd5e1; }
-    .token-input-wrap input {
-      border: 0;
-      border-radius: 0;
-      background: #f8fbff;
-    }
-    /* Hide native datalist indicator to avoid double arrows with custom button */
-    .token-input-wrap input[list]::-webkit-calendar-picker-indicator { display: none !important; }
-    .token-input-wrap .dd-btn {
-      border: 0;
-      background: #eef2f7;
-      color: #334155;
-      height: 100%;
-      min-width: 32px;
-      cursor: pointer;
-      font-size: 12px;
-      font-weight: 700;
-    }
     .invalid-input {
       border: 1px solid #ef4444 !important;
       box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18);
@@ -29309,7 +29373,6 @@ HTML_PAGE = """
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
-      .pair-row { grid-template-columns: 1fr 1fr; }
       .inline-grid { grid-template-columns: 1fr 1fr; }
       .summary-strip { gap: 6px; }
       .summary-box { min-width: 150px; }
@@ -29554,13 +29617,6 @@ HTML_PAGE = """
 
     function formatUsd(v) {
       return new Intl.NumberFormat("en-US", {maximumFractionDigits: 0}).format(Number(v || 0));
-    }
-
-    function formatUsdShort(v) {
-      const n = Number(v || 0);
-      if (n >= 1000000) return "$" + (n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1) + "M";
-      if (n >= 1000) return "$" + (n / 1000).toFixed(n % 1000 === 0 ? 0 : 1) + "k";
-      return "$" + String(Math.round(n));
     }
 
     function getDaysValue() {
@@ -30543,17 +30599,6 @@ HTML_PAGE = """
       try {
         const r = await fetch("/api/meta");
         const meta = await r.json();
-        const topN = Number(meta.token_catalog?.major_top_n || 0);
-        const minTvl = Number(meta.token_catalog?.min_tvl_usd || 10000);
-        const symCount = Number(meta.token_catalog?.count || 0);
-        const tokensMetaEl = document.getElementById("tokensMeta");
-        if (tokensMetaEl) {
-          if (topN > 0) {
-            tokensMetaEl.textContent = `Top ${topN} tokens · updated: ${meta.token_catalog?.updated_at || "-"}`;
-          } else {
-            tokensMetaEl.textContent = `Popular tokens (TVL>${formatUsdShort(minTvl)}): ${symCount}, updated: ${meta.token_catalog?.updated_at || "-"}`;
-          }
-        }
         pairPresetCatalog = {
           stablecoins: Array.isArray(meta?.pair_lists?.stablecoins_full) && meta.pair_lists.stablecoins_full.length
             ? meta.pair_lists.stablecoins_full
