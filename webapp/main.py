@@ -79,7 +79,7 @@ except Exception:
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 PAIR_LISTS_CATALOG_PATH = CATALOG_DIR / "pair_lists_catalog.json"
-PAIR_LISTS_SCHEMA_VERSION = 7
+PAIR_LISTS_SCHEMA_VERSION = 11
 MAJOR_TOKENS_CACHE_PATH = CATALOG_DIR / "major_tokens_by_chain.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
 TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000000"))
@@ -16776,6 +16776,10 @@ _COMMODITY_CATEGORY_IDS = ("tokenized-gold", "tokenized-silver", "commodity-back
 _MEME_COINGECKO_CATEGORY_ID = "meme-token"
 _MEME_TAG_IDS = ("meme-coin", "dog-meme-coin", "cat-meme-coin", "frog-meme-coin", "president-meme-coin")
 _MEME_SYMBOLS = {"doge", "pepe", "shib", "floki", "bonk", "wif"}
+_COINS_PROTECT_ALLOWLIST = {
+    "wbtc", "weth", "eth", "arb", "link", "uni", "aave", "crv",
+    "sol", "bnb", "comp", "ldo", "pendle", "tbtc", "stg", "rsr", "zro",
+}
 _PAIR_LIST_BLOCKED_SYMBOLS = {"test", "unknown"}
 
 
@@ -16852,7 +16856,7 @@ def _fetch_coinpaprika_tag_symbols(tag_id: str) -> set[str]:
     return out
 
 
-def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], list[str]]:
+def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], list[str], set[str], set[str]]:
     import json
 
     req = UrlRequest(_DEFI_LLAMA_STABLECOINS_API, headers={"User-Agent": APP_USER_AGENT, "Accept": "application/json"})
@@ -16861,6 +16865,8 @@ def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], li
     rows = payload.get("peggedAssets", []) if isinstance(payload, dict) else []
     usd_stables: set[str] = set()
     nonusd_stables: set[str] = set()
+    usd_fiat_backed: set[str] = set()
+    usd_algo_crypto_backed: set[str] = set()
     usd_ranked_pairs: list[tuple[float, str]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -16871,6 +16877,12 @@ def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], li
         peg = str(row.get("pegType") or "").strip().lower()
         if peg == "peggedusd":
             usd_stables.add(sym)
+            mech = str(row.get("pegMechanism") or "").strip().lower()
+            if ("algo" in mech) or ("crypto" in mech):
+                usd_algo_crypto_backed.add(sym)
+            else:
+                # Default bucket for ambiguous/non-labeled mechanisms.
+                usd_fiat_backed.add(sym)
             circ_raw = row.get("circulating")
             circ = 0.0
             if isinstance(circ_raw, dict):
@@ -16898,22 +16910,27 @@ def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], li
             continue
         seen.add(sym)
         usd_ranked.append(sym)
-    return usd_stables, nonusd_stables, usd_ranked
+    return usd_stables, nonusd_stables, usd_ranked, usd_fiat_backed, usd_algo_crypto_backed
 
 
 def _classify_ranked_symbols(
     ranked_symbols: list[str],
     *,
     usd_stable_symbols: set[str] | None = None,
+    fiat_usd_stable_symbols: set[str] | None = None,
+    algo_crypto_usd_stable_symbols: set[str] | None = None,
     commodity_symbols: set[str] | None = None,
     nonusd_fiat_symbols: set[str] | None = None,
     meme_symbols: set[str] | None = None,
-) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str]]:
     usd_stables = {str(s).strip().lower() for s in (usd_stable_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    fiat_usd = {str(s).strip().lower() for s in (fiat_usd_stable_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    algo_usd = {str(s).strip().lower() for s in (algo_crypto_usd_stable_symbols or set()) if _is_clean_symbol(str(s).strip())}
     commodity_syms = {str(s).strip().lower() for s in (commodity_symbols or set()) if _is_clean_symbol(str(s).strip())}
     nonusd_syms = {str(s).strip().lower() for s in (nonusd_fiat_symbols or set()) if _is_clean_symbol(str(s).strip())}
     meme_syms = {str(s).strip().lower() for s in (meme_symbols or set()) if _is_clean_symbol(str(s).strip())}
-    stable_ranked: list[str] = []
+    stable_fiat_ranked: list[str] = []
+    stable_algo_ranked: list[str] = []
     token_ranked: list[str] = []
     commodity_ranked: list[str] = []
     fiat_nonusd_ranked: list[str] = []
@@ -16927,6 +16944,8 @@ def _classify_ranked_symbols(
         is_commodity = s in commodity_syms
         is_nonusd = s in nonusd_syms
         is_usd_stable = _is_stablecoin_symbol(s) or s in usd_stables
+        is_algo_usd = s in algo_usd
+        is_fiat_usd = (s in fiat_usd) or (is_usd_stable and not is_algo_usd)
         is_meme = s in meme_syms
         # Meme bucket must not absorb symbols that are already classified as stable/commodity/non-USD.
         if is_meme and (not is_usd_stable) and (not is_commodity) and (not is_nonusd):
@@ -16934,14 +16953,19 @@ def _classify_ranked_symbols(
             continue
         is_stable_main = bool(is_usd_stable and not is_commodity and not is_nonusd)
         if is_stable_main:
-            stable_ranked.append(s)
+            if is_algo_usd:
+                stable_algo_ranked.append(s)
+            elif is_fiat_usd:
+                stable_fiat_ranked.append(s)
+            else:
+                stable_fiat_ranked.append(s)
         elif (not is_commodity) and (not is_nonusd):
             token_ranked.append(s)
         if is_commodity:
             commodity_ranked.append(s)
         if is_nonusd:
             fiat_nonusd_ranked.append(s)
-    return stable_ranked, token_ranked, commodity_ranked, fiat_nonusd_ranked, meme_ranked
+    return stable_fiat_ranked, stable_algo_ranked, token_ranked, commodity_ranked, fiat_nonusd_ranked, meme_ranked
 
 
 def _build_pair_lists_catalog_from_major(
@@ -16952,6 +16976,8 @@ def _build_pair_lists_catalog_from_major(
     stable_fallback_ranked: list[str] | None = None,
     preferred_coin_symbols: set[str] | None = None,
     usd_stable_symbols: set[str] | None = None,
+    fiat_usd_stable_symbols: set[str] | None = None,
+    algo_crypto_usd_stable_symbols: set[str] | None = None,
     commodity_symbols: set[str] | None = None,
     nonusd_fiat_symbols: set[str] | None = None,
     meme_symbols: set[str] | None = None,
@@ -16991,20 +17017,49 @@ def _build_pair_lists_catalog_from_major(
             for sym in (stable_fallback_ranked or [])
             if _is_clean_symbol(str(sym or "").strip()) and str(sym or "").strip().lower() not in _PAIR_LIST_BLOCKED_SYMBOLS
         ]
-    stable_ranked, token_ranked, commodity_ranked, fiat_nonusd_ranked, meme_ranked = _classify_ranked_symbols(
+    stable_fiat_ranked, stable_algo_ranked, token_ranked, commodity_ranked, fiat_nonusd_ranked, meme_ranked = _classify_ranked_symbols(
         ranked,
         usd_stable_symbols=usd_stable_symbols,
+        fiat_usd_stable_symbols=fiat_usd_stable_symbols,
+        algo_crypto_usd_stable_symbols=algo_crypto_usd_stable_symbols,
         commodity_symbols=commodity_symbols,
         nonusd_fiat_symbols=nonusd_fiat_symbols,
         meme_symbols=meme_symbols,
     )
+    if stable_fallback_ranked and (len(stable_fiat_ranked) + len(stable_algo_ranked) < 200):
+        # TVL rank from major cache is primary. DefiLlama USD-peg rank is only a
+        # fallback filler when TVL-ranked stables are missing/insufficient.
+        seen_stable = set(stable_fiat_ranked) | set(stable_algo_ranked)
+        algo_set = {
+            str(s).strip().lower()
+            for s in (algo_crypto_usd_stable_symbols or set())
+            if _is_clean_symbol(str(s).strip())
+        }
+        for sym in stable_fallback_ranked:
+            s = str(sym or "").strip().lower()
+            if (not _is_clean_symbol(s)) or (s in _PAIR_LIST_BLOCKED_SYMBOLS):
+                continue
+            if s in seen_stable:
+                continue
+            if s in algo_set:
+                stable_algo_ranked.append(s)
+            else:
+                stable_fiat_ranked.append(s)
+            seen_stable.add(s)
+            if (len(stable_fiat_ranked) + len(stable_algo_ranked)) >= 200:
+                break
     if preferred_coin_symbols:
         preferred = {
             str(s).strip().lower()
             for s in (preferred_coin_symbols or set())
             if _is_clean_symbol(str(s).strip())
         }
-        filtered_tokens = [s for s in token_ranked if s in preferred]
+        allow_keep = {
+            str(s).strip().lower()
+            for s in _COINS_PROTECT_ALLOWLIST
+            if _is_clean_symbol(str(s).strip())
+        }
+        filtered_tokens = [s for s in token_ranked if (s in preferred) or (s in allow_keep)]
         if filtered_tokens:
             token_ranked = filtered_tokens
     for sym in sorted(_COMMODITY_STABLE_SYMBOLS):
@@ -17017,10 +17072,13 @@ def _build_pair_lists_catalog_from_major(
         "schema_version": int(PAIR_LISTS_SCHEMA_VERSION),
         "updated_at": str(updated_at or _iso_now()),
         "source": str(source or "major_tokens_top_n_rank_proxy"),
-        "stablecoins": stable_ranked[:20],
+        # Backward-compatible key: "stablecoins" now represents fiat-backed USD stables.
+        "stablecoins": stable_fiat_ranked[:20],
         "tokens": token_ranked[:20],
         "coins": token_ranked[:20],
-        "stablecoins_full": stable_ranked[:200],
+        "stablecoins_full": stable_fiat_ranked[:200],
+        "stable_algo_crypto": stable_algo_ranked[:200],
+        "stable_algo_crypto_full": stable_algo_ranked[:200],
         "tokens_full": token_ranked[:200],
         "coins_full": token_ranked[:200],
         "commodity_stables": commodity_ranked[:200],
@@ -17035,6 +17093,7 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         if (
             int(cached.get("schema_version") or 0) == int(PAIR_LISTS_SCHEMA_VERSION)
             and isinstance(cached.get("stablecoins"), list)
+            and isinstance(cached.get("stable_algo_crypto"), list)
             and isinstance(cached.get("tokens"), list)
             and isinstance(cached.get("commodity_stables"), list)
             and isinstance(cached.get("fiat_nonusd_stables"), list)
@@ -17047,9 +17106,11 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
     stable_fallback_ranked: list[str] = []
     preferred_coin_symbols: set[str] | None = None
     usd_stable_symbols: set[str] = set(_STABLECOIN_SYMBOLS)
+    fiat_usd_stable_symbols: set[str] = set(_STABLECOIN_SYMBOLS)
+    algo_crypto_usd_stable_symbols: set[str] = set()
     commodity_symbols: set[str] = set(_COMMODITY_STABLE_SYMBOLS)
     nonusd_fiat_symbols: set[str] = set(_NON_USD_FIAT_STABLE_SYMBOLS)
-    meme_symbols: set[str] = set(_MEME_SYMBOLS)
+    meme_symbols: set[str] = set()
     source_parts = ["major_tokens_top_n_rank_proxy"]
     try:
         verified_all, _, _profiles = _fetch_uniswap_verified_token_profiles()
@@ -17092,8 +17153,8 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
             per_page=100,
         )
         if meme_from_cg:
-            # Prefer CoinGecko memes to avoid broad symbol collisions from tag-only providers.
-            meme_symbols = set(meme_from_cg)
+            # Prefer CoinGecko memes, but do not depend on it exclusively.
+            meme_symbols.update(meme_from_cg)
             source_parts.append("coingecko_memes")
         else:
             source_parts.append("coingecko_memes_empty")
@@ -17103,24 +17164,35 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         meme_from_paprika: set[str] = set()
         for tag_id in _MEME_TAG_IDS:
             meme_from_paprika.update(_fetch_coinpaprika_tag_symbols(tag_id))
-        if meme_from_paprika and (not meme_symbols):
+        if meme_from_paprika:
             meme_symbols.update(meme_from_paprika)
             source_parts.append("coinpaprika_memes")
-        elif meme_from_paprika:
-            source_parts.append("coinpaprika_memes_unused")
         else:
             source_parts.append("coinpaprika_memes_empty")
     except Exception:
         source_parts.append("coinpaprika_memes_fallback")
-    if not meme_symbols:
-        meme_symbols = set(_MEME_SYMBOLS)
+    # Always include a small hardcoded meme seed set to avoid false negatives when APIs degrade.
+    meme_symbols.update(_MEME_SYMBOLS)
+    if meme_symbols == set(_MEME_SYMBOLS):
         source_parts.append("meme_seed_only")
+    else:
+        source_parts.append("meme_seed_augmented")
     try:
-        usd_from_llama, nonusd_from_llama, usd_ranked_from_llama = _fetch_defillama_stablecoin_symbol_classes()
+        (
+            usd_from_llama,
+            nonusd_from_llama,
+            usd_ranked_from_llama,
+            fiat_from_llama,
+            algo_from_llama,
+        ) = _fetch_defillama_stablecoin_symbol_classes()
         if usd_from_llama:
             usd_stable_symbols.update(usd_from_llama)
         if usd_ranked_from_llama:
             stable_fallback_ranked = list(usd_ranked_from_llama)
+        if fiat_from_llama:
+            fiat_usd_stable_symbols.update(fiat_from_llama)
+        if algo_from_llama:
+            algo_crypto_usd_stable_symbols.update(algo_from_llama)
         if nonusd_from_llama:
             nonusd_fiat_symbols.update(nonusd_from_llama)
         source_parts.append("defillama_stables")
@@ -17133,6 +17205,8 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         stable_fallback_ranked=stable_fallback_ranked,
         preferred_coin_symbols=preferred_coin_symbols,
         usd_stable_symbols=usd_stable_symbols,
+        fiat_usd_stable_symbols=fiat_usd_stable_symbols,
+        algo_crypto_usd_stable_symbols=algo_crypto_usd_stable_symbols,
         commodity_symbols=commodity_symbols,
         nonusd_fiat_symbols=nonusd_fiat_symbols,
         meme_symbols=meme_symbols,
@@ -28788,9 +28862,11 @@ def meta() -> dict[str, Any]:
             "updated_at": pair_lists_catalog.get("updated_at"),
             "source": pair_lists_catalog.get("source", ""),
             "stablecoins": pair_lists_catalog.get("stablecoins", []),
+            "stable_algo_crypto": pair_lists_catalog.get("stable_algo_crypto", []),
             "tokens": pair_lists_catalog.get("tokens", []),
             "coins": pair_lists_catalog.get("coins", pair_lists_catalog.get("tokens", [])),
             "stablecoins_full": pair_lists_catalog.get("stablecoins_full", []),
+            "stable_algo_crypto_full": pair_lists_catalog.get("stable_algo_crypto_full", pair_lists_catalog.get("stable_algo_crypto", [])),
             "tokens_full": pair_lists_catalog.get("tokens_full", []),
             "coins_full": pair_lists_catalog.get("coins_full", pair_lists_catalog.get("tokens_full", [])),
             "commodity_stables": pair_lists_catalog.get("commodity_stables", []),
@@ -29748,9 +29824,12 @@ HTML_PAGE = """
                   <div class="pair-bucket-row">
                     <select id="stableBucketMode" onchange="updatePairBuilderUi()">
                       <option value="manual">manual</option>
-                      <option value="stable_top5">top 5 stablecoins</option>
-                      <option value="stable_top10">top 10 stablecoins</option>
-                      <option value="stable_top20">top 20 stablecoins</option>
+                      <option value="stable_top5">top 5 fiat-backed stablecoins</option>
+                      <option value="stable_top10">top 10 fiat-backed stablecoins</option>
+                      <option value="stable_top20">top 20 fiat-backed stablecoins</option>
+                      <option value="stable_algo_top5">top 5 algo/crypto-backed stablecoins</option>
+                      <option value="stable_algo_top10">top 10 algo/crypto-backed stablecoins</option>
+                      <option value="stable_algo_top20">top 20 algo/crypto-backed stablecoins</option>
                       <option value="commodity_top5">top 5 commodity stables</option>
                       <option value="commodity_top10">top 10 commodity stables</option>
                       <option value="commodity_top20">top 20 commodity stables</option>
@@ -29774,9 +29853,12 @@ HTML_PAGE = """
                       <option value="token_top5">top 5 coins</option>
                       <option value="token_top10">top 10 coins</option>
                       <option value="token_top20">top 20 coins</option>
-                      <option value="stable_top5">top 5 stablecoins</option>
-                      <option value="stable_top10">top 10 stablecoins</option>
-                      <option value="stable_top20">top 20 stablecoins</option>
+                      <option value="stable_top5">top 5 fiat-backed stablecoins</option>
+                      <option value="stable_top10">top 10 fiat-backed stablecoins</option>
+                      <option value="stable_top20">top 20 fiat-backed stablecoins</option>
+                      <option value="stable_algo_top5">top 5 algo/crypto-backed stablecoins</option>
+                      <option value="stable_algo_top10">top 10 algo/crypto-backed stablecoins</option>
+                      <option value="stable_algo_top20">top 20 algo/crypto-backed stablecoins</option>
                       <option value="commodity_top5">top 5 commodity stables</option>
                       <option value="commodity_top10">top 10 commodity stables</option>
                       <option value="commodity_top20">top 20 commodity stables</option>
@@ -29932,7 +30014,7 @@ HTML_PAGE = """
     let visibilityMap = {};
     let seriesByPool = {};
     let currentRequest = {};
-    let pairPresetCatalog = {stablecoins: [], coins: [], commodityStablecoins: [], fiatNonUsdStablecoins: [], memes: []};
+    let pairPresetCatalog = {stablecoins: [], stableAlgoCrypto: [], coins: [], commodityStablecoins: [], fiatNonUsdStablecoins: [], memes: []};
     let authState = {authenticated: false};
     let hasScanRun = false;
     let scanTicker = null;
@@ -30656,6 +30738,10 @@ HTML_PAGE = """
         const count = effectiveTopCount(mode, (pairPresetCatalog.commodityStablecoins || []).length);
         return (pairPresetCatalog.commodityStablecoins || []).slice(0, count).map((x) => normalizePairToken(x)).filter(Boolean);
       }
+      if (mode.startsWith("stable_algo_top")) {
+        const count = effectiveTopCount(mode, (pairPresetCatalog.stableAlgoCrypto || []).length);
+        return (pairPresetCatalog.stableAlgoCrypto || []).slice(0, count).map((x) => normalizePairToken(x)).filter(Boolean);
+      }
       if (mode.startsWith("fiat_nonusd_top")) {
         const count = effectiveTopCount(mode, (pairPresetCatalog.fiatNonUsdStablecoins || []).length);
         return (pairPresetCatalog.fiatNonUsdStablecoins || []).slice(0, count).map((x) => normalizePairToken(x)).filter(Boolean);
@@ -31045,6 +31131,9 @@ HTML_PAGE = """
           stablecoins: Array.isArray(meta?.pair_lists?.stablecoins_full) && meta.pair_lists.stablecoins_full.length
             ? meta.pair_lists.stablecoins_full
             : (meta?.pair_lists?.stablecoins || []),
+          stableAlgoCrypto: Array.isArray(meta?.pair_lists?.stable_algo_crypto_full) && meta.pair_lists.stable_algo_crypto_full.length
+            ? meta.pair_lists.stable_algo_crypto_full
+            : (meta?.pair_lists?.stable_algo_crypto || []),
           coins: Array.isArray(meta?.pair_lists?.coins_full) && meta.pair_lists.coins_full.length
             ? meta.pair_lists.coins_full
             : ((Array.isArray(meta?.pair_lists?.tokens_full) && meta.pair_lists.tokens_full.length)
@@ -31061,6 +31150,7 @@ HTML_PAGE = """
             : [],
         };
         const stCount = Number((meta?.pair_lists?.stablecoins_full || meta?.pair_lists?.stablecoins || []).length || 0);
+        const stAlgoCount = Number((meta?.pair_lists?.stable_algo_crypto_full || meta?.pair_lists?.stable_algo_crypto || []).length || 0);
         const coinCount = Number((meta?.pair_lists?.coins_full || meta?.pair_lists?.tokens_full || meta?.pair_lists?.coins || meta?.pair_lists?.tokens || []).length || 0);
         const cmCount = Number((meta?.pair_lists?.commodity_stables || []).length || 0);
         const fxCount = Number((meta?.pair_lists?.fiat_nonusd_stables || []).length || 0);
@@ -31068,12 +31158,12 @@ HTML_PAGE = """
         const plUpdated = String(meta?.pair_lists?.updated_at || "-");
         const plBadge = document.getElementById("pairListsMeta");
         if (plBadge) {
-          plBadge.textContent = `pair lists: stable ${stCount}, coins ${coinCount}, commodity ${cmCount}, non-USD ${fxCount}, memes ${memeCount}, updated: ${plUpdated}`;
+          plBadge.textContent = `pair lists: fiat-stable ${stCount}, algo/crypto-stable ${stAlgoCount}, coins ${coinCount}, commodity ${cmCount}, non-USD ${fxCount}, memes ${memeCount}, updated: ${plUpdated}`;
           const topN = (arr, n) => ((arr || []).slice(0, n).join(", ") || "-");
           const topLines = (arr, count) => {
             const ct = Math.max(0, Number(count || 0));
             const lines = [];
-            const hideTop5 = (ct >= 7 && ct <= 7);
+            const hideTop5 = (ct >= 5 && ct <= 7);
             const showTop10 = (ct >= 5);
             const showTop20 = ct >= 10;
             if (!hideTop5) {
@@ -31090,8 +31180,10 @@ HTML_PAGE = """
             return lines;
           };
           pairListsDetailsLines = [
-            `Stablecoins ranked count: ${stCount}`,
+            `Fiat-backed stablecoins ranked count: ${stCount}`,
             ...topLines(pairPresetCatalog.stablecoins, stCount),
+            `Algo/crypto-backed stablecoins ranked count: ${stAlgoCount}`,
+            ...topLines(pairPresetCatalog.stableAlgoCrypto, stAlgoCount),
             `Coins ranked count: ${coinCount}`,
             ...topLines(pairPresetCatalog.coins, coinCount),
             `Commodity stables ranked count: ${cmCount}`,
@@ -31110,7 +31202,7 @@ HTML_PAGE = """
             if (!opt) return;
             const topN = value.endsWith("_top5") ? 5 : (value.endsWith("_top10") ? 10 : 20);
             const count = Math.max(0, Number(sourceCount || 0));
-            const hideTop5 = (count >= 7 && count <= 7);
+            const hideTop5 = (count >= 5 && count <= 7);
             const showTop10 = (count >= 5);
             const showTop20 = count >= 10;
             if (topN === 10) {
@@ -31145,9 +31237,12 @@ HTML_PAGE = """
                   : Math.max(0, Math.min(count, topN)));
             opt.textContent = `top ${shown} ${label}`;
           };
-          setTopOption("stable_top5", stCount, "stablecoins");
-          setTopOption("stable_top10", stCount, "stablecoins");
-          setTopOption("stable_top20", stCount, "stablecoins");
+          setTopOption("stable_top5", stCount, "fiat-backed stablecoins");
+          setTopOption("stable_top10", stCount, "fiat-backed stablecoins");
+          setTopOption("stable_top20", stCount, "fiat-backed stablecoins");
+          setTopOption("stable_algo_top5", stAlgoCount, "algo/crypto-backed stablecoins");
+          setTopOption("stable_algo_top10", stAlgoCount, "algo/crypto-backed stablecoins");
+          setTopOption("stable_algo_top20", stAlgoCount, "algo/crypto-backed stablecoins");
           setTopOption("token_top5", coinCount, "coins");
           setTopOption("token_top10", coinCount, "coins");
           setTopOption("token_top20", coinCount, "coins");
