@@ -29798,6 +29798,7 @@ HTML_PAGE = """
       align-items: start;
     }
     .control-card .row {
+      grid-template-columns: 110px 1fr;
       background: #f8fbff;
       border: 1px solid #d7e1ef;
       border-radius: 12px;
@@ -30200,31 +30201,35 @@ HTML_PAGE = """
       align-items: flex-start;
       justify-content: space-between;
       gap: 10px;
-      flex-wrap: nowrap;
+      flex-wrap: wrap;
     }
     .chains-main {
       min-width: 0;
       flex: 1 1 auto;
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      background: #f8fbff;
+      padding: 8px 10px;
     }
     .chains-side {
       display: flex;
       flex-direction: column;
-      align-items: flex-end;
+      align-items: flex-start;
       gap: 6px;
       flex: 0 0 auto;
-      min-width: 240px;
+      min-width: 0;
     }
     .chain-note { display: none; }
     .chains-meta-badge {
       white-space: nowrap;
     }
     
-    .inline-grid { display: grid; grid-template-columns: repeat(6, 150px); gap: 8px; align-items: end; justify-content: start; }
+    .inline-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; align-items: end; justify-content: start; }
     .inline-grid .filter-item input,
     .inline-grid .filter-item select {
-      width: 150px;
-      min-width: 150px;
-      max-width: 150px;
+      width: 100%;
+      min-width: 0;
+      max-width: none;
       height: 42px;
     }
     .filter-item .hint {
@@ -30239,7 +30244,7 @@ HTML_PAGE = """
       display: flex;
       gap: 10px;
       align-items: center;
-      width: 150px;
+      width: 100%;
       height: 42px;
       padding: 0 4px;
       border: 1px solid #cbd5e1;
@@ -30317,7 +30322,7 @@ HTML_PAGE = """
     }
     .pair-lists-section h5 {
       margin: 0 0 5px 0;
-      font-size: 12px;
+      font-size: 13px;
       color: #0f172a;
     }
     .pair-top-block { margin-top: 4px; }
@@ -30328,7 +30333,7 @@ HTML_PAGE = """
       min-width: 0;
     }
     .pair-top-title {
-      font-size: 11px;
+      font-size: 12px;
       color: #64748b;
       margin: 0;
       font-weight: 700;
@@ -30339,7 +30344,7 @@ HTML_PAGE = """
     .token-chip-list {
       display: flex;
       flex-wrap: nowrap;
-      gap: 2px;
+      gap: 1px;
       overflow-x: auto;
       overflow-y: hidden;
       white-space: nowrap;
@@ -30355,17 +30360,17 @@ HTML_PAGE = """
       border-radius: 0;
       padding: 1px 2px;
       background: transparent;
-      font-size: 11px;
+      font-size: 12px;
       color: #334155;
       cursor: default;
     }
     .token-chip img {
-      width: 12px;
-      height: 12px;
+      width: 11px;
+      height: 11px;
       border-radius: 999px;
       object-fit: cover;
       background: #e5e7eb;
-      flex: 0 0 12px;
+      flex: 0 0 11px;
     }
     @media (max-width: 900px) {
       .pair-lists-grid { grid-template-columns: 1fr; }
