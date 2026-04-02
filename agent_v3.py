@@ -83,7 +83,9 @@ V3_EXACT_TVL_CHAINS = {
     if c.strip()
 }
 V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 3))
-V3_EXACT_TVL_DAYS_MAX = max(1, _env_int("V3_EXACT_TVL_DAYS_MAX", 31))
+# By default exact-days cap follows the same history window as agent day-data (FEE_DAYS),
+# i.e. the value selected in UI "History days".
+V3_EXACT_TVL_DAYS_MAX = max(1, _env_int("V3_EXACT_TVL_DAYS_MAX", int(FEE_DAYS)))
 V3_EXACT_TVL_POOL_BUDGET_SEC = max(2.0, _env_float("V3_EXACT_TVL_POOL_BUDGET_SEC", 12.0))
 V3_EXACT_TVL_DEBUG = _env_flag("V3_EXACT_TVL_DEBUG", False)
 
