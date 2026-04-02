@@ -30298,8 +30298,12 @@ HTML_PAGE = """
     }
     .token-chip-list {
       display: flex;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       gap: 4px;
+      overflow-x: auto;
+      overflow-y: hidden;
+      white-space: nowrap;
+      padding-bottom: 2px;
     }
     .token-chip {
       display: inline-flex;
@@ -31465,12 +31469,28 @@ HTML_PAGE = """
 
     function topBuckets(items) {
       const arr = Array.isArray(items) ? items : [];
+      const plan = smartTopPlan(arr.length);
       const out = [];
-      for (const n of [5, 10, 20]) {
-        const eff = Math.min(n, arr.length);
-        if (eff <= 0) continue;
-        const label = eff === n ? `Top-${n}` : `Top-${n} (showing ${eff})`;
+      const seenN = new Set();
+      const pushBucket = (n, canonicalN) => {
+        const eff = Math.max(0, Math.min(Number(n || 0), arr.length));
+        if (eff <= 0 || seenN.has(eff)) return;
+        seenN.add(eff);
+        const base = Number(canonicalN || 0);
+        const label = eff === base ? `Top-${base}` : `Top-${eff}`;
         out.push({label, n: eff});
+      };
+      if (!plan.hideTop5) {
+        pushBucket(Math.min(5, plan.ct), 5);
+      } else if (!plan.showTop10 && plan.ct > 0) {
+        // Safety fallback when Top-5 is hidden and Top-10 is unavailable.
+        pushBucket(Math.min(5, plan.ct), 5);
+      }
+      if (plan.showTop10) {
+        pushBucket(plan.n10, 10);
+      }
+      if (plan.showTop20) {
+        pushBucket(plan.n20, 20);
       }
       return out;
     }
