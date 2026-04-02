@@ -79,7 +79,7 @@ except Exception:
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 PAIR_LISTS_CATALOG_PATH = CATALOG_DIR / "pair_lists_catalog.json"
-PAIR_LISTS_SCHEMA_VERSION = 15
+PAIR_LISTS_SCHEMA_VERSION = 19
 MAJOR_TOKENS_CACHE_PATH = CATALOG_DIR / "major_tokens_by_chain.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
 TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000000"))
@@ -221,6 +221,7 @@ ADMIN_WALLET_ADDRESSES_ENV = os.environ.get("ADMIN_WALLET_ADDRESSES", ADMIN_WALL
 ADMIN_WALLETS_ENC_KEY = os.environ.get("ADMIN_WALLETS_ENC_KEY", "").strip()
 ADMIN_WALLETS_STATE_KEY_PLAIN = "admin_wallets_csv"
 ADMIN_WALLETS_STATE_KEY_ENC = "admin_wallets_csv_enc_v1"
+PAIR_LISTS_MANUAL_STATE_KEY = "pair_lists_manual_overrides_v1"
 ANALYTICS_DB_PATH = Path(os.environ.get("ANALYTICS_DB_PATH", str(CATALOG_DIR / "analytics.sqlite3")))
 ANALYTICS_ENABLED = os.environ.get("ANALYTICS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 WALLETCONNECT_PROJECT_ID = (
@@ -16772,19 +16773,115 @@ def _curated_token_symbols() -> set[str]:
 _COINGECKO_CATEGORY_API = "https://api.coingecko.com/api/v3/coins/markets"
 _COINGECKO_TOP_MARKETCAP_PAGES = max(1, min(5, int(os.environ.get("COINGECKO_TOP_MARKETCAP_PAGES", "2"))))
 _COINGECKO_TOP_MARKETCAP_PER_PAGE = max(50, min(250, int(os.environ.get("COINGECKO_TOP_MARKETCAP_PER_PAGE", "250"))))
+_STABLE_FIAT_MIN_MARKET_CAP_USD = max(0.0, float(os.environ.get("STABLE_FIAT_MIN_MARKET_CAP_USD", "50000000")))
+_STABLE_ALGO_MIN_MARKET_CAP_USD = max(0.0, float(os.environ.get("STABLE_ALGO_MIN_MARKET_CAP_USD", "30000000")))
+_STABLE_NONUSD_MIN_MARKET_CAP_USD = max(0.0, float(os.environ.get("STABLE_NONUSD_MIN_MARKET_CAP_USD", "10000000")))
+_MEME_MIN_MARKET_CAP_USD = max(0.0, float(os.environ.get("MEME_MIN_MARKET_CAP_USD", "50000000")))
 _DEFI_LLAMA_STABLECOINS_API = "https://stablecoins.llama.fi/stablecoins?includePrices=true"
 _COINPAPRIKA_TAG_API = "https://api.coinpaprika.com/v1/tags"
 _COINPAPRIKA_TICKERS_API = "https://api.coinpaprika.com/v1/tickers"
 _COINPAPRIKA_TOP_MAX_RANK = max(50, min(2000, int(os.environ.get("COINPAPRIKA_TOP_MAX_RANK", "500"))))
+_STABLE_FIAT_COINGECKO_CATEGORY_IDS = ("fiat-backed-stablecoin",)
+_STABLE_ALGO_COINGECKO_CATEGORY_IDS = ("algorithmic-stablecoin",)
+_STABLE_CRYPTO_BACKED_COINGECKO_CATEGORY_IDS = ("crypto-backed-stablecoin",)
 _COMMODITY_CATEGORY_IDS = ("tokenized-gold", "tokenized-silver", "commodity-backed-stablecoin")
 _MEME_COINGECKO_CATEGORY_ID = "meme-token"
 _MEME_TAG_IDS = ("meme-coin", "dog-meme-coin", "cat-meme-coin", "frog-meme-coin", "president-meme-coin")
+_STABLE_CORE_PRIORITY = tuple(
+    str(x or "").strip().lower()
+    for x in (
+        os.environ.get("STABLE_CORE_PRIORITY", "usdt,usdc,usds,usde,dai,gho,crvusd")
+        .replace(" ", "")
+        .split(",")
+    )
+    if _is_clean_symbol(str(x or "").strip().lower())
+)
 _MEME_SYMBOLS = {"doge", "pepe", "shib", "floki", "bonk", "wif"}
 _COINS_PROTECT_ALLOWLIST = {
     "wbtc", "weth", "eth", "arb", "link", "uni", "aave", "crv",
     "sol", "bnb", "comp", "ldo", "pendle", "tbtc", "stg", "rsr", "zro",
 }
 _PAIR_LIST_BLOCKED_SYMBOLS = {"test", "unknown"}
+_MANUAL_FIAT_STABLE_DEFAULT_CORE = (
+    "usdt", "usdc", "usd1", "pyusd", "fdusd",
+    "rlusd", "usdg", "tusd", "gusd", "husd",
+)
+_MANUAL_FIAT_STABLE_DEFAULT_RWA = (
+    "buidl", "usyc", "usdy", "usdtb", "usd0",
+    "frxusd", "mnee", "cgusd",
+)
+_MANUAL_ALGO_STABLE_DEFAULT_MAIN = (
+    "usds", "usde", "dai", "gho", "crvusd", "frax", "frxusd", "mim", "dola",
+)
+_MANUAL_ALGO_STABLE_DEFAULT_NICHE = (
+    "usdd", "usdf", "usx", "rwausdi", "usda",
+    "reusd", "satusd", "bold", "lisusd", "usdai",
+)
+_MANUAL_FIAT_STABLE_HINTS: dict[str, dict[str, str]] = {
+    "usdt": {"desc": "Absolute leader", "liquidity": "~$184B"},
+    "usdc": {"desc": "Institutional standard", "liquidity": "~$77B"},
+    "usd1": {"desc": "Fast-growth fiat stable", "liquidity": "~$4.4B"},
+    "pyusd": {"desc": "PayPal stablecoin with broad integrations", "liquidity": "~$4B"},
+    "fdusd": {"desc": "Binance-related fiat stable", "liquidity": "top-tier CEX liquidity"},
+    "rlusd": {"desc": "Ripple USD", "liquidity": "~$1.4B"},
+    "usdg": {"desc": "Global Dollar", "liquidity": "~$1.84B"},
+    "tusd": {"desc": "Legacy fiat stable", "liquidity": "legacy/liquid on selected venues"},
+    "gusd": {"desc": "Gemini Dollar", "liquidity": "legacy/liquid on selected venues"},
+    "husd": {"desc": "Legacy fiat stable", "liquidity": "legacy, limited current depth"},
+    "buidl": {"desc": "BlackRock tokenized Treasury fund (RWA)", "liquidity": "large RWA allocation"},
+    "usyc": {"desc": "Circle yield-bearing Treasury/repo token (RWA)", "liquidity": "institutional RWA usage"},
+    "usdy": {"desc": "Ondo yield-bearing USD token", "liquidity": "active RWA/yield usage"},
+    "usdtb": {"desc": "USDtb tokenized T-bills", "liquidity": "~$860-950M"},
+    "usd0": {"desc": "Usual USD, RWA-backed", "liquidity": "~$560M"},
+    "frxusd": {"desc": "Frax fully collateralized USD stable", "liquidity": "mid-tier DeFi liquidity"},
+    "mnee": {"desc": "Niche fiat-backed stable", "liquidity": "~$100M"},
+    "cgusd": {"desc": "Cygnus Finance Global USD", "liquidity": "~$75M"},
+}
+_MANUAL_ALGO_STABLE_HINTS: dict[str, dict[str, str]] = {
+    "usds": {"desc": "Sky (ex-Maker) decentralized stable, yield-oriented", "liquidity": "~$11.7B"},
+    "usde": {"desc": "Ethena synthetic delta-neutral stable", "liquidity": "~$5.88B"},
+    "dai": {"desc": "Classic decentralized overcollateralized stable", "liquidity": "~$5.36B"},
+    "gho": {"desc": "Aave-native stable, strongest in Aave E-Mode", "liquidity": "~$584M"},
+    "crvusd": {"desc": "Curve-native LLAMMA stable", "liquidity": "~$260-300M"},
+    "frax": {"desc": "Frax hybrid stable with deep DeFi integrations", "liquidity": "~$200-600M"},
+    "frxusd": {"desc": "Frax USD variant, Curve-integrated", "liquidity": "~$200-600M"},
+    "mim": {"desc": "Magic Internet Money (Abracadabra), higher-risk niche", "liquidity": "~$30-100M"},
+    "dola": {"desc": "Inverse Finance overcollateralized stable", "liquidity": "~$50-150M"},
+    "usdd": {"desc": "Tron-focused stable, limited core Ethereum composability", "liquidity": "~$1.1B"},
+    "usdf": {"desc": "Institutional-focused niche stable", "liquidity": "~$1.6B"},
+    "usx": {"desc": "Niche stable with relatively shallow pools", "liquidity": "~$350-400M"},
+    "rwausdi": {"desc": "RWA-hybrid stable with redemption/structure risks", "liquidity": "~$300M"},
+    "usda": {"desc": "Niche overcollateralized stable", "liquidity": "~$200-300M"},
+    "reusd": {"desc": "Resupply niche yield/RWA stable", "liquidity": "~$100-150M"},
+    "satusd": {"desc": "Low-cap stable", "liquidity": "very low"},
+    "bold": {"desc": "Niche overcollateralized stable", "liquidity": "~$30M"},
+    "lisusd": {"desc": "Niche stablecoin", "liquidity": "~$70-80M"},
+    "usdai": {"desc": "Variant stable with moderate cap, lower DeFi activity", "liquidity": "moderate"},
+}
+_MANUAL_COMMODITY_HINTS: dict[str, dict[str, str]] = {
+    "xaut": {"desc": "Tether Gold, 1 token = 1 troy ounce physical LBMA gold (Swiss vaults)", "liquidity": "highest among commodity tokens"},
+    "paxg": {"desc": "Pax Gold, 1 token = 1 troy ounce LBMA physical gold (London vaults)", "liquidity": "high with strong transparency"},
+    "kau": {"desc": "Kinesis Gold, about 1 gram allocated physical gold per token", "liquidity": "yield-bearing fee-share model"},
+    "kag": {"desc": "Kinesis Silver, 1 token = 1 troy ounce physical silver", "liquidity": "yield-bearing fee-share model"},
+    "cgo": {"desc": "Comtech Gold, physical gold-backed token (UAE regulated, Shariah-compliant)", "liquidity": "niche but growing"},
+}
+_MANUAL_MEME_DEFAULT = (
+    "doge", "shib", "pepe", "floki", "brett",
+    "mog", "trump", "pump", "spx", "turbo", "toshi",
+)
+_MANUAL_MEME_HINTS: dict[str, dict[str, str]] = {
+    "doge": {"desc": "Original meme coin, broad multi-chain presence", "liquidity": "~$13-15B"},
+    "shib": {"desc": "Shiba Inu on Ethereum + Shibarium L2", "liquidity": "~$3.4B"},
+    "pepe": {"desc": "Pure frog meme, native ERC-20 on Ethereum", "liquidity": "~$1.38B"},
+    "floki": {"desc": "Utility meme with gaming/NFT components", "liquidity": "active on Ethereum + BNB Chain"},
+    "brett": {"desc": "Base chain mascot meme", "liquidity": "strong Base community activity"},
+    "mog": {"desc": "Cat meme token", "liquidity": "native Ethereum meme liquidity"},
+    "trump": {"desc": "Political/hype meme", "liquidity": "mostly Ethereum/Base venues"},
+    "pump": {"desc": "Hype meme token", "liquidity": "mostly Ethereum/Base venues"},
+    "spx": {"desc": "SPX6900 degenerate meme", "liquidity": "Ethereum/Base cross-chain presence"},
+    "turbo": {"desc": "AI-generated meme, native on Ethereum", "liquidity": "mid-tier meme liquidity"},
+    "toshi": {"desc": "Base chain cat meme", "liquidity": "active Base L2 community"},
+}
 
 
 def _normalize_pair_list_symbol_key(sym: str) -> str:
@@ -16797,6 +16894,213 @@ def _normalize_pair_list_symbol_key(sym: str) -> str:
         "weth9": "eth",
     }
     return alias.get(s, s)
+
+
+def _normalize_symbol_list(items: list[Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for it in (items or []):
+        s = str(it or "").strip().lower()
+        if (not _is_clean_symbol(s)) or (s in _PAIR_LIST_BLOCKED_SYMBOLS):
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+PAIR_LISTS_MANUAL_OVERRIDES_RUNTIME: dict[str, Any] | None = None
+
+
+def _default_manual_pair_lists_overrides() -> dict[str, Any]:
+    enabled = str(os.environ.get("MANUAL_FIAT_STABLE_ENABLE", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    strict = str(os.environ.get("MANUAL_FIAT_STABLE_STRICT", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    core_env = os.environ.get("MANUAL_FIAT_STABLE_CORE", "")
+    rwa_env = os.environ.get("MANUAL_FIAT_STABLE_RWA", "")
+    core = _normalize_symbol_list(core_env.split(",")) if core_env.strip() else list(_MANUAL_FIAT_STABLE_DEFAULT_CORE)
+    rwa = _normalize_symbol_list(rwa_env.split(",")) if rwa_env.strip() else list(_MANUAL_FIAT_STABLE_DEFAULT_RWA)
+    sel_date = str(os.environ.get("MANUAL_FIAT_STABLE_DATE", "")).strip() or datetime.now(timezone.utc).date().isoformat()
+    algo_enabled = str(os.environ.get("MANUAL_ALGO_STABLE_ENABLE", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    algo_strict = str(os.environ.get("MANUAL_ALGO_STABLE_STRICT", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    algo_main_env = os.environ.get("MANUAL_ALGO_STABLE_MAIN", "")
+    algo_niche_env = os.environ.get("MANUAL_ALGO_STABLE_NICHE", "")
+    algo_main = _normalize_symbol_list(algo_main_env.split(",")) if algo_main_env.strip() else list(_MANUAL_ALGO_STABLE_DEFAULT_MAIN)
+    algo_niche = _normalize_symbol_list(algo_niche_env.split(",")) if algo_niche_env.strip() else list(_MANUAL_ALGO_STABLE_DEFAULT_NICHE)
+    algo_date = str(os.environ.get("MANUAL_ALGO_STABLE_DATE", "")).strip() or datetime.now(timezone.utc).date().isoformat()
+    meme_enabled = str(os.environ.get("MANUAL_MEME_ENABLE", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    meme_strict = str(os.environ.get("MANUAL_MEME_STRICT", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    meme_top_env = os.environ.get("MANUAL_MEME_TOP", "")
+    meme_top = _normalize_symbol_list(meme_top_env.split(",")) if meme_top_env.strip() else list(_MANUAL_MEME_DEFAULT)
+    meme_date = str(os.environ.get("MANUAL_MEME_DATE", "")).strip() or datetime.now(timezone.utc).date().isoformat()
+    return {
+        "fiat_stable": {
+            "enabled": bool(enabled),
+            "strict": bool(strict),
+            "selection_date": sel_date,
+            "core": _normalize_symbol_list(core),
+            "rwa": _normalize_symbol_list(rwa),
+        },
+        "algo_stable": {
+            "enabled": bool(algo_enabled),
+            "strict": bool(algo_strict),
+            "selection_date": algo_date,
+            "main": _normalize_symbol_list(algo_main),
+            "niche": _normalize_symbol_list(algo_niche),
+        },
+        "memes": {
+            "enabled": bool(meme_enabled),
+            "strict": bool(meme_strict),
+            "selection_date": meme_date,
+            "top": _normalize_symbol_list(meme_top),
+        },
+    }
+
+
+def _load_manual_pair_lists_overrides() -> dict[str, Any]:
+    global PAIR_LISTS_MANUAL_OVERRIDES_RUNTIME
+    base = _default_manual_pair_lists_overrides()
+    if isinstance(PAIR_LISTS_MANUAL_OVERRIDES_RUNTIME, dict):
+        raw = PAIR_LISTS_MANUAL_OVERRIDES_RUNTIME
+    else:
+        raw_text = _analytics_get_state(PAIR_LISTS_MANUAL_STATE_KEY)
+        raw = {}
+        if raw_text:
+            try:
+                raw = json.loads(raw_text)
+            except Exception:
+                raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    fiat_raw = raw.get("fiat_stable") if isinstance(raw.get("fiat_stable"), dict) else {}
+    algo_raw = raw.get("algo_stable") if isinstance(raw.get("algo_stable"), dict) else {}
+    meme_raw = raw.get("memes") if isinstance(raw.get("memes"), dict) else {}
+    fiat_base = base["fiat_stable"]
+    algo_base = base["algo_stable"]
+    meme_base = base["memes"]
+    cfg = {
+        "enabled": bool(fiat_raw.get("enabled", fiat_base.get("enabled", True))),
+        "strict": bool(fiat_raw.get("strict", fiat_base.get("strict", True))),
+        "selection_date": str(fiat_raw.get("selection_date") or fiat_base.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+        "core": _normalize_symbol_list(fiat_raw.get("core") if isinstance(fiat_raw.get("core"), list) else fiat_base.get("core", [])),
+        "rwa": _normalize_symbol_list(fiat_raw.get("rwa") if isinstance(fiat_raw.get("rwa"), list) else fiat_base.get("rwa", [])),
+    }
+    algo_cfg = {
+        "enabled": bool(algo_raw.get("enabled", algo_base.get("enabled", True))),
+        "strict": bool(algo_raw.get("strict", algo_base.get("strict", True))),
+        "selection_date": str(algo_raw.get("selection_date") or algo_base.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+        "main": _normalize_symbol_list(algo_raw.get("main") if isinstance(algo_raw.get("main"), list) else algo_base.get("main", [])),
+        "niche": _normalize_symbol_list(algo_raw.get("niche") if isinstance(algo_raw.get("niche"), list) else algo_base.get("niche", [])),
+    }
+    meme_cfg = {
+        "enabled": bool(meme_raw.get("enabled", meme_base.get("enabled", True))),
+        "strict": bool(meme_raw.get("strict", meme_base.get("strict", True))),
+        "selection_date": str(meme_raw.get("selection_date") or meme_base.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+        "top": _normalize_symbol_list(meme_raw.get("top") if isinstance(meme_raw.get("top"), list) else meme_base.get("top", [])),
+    }
+    out = {"fiat_stable": cfg, "algo_stable": algo_cfg, "memes": meme_cfg}
+    PAIR_LISTS_MANUAL_OVERRIDES_RUNTIME = out
+    return out
+
+
+def _save_manual_pair_lists_overrides(payload: dict[str, Any]) -> dict[str, Any]:
+    global PAIR_LISTS_MANUAL_OVERRIDES_RUNTIME
+    cur = _load_manual_pair_lists_overrides()
+    src = payload if isinstance(payload, dict) else {}
+    fiat_src = src.get("fiat_stable") if isinstance(src.get("fiat_stable"), dict) else {}
+    algo_src = src.get("algo_stable") if isinstance(src.get("algo_stable"), dict) else {}
+    meme_src = src.get("memes") if isinstance(src.get("memes"), dict) else {}
+    fiat_cur = cur.get("fiat_stable") if isinstance(cur.get("fiat_stable"), dict) else {}
+    algo_cur = cur.get("algo_stable") if isinstance(cur.get("algo_stable"), dict) else {}
+    meme_cur = cur.get("memes") if isinstance(cur.get("memes"), dict) else {}
+    merged = {
+        "fiat_stable": {
+            "enabled": bool(fiat_src.get("enabled", fiat_cur.get("enabled", True))),
+            "strict": bool(fiat_src.get("strict", fiat_cur.get("strict", True))),
+            "selection_date": str(fiat_src.get("selection_date") or fiat_cur.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+            "core": _normalize_symbol_list(fiat_src.get("core") if isinstance(fiat_src.get("core"), list) else fiat_cur.get("core", [])),
+            "rwa": _normalize_symbol_list(fiat_src.get("rwa") if isinstance(fiat_src.get("rwa"), list) else fiat_cur.get("rwa", [])),
+        },
+        "algo_stable": {
+            "enabled": bool(algo_src.get("enabled", algo_cur.get("enabled", True))),
+            "strict": bool(algo_src.get("strict", algo_cur.get("strict", True))),
+            "selection_date": str(algo_src.get("selection_date") or algo_cur.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+            "main": _normalize_symbol_list(algo_src.get("main") if isinstance(algo_src.get("main"), list) else algo_cur.get("main", [])),
+            "niche": _normalize_symbol_list(algo_src.get("niche") if isinstance(algo_src.get("niche"), list) else algo_cur.get("niche", [])),
+        },
+        "memes": {
+            "enabled": bool(meme_src.get("enabled", meme_cur.get("enabled", True))),
+            "strict": bool(meme_src.get("strict", meme_cur.get("strict", True))),
+            "selection_date": str(meme_src.get("selection_date") or meme_cur.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+            "top": _normalize_symbol_list(meme_src.get("top") if isinstance(meme_src.get("top"), list) else meme_cur.get("top", [])),
+        },
+    }
+    PAIR_LISTS_MANUAL_OVERRIDES_RUNTIME = merged
+    try:
+        _analytics_set_state(PAIR_LISTS_MANUAL_STATE_KEY, json.dumps(merged, ensure_ascii=False))
+    except Exception:
+        pass
+    return merged
+
+
+def _manual_fiat_hints_lines(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for s in _normalize_symbol_list(items):
+        info = _MANUAL_FIAT_STABLE_HINTS.get(s, {})
+        desc = str(info.get("desc") or "").strip()
+        liq = str(info.get("liquidity") or "").strip()
+        if desc and liq:
+            out.append(f"{s.upper()} - {desc}; liquidity: {liq}")
+        elif desc:
+            out.append(f"{s.upper()} - {desc}")
+        elif liq:
+            out.append(f"{s.upper()} - liquidity: {liq}")
+    return out
+
+
+def _manual_algo_hints_lines(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for s in _normalize_symbol_list(items):
+        info = _MANUAL_ALGO_STABLE_HINTS.get(s, {})
+        desc = str(info.get("desc") or "").strip()
+        liq = str(info.get("liquidity") or "").strip()
+        if desc and liq:
+            out.append(f"{s.upper()} - {desc}; liquidity: {liq}")
+        elif desc:
+            out.append(f"{s.upper()} - {desc}")
+        elif liq:
+            out.append(f"{s.upper()} - liquidity: {liq}")
+    return out
+
+
+def _manual_commodity_hints_lines(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for s in _normalize_symbol_list(items):
+        info = _MANUAL_COMMODITY_HINTS.get(s, {})
+        desc = str(info.get("desc") or "").strip()
+        liq = str(info.get("liquidity") or "").strip()
+        if desc and liq:
+            out.append(f"{s.upper()} - {desc}; liquidity: {liq}")
+        elif desc:
+            out.append(f"{s.upper()} - {desc}")
+        elif liq:
+            out.append(f"{s.upper()} - liquidity: {liq}")
+    return out
+
+
+def _manual_meme_hints_lines(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for s in _normalize_symbol_list(items):
+        info = _MANUAL_MEME_HINTS.get(s, {})
+        desc = str(info.get("desc") or "").strip()
+        liq = str(info.get("liquidity") or "").strip()
+        if desc and liq:
+            out.append(f"{s.upper()} - {desc}; liquidity: {liq}")
+        elif desc:
+            out.append(f"{s.upper()} - {desc}")
+        elif liq:
+            out.append(f"{s.upper()} - liquidity: {liq}")
+    return out
 
 
 def _fetch_coingecko_category_symbols(category_id: str, *, max_pages: int = 2, per_page: int = 250) -> set[str]:
@@ -16891,7 +17195,7 @@ def _fetch_coinpaprika_tag_coin_ids(tag_id: str) -> set[str]:
     return out
 
 
-def _fetch_coinpaprika_top_non_meme_symbols(max_rank: int = 500) -> set[str]:
+def _fetch_coinpaprika_top_non_meme_symbols(max_rank: int = 500) -> list[str]:
     import json
 
     meme_ids: set[str] = set()
@@ -16903,7 +17207,7 @@ def _fetch_coinpaprika_top_non_meme_symbols(max_rank: int = 500) -> set[str]:
     req = UrlRequest(_COINPAPRIKA_TICKERS_API, headers={"User-Agent": APP_USER_AGENT, "Accept": "application/json"})
     with urlopen(req, timeout=18) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
-    out: set[str] = set()
+    rows: list[tuple[int, str]] = []
     for row in (payload or []):
         if not isinstance(row, dict):
             continue
@@ -16918,7 +17222,57 @@ def _fetch_coinpaprika_top_non_meme_symbols(max_rank: int = 500) -> set[str]:
             continue
         sym = str(row.get("symbol") or "").strip().lower()
         if _is_clean_symbol(sym):
-            out.add(sym)
+            rows.append((rank, sym))
+    rows.sort(key=lambda x: (int(x[0]), x[1]))
+    out: list[str] = []
+    seen: set[str] = set()
+    for _rank, sym in rows:
+        s = str(sym or "").strip().lower()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _fetch_coinpaprika_top_meme_symbols(max_rank: int = 500) -> list[str]:
+    import json
+
+    meme_ids: set[str] = set()
+    for tag_id in _MEME_TAG_IDS:
+        try:
+            meme_ids.update(_fetch_coinpaprika_tag_coin_ids(tag_id))
+        except Exception:
+            continue
+    req = UrlRequest(_COINPAPRIKA_TICKERS_API, headers={"User-Agent": APP_USER_AGENT, "Accept": "application/json"})
+    with urlopen(req, timeout=18) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    rows: list[tuple[int, str]] = []
+    for row in (payload or []):
+        if not isinstance(row, dict):
+            continue
+        cid = str(row.get("id") or "").strip().lower()
+        if (not cid) or (cid not in meme_ids):
+            continue
+        try:
+            rank = int(row.get("rank") or 0)
+        except (TypeError, ValueError):
+            rank = 0
+        if rank <= 0 or rank > int(max_rank):
+            continue
+        sym = str(row.get("symbol") or "").strip().lower()
+        # Additional quality gate against garbage symbols.
+        if (not _is_clean_symbol(sym)) or (not re.search(r"[a-zA-Z]", sym)):
+            continue
+        rows.append((rank, sym))
+    rows.sort(key=lambda x: (int(x[0]), x[1]))
+    out: list[str] = []
+    seen: set[str] = set()
+    for _rank, sym in rows:
+        if sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
     return out
 
 
@@ -17066,6 +17420,94 @@ def _classify_ranked_symbols(
     return stable_fiat_ranked, stable_algo_ranked, token_ranked, commodity_ranked, fiat_nonusd_ranked, meme_ranked
 
 
+def _fetch_coingecko_category_ranked_symbols(category_id: str, *, max_pages: int = 2, per_page: int = 250) -> list[str]:
+    pairs = _fetch_coingecko_category_ranked_pairs(category_id, max_pages=max_pages, per_page=per_page)
+    return [sym for sym, _mcap in pairs]
+
+
+def _fetch_coingecko_category_ranked_pairs(category_id: str, *, max_pages: int = 2, per_page: int = 250) -> list[tuple[str, float]]:
+    import json
+
+    out: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    cat = str(category_id or "").strip().lower()
+    if not cat:
+        return out
+    per = max(1, min(int(per_page), 250))
+    for page in range(1, max(1, int(max_pages)) + 1):
+        url = (
+            f"{_COINGECKO_CATEGORY_API}?vs_currency=usd"
+            f"&category={cat}&order=market_cap_desc"
+            f"&per_page={per}&page={int(page)}"
+            "&sparkline=false&price_change_percentage=24h"
+        )
+        req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT, "Accept": "application/json"})
+        with urlopen(req, timeout=16) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(payload, list) or not payload:
+            break
+        for item in payload:
+            sym = str((item or {}).get("symbol") or "").strip().lower()
+            if not _is_clean_symbol(sym):
+                continue
+            if sym in seen:
+                continue
+            seen.add(sym)
+            try:
+                mcap = float((item or {}).get("market_cap") or 0.0)
+            except (TypeError, ValueError):
+                mcap = 0.0
+            out.append((sym, mcap))
+        if len(payload) < per:
+            break
+    return out
+
+
+def _merge_ranked_symbol_lists(*lists: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for arr in lists:
+        for sym in (arr or []):
+            s = str(sym or "").strip().lower()
+            if not _is_clean_symbol(s):
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _apply_manual_list(items: list[str], manual: list[str], *, strict: bool = False) -> list[str]:
+    """Apply manual list as priority (or strict allowlist) over ranked items."""
+    cleaned_items = _merge_ranked_symbol_lists(items or [])
+    cleaned_manual = _merge_ranked_symbol_lists(manual or [])
+    if not cleaned_manual:
+        return cleaned_items
+    if strict:
+        return cleaned_manual
+    manual_norm = {_normalize_pair_list_symbol_key(x) for x in cleaned_manual}
+    tail = [s for s in cleaned_items if _normalize_pair_list_symbol_key(s) not in manual_norm]
+    return cleaned_manual + tail
+
+
+def _filter_ranked_pairs_min_mcap(rows: list[tuple[str, float]], min_mcap_usd: float) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    threshold = float(min_mcap_usd or 0.0)
+    for sym, mcap in (rows or []):
+        s = str(sym or "").strip().lower()
+        if not _is_clean_symbol(s):
+            continue
+        if s in seen:
+            continue
+        if float(mcap or 0.0) < threshold:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 def _build_pair_lists_catalog_from_major(
     raw_major: dict[str, Any],
     updated_at: str,
@@ -17146,6 +17588,11 @@ def _build_pair_lists_catalog_from_major(
         filtered_tokens = [s for s in token_ranked if (s in preferred) or (s in allow_keep)]
         if filtered_tokens:
             token_ranked = filtered_tokens
+    commodity_ranked = _apply_manual_list(
+        commodity_ranked,
+        list(_COMMODITY_MANUAL_LIST),
+        strict=bool(_COMMODITY_MANUAL_STRICT),
+    )
     return {
         "schema_version": int(PAIR_LISTS_SCHEMA_VERSION),
         "updated_at": str(updated_at or _iso_now()),
@@ -17167,6 +17614,19 @@ def _build_pair_lists_catalog_from_major(
 
 def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
     def _empty_pair_lists_catalog() -> dict[str, Any]:
+        manual_cfg = _load_manual_pair_lists_overrides()
+        fiat_cfg = manual_cfg.get("fiat_stable") if isinstance(manual_cfg.get("fiat_stable"), dict) else {}
+        algo_cfg = manual_cfg.get("algo_stable") if isinstance(manual_cfg.get("algo_stable"), dict) else {}
+        meme_cfg = manual_cfg.get("memes") if isinstance(manual_cfg.get("memes"), dict) else {}
+        fiat_all = _merge_ranked_symbol_lists(
+            _normalize_symbol_list(fiat_cfg.get("core") if isinstance(fiat_cfg.get("core"), list) else []),
+            _normalize_symbol_list(fiat_cfg.get("rwa") if isinstance(fiat_cfg.get("rwa"), list) else []),
+        )
+        algo_all = _merge_ranked_symbol_lists(
+            _normalize_symbol_list(algo_cfg.get("main") if isinstance(algo_cfg.get("main"), list) else []),
+            _normalize_symbol_list(algo_cfg.get("niche") if isinstance(algo_cfg.get("niche"), list) else []),
+        )
+        meme_all = _normalize_symbol_list(meme_cfg.get("top") if isinstance(meme_cfg.get("top"), list) else [])
         return {
             "schema_version": int(PAIR_LISTS_SCHEMA_VERSION),
             "updated_at": _iso_now(),
@@ -17182,6 +17642,35 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
             "commodity_stables": [],
             "fiat_nonusd_stables": [],
             "memes": [],
+            "manual_overrides": {
+                "fiat_stable": {
+                    "enabled": bool(fiat_cfg.get("enabled", True)),
+                    "strict": bool(fiat_cfg.get("strict", True)),
+                    "selection_date": str(fiat_cfg.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+                    "core": _normalize_symbol_list(fiat_cfg.get("core") if isinstance(fiat_cfg.get("core"), list) else []),
+                    "rwa": _normalize_symbol_list(fiat_cfg.get("rwa") if isinstance(fiat_cfg.get("rwa"), list) else []),
+                    "count": len(fiat_all),
+                },
+                "algo_stable": {
+                    "enabled": bool(algo_cfg.get("enabled", True)),
+                    "strict": bool(algo_cfg.get("strict", True)),
+                    "selection_date": str(algo_cfg.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+                    "main": _normalize_symbol_list(algo_cfg.get("main") if isinstance(algo_cfg.get("main"), list) else []),
+                    "niche": _normalize_symbol_list(algo_cfg.get("niche") if isinstance(algo_cfg.get("niche"), list) else []),
+                    "count": len(algo_all),
+                },
+                "memes": {
+                    "enabled": bool(meme_cfg.get("enabled", True)),
+                    "strict": bool(meme_cfg.get("strict", True)),
+                    "selection_date": str(meme_cfg.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+                    "top": meme_all,
+                    "count": len(meme_all),
+                },
+            },
+            "fiat_stable_hints": _manual_fiat_hints_lines(fiat_all),
+            "algo_stable_hints": _manual_algo_hints_lines(algo_all),
+            "commodity_hints": _manual_commodity_hints_lines(list(_COMMODITY_MANUAL_LIST)),
+            "meme_hints": _manual_meme_hints_lines(meme_all),
         }
 
     def _normalize_pair_lists_catalog(raw: dict[str, Any]) -> dict[str, Any]:
@@ -17189,18 +17678,13 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         if not isinstance(raw, dict):
             return base
         as_list = lambda v: v if isinstance(v, list) else []
-        meme_seed_norm = {_normalize_pair_list_symbol_key(x) for x in _MEME_SYMBOLS}
-        def _clean_sym_list(items: list[Any], *, drop_memes: bool = False) -> list[str]:
+        def _clean_sym_list(items: list[Any]) -> list[str]:
             out: list[str] = []
             seen: set[str] = set()
             for it in (items or []):
                 s = str(it or "").strip().lower()
                 if (not _is_clean_symbol(s)) or (s in _PAIR_LIST_BLOCKED_SYMBOLS):
                     continue
-                if drop_memes:
-                    s_norm = _normalize_pair_list_symbol_key(s)
-                    if s_norm in meme_seed_norm:
-                        continue
                 if s in seen:
                     continue
                 seen.add(s)
@@ -17214,14 +17698,81 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         out["stablecoins_full"] = _clean_sym_list(as_list(raw.get("stablecoins_full")) or list(out["stablecoins"]))
         out["stable_algo_crypto"] = _clean_sym_list(as_list(raw.get("stable_algo_crypto")))
         out["stable_algo_crypto_full"] = _clean_sym_list(as_list(raw.get("stable_algo_crypto_full")) or list(out["stable_algo_crypto"]))
-        out["tokens"] = _clean_sym_list(as_list(raw.get("tokens")), drop_memes=True)
-        out["coins"] = _clean_sym_list(as_list(raw.get("coins")) or list(out["tokens"]), drop_memes=True)
-        out["tokens_full"] = _clean_sym_list(as_list(raw.get("tokens_full")) or list(out["tokens"]), drop_memes=True)
-        out["coins_full"] = _clean_sym_list(as_list(raw.get("coins_full")) or as_list(raw.get("tokens_full")) or list(out["coins"]), drop_memes=True)
         out["commodity_stables"] = _clean_sym_list(as_list(raw.get("commodity_stables")))
         out["fiat_nonusd_stables"] = _clean_sym_list(as_list(raw.get("fiat_nonusd_stables")))
         out["memes"] = _clean_sym_list(as_list(raw.get("memes")))
+        meme_norm = {_normalize_pair_list_symbol_key(x) for x in out["memes"]}
+        def _clean_non_meme(items: list[Any]) -> list[str]:
+            cleaned = _clean_sym_list(items)
+            return [s for s in cleaned if _normalize_pair_list_symbol_key(s) not in meme_norm]
+        out["tokens"] = _clean_non_meme(as_list(raw.get("tokens")))
+        out["coins"] = _clean_non_meme(as_list(raw.get("coins")) or list(out["tokens"]))
+        out["tokens_full"] = _clean_non_meme(as_list(raw.get("tokens_full")) or list(out["tokens"]))
+        out["coins_full"] = _clean_non_meme(as_list(raw.get("coins_full")) or as_list(raw.get("tokens_full")) or list(out["coins"]))
+        manual_cfg_raw = raw.get("manual_overrides") if isinstance(raw.get("manual_overrides"), dict) else {}
+        fiat_manual_raw = manual_cfg_raw.get("fiat_stable") if isinstance(manual_cfg_raw.get("fiat_stable"), dict) else {}
+        algo_manual_raw = manual_cfg_raw.get("algo_stable") if isinstance(manual_cfg_raw.get("algo_stable"), dict) else {}
+        meme_manual_raw = manual_cfg_raw.get("memes") if isinstance(manual_cfg_raw.get("memes"), dict) else {}
+        base_manual = base.get("manual_overrides", {}).get("fiat_stable", {})
+        base_algo = base.get("manual_overrides", {}).get("algo_stable", {})
+        base_meme = base.get("manual_overrides", {}).get("memes", {})
+        fiat_manual = {
+            "enabled": bool(fiat_manual_raw.get("enabled", base_manual.get("enabled", True))),
+            "strict": bool(fiat_manual_raw.get("strict", base_manual.get("strict", True))),
+            "selection_date": str(fiat_manual_raw.get("selection_date") or base_manual.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+            "core": _clean_sym_list(as_list(fiat_manual_raw.get("core")) or as_list(base_manual.get("core"))),
+            "rwa": _clean_sym_list(as_list(fiat_manual_raw.get("rwa")) or as_list(base_manual.get("rwa"))),
+        }
+        fiat_manual["count"] = len(_merge_ranked_symbol_lists(fiat_manual.get("core", []), fiat_manual.get("rwa", [])))
+        algo_manual = {
+            "enabled": bool(algo_manual_raw.get("enabled", base_algo.get("enabled", True))),
+            "strict": bool(algo_manual_raw.get("strict", base_algo.get("strict", True))),
+            "selection_date": str(algo_manual_raw.get("selection_date") or base_algo.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+            "main": _clean_sym_list(as_list(algo_manual_raw.get("main")) or as_list(base_algo.get("main"))),
+            "niche": _clean_sym_list(as_list(algo_manual_raw.get("niche")) or as_list(base_algo.get("niche"))),
+        }
+        algo_manual["count"] = len(_merge_ranked_symbol_lists(algo_manual.get("main", []), algo_manual.get("niche", [])))
+        meme_manual = {
+            "enabled": bool(meme_manual_raw.get("enabled", base_meme.get("enabled", True))),
+            "strict": bool(meme_manual_raw.get("strict", base_meme.get("strict", True))),
+            "selection_date": str(meme_manual_raw.get("selection_date") or base_meme.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+            "top": _clean_sym_list(as_list(meme_manual_raw.get("top")) or as_list(base_meme.get("top"))),
+        }
+        meme_manual["count"] = len(meme_manual.get("top", []))
+        out["manual_overrides"] = {"fiat_stable": fiat_manual, "algo_stable": algo_manual, "memes": meme_manual}
+        raw_hints = raw.get("fiat_stable_hints")
+        if isinstance(raw_hints, list) and raw_hints:
+            out["fiat_stable_hints"] = [str(x)[:220] for x in raw_hints if str(x or "").strip()]
+        else:
+            out["fiat_stable_hints"] = _manual_fiat_hints_lines(_merge_ranked_symbol_lists(fiat_manual.get("core", []), fiat_manual.get("rwa", [])))
+        raw_algo_hints = raw.get("algo_stable_hints")
+        if isinstance(raw_algo_hints, list) and raw_algo_hints:
+            out["algo_stable_hints"] = [str(x)[:220] for x in raw_algo_hints if str(x or "").strip()]
+        else:
+            out["algo_stable_hints"] = _manual_algo_hints_lines(_merge_ranked_symbol_lists(algo_manual.get("main", []), algo_manual.get("niche", [])))
+        raw_commodity_hints = raw.get("commodity_hints")
+        if isinstance(raw_commodity_hints, list) and raw_commodity_hints:
+            out["commodity_hints"] = [str(x)[:220] for x in raw_commodity_hints if str(x or "").strip()]
+        else:
+            out["commodity_hints"] = _manual_commodity_hints_lines(out.get("commodity_stables", []))
+        raw_meme_hints = raw.get("meme_hints")
+        if isinstance(raw_meme_hints, list) and raw_meme_hints:
+            out["meme_hints"] = [str(x)[:220] for x in raw_meme_hints if str(x or "").strip()]
+        else:
+            out["meme_hints"] = _manual_meme_hints_lines(meme_manual.get("top", []))
         return out
+
+    def _pair_lists_core_empty(pl: dict[str, Any]) -> bool:
+        if not isinstance(pl, dict):
+            return True
+        return (
+            len(pl.get("stablecoins_full") or []) == 0
+            and len(pl.get("stable_algo_crypto_full") or []) == 0
+            and len(pl.get("coins_full") or []) == 0
+            and len(pl.get("commodity_stables") or []) == 0
+            and len(pl.get("fiat_nonusd_stables") or []) == 0
+            and len(pl.get("memes") or []) == 0
+        )
 
     def _schedule_pair_lists_refresh() -> None:
         global PAIR_LISTS_ASYNC_REFRESH_INFLIGHT
@@ -17249,20 +17800,38 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
             # Keep /api/meta fast: return cached immediately; refresh in background if schema is old.
             if int(normalized.get("schema_version") or 0) != int(PAIR_LISTS_SCHEMA_VERSION):
                 _schedule_pair_lists_refresh()
+            elif _pair_lists_core_empty(normalized):
+                # Self-heal empty catalogs after deploy/config changes.
+                _schedule_pair_lists_refresh()
             return normalized
         _schedule_pair_lists_refresh()
         return _empty_pair_lists_catalog()
     raw_major = _read_json(MAJOR_TOKENS_CACHE_PATH) or {}
+    if int(TOKENS_MAJOR_TOP_N or 0) > 0:
+        by_chain = raw_major.get("by_chain") if isinstance(raw_major, dict) else None
+        if not isinstance(by_chain, dict) or len(by_chain) == 0:
+            try:
+                _refresh_major_tokens_cache(force=True)
+                raw_major = _read_json(MAJOR_TOKENS_CACHE_PATH) or raw_major
+            except Exception:
+                pass
     updated_at = str(raw_major.get("updated_at") or _iso_now())
     allowed = None
     meme_excluded_symbols: set[str] = set(_COINS_PROTECT_ALLOWLIST)
     preferred_coin_symbols: set[str] | None = None
+    preferred_coin_ranked: list[str] = []
     usd_stable_symbols: set[str] = set(_STABLECOIN_SYMBOLS)
     fiat_usd_stable_symbols: set[str] = set(_STABLECOIN_SYMBOLS)
     algo_crypto_usd_stable_symbols: set[str] = set()
+    usd_ranked: list[str] = []
+    stable_fiat_ranked_external: list[str] = []
+    stable_algo_ranked_external: list[str] = []
     commodity_symbols: set[str] = set(_COMMODITY_STABLE_SYMBOLS)
+    commodity_ranked: list[str] = []
     nonusd_fiat_symbols: set[str] = set(_NON_USD_FIAT_STABLE_SYMBOLS)
+    nonusd_ranked: list[str] = []
     meme_symbols: set[str] = set()
+    meme_ranked: list[str] = []
     source_parts = ["major_tokens_top_n_rank_proxy"]
     try:
         verified_all, _, _profiles = _fetch_uniswap_verified_token_profiles()
@@ -17280,8 +17849,9 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
     try:
         cp_top = _fetch_coinpaprika_top_non_meme_symbols(max_rank=int(_COINPAPRIKA_TOP_MAX_RANK))
         if cp_top:
-            preferred_coin_symbols = set(cp_top)
-            meme_excluded_symbols.update(cp_top)
+            preferred_coin_ranked = list(cp_top)
+            preferred_coin_symbols = set(preferred_coin_ranked)
+            meme_excluded_symbols.update(preferred_coin_ranked)
             source_parts.append("coinpaprika_top_non_meme")
         else:
             source_parts.append("coinpaprika_top_non_meme_empty")
@@ -17294,31 +17864,50 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
                 per_page=int(_COINGECKO_TOP_MARKETCAP_PER_PAGE),
             )
             if cg_top:
-                preferred_coin_symbols = set(cg_top)
-                meme_excluded_symbols.update(cg_top)
+                preferred_coin_ranked = list(cg_top)
+                preferred_coin_symbols = set(preferred_coin_ranked)
+                meme_excluded_symbols.update(preferred_coin_ranked)
                 source_parts.append("coingecko_top_mcap")
             else:
                 source_parts.append("coingecko_top_mcap_empty")
         except Exception:
             source_parts.append("coingecko_top_mcap_fallback")
     try:
-        commodity_from_cg: set[str] = set()
+        fiat_lists: list[list[str]] = []
+        for cat in _STABLE_FIAT_COINGECKO_CATEGORY_IDS:
+            fiat_pairs = _fetch_coingecko_category_ranked_pairs(cat, max_pages=2, per_page=250)
+            fiat_lists.append(_filter_ranked_pairs_min_mcap(fiat_pairs, _STABLE_FIAT_MIN_MARKET_CAP_USD))
+        stable_fiat_ranked_external = _merge_ranked_symbol_lists(*fiat_lists)
+
+        algo_lists: list[list[str]] = []
+        for cat in (_STABLE_ALGO_COINGECKO_CATEGORY_IDS + _STABLE_CRYPTO_BACKED_COINGECKO_CATEGORY_IDS):
+            algo_pairs = _fetch_coingecko_category_ranked_pairs(cat, max_pages=2, per_page=250)
+            algo_lists.append(_filter_ranked_pairs_min_mcap(algo_pairs, _STABLE_ALGO_MIN_MARKET_CAP_USD))
+        stable_algo_ranked_external = _merge_ranked_symbol_lists(*algo_lists)
+        source_parts.append("coingecko_stable_rank")
+    except Exception:
+        source_parts.append("coingecko_stable_rank_fallback")
+    try:
+        commodity_lists: list[list[str]] = []
         for cat in _COMMODITY_CATEGORY_IDS:
-            commodity_from_cg.update(_fetch_coingecko_category_symbols(cat, max_pages=1, per_page=250))
-        if commodity_from_cg:
-            commodity_symbols.update(commodity_from_cg)
+            commodity_lists.append(_fetch_coingecko_category_ranked_symbols(cat, max_pages=1, per_page=250))
+        commodity_ranked = _merge_ranked_symbol_lists(*commodity_lists)
+        if commodity_ranked:
+            commodity_symbols.update(commodity_ranked)
         source_parts.append("coingecko_commodity")
     except Exception:
         source_parts.append("coingecko_commodity_fallback")
     try:
-        meme_from_cg = _fetch_coingecko_category_symbols(
+        meme_from_cg_pairs = _fetch_coingecko_category_ranked_pairs(
             _MEME_COINGECKO_CATEGORY_ID,
             max_pages=2,
             per_page=100,
         )
+        meme_from_cg = _filter_ranked_pairs_min_mcap(meme_from_cg_pairs, _MEME_MIN_MARKET_CAP_USD)
         if meme_from_cg:
             # Prefer CoinGecko memes, but do not depend on it exclusively.
-            meme_symbols.update(meme_from_cg)
+            meme_ranked = list(meme_from_cg)
+            meme_symbols.update(meme_ranked)
             source_parts.append("coingecko_memes")
         else:
             source_parts.append("coingecko_memes_empty")
@@ -17328,53 +17917,259 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         meme_from_paprika: set[str] = set()
         for tag_id in _MEME_TAG_IDS:
             meme_from_paprika.update(_fetch_coinpaprika_tag_symbols(tag_id))
+        meme_ranked_from_paprika = _fetch_coinpaprika_top_meme_symbols(max_rank=int(_COINPAPRIKA_TOP_MAX_RANK))
         if meme_from_paprika:
             meme_symbols.update(meme_from_paprika)
+            if not meme_ranked:
+                meme_ranked = list(meme_ranked_from_paprika) if meme_ranked_from_paprika else sorted(meme_from_paprika)
             source_parts.append("coinpaprika_memes")
         else:
             source_parts.append("coinpaprika_memes_empty")
     except Exception:
         source_parts.append("coinpaprika_memes_fallback")
-    # Always include a small hardcoded meme seed set to avoid false negatives when APIs degrade.
-    meme_symbols.update(_MEME_SYMBOLS)
-    if meme_symbols == set(_MEME_SYMBOLS):
-        source_parts.append("meme_seed_only")
-    else:
-        source_parts.append("meme_seed_augmented")
+    # No hardcoded meme symbols: classification must come from source categories/tags.
     try:
         (
             usd_from_llama,
             nonusd_from_llama,
-            _usd_ranked_from_llama,
-            _nonusd_ranked_from_llama,
+            usd_ranked_from_llama,
+            nonusd_ranked_from_llama,
             fiat_from_llama,
             algo_from_llama,
         ) = _fetch_defillama_stablecoin_symbol_classes()
         if usd_from_llama:
             usd_stable_symbols.update(usd_from_llama)
+        if usd_ranked_from_llama:
+            # Keep authoritative supply-ranked order for stable classes.
+            # Actual splitting fiat/algo is done below using mechanism-derived sets.
+            usd_ranked = list(usd_ranked_from_llama)
         if fiat_from_llama:
             fiat_usd_stable_symbols.update(fiat_from_llama)
         if algo_from_llama:
             algo_crypto_usd_stable_symbols.update(algo_from_llama)
         if nonusd_from_llama:
             nonusd_fiat_symbols.update(nonusd_from_llama)
+        if nonusd_ranked_from_llama:
+            nonusd_ranked = list(nonusd_ranked_from_llama)
+        try:
+            nonusd_pairs: list[tuple[str, float]] = []
+            for cat in ("eur-stablecoin", "gbp-stablecoin", "jpy-stablecoin", "chf-stablecoin", "idr-stablecoin", "try-stablecoins", "cny-stablecoin"):
+                nonusd_pairs.extend(_fetch_coingecko_category_ranked_pairs(cat, max_pages=1, per_page=250))
+            nonusd_ranked_cg = _filter_ranked_pairs_min_mcap(nonusd_pairs, _STABLE_NONUSD_MIN_MARKET_CAP_USD)
+            if nonusd_ranked_cg:
+                nonusd_ranked = list(_merge_ranked_symbol_lists(nonusd_ranked_cg))
+                source_parts.append("coingecko_nonusd_rank")
+        except Exception:
+            source_parts.append("coingecko_nonusd_rank_fallback")
         source_parts.append("defillama_stables")
     except Exception:
         source_parts.append("defillama_fallback")
-    out = _build_pair_lists_catalog_from_major(
-        raw_major,
-        updated_at,
-        allowed_symbols=allowed,
-        preferred_coin_symbols=preferred_coin_symbols,
-        meme_excluded_symbols=meme_excluded_symbols,
-        usd_stable_symbols=usd_stable_symbols,
-        fiat_usd_stable_symbols=fiat_usd_stable_symbols,
-        algo_crypto_usd_stable_symbols=algo_crypto_usd_stable_symbols,
-        commodity_symbols=commodity_symbols,
-        nonusd_fiat_symbols=nonusd_fiat_symbols,
-        meme_symbols=meme_symbols,
-        source="+".join(source_parts),
+    norm = _normalize_pair_list_symbol_key
+    blocked = {str(x).strip().lower() for x in _PAIR_LIST_BLOCKED_SYMBOLS}
+    fiat_set = {norm(x) for x in fiat_usd_stable_symbols if _is_clean_symbol(str(x).strip())}
+    algo_set = {norm(x) for x in algo_crypto_usd_stable_symbols if _is_clean_symbol(str(x).strip())}
+    usd_set = {norm(x) for x in usd_stable_symbols if _is_clean_symbol(str(x).strip())}
+    nonusd_set = {norm(x) for x in nonusd_fiat_symbols if _is_clean_symbol(str(x).strip())}
+    commodity_set = {norm(x) for x in commodity_symbols if _is_clean_symbol(str(x).strip())}
+    meme_set = {norm(x) for x in meme_symbols if _is_clean_symbol(str(x).strip())}
+    meme_excluded_set = {norm(x) for x in meme_excluded_symbols if _is_clean_symbol(str(x).strip())}
+
+    def _ordered_unique(items: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in (items or []):
+            s = str(raw or "").strip().lower()
+            if (not _is_clean_symbol(s)) or (s in blocked):
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    def _apply_stable_core_priority(items: list[str]) -> list[str]:
+        cleaned = _ordered_unique(items)
+        if not cleaned:
+            return cleaned
+        priority_norm = [norm(x) for x in _STABLE_CORE_PRIORITY]
+        if not priority_norm:
+            return cleaned
+        by_norm: dict[str, str] = {}
+        for s in cleaned:
+            sn = norm(s)
+            if sn and sn not in by_norm:
+                by_norm[sn] = s
+        front: list[str] = [by_norm[pn] for pn in priority_norm if pn in by_norm]
+        front_norm = {norm(x) for x in front}
+        tail = [s for s in cleaned if norm(s) not in front_norm]
+        return front + tail
+
+    stable_fiat_ranked_auth: list[str] = []
+    stable_algo_ranked_auth: list[str] = []
+    # Primary rank source for stables: CoinGecko stable categories.
+    for s in _ordered_unique(stable_fiat_ranked_external):
+        sn = norm(s)
+        if (sn in algo_set):
+            continue
+        if sn in fiat_set or sn in usd_set:
+            stable_fiat_ranked_auth.append(s)
+    for s in _ordered_unique(stable_algo_ranked_external):
+        sn = norm(s)
+        if sn in algo_set:
+            stable_algo_ranked_auth.append(s)
+    # Fallback/backfill rank source: DefiLlama stable supply ranking.
+    seen_fiat = {norm(x) for x in stable_fiat_ranked_auth}
+    seen_algo = {norm(x) for x in stable_algo_ranked_auth}
+    for s in _ordered_unique(usd_ranked):
+        sn = norm(s)
+        if sn in algo_set:
+            if sn not in seen_algo:
+                stable_algo_ranked_auth.append(s)
+                seen_algo.add(sn)
+        elif sn in fiat_set or sn in usd_set:
+            if sn not in seen_fiat:
+                stable_fiat_ranked_auth.append(s)
+                seen_fiat.add(sn)
+    stable_fiat_ranked_auth = _apply_stable_core_priority(stable_fiat_ranked_auth)
+    stable_algo_ranked_auth = _apply_stable_core_priority(stable_algo_ranked_auth)
+
+    nonusd_ranked_auth = [s for s in _ordered_unique(nonusd_ranked) if norm(s) in nonusd_set]
+    commodity_ranked_auth = [s for s in _ordered_unique(commodity_ranked) if norm(s) in commodity_set]
+    commodity_ranked_auth = _apply_manual_list(
+        commodity_ranked_auth,
+        list(_COMMODITY_MANUAL_LIST),
+        strict=bool(_COMMODITY_MANUAL_STRICT),
     )
+    meme_ranked_auth = [s for s in _ordered_unique(meme_ranked) if (norm(s) in meme_set and norm(s) not in meme_excluded_set)]
+
+    preferred_ranked = _ordered_unique(preferred_coin_ranked)
+    stable_union = {norm(x) for x in (stable_fiat_ranked_auth + stable_algo_ranked_auth)}
+    nonmeme_coin_ranked_auth: list[str] = []
+    for s in preferred_ranked:
+        sn = norm(s)
+        if sn in stable_union or sn in nonusd_set or sn in commodity_set or sn in meme_set:
+            continue
+        nonmeme_coin_ranked_auth.append(s)
+
+    authoritative_non_empty = bool(
+        stable_fiat_ranked_auth
+        or stable_algo_ranked_auth
+        or nonmeme_coin_ranked_auth
+        or commodity_ranked_auth
+        or nonusd_ranked_auth
+        or meme_ranked_auth
+    )
+    if authoritative_non_empty:
+        out = {
+            "schema_version": int(PAIR_LISTS_SCHEMA_VERSION),
+            "updated_at": str(updated_at or _iso_now()),
+            "source": "+".join(source_parts + ["authoritative_catalog"]),
+            "stablecoins": stable_fiat_ranked_auth[:20],
+            "stablecoins_full": stable_fiat_ranked_auth[:200],
+            "stable_algo_crypto": stable_algo_ranked_auth[:200],
+            "stable_algo_crypto_full": stable_algo_ranked_auth[:200],
+            "tokens": nonmeme_coin_ranked_auth[:20],
+            "coins": nonmeme_coin_ranked_auth[:20],
+            "tokens_full": nonmeme_coin_ranked_auth[:200],
+            "coins_full": nonmeme_coin_ranked_auth[:200],
+            "commodity_stables": commodity_ranked_auth[:200],
+            "fiat_nonusd_stables": nonusd_ranked_auth[:200],
+            "memes": meme_ranked_auth[:200],
+        }
+    else:
+        out = _build_pair_lists_catalog_from_major(
+            raw_major,
+            updated_at,
+            allowed_symbols=allowed,
+            preferred_coin_symbols=preferred_coin_symbols,
+            meme_excluded_symbols=meme_excluded_symbols,
+            usd_stable_symbols=usd_stable_symbols,
+            fiat_usd_stable_symbols=fiat_usd_stable_symbols,
+            algo_crypto_usd_stable_symbols=algo_crypto_usd_stable_symbols,
+            commodity_symbols=commodity_symbols,
+            nonusd_fiat_symbols=nonusd_fiat_symbols,
+            meme_symbols=meme_symbols,
+            source="+".join(source_parts + ["major_fallback"]),
+        )
+    manual_cfg = _load_manual_pair_lists_overrides()
+    fiat_manual = manual_cfg.get("fiat_stable") if isinstance(manual_cfg.get("fiat_stable"), dict) else {}
+    fiat_manual_core = _normalize_symbol_list(fiat_manual.get("core") if isinstance(fiat_manual.get("core"), list) else [])
+    fiat_manual_rwa = _normalize_symbol_list(fiat_manual.get("rwa") if isinstance(fiat_manual.get("rwa"), list) else [])
+    fiat_manual_all = _merge_ranked_symbol_lists(fiat_manual_core, fiat_manual_rwa)
+    if bool(fiat_manual.get("enabled", True)) and fiat_manual_all:
+        ranked_fiat = _apply_manual_list(
+            list(out.get("stablecoins_full") or out.get("stablecoins") or []),
+            fiat_manual_all,
+            strict=bool(fiat_manual.get("strict", True)),
+        )
+        out["stablecoins_full"] = ranked_fiat[:200]
+        out["stablecoins"] = ranked_fiat[:20]
+        src_cur = str(out.get("source") or "")
+        if "manual_fiat_override" not in src_cur:
+            out["source"] = f"{src_cur}+manual_fiat_override".strip("+")
+    out["manual_overrides"] = {
+        "fiat_stable": {
+            "enabled": bool(fiat_manual.get("enabled", True)),
+            "strict": bool(fiat_manual.get("strict", True)),
+            "selection_date": str(fiat_manual.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+            "core": fiat_manual_core,
+            "rwa": fiat_manual_rwa,
+            "count": len(fiat_manual_all),
+        },
+    }
+    out["fiat_stable_hints"] = _manual_fiat_hints_lines(fiat_manual_all)
+    algo_manual = manual_cfg.get("algo_stable") if isinstance(manual_cfg.get("algo_stable"), dict) else {}
+    algo_manual_main = _normalize_symbol_list(algo_manual.get("main") if isinstance(algo_manual.get("main"), list) else [])
+    algo_manual_niche = _normalize_symbol_list(algo_manual.get("niche") if isinstance(algo_manual.get("niche"), list) else [])
+    algo_manual_all = _merge_ranked_symbol_lists(algo_manual_main, algo_manual_niche)
+    if bool(algo_manual.get("enabled", True)) and algo_manual_all:
+        ranked_algo = _apply_manual_list(
+            list(out.get("stable_algo_crypto_full") or out.get("stable_algo_crypto") or []),
+            algo_manual_all,
+            strict=bool(algo_manual.get("strict", True)),
+        )
+        out["stable_algo_crypto_full"] = ranked_algo[:200]
+        out["stable_algo_crypto"] = ranked_algo[:200]
+        src_cur = str(out.get("source") or "")
+        if "manual_algo_override" not in src_cur:
+            out["source"] = f"{src_cur}+manual_algo_override".strip("+")
+    out["manual_overrides"]["algo_stable"] = {
+        "enabled": bool(algo_manual.get("enabled", True)),
+        "strict": bool(algo_manual.get("strict", True)),
+        "selection_date": str(algo_manual.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+        "main": algo_manual_main,
+        "niche": algo_manual_niche,
+        "count": len(algo_manual_all),
+    }
+    out["algo_stable_hints"] = _manual_algo_hints_lines(algo_manual_all)
+    out["commodity_hints"] = _manual_commodity_hints_lines(out.get("commodity_stables", []))
+    meme_manual = manual_cfg.get("memes") if isinstance(manual_cfg.get("memes"), dict) else {}
+    meme_manual_top = _normalize_symbol_list(meme_manual.get("top") if isinstance(meme_manual.get("top"), list) else [])
+    if bool(meme_manual.get("enabled", True)) and meme_manual_top:
+        ranked_memes = _apply_manual_list(
+            list(out.get("memes") or []),
+            meme_manual_top,
+            strict=bool(meme_manual.get("strict", True)),
+        )
+        out["memes"] = ranked_memes[:200]
+        src_cur = str(out.get("source") or "")
+        if "manual_meme_override" not in src_cur:
+            out["source"] = f"{src_cur}+manual_meme_override".strip("+")
+    out["manual_overrides"]["memes"] = {
+        "enabled": bool(meme_manual.get("enabled", True)),
+        "strict": bool(meme_manual.get("strict", True)),
+        "selection_date": str(meme_manual.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+        "top": meme_manual_top,
+        "count": len(meme_manual_top),
+    }
+    out["meme_hints"] = _manual_meme_hints_lines(meme_manual_top)
+    if _pair_lists_core_empty(out) and isinstance(cached, dict):
+        prev = _normalize_pair_lists_catalog(cached)
+        if not _pair_lists_core_empty(prev):
+            prev["schema_version"] = int(PAIR_LISTS_SCHEMA_VERSION)
+            prev["updated_at"] = str(prev.get("updated_at") or _iso_now())
+            prev["source"] = f"{str(prev.get('source') or '')}+kept_previous_non_empty"
+            out = prev
     try:
         _write_json(PAIR_LISTS_CATALOG_PATH, out)
     except Exception:
@@ -17743,7 +18538,13 @@ _STABLECOIN_SYMBOLS = {
     "lusd", "usdd", "usdbc", "usdt0", "rlusd", "eurc", "ageur", "usds", "usd0", "usdm",
     "eura", "eurt", "eurs", "xsgd", "audd", "cchf", "cadc", "jpyc", "gbpt", "gbpc", "brz", "tryb",
 }
-_COMMODITY_STABLE_SYMBOLS = {"paxg", "xaut", "xagx", "kag", "xag", "dgx"}
+_COMMODITY_MANUAL_LIST = tuple(
+    str(x or "").strip().lower()
+    for x in os.environ.get("COMMODITY_MANUAL_LIST", "xaut,paxg,kau,kag,cgo").replace(" ", "").split(",")
+    if _is_clean_symbol(str(x or "").strip().lower())
+)
+_COMMODITY_MANUAL_STRICT = str(os.environ.get("COMMODITY_MANUAL_STRICT", "1")).strip().lower() in {"1", "true", "yes", "on"}
+_COMMODITY_STABLE_SYMBOLS = set(_COMMODITY_MANUAL_LIST) if _COMMODITY_MANUAL_LIST else {"paxg", "xaut", "xagx", "kag", "xag", "dgx"}
 _NON_USD_FIAT_STABLE_SYMBOLS = {
     "eurc", "eurt", "eura", "eurs", "xsgd", "audd", "cchf", "cadc", "jpyc", "gbpt", "gbpc", "brz", "tryb",
 }
@@ -18513,6 +19314,19 @@ class AuthVerifyRequest(BaseModel):
 class AdminWalletUpdate(BaseModel):
     action: str
     address: str
+
+
+class AdminPairListsManualUpdate(BaseModel):
+    enabled: bool = True
+    strict: bool = True
+    selection_date: str = ""
+    fiat_core: list[str] = Field(default_factory=list)
+    fiat_rwa: list[str] = Field(default_factory=list)
+    algo_enabled: bool | None = None
+    algo_strict: bool | None = None
+    algo_selection_date: str = ""
+    algo_main: list[str] = Field(default_factory=list)
+    algo_niche: list[str] = Field(default_factory=list)
 
 
 class HelpTicketCreate(BaseModel):
@@ -24298,6 +25112,21 @@ def _render_admin_page() -> str:
         <div class="row"><label>Token catalog</label><div id="tokenCatalogInfo">-</div></div>
         <span id="adminStatus" class="status">Ready</span>
       </section>
+      <section class="card">
+        <h3>Pair Lists Manual Override</h3>
+        <p class="hint">Manual fiat-backed stablecoin shortlist (core + RWA/yield). Saved in admin state and applied on next catalog refresh.</p>
+        <div class="row"><label>Enabled</label><select id="manualFiatEnabled"><option value="true">yes</option><option value="false">no</option></select></div>
+        <div class="row"><label>Strict mode</label><select id="manualFiatStrict"><option value="true">strict (only manual list)</option><option value="false">priority (manual first + tail)</option></select></div>
+        <div class="row"><label>Selection date</label><input id="manualFiatDate" type="text" placeholder="YYYY-MM-DD"/></div>
+        <div class="row"><label>Fiat core (CSV)</label><textarea id="manualFiatCore" placeholder="usdt,usdc,usd1,pyusd,fdusd,rlusd,usdg,tusd,gusd,husd"></textarea></div>
+        <div class="row"><label>Fiat RWA/yield (CSV)</label><textarea id="manualFiatRwa" placeholder="buidl,usyc,usdy,usdtb,usd0,frxusd,mnee,cgusd"></textarea></div>
+        <div class="row"><label>Algo enabled</label><select id="manualAlgoEnabled"><option value="true">yes</option><option value="false">no</option></select></div>
+        <div class="row"><label>Algo strict mode</label><select id="manualAlgoStrict"><option value="true">strict (only manual list)</option><option value="false">priority (manual first + tail)</option></select></div>
+        <div class="row"><label>Algo selection date</label><input id="manualAlgoDate" type="text" placeholder="YYYY-MM-DD"/></div>
+        <div class="row"><label>Algo Main Tier (CSV)</label><textarea id="manualAlgoMain" placeholder="usds,usde,dai,gho,crvusd,frax,frxusd,mim,dola"></textarea></div>
+        <div class="row"><label>Algo Niche Tier (CSV)</label><textarea id="manualAlgoNiche" placeholder="usdd,usdf,usx,rwausdi,usda,reusd,satusd,bold,lisusd,usdai"></textarea></div>
+        <button class="btn" onclick="saveManualFiatOverride()">Save manual stable overrides</button>
+      </section>
     </div>
     <div class="grid" id="tabStats" style="display:none">
       <section class="card">
@@ -24855,8 +25684,68 @@ def _render_admin_page() -> str:
         document.getElementById("eventsCount").textContent = String(data.events_count || 0);
         document.getElementById("tokenCatalogInfo").textContent = `updated: ${{data.token_catalog_updated_at || "-"}}, count: ${{data.token_catalog_count || 0}}`;
         renderAdminWallets(data.admin_wallets || []);
+        renderManualFiatSettings(data.pair_lists_manual || {{}});
       }} catch (e) {{
         setAdminStatus("Load failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    function renderManualFiatSettings(cfg) {{
+      const fiat = cfg && cfg.fiat_stable ? cfg.fiat_stable : {{}};
+      const algo = cfg && cfg.algo_stable ? cfg.algo_stable : {{}};
+      const core = Array.isArray(fiat.core) ? fiat.core : [];
+      const rwa = Array.isArray(fiat.rwa) ? fiat.rwa : [];
+      const algoMain = Array.isArray(algo.main) ? algo.main : [];
+      const algoNiche = Array.isArray(algo.niche) ? algo.niche : [];
+      const enabled = !!fiat.enabled;
+      const strict = (fiat.strict === undefined) ? true : !!fiat.strict;
+      const selDate = String(fiat.selection_date || "").trim();
+      const algoEnabled = !!algo.enabled;
+      const algoStrict = (algo.strict === undefined) ? true : !!algo.strict;
+      const algoDate = String(algo.selection_date || "").trim();
+      const elEnabled = document.getElementById("manualFiatEnabled");
+      const elStrict = document.getElementById("manualFiatStrict");
+      const elDate = document.getElementById("manualFiatDate");
+      const elCore = document.getElementById("manualFiatCore");
+      const elRwa = document.getElementById("manualFiatRwa");
+      const elAlgoEnabled = document.getElementById("manualAlgoEnabled");
+      const elAlgoStrict = document.getElementById("manualAlgoStrict");
+      const elAlgoDate = document.getElementById("manualAlgoDate");
+      const elAlgoMain = document.getElementById("manualAlgoMain");
+      const elAlgoNiche = document.getElementById("manualAlgoNiche");
+      if (elEnabled) elEnabled.value = enabled ? "true" : "false";
+      if (elStrict) elStrict.value = strict ? "true" : "false";
+      if (elDate) elDate.value = selDate;
+      if (elCore) elCore.value = core.join(",");
+      if (elRwa) elRwa.value = rwa.join(",");
+      if (elAlgoEnabled) elAlgoEnabled.value = algoEnabled ? "true" : "false";
+      if (elAlgoStrict) elAlgoStrict.value = algoStrict ? "true" : "false";
+      if (elAlgoDate) elAlgoDate.value = algoDate;
+      if (elAlgoMain) elAlgoMain.value = algoMain.join(",");
+      if (elAlgoNiche) elAlgoNiche.value = algoNiche.join(",");
+    }}
+    function csvToSymbols(raw) {{
+      return String(raw || "")
+        .split(",")
+        .map((x) => String(x || "").trim().toLowerCase())
+        .filter((x) => /^[a-z0-9][a-z0-9._-]{0,31}$/.test(x));
+    }}
+    async function saveManualFiatOverride() {{
+      try {{
+        const enabled = String(document.getElementById("manualFiatEnabled")?.value || "true") === "true";
+        const strict = String(document.getElementById("manualFiatStrict")?.value || "true") === "true";
+        const selection_date = String(document.getElementById("manualFiatDate")?.value || "").trim();
+        const fiat_core = csvToSymbols(document.getElementById("manualFiatCore")?.value || "");
+        const fiat_rwa = csvToSymbols(document.getElementById("manualFiatRwa")?.value || "");
+        const algo_enabled = String(document.getElementById("manualAlgoEnabled")?.value || "true") === "true";
+        const algo_strict = String(document.getElementById("manualAlgoStrict")?.value || "true") === "true";
+        const algo_selection_date = String(document.getElementById("manualAlgoDate")?.value || "").trim();
+        const algo_main = csvToSymbols(document.getElementById("manualAlgoMain")?.value || "");
+        const algo_niche = csvToSymbols(document.getElementById("manualAlgoNiche")?.value || "");
+        const data = await postJson("/api/admin/pair-lists-manual", {{enabled, strict, selection_date, fiat_core, fiat_rwa, algo_enabled, algo_strict, algo_selection_date, algo_main, algo_niche}});
+        setAdminStatus(data.info || "Manual override saved", false);
+        await loadAdmin();
+      }} catch (e) {{
+        setAdminStatus("Save manual stable override failed: " + (e?.message || "unknown"), true);
       }}
     }}
     function renderAdminWallets(items) {{
@@ -25431,6 +26320,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
     _require_admin(request, response)
     try:
         token_catalog = _load_token_catalog(refresh=False)
+        manual_cfg = _load_manual_pair_lists_overrides()
         events_count = 0
         if ANALYTICS_ENABLED:
             with _analytics_conn() as conn:
@@ -25442,6 +26332,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "events_count": events_count,
             "token_catalog_updated_at": token_catalog.get("updated_at"),
             "token_catalog_count": token_catalog.get("count", 0),
+            "pair_lists_manual": manual_cfg,
         }
     except Exception as e:
         return {
@@ -25451,6 +26342,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "events_count": 0,
             "token_catalog_updated_at": None,
             "token_catalog_count": 0,
+            "pair_lists_manual": _load_manual_pair_lists_overrides(),
             "info": f"Admin settings fallback mode. Error: {e}",
         }
 
@@ -25574,6 +26466,41 @@ def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Res
     wallets = [w for w in wallets if w != address]
     _set_admin_wallets(wallets)
     return {"ok": True, "info": "Admin wallet removed.", "items": _admin_wallets_value()}
+
+
+@app.post("/api/admin/pair-lists-manual")
+def admin_pair_lists_manual_update(req: AdminPairListsManualUpdate, request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    current = _load_manual_pair_lists_overrides()
+    cur_algo = current.get("algo_stable") if isinstance(current.get("algo_stable"), dict) else {}
+    sel_date = str(req.selection_date or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", sel_date):
+        sel_date = datetime.now(timezone.utc).date().isoformat()
+    algo_sel_date = str(req.algo_selection_date or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", algo_sel_date):
+        algo_sel_date = str(cur_algo.get("selection_date") or sel_date)
+    payload = {
+        "fiat_stable": {
+            "enabled": bool(req.enabled),
+            "strict": bool(req.strict),
+            "selection_date": sel_date,
+            "core": _normalize_symbol_list(req.fiat_core or []),
+            "rwa": _normalize_symbol_list(req.fiat_rwa or []),
+        },
+        "algo_stable": {
+            "enabled": bool(cur_algo.get("enabled", True) if req.algo_enabled is None else req.algo_enabled),
+            "strict": bool(cur_algo.get("strict", True) if req.algo_strict is None else req.algo_strict),
+            "selection_date": algo_sel_date,
+            "main": _normalize_symbol_list(req.algo_main or cur_algo.get("main") or []),
+            "niche": _normalize_symbol_list(req.algo_niche or cur_algo.get("niche") or []),
+        },
+    }
+    saved = _save_manual_pair_lists_overrides(payload)
+    try:
+        _load_pair_lists_catalog(refresh=True)
+    except Exception:
+        pass
+    return {"ok": True, "info": "Pair-lists manual override saved.", "pair_lists_manual": saved}
 
 
 @app.get("/api/positions/chains")
@@ -29035,6 +29962,11 @@ def meta() -> dict[str, Any]:
             "commodity_stables": pair_lists_catalog.get("commodity_stables", []),
             "fiat_nonusd_stables": pair_lists_catalog.get("fiat_nonusd_stables", []),
             "memes": pair_lists_catalog.get("memes", []),
+            "manual_overrides": pair_lists_catalog.get("manual_overrides", {}),
+            "fiat_stable_hints": pair_lists_catalog.get("fiat_stable_hints", []),
+            "algo_stable_hints": pair_lists_catalog.get("algo_stable_hints", []),
+            "commodity_hints": pair_lists_catalog.get("commodity_hints", []),
+            "meme_hints": pair_lists_catalog.get("meme_hints", []),
         },
         "token_catalog": {
             "count": token_catalog.get("count", 0),
@@ -31319,9 +32251,24 @@ HTML_PAGE = """
         const fxCount = Number((meta?.pair_lists?.fiat_nonusd_stables || []).length || 0);
         const memeCount = Number((meta?.pair_lists?.memes || []).length || 0);
         const plUpdated = String(meta?.pair_lists?.updated_at || "-");
+        const plSource = String(meta?.pair_lists?.source || "-");
+        const manualFiat = (meta?.pair_lists?.manual_overrides && meta.pair_lists.manual_overrides.fiat_stable) || {};
+        const manualAlgo = (meta?.pair_lists?.manual_overrides && meta.pair_lists.manual_overrides.algo_stable) || {};
+        const manualFiatEnabled = !!manualFiat.enabled;
+        const manualAlgoEnabled = !!manualAlgo.enabled;
+        const manualFiatDate = String(manualFiat.selection_date || "").trim();
+        const manualAlgoDate = String(manualAlgo.selection_date || "").trim();
+        const manualFiatHints = Array.isArray(meta?.pair_lists?.fiat_stable_hints) ? meta.pair_lists.fiat_stable_hints : [];
+        const manualAlgoHints = Array.isArray(meta?.pair_lists?.algo_stable_hints) ? meta.pair_lists.algo_stable_hints : [];
+        const manualCommodityHints = Array.isArray(meta?.pair_lists?.commodity_hints) ? meta.pair_lists.commodity_hints : [];
+        const manualMemeHints = Array.isArray(meta?.pair_lists?.meme_hints) ? meta.pair_lists.meme_hints : [];
         const plBadge = document.getElementById("pairListsMeta");
         if (plBadge) {
-          plBadge.textContent = `pair lists: fiat-stable ${stCount}, algo/crypto-stable ${stAlgoCount}, coins ${coinCount}, commodity ${cmCount}, non-USD ${fxCount}, memes ${memeCount}, updated: ${plUpdated}`;
+          const fiatTag = manualFiatEnabled ? `manual fiat selection date: ${manualFiatDate || "-"}` : "";
+          const algoTag = manualAlgoEnabled ? `manual algo selection date: ${manualAlgoDate || "-"}` : "";
+          const manualTag = [fiatTag, algoTag].filter(Boolean).join("; ");
+          const manualSuffix = manualTag ? `, ${manualTag}` : "";
+          plBadge.textContent = `pair lists: fiat-stable ${stCount}, algo/crypto-stable ${stAlgoCount}, coins ${coinCount}, commodity ${cmCount}, non-USD ${fxCount}, memes ${memeCount}, updated: ${plUpdated}${manualSuffix}`;
           const topN = (arr, n) => ((arr || []).slice(0, n).join(", ") || "-");
           const smartTopPlan = (count) => {
             const ct = Math.max(0, Number(count || 0));
@@ -31360,16 +32307,21 @@ HTML_PAGE = """
           pairListsDetailsLines = [
             `Fiat-backed stablecoins ranked count: ${stCount}`,
             ...topLines(pairPresetCatalog.stablecoins, stCount),
+            ...(manualFiatHints.length ? ["  Manual fiat hints (description + liquidity):", ...manualFiatHints.map((x) => `    ${x}`)] : []),
             `Algo/crypto-backed stablecoins ranked count: ${stAlgoCount}`,
             ...topLines(pairPresetCatalog.stableAlgoCrypto, stAlgoCount),
+            ...(manualAlgoHints.length ? ["  Manual algo hints (description + liquidity):", ...manualAlgoHints.map((x) => `    ${x}`)] : []),
             `Coins ranked count: ${coinCount}`,
             ...topLines(pairPresetCatalog.coins, coinCount),
             `Commodity stables ranked count: ${cmCount}`,
             ...topLines(pairPresetCatalog.commodityStablecoins, cmCount),
+            ...(manualCommodityHints.length ? ["  Manual commodity hints (description + liquidity):", ...manualCommodityHints.map((x) => `    ${x}`)] : []),
             `Non-USD fiat stables ranked count: ${fxCount}`,
             ...topLines(pairPresetCatalog.fiatNonUsdStablecoins, fxCount),
             `Memes ranked count: ${memeCount}`,
             ...topLines(pairPresetCatalog.memes, memeCount),
+            ...(manualMemeHints.length ? ["  Manual meme hints (description + liquidity):", ...manualMemeHints.map((x) => `    ${x}`)] : []),
+            `Pair lists source: ${plSource}`,
           ];
         }
         for (const selId of ["stableBucketMode", "tokenBucketMode"]) {

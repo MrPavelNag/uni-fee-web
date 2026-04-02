@@ -1,0 +1,104 @@
+{
+  "updated_at": "2026-04-01T23:26:15Z",
+  "count": 11,
+  "items": [
+    "bnb",
+    "eth",
+    "fluid",
+    "paxg",
+    "pol",
+    "rlc",
+    "uni",
+    "usdc",
+    "usdt",
+    "wbtc",
+    "xaut"
+  ],
+  "by_chain": {
+    "ethereum": [
+      "eth",
+      "fluid",
+      "paxg",
+      "rlc",
+      "uni",
+      "usdc",
+      "usdt",
+      "wbtc",
+      "xaut"
+    ],
+    "arbitrum": [
+      "eth",
+      "fluid",
+      "paxg",
+      "uni",
+      "usdc",
+      "usdt",
+      "wbtc",
+      "xaut"
+    ],
+    "base": [
+      "eth",
+      "fluid",
+      "paxg",
+      "uni",
+      "usdc",
+      "usdt",
+      "wbtc"
+    ],
+    "optimism": [
+      "eth",
+      "fluid",
+      "uni",
+      "usdc",
+      "usdt",
+      "wbtc"
+    ],
+    "polygon": [
+      "eth",
+      "fluid",
+      "paxg",
+      "pol",
+      "uni",
+      "usdc",
+      "usdt",
+      "wbtc",
+      "xaut"
+    ],
+    "bsc": [
+      "bnb",
+      "eth",
+      "fluid",
+      "uni",
+      "usdc",
+      "usdt",
+      "wbtc"
+    ],
+    "avalanche": [
+      "eth",
+      "fluid",
+      "uni",
+      "usdc",
+      "usdt",
+      "wbtc"
+    ],
+    "celo": [
+      "eth",
+      "fluid",
+      "uni",
+      "usdc",
+      "usdt",
+      "wbtc"
+    ],
+    "unichain": [
+      "eth",
+      "uni",
+      "usdc",
+      "usdt",
+      "wbtc"
+    ]
+  },
+  "source": "major_tokens_top_n_merged",
+  "min_tvl_usd": 0.0,
+  "major_top_n": 500,
+  "major_min_tvl_usd": 0.0
+}
