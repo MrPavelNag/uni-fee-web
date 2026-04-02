@@ -17937,6 +17937,7 @@ def _merge_for_web(
             "final_income": final_income,
             "apy_pct": float(apy_pct),
             "last_tvl": pool_tvl_now_usd,
+            "data_quality": str(v.get("data_quality") or "estimated"),
             "status": status,
         }
         rows.append(row)
@@ -30660,6 +30661,7 @@ HTML_PAGE = """
       final_income: (r) => Number(r.final_income || 0),
       apy_pct: (r) => Number(r.apy_pct || 0),
       last_tvl: (r) => Number(r.last_tvl || 0),
+      data_quality: (r) => String(r.data_quality || ""),
       status: (r) => r.status || ""
     };
 
@@ -31857,7 +31859,7 @@ HTML_PAGE = """
       const table = document.getElementById("resultTable");
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
-        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["status", "Status"]
+        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["data_quality", "Data quality"], ["status", "Status"]
       ];
 
       let html = "<tr>";
@@ -31888,6 +31890,7 @@ HTML_PAGE = """
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
+        html += `<td>${escAttr(r.data_quality || "estimated")}</td>`;
         const statusLabel = r.status === "ok"
           ? "ok"
           : (r.status === "filtered_suffix" ? "excluded by suffix" : "filtered by fee range");
@@ -31922,7 +31925,7 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "status"];
+      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "data_quality", "status"];
       const lines = [headers.join(",")];
       for (const r of rows) {
         const vals = headers.map(h => {

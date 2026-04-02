@@ -11,6 +11,7 @@ Agent 1: Uniswap v3 (base version).
 import argparse
 import os
 import threading
+import time
 import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,6 +57,243 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except Exception:
         return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _is_eth_address(v: str) -> bool:
+    s = str(v or "").strip().lower()
+    return s.startswith("0x") and len(s) == 42
+
+
+V3_EXACT_TVL_ENABLE = _env_flag("V3_EXACT_TVL_ENABLE", True)
+V3_EXACT_TVL_CHAINS = {
+    c.strip().lower()
+    for c in str(os.environ.get("V3_EXACT_TVL_CHAINS", "ethereum")).split(",")
+    if c.strip()
+}
+V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 3))
+V3_EXACT_TVL_DAYS_MAX = max(1, _env_int("V3_EXACT_TVL_DAYS_MAX", 31))
+V3_EXACT_TVL_POOL_BUDGET_SEC = max(2.0, _env_float("V3_EXACT_TVL_POOL_BUDGET_SEC", 12.0))
+V3_EXACT_TVL_DEBUG = _env_flag("V3_EXACT_TVL_DEBUG", False)
+
+CHAIN_ID_BY_KEY: dict[str, int] = {
+    "ethereum": 1,
+    "optimism": 10,
+    "bsc": 56,
+    "unichain": 130,
+    "polygon": 137,
+    "base": 8453,
+    "arbitrum": 42161,
+    "avalanche": 43114,
+    "celo": 42220,
+}
+LLAMA_CHAIN_BY_KEY: dict[str, str] = {
+    "ethereum": "ethereum",
+    "optimism": "optimism",
+    "bsc": "bsc",
+    "unichain": "unichain",
+    "polygon": "polygon",
+    "base": "base",
+    "arbitrum": "arbitrum",
+    "avalanche": "avax",
+    "celo": "celo",
+}
+COINGECKO_PLATFORM_BY_KEY: dict[str, str] = {
+    "ethereum": "ethereum",
+    "arbitrum": "arbitrum-one",
+    "optimism": "optimistic-ethereum",
+    "polygon": "polygon-pos",
+    "base": "base",
+    "bsc": "binance-smart-chain",
+    "avalanche": "avalanche",
+    "celo": "celo",
+    "unichain": "unichain",
+}
+DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
+    1: ["https://ethereum-rpc.publicnode.com"],
+    10: ["https://optimism-rpc.publicnode.com"],
+    56: ["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.binance.org"],
+    130: ["https://unichain-rpc.publicnode.com", "https://mainnet.unichain.org"],
+    137: ["https://polygon-bor-rpc.publicnode.com"],
+    8453: ["https://base-rpc.publicnode.com", "https://mainnet.base.org"],
+    42161: ["https://arbitrum-one-rpc.publicnode.com", "https://arb1.arbitrum.io/rpc"],
+    43114: ["https://avalanche-c-chain-rpc.publicnode.com", "https://api.avax.network/ext/bc/C/rpc"],
+    42220: ["https://forno.celo.org"],
+}
+
+_EXACT_CACHE_LOCK = threading.Lock()
+_BLOCK_BY_DAY_CACHE: dict[tuple[str, int], int] = {}
+_DECIMALS_CACHE: dict[tuple[int, str], int] = {}
+_CG_DAY_PRICE_CACHE: dict[tuple[str, str, int], float] = {}
+
+
+def _rpc_urls(chain_id: int) -> list[str]:
+    env_key = f"V3_RPC_URLS_{int(chain_id)}"
+    raw = str(os.environ.get(env_key, "") or "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    return list(DEFAULT_RPC_URLS_BY_CHAIN_ID.get(int(chain_id), []))
+
+
+def _rpc_json(chain_id: int, method: str, params: list, timeout_sec: float = 8.0) -> dict:
+    last = None
+    urls = _rpc_urls(chain_id)
+    if not urls:
+        raise RuntimeError(f"no rpc urls for chain_id={chain_id}")
+    for url in urls:
+        try:
+            r = requests.post(
+                url,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=(3.0, max(3.0, float(timeout_sec))),
+            )
+            r.raise_for_status()
+            d = r.json() if isinstance(r.json(), dict) else {}
+            if d.get("error"):
+                last = RuntimeError(str(d.get("error")))
+                continue
+            return d
+        except Exception as e:
+            last = e
+            continue
+    raise RuntimeError(str(last or "rpc failed"))
+
+
+def _rpc_eth_call_hex(chain_id: int, to: str, data_hex: str, block_hex: str, timeout_sec: float = 8.0) -> str:
+    d = _rpc_json(
+        int(chain_id),
+        "eth_call",
+        [{"to": str(to).strip(), "data": str(data_hex).strip()}, str(block_hex)],
+        timeout_sec=timeout_sec,
+    )
+    out = str(d.get("result") or "")
+    if not out.startswith("0x"):
+        raise RuntimeError("invalid eth_call result")
+    return out
+
+
+def _decode_uint_hex(data_hex: str) -> int:
+    s = str(data_hex or "").strip().lower()
+    if not s.startswith("0x"):
+        return 0
+    if s == "0x":
+        return 0
+    return int(s, 16)
+
+
+def _erc20_decimals(chain_id: int, token: str) -> int:
+    key = (int(chain_id), str(token).strip().lower())
+    with _EXACT_CACHE_LOCK:
+        if key in _DECIMALS_CACHE:
+            return int(_DECIMALS_CACHE[key])
+    try:
+        out = _rpc_eth_call_hex(int(chain_id), str(token), "0x313ce567", "latest", timeout_sec=6.0)
+        dec = int(_decode_uint_hex(out))
+        if dec <= 0 or dec > 36:
+            dec = 18
+    except Exception:
+        dec = 18
+    with _EXACT_CACHE_LOCK:
+        _DECIMALS_CACHE[key] = int(dec)
+    return int(dec)
+
+
+def _llama_block_for_day(chain_key: str, day_ts: int) -> int:
+    ck = str(chain_key or "").strip().lower()
+    lk = LLAMA_CHAIN_BY_KEY.get(ck, ck)
+    key = (lk, int(day_ts))
+    with _EXACT_CACHE_LOCK:
+        b = _BLOCK_BY_DAY_CACHE.get(key)
+        if b:
+            return int(b)
+    url = f"https://coins.llama.fi/block/{lk}/{int(day_ts)}"
+    r = requests.get(url, timeout=(3.0, 8.0))
+    r.raise_for_status()
+    d = r.json() if isinstance(r.json(), dict) else {}
+    block = int((d.get("height") or ((d.get("block") or {}).get("height")) or 0))
+    if block <= 0:
+        raise RuntimeError(f"llama block not found: chain={lk} ts={day_ts}")
+    with _EXACT_CACHE_LOCK:
+        _BLOCK_BY_DAY_CACHE[key] = int(block)
+    return int(block)
+
+
+def _coingecko_fill_price_cache(chain_key: str, token: str, day_start: int, day_end: int) -> None:
+    ck = str(chain_key or "").strip().lower()
+    tk = str(token or "").strip().lower()
+    if not (_is_eth_address(tk) and day_start > 0 and day_end >= day_start):
+        return
+    with _EXACT_CACHE_LOCK:
+        exists = all((ck, tk, d) in _CG_DAY_PRICE_CACHE for d in range(day_start, day_end + 1, 86400))
+    if exists:
+        return
+    platform = COINGECKO_PLATFORM_BY_KEY.get(ck, "")
+    if not platform:
+        return
+    url = f"https://api.coingecko.com/api/v3/coins/{platform}/contract/{tk}/market_chart/range"
+    headers = {"User-Agent": "uni-fee-agent/1.0"}
+    params = {"vs_currency": "usd", "from": int(day_start), "to": int(day_end + 86399)}
+    r = requests.get(url, headers=headers, params=params, timeout=(4.0, 14.0))
+    r.raise_for_status()
+    d = r.json() if isinstance(r.json(), dict) else {}
+    pts = d.get("prices") if isinstance(d, dict) else None
+    if not isinstance(pts, list):
+        return
+    by_day: dict[int, list[float]] = {}
+    for it in pts:
+        if not (isinstance(it, list) and len(it) >= 2):
+            continue
+        ms = int(float(it[0] or 0))
+        px = float(it[1] or 0.0)
+        if px <= 0:
+            continue
+        day = int((ms // 1000) // 86400 * 86400)
+        by_day.setdefault(day, []).append(px)
+    with _EXACT_CACHE_LOCK:
+        for day, arr in by_day.items():
+            if arr:
+                _CG_DAY_PRICE_CACHE[(ck, tk, int(day))] = float(sum(arr) / len(arr))
+
+
+def _historical_price_usd(chain_key: str, token: str, day_ts: int, day_start: int, day_end: int) -> float:
+    ck = str(chain_key or "").strip().lower()
+    tk = str(token or "").strip().lower()
+    dts = int((int(day_ts) // 86400) * 86400)
+    _coingecko_fill_price_cache(ck, tk, int(day_start), int(day_end))
+    with _EXACT_CACHE_LOCK:
+        px = _CG_DAY_PRICE_CACHE.get((ck, tk, dts))
+        if px and float(px) > 0:
+            return float(px)
+    lk = LLAMA_CHAIN_BY_KEY.get(ck, ck)
+    try:
+        u = f"https://coins.llama.fi/prices/historical/{int(dts + 86399)}/{lk}:{tk}"
+        r = requests.get(u, timeout=(3.0, 8.0))
+        r.raise_for_status()
+        data = r.json() if isinstance(r.json(), dict) else {}
+        coin = (data.get("coins") or {}).get(f"{lk}:{tk}") or {}
+        p = float(coin.get("price") or 0.0)
+        if p > 0:
+            return p
+    except Exception:
+        pass
+    return 0.0
+
+
+def _balance_of_raw(chain_id: int, token: str, owner: str, block_num: int) -> int:
+    data = "0x70a08231" + str(owner).strip().lower().replace("0x", "").rjust(64, "0")
+    out = _rpc_eth_call_hex(int(chain_id), str(token), data, hex(int(block_num)), timeout_sec=8.0)
+    return int(_decode_uint_hex(out))
 
 
 def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
@@ -612,6 +850,55 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
     return {"_fees_usd": fees_usd_series, "_raw_tvl_usd": raw_tvl_series}
 
 
+def _build_exact_tvl_series_v3(
+    *,
+    chain: str,
+    pool: dict,
+    fees_usd: list[tuple[int, float]],
+    day_start_ts: int,
+    day_end_ts: int,
+    budget_sec: float,
+) -> list[tuple[int, float]]:
+    if not fees_usd:
+        return []
+    ck = str(chain or "").strip().lower()
+    if ck not in V3_EXACT_TVL_CHAINS:
+        return []
+    if len(fees_usd) > int(V3_EXACT_TVL_DAYS_MAX):
+        return []
+    chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    if chain_id <= 0:
+        return []
+    pool_id = str(pool.get("id") or "").strip().lower()
+    t0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    t1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    if not (_is_eth_address(pool_id) and _is_eth_address(t0) and _is_eth_address(t1)):
+        return []
+
+    t0_dec = _erc20_decimals(chain_id, t0)
+    t1_dec = _erc20_decimals(chain_id, t1)
+    out: list[tuple[int, float]] = []
+    t_started = time.perf_counter()
+    for ts, _ in fees_usd:
+        if (time.perf_counter() - t_started) > float(max(1.0, budget_sec)):
+            return []
+        dts = int((int(ts) // 86400) * 86400)
+        try:
+            block_num = _llama_block_for_day(ck, int(dts + 86399))
+            b0 = _balance_of_raw(chain_id, t0, pool_id, block_num) / (10 ** int(t0_dec))
+            b1 = _balance_of_raw(chain_id, t1, pool_id, block_num) / (10 ** int(t1_dec))
+            p0 = _historical_price_usd(ck, t0, dts, day_start_ts, day_end_ts)
+            p1 = _historical_price_usd(ck, t1, dts, day_start_ts, day_end_ts)
+            tvl = max(0.0, float(b0) * max(0.0, float(p0))) + max(0.0, float(b1) * max(0.0, float(p1)))
+            out.append((int(ts), float(tvl)))
+        except Exception:
+            out.append((int(ts), 0.0))
+    non_zero = len([1 for _ts, v in out if float(v) > 0.0])
+    if non_zero < max(3, int(len(out) * 0.6)):
+        return []
+    return out
+
+
 def save_pdf(pools: list[dict], path: str) -> None:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
@@ -682,8 +969,11 @@ def main() -> None:
 
     pool_chart_data = {}
     max_workers = max(1, min(16, int(os.environ.get("POOL_SERIES_WORKERS", "8"))))
+    exact_slots_lock = threading.Lock()
+    exact_slots_left = int(V3_EXACT_TVL_MAX_POOLS if V3_EXACT_TVL_ENABLE else 0)
 
     def _process_pool(idx: int, pool: dict) -> tuple[int, str | None, dict | None, str]:
+        nonlocal exact_slots_left
         chain = pool.get("chain", "unknown")
         t0 = (pool.get("token0") or {}).get("symbol", "?")
         t1 = (pool.get("token1") or {}).get("symbol", "?")
@@ -714,29 +1004,53 @@ def main() -> None:
         # Build TVL and profitability strictly from external TVL (no subgraph TVL dependency).
         data["fees"] = []
         data["tvl"] = []
+        tvl_quality = "estimated"
         try:
             fees_usd = data.get("_fees_usd") or []
             raw_tvl = data.get("_raw_tvl_usd") or []
             if fees_usd and pool_tvl_now_usd > 0:
                 tvl_series = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                exact_used = False
+                if V3_EXACT_TVL_ENABLE and str(chain).strip().lower() in V3_EXACT_TVL_CHAINS and fees_usd:
+                    take_slot = False
+                    with exact_slots_lock:
+                        if exact_slots_left > 0:
+                            exact_slots_left -= 1
+                            take_slot = True
+                    if take_slot:
+                        day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
+                        day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
+                        exact_series = _build_exact_tvl_series_v3(
+                            chain=str(chain),
+                            pool=pool,
+                            fees_usd=fees_usd,
+                            day_start_ts=day_start_ts,
+                            day_end_ts=day_end_ts,
+                            budget_sec=float(V3_EXACT_TVL_POOL_BUDGET_SEC),
+                        )
+                        if exact_series and len(exact_series) == len(fees_usd):
+                            tvl_series = exact_series
+                            exact_used = True
+                            tvl_quality = "exact"
                 if raw_tvl and len(raw_tvl) == len(fees_usd):
-                    anchor = 0.0
-                    for _, rv in reversed(raw_tvl):
-                        rvf = float(rv or 0.0)
-                        if rvf > 0:
-                            anchor = rvf
-                            break
-                    if anchor > 0:
-                        shaped: list[tuple[int, float]] = []
-                        for i, (ts, _) in enumerate(fees_usd):
-                            rv = float(raw_tvl[i][1] or 0.0)
-                            if rv > 0:
-                                day_tvl = float(pool_tvl_now_usd) * (rv / anchor)
-                                day_tvl = max(float(pool_tvl_now_usd) * 0.2, min(float(pool_tvl_now_usd) * 5.0, day_tvl))
-                            else:
-                                day_tvl = float(pool_tvl_now_usd)
-                            shaped.append((int(ts), float(day_tvl)))
-                        tvl_series = shaped
+                    if not exact_used:
+                        anchor = 0.0
+                        for _, rv in reversed(raw_tvl):
+                            rvf = float(rv or 0.0)
+                            if rvf > 0:
+                                anchor = rvf
+                                break
+                        if anchor > 0:
+                            shaped: list[tuple[int, float]] = []
+                            for i, (ts, _) in enumerate(fees_usd):
+                                rv = float(raw_tvl[i][1] or 0.0)
+                                if rv > 0:
+                                    day_tvl = float(pool_tvl_now_usd) * (rv / anchor)
+                                    day_tvl = max(float(pool_tvl_now_usd) * 0.2, min(float(pool_tvl_now_usd) * 5.0, day_tvl))
+                                else:
+                                    day_tvl = float(pool_tvl_now_usd)
+                                shaped.append((int(ts), float(day_tvl)))
+                            tvl_series = shaped
                 data["tvl"] = tvl_series
                 cumul = 0.0
                 fees_rebuilt = []
@@ -766,8 +1080,12 @@ def main() -> None:
             "pair": pair,
             "chain": chain,
             "version": "v3",
+            "data_quality": tvl_quality,
         }
-        return idx, pool_id, payload, f"  [{idx+1}/{len(pools)}] {chain} {pair}: {len(data.get('fees') or [])} days"
+        msg = f"  [{idx+1}/{len(pools)}] {chain} {pair}: {len(data.get('fees') or [])} days"
+        if V3_EXACT_TVL_DEBUG:
+            msg += f" | quality={tvl_quality}"
+        return idx, pool_id, payload, msg
 
     if pools:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
