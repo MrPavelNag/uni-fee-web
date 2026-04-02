@@ -79,6 +79,7 @@ except Exception:
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 PAIR_LISTS_CATALOG_PATH = CATALOG_DIR / "pair_lists_catalog.json"
+PAIR_LISTS_SCHEMA_VERSION = 2
 MAJOR_TOKENS_CACHE_PATH = CATALOG_DIR / "major_tokens_by_chain.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
 TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000000"))
@@ -16806,10 +16807,10 @@ def _classify_ranked_symbols(
         is_commodity = s in _COMMODITY_STABLE_SYMBOLS or _text_has_any_hint(texts, _COMMODITY_HINTS)
         is_nonusd = s in _NON_USD_FIAT_STABLE_SYMBOLS or _text_has_any_hint(texts, _NON_USD_FIAT_HINTS)
         is_usd_stable = _is_stablecoin_symbol(s) or _text_has_any_hint(texts, _USD_STABLE_HINTS)
-        is_stable = bool(is_usd_stable or is_commodity or is_nonusd)
-        if is_stable:
+        is_stable_main = bool(is_usd_stable and not is_commodity and not is_nonusd)
+        if is_stable_main:
             stable_ranked.append(s)
-        else:
+        elif (not is_commodity) and (not is_nonusd):
             token_ranked.append(s)
         if is_commodity:
             commodity_ranked.append(s)
@@ -16831,7 +16832,9 @@ def _build_pair_lists_catalog_from_major(
     Ranking is based on per-chain TVL order proxy (higher placement -> higher score).
     """
     score: dict[str, int] = {}
-    allowed = {str(s).strip().lower() for s in (allowed_symbols or set()) if _is_clean_symbol(str(s).strip())}
+    allowed = None
+    if allowed_symbols:
+        allowed = {str(s).strip().lower() for s in (allowed_symbols or set()) if _is_clean_symbol(str(s).strip())}
     by_chain = raw_major.get("by_chain") if isinstance(raw_major, dict) else None
     if isinstance(by_chain, dict):
         for _chain, addr_to_sym in by_chain.items():
@@ -16845,7 +16848,7 @@ def _build_pair_lists_catalog_from_major(
                 sym = str(sym_raw or "").strip().lower()
                 if not _is_clean_symbol(sym):
                     continue
-                if allowed and sym not in allowed:
+                if allowed is not None and sym not in allowed:
                     continue
                 # Earlier in the list means higher TVL on that chain/version.
                 weight = max(1, n - idx)
@@ -16856,13 +16859,22 @@ def _build_pair_lists_catalog_from_major(
         ranked,
         verified_profiles=verified_profiles,
     )
+    for sym in sorted(_COMMODITY_STABLE_SYMBOLS):
+        if sym not in commodity_ranked:
+            commodity_ranked.append(sym)
+    for sym in sorted(_NON_USD_FIAT_STABLE_SYMBOLS):
+        if sym not in fiat_nonusd_ranked:
+            fiat_nonusd_ranked.append(sym)
     return {
+        "schema_version": int(PAIR_LISTS_SCHEMA_VERSION),
         "updated_at": str(updated_at or _iso_now()),
         "source": str(source or "major_tokens_top_n_rank_proxy"),
         "stablecoins": stable_ranked[:20],
         "tokens": token_ranked[:20],
+        "coins": token_ranked[:20],
         "stablecoins_full": stable_ranked[:200],
         "tokens_full": token_ranked[:200],
+        "coins_full": token_ranked[:200],
         "commodity_stables": commodity_ranked[:200],
         "fiat_nonusd_stables": fiat_nonusd_ranked[:200],
     }
@@ -16872,7 +16884,8 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
     cached = _read_json(PAIR_LISTS_CATALOG_PATH)
     if not refresh and isinstance(cached, dict):
         if (
-            isinstance(cached.get("stablecoins"), list)
+            int(cached.get("schema_version") or 0) == int(PAIR_LISTS_SCHEMA_VERSION)
+            and isinstance(cached.get("stablecoins"), list)
             and isinstance(cached.get("tokens"), list)
             and isinstance(cached.get("commodity_stables"), list)
             and isinstance(cached.get("fiat_nonusd_stables"), list)
@@ -16880,9 +16893,9 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
             return cached
     raw_major = _read_json(MAJOR_TOKENS_CACHE_PATH) or {}
     updated_at = str(raw_major.get("updated_at") or _iso_now())
-    allowed = _curated_token_symbols()
+    allowed = None
     verified_profiles: dict[str, set[str]] = {}
-    source_parts = ["major_tokens_top_n_rank_proxy", "curated"]
+    source_parts = ["major_tokens_top_n_rank_proxy"]
     try:
         verified_all, _, profiles = _fetch_uniswap_verified_token_profiles()
         verified_clean = {
@@ -16891,12 +16904,12 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
             if _is_clean_symbol(str(s).strip())
         }
         if verified_clean:
-            allowed.update(verified_clean)
-            source_parts.append("verified")
+            allowed = set(verified_clean) | _curated_token_symbols()
+            source_parts.extend(["verified", "curated"])
         verified_profiles = {str(k).strip().lower(): set(v or set()) for k, v in (profiles or {}).items()}
     except Exception:
-        # Keep working with curated-only allowlist when verified list fetch fails.
-        pass
+        # Fail-open to ranked symbols if verified list is temporarily unavailable.
+        source_parts.append("unfiltered_fallback")
     out = _build_pair_lists_catalog_from_major(
         raw_major,
         updated_at,
@@ -28550,12 +28563,15 @@ def meta() -> dict[str, Any]:
         "tokens": token_catalog.get("items", []),
         "chains": chain_catalog.get("items", []),
         "pair_lists": {
+            "schema_version": pair_lists_catalog.get("schema_version", 0),
             "updated_at": pair_lists_catalog.get("updated_at"),
             "source": pair_lists_catalog.get("source", ""),
             "stablecoins": pair_lists_catalog.get("stablecoins", []),
             "tokens": pair_lists_catalog.get("tokens", []),
+            "coins": pair_lists_catalog.get("coins", pair_lists_catalog.get("tokens", [])),
             "stablecoins_full": pair_lists_catalog.get("stablecoins_full", []),
             "tokens_full": pair_lists_catalog.get("tokens_full", []),
+            "coins_full": pair_lists_catalog.get("coins_full", pair_lists_catalog.get("tokens_full", [])),
             "commodity_stables": pair_lists_catalog.get("commodity_stables", []),
             "fiat_nonusd_stables": pair_lists_catalog.get("fiat_nonusd_stables", []),
         },
@@ -29202,6 +29218,28 @@ HTML_PAGE = """
       border-radius: 10px;
       background: #f8fbff;
     }
+    #feesChart.plot {
+      min-height: 742px;
+    }
+    #tvlChart.plot {
+      min-height: 248px;
+    }
+    .chart-title-hint-tooltip {
+      position: fixed;
+      z-index: 9999;
+      pointer-events: none;
+      max-width: min(880px, 92vw);
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid #cbd5e1;
+      background: rgba(241, 245, 249, 0.98);
+      color: #334155;
+      font-size: 17px;
+      line-height: 1.25;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.18);
+      white-space: normal;
+      display: none;
+    }
     .table-wrap {
       overflow-x: auto;
       border: 1px solid #dbe3ef;
@@ -29264,8 +29302,19 @@ HTML_PAGE = """
       background: transparent;
     }
     .pair-bucket .hint { margin-bottom: 6px; }
-    .pair-bucket select { margin-bottom: 6px; }
-    .pair-bucket input { margin-top: 4px; }
+    .pair-bucket-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .pair-bucket-row select {
+      flex: 0 0 52%;
+      margin: 0;
+    }
+    .pair-bucket-row input {
+      flex: 1 1 48%;
+      margin: 0;
+    }
     .meta-badge { border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #475569; background: #f8fafc; }
     .info-chip {
       border: 1px solid #cbd5e1;
@@ -29422,36 +29471,40 @@ HTML_PAGE = """
               </div>
               <div class="pair-builder-row" id="pairBuilderRow" style="display:none">
                 <div class="pair-bucket">
-                  <select id="stableBucketMode" onchange="updatePairBuilderUi()">
-                    <option value="manual">manual</option>
-                    <option value="stable_top5">top 5 stablecoins</option>
-                    <option value="stable_top10">top 10 stablecoins</option>
-                    <option value="stable_top15">top 15 stablecoins</option>
-                    <option value="stable_top20">top 20 stablecoins</option>
-                    <option value="stable_commodity">commodity stables (gold/silver)</option>
-                    <option value="stable_fiat_nonusd">fiat stables (non-USD)</option>
-                    <option value="token_top5">top 5 tokens</option>
-                    <option value="token_top10">top 10 tokens</option>
-                    <option value="token_top15">top 15 tokens</option>
-                    <option value="token_top20">top 20 tokens</option>
-                  </select>
-                  <input id="stableBucketManual" placeholder="e.g. usdt,usdc,dai"/>
+                  <div class="pair-bucket-row">
+                    <select id="stableBucketMode" onchange="updatePairBuilderUi()">
+                      <option value="manual">manual</option>
+                      <option value="stable_top5">top 5 stablecoins</option>
+                      <option value="stable_top10">top 10 stablecoins</option>
+                      <option value="stable_top15">top 15 stablecoins</option>
+                      <option value="stable_top20">top 20 stablecoins</option>
+                      <option value="stable_commodity">commodity stables (gold/silver)</option>
+                      <option value="stable_fiat_nonusd">fiat stables (non-USD)</option>
+                      <option value="token_top5">top 5 coins</option>
+                      <option value="token_top10">top 10 coins</option>
+                      <option value="token_top15">top 15 coins</option>
+                      <option value="token_top20">top 20 coins</option>
+                    </select>
+                    <input id="stableBucketManual" placeholder="e.g. usdt,usdc,dai"/>
+                  </div>
                 </div>
                 <div class="pair-bucket">
-                  <select id="tokenBucketMode" onchange="updatePairBuilderUi()">
-                    <option value="manual">manual</option>
-                    <option value="token_top5">top 5 tokens</option>
-                    <option value="token_top10">top 10 tokens</option>
-                    <option value="token_top15">top 15 tokens</option>
-                    <option value="token_top20">top 20 tokens</option>
-                    <option value="stable_top5">top 5 stablecoins</option>
-                    <option value="stable_top10">top 10 stablecoins</option>
-                    <option value="stable_top15">top 15 stablecoins</option>
-                    <option value="stable_top20">top 20 stablecoins</option>
-                    <option value="stable_commodity">commodity stables (gold/silver)</option>
-                    <option value="stable_fiat_nonusd">fiat stables (non-USD)</option>
-                  </select>
-                  <input id="tokenBucketManual" placeholder="e.g. eth,wbtc,sol"/>
+                  <div class="pair-bucket-row">
+                    <select id="tokenBucketMode" onchange="updatePairBuilderUi()">
+                      <option value="manual">manual</option>
+                      <option value="token_top5">top 5 coins</option>
+                      <option value="token_top10">top 10 coins</option>
+                      <option value="token_top15">top 15 coins</option>
+                      <option value="token_top20">top 20 coins</option>
+                      <option value="stable_top5">top 5 stablecoins</option>
+                      <option value="stable_top10">top 10 stablecoins</option>
+                      <option value="stable_top15">top 15 stablecoins</option>
+                      <option value="stable_top20">top 20 stablecoins</option>
+                      <option value="stable_commodity">commodity stables (gold/silver)</option>
+                      <option value="stable_fiat_nonusd">fiat stables (non-USD)</option>
+                    </select>
+                    <input id="tokenBucketManual" placeholder="e.g. eth,wbtc,sol"/>
+                  </div>
                 </div>
               </div>
               <div class="hint" style="margin-top:6px">Note: scanning one pair across all chains typically takes about 20-30 seconds.</div>
@@ -29589,7 +29642,7 @@ HTML_PAGE = """
     let visibilityMap = {};
     let seriesByPool = {};
     let currentRequest = {};
-    let pairPresetCatalog = {stablecoins: [], tokens: [], commodityStablecoins: [], fiatNonUsdStablecoins: []};
+    let pairPresetCatalog = {stablecoins: [], coins: [], commodityStablecoins: [], fiatNonUsdStablecoins: []};
     let authState = {authenticated: false};
     let hasScanRun = false;
     let scanTicker = null;
@@ -30290,7 +30343,7 @@ HTML_PAGE = """
       const sourceKind = parseBucketSource(mode);
       const source = sourceKind === "stable"
         ? (pairPresetCatalog.stablecoins || [])
-        : (pairPresetCatalog.tokens || []);
+        : (pairPresetCatalog.coins || []);
       const count = topCountFromMode(mode);
       return (source || []).slice(0, count).map((x) => normalizePairToken(x)).filter(Boolean);
     }
@@ -30372,12 +30425,56 @@ HTML_PAGE = """
       if (Number.isFinite(minApy) && minApy > 0) {
         parts.push(`Min APY: ${Number(minApy).toFixed(1)}%`);
       }
-      const feesEl = document.getElementById("feesChart");
-      const tvlEl = document.getElementById("tvlChart");
-      const hintText = pairHint ? `Pairs: ${pairHint}` : "Pairs: -";
-      if (feesEl) feesEl.title = hintText;
-      if (tvlEl) tvlEl.title = hintText;
       return parts.length ? ` | ${parts.join(" | ")}` : "";
+    }
+
+    function ensureChartTitleHintTooltip() {
+      let el = document.getElementById("chartTitleHintTooltip");
+      if (el) return el;
+      el = document.createElement("div");
+      el.id = "chartTitleHintTooltip";
+      el.className = "chart-title-hint-tooltip";
+      document.body.appendChild(el);
+      return el;
+    }
+
+    function moveChartTitleHintTooltip(ev) {
+      const tip = ensureChartTitleHintTooltip();
+      const pad = 14;
+      const vw = window.innerWidth || document.documentElement.clientWidth || 1200;
+      let x = Number(ev?.clientX || 0) + pad;
+      let y = Number(ev?.clientY || 0) + pad;
+      const maxW = Math.min(880, Math.round(vw * 0.92));
+      tip.style.maxWidth = `${maxW}px`;
+      tip.style.display = "block";
+      const w = tip.offsetWidth || 320;
+      const h = tip.offsetHeight || 40;
+      if (x + w > vw - 8) x = Math.max(8, vw - w - 8);
+      const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+      if (y + h > vh - 8) y = Math.max(8, Number(ev?.clientY || 0) - h - 10);
+      tip.style.left = `${x}px`;
+      tip.style.top = `${y}px`;
+    }
+
+    function hideChartTitleHintTooltip() {
+      const tip = document.getElementById("chartTitleHintTooltip");
+      if (tip) tip.style.display = "none";
+    }
+
+    function installChartTitleHint(chartId, hintText) {
+      const root = document.getElementById(chartId);
+      if (!root) return;
+      const titleEl = root.querySelector(".gtitle");
+      if (!titleEl) return;
+      const text = String(hintText || "Pairs: -");
+      titleEl.style.cursor = "help";
+      titleEl.onmouseenter = (ev) => {
+        const tip = ensureChartTitleHintTooltip();
+        tip.textContent = text;
+        moveChartTitleHintTooltip(ev);
+      };
+      titleEl.onmousemove = (ev) => moveChartTitleHintTooltip(ev);
+      titleEl.onmouseleave = () => hideChartTitleHintTooltip();
     }
 
     function getSelectedProtocols() {
@@ -30476,6 +30573,7 @@ HTML_PAGE = """
       const alloc = Number(currentRequest?.lp_allocation_usd || 1000);
       const days = Number(currentRequest?.days || getDaysValue());
       const scopeSuffix = getChartScopeSuffix();
+      const pairHintText = getChartPairsHintText();
       const endDate = maxTs > 0 ? new Date(maxTs * 1000) : new Date();
       const startDate = new Date(endDate.getTime() - days * 24 * 3600 * 1000);
       Plotly.newPlot("feesChart", feeTraces, {
@@ -30487,7 +30585,9 @@ HTML_PAGE = """
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
-      }, {displaylogo: false, responsive: true});
+      }, {displaylogo: false, responsive: true}).then(() => {
+        installChartTitleHint("feesChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
+      });
       Plotly.newPlot("tvlChart", tvlTraces, {
         title: `TVL dynamics (thousands USD)${scopeSuffix}`,
         paper_bgcolor: "#ffffff",
@@ -30497,7 +30597,9 @@ HTML_PAGE = """
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
-      }, {displaylogo: false, responsive: true});
+      }, {displaylogo: false, responsive: true}).then(() => {
+        installChartTitleHint("tvlChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
+      });
     }
 
     function shortStartEnd4(value) {
@@ -30603,9 +30705,11 @@ HTML_PAGE = """
           stablecoins: Array.isArray(meta?.pair_lists?.stablecoins_full) && meta.pair_lists.stablecoins_full.length
             ? meta.pair_lists.stablecoins_full
             : (meta?.pair_lists?.stablecoins || []),
-          tokens: Array.isArray(meta?.pair_lists?.tokens_full) && meta.pair_lists.tokens_full.length
-            ? meta.pair_lists.tokens_full
-            : (meta?.pair_lists?.tokens || []),
+          coins: Array.isArray(meta?.pair_lists?.coins_full) && meta.pair_lists.coins_full.length
+            ? meta.pair_lists.coins_full
+            : ((Array.isArray(meta?.pair_lists?.tokens_full) && meta.pair_lists.tokens_full.length)
+                ? meta.pair_lists.tokens_full
+                : (meta?.pair_lists?.coins || meta?.pair_lists?.tokens || [])),
           commodityStablecoins: Array.isArray(meta?.pair_lists?.commodity_stables)
             ? meta.pair_lists.commodity_stables
             : [],
@@ -30614,13 +30718,13 @@ HTML_PAGE = """
             : [],
         };
         const stCount = Number((meta?.pair_lists?.stablecoins_full || meta?.pair_lists?.stablecoins || []).length || 0);
-        const tkCount = Number((meta?.pair_lists?.tokens_full || meta?.pair_lists?.tokens || []).length || 0);
+        const coinCount = Number((meta?.pair_lists?.coins_full || meta?.pair_lists?.tokens_full || meta?.pair_lists?.coins || meta?.pair_lists?.tokens || []).length || 0);
         const cmCount = Number((meta?.pair_lists?.commodity_stables || []).length || 0);
         const fxCount = Number((meta?.pair_lists?.fiat_nonusd_stables || []).length || 0);
         const plUpdated = String(meta?.pair_lists?.updated_at || "-");
         const plBadge = document.getElementById("pairListsMeta");
         if (plBadge) {
-          plBadge.textContent = `pair lists: stable ${stCount}, tokens ${tkCount}, commodity ${cmCount}, non-USD ${fxCount}, updated: ${plUpdated}`;
+          plBadge.textContent = `pair lists: stable ${stCount}, coins ${coinCount}, commodity ${cmCount}, non-USD ${fxCount}, updated: ${plUpdated}`;
           const show = (arr, n = 20) => {
             const items = (arr || []).slice(0, n).join(", ");
             return (arr || []).length > n ? `${items}, ...` : items;
@@ -30631,10 +30735,10 @@ HTML_PAGE = """
             `  Top-5: ${topN(pairPresetCatalog.stablecoins, 5)}`,
             `  Top-10: ${topN(pairPresetCatalog.stablecoins, 10)}`,
             `  Top-20: ${topN(pairPresetCatalog.stablecoins, 20)}`,
-            `Tokens ranked count: ${tkCount}`,
-            `  Top-5: ${topN(pairPresetCatalog.tokens, 5)}`,
-            `  Top-10: ${topN(pairPresetCatalog.tokens, 10)}`,
-            `  Top-20: ${topN(pairPresetCatalog.tokens, 20)}`,
+            `Coins ranked count: ${coinCount}`,
+            `  Top-5: ${topN(pairPresetCatalog.coins, 5)}`,
+            `  Top-10: ${topN(pairPresetCatalog.coins, 10)}`,
+            `  Top-20: ${topN(pairPresetCatalog.coins, 20)}`,
             `Commodity stables (${cmCount}): ${show(pairPresetCatalog.commodityStablecoins) || "-"}`,
             `Non-USD fiat stables (${fxCount}): ${show(pairPresetCatalog.fiatNonUsdStablecoins) || "-"}`,
           ].join("\\n");
@@ -30904,8 +31008,13 @@ HTML_PAGE = """
         annotations: [{text: "Scan to load data", x: 0.5, y: 0.5, xref: "paper", yref: "paper", showarrow: false, font: {color: "#64748b"}}],
       };
       const scopeSuffix = getChartScopeSuffix();
-      Plotly.newPlot("feesChart", baseline, {title: `Cumulative Fees${scopeSuffix}`, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "Cumulative fee (USD)"}}, {displaylogo: false, responsive: true});
-      Plotly.newPlot("tvlChart", baseline, {title: `TVL dynamics (thousands USD)${scopeSuffix}`, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "TVL (k USD)"}}, {displaylogo: false, responsive: true});
+      const pairHintText = getChartPairsHintText();
+      Plotly.newPlot("feesChart", baseline, {title: `Cumulative Fees${scopeSuffix}`, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "Cumulative fee (USD)"}}, {displaylogo: false, responsive: true}).then(() => {
+        installChartTitleHint("feesChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
+      });
+      Plotly.newPlot("tvlChart", baseline, {title: `TVL dynamics (thousands USD)${scopeSuffix}`, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "TVL (k USD)"}}, {displaylogo: false, responsive: true}).then(() => {
+        installChartTitleHint("tvlChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
+      });
     }
 
     attachAutosave();
