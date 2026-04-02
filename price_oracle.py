@@ -17,6 +17,7 @@ import requests
 
 _CACHE_LOCK = threading.Lock()
 _PRICE_CACHE: dict[tuple[str, str], tuple[float, float, str]] = {}
+_HIST_PRICE_CACHE: dict[tuple[str, str, int], tuple[float, float, str]] = {}
 
 
 def _safe_float(v: Any) -> float:
@@ -114,6 +115,27 @@ def _cache_put(chain: str, addr: str, price_usd: float, source: str) -> None:
         _PRICE_CACHE[key] = (time.time(), px, str(source or ""))
 
 
+def _hist_cache_get(chain: str, addr: str, day_ts: int) -> tuple[float, str]:
+    key = (_norm_chain(chain), str(addr or "").strip().lower(), int(day_ts))
+    with _CACHE_LOCK:
+        rec = _HIST_PRICE_CACHE.get(key)
+        if not rec:
+            return 0.0, ""
+        _stored_at, px, src = rec
+        if float(px) <= 0:
+            return 0.0, ""
+        return float(px), str(src or "")
+
+
+def _hist_cache_put(chain: str, addr: str, day_ts: int, price_usd: float, source: str) -> None:
+    px = float(price_usd or 0.0)
+    if px <= 0:
+        return
+    key = (_norm_chain(chain), str(addr or "").strip().lower(), int(day_ts))
+    with _CACHE_LOCK:
+        _HIST_PRICE_CACHE[key] = (time.time(), px, str(source or ""))
+
+
 def _fetch_dexscreener(chain: str, addresses: list[str]) -> tuple[dict[str, float], dict[str, str]]:
     out: dict[str, float] = {}
     src: dict[str, str] = {}
@@ -198,6 +220,34 @@ def _fetch_defillama(chain: str, addresses: list[str]) -> tuple[dict[str, float]
     return out, src
 
 
+def _fetch_defillama_historical(chain: str, addresses: list[str], ts: int) -> tuple[dict[str, float], dict[str, str]]:
+    out: dict[str, float] = {}
+    src: dict[str, str] = {}
+    chain_key = _llama_chain(chain)
+    keys = [f"{chain_key}:{a}" for a in addresses if a]
+    if not keys:
+        return out, src
+    try:
+        # DefiLlama historical pricing endpoint: /prices/historical/{timestamp}/{coins}
+        joined = ",".join(keys)
+        tsv = int(max(0, ts))
+        r = requests.get(f"https://coins.llama.fi/prices/historical/{tsv}/{joined}", timeout=9)
+        r.raise_for_status()
+        payload = r.json() if isinstance(r.json(), dict) else {}
+        coins = payload.get("coins") if isinstance(payload, dict) else None
+        if not isinstance(coins, dict):
+            return out, src
+        for a in addresses:
+            row = coins.get(f"{chain_key}:{a}") or {}
+            price = _safe_float((row or {}).get("price") if isinstance(row, dict) else 0.0)
+            if price > 0:
+                out[a] = price
+                src[a] = "defillama_historical"
+    except Exception:
+        return out, src
+    return out, src
+
+
 def get_token_prices_usd(chain: str, token_addresses: list[str]) -> tuple[dict[str, float], dict[str, str], list[str]]:
     """
     Return (prices, sources, errors).
@@ -245,5 +295,60 @@ def get_token_prices_usd(chain: str, token_addresses: list[str]) -> tuple[dict[s
     if pending:
         errors.append(
             f"price_unavailable chain={_norm_chain(chain)} unresolved={','.join(pending)}"
+        )
+    return prices, sources, errors
+
+
+def get_token_prices_usd_at(chain: str, token_addresses: list[str], ts: int) -> tuple[dict[str, float], dict[str, str], list[str]]:
+    """
+    Historical USD prices near timestamp `ts` (UTC seconds).
+    Primary: DefiLlama historical endpoint; fallback: current spot prices.
+    """
+    addrs = [str(a or "").strip().lower() for a in (token_addresses or []) if str(a or "").strip()]
+    addrs = list(dict.fromkeys(addrs))
+    prices: dict[str, float] = {}
+    sources: dict[str, str] = {}
+    errors: list[str] = []
+    if not addrs:
+        return prices, sources, errors
+
+    day_ts = int(max(0, int(ts or 0)) // 86400 * 86400)
+    pending: list[str] = []
+    for a in addrs:
+        px, src = _hist_cache_get(chain, a, day_ts)
+        if px > 0:
+            prices[a] = px
+            sources[a] = src or "cache_hist"
+        else:
+            pending.append(a)
+
+    if pending:
+        got_prices, got_sources = _fetch_defillama_historical(chain, pending, day_ts)
+        for a in list(pending):
+            px = _safe_float(got_prices.get(a))
+            if px <= 0:
+                continue
+            src = str(got_sources.get(a) or "defillama_historical")
+            prices[a] = px
+            sources[a] = src
+            _hist_cache_put(chain, a, day_ts, px, src)
+            pending.remove(a)
+
+    if pending:
+        # Soft fallback: use current spot price when historical source has gaps.
+        spot_prices, spot_sources, spot_errors = get_token_prices_usd(chain, pending)
+        errors.extend(spot_errors or [])
+        for a in list(pending):
+            px = _safe_float(spot_prices.get(a))
+            if px <= 0:
+                continue
+            src = str(spot_sources.get(a) or "spot_fallback")
+            prices[a] = px
+            sources[a] = src
+            pending.remove(a)
+
+    if pending:
+        errors.append(
+            f"historical_price_unavailable chain={_norm_chain(chain)} ts={day_ts} unresolved={','.join(pending)}"
         )
     return prices, sources, errors

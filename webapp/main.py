@@ -109,7 +109,7 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-APP_VERSION = "0.1.71"
+APP_VERSION = "0.2.0"
 APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
@@ -194,6 +194,10 @@ RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC"
 RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
+RUN_MAX_CONCURRENT = max(1, min(6, int(os.environ.get("RUN_MAX_CONCURRENT", "1"))))
+RUN_SLOT_WAIT_TIMEOUT_SEC = max(10, int(os.environ.get("RUN_SLOT_WAIT_TIMEOUT_SEC", "180")))
+RUN_MAX_ACTIVE_PER_SESSION = max(1, min(6, int(os.environ.get("RUN_MAX_ACTIVE_PER_SESSION", "2"))))
+RUN_SLOTS_SEMAPHORE = threading.BoundedSemaphore(RUN_MAX_CONCURRENT)
 SESSION_COOKIE_NAME = "uni_fee_sid"
 SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", str(30 * 24 * 60 * 60)))
 CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
@@ -18562,9 +18566,46 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
 
     try:
         merged_raw: dict[str, dict] = {}
+        running_jobs = 0
+        with JOB_LOCK:
+            for _jid, _j in JOBS.items():
+                if str(_jid) == str(job_id):
+                    continue
+                if str((_j or {}).get("status") or "") == "running":
+                    running_jobs += 1
+        if running_jobs > 0:
+            _set_stage("queue", f"Waiting for scan slot ({running_jobs} active run(s))", 8)
         t_lock_wait0 = time.perf_counter()
-        with RUN_LOCK:
-            timing_debug["stage_ms"]["run_lock_wait"] = int(round(max(0.0, time.perf_counter() - t_lock_wait0) * 1000.0))
+        slot_acquired = RUN_SLOTS_SEMAPHORE.acquire(timeout=float(RUN_SLOT_WAIT_TIMEOUT_SEC))
+        timing_debug["stage_ms"]["run_lock_wait"] = int(round(max(0.0, time.perf_counter() - t_lock_wait0) * 1000.0))
+        if not slot_acquired:
+            msg = f"Queue timeout: no scan slot within {int(RUN_SLOT_WAIT_TIMEOUT_SEC)}s. Please retry."
+            timing_debug["total_ms"] = int(round(max(0.0, time.perf_counter() - job_t0) * 1000.0))
+            with JOB_LOCK:
+                job["status"] = "failed"
+                job["error"] = msg
+                job["stage"] = "failed"
+                job["stage_label"] = "Queue timeout"
+                job["progress"] = 100
+                job["result"] = {"logs": logs[-8:], "debug_timing": timing_debug}
+            _push_run_history(
+                session_id=session_id,
+                status="failed",
+                token_pairs=token_pairs,
+                include_chains=include_chains,
+                min_tvl=req.min_tvl,
+                days=req.days,
+                include_versions=include_versions,
+                speed_mode=speed_mode,
+                min_fee_pct=req.min_fee_pct,
+                max_fee_pct=req.max_fee_pct,
+                min_apy_pct=req.min_apy_pct,
+                exclude_suffixes=req.exclude_suffixes,
+                logs=logs,
+                error=msg,
+            )
+            return
+        try:
             t_agents_total0 = time.perf_counter()
             total_pairs = max(1, len(pairs))
             pair_workers = _pair_worker_count(speed_mode, total_pairs)
@@ -18618,6 +18659,8 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 timing_debug["pairs"].append(pair_dbg)
                 logs.extend(pair_logs or [])
             timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
+        finally:
+            RUN_SLOTS_SEMAPHORE.release()
 
         # Keep only pools that really match requested pairs.
         # Protects against occasional cross-token resolution artifacts (e.g. POL instead of ETH).
@@ -29576,6 +29619,7 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
                     "created_at": time.time(),
                     "started_at": time.time(),
                     "finished_at": time.time(),
+                    "session_id": session_id,
                     "result": cached_payload,
                     "error": None,
                 }
@@ -29584,6 +29628,22 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
     job_id = str(uuid.uuid4())
     with JOB_LOCK:
         _prune_run_jobs_locked()
+        active_for_session = 0
+        for _jid, _j in JOBS.items():
+            if str((_j or {}).get("session_id") or "") != str(session_id):
+                continue
+            _status = str((_j or {}).get("status") or "")
+            if _status in {"queued", "running"}:
+                active_for_session += 1
+        if active_for_session >= int(RUN_MAX_ACTIVE_PER_SESSION):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Too many active scans in this session "
+                    f"({active_for_session}/{int(RUN_MAX_ACTIVE_PER_SESSION)}). "
+                    "Wait for completion and retry."
+                ),
+            )
         JOBS[job_id] = {
             "id": job_id,
             "status": "queued",
@@ -29591,6 +29651,7 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
             "stage_label": "Queued",
             "progress": 0,
             "created_at": time.time(),
+            "session_id": session_id,
             "result": None,
             "error": None,
         }
@@ -30628,6 +30689,7 @@ HTML_PAGE = """
     let scanStageLabel = "waiting";
     let scanProgressPct = 0;
     let scanProgressTargetPct = 0;
+    let scanLastBackendAt = 0;
     let pairListsHintBySymbol = {};
     let pairListsIconUrls = {};
     let pairListsExpanded = true;
@@ -31114,13 +31176,15 @@ HTML_PAGE = """
       scanStageLabel = "waiting";
       scanProgressPct = 0;
       scanProgressTargetPct = 0;
+      scanLastBackendAt = 0;
     }
 
     function startScanTicker() {
       stopScanTicker();
       scanStartedAt = Date.now();
+      scanLastBackendAt = Date.now();
       const selected = getSelectedChains();
-      const chainHints = selected.length ? selected : (availableChains.length ? availableChains : ["all chains"]);
+      const chainSummary = selected.length ? `${selected.length} chain(s)` : "all chains";
       const parsePairScanProgress = (label) => {
         const txt = String(label || "");
         const m = txt.match(/Running pair scans\s*\((\d+)\s*\/\s*(\d+)\)/i);
@@ -31162,11 +31226,12 @@ HTML_PAGE = """
           scanProgressPct = target;
         }
         const pct = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
-        const chainHint = chainHints[Math.floor(elapsed / 4) % chainHints.length];
+        const staleSec = scanLastBackendAt > 0 ? Math.max(0, Math.floor((Date.now() - scanLastBackendAt) / 1000)) : 0;
+        const backendNote = staleSec >= 25 ? ` · waiting backend ${staleSec}s` : "";
         const el = document.getElementById("status");
         if (!el) return;
         el.className = "status running";
-        el.innerHTML = `Scanning pools... <span class="status-live-num">${pct}%</span> | ${escAttr(scanStageLabel)} (${escAttr(chainHint)}) · <span class="status-live-num">${elapsed}s</span>`;
+        el.innerHTML = `Scanning pools... <span class="status-live-num">${pct}%</span> | ${escAttr(scanStageLabel)} | ${escAttr(chainSummary)}${escAttr(backendNote)} · <span class="status-live-num">${elapsed}s</span>`;
       };
       tick();
       scanTicker = setInterval(tick, 900);
@@ -31184,6 +31249,7 @@ HTML_PAGE = """
     function updateProgress(progress, stageLabel) {
       scanStageLabel = String(stageLabel || "running");
       scanProgressTargetPct = Math.max(0, Math.min(100, Number(progress || 0)));
+      scanLastBackendAt = Date.now();
     }
 
     function scanElapsedSecFromJob(job) {
