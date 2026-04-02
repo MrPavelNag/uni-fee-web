@@ -11,7 +11,6 @@ Agent 1: Uniswap v3 (base version).
 import argparse
 import os
 import threading
-import time
 import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,7 +42,6 @@ from uniswap_client import (
     query_pools_by_token_symbols,
     query_token_by_symbol,
 )
-from price_oracle import get_token_prices_usd, get_token_prices_usd_at
 
 
 def _pool_tvl_usd(pool: dict) -> float:
@@ -58,161 +56,6 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except Exception:
         return int(default)
-
-
-def _safe_float(v: object) -> float:
-    try:
-        x = float(v or 0.0)
-        return x if x > 0 else 0.0
-    except Exception:
-        return 0.0
-
-
-def _hist_anchor_days() -> int:
-    return max(3, min(30, _env_int("HIST_TVL_ANCHOR_DAYS", 10)))
-
-
-def _hist_debug_enabled() -> bool:
-    raw = str(os.environ.get("HIST_TVL_DEBUG", "0")).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _build_hybrid_tvl_series(
-    chain: str,
-    pool: dict,
-    fees_usd: list[tuple[int, float]],
-    raw_tvl: list[tuple[int, float]],
-    pool_tvl_now_usd: float,
-) -> tuple[list[tuple[int, float]], dict]:
-    stats = {
-        "mode": "hybrid",
-        "fees_days": int(len(fees_usd or [])),
-        "raw_days": int(len(raw_tvl or [])),
-        "anchor_step_days": int(_hist_anchor_days()),
-        "anchor_candidates": 0,
-        "anchor_used": 0,
-        "hist_requests": 0,
-        "hist_hits": 0,
-        "spot_fallback_hits": 0,
-        "unpriced_legs": 0,
-    }
-    if not fees_usd or pool_tvl_now_usd <= 0:
-        stats["mode"] = "empty_input"
-        return [], stats
-    n = len(fees_usd)
-    if n == 1:
-        stats["mode"] = "single_day"
-        return [(int(fees_usd[0][0]), float(pool_tvl_now_usd))], stats
-    raw_aligned = [float(raw_tvl[i][1] or 0.0) if i < len(raw_tvl) else 0.0 for i in range(n)]
-    raw_ref = 0.0
-    for rv in reversed(raw_aligned):
-        if rv > 0:
-            raw_ref = rv
-            break
-    if raw_ref <= 0:
-        stats["mode"] = "flat_no_raw_ref"
-        return [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd], stats
-
-    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
-    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
-    amt0_now = _safe_float(pool.get("totalValueLockedToken0"))
-    amt1_now = _safe_float(pool.get("totalValueLockedToken1"))
-    if (not token0) or (not token1) or (amt0_now <= 0 and amt1_now <= 0):
-        stats["mode"] = "scaled_no_token_amounts"
-        return [(int(ts), float(pool_tvl_now_usd) * (raw_aligned[i] / raw_ref if raw_aligned[i] > 0 else 1.0)) for i, (ts, _) in enumerate(fees_usd)], stats
-
-    ratio01 = _safe_float(pool.get("token0Price"))  # token1 per token0
-    spot_prices, _spot_sources, _spot_errors = get_token_prices_usd(chain, [token0, token1])
-    p0_now = _safe_float(spot_prices.get(token0))
-    p1_now = _safe_float(spot_prices.get(token1))
-    if p0_now <= 0 and p1_now > 0 and ratio01 > 0:
-        p0_now = p1_now * ratio01
-    if p1_now <= 0 and p0_now > 0 and ratio01 > 0:
-        p1_now = p0_now / ratio01
-    if p0_now <= 0 and p1_now <= 0:
-        stats["mode"] = "scaled_no_spot_prices"
-        return [(int(ts), float(pool_tvl_now_usd) * (raw_aligned[i] / raw_ref if raw_aligned[i] > 0 else 1.0)) for i, (ts, _) in enumerate(fees_usd)], stats
-
-    step = _hist_anchor_days()
-    anchor_idx = list(range(0, n, step))
-    if anchor_idx[-1] != n - 1:
-        anchor_idx.append(n - 1)
-    stats["anchor_candidates"] = int(len(anchor_idx))
-    anchors: dict[int, float] = {}
-    for i in anchor_idx:
-        rv = raw_aligned[i]
-        ts = int(fees_usd[i][0])
-        if rv <= 0:
-            continue
-        scale = rv / max(1e-12, raw_ref)
-        amt0_day = amt0_now * scale
-        amt1_day = amt1_now * scale
-        stats["hist_requests"] += 1
-        hist_prices, hist_sources, _hist_errors = get_token_prices_usd_at(chain, [token0, token1], ts)
-        for tk in (token0, token1):
-            src = str(hist_sources.get(tk) or "")
-            if "historical" in src:
-                stats["hist_hits"] += 1
-            elif "spot_fallback" in src:
-                stats["spot_fallback_hits"] += 1
-        p0 = _safe_float(hist_prices.get(token0)) or p0_now
-        p1 = _safe_float(hist_prices.get(token1)) or p1_now
-        if p0 <= 0 and p1 > 0 and ratio01 > 0:
-            p0 = p1 * ratio01
-        if p1 <= 0 and p0 > 0 and ratio01 > 0:
-            p1 = p0 / ratio01
-        if p0 <= 0:
-            stats["unpriced_legs"] += 1
-        if p1 <= 0:
-            stats["unpriced_legs"] += 1
-        ext_tvl = max(0.0, amt0_day * max(0.0, p0)) + max(0.0, amt1_day * max(0.0, p1))
-        if ext_tvl > 0:
-            anchors[i] = float(ext_tvl)
-    stats["anchor_used"] = int(len(anchors))
-
-    if len(anchors) < 2:
-        stats["mode"] = "scaled_fallback_not_enough_anchors"
-        shaped: list[tuple[int, float]] = []
-        for i, (ts, _f) in enumerate(fees_usd):
-            rv = raw_aligned[i]
-            if rv > 0:
-                day_tvl = float(pool_tvl_now_usd) * (rv / raw_ref)
-                day_tvl = max(float(pool_tvl_now_usd) * 0.2, min(float(pool_tvl_now_usd) * 5.0, day_tvl))
-            else:
-                day_tvl = float(pool_tvl_now_usd)
-            shaped.append((int(ts), float(day_tvl)))
-        return shaped, stats
-
-    idxs = sorted(anchors.keys())
-    out_vals: list[float] = [0.0] * n
-    first = idxs[0]
-    first_factor = anchors[first] / max(1e-12, raw_aligned[first])
-    for i in range(0, first):
-        rv = raw_aligned[i]
-        out_vals[i] = (rv * first_factor) if rv > 0 else anchors[first]
-    last = idxs[-1]
-    last_factor = anchors[last] / max(1e-12, raw_aligned[last])
-    for i in range(last + 1, n):
-        rv = raw_aligned[i]
-        out_vals[i] = (rv * last_factor) if rv > 0 else anchors[last]
-    for seg in range(len(idxs) - 1):
-        a = idxs[seg]
-        b = idxs[seg + 1]
-        a_ext = anchors[a]
-        b_ext = anchors[b]
-        a_raw = max(0.0, raw_aligned[a])
-        b_raw = max(0.0, raw_aligned[b])
-        span = max(1, b - a)
-        for i in range(a, b + 1):
-            w = float(i - a) / float(span)
-            target = a_ext + (b_ext - a_ext) * w
-            raw_interp = a_raw + (b_raw - a_raw) * w
-            factor = target / max(1e-12, raw_interp) if raw_interp > 0 else 1.0
-            rv = raw_aligned[i]
-            v = (rv * factor) if rv > 0 else target
-            out_vals[i] = max(0.0, float(v))
-    stats["mode"] = "hybrid_interpolated"
-    return [(int(fees_usd[i][0]), float(out_vals[i])) for i in range(n)], stats
 
 
 def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
@@ -839,10 +682,6 @@ def main() -> None:
 
     pool_chart_data = {}
     max_workers = max(1, min(16, int(os.environ.get("POOL_SERIES_WORKERS", "8"))))
-    hist_debug = _hist_debug_enabled()
-    hybrid_timings_ms: list[float] = []
-    hybrid_anchor_used: list[int] = []
-    hybrid_modes: dict[str, int] = {}
 
     def _process_pool(idx: int, pool: dict) -> tuple[int, str | None, dict | None, str]:
         chain = pool.get("chain", "unknown")
@@ -875,23 +714,29 @@ def main() -> None:
         # Build TVL and profitability strictly from external TVL (no subgraph TVL dependency).
         data["fees"] = []
         data["tvl"] = []
-        hybrid_meta: dict = {}
-        hybrid_ms = 0.0
         try:
             fees_usd = data.get("_fees_usd") or []
             raw_tvl = data.get("_raw_tvl_usd") or []
             if fees_usd and pool_tvl_now_usd > 0:
-                t0_ms = time.perf_counter()
-                tvl_series, hybrid_meta = _build_hybrid_tvl_series(
-                    chain=chain,
-                    pool=pool,
-                    fees_usd=fees_usd,
-                    raw_tvl=raw_tvl,
-                    pool_tvl_now_usd=float(pool_tvl_now_usd),
-                )
-                hybrid_ms = (time.perf_counter() - t0_ms) * 1000.0
-                if not tvl_series:
-                    tvl_series = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                tvl_series = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                if raw_tvl and len(raw_tvl) == len(fees_usd):
+                    anchor = 0.0
+                    for _, rv in reversed(raw_tvl):
+                        rvf = float(rv or 0.0)
+                        if rvf > 0:
+                            anchor = rvf
+                            break
+                    if anchor > 0:
+                        shaped: list[tuple[int, float]] = []
+                        for i, (ts, _) in enumerate(fees_usd):
+                            rv = float(raw_tvl[i][1] or 0.0)
+                            if rv > 0:
+                                day_tvl = float(pool_tvl_now_usd) * (rv / anchor)
+                                day_tvl = max(float(pool_tvl_now_usd) * 0.2, min(float(pool_tvl_now_usd) * 5.0, day_tvl))
+                            else:
+                                day_tvl = float(pool_tvl_now_usd)
+                            shaped.append((int(ts), float(day_tvl)))
+                        tvl_series = shaped
                 data["tvl"] = tvl_series
                 cumul = 0.0
                 fees_rebuilt = []
@@ -922,23 +767,7 @@ def main() -> None:
             "chain": chain,
             "version": "v3",
         }
-        msg = f"  [{idx+1}/{len(pools)}] {chain} {pair}: {len(data.get('fees') or [])} days"
-        if hist_debug:
-            mode = str(hybrid_meta.get("mode") or "-")
-            ac = int(hybrid_meta.get("anchor_candidates") or 0)
-            au = int(hybrid_meta.get("anchor_used") or 0)
-            hr = int(hybrid_meta.get("hist_requests") or 0)
-            hh = int(hybrid_meta.get("hist_hits") or 0)
-            sf = int(hybrid_meta.get("spot_fallback_hits") or 0)
-            msg += (
-                f" | hybrid={mode} anchors={au}/{ac} hist_req={hr} hist_hits={hh} "
-                f"spot_fallback={sf} hybrid_ms={hybrid_ms:.1f}"
-            )
-        payload["_hybrid_debug"] = {
-            "ms": float(hybrid_ms),
-            **(hybrid_meta or {}),
-        }
-        return idx, pool_id, payload, msg
+        return idx, pool_id, payload, f"  [{idx+1}/{len(pools)}] {chain} {pair}: {len(data.get('fees') or [])} days"
 
     if pools:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -947,32 +776,10 @@ def main() -> None:
                 try:
                     _, pool_id, payload, msg = fut.result()
                     if pool_id and payload:
-                        dbg = payload.get("_hybrid_debug") or {}
-                        ms = float(dbg.get("ms") or 0.0)
-                        hybrid_timings_ms.append(ms)
-                        hybrid_anchor_used.append(int(dbg.get("anchor_used") or 0))
-                        m = str(dbg.get("mode") or "unknown")
-                        hybrid_modes[m] = int(hybrid_modes.get(m, 0)) + 1
-                        payload.pop("_hybrid_debug", None)
                         pool_chart_data[pool_id] = payload
                     print(msg)
                 except Exception as e:
                     print(f"  [series] error - {e}")
-
-    if hist_debug and hybrid_timings_ms:
-        arr = sorted(hybrid_timings_ms)
-        n = len(arr)
-        p95_idx = min(n - 1, max(0, int(n * 0.95) - 1))
-        avg_ms = sum(arr) / max(1, n)
-        max_ms = arr[-1]
-        p95_ms = arr[p95_idx]
-        avg_anchors = sum(hybrid_anchor_used) / max(1, len(hybrid_anchor_used))
-        modes = ", ".join(f"{k}:{v}" for k, v in sorted(hybrid_modes.items()))
-        print(
-            "[hybrid-timing][v3] "
-            f"pools={n} avg_ms={avg_ms:.1f} p95_ms={p95_ms:.1f} max_ms={max_ms:.1f} "
-            f"avg_anchors={avg_anchors:.2f} modes={modes}"
-        )
 
     out_json = f"data/pools_v3_{suffix}.json"
     save_chart_data_json(pool_chart_data, out_json)
