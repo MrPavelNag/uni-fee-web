@@ -79,7 +79,7 @@ except Exception:
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 PAIR_LISTS_CATALOG_PATH = CATALOG_DIR / "pair_lists_catalog.json"
-PAIR_LISTS_SCHEMA_VERSION = 5
+PAIR_LISTS_SCHEMA_VERSION = 7
 MAJOR_TOKENS_CACHE_PATH = CATALOG_DIR / "major_tokens_by_chain.json"
 UNISWAP_TOKEN_LIST_URL = os.environ.get("UNISWAP_TOKEN_LIST_URL", "https://tokens.uniswap.org")
 TOKENS_MIN_TVL_USD = float(os.environ.get("TOKENS_MIN_TVL_USD", "1000000"))
@@ -16768,9 +16768,12 @@ def _curated_token_symbols() -> set[str]:
 
 
 _COINGECKO_CATEGORY_API = "https://api.coingecko.com/api/v3/coins/markets"
+_COINGECKO_TOP_MARKETCAP_PAGES = max(1, min(5, int(os.environ.get("COINGECKO_TOP_MARKETCAP_PAGES", "2"))))
+_COINGECKO_TOP_MARKETCAP_PER_PAGE = max(50, min(250, int(os.environ.get("COINGECKO_TOP_MARKETCAP_PER_PAGE", "250"))))
 _DEFI_LLAMA_STABLECOINS_API = "https://stablecoins.llama.fi/stablecoins?includePrices=true"
 _COINPAPRIKA_TAG_API = "https://api.coinpaprika.com/v1/tags"
 _COMMODITY_CATEGORY_IDS = ("tokenized-gold", "tokenized-silver", "commodity-backed-stablecoin")
+_MEME_COINGECKO_CATEGORY_ID = "meme-token"
 _MEME_TAG_IDS = ("meme-coin", "dog-meme-coin", "cat-meme-coin", "frog-meme-coin", "president-meme-coin")
 _MEME_SYMBOLS = {"doge", "pepe", "shib", "floki", "bonk", "wif"}
 _PAIR_LIST_BLOCKED_SYMBOLS = {"test", "unknown"}
@@ -16787,6 +16790,31 @@ def _fetch_coingecko_category_symbols(category_id: str, *, max_pages: int = 2, p
         url = (
             f"{_COINGECKO_CATEGORY_API}?vs_currency=usd"
             f"&category={cat}&order=market_cap_desc"
+            f"&per_page={max(1, min(int(per_page), 250))}&page={int(page)}"
+            "&sparkline=false&price_change_percentage=24h"
+        )
+        req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT, "Accept": "application/json"})
+        with urlopen(req, timeout=16) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(payload, list) or not payload:
+            break
+        for item in payload:
+            sym = str((item or {}).get("symbol") or "").strip().lower()
+            if _is_clean_symbol(sym):
+                out.add(sym)
+        if len(payload) < max(1, min(int(per_page), 250)):
+            break
+    return out
+
+
+def _fetch_coingecko_top_marketcap_symbols(*, max_pages: int, per_page: int) -> set[str]:
+    import json
+
+    out: set[str] = set()
+    for page in range(1, max(1, int(max_pages)) + 1):
+        url = (
+            f"{_COINGECKO_CATEGORY_API}?vs_currency=usd"
+            "&order=market_cap_desc"
             f"&per_page={max(1, min(int(per_page), 250))}&page={int(page)}"
             "&sparkline=false&price_change_percentage=24h"
         )
@@ -16824,7 +16852,7 @@ def _fetch_coinpaprika_tag_symbols(tag_id: str) -> set[str]:
     return out
 
 
-def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str]]:
+def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str], list[str]]:
     import json
 
     req = UrlRequest(_DEFI_LLAMA_STABLECOINS_API, headers={"User-Agent": APP_USER_AGENT, "Accept": "application/json"})
@@ -16833,6 +16861,7 @@ def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str]]:
     rows = payload.get("peggedAssets", []) if isinstance(payload, dict) else []
     usd_stables: set[str] = set()
     nonusd_stables: set[str] = set()
+    usd_ranked_pairs: list[tuple[float, str]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -16842,9 +16871,34 @@ def _fetch_defillama_stablecoin_symbol_classes() -> tuple[set[str], set[str]]:
         peg = str(row.get("pegType") or "").strip().lower()
         if peg == "peggedusd":
             usd_stables.add(sym)
+            circ_raw = row.get("circulating")
+            circ = 0.0
+            if isinstance(circ_raw, dict):
+                # DefiLlama typically returns {"peggedUSD": <value>} for USD stables.
+                for k, v in circ_raw.items():
+                    if str(k or "").strip().lower() == "peggedusd":
+                        try:
+                            circ = float(v or 0.0)
+                        except (TypeError, ValueError):
+                            circ = 0.0
+                        break
+            else:
+                try:
+                    circ = float(circ_raw or 0.0)
+                except (TypeError, ValueError):
+                    circ = 0.0
+            usd_ranked_pairs.append((circ, sym))
         elif peg.startswith("pegged") and peg not in {"peggedusd", "peggedvar"}:
             nonusd_stables.add(sym)
-    return usd_stables, nonusd_stables
+    usd_ranked_pairs.sort(key=lambda x: (-float(x[0]), x[1]))
+    usd_ranked: list[str] = []
+    seen: set[str] = set()
+    for _circ, sym in usd_ranked_pairs:
+        if sym in seen:
+            continue
+        seen.add(sym)
+        usd_ranked.append(sym)
+    return usd_stables, nonusd_stables, usd_ranked
 
 
 def _classify_ranked_symbols(
@@ -16870,13 +16924,14 @@ def _classify_ranked_symbols(
             continue
         if s in _PAIR_LIST_BLOCKED_SYMBOLS:
             continue
-        is_meme = s in meme_syms
-        if is_meme:
-            meme_ranked.append(s)
-            continue
         is_commodity = s in commodity_syms
         is_nonusd = s in nonusd_syms
         is_usd_stable = _is_stablecoin_symbol(s) or s in usd_stables
+        is_meme = s in meme_syms
+        # Meme bucket must not absorb symbols that are already classified as stable/commodity/non-USD.
+        if is_meme and (not is_usd_stable) and (not is_commodity) and (not is_nonusd):
+            meme_ranked.append(s)
+            continue
         is_stable_main = bool(is_usd_stable and not is_commodity and not is_nonusd)
         if is_stable_main:
             stable_ranked.append(s)
@@ -16894,6 +16949,8 @@ def _build_pair_lists_catalog_from_major(
     updated_at: str,
     *,
     allowed_symbols: set[str] | None = None,
+    stable_fallback_ranked: list[str] | None = None,
+    preferred_coin_symbols: set[str] | None = None,
     usd_stable_symbols: set[str] | None = None,
     commodity_symbols: set[str] | None = None,
     nonusd_fiat_symbols: set[str] | None = None,
@@ -16928,6 +16985,12 @@ def _build_pair_lists_catalog_from_major(
                 score[sym] = int(score.get(sym, 0)) + int(weight)
 
     ranked = [str(sym or "").strip().lower() for sym, _ in sorted(score.items(), key=lambda kv: (-int(kv[1] or 0), kv[0]))]
+    if (not ranked) and stable_fallback_ranked:
+        ranked = [
+            str(sym or "").strip().lower()
+            for sym in (stable_fallback_ranked or [])
+            if _is_clean_symbol(str(sym or "").strip()) and str(sym or "").strip().lower() not in _PAIR_LIST_BLOCKED_SYMBOLS
+        ]
     stable_ranked, token_ranked, commodity_ranked, fiat_nonusd_ranked, meme_ranked = _classify_ranked_symbols(
         ranked,
         usd_stable_symbols=usd_stable_symbols,
@@ -16935,6 +16998,15 @@ def _build_pair_lists_catalog_from_major(
         nonusd_fiat_symbols=nonusd_fiat_symbols,
         meme_symbols=meme_symbols,
     )
+    if preferred_coin_symbols:
+        preferred = {
+            str(s).strip().lower()
+            for s in (preferred_coin_symbols or set())
+            if _is_clean_symbol(str(s).strip())
+        }
+        filtered_tokens = [s for s in token_ranked if s in preferred]
+        if filtered_tokens:
+            token_ranked = filtered_tokens
     for sym in sorted(_COMMODITY_STABLE_SYMBOLS):
         if sym not in commodity_ranked:
             commodity_ranked.append(sym)
@@ -16972,6 +17044,8 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
     raw_major = _read_json(MAJOR_TOKENS_CACHE_PATH) or {}
     updated_at = str(raw_major.get("updated_at") or _iso_now())
     allowed = None
+    stable_fallback_ranked: list[str] = []
+    preferred_coin_symbols: set[str] | None = None
     usd_stable_symbols: set[str] = set(_STABLECOIN_SYMBOLS)
     commodity_symbols: set[str] = set(_COMMODITY_STABLE_SYMBOLS)
     nonusd_fiat_symbols: set[str] = set(_NON_USD_FIAT_STABLE_SYMBOLS)
@@ -16991,6 +17065,18 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         # Fail-open to ranked symbols if verified list is temporarily unavailable.
         source_parts.append("unfiltered_fallback")
     try:
+        cg_top = _fetch_coingecko_top_marketcap_symbols(
+            max_pages=int(_COINGECKO_TOP_MARKETCAP_PAGES),
+            per_page=int(_COINGECKO_TOP_MARKETCAP_PER_PAGE),
+        )
+        if cg_top:
+            preferred_coin_symbols = set(cg_top)
+            source_parts.append("coingecko_top_mcap")
+        else:
+            source_parts.append("coingecko_top_mcap_empty")
+    except Exception:
+        source_parts.append("coingecko_top_mcap_fallback")
+    try:
         commodity_from_cg: set[str] = set()
         for cat in _COMMODITY_CATEGORY_IDS:
             commodity_from_cg.update(_fetch_coingecko_category_symbols(cat, max_pages=1, per_page=250))
@@ -17000,18 +17086,41 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
     except Exception:
         source_parts.append("coingecko_commodity_fallback")
     try:
+        meme_from_cg = _fetch_coingecko_category_symbols(
+            _MEME_COINGECKO_CATEGORY_ID,
+            max_pages=2,
+            per_page=100,
+        )
+        if meme_from_cg:
+            # Prefer CoinGecko memes to avoid broad symbol collisions from tag-only providers.
+            meme_symbols = set(meme_from_cg)
+            source_parts.append("coingecko_memes")
+        else:
+            source_parts.append("coingecko_memes_empty")
+    except Exception:
+        source_parts.append("coingecko_memes_fallback")
+    try:
         meme_from_paprika: set[str] = set()
         for tag_id in _MEME_TAG_IDS:
             meme_from_paprika.update(_fetch_coinpaprika_tag_symbols(tag_id))
-        if meme_from_paprika:
+        if meme_from_paprika and (not meme_symbols):
             meme_symbols.update(meme_from_paprika)
-        source_parts.append("coinpaprika_memes")
+            source_parts.append("coinpaprika_memes")
+        elif meme_from_paprika:
+            source_parts.append("coinpaprika_memes_unused")
+        else:
+            source_parts.append("coinpaprika_memes_empty")
     except Exception:
         source_parts.append("coinpaprika_memes_fallback")
+    if not meme_symbols:
+        meme_symbols = set(_MEME_SYMBOLS)
+        source_parts.append("meme_seed_only")
     try:
-        usd_from_llama, nonusd_from_llama = _fetch_defillama_stablecoin_symbol_classes()
+        usd_from_llama, nonusd_from_llama, usd_ranked_from_llama = _fetch_defillama_stablecoin_symbol_classes()
         if usd_from_llama:
             usd_stable_symbols.update(usd_from_llama)
+        if usd_ranked_from_llama:
+            stable_fallback_ranked = list(usd_ranked_from_llama)
         if nonusd_from_llama:
             nonusd_fiat_symbols.update(nonusd_from_llama)
         source_parts.append("defillama_stables")
@@ -17021,6 +17130,8 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         raw_major,
         updated_at,
         allowed_symbols=allowed,
+        stable_fallback_ranked=stable_fallback_ranked,
+        preferred_coin_symbols=preferred_coin_symbols,
         usd_stable_symbols=usd_stable_symbols,
         commodity_symbols=commodity_symbols,
         nonusd_fiat_symbols=nonusd_fiat_symbols,
@@ -29646,12 +29757,12 @@ HTML_PAGE = """
                       <option value="fiat_nonusd_top5">top 5 non-USD fiat stables</option>
                       <option value="fiat_nonusd_top10">top 10 non-USD fiat stables</option>
                       <option value="fiat_nonusd_top20">top 20 non-USD fiat stables</option>
-                      <option value="meme_top5">top 5 memes</option>
-                      <option value="meme_top10">top 10 memes</option>
-                      <option value="meme_top20">top 20 memes</option>
                       <option value="token_top5">top 5 coins</option>
                       <option value="token_top10">top 10 coins</option>
                       <option value="token_top20">top 20 coins</option>
+                      <option value="meme_top5">top 5 memes</option>
+                      <option value="meme_top10">top 10 memes</option>
+                      <option value="meme_top20">top 20 memes</option>
                     </select>
                     <input id="stableBucketManual" placeholder="e.g. usdt,usdc,dai"/>
                   </div>
@@ -30516,6 +30627,14 @@ HTML_PAGE = """
       return 0;
     }
 
+    function effectiveTopCount(mode, sourceCount) {
+      const base = topCountFromMode(mode);
+      const n = Math.max(0, Number(sourceCount || 0));
+      if (base === 10 && n >= 10 && n <= 15) return n;
+      if (base === 20 && n >= 20 && n <= 25) return n;
+      return base;
+    }
+
     function isManualMode(mode) {
       const m = String(mode || "");
       return m === "manual" || m.endsWith("_manual");
@@ -30534,22 +30653,22 @@ HTML_PAGE = """
         return parseManualSymbols(inputEl?.value || "");
       }
       if (mode.startsWith("commodity_top")) {
-        const count = topCountFromMode(mode);
+        const count = effectiveTopCount(mode, (pairPresetCatalog.commodityStablecoins || []).length);
         return (pairPresetCatalog.commodityStablecoins || []).slice(0, count).map((x) => normalizePairToken(x)).filter(Boolean);
       }
       if (mode.startsWith("fiat_nonusd_top")) {
-        const count = topCountFromMode(mode);
+        const count = effectiveTopCount(mode, (pairPresetCatalog.fiatNonUsdStablecoins || []).length);
         return (pairPresetCatalog.fiatNonUsdStablecoins || []).slice(0, count).map((x) => normalizePairToken(x)).filter(Boolean);
       }
       if (mode.startsWith("meme_top")) {
-        const count = topCountFromMode(mode);
+        const count = effectiveTopCount(mode, (pairPresetCatalog.memes || []).length);
         return (pairPresetCatalog.memes || []).slice(0, count).map((x) => normalizePairToken(x)).filter(Boolean);
       }
       const sourceKind = parseBucketSource(mode);
       const source = sourceKind === "stable"
         ? (pairPresetCatalog.stablecoins || [])
         : (pairPresetCatalog.coins || []);
-      const count = topCountFromMode(mode);
+      const count = effectiveTopCount(mode, (source || []).length);
       return (source || []).slice(0, count).map((x) => normalizePairToken(x)).filter(Boolean);
     }
 
@@ -30951,27 +31070,36 @@ HTML_PAGE = """
         if (plBadge) {
           plBadge.textContent = `pair lists: stable ${stCount}, coins ${coinCount}, commodity ${cmCount}, non-USD ${fxCount}, memes ${memeCount}, updated: ${plUpdated}`;
           const topN = (arr, n) => ((arr || []).slice(0, n).join(", ") || "-");
+          const topLines = (arr, count) => {
+            const ct = Math.max(0, Number(count || 0));
+            const lines = [];
+            const hideTop5 = (ct >= 7 && ct <= 7);
+            const showTop10 = (ct >= 5);
+            const showTop20 = ct >= 10;
+            if (!hideTop5) {
+              lines.push(`  Top-5: ${topN(arr, Math.min(5, ct || 5))}`);
+            }
+            if (showTop10) {
+              const top10n = (ct >= 10 && ct <= 15) ? ct : (ct < 10 ? ct : 10);
+              lines.push(`  Top-${top10n}: ${topN(arr, top10n)}`);
+            }
+            if (showTop20) {
+              const top20n = (ct >= 20 && ct <= 25) ? ct : (ct < 20 ? ct : 20);
+              lines.push(`  Top-${top20n}: ${topN(arr, top20n)}`);
+            }
+            return lines;
+          };
           pairListsDetailsLines = [
             `Stablecoins ranked count: ${stCount}`,
-            `  Top-5: ${topN(pairPresetCatalog.stablecoins, 5)}`,
-            `  Top-10: ${topN(pairPresetCatalog.stablecoins, 10)}`,
-            `  Top-20: ${topN(pairPresetCatalog.stablecoins, 20)}`,
+            ...topLines(pairPresetCatalog.stablecoins, stCount),
             `Coins ranked count: ${coinCount}`,
-            `  Top-5: ${topN(pairPresetCatalog.coins, 5)}`,
-            `  Top-10: ${topN(pairPresetCatalog.coins, 10)}`,
-            `  Top-20: ${topN(pairPresetCatalog.coins, 20)}`,
+            ...topLines(pairPresetCatalog.coins, coinCount),
             `Commodity stables ranked count: ${cmCount}`,
-            `  Top-5: ${topN(pairPresetCatalog.commodityStablecoins, 5)}`,
-            `  Top-10: ${topN(pairPresetCatalog.commodityStablecoins, 10)}`,
-            `  Top-20: ${topN(pairPresetCatalog.commodityStablecoins, 20)}`,
+            ...topLines(pairPresetCatalog.commodityStablecoins, cmCount),
             `Non-USD fiat stables ranked count: ${fxCount}`,
-            `  Top-5: ${topN(pairPresetCatalog.fiatNonUsdStablecoins, 5)}`,
-            `  Top-10: ${topN(pairPresetCatalog.fiatNonUsdStablecoins, 10)}`,
-            `  Top-20: ${topN(pairPresetCatalog.fiatNonUsdStablecoins, 20)}`,
+            ...topLines(pairPresetCatalog.fiatNonUsdStablecoins, fxCount),
             `Memes ranked count: ${memeCount}`,
-            `  Top-5: ${topN(pairPresetCatalog.memes, 5)}`,
-            `  Top-10: ${topN(pairPresetCatalog.memes, 10)}`,
-            `  Top-20: ${topN(pairPresetCatalog.memes, 20)}`,
+            ...topLines(pairPresetCatalog.memes, memeCount),
           ];
         }
         for (const selId of ["stableBucketMode", "tokenBucketMode"]) {
@@ -30981,7 +31109,40 @@ HTML_PAGE = """
             const opt = sel.querySelector(`option[value="${value}"]`);
             if (!opt) return;
             const topN = value.endsWith("_top5") ? 5 : (value.endsWith("_top10") ? 10 : 20);
-            const shown = Math.max(0, Math.min(Number(sourceCount || 0), topN));
+            const count = Math.max(0, Number(sourceCount || 0));
+            const hideTop5 = (count >= 7 && count <= 7);
+            const showTop10 = (count >= 5);
+            const showTop20 = count >= 10;
+            if (topN === 10) {
+              opt.hidden = !showTop10;
+              opt.disabled = !showTop10;
+              if (!showTop10 && String(sel.value || "") === value) {
+                sel.value = value.replace("_top10", "_top5");
+              }
+              if (!showTop10) return;
+            }
+            if (topN === 20) {
+              opt.hidden = !showTop20;
+              opt.disabled = !showTop20;
+              if (!showTop20 && String(sel.value || "") === value) {
+                sel.value = (count >= 5) ? value.replace("_top20", "_top10") : value.replace("_top20", "_top5");
+              }
+              if (!showTop20) return;
+            }
+            if (topN === 5) {
+              const showTop5 = !hideTop5;
+              opt.hidden = !showTop5;
+              opt.disabled = !showTop5;
+              if (!showTop5 && String(sel.value || "") === value) {
+                sel.value = value.replace("_top5", "_top10");
+              }
+              if (!showTop5) return;
+            }
+            const shown = (topN === 10 && count >= 10 && count <= 15)
+              ? count
+              : ((topN === 20 && count >= 20 && count <= 25)
+                  ? count
+                  : Math.max(0, Math.min(count, topN)));
             opt.textContent = `top ${shown} ${label}`;
           };
           setTopOption("stable_top5", stCount, "stablecoins");
