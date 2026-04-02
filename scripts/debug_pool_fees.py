@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Проверить raw данные subgraph для пула: volume, fees, TVL по дням.
-Сравнить с UI: fees ≤ volume × fee_rate (обычно 0.003 для 0.3%).
+Inspect raw subgraph pool data: daily volume, fees, and TVL.
+Compare with UI expectation: fees <= volume * fee_rate (typically 0.003 for 0.3%).
 """
 import os
 import sys
@@ -20,7 +20,7 @@ VERSION = "v3"
 def main():
     ep = get_graph_endpoint(CHAIN, VERSION)
     if not ep:
-        print("Нет endpoint")
+        print("No endpoint")
         return
 
     end = datetime.utcnow()
@@ -28,7 +28,7 @@ def main():
     day_start = int(start.timestamp() // 86400)
     day_end = int(end.timestamp() // 86400)
 
-    # Сначала проверим, есть ли pool и его общие данные
+    # First check if pool exists and print general stats
     pool_q = """
     query { pool(id: "%s") {
       id token0 { symbol } token1 { symbol }
@@ -57,7 +57,7 @@ def main():
     data = graphql_query(ep, q, {"pool": POOL_ID, "start": day_start, "end": day_end, "skip": 0})
     rows = data.get("data", {}).get("poolDayDatas", [])
 
-    # Если 0 дней — попробуем без фильтра дат (последние записи)
+    # If no days returned, retry without date filter (latest records)
     if not rows:
         q2 = """
         query { poolDayDatas(first: 5, orderBy: date, orderDirection: desc, where: { pool: "%s" }) {
@@ -68,7 +68,7 @@ def main():
             d2 = graphql_query(ep, q2)
             rows2 = d2.get("data", {}).get("poolDayDatas", [])
             if rows2:
-                print("(Найдены последние записи без фильтра дат:)")
+                print("(Latest records found without date filter:)")
                 rows = rows2
         except Exception:
             pass
@@ -88,11 +88,11 @@ def main():
         print(f"  {dt}  vol=${vol:,.0f}  fees=${fees:,.2f}  tvl=${tvl:,.0f}")
 
     print("-" * 60)
-    print(f"Итого за {FEE_DAYS} дней: volume=${total_vol:,.0f}  fees=${total_fees:,.2f}")
-    print(f"Ожидаемо: fees ≈ volume × 0.003 = ${total_vol * 0.003:,.2f}")
-    print("Проекция LP $10k: disabled in this debug script (subgraph TVL denominator removed)")
+    print(f"Total for {FEE_DAYS} days: volume=${total_vol:,.0f}  fees=${total_fees:,.2f}")
+    print(f"Expected: fees ~= volume x 0.003 = ${total_vol * 0.003:,.2f}")
+    print("LP $10k projection: disabled in this debug script (subgraph TVL denominator removed)")
     if total_vol > 0 and total_fees > total_vol * 0.01:
-        print("⚠ Возможная ошибка: fees >> volume×1% — данные subgraph под вопросом")
+        print("Warning: possible anomaly: fees >> volume x 1% (subgraph data may be incorrect)")
 
 if __name__ == "__main__":
     main()

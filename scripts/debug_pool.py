@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Проверить пул в v4 subgraph: есть ли он, какие токены, TVL."""
+"""Check a v4 subgraph pool: existence, tokens, and TVL."""
 import os
 import sys
 
@@ -13,7 +13,7 @@ CHAIN = "arbitrum"
 def main():
     ep = get_graph_endpoint(CHAIN, "v4")
     if not ep:
-        print("Нет endpoint. THE_GRAPH_API_KEY?")
+        print("No endpoint. THE_GRAPH_API_KEY?")
         return
     q = """
     query {
@@ -30,17 +30,17 @@ def main():
         data = graphql_query(ep, q)
         pool = data.get("data", {}).get("pool")
         if pool:
-            print("Пул найден в subgraph:")
+            print("Pool found in subgraph:")
             print("  token0:", pool["token0"]["symbol"], pool["token0"]["id"])
             print("  token1:", pool["token1"]["symbol"], pool["token1"]["id"])
             print("  TVL USD:", pool.get("totalValueLockedUSD"))
             print("  feeTier:", pool.get("feeTier"))
         else:
-            print("Пул НЕ найден в subgraph (pool=null)")
+            print("Pool NOT found in subgraph (pool=null)")
         if "errors" in data:
             print("Errors:", data["errors"])
     except Exception as e:
-        print("Ошибка:", e)
+        print("Error:", e)
 
 if __name__ == "__main__":
     main()

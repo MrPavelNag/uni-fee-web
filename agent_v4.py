@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Uniswap v4 Agent: поиск пулов, расчёт LP-комиссий, сохранение для графика.
+Uniswap v4 Agent: pool discovery, LP fee computation, chart data output.
 
-Использует: The Graph (THE_GRAPH_API_KEY) или V4_OVERRIDE_* для Ormi.
-Выход: data/pools_v4_{suffix}.json — формат для agent_merge.
+Uses: The Graph (THE_GRAPH_API_KEY) or V4_OVERRIDE_* for Ormi.
+Output: data/pools_v4_{suffix}.json in agent_merge format.
 """
 
 import argparse
@@ -34,7 +34,7 @@ from agent_common import (
 
 
 def save_pdf(pools: list[dict], path: str) -> None:
-    """Сохранить список v4 пулов в PDF (аналогично v3)."""
+    """Save v4 pool list to PDF (same style as v3)."""
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import getSampleStyleSheet
@@ -58,7 +58,7 @@ def save_pdf(pools: list[dict], path: str) -> None:
                 [
                     p.get("chain", ""),
                     p.get("pair_label", f"{t0}/{t1}"),
-                    pid,  # полный pool id
+                    pid,  # full pool id
                     f"{fee_pct}%",
                     f"${tvl:,.0f}",
                     f"${vol:,.0f}",
@@ -82,7 +82,7 @@ def save_pdf(pools: list[dict], path: str) -> None:
     doc.build(story)
     print(f"Saved: {path}")
 
-# v4 может использовать native ETH (0x0) вместо WETH
+# v4 may use native ETH (0x0) instead of WETH
 NATIVE_ETH = "0x0000000000000000000000000000000000000000"
 
 
@@ -189,7 +189,7 @@ def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> li
 
 
 def parse_pairs(s: str) -> list[tuple[str, str]]:
-    """Parse 'uni,eth;fluid,usdc' -> [(uni,eth), (fluid,usdc)]. Нормализует дубли (fluid,eth)==(eth,fluid)."""
+    """Parse 'uni,eth;fluid,usdc' -> [(uni,eth), (fluid,usdc)]. Deduplicates (fluid,eth)==(eth,fluid)."""
     seen = set()
     out = []
     for part in s.replace(" ", "").lower().split(";"):
@@ -205,7 +205,7 @@ def parse_pairs(s: str) -> list[tuple[str, str]]:
 
 
 def get_endpoint(chain: str) -> Optional[str]:
-    """GraphQL endpoint для v4 на данной сети."""
+    """GraphQL endpoint for v4 on a given chain."""
     override = os.environ.get(f"V4_OVERRIDE_{chain.upper().replace('-', '_')}")
     if override:
         return override
@@ -217,7 +217,7 @@ def get_endpoint(chain: str) -> Optional[str]:
 
 
 def resolve_token(chain: str, symbol: str, endpoint: str, dynamic: dict) -> Optional[str]:
-    """Адрес токена: config -> dynamic -> subgraph lookup."""
+    """Resolve token address: config -> dynamic -> subgraph lookup."""
     sym = symbol.lower()
     for c in [chain, "ethereum"]:
         addrs = get_token_addresses(c, symbol, dynamic)
@@ -232,7 +232,7 @@ def resolve_token(chain: str, symbol: str, endpoint: str, dynamic: dict) -> Opti
 
 
 def query_pools(endpoint: str, token_a: str, token_b: str, max_results: int = 0) -> list[dict]:
-    """Найти пулы с обоими токенами (в любом порядке)."""
+    """Find pools containing both tokens (either order)."""
     from uniswap_client import graphql_query
 
     a, b = token_a.lower(), token_b.lower()
@@ -303,7 +303,7 @@ def query_pools_by_symbols(endpoint: str, symbol_a: str, symbol_b: str, max_resu
 
 
 def query_pool_day_data(endpoint: str, pool_id: str, start_ts: int, end_ts: int) -> list[dict]:
-    """PoolDayData за период."""
+    """PoolDayData for the selected period."""
     from uniswap_client import graphql_query
 
     q = """
@@ -332,7 +332,7 @@ def compute_fee_series(pool: dict, endpoint: str) -> dict:
     """Load day-level fees; TVL/income are rebuilt from external TVL later."""
     end = datetime.utcnow()
     start = end - timedelta(days=FEE_DAYS)
-    # v4 subgraph: пробуем Unix timestamps (как v3)
+    # v4 subgraph: use Unix timestamps (same as v3)
     start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
@@ -343,7 +343,7 @@ def compute_fee_series(pool: dict, endpoint: str) -> dict:
         fees = float(r.get("feesUSD") or 0)
         if fees <= 0:
             fees = 0.0
-        # date может быть Unix или day index — для оси времени нужен Unix
+        # date may be Unix or day index; chart axis needs Unix timestamp
         d = int(r["date"])
         ts = d if d > 1e9 else d * 86400
         fees_usd_series.append((ts, fees))
@@ -356,7 +356,7 @@ def compute_fee_series(pool: dict, endpoint: str) -> dict:
 
 
 def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
-    """Найти v4 пулы по всем сетям и парам."""
+    """Discover v4 pools across all chains and pairs."""
     chains = [c for c in V4_CHAINS if c in UNISWAP_V4_SUBGRAPHS]
     if "base" in chains and not _is_base_chain_enabled():
         chains = [c for c in chains if c != "base"]
@@ -496,7 +496,7 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
         print("  [base] v4 isolated pipeline: enabled")
         _scan_chain("base", base_override_ep)
 
-    # дедупликация по (chain, id)
+    # deduplicate by (chain, id)
     seen = set()
     unique = []
     for p in all_pools:
@@ -520,7 +520,7 @@ def main() -> None:
     if not os.environ.get("THE_GRAPH_API_KEY") and not any(
         k.startswith("V4_OVERRIDE_") for k in os.environ
     ):
-        print("Нужен THE_GRAPH_API_KEY или V4_OVERRIDE_* (Ormi)")
+        print("THE_GRAPH_API_KEY or V4_OVERRIDE_* (Ormi) is required")
         return
 
     pairs_str = os.environ.get("TOKEN_PAIRS", DEFAULT_TOKEN_PAIRS)
@@ -529,16 +529,16 @@ def main() -> None:
     os.makedirs("data", exist_ok=True)
 
     print("Uniswap v4 Agent")
-    print("Пары:", pairs_str, "| Min TVL: $%.0f" % min_tvl)
-    print("Поиск пулов...")
+    print("Pairs:", pairs_str, "| Min TVL: $%.0f" % min_tvl)
+    print("Discovering pools...")
 
     pools = discover_pools(pairs, min_tvl)
     max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 40))
     max_total = max(0, _env_int("MAX_POOLS_TOTAL", 300))
     pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)
-    print(f"Найдено {len(pools)} v4 пулов")
+    print(f"Found {len(pools)} v4 pools")
 
-    # PDF-список пулов (аналогично v3)
+    # Pool list PDF (same style as v3)
     if os.environ.get("DISABLE_PDF_OUTPUT", "").strip().lower() not in ("1", "true", "yes", "on"):
         save_pdf(pools, f"data/available_pairs_v4_{suffix}.pdf")
     else:
@@ -645,7 +645,7 @@ def main() -> None:
 
     out_path = f"data/pools_v4_{suffix}.json"
     save_chart_data_json(chart_data, out_path)
-    print("Готово:", out_path)
+    print("Done:", out_path)
 
 
 if __name__ == "__main__":

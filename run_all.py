@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Запуск всех агентов одной командой: v3 → v4 → merge.
+Run all agents with one command: v3 -> v4 -> merge.
 
-Режимы:
-  1) Пары: python run_all.py "paxg,usdt;paxg,usdc"
-  2) По токенам: python run_all.py --tokens "paxg,fluid,wbtc" — для каждого токена
-     запускается поиск по парам с usdt, usdc, eth (отдельный прогон и свои PDF/графики).
+Modes:
+  1) Pair mode: python run_all.py "paxg,usdt;paxg,usdc"
+  2) Token mode: python run_all.py --tokens "paxg,fluid,wbtc" -> for each token,
+     run pair scans against usdt, usdc, eth (separate run and output files).
 """
 
 import argparse
@@ -13,12 +13,12 @@ import os
 import subprocess
 import sys
 
-# Котировки для режима --tokens: с каждым токеном ищем пары token+quote
+# Quote tokens for --tokens mode: scan token+quote pairs
 DEFAULT_QUOTE_TOKENS = ["usdt", "usdc", "eth"]
 
 
 def run_pipeline(env: dict, args, token_pairs: str) -> int:
-    """Запуск v3 → v4 → merge с заданным TOKEN_PAIRS. Возвращает exit code."""
+    """Run v3 -> v4 -> merge for given TOKEN_PAIRS. Returns exit code."""
     env = env.copy()
     env["TOKEN_PAIRS"] = token_pairs
     print("TOKEN_PAIRS:", token_pairs)
@@ -58,7 +58,7 @@ if __name__ == "__main__":
             "Examples:\n"
             "  python run_all.py uni,eth --min-tvl 500\n"
             "  python run_all.py \"wbtc,usdt;wbtc,usdc\" --min-tvl 500000\n"
-            "  python run_all.py --tokens \"paxg,fluid,wbtc\"   # поиск по каждому токену (пары с usdt, usdc, eth)"
+            "  python run_all.py --tokens \"paxg,fluid,wbtc\"   # per-token scan (pairs with usdt, usdc, eth)"
         ),
     )
     parser.add_argument(
@@ -91,17 +91,17 @@ if __name__ == "__main__":
     env = os.environ.copy()
 
     if args.tokens.strip():
-        # Режим «по каждому токену»: для каждого токена — свой прогон
+        # Per-token mode: separate run for each token
         tokens = [t.strip().lower() for t in args.tokens.split(",") if t.strip()]
         if not tokens:
-            print("--tokens: список токенов пуст")
+            print("--tokens: token list is empty")
             sys.exit(1)
-        print("Режим по токенам. Токены:", tokens)
-        print("Котировки для пар:", DEFAULT_QUOTE_TOKENS)
+        print("Token mode. Tokens:", tokens)
+        print("Quote tokens:", DEFAULT_QUOTE_TOKENS)
         for i, base in enumerate(tokens):
             pairs_str = ";".join(f"{base},{q}" for q in DEFAULT_QUOTE_TOKENS)
             print("\n" + "#" * 60)
-            print(f"# Токен [{i+1}/{len(tokens)}]: {base}")
+            print(f"# Token [{i+1}/{len(tokens)}]: {base}")
             print("#" * 60)
             code = run_pipeline(env, args, pairs_str)
             if code != 0:
@@ -110,7 +110,7 @@ if __name__ == "__main__":
         print("Done. Check data/fee_chart_*.pdf for each token.")
         print("=" * 50)
     else:
-        # Обычный режим: один прогон по парам
+        # Standard mode: one run for provided pairs
         token_pairs = args.pairs or env.get("TOKEN_PAIRS", "fluid,eth;uni,eth")
         code = run_pipeline(env, args, token_pairs)
         if code != 0:

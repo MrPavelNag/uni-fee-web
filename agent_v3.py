@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Agent 1: Uniswap v3 (базовая версия).
+Agent 1: Uniswap v3 (base version).
 
-- Ищет v3 пулы по TOKEN_PAIRS
-- Фильтр по TVL
-- Сохраняет PDF со списком пулов
-- Сохраняет данные для графика в data/pools_v3_{suffix}.json
+- Discovers v3 pools by TOKEN_PAIRS
+- Applies TVL filter
+- Saves pool list PDF
+- Saves chart data to data/pools_v3_{suffix}.json
 """
 
 import argparse
@@ -587,7 +587,7 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
     """Load day-level fees; TVL/income are rebuilt from external TVL later."""
     end = datetime.utcnow()
     start = end - timedelta(days=FEE_DAYS)
-    # v3 subgraph ожидает Unix timestamps для date_gte/date_lte
+    # v3 subgraph expects Unix timestamps for date_gte/date_lte
     start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
@@ -599,7 +599,7 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
     raw_tvl_series = []
     for d in day_data:
         fees = float(d.get("feesUSD") or 0)
-        # feesUSD=0: не оцениваем из volume — subgraph иногда возвращает неверный volume
+        # feesUSD=0: do not estimate from volume; subgraph volume can be unreliable
         if fees <= 0:
             fees = 0.0
         ts = int(d["date"])
@@ -620,7 +620,7 @@ def save_pdf(pools: list[dict], path: str) -> None:
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     doc = SimpleDocTemplate(path, pagesize=landscape(A4), rightMargin=1.5 * cm, leftMargin=1.5 * cm)
-    story = [Paragraph("Uniswap v3 Pools (базовая версия, TVL &gt; $1000)", getSampleStyleSheet()["Title"]), Spacer(1, 0.5 * cm)]
+    story = [Paragraph("Uniswap v3 Pools (base version, TVL &gt; $1000)", getSampleStyleSheet()["Title"]), Spacer(1, 0.5 * cm)]
     if not pools:
         story.append(Paragraph("No pools found.", getSampleStyleSheet()["Normal"]))
     else:
@@ -635,7 +635,7 @@ def save_pdf(pools: list[dict], path: str) -> None:
             data.append([
                 p.get("chain", ""),
                 p.get("pair_label", f"{t0}/{t1}"),
-                pid,  # полный pool id
+                pid,  # full pool id
                 f"{fee_pct}%",
                 f"${tvl:,.0f}",
                 f"${vol:,.0f}",
@@ -656,7 +656,7 @@ def save_pdf(pools: list[dict], path: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Agent 1: Uniswap v3 (базовая версия)")
+    parser = argparse.ArgumentParser(description="Agent 1: Uniswap v3 (base version)")
     parser.add_argument("--min-tvl", type=float, default=None, help="Min TVL USD")
     args = parser.parse_args()
 
@@ -665,7 +665,7 @@ def main() -> None:
     suffix = pairs_to_filename_suffix(token_pairs)
     os.makedirs("data", exist_ok=True)
 
-    print("Agent 1: Uniswap v3 (базовая версия)")
+    print("Agent 1: Uniswap v3 (base version)")
     print("Token pairs:", token_pairs, "| Min TVL: $%s" % f"{min_tvl_val:,.0f}".replace(",", " "))
     print("Discovering v3 pools...")
     fresh = "TOKEN_PAIRS" in os.environ

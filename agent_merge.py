@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Agent 3: Объединение данных Агента 1 (v3) и Агента 2 (v4) на одном графике.
+Agent 3: Merge Agent 1 (v3) and Agent 2 (v4) data into one chart.
 
-- Читает data/pools_v3_{suffix}.json
-- Читает data/pools_v4_{suffix}.json
-- Объединяет и сохраняет график в data/fee_chart_{suffix}.pdf
+- Reads data/pools_v3_{suffix}.json
+- Reads data/pools_v4_{suffix}.json
+- Merges and saves chart to data/fee_chart_{suffix}.pdf
 """
 
 import argparse
@@ -22,18 +22,18 @@ from config import DEFAULT_TOKEN_PAIRS
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Agent 3: объединение v3 + v4 на одном графике")
+    parser = argparse.ArgumentParser(description="Agent 3: merge v3 + v4 on one chart")
     parser.add_argument(
         "--exclude-chains",
         type=str,
         default="",
-        help="Список чейнов через запятую, которые НЕ рисовать (пример: base,polygon)",
+        help="Comma-separated chains to exclude from chart (example: base,polygon)",
     )
     parser.add_argument(
         "--exclude-pools-suffix",
         type=str,
         default="",
-        help="Список суффиксов (последние 4 символа pool_id) через запятую, которые НЕ рисовать",
+        help="Comma-separated pool_id suffixes (last 4 chars) to exclude from chart",
     )
     args = parser.parse_args()
 
@@ -45,7 +45,7 @@ def main() -> None:
     chart_path = f"data/fee_chart_{suffix}.pdf"
     list_pdf_path = f"data/available_pairs_merged_{suffix}.pdf"
 
-    print("Agent 3: объединение v3 + v4")
+    print("Agent 3: merge v3 + v4")
     print("Token pairs:", token_pairs, "→ suffix:", suffix)
     if not os.path.isfile(v3_path):
         print("  Missing:", v3_path, "→ run: TOKEN_PAIRS=\"%s\" python agent_v3.py" % token_pairs)
@@ -65,7 +65,7 @@ def main() -> None:
     n_v4 = len(v4_data)
     print(f"Merged: {n_v3} v3 pools + {n_v4} v4 pools = {len(merged)} total")
 
-    # Фильтрация только на этапе построения графика (данные в JSON остаются полными)
+    # Filter only at chart render stage (JSON data remains complete)
     exclude = {c.strip().lower() for c in (args.exclude_chains or "").split(",") if c.strip()}
     if exclude:
         before = len(merged)
@@ -77,7 +77,7 @@ def main() -> None:
         removed = before - len(merged)
         print(f"Excluded chains in chart: {', '.join(sorted(exclude))} (removed {removed} pools)")
 
-    # Исключение пулов по последним 4 символам pool_id
+    # Exclude pools by last 4 chars of pool_id
     suffixes = {s.strip().lower() for s in (args.exclude_pools_suffix or "").split(",") if s.strip()}
     if suffixes:
         before = len(merged)
@@ -95,8 +95,8 @@ def main() -> None:
         print("No data to plot. Run agent_v3.py and/or agent_v4.py first.")
         return
 
-    # Исключаем из графика пулы с fee > 3% (ошибка данных subgraph),
-    # но оставляем их в PDF в конце списка с пометкой.
+    # Exclude pools with fee > 3% from chart (likely subgraph error),
+    # but keep them at the end of PDF with a warning marker.
     bad_fee = {k: v for k, v in merged.items() if _is_bad_fee_entry(v)}
     if bad_fee:
         print(f"Excluded {len(bad_fee)} pools with fee > 3% from chart (they are listed at the end of PDF).")
