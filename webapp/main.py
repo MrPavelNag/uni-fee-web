@@ -17143,6 +17143,9 @@ def _merge_for_web(
     include_chains: list[str],
     min_fee_pct: float,
     max_fee_pct: float,
+    min_apy_pct: float,
+    days: int,
+    lp_allocation_usd: float,
     exclude_suffixes: list[str],
     merged_override: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
@@ -17183,9 +17186,16 @@ def _merge_for_web(
     chart_series = []
     filtered_out = 0
     default_visible = 0
+    days_safe = max(1, int(days or 1))
+    alloc_safe = float(lp_allocation_usd or 0.0)
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
+        final_income = _final_income(v)
+        apy_pct = (final_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+        if float(apy_pct) < float(min_apy_pct or 0.0):
+            filtered_out += 1
+            continue
         if excluded_by_suffix(v, pool_id):
             status = "filtered_suffix"
         elif in_fee_range(v):
@@ -17204,7 +17214,8 @@ def _merge_for_web(
             "version": v.get("version", ""),
             "pair": v.get("pair", ""),
             "fee_pct": float(v.get("fee_pct") or 0),
-            "final_income": _final_income(v),
+            "final_income": final_income,
+            "apy_pct": float(apy_pct),
             "last_tvl": pool_tvl_now_usd,
             "status": status,
         }
@@ -17460,6 +17471,7 @@ def _push_run_history(
     speed_mode: str,
     min_fee_pct: float,
     max_fee_pct: float,
+    min_apy_pct: float,
     exclude_suffixes: list[str],
     logs: list[str],
     error: str | None = None,
@@ -17476,6 +17488,7 @@ def _push_run_history(
             "speed_mode": speed_mode,
             "min_fee_pct": min_fee_pct,
             "max_fee_pct": max_fee_pct,
+            "min_apy_pct": min_apy_pct,
             "exclude_suffixes": exclude_suffixes,
         },
         "error": error or "",
@@ -17507,6 +17520,7 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
         "speed_mode": str(req.speed_mode or "normal").strip().lower(),
         "min_fee_pct": float(req.min_fee_pct or 0.0),
         "max_fee_pct": float(req.max_fee_pct or 0.0),
+        "min_apy_pct": float(req.min_apy_pct or 0.0),
         "exclude_suffixes": suffixes,
     }
     try:
@@ -17808,6 +17822,9 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             include_chains=include_chains,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
+            min_apy_pct=req.min_apy_pct,
+            days=req.days,
+            lp_allocation_usd=float(env.get("LP_ALLOCATION_USD", "1000") or 1000.0),
             exclude_suffixes=req.exclude_suffixes,
             merged_override=merged_raw,
         )
@@ -17839,6 +17856,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 "speed_mode": speed_mode,
                 "min_fee_pct": req.min_fee_pct,
                 "max_fee_pct": req.max_fee_pct,
+                "min_apy_pct": req.min_apy_pct,
                 "exclude_suffixes": req.exclude_suffixes,
                 "lp_allocation_usd": float(env.get("LP_ALLOCATION_USD", "1000")),
                 "ignore_cache": bool(getattr(req, "ignore_cache", False)),
@@ -17866,6 +17884,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             speed_mode=speed_mode,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
+            min_apy_pct=req.min_apy_pct,
             exclude_suffixes=req.exclude_suffixes,
             logs=logs,
         )
@@ -17889,6 +17908,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             speed_mode=speed_mode,
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
+            min_apy_pct=req.min_apy_pct,
             exclude_suffixes=req.exclude_suffixes,
             logs=logs,
             error=str(e),
@@ -17907,6 +17927,7 @@ class PoolsRunRequest(BaseModel):
     days: int = 30
     min_fee_pct: float = 0.0
     max_fee_pct: float = 2.0
+    min_apy_pct: float = 0.0
     exclude_suffixes: list[str] = Field(default_factory=list, description="Exclude pool ids by last 4 chars")
     ignore_cache: bool = False
 
@@ -28549,6 +28570,8 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         raise HTTPException(status_code=400, detail="max_fee_pct must be in range 1..3")
     if req.min_fee_pct >= req.max_fee_pct:
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
+    if req.min_apy_pct < 0 or req.min_apy_pct > 100000:
+        raise HTTPException(status_code=400, detail="min_apy_pct must be in range 0..100000")
     req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
     req.include_versions = list(dict.fromkeys(req.include_versions))
     if not req.include_versions:
@@ -29081,7 +29104,7 @@ HTML_PAGE = """
     }
     .plot {
       width: 100%;
-      min-height: 330px;
+      min-height: 495px;
       border: 1px solid #dbe3ef;
       border-radius: 10px;
       background: #f8fbff;
@@ -29171,10 +29194,10 @@ HTML_PAGE = """
       margin-bottom: 8px;
     }
     .pair-bucket {
-      border: 1px solid #dbe3ef;
-      border-radius: 8px;
-      padding: 8px;
-      background: #ffffff;
+      border: 0;
+      border-radius: 0;
+      padding: 0;
+      background: transparent;
     }
     .pair-bucket .hint { margin-bottom: 6px; }
     .pair-bucket select { margin-bottom: 6px; }
@@ -29333,8 +29356,6 @@ HTML_PAGE = """
                 <span class="meta-badge" id="pairListsMeta">pair lists: -</span>
               </div>
               <div class="top-line">
-                <span class="meta-badge" id="tokensMeta">Top 500 tokens · …</span>
-                <span class="info-chip">Top-500 by token TVL (same as pool lookup) — manual symbols still work</span>
               </div>
               <div class="pair-builder-row" id="pairBuilderRow" style="display:none">
                 <div class="pair-bucket">
@@ -29351,7 +29372,7 @@ HTML_PAGE = """
                     <option value="token_top15">top 15 tokens</option>
                     <option value="token_top20">top 20 tokens</option>
                   </select>
-                  <input id="stableBucketManual" list="tokenHints" placeholder="e.g. usdt,usdc,dai"/>
+                  <input id="stableBucketManual" placeholder="e.g. usdt,usdc,dai"/>
                 </div>
                 <div class="pair-bucket">
                   <select id="tokenBucketMode" onchange="updatePairBuilderUi()">
@@ -29367,10 +29388,9 @@ HTML_PAGE = """
                     <option value="stable_commodity">commodity stables (gold/silver)</option>
                     <option value="stable_fiat_nonusd">fiat stables (non-USD)</option>
                   </select>
-                  <input id="tokenBucketManual" list="tokenHints" placeholder="e.g. eth,wbtc,sol"/>
+                  <input id="tokenBucketManual" placeholder="e.g. eth,wbtc,sol"/>
                 </div>
               </div>
-              <datalist id="tokenHints"></datalist>
               <div class="hint" style="margin-top:6px">Note: scanning one pair across all chains typically takes about 20-30 seconds.</div>
             </div>
           </div>
@@ -29409,6 +29429,10 @@ HTML_PAGE = """
                 <div class="filter-item">
                   <div class="hint">Exclude above<br/>X% fee</div>
                   <input id="maxFeePct" value="2" type="number" step="0.1" min="1" max="3"/>
+                </div>
+                <div class="filter-item">
+                  <div class="hint">Min APY<br/>%</div>
+                  <input id="minApyPct" value="0" type="number" step="0.1" min="0" max="100000"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">Protocol<br/>version</div>
@@ -29494,7 +29518,7 @@ HTML_PAGE = """
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
     const FIELD_IDS = [
       "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
-      "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "allChains", "runIgnoreCache"
+      "minTvl", "days", "maxFeePct", "minFeePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache"
     ];
     let availableChains = [];
     let colorMap = {};
@@ -30254,7 +30278,7 @@ HTML_PAGE = """
       return validateBucketPairs().pairs;
     }
 
-    function getChartScopeSuffix() {
+    function getChartPairsHintText() {
       let reqPairs = [];
       const rp = currentRequest?.pairs;
       if (Array.isArray(rp)) {
@@ -30270,19 +30294,33 @@ HTML_PAGE = """
           return `${a.toUpperCase()}/${b.toUpperCase()}`;
         })
         .filter(Boolean);
+      return pairLabels.length ? pairLabels.join("; ") : "";
+    }
+
+    function getChartScopeSuffix() {
+      const pairHint = getChartPairsHintText();
 
       let minTvl = Number(currentRequest?.min_tvl);
       if (!Number.isFinite(minTvl)) {
         minTvl = Number(document.getElementById("minTvl")?.value || 0);
       }
+      let minApy = Number(currentRequest?.min_apy_pct);
+      if (!Number.isFinite(minApy)) {
+        minApy = Number(document.getElementById("minApyPct")?.value || 0);
+      }
 
       const parts = [];
-      if (pairLabels.length) {
-        parts.push(pairLabels.length > 1 ? `pairs: ${pairLabels.join("; ")}` : `pair: ${pairLabels[0]}`);
-      }
       if (Number.isFinite(minTvl) && minTvl >= 0) {
         parts.push(`Min TVL: $${formatUsd(minTvl)}`);
       }
+      if (Number.isFinite(minApy) && minApy > 0) {
+        parts.push(`Min APY: ${Number(minApy).toFixed(1)}%`);
+      }
+      const feesEl = document.getElementById("feesChart");
+      const tvlEl = document.getElementById("tvlChart");
+      const hintText = pairHint ? `Pairs: ${pairHint}` : "Pairs: -";
+      if (feesEl) feesEl.title = hintText;
+      if (tvlEl) tvlEl.title = hintText;
       return parts.length ? ` | ${parts.join(" | ")}` : "";
     }
 
@@ -30505,17 +30543,16 @@ HTML_PAGE = """
       try {
         const r = await fetch("/api/meta");
         const meta = await r.json();
-        const tokenHints = document.getElementById("tokenHints");
-        tokenHints.innerHTML = (meta.tokens || []).map((t) => `<option value="${escAttr(t)}"></option>`).join("");
         const topN = Number(meta.token_catalog?.major_top_n || 0);
         const minTvl = Number(meta.token_catalog?.min_tvl_usd || 10000);
         const symCount = Number(meta.token_catalog?.count || 0);
-        if (topN > 0) {
-          document.getElementById("tokensMeta").textContent =
-            `Top ${topN} tokens · updated: ${meta.token_catalog?.updated_at || "-"}`;
-        } else {
-          document.getElementById("tokensMeta").textContent =
-            `Popular tokens (TVL>${formatUsdShort(minTvl)}): ${symCount}, updated: ${meta.token_catalog?.updated_at || "-"}`;
+        const tokensMetaEl = document.getElementById("tokensMeta");
+        if (tokensMetaEl) {
+          if (topN > 0) {
+            tokensMetaEl.textContent = `Top ${topN} tokens · updated: ${meta.token_catalog?.updated_at || "-"}`;
+          } else {
+            tokensMetaEl.textContent = `Popular tokens (TVL>${formatUsdShort(minTvl)}): ${symCount}, updated: ${meta.token_catalog?.updated_at || "-"}`;
+          }
         }
         pairPresetCatalog = {
           stablecoins: Array.isArray(meta?.pair_lists?.stablecoins_full) && meta.pair_lists.stablecoins_full.length
@@ -30611,7 +30648,8 @@ HTML_PAGE = """
         const daysRaw = String(document.getElementById("days").value ?? "").trim();
         const maxFeeRaw = String(document.getElementById("maxFeePct").value ?? "").trim();
         const minFeeRaw = String(document.getElementById("minFeePct").value ?? "").trim();
-        if (!minTvlRaw || !daysRaw || !minFeeRaw || !maxFeeRaw) {
+        const minApyRaw = String(document.getElementById("minApyPct").value ?? "").trim();
+        if (!minTvlRaw || !daysRaw || !minFeeRaw || !maxFeeRaw || !minApyRaw) {
           setStatus("Fill all filter fields before running analysis.", "fail");
           return;
         }
@@ -30623,6 +30661,7 @@ HTML_PAGE = """
           days: Number(daysRaw),
           max_fee_pct: Number(maxFeeRaw),
           min_fee_pct: Number(minFeeRaw),
+          min_apy_pct: Number(minApyRaw),
           ignore_cache: !!document.getElementById("runIgnoreCache")?.checked,
         };
         if (!payload.include_versions.length) {
@@ -30647,6 +30686,10 @@ HTML_PAGE = """
         }
         if (payload.min_fee_pct >= payload.max_fee_pct) {
           setStatus("Exclude below must be lower than Exclude above.", "fail");
+          return;
+        }
+        if (!Number.isFinite(payload.min_apy_pct) || payload.min_apy_pct < 0 || payload.min_apy_pct > 100000) {
+          setStatus("Min APY must be in range 0..100000.", "fail");
           return;
         }
         if (!pairCheck.valid) {
@@ -30787,7 +30830,10 @@ HTML_PAGE = """
       lastRows = (result.rows || []).map((r) => {
         const income = Number(r.final_income || 0);
         const alloc = Number(currentRequest?.lp_allocation_usd || 1000);
-        const apyPct = (alloc > 0 && daysForApy > 0) ? (income / alloc) * (365 / daysForApy) * 100 : 0;
+        const apyRaw = Number(r.apy_pct);
+        const apyPct = Number.isFinite(apyRaw)
+          ? apyRaw
+          : ((alloc > 0 && daysForApy > 0) ? (income / alloc) * (365 / daysForApy) * 100 : 0);
         return {...r, apy_pct: apyPct};
       });
       redrawCharts();
