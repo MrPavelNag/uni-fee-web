@@ -30274,7 +30274,7 @@ HTML_PAGE = """
     }
     .pair-lists-grid {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: 1fr;
       gap: 8px;
     }
     .pair-lists-section {
@@ -30288,31 +30288,41 @@ HTML_PAGE = """
       font-size: 12px;
       color: #0f172a;
     }
-    .pair-top-block { margin-top: 5px; }
+    .pair-top-block { margin-top: 4px; }
+    .pair-top-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
     .pair-top-title {
       font-size: 11px;
       color: #64748b;
-      margin-bottom: 3px;
+      margin: 0;
       font-weight: 700;
       letter-spacing: 0.01em;
+      flex: 0 0 auto;
+      min-width: 52px;
     }
     .token-chip-list {
       display: flex;
       flex-wrap: nowrap;
-      gap: 4px;
+      gap: 2px;
       overflow-x: auto;
       overflow-y: hidden;
       white-space: nowrap;
-      padding-bottom: 2px;
+      padding-bottom: 1px;
+      min-width: 0;
+      flex: 1 1 auto;
     }
     .token-chip {
       display: inline-flex;
       align-items: center;
-      gap: 4px;
-      border: 1px solid #dbe3ef;
-      border-radius: 999px;
-      padding: 2px 6px;
-      background: #f8fbff;
+      gap: 3px;
+      border: 0;
+      border-radius: 0;
+      padding: 1px 2px;
+      background: transparent;
       font-size: 11px;
       color: #334155;
       cursor: default;
@@ -31437,7 +31447,8 @@ HTML_PAGE = """
       const out = {};
       for (const line of (lines || [])) {
         const raw = String(line || "").trim();
-        const m = raw.match(/^([A-Z0-9._-]{2,20})\s*-\s*(.+)$/);
+        // Accept multiple separators to be resilient to old/new hint formats.
+        const m = raw.match(/^([A-Z0-9._-]{2,20})\s*(?:-|—|–|:)\s*(.+)$/i);
         if (!m) continue;
         const sym = String(m[1] || "").trim().toLowerCase();
         const hint = String(m[2] || "").trim();
@@ -31452,8 +31463,8 @@ HTML_PAGE = """
       const hint = String(pairListsHintBySymbol[s] || "");
       const icon = String(pairListsIconUrls[s] || "");
       const tt = hint ? ` title="${escAttr(hint)}"` : "";
-      const img = icon ? `<img src="${escAttr(icon)}" alt="" loading="lazy" onerror="this.style.display='none'"/>` : "";
-      return `<span class="token-chip"${tt}>${img}<span>${escAttr(s.toUpperCase())}</span></span>`;
+      const img = icon ? `<img src="${escAttr(icon)}" alt="" loading="lazy"${tt} onerror="this.style.display='none'"/>` : "";
+      return `<span class="token-chip"${tt}>${img}<span${tt}>${escAttr(s.toUpperCase())}</span></span>`;
     }
 
     function smartTopPlan(count) {
@@ -31501,7 +31512,7 @@ HTML_PAGE = """
       const body = groups.length
         ? groups.map((g) => {
             const chips = arr.slice(0, g.n).map((x) => tokenChipHtml(x)).join("");
-            return `<div class="pair-top-block"><div class="pair-top-title">${escAttr(g.label)}</div><div class="token-chip-list">${chips || `<span class="hint">No tokens</span>`}</div></div>`;
+            return `<div class="pair-top-block"><div class="pair-top-row"><div class="pair-top-title">${escAttr(g.label)}</div><div class="token-chip-list">${chips || `<span class="hint">No tokens</span>`}</div></div></div>`;
           }).join("")
         : `<span class="hint">No tokens</span>`;
       return `<section class="pair-lists-section"><h5>${escAttr(title)} (${arr.length})</h5>${body}</section>`;
