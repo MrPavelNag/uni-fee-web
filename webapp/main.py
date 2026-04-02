@@ -18717,11 +18717,14 @@ class AdminPairListsManualUpdate(BaseModel):
     selection_date: str = ""
     fiat_core: list[str] = Field(default_factory=list)
     fiat_rwa: list[str] = Field(default_factory=list)
-    algo_enabled: bool | None = None
-    algo_strict: bool | None = None
-    algo_selection_date: str = ""
-    algo_main: list[str] = Field(default_factory=list)
-    algo_niche: list[str] = Field(default_factory=list)
+    coins_enabled: bool | None = None
+    coins_strict: bool | None = None
+    coins_selection_date: str = ""
+    coins_top: list[str] = Field(default_factory=list)
+    memes_enabled: bool | None = None
+    memes_strict: bool | None = None
+    memes_selection_date: str = ""
+    memes_top: list[str] = Field(default_factory=list)
 
 
 class HelpTicketCreate(BaseModel):
@@ -24509,18 +24512,21 @@ def _render_admin_page() -> str:
       </section>
       <section class="card">
         <h3>Pair Lists Manual Override</h3>
-        <p class="hint">Manual fiat-backed stablecoin shortlist (core + RWA/yield). Saved in admin state and applied on next catalog refresh.</p>
+        <p class="hint">Manual pair-lists controls (fiat-backed stables, coins, memes). Saved in admin state and applied on next catalog refresh.</p>
         <div class="row"><label>Enabled</label><select id="manualFiatEnabled"><option value="true">yes</option><option value="false">no</option></select></div>
         <div class="row"><label>Strict mode</label><select id="manualFiatStrict"><option value="true">strict (only manual list)</option><option value="false">priority (manual first + tail)</option></select></div>
         <div class="row"><label>Selection date</label><input id="manualFiatDate" type="text" placeholder="YYYY-MM-DD"/></div>
         <div class="row"><label>Fiat core (CSV)</label><textarea id="manualFiatCore" placeholder="usdt,usdc,usd1,pyusd,fdusd,rlusd,usdg,tusd,gusd,husd"></textarea></div>
         <div class="row"><label>Fiat RWA/yield (CSV)</label><textarea id="manualFiatRwa" placeholder="buidl,usyc,usdy,usdtb,usd0,frxusd,mnee,cgusd"></textarea></div>
-        <div class="row"><label>Algo enabled</label><select id="manualAlgoEnabled"><option value="true">yes</option><option value="false">no</option></select></div>
-        <div class="row"><label>Algo strict mode</label><select id="manualAlgoStrict"><option value="true">strict (only manual list)</option><option value="false">priority (manual first + tail)</option></select></div>
-        <div class="row"><label>Algo selection date</label><input id="manualAlgoDate" type="text" placeholder="YYYY-MM-DD"/></div>
-        <div class="row"><label>Algo Main Tier (CSV)</label><textarea id="manualAlgoMain" placeholder="usds,usde,dai,gho,crvusd,frax,frxusd,mim,dola"></textarea></div>
-        <div class="row"><label>Algo Niche Tier (CSV)</label><textarea id="manualAlgoNiche" placeholder="usdd,usdf,usx,rwausdi,usda,reusd,satusd,bold,lisusd,usdai"></textarea></div>
-        <button class="btn" onclick="saveManualFiatOverride()">Save manual stable overrides</button>
+        <div class="row"><label>Coins enabled</label><select id="manualCoinsEnabled"><option value="true">yes</option><option value="false">no</option></select></div>
+        <div class="row"><label>Coins strict mode</label><select id="manualCoinsStrict"><option value="true">strict (only manual list)</option><option value="false">priority (manual first + tail)</option></select></div>
+        <div class="row"><label>Coins selection date</label><input id="manualCoinsDate" type="text" placeholder="YYYY-MM-DD"/></div>
+        <div class="row"><label>Coins Top (CSV)</label><textarea id="manualCoinsTop" placeholder="eth,wbtc,steth,wsteth,weeth,bnb,link,uni,aave,arb,op,avax,xrp,ada,bch,xlm,hype,leo,okb,wbt"></textarea></div>
+        <div class="row"><label>Memes enabled</label><select id="manualMemesEnabled"><option value="true">yes</option><option value="false">no</option></select></div>
+        <div class="row"><label>Memes strict mode</label><select id="manualMemesStrict"><option value="true">strict (only manual list)</option><option value="false">priority (manual first + tail)</option></select></div>
+        <div class="row"><label>Memes selection date</label><input id="manualMemesDate" type="text" placeholder="YYYY-MM-DD"/></div>
+        <div class="row"><label>Memes Top (CSV)</label><textarea id="manualMemesTop" placeholder="doge,shib,pepe,floki,brett,mog,trump,pump,spx,turbo,toshi"></textarea></div>
+        <button class="btn" onclick="saveManualFiatOverride()">Save manual pair-lists overrides</button>
       </section>
     </div>
     <div class="grid" id="tabStats" style="display:none">
@@ -25086,37 +25092,47 @@ def _render_admin_page() -> str:
     }}
     function renderManualFiatSettings(cfg) {{
       const fiat = cfg && cfg.fiat_stable ? cfg.fiat_stable : {{}};
-      const algo = cfg && cfg.algo_stable ? cfg.algo_stable : {{}};
+      const coins = cfg && cfg.coins ? cfg.coins : {{}};
+      const memes = cfg && cfg.memes ? cfg.memes : {{}};
       const core = Array.isArray(fiat.core) ? fiat.core : [];
       const rwa = Array.isArray(fiat.rwa) ? fiat.rwa : [];
-      const algoMain = Array.isArray(algo.main) ? algo.main : [];
-      const algoNiche = Array.isArray(algo.niche) ? algo.niche : [];
+      const coinsTop = Array.isArray(coins.top) ? coins.top : [];
+      const memesTop = Array.isArray(memes.top) ? memes.top : [];
       const enabled = !!fiat.enabled;
       const strict = (fiat.strict === undefined) ? true : !!fiat.strict;
       const selDate = String(fiat.selection_date || "").trim();
-      const algoEnabled = !!algo.enabled;
-      const algoStrict = (algo.strict === undefined) ? true : !!algo.strict;
-      const algoDate = String(algo.selection_date || "").trim();
+      const coinsEnabled = !!coins.enabled;
+      const coinsStrict = (coins.strict === undefined) ? true : !!coins.strict;
+      const coinsDate = String(coins.selection_date || "").trim();
+      const memesEnabled = !!memes.enabled;
+      const memesStrict = (memes.strict === undefined) ? true : !!memes.strict;
+      const memesDate = String(memes.selection_date || "").trim();
       const elEnabled = document.getElementById("manualFiatEnabled");
       const elStrict = document.getElementById("manualFiatStrict");
       const elDate = document.getElementById("manualFiatDate");
       const elCore = document.getElementById("manualFiatCore");
       const elRwa = document.getElementById("manualFiatRwa");
-      const elAlgoEnabled = document.getElementById("manualAlgoEnabled");
-      const elAlgoStrict = document.getElementById("manualAlgoStrict");
-      const elAlgoDate = document.getElementById("manualAlgoDate");
-      const elAlgoMain = document.getElementById("manualAlgoMain");
-      const elAlgoNiche = document.getElementById("manualAlgoNiche");
+      const elCoinsEnabled = document.getElementById("manualCoinsEnabled");
+      const elCoinsStrict = document.getElementById("manualCoinsStrict");
+      const elCoinsDate = document.getElementById("manualCoinsDate");
+      const elCoinsTop = document.getElementById("manualCoinsTop");
+      const elMemesEnabled = document.getElementById("manualMemesEnabled");
+      const elMemesStrict = document.getElementById("manualMemesStrict");
+      const elMemesDate = document.getElementById("manualMemesDate");
+      const elMemesTop = document.getElementById("manualMemesTop");
       if (elEnabled) elEnabled.value = enabled ? "true" : "false";
       if (elStrict) elStrict.value = strict ? "true" : "false";
       if (elDate) elDate.value = selDate;
       if (elCore) elCore.value = core.join(",");
       if (elRwa) elRwa.value = rwa.join(",");
-      if (elAlgoEnabled) elAlgoEnabled.value = algoEnabled ? "true" : "false";
-      if (elAlgoStrict) elAlgoStrict.value = algoStrict ? "true" : "false";
-      if (elAlgoDate) elAlgoDate.value = algoDate;
-      if (elAlgoMain) elAlgoMain.value = algoMain.join(",");
-      if (elAlgoNiche) elAlgoNiche.value = algoNiche.join(",");
+      if (elCoinsEnabled) elCoinsEnabled.value = coinsEnabled ? "true" : "false";
+      if (elCoinsStrict) elCoinsStrict.value = coinsStrict ? "true" : "false";
+      if (elCoinsDate) elCoinsDate.value = coinsDate;
+      if (elCoinsTop) elCoinsTop.value = coinsTop.join(",");
+      if (elMemesEnabled) elMemesEnabled.value = memesEnabled ? "true" : "false";
+      if (elMemesStrict) elMemesStrict.value = memesStrict ? "true" : "false";
+      if (elMemesDate) elMemesDate.value = memesDate;
+      if (elMemesTop) elMemesTop.value = memesTop.join(",");
     }}
     function csvToSymbols(raw) {{
       return String(raw || "")
@@ -25131,16 +25147,19 @@ def _render_admin_page() -> str:
         const selection_date = String(document.getElementById("manualFiatDate")?.value || "").trim();
         const fiat_core = csvToSymbols(document.getElementById("manualFiatCore")?.value || "");
         const fiat_rwa = csvToSymbols(document.getElementById("manualFiatRwa")?.value || "");
-        const algo_enabled = String(document.getElementById("manualAlgoEnabled")?.value || "true") === "true";
-        const algo_strict = String(document.getElementById("manualAlgoStrict")?.value || "true") === "true";
-        const algo_selection_date = String(document.getElementById("manualAlgoDate")?.value || "").trim();
-        const algo_main = csvToSymbols(document.getElementById("manualAlgoMain")?.value || "");
-        const algo_niche = csvToSymbols(document.getElementById("manualAlgoNiche")?.value || "");
-        const data = await postJson("/api/admin/pair-lists-manual", {{enabled, strict, selection_date, fiat_core, fiat_rwa, algo_enabled, algo_strict, algo_selection_date, algo_main, algo_niche}});
-        setAdminStatus(data.info || "Manual override saved", false);
+        const coins_enabled = String(document.getElementById("manualCoinsEnabled")?.value || "true") === "true";
+        const coins_strict = String(document.getElementById("manualCoinsStrict")?.value || "true") === "true";
+        const coins_selection_date = String(document.getElementById("manualCoinsDate")?.value || "").trim();
+        const coins_top = csvToSymbols(document.getElementById("manualCoinsTop")?.value || "");
+        const memes_enabled = String(document.getElementById("manualMemesEnabled")?.value || "true") === "true";
+        const memes_strict = String(document.getElementById("manualMemesStrict")?.value || "true") === "true";
+        const memes_selection_date = String(document.getElementById("manualMemesDate")?.value || "").trim();
+        const memes_top = csvToSymbols(document.getElementById("manualMemesTop")?.value || "");
+        const data = await postJson("/api/admin/pair-lists-manual", {{enabled, strict, selection_date, fiat_core, fiat_rwa, coins_enabled, coins_strict, coins_selection_date, coins_top, memes_enabled, memes_strict, memes_selection_date, memes_top}});
+        setAdminStatus(data.info || "Manual pair-lists override saved", false);
         await loadAdmin();
       }} catch (e) {{
-        setAdminStatus("Save manual stable override failed: " + (e?.message || "unknown"), true);
+        setAdminStatus("Save manual pair-lists override failed: " + (e?.message || "unknown"), true);
       }}
     }}
     function renderAdminWallets(items) {{
@@ -29758,6 +29777,9 @@ HTML_PAGE = """
     .control-card {
       background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%);
       border-color: #cfdcec;
+      width: 70%;
+      max-width: 70%;
+      justify-self: start;
     }
     .card h3 {
       margin: 0 0 10px;
@@ -30090,8 +30112,14 @@ HTML_PAGE = """
       font-size: 12px;
     }
     .invalid-input {
-      border: 1px solid #ef4444 !important;
-      box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18);
+      border: 1px solid #1e3a8a !important;
+      box-shadow: 0 0 0 2px rgba(30, 58, 138, 0.18);
+      background: #f5f8ff !important;
+    }
+    .pair-active-right {
+      border: 1px solid #1e3a8a !important;
+      box-shadow: none !important;
+      background: inherit !important;
     }
     .top-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
     .pair-mode-line { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
@@ -30239,6 +30267,10 @@ HTML_PAGE = """
       transform: translateY(-1px);
     }
     @media (max-width: 980px) {
+      .control-card {
+        width: 100%;
+        max-width: 100%;
+      }
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
       .inline-grid { grid-template-columns: 1fr 1fr; }
@@ -31229,6 +31261,7 @@ HTML_PAGE = """
       if (rowBuilder) rowBuilder.style.display = "grid";
       const stableMode = String(document.getElementById("stableBucketMode")?.value || "manual");
       const tokenMode = String(document.getElementById("tokenBucketMode")?.value || "manual");
+      const tokenModeEl = document.getElementById("tokenBucketMode");
       const stableInput = document.getElementById("stableBucketManual");
       const tokenInput = document.getElementById("tokenBucketManual");
       if (stableInput) {
@@ -31238,6 +31271,14 @@ HTML_PAGE = """
       if (tokenInput) {
         tokenInput.style.display = isManualMode(tokenMode) ? "" : "none";
         tokenInput.placeholder = "e.g. usdt,eth,wbtc";
+      }
+      // Highlight active selection on the right side (requested UX).
+      if (tokenModeEl) tokenModeEl.classList.remove("pair-active-right");
+      if (tokenInput) tokenInput.classList.remove("pair-active-right");
+      if (isManualMode(tokenMode)) {
+        if (tokenInput) tokenInput.classList.add("pair-active-right");
+      } else {
+        if (tokenModeEl) tokenModeEl.classList.add("pair-active-right");
       }
     }
 
@@ -31365,9 +31406,56 @@ HTML_PAGE = """
       return pairLabels.length ? pairLabels.join("; ") : "";
     }
 
-    function getChartScopeSuffix() {
-      const pairHint = getChartPairsHintText();
+    function bucketModeSearchLabel(mode, side) {
+      const m = String(mode || "");
+      const isLeft = side === "left";
+      const manualInput = document.getElementById(isLeft ? "stableBucketManual" : "tokenBucketManual");
+      if (isManualMode(m)) {
+        const syms = parseManualSymbols(manualInput?.value || "");
+        if (syms.length === 1) return String(syms[0] || "").toLowerCase();
+        if (syms.length > 1) return `manual(${syms.length})`;
+        return "manual";
+      }
+      const nByMode = {
+        "stable_top5": effectiveTopCount(m, (pairPresetCatalog.stablecoins || []).length),
+        "stable_top10": effectiveTopCount(m, (pairPresetCatalog.stablecoins || []).length),
+        "stable_top20": effectiveTopCount(m, (pairPresetCatalog.stablecoins || []).length),
+        "stable_algo_top5": effectiveTopCount(m, (pairPresetCatalog.stableAlgoCrypto || []).length),
+        "stable_algo_top10": effectiveTopCount(m, (pairPresetCatalog.stableAlgoCrypto || []).length),
+        "stable_algo_top20": effectiveTopCount(m, (pairPresetCatalog.stableAlgoCrypto || []).length),
+        "token_top5": effectiveTopCount(m, (pairPresetCatalog.coins || []).length),
+        "token_top10": effectiveTopCount(m, (pairPresetCatalog.coins || []).length),
+        "token_top20": effectiveTopCount(m, (pairPresetCatalog.coins || []).length),
+        "commodity_top5": effectiveTopCount(m, (pairPresetCatalog.commodityStablecoins || []).length),
+        "commodity_top10": effectiveTopCount(m, (pairPresetCatalog.commodityStablecoins || []).length),
+        "commodity_top20": effectiveTopCount(m, (pairPresetCatalog.commodityStablecoins || []).length),
+        "fiat_nonusd_top5": effectiveTopCount(m, (pairPresetCatalog.fiatNonUsdStablecoins || []).length),
+        "fiat_nonusd_top10": effectiveTopCount(m, (pairPresetCatalog.fiatNonUsdStablecoins || []).length),
+        "fiat_nonusd_top20": effectiveTopCount(m, (pairPresetCatalog.fiatNonUsdStablecoins || []).length),
+        "meme_top5": effectiveTopCount(m, (pairPresetCatalog.memes || []).length),
+        "meme_top10": effectiveTopCount(m, (pairPresetCatalog.memes || []).length),
+        "meme_top20": effectiveTopCount(m, (pairPresetCatalog.memes || []).length),
+      };
+      const n = Math.max(0, Number(nByMode[m] || topCountFromMode(m) || 0));
+      if (m.startsWith("token_top")) return n > 0 ? `top-${n} coins` : "coins";
+      if (m.startsWith("stable_algo_top")) return n > 0 ? `top-${n} algo stables` : "algo stables";
+      if (m.startsWith("stable_top")) return n > 0 ? `top-${n} fiat stables` : "fiat stables";
+      if (m.startsWith("commodity_top")) return n > 0 ? `top-${n} commodity` : "commodity";
+      if (m.startsWith("fiat_nonusd_top")) return n > 0 ? `top-${n} non-usd` : "non-usd";
+      if (m.startsWith("meme_top")) return n > 0 ? `top-${n} memes` : "memes";
+      return m || "manual";
+    }
 
+    function getSearchObjectText() {
+      const leftMode = String(document.getElementById("stableBucketMode")?.value || "manual");
+      const rightMode = String(document.getElementById("tokenBucketMode")?.value || "manual");
+      const left = bucketModeSearchLabel(leftMode, "left");
+      const right = bucketModeSearchLabel(rightMode, "right");
+      if (left && right) return `${left}/${right}`;
+      return left || right || "";
+    }
+
+    function getChartScopeSuffix() {
       let minTvl = Number(currentRequest?.min_tvl);
       if (!Number.isFinite(minTvl)) {
         minTvl = Number(document.getElementById("minTvl")?.value || 0);
@@ -31378,6 +31466,10 @@ HTML_PAGE = """
       }
 
       const parts = [];
+      const searchObject = getSearchObjectText();
+      if (searchObject) {
+        parts.push(`Search: ${searchObject}`);
+      }
       if (Number.isFinite(minTvl) && minTvl >= 0) {
         parts.push(`Min TVL: $${formatUsd(minTvl)}`);
       }
