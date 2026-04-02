@@ -16428,7 +16428,7 @@ def _is_clean_symbol(symbol: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9]{2,20}", symbol))
 
 
-def _fetch_uniswap_verified_tokens() -> tuple[set[str], dict[str, list[str]]]:
+def _fetch_uniswap_verified_token_profiles() -> tuple[set[str], dict[str, list[str]], dict[str, set[str]]]:
     import json
 
     with urlopen(UNISWAP_TOKEN_LIST_URL, timeout=20) as resp:
@@ -16437,6 +16437,7 @@ def _fetch_uniswap_verified_tokens() -> tuple[set[str], dict[str, list[str]]]:
     supported = set(_supported_chains())
     by_chain_set: dict[str, set[str]] = {}
     all_tokens: set[str] = set()
+    profiles: dict[str, set[str]] = {}
     for item in payload.get("tokens", []):
         symbol = str(item.get("symbol") or "").strip()
         if not _is_clean_symbol(symbol):
@@ -16447,8 +16448,18 @@ def _fetch_uniswap_verified_tokens() -> tuple[set[str], dict[str, list[str]]]:
         sym = symbol.lower()
         by_chain_set.setdefault(chain_name, set()).add(sym)
         all_tokens.add(sym)
+        nm = str(item.get("name") or "").strip().lower()
+        if nm:
+            profiles.setdefault(sym, set()).add(nm)
+        # include symbol text itself for lightweight keyword matching
+        profiles.setdefault(sym, set()).add(sym)
 
     by_chain = {k: sorted(v) for k, v in by_chain_set.items()}
+    return all_tokens, by_chain, profiles
+
+
+def _fetch_uniswap_verified_tokens() -> tuple[set[str], dict[str, list[str]]]:
+    all_tokens, by_chain, _profiles = _fetch_uniswap_verified_token_profiles()
     return all_tokens, by_chain
 
 
@@ -16754,11 +16765,65 @@ def _curated_token_symbols() -> set[str]:
     }
 
 
+_COMMODITY_HINTS = {
+    "gold", "silver", "xau", "xag", "oil", "brent", "wti", "platinum", "palladium", "commodity",
+}
+_NON_USD_FIAT_HINTS = {
+    "eur", "euro", "sgd", "aud", "chf", "jpy", "yen", "gbp", "sterling", "cad", "brl", "try", "mxn", "zar",
+}
+_USD_STABLE_HINTS = {
+    "usd", "dollar", "stable", "tether", "usdc", "usdt", "dai", "frax", "pyusd", "usde",
+}
+
+
+def _text_has_any_hint(texts: set[str], hints: set[str]) -> bool:
+    for t in texts:
+        tl = str(t or "").strip().lower()
+        if not tl:
+            continue
+        for h in hints:
+            if h and h in tl:
+                return True
+    return False
+
+
+def _classify_ranked_symbols(
+    ranked_symbols: list[str],
+    *,
+    verified_profiles: dict[str, set[str]] | None = None,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    profiles = verified_profiles or {}
+    stable_ranked: list[str] = []
+    token_ranked: list[str] = []
+    commodity_ranked: list[str] = []
+    fiat_nonusd_ranked: list[str] = []
+    for sym in ranked_symbols:
+        s = str(sym or "").strip().lower()
+        if not _is_clean_symbol(s):
+            continue
+        texts = set(profiles.get(s) or set())
+        texts.add(s)
+        is_commodity = s in _COMMODITY_STABLE_SYMBOLS or _text_has_any_hint(texts, _COMMODITY_HINTS)
+        is_nonusd = s in _NON_USD_FIAT_STABLE_SYMBOLS or _text_has_any_hint(texts, _NON_USD_FIAT_HINTS)
+        is_usd_stable = _is_stablecoin_symbol(s) or _text_has_any_hint(texts, _USD_STABLE_HINTS)
+        is_stable = bool(is_usd_stable or is_commodity or is_nonusd)
+        if is_stable:
+            stable_ranked.append(s)
+        else:
+            token_ranked.append(s)
+        if is_commodity:
+            commodity_ranked.append(s)
+        if is_nonusd:
+            fiat_nonusd_ranked.append(s)
+    return stable_ranked, token_ranked, commodity_ranked, fiat_nonusd_ranked
+
+
 def _build_pair_lists_catalog_from_major(
     raw_major: dict[str, Any],
     updated_at: str,
     *,
     allowed_symbols: set[str] | None = None,
+    verified_profiles: dict[str, set[str]] | None = None,
     source: str = "major_tokens_top_n_rank_proxy",
 ) -> dict[str, Any]:
     """
@@ -16786,9 +16851,11 @@ def _build_pair_lists_catalog_from_major(
                 weight = max(1, n - idx)
                 score[sym] = int(score.get(sym, 0)) + int(weight)
 
-    ranked = sorted(score.items(), key=lambda kv: (-int(kv[1] or 0), kv[0]))
-    stable_ranked = [sym for sym, _ in ranked if _is_stablecoin_symbol(sym)]
-    token_ranked = [sym for sym, _ in ranked if not _is_stablecoin_symbol(sym)]
+    ranked = [str(sym or "").strip().lower() for sym, _ in sorted(score.items(), key=lambda kv: (-int(kv[1] or 0), kv[0]))]
+    stable_ranked, token_ranked, commodity_ranked, fiat_nonusd_ranked = _classify_ranked_symbols(
+        ranked,
+        verified_profiles=verified_profiles,
+    )
     return {
         "updated_at": str(updated_at or _iso_now()),
         "source": str(source or "major_tokens_top_n_rank_proxy"),
@@ -16796,20 +16863,28 @@ def _build_pair_lists_catalog_from_major(
         "tokens": token_ranked[:20],
         "stablecoins_full": stable_ranked[:200],
         "tokens_full": token_ranked[:200],
+        "commodity_stables": commodity_ranked[:200],
+        "fiat_nonusd_stables": fiat_nonusd_ranked[:200],
     }
 
 
 def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
     cached = _read_json(PAIR_LISTS_CATALOG_PATH)
     if not refresh and isinstance(cached, dict):
-        if isinstance(cached.get("stablecoins"), list) and isinstance(cached.get("tokens"), list):
+        if (
+            isinstance(cached.get("stablecoins"), list)
+            and isinstance(cached.get("tokens"), list)
+            and isinstance(cached.get("commodity_stables"), list)
+            and isinstance(cached.get("fiat_nonusd_stables"), list)
+        ):
             return cached
     raw_major = _read_json(MAJOR_TOKENS_CACHE_PATH) or {}
     updated_at = str(raw_major.get("updated_at") or _iso_now())
     allowed = _curated_token_symbols()
+    verified_profiles: dict[str, set[str]] = {}
     source_parts = ["major_tokens_top_n_rank_proxy", "curated"]
     try:
-        verified_all, _ = _fetch_uniswap_verified_tokens()
+        verified_all, _, profiles = _fetch_uniswap_verified_token_profiles()
         verified_clean = {
             str(s).strip().lower()
             for s in (verified_all or set())
@@ -16818,6 +16893,7 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         if verified_clean:
             allowed.update(verified_clean)
             source_parts.append("verified")
+        verified_profiles = {str(k).strip().lower(): set(v or set()) for k, v in (profiles or {}).items()}
     except Exception:
         # Keep working with curated-only allowlist when verified list fetch fails.
         pass
@@ -16825,6 +16901,7 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         raw_major,
         updated_at,
         allowed_symbols=allowed,
+        verified_profiles=verified_profiles,
         source="+".join(source_parts),
     )
     try:
@@ -17182,6 +17259,11 @@ RUN_PAIRS_LIMIT = max(1, min(400, int(os.environ.get("RUN_PAIRS_LIMIT", "120")))
 _STABLECOIN_SYMBOLS = {
     "usdc", "usdt", "dai", "frax", "fdusd", "pyusd", "usde", "susde", "usdp", "tusd", "gusd",
     "lusd", "usdd", "usdbc", "usdt0", "rlusd", "eurc", "ageur", "usds", "usd0", "usdm",
+    "eura", "eurt", "eurs", "xsgd", "audd", "cchf", "cadc", "jpyc", "gbpt", "gbpc", "brz", "tryb",
+}
+_COMMODITY_STABLE_SYMBOLS = {"paxg", "xaut", "xagx", "kag", "xag", "dgx"}
+_NON_USD_FIAT_STABLE_SYMBOLS = {
+    "eurc", "eurt", "eura", "eurs", "xsgd", "audd", "cchf", "cadc", "jpyc", "gbpt", "gbpc", "brz", "tryb",
 }
 
 
@@ -28360,6 +28442,8 @@ def meta() -> dict[str, Any]:
             "tokens": pair_lists_catalog.get("tokens", []),
             "stablecoins_full": pair_lists_catalog.get("stablecoins_full", []),
             "tokens_full": pair_lists_catalog.get("tokens_full", []),
+            "commodity_stables": pair_lists_catalog.get("commodity_stables", []),
+            "fiat_nonusd_stables": pair_lists_catalog.get("fiat_nonusd_stables", []),
         },
         "token_catalog": {
             "count": token_catalog.get("count", 0),
@@ -29243,28 +29327,25 @@ HTML_PAGE = """
       <section class="card control-card">
         <div class="form-grid">
           <div class="row">
-            <label title="Manual: up to 4 pairs. Presets: each-to-each expansion">Pairs</label>
+            <label title="Build pair sets with each-to-each expansion">Pairs</label>
             <div>
               <div class="pair-mode-line">
-                <label class="check"><input id="useManualPairs" type="checkbox" checked onchange="setPairInputMode('manual')"/> use pairs</label>
-                <label class="check"><input id="usePresetPairs" type="checkbox" onchange="setPairInputMode('preset')"/> use dropdown sets</label>
                 <span class="meta-badge" id="pairListsMeta">pair lists: -</span>
               </div>
               <div class="top-line">
-                <button class="small-btn" id="addPairBtn" onclick="addPairRow()">+ pair</button>
-                <button class="small-btn" id="removePairBtn" onclick="removePairRow()">- pair</button>
                 <span class="meta-badge" id="tokensMeta">Top 500 tokens · …</span>
                 <span class="info-chip">Top-500 by token TVL (same as pool lookup) — manual symbols still work</span>
               </div>
               <div class="pair-builder-row" id="pairBuilderRow" style="display:none">
                 <div class="pair-bucket">
                   <select id="stableBucketMode" onchange="updatePairBuilderUi()">
-                    <option value="stable_manual">stablecoin (manual)</option>
+                    <option value="manual">manual</option>
                     <option value="stable_top5">top 5 stablecoins</option>
                     <option value="stable_top10">top 10 stablecoins</option>
                     <option value="stable_top15">top 15 stablecoins</option>
                     <option value="stable_top20">top 20 stablecoins</option>
-                    <option value="token_manual">token (manual)</option>
+                    <option value="stable_commodity">commodity stables (gold/silver)</option>
+                    <option value="stable_fiat_nonusd">fiat stables (non-USD)</option>
                     <option value="token_top5">top 5 tokens</option>
                     <option value="token_top10">top 10 tokens</option>
                     <option value="token_top15">top 15 tokens</option>
@@ -29274,39 +29355,23 @@ HTML_PAGE = """
                 </div>
                 <div class="pair-bucket">
                   <select id="tokenBucketMode" onchange="updatePairBuilderUi()">
-                    <option value="token_manual">token (manual)</option>
+                    <option value="manual">manual</option>
                     <option value="token_top5">top 5 tokens</option>
                     <option value="token_top10">top 10 tokens</option>
                     <option value="token_top15">top 15 tokens</option>
                     <option value="token_top20">top 20 tokens</option>
-                    <option value="stable_manual">stablecoin (manual)</option>
                     <option value="stable_top5">top 5 stablecoins</option>
                     <option value="stable_top10">top 10 stablecoins</option>
                     <option value="stable_top15">top 15 stablecoins</option>
                     <option value="stable_top20">top 20 stablecoins</option>
+                    <option value="stable_commodity">commodity stables (gold/silver)</option>
+                    <option value="stable_fiat_nonusd">fiat stables (non-USD)</option>
                   </select>
                   <input id="tokenBucketManual" list="tokenHints" placeholder="e.g. eth,wbtc,sol"/>
                 </div>
               </div>
-              <div class="pair-row" id="pairRows">
-                <div class="pair-item" id="pairRow1">
-                  <div class="token-input-wrap"><input id="pair1a" list="tokenHints" placeholder="base token" value="usdt"/><button class="dd-btn" onclick="openTokenList('pair1a')">▼</button></div>
-                  <div class="token-input-wrap"><input id="pair1b" list="tokenHints" placeholder="quote token" value="usdc"/><button class="dd-btn" onclick="openTokenList('pair1b')">▼</button></div>
-                </div>
-                <div class="pair-item" id="pairRow2" style="display:none">
-                  <div class="token-input-wrap"><input id="pair2a" list="tokenHints" placeholder="base token"/><button class="dd-btn" onclick="openTokenList('pair2a')">▼</button></div>
-                  <div class="token-input-wrap"><input id="pair2b" list="tokenHints" placeholder="quote token"/><button class="dd-btn" onclick="openTokenList('pair2b')">▼</button></div>
-                </div>
-                <div class="pair-item" id="pairRow3" style="display:none">
-                  <div class="token-input-wrap"><input id="pair3a" list="tokenHints" placeholder="base token"/><button class="dd-btn" onclick="openTokenList('pair3a')">▼</button></div>
-                  <div class="token-input-wrap"><input id="pair3b" list="tokenHints" placeholder="quote token"/><button class="dd-btn" onclick="openTokenList('pair3b')">▼</button></div>
-                </div>
-                <div class="pair-item" id="pairRow4" style="display:none">
-                  <div class="token-input-wrap"><input id="pair4a" list="tokenHints" placeholder="base token"/><button class="dd-btn" onclick="openTokenList('pair4a')">▼</button></div>
-                  <div class="token-input-wrap"><input id="pair4b" list="tokenHints" placeholder="quote token"/><button class="dd-btn" onclick="openTokenList('pair4b')">▼</button></div>
-                </div>
-              </div>
               <datalist id="tokenHints"></datalist>
+              <div class="hint" style="margin-top:6px">Note: scanning one pair across all chains typically takes about 20-30 seconds.</div>
             </div>
           </div>
 
@@ -29428,8 +29493,7 @@ HTML_PAGE = """
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
     const FIELD_IDS = [
-      "pair1a", "pair1b", "pair2a", "pair2b", "pair3a", "pair3b", "pair4a", "pair4b",
-      "useManualPairs", "usePresetPairs", "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
+      "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
       "minTvl", "days", "maxFeePct", "minFeePct", "protoV3", "protoV4", "allChains", "runIgnoreCache"
     ];
     let availableChains = [];
@@ -29438,8 +29502,7 @@ HTML_PAGE = """
     let visibilityMap = {};
     let seriesByPool = {};
     let currentRequest = {};
-    let pairRowsVisible = 1;
-    let pairPresetCatalog = {stablecoins: [], tokens: []};
+    let pairPresetCatalog = {stablecoins: [], tokens: [], commodityStablecoins: [], fiatNonUsdStablecoins: []};
     let authState = {authenticated: false};
     let hasScanRun = false;
     let scanTicker = null;
@@ -30012,7 +30075,6 @@ HTML_PAGE = """
         }
       }
       state.selectedChains = getSelectedChains();
-      state.pairRowsVisible = pairRowsVisible;
       localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(state));
     }
 
@@ -30071,24 +30133,6 @@ HTML_PAGE = """
             if (box) box.checked = true;
           }
         }
-        // Always start with one visible pair row.
-        pairRowsVisible = 1;
-        updatePairRows();
-        for (let i = 2; i <= 4; i++) {
-          for (const side of ["a", "b"]) {
-            const el = document.getElementById(`pair${i}${side}`);
-            if (el) el.value = "";
-          }
-        }
-        const useManual = !!document.getElementById("useManualPairs")?.checked;
-        const usePreset = !!document.getElementById("usePresetPairs")?.checked;
-        if (!useManual && !usePreset) {
-          const manualEl = document.getElementById("useManualPairs");
-          if (manualEl) manualEl.checked = true;
-        } else if (useManual && usePreset) {
-          const presetEl = document.getElementById("usePresetPairs");
-          if (presetEl) presetEl.checked = false;
-        }
         updatePairBuilderUi();
       } catch (e) {
         console.warn("load form state failed", e);
@@ -30105,97 +30149,20 @@ HTML_PAGE = """
       }
     }
 
-    function updatePairRows() {
-      const useManual = !!document.getElementById("useManualPairs")?.checked;
-      for (let i = 1; i <= 4; i++) {
-        const row = document.getElementById(`pairRow${i}`);
-        if (!row) continue;
-        row.style.display = i <= pairRowsVisible ? "grid" : "none";
-      }
-      const addBtn = document.getElementById("addPairBtn");
-      const removeBtn = document.getElementById("removePairBtn");
-      if (addBtn) addBtn.disabled = !useManual;
-      if (removeBtn) removeBtn.disabled = !useManual || pairRowsVisible <= 1;
-    }
-
-    function addPairRow() {
-      if (!document.getElementById("useManualPairs")?.checked) return;
-      if (pairRowsVisible < 4) {
-        pairRowsVisible += 1;
-        updatePairRows();
-        saveFormState();
-      }
-    }
-
-    function removePairRow() {
-      if (!document.getElementById("useManualPairs")?.checked) return;
-      if (pairRowsVisible <= 1) return;
-      for (const side of ["a", "b"]) {
-        const el = document.getElementById(`pair${pairRowsVisible}${side}`);
-        if (el) {
-          el.value = "";
-          el.classList.remove("invalid-input");
-        }
-      }
-      pairRowsVisible -= 1;
-      updatePairRows();
-      saveFormState();
-    }
-
-    function openTokenList(inputId) {
-      const el = document.getElementById(inputId);
-      if (!el) return;
-      el.value = "";
-      try {
-        if (typeof el.showPicker === "function") {
-          el.showPicker();
-          return;
-        }
-      } catch (_) {}
-      el.focus();
-      el.dispatchEvent(new KeyboardEvent("keydown", {key: "ArrowDown"}));
-      saveFormState();
-    }
-
-    function setPairInputMode(mode) {
-      const manualEl = document.getElementById("useManualPairs");
-      const presetEl = document.getElementById("usePresetPairs");
-      if (!manualEl || !presetEl) return;
-      if (mode === "preset") {
-        manualEl.checked = false;
-        presetEl.checked = true;
-      } else {
-        manualEl.checked = true;
-        presetEl.checked = false;
-      }
-      if (!manualEl.checked && !presetEl.checked) manualEl.checked = true;
-      updatePairBuilderUi();
-      saveFormState();
-    }
-
     function updatePairBuilderUi() {
-      const useManual = !!document.getElementById("useManualPairs")?.checked;
-      const rowManual = document.getElementById("pairRows");
       const rowBuilder = document.getElementById("pairBuilderRow");
-      if (rowManual) rowManual.style.display = useManual ? "grid" : "none";
-      if (rowBuilder) rowBuilder.style.display = useManual ? "none" : "grid";
-      const addBtn = document.getElementById("addPairBtn");
-      const remBtn = document.getElementById("removePairBtn");
-      if (addBtn) addBtn.disabled = !useManual;
-      if (remBtn) remBtn.disabled = !useManual || pairRowsVisible <= 1;
-      const stableMode = String(document.getElementById("stableBucketMode")?.value || "stable_manual");
-      const tokenMode = String(document.getElementById("tokenBucketMode")?.value || "token_manual");
+      if (rowBuilder) rowBuilder.style.display = "grid";
+      const stableMode = String(document.getElementById("stableBucketMode")?.value || "manual");
+      const tokenMode = String(document.getElementById("tokenBucketMode")?.value || "manual");
       const stableInput = document.getElementById("stableBucketManual");
       const tokenInput = document.getElementById("tokenBucketManual");
       if (stableInput) {
-        const isStableManual = String(stableMode).startsWith("stable_");
         stableInput.style.display = isManualMode(stableMode) ? "" : "none";
-        stableInput.placeholder = isStableManual ? "e.g. usdt,usdc,dai" : "e.g. eth,wbtc,sol";
+        stableInput.placeholder = "e.g. usdt,eth,wbtc";
       }
       if (tokenInput) {
-        const isStableManual = String(tokenMode).startsWith("stable_");
         tokenInput.style.display = isManualMode(tokenMode) ? "" : "none";
-        tokenInput.placeholder = isStableManual ? "e.g. usdt,usdc,dai" : "e.g. eth,wbtc,sol";
+        tokenInput.placeholder = "e.g. usdt,eth,wbtc";
       }
     }
 
@@ -30218,7 +30185,8 @@ HTML_PAGE = """
     }
 
     function isManualMode(mode) {
-      return String(mode || "").endsWith("_manual");
+      const m = String(mode || "");
+      return m === "manual" || m.endsWith("_manual");
     }
 
     function parseBucketSource(mode) {
@@ -30229,9 +30197,15 @@ HTML_PAGE = """
       const isLeft = side === "left";
       const modeEl = document.getElementById(isLeft ? "stableBucketMode" : "tokenBucketMode");
       const inputEl = document.getElementById(isLeft ? "stableBucketManual" : "tokenBucketManual");
-      const mode = String(modeEl?.value || "token_manual");
+      const mode = String(modeEl?.value || "manual");
       if (isManualMode(mode)) {
         return parseManualSymbols(inputEl?.value || "");
+      }
+      if (mode.endsWith("_commodity")) {
+        return (pairPresetCatalog.commodityStablecoins || []).map((x) => normalizePairToken(x)).filter(Boolean);
+      }
+      if (mode.endsWith("_fiat_nonusd")) {
+        return (pairPresetCatalog.fiatNonUsdStablecoins || []).map((x) => normalizePairToken(x)).filter(Boolean);
       }
       const sourceKind = parseBucketSource(mode);
       const source = sourceKind === "stable"
@@ -30246,8 +30220,8 @@ HTML_PAGE = """
       const tokenInput = document.getElementById("tokenBucketManual");
       if (stableInput) stableInput.classList.remove("invalid-input");
       if (tokenInput) tokenInput.classList.remove("invalid-input");
-      const leftMode = String(document.getElementById("stableBucketMode")?.value || "stable_manual");
-      const rightMode = String(document.getElementById("tokenBucketMode")?.value || "token_manual");
+      const leftMode = String(document.getElementById("stableBucketMode")?.value || "manual");
+      const rightMode = String(document.getElementById("tokenBucketMode")?.value || "manual");
       const left = resolvePairBucket("left");
       const right = resolvePairBucket("right");
       if (!left.length || !right.length) {
@@ -30270,44 +30244,14 @@ HTML_PAGE = """
     }
 
     function clearPairErrors() {
-      for (let i = 1; i <= 4; i++) {
-        for (const side of ["a", "b"]) {
-          const el = document.getElementById(`pair${i}${side}`);
-          if (el) el.classList.remove("invalid-input");
-        }
-      }
       const stableInput = document.getElementById("stableBucketManual");
       const tokenInput = document.getElementById("tokenBucketManual");
       if (stableInput) stableInput.classList.remove("invalid-input");
       if (tokenInput) tokenInput.classList.remove("invalid-input");
     }
 
-    function validatePairs() {
-      clearPairErrors();
-      const out = [];
-      let hasError = false;
-      for (let i = 1; i <= 4; i++) {
-        if (i > pairRowsVisible) continue;
-        const aEl = document.getElementById(`pair${i}a`);
-        const bEl = document.getElementById(`pair${i}b`);
-        const a = normalizePairToken(aEl?.value || "");
-        const b = normalizePairToken(bEl?.value || "");
-        if (!a && !b) continue;
-        if (!a || !b || a === b) {
-          if (aEl) aEl.classList.add("invalid-input");
-          if (bEl) bEl.classList.add("invalid-input");
-          hasError = true;
-          continue;
-        }
-        out.push(`${a},${b}`);
-      }
-      const unique = Array.from(new Set(out));
-      return {pairs: unique, valid: !hasError && unique.length > 0};
-    }
-
     function getSelectedPairs() {
-      const useManual = !!document.getElementById("useManualPairs")?.checked;
-      return useManual ? validatePairs().pairs : validateBucketPairs().pairs;
+      return validateBucketPairs().pairs;
     }
 
     function getChartScopeSuffix() {
@@ -30580,13 +30524,38 @@ HTML_PAGE = """
           tokens: Array.isArray(meta?.pair_lists?.tokens_full) && meta.pair_lists.tokens_full.length
             ? meta.pair_lists.tokens_full
             : (meta?.pair_lists?.tokens || []),
+          commodityStablecoins: Array.isArray(meta?.pair_lists?.commodity_stables)
+            ? meta.pair_lists.commodity_stables
+            : [],
+          fiatNonUsdStablecoins: Array.isArray(meta?.pair_lists?.fiat_nonusd_stables)
+            ? meta.pair_lists.fiat_nonusd_stables
+            : [],
         };
         const stCount = Number((meta?.pair_lists?.stablecoins_full || meta?.pair_lists?.stablecoins || []).length || 0);
         const tkCount = Number((meta?.pair_lists?.tokens_full || meta?.pair_lists?.tokens || []).length || 0);
+        const cmCount = Number((meta?.pair_lists?.commodity_stables || []).length || 0);
+        const fxCount = Number((meta?.pair_lists?.fiat_nonusd_stables || []).length || 0);
         const plUpdated = String(meta?.pair_lists?.updated_at || "-");
         const plBadge = document.getElementById("pairListsMeta");
         if (plBadge) {
-          plBadge.textContent = `pair lists: stable ${stCount}, tokens ${tkCount}, updated: ${plUpdated}`;
+          plBadge.textContent = `pair lists: stable ${stCount}, tokens ${tkCount}, commodity ${cmCount}, non-USD ${fxCount}, updated: ${plUpdated}`;
+          const show = (arr, n = 20) => {
+            const items = (arr || []).slice(0, n).join(", ");
+            return (arr || []).length > n ? `${items}, ...` : items;
+          };
+          const topN = (arr, n) => ((arr || []).slice(0, n).join(", ") || "-");
+          plBadge.title = [
+            `Stablecoins ranked count: ${stCount}`,
+            `  Top-5: ${topN(pairPresetCatalog.stablecoins, 5)}`,
+            `  Top-10: ${topN(pairPresetCatalog.stablecoins, 10)}`,
+            `  Top-20: ${topN(pairPresetCatalog.stablecoins, 20)}`,
+            `Tokens ranked count: ${tkCount}`,
+            `  Top-5: ${topN(pairPresetCatalog.tokens, 5)}`,
+            `  Top-10: ${topN(pairPresetCatalog.tokens, 10)}`,
+            `  Top-20: ${topN(pairPresetCatalog.tokens, 20)}`,
+            `Commodity stables (${cmCount}): ${show(pairPresetCatalog.commodityStablecoins) || "-"}`,
+            `Non-USD fiat stables (${fxCount}): ${show(pairPresetCatalog.fiatNonUsdStablecoins) || "-"}`,
+          ].join("\\n");
         }
 
         availableChains = meta.chains || [];
@@ -30637,13 +30606,7 @@ HTML_PAGE = """
       try {
         stopActivePoll();
         renderPoolRunDebug(null);
-        const useManual = !!document.getElementById("useManualPairs")?.checked;
-        const usePreset = !!document.getElementById("usePresetPairs")?.checked;
-        if ((useManual && usePreset) || (!useManual && !usePreset)) {
-          setStatus("Enable exactly one pair input mode.", "fail");
-          return;
-        }
-        const pairCheck = useManual ? validatePairs() : validateBucketPairs();
+        const pairCheck = validateBucketPairs();
         const minTvlRaw = String(document.getElementById("minTvl").value ?? "").trim();
         const daysRaw = String(document.getElementById("days").value ?? "").trim();
         const maxFeeRaw = String(document.getElementById("maxFeePct").value ?? "").trim();
@@ -30687,10 +30650,7 @@ HTML_PAGE = """
           return;
         }
         if (!pairCheck.valid) {
-          setStatus(useManual
-            ? "Invalid pairs: fill both tokens and avoid duplicates in a pair."
-            : "Invalid dropdown sets: choose non-empty stable/token sets.",
-          "fail");
+          setStatus("Invalid dropdown sets: choose non-empty sets.", "fail");
           return;
         }
 
@@ -30858,7 +30818,6 @@ HTML_PAGE = """
     }
 
     attachAutosave();
-    updatePairRows();
     setHomeSectionCollapsed("feeHistory", false);
     setHomeSectionCollapsed("poolsTable", false);
     renderEmptyCharts();
