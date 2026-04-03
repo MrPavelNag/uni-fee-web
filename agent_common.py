@@ -278,6 +278,10 @@ def save_chart_data_json(pool_chart_data: dict[str, dict], path: str) -> None:
             "version": v.get("version", "v3"),
             "data_quality": v.get("data_quality"),
             "data_quality_reason": v.get("data_quality_reason"),
+            "strict_compare_estimated_tvl": v.get("strict_compare_estimated_tvl") or [],
+            "strict_compare_estimated_fees": v.get("strict_compare_estimated_fees") or [],
+            "strict_compare_exact_tvl": v.get("strict_compare_exact_tvl") or [],
+            "strict_compare_exact_fees": v.get("strict_compare_exact_fees") or [],
         }
     os.makedirs("data", exist_ok=True)
     with open(path, "w") as f:
