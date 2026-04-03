@@ -17911,19 +17911,28 @@ def _merge_for_web(
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
+        has_strict_compare = bool(
+            (v.get("strict_compare_estimated_fees") or [])
+            or (v.get("strict_compare_estimated_tvl") or [])
+            or (v.get("strict_compare_exact_fees") or [])
+            or (v.get("strict_compare_exact_tvl") or [])
+        )
         final_income = _final_income(v)
         apy_pct = (final_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-        if float(apy_pct) < float(min_apy_pct or 0.0):
-            filtered_out += 1
-            continue
-        if excluded_by_suffix(v, pool_id):
-            status = "filtered_suffix"
-        elif in_fee_range(v):
+        if has_strict_compare:
             status = "ok"
         else:
-            status = "filtered_fee_range"
-        if status != "ok":
-            filtered_out += 1
+            if float(apy_pct) < float(min_apy_pct or 0.0):
+                filtered_out += 1
+                continue
+            if excluded_by_suffix(v, pool_id):
+                status = "filtered_suffix"
+            elif in_fee_range(v):
+                status = "ok"
+            else:
+                status = "filtered_fee_range"
+            if status != "ok":
+                filtered_out += 1
         try:
             pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
         except (TypeError, ValueError):
@@ -17940,36 +17949,80 @@ def _merge_for_web(
                 dq_reason = "v3_estimated_legacy_or_cache"
             else:
                 dq_reason = "not_reported"
-        row = {
-            "pool_id": v.get("pool_id", pool_id),
-            "chain": v.get("chain", ""),
-            "version": v.get("version", ""),
-            "pair": v.get("pair", ""),
-            "fee_pct": float(v.get("fee_pct") or 0),
-            "final_income": final_income,
-            "apy_pct": float(apy_pct),
-            "last_tvl": pool_tvl_now_usd,
-            "data_quality": dq,
-            "data_quality_reason": dq_reason,
-            "status": status,
-        }
-        rows.append(row)
-        has_strict_compare = bool(
-            (v.get("strict_compare_estimated_fees") or [])
-            or (v.get("strict_compare_estimated_tvl") or [])
-            or (v.get("strict_compare_exact_fees") or [])
-            or (v.get("strict_compare_exact_tvl") or [])
-        )
+        base_pool_id = v.get("pool_id", pool_id)
+        base_chain = v.get("chain", "")
+        base_version = v.get("version", "")
+        base_pair = v.get("pair", "")
+        base_fee_pct = float(v.get("fee_pct") or 0)
+        if has_strict_compare:
+            est_fees = v.get("strict_compare_estimated_fees") or []
+            est_tvl = v.get("strict_compare_estimated_tvl") or []
+            ex_fees = v.get("strict_compare_exact_fees") or []
+            ex_tvl = v.get("strict_compare_exact_tvl") or []
+
+            est_income = float(est_fees[-1][1]) if est_fees else 0.0
+            est_apy = (est_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+            est_last_tvl = float(est_tvl[-1][1]) if est_tvl else pool_tvl_now_usd
+            rows.append(
+                {
+                    "pool_id": base_pool_id,
+                    "chain": base_chain,
+                    "version": base_version,
+                    "pair": f"{base_pair} (estimated)",
+                    "fee_pct": base_fee_pct,
+                    "final_income": est_income,
+                    "apy_pct": float(est_apy),
+                    "last_tvl": est_last_tvl,
+                    "data_quality": "estimated",
+                    "data_quality_reason": "strict_compare:estimated",
+                    "status": status,
+                }
+            )
+
+            exact_income = float(ex_fees[-1][1]) if ex_fees else 0.0
+            exact_apy = (exact_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+            exact_last_tvl = float(ex_tvl[-1][1]) if ex_tvl else 0.0
+            exact_full = bool(ex_tvl) and all(float(p[1]) > 0.0 for p in ex_tvl)
+            rows.append(
+                {
+                    "pool_id": base_pool_id,
+                    "chain": base_chain,
+                    "version": base_version,
+                    "pair": f"{base_pair} (exact)",
+                    "fee_pct": base_fee_pct,
+                    "final_income": exact_income,
+                    "apy_pct": float(exact_apy),
+                    "last_tvl": exact_last_tvl,
+                    "data_quality": ("exact" if exact_full else "strict_unavailable"),
+                    "data_quality_reason": (dq_reason if dq_reason else "strict_compare:exact"),
+                    "status": status,
+                }
+            )
+        else:
+            row = {
+                "pool_id": base_pool_id,
+                "chain": base_chain,
+                "version": base_version,
+                "pair": base_pair,
+                "fee_pct": base_fee_pct,
+                "final_income": final_income,
+                "apy_pct": float(apy_pct),
+                "last_tvl": pool_tvl_now_usd,
+                "data_quality": dq,
+                "data_quality_reason": dq_reason,
+                "status": status,
+            }
+            rows.append(row)
         if fees or tvl or has_strict_compare:
             chart_series.append(
                 {
-                    "label": f"{row['chain']} {row['version']} {row['pair']} ...{row['pool_id'][-4:]}",
-                    "chain": row["chain"],
-                    "version": row["version"],
-                    "pair": row["pair"],
-                    "fee_pct": row["fee_pct"],
+                    "label": f"{base_chain} {base_version} {base_pair} ...{str(base_pool_id)[-4:]}",
+                    "chain": base_chain,
+                    "version": base_version,
+                    "pair": base_pair,
+                    "fee_pct": base_fee_pct,
                     "status": status,
-                    "pool_id": row["pool_id"],
+                    "pool_id": base_pool_id,
                     "fees": fees,
                     "tvl": tvl,
                     "strict_compare_estimated_fees": (v.get("strict_compare_estimated_fees") or []),
@@ -30425,8 +30478,8 @@ HTML_PAGE = """
     
     .inline-grid {
       display: grid;
-      grid-template-columns: repeat(7, minmax(0, 1fr)) minmax(220px, 1.8fr);
-      gap: 6px;
+      grid-template-columns: repeat(7, minmax(80px, 1fr)) minmax(170px, 1.6fr);
+      gap: 4px;
       align-items: end;
       justify-content: start;
     }
@@ -30435,15 +30488,18 @@ HTML_PAGE = """
       width: 100%;
       min-width: 0;
       max-width: none;
-      height: 38px;
+      height: 34px;
+      padding: 6px 7px;
+      font-size: 13px;
     }
     .filter-item .hint {
       margin-bottom: 3px !important;
-      min-height: 30px;
+      min-height: 24px;
       display: flex;
       align-items: flex-end;
       line-height: 1.15;
       white-space: normal;
+      font-size: 11px;
     }
     .filter-item.contract-item input {
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
@@ -30452,11 +30508,11 @@ HTML_PAGE = """
     }
     .proto-checks {
       display: flex;
-      gap: 8px;
+      gap: 6px;
       align-items: center;
       width: 100%;
-      height: 38px;
-      padding: 0 6px;
+      height: 34px;
+      padding: 0 4px;
       border: 1px solid #cbd5e1;
       border-radius: 8px;
       background: #f8fbff;
@@ -30467,7 +30523,7 @@ HTML_PAGE = """
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      font-size: 11px;
+      font-size: 10.5px;
       font-weight: 700;
       color: #334155;
       padding-top: 0;
@@ -30707,12 +30763,8 @@ HTML_PAGE = """
                   <input id="days" value="30" type="number" min="1" max="3650" step="1"/>
                 </div>
                 <div class="filter-item">
-                  <div class="hint">Exclude below<br/>X% fee</div>
-                  <input id="minFeePct" value="0" type="number" step="0.1" min="0" max="1"/>
-                </div>
-                <div class="filter-item">
-                  <div class="hint">Exclude above<br/>X% fee</div>
-                  <input id="maxFeePct" value="2" type="number" step="0.1" min="1" max="3"/>
+                  <div class="hint">Exclude fee range<br/>X% (min-max)</div>
+                  <input id="feeRangePct" value="0-2" type="text" placeholder="0-2 or 0/2"/>
                 </div>
                 <div class="filter-item">
                   <div class="hint">Min APY<br/>%</div>
@@ -30733,8 +30785,8 @@ HTML_PAGE = """
                   </div>
                 </div>
                 <div class="filter-item contract-item">
-                  <div class="hint">Contract<br/>address</div>
-                  <input id="targetPoolId" type="text" placeholder="0x... (optional)"/>
+                  <div class="hint">Contract address</div>
+                  <input id="targetPoolId" type="text" placeholder="0x1234...abcd (optional)" onfocus="expandTargetPoolInput()" onblur="shrinkTargetPoolInput()"/>
                 </div>
               </div>
             </div>
@@ -30814,7 +30866,7 @@ HTML_PAGE = """
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
     const FIELD_IDS = [
       "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
-      "minTvl", "days", "maxFeePct", "minFeePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache",
+      "minTvl", "days", "feeRangePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache",
       "modeFastLegacy", "modeStrictExact", "targetPoolId"
     ];
     let availableChains = [];
@@ -30837,6 +30889,7 @@ HTML_PAGE = """
     let pairListsHintBySymbol = {};
     let pairListsIconUrls = {};
     let pairListsExpanded = true;
+    let targetPoolFullValue = "";
     const homeSectionState = { feeHistory: false, poolsTable: false };
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
 
@@ -30893,6 +30946,73 @@ HTML_PAGE = """
         .replace(/"/g, "&quot;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
+    }
+
+    function normalizeTargetPoolAddress(v) {
+      return String(v || "").trim().toLowerCase();
+    }
+
+    function isHexPoolAddress(v) {
+      return /^0x[a-f0-9]{40}$/.test(String(v || ""));
+    }
+
+    function shortAddress4x4(v) {
+      const s = normalizeTargetPoolAddress(v);
+      if (!isHexPoolAddress(s)) return s;
+      return `${s.slice(0, 6)}...${s.slice(-4)}`;
+    }
+
+    function setTargetPoolAddress(raw) {
+      targetPoolFullValue = normalizeTargetPoolAddress(raw);
+      const el = document.getElementById("targetPoolId");
+      if (!el) return;
+      if (!targetPoolFullValue) {
+        el.value = "";
+        return;
+      }
+      el.value = shortAddress4x4(targetPoolFullValue);
+    }
+
+    function getTargetPoolAddressForSubmit() {
+      const el = document.getElementById("targetPoolId");
+      const current = normalizeTargetPoolAddress(el?.value || "");
+      if (isHexPoolAddress(current)) {
+        targetPoolFullValue = current;
+      }
+      return normalizeTargetPoolAddress(targetPoolFullValue);
+    }
+
+    function expandTargetPoolInput() {
+      const el = document.getElementById("targetPoolId");
+      if (!el) return;
+      const full = normalizeTargetPoolAddress(targetPoolFullValue);
+      if (full) {
+        el.value = full;
+        return;
+      }
+      const current = normalizeTargetPoolAddress(el.value || "");
+      if (isHexPoolAddress(current)) {
+        targetPoolFullValue = current;
+        el.value = current;
+      }
+    }
+
+    function shrinkTargetPoolInput() {
+      const el = document.getElementById("targetPoolId");
+      if (!el) return;
+      const typed = normalizeTargetPoolAddress(el.value || "");
+      if (!typed) {
+        targetPoolFullValue = "";
+        el.value = "";
+        saveFormState();
+        return;
+      }
+      if (isHexPoolAddress(typed)) {
+        targetPoolFullValue = typed;
+      }
+      const full = normalizeTargetPoolAddress(targetPoolFullValue);
+      el.value = full ? shortAddress4x4(full) : typed;
+      saveFormState();
     }
 
     function normalizePairToken(v) {
@@ -31432,6 +31552,8 @@ HTML_PAGE = """
         if (!el) continue;
         if (el.type === "checkbox") {
           state[id] = !!el.checked;
+        } else if (id === "targetPoolId") {
+          state[id] = getTargetPoolAddressForSubmit();
         } else {
           state[id] = el.value;
         }
@@ -31485,6 +31607,8 @@ HTML_PAGE = """
           if (!el || state[id] == null) continue;
           if (el.type === "checkbox") {
             el.checked = !!state[id];
+          } else if (id === "targetPoolId") {
+            setTargetPoolAddress(state[id]);
           } else if (typeof state[id] === "string") {
             el.value = state[id];
           }
@@ -32346,23 +32470,33 @@ HTML_PAGE = """
         const pairCheck = validateBucketPairs();
         const minTvlRaw = String(document.getElementById("minTvl").value ?? "").trim();
         const daysRaw = String(document.getElementById("days").value ?? "").trim();
-        const maxFeeRaw = String(document.getElementById("maxFeePct").value ?? "").trim();
-        const minFeeRaw = String(document.getElementById("minFeePct").value ?? "").trim();
+        const feeRangeRaw = String(document.getElementById("feeRangePct").value ?? "").trim();
         const minApyRaw = String(document.getElementById("minApyPct").value ?? "").trim();
-        const targetPoolRaw = String(document.getElementById("targetPoolId")?.value ?? "").trim().toLowerCase();
+        const targetPoolRaw = getTargetPoolAddressForSubmit();
         syncRunModes("");
-        if (!minTvlRaw || !daysRaw || !minFeeRaw || !maxFeeRaw || !minApyRaw) {
+        if (!minTvlRaw || !daysRaw || !feeRangeRaw || !minApyRaw) {
           setStatus("Fill all filter fields before running analysis.", "fail");
           return;
         }
+        const feeParts = feeRangeRaw
+          .replace(",", ".")
+          .split(/[-/]/)
+          .map((x) => x.trim())
+          .filter(Boolean);
+        if (feeParts.length !== 2) {
+          setStatus("Fee range format: min-max (for example 0-2 or 0/2).", "fail");
+          return;
+        }
+        const minFeeNum = Number(feeParts[0]);
+        const maxFeeNum = Number(feeParts[1]);
         const payload = {
           pairs: pairCheck.pairs,
           include_chains: getSelectedChains(),
           include_versions: getSelectedProtocols(),
           min_tvl: Number(minTvlRaw),
           days: Number(daysRaw),
-          max_fee_pct: Number(maxFeeRaw),
-          min_fee_pct: Number(minFeeRaw),
+          max_fee_pct: maxFeeNum,
+          min_fee_pct: minFeeNum,
           min_apy_pct: Number(minApyRaw),
           ignore_cache: !!document.getElementById("runIgnoreCache")?.checked,
           mode_fast_legacy: !!document.getElementById("modeFastLegacy")?.checked,
