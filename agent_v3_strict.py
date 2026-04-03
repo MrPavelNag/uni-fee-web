@@ -351,8 +351,8 @@ def _alchemy_fetch_transfer_deltas(
     if not url:
         raise RuntimeError("alchemy_not_configured_for_chain")
 
-    def _fetch_direction(direction: str) -> list[dict]:
-        out: list[dict] = []
+    by_block: dict[int, int] = {}
+    for direction, sign in (("from", -1), ("to", 1)):
         page_key = ""
         while True:
             if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
@@ -375,30 +375,27 @@ def _alchemy_fetch_transfer_deltas(
             body = {"jsonrpc": "2.0", "id": 1, "method": "alchemy_getAssetTransfers", "params": [params]}
             r = requests.post(url, json=body, timeout=(3.0, 12.0))
             r.raise_for_status()
-            data = r.json() if isinstance(r.json(), dict) else {}
+            payload = r.json()
+            data = payload if isinstance(payload, dict) else {}
             if data.get("error"):
                 raise RuntimeError(str(data.get("error")))
             res = data.get("result") or {}
             items = res.get("transfers") or []
             if isinstance(items, list):
-                out.extend([x for x in items if isinstance(x, dict)])
+                for tr in items:
+                    if not isinstance(tr, dict):
+                        continue
+                    bn = _safe_hex_to_int(tr.get("blockNum"))
+                    if bn <= 0:
+                        continue
+                    raw = ((tr.get("rawContract") or {}).get("value"))
+                    val = _safe_hex_to_int(raw)
+                    if val <= 0:
+                        continue
+                    by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
             page_key = str(res.get("pageKey") or "").strip()
             if not page_key:
                 break
-        return out
-
-    by_block: dict[int, int] = {}
-    for direction, sign in (("from", -1), ("to", 1)):
-        rows = _fetch_direction(direction)
-        for tr in rows:
-            bn = _safe_hex_to_int(tr.get("blockNum"))
-            if bn <= 0:
-                continue
-            raw = ((tr.get("rawContract") or {}).get("value"))
-            val = _safe_hex_to_int(raw)
-            if val <= 0:
-                continue
-            by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
     return by_block
 
 
