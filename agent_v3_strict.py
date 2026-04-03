@@ -542,8 +542,10 @@ def main() -> None:
             strict_exact_tvl = _append_now_tvl_anchor(strict_exact_tvl_base, float(pool_tvl_now_usd))
             strict_exact_fees = _append_now_fee_anchor(strict_exact_fees_base)
         else:
-            strict_exact_tvl = []
-            strict_exact_fees = []
+            # Even when strict reconstruction fails, today's exact TVL point is known
+            # from external reserves*prices and must not be displayed as zero.
+            strict_exact_tvl = _append_now_tvl_anchor([], float(pool_tvl_now_usd))
+            strict_exact_fees = _append_now_fee_anchor([])
 
     payload = {
         "fees": final_fees,
