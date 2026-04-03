@@ -47,6 +47,11 @@ from uniswap_client import get_graph_endpoint, graphql_query
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
+JOB_STATUS_DIR = DATA_DIR / "job_status"
+try:
+    JOB_STATUS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
 
 def _resolve_catalog_dir() -> Path:
@@ -18564,6 +18569,49 @@ def _run_result_cache_put(key: str, result: dict[str, Any]) -> None:
                     RUN_RESULT_CACHE.pop(k, None)
 
 
+def _job_snapshot_path(job_id: str) -> Path:
+    return JOB_STATUS_DIR / f"{str(job_id)}.json"
+
+
+def _job_snapshot_delete(job_id: str) -> None:
+    try:
+        _job_snapshot_path(str(job_id)).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _job_snapshot_save(job: dict[str, Any]) -> None:
+    if not isinstance(job, dict):
+        return
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        return
+    p = _job_snapshot_path(job_id)
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        payload = _json_safe(job)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True, indent=2)
+        os.replace(tmp, p)
+    except Exception:
+        with contextlib.suppress(Exception):
+            tmp.unlink(missing_ok=True)
+
+
+def _job_snapshot_load(job_id: str) -> dict[str, Any] | None:
+    p = _job_snapshot_path(str(job_id))
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict) and str(obj.get("id") or "") == str(job_id):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
 def _prune_run_jobs_locked(now: float | None = None) -> None:
     ts_now = float(now or time.time())
     stale_ids = [
@@ -18576,6 +18624,7 @@ def _prune_run_jobs_locked(now: float | None = None) -> None:
     ]
     for jid in stale_ids:
         JOBS.pop(str(jid), None)
+        _job_snapshot_delete(str(jid))
     if len(JOBS) > int(RUN_JOB_LIMIT):
         active_ids = {
             str(jid)
@@ -18593,6 +18642,7 @@ def _prune_run_jobs_locked(now: float | None = None) -> None:
         for k in list(JOBS.keys()):
             if str(k) not in keep:
                 JOBS.pop(k, None)
+                _job_snapshot_delete(str(k))
 
 
 def _compact_job_result_inplace(job: dict[str, Any]) -> None:
@@ -18895,6 +18945,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             j["stage"] = stage
             j["stage_label"] = label
             j["progress"] = max(0, min(100, progress))
+            _job_snapshot_save(j)
 
     timing_debug: dict[str, Any] = {
         "total_ms": 0,
@@ -18922,6 +18973,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         job["stage"] = "prepare"
         job["stage_label"] = f"Preparing parameters ({speed_mode}, {run_mode})"
         job["progress"] = 5
+        _job_snapshot_save(job)
 
     # Build selected token pairs (bounded by RUN_PAIRS_LIMIT).
     t_pairs_parse0 = time.perf_counter()
@@ -18936,6 +18988,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             job["progress"] = 100
             timing_debug["total_ms"] = int(round(max(0.0, time.perf_counter() - job_t0) * 1000.0))
             job["result"] = {"logs": [], "debug_timing": timing_debug}
+            _job_snapshot_save(job)
         return
     token_pairs = _pairs_to_string(pairs)
     requested_pair_keys = {_requested_pair_key(a, b) for a, b in pairs}
@@ -18981,6 +19034,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 job["stage_label"] = "Queue timeout"
                 job["progress"] = 100
                 job["result"] = {"logs": logs[-8:], "debug_timing": timing_debug}
+                _job_snapshot_save(job)
             _push_run_history(
                 session_id=session_id,
                 status="failed",
@@ -19193,6 +19247,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             job["stage_label"] = "Completed"
             job["progress"] = 100
             job["result"] = result_payload
+            _job_snapshot_save(job)
         if not bool(getattr(req, "ignore_cache", False)):
             _run_result_cache_put(_pool_run_cache_key(req), result_payload)
         _push_run_history(
@@ -19219,6 +19274,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             job["stage_label"] = "Failed"
             job["progress"] = 100
             job["result"] = {"logs": logs[-8:], "debug_timing": timing_debug}
+            _job_snapshot_save(job)
         _push_run_history(
             session_id=session_id,
             status="failed",
@@ -19238,6 +19294,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     finally:
         with JOB_LOCK:
             job["finished_at"] = time.time()
+            _job_snapshot_save(job)
 
 
 class PoolsRunRequest(BaseModel):
@@ -30108,6 +30165,7 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
                     "result": cached_payload,
                     "error": None,
                 }
+                _job_snapshot_save(JOBS[job_id])
             return {"job_id": job_id}
 
     job_id = str(uuid.uuid4())
@@ -30140,6 +30198,7 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
             "result": None,
             "error": None,
         }
+        _job_snapshot_save(JOBS[job_id])
     t = threading.Thread(target=_run_pool_job, args=(job_id, req, session_id), daemon=True)
     t.start()
     return {"job_id": job_id}
@@ -30151,6 +30210,9 @@ def job_status(job_id: str) -> dict[str, Any]:
         _prune_run_jobs_locked()
         job = JOBS.get(job_id)
     if not job:
+        snap = _job_snapshot_load(job_id)
+        if isinstance(snap, dict) and snap:
+            return _json_safe(snap)
         raise HTTPException(status_code=404, detail="Job not found")
     return _json_safe(job)
 
