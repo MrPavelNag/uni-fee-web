@@ -276,6 +276,8 @@ def save_chart_data_json(pool_chart_data: dict[str, dict], path: str) -> None:
             "pair": v.get("pair", ""),
             "chain": v.get("chain", ""),
             "version": v.get("version", "v3"),
+            "data_quality": v.get("data_quality"),
+            "data_quality_reason": v.get("data_quality_reason"),
         }
     os.makedirs("data", exist_ok=True)
     with open(path, "w") as f:
