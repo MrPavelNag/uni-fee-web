@@ -196,6 +196,28 @@ def _rebuild_fees_cumulative(fees_usd: list[tuple[int, float]], tvl_series: list
     return out
 
 
+def _append_now_tvl_anchor(tvl_series: list[tuple[int, float]], now_tvl_usd: float) -> list[tuple[int, float]]:
+    out = list(tvl_series or [])
+    now_ts = int(datetime.utcnow().timestamp())
+    now_tvl = float(max(0.0, now_tvl_usd))
+    if out and int(out[-1][0]) >= now_ts - 3600:
+        out[-1] = (int(out[-1][0]), now_tvl)
+    else:
+        out.append((now_ts, now_tvl))
+    return out
+
+
+def _append_now_fee_anchor(fee_series: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    out = list(fee_series or [])
+    now_ts = int(datetime.utcnow().timestamp())
+    last_val = float(out[-1][1]) if out else 0.0
+    if out and int(out[-1][0]) >= now_ts - 3600:
+        out[-1] = (int(out[-1][0]), last_val)
+    else:
+        out.append((now_ts, last_val))
+    return out
+
+
 def _addr_topic(addr: str) -> str:
     clean = str(addr or "").strip().lower().replace("0x", "")
     return "0x" + clean.rjust(64, "0")
@@ -472,8 +494,10 @@ def main() -> None:
         )
         return
 
-    estimated_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
-    estimated_fees = _rebuild_fees_cumulative(fees_usd, estimated_tvl)
+    estimated_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
+    estimated_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_tvl_base)
+    estimated_tvl = _append_now_tvl_anchor(estimated_tvl_base, float(pool_tvl_now_usd))
+    estimated_fees = _append_now_fee_anchor(estimated_fees_base)
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
@@ -502,9 +526,11 @@ def main() -> None:
     if strict_exact_ok:
         data_quality = "exact"
         data_quality_reason = ("exact1:ok" if variant == "exact1" else "exact2.0:ok")
-        final_tvl = list(exact_series)
-        final_fees = _rebuild_fees_cumulative(fees_usd, final_tvl)
-        strict_exact_tvl = list(exact_series)
+        final_tvl_base = list(exact_series)
+        final_fees_base = _rebuild_fees_cumulative(fees_usd, final_tvl_base)
+        final_tvl = _append_now_tvl_anchor(final_tvl_base, float(pool_tvl_now_usd))
+        final_fees = _append_now_fee_anchor(final_fees_base)
+        strict_exact_tvl = list(final_tvl)
         strict_exact_fees = list(final_fees)
     else:
         data_quality = "strict_unavailable"
@@ -513,8 +539,14 @@ def main() -> None:
         )
         final_tvl = []
         final_fees = []
-        strict_exact_tvl = list(exact_series) if exact_series else []
-        strict_exact_fees = _rebuild_fees_cumulative(fees_usd, strict_exact_tvl) if strict_exact_tvl else []
+        if exact_series:
+            strict_exact_tvl_base = list(exact_series)
+            strict_exact_fees_base = _rebuild_fees_cumulative(fees_usd, strict_exact_tvl_base)
+            strict_exact_tvl = _append_now_tvl_anchor(strict_exact_tvl_base, float(pool_tvl_now_usd))
+            strict_exact_fees = _append_now_fee_anchor(strict_exact_fees_base)
+        else:
+            strict_exact_tvl = []
+            strict_exact_fees = []
 
     payload = {
         "fees": final_fees,

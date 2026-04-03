@@ -1184,19 +1184,17 @@ def main() -> None:
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair}: skipped (no endpoint)"
         data = compute_fee_and_tvl_series(pool, endpoint)
-        try:
-            pool_tvl_now_usd = float(pool.get("effectiveTvlUSD") or 0.0)
-        except Exception:
-            pool_tvl_now_usd = 0.0
-        if pool_tvl_now_usd <= 0:
-            pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
-            if float(pool_tvl_now_usd) <= 0:
-                msg = (
-                    f"  [{idx+1}/{len(pools)}] {chain} {pair}: "
-                    f"skipped (external TVL unavailable: {price_err or 'unknown'})"
-                )
-                return idx, None, None, msg
-            pool["tvl_price_source"] = str(price_source or "external")
+        # Hard rule: TVL "now" must always come from reserves * external prices.
+        # Never trust prefilled pool TVL fields for current-point valuation.
+        pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
+        if float(pool_tvl_now_usd) <= 0:
+            msg = (
+                f"  [{idx+1}/{len(pools)}] {chain} {pair}: "
+                f"skipped (external TVL unavailable: {price_err or 'unknown'})"
+            )
+            return idx, None, None, msg
+        pool["effectiveTvlUSD"] = float(pool_tvl_now_usd)
+        pool["tvl_price_source"] = str(price_source or "external")
         # Build TVL and profitability strictly from external TVL (no subgraph TVL dependency).
         data["fees"] = []
         data["tvl"] = []

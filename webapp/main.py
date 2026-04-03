@@ -18758,8 +18758,21 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         try:
             t_agents_total0 = time.perf_counter()
             if run_mode == "strict_exact":
-                _set_stage("strict", "Running strict exact1/2.0 agents (single pool)", 20)
+                _set_stage("strict", "Running strict estimated baseline (single pool)", 18)
                 pair_suffix = pairs_to_filename_suffix(token_pairs)
+                env_est = dict(env)
+                env_est["V3_EXACT_TVL_ENABLE"] = "0"
+                env_est["V3_EXACT_TVL_STRICT_MODE"] = "0"
+                env_est["AGENT_TIMEOUT_SEC"] = str(max(60, min(int(env.get("AGENT_TIMEOUT_SEC", "480") or 480), 150)))
+                est_data, est_dbg = _run_agent_and_load_timed(
+                    script_name="agent_v3.py",
+                    env=env_est,
+                    min_tvl=req.min_tvl,
+                    logs=logs,
+                    pair_suffix=pair_suffix,
+                )
+
+                _set_stage("strict", "Running strict exact1/2.0 agents (single pool)", 28)
                 try:
                     strict_total_budget = max(20.0, float(env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")))
                 except Exception:
@@ -18809,15 +18822,29 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                         base["strict_compare_estimated_tvl"] = (_v1.get("strict_compare_estimated_tvl") or [])
                     if not (base.get("strict_compare_estimated_fees") or []):
                         base["strict_compare_estimated_fees"] = (_v1.get("strict_compare_estimated_fees") or [])
+                for _pid, _ve in (est_data or {}).items():
+                    base = merged_raw.get(_pid)
+                    if not isinstance(base, dict):
+                        continue
+                    est_tvl = (_ve.get("tvl") or [])
+                    est_fees = (_ve.get("fees") or [])
+                    if est_tvl:
+                        base["strict_compare_estimated_tvl"] = est_tvl
+                    if est_fees:
+                        base["strict_compare_estimated_fees"] = est_fees
                 timing_debug["pairs"].append(
                     {
                         "pair": token_pairs,
                         "index": 1,
-                        "agents": [strict1_dbg, strict2_dbg],
+                        "agents": [est_dbg, strict1_dbg, strict2_dbg],
                         "merged_before": 0,
                         "merged_after": int(len(merged_raw)),
                         "merged_added": int(len(merged_raw)),
-                        "total_ms": int((strict1_dbg or {}).get("total_ms") or 0) + int((strict2_dbg or {}).get("total_ms") or 0),
+                        "total_ms": (
+                            int((est_dbg or {}).get("total_ms") or 0)
+                            + int((strict1_dbg or {}).get("total_ms") or 0)
+                            + int((strict2_dbg or {}).get("total_ms") or 0)
+                        ),
                     }
                 )
                 _set_stage("strict", "Strict exact1/2.0 agents completed", 75)
@@ -32329,7 +32356,7 @@ HTML_PAGE = """
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
-        showlegend: false,
+        showlegend: !!strictMode,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
@@ -32341,7 +32368,7 @@ HTML_PAGE = """
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
-        showlegend: false,
+        showlegend: !!strictMode,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
