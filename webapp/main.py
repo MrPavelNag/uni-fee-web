@@ -18024,6 +18024,7 @@ def _merge_for_web(
             exact_legacy_apy = (exact_legacy_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
             exact_legacy_last_tvl = float(ex_legacy_tvl[-1][1]) if ex_legacy_tvl else 0.0
             exact_legacy_full = bool(ex_legacy_tvl) and all(float(p[1]) > 0.0 for p in ex_legacy_tvl)
+            exact_legacy_ok = bool(exact_legacy_full and not str(legacy_reason).startswith("strict_required:"))
             rows.append(
                 {
                     "pool_id": base_pool_id,
@@ -18034,7 +18035,7 @@ def _merge_for_web(
                     "final_income": exact_legacy_income,
                     "apy_pct": float(exact_legacy_apy),
                     "last_tvl": exact_legacy_last_tvl,
-                    "data_quality": ("exact" if exact_legacy_full else "strict_unavailable"),
+                    "data_quality": ("exact" if exact_legacy_ok else "strict_unavailable"),
                     "data_quality_reason": legacy_reason,
                     "status": status,
                 }
@@ -18044,6 +18045,7 @@ def _merge_for_web(
             exact_apy = (exact_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
             exact_last_tvl = float(ex_tvl[-1][1]) if ex_tvl else 0.0
             exact_full = bool(ex_tvl) and all(float(p[1]) > 0.0 for p in ex_tvl)
+            exact_ok = bool(exact_full and not str(exact2_reason).startswith("strict_required:"))
             rows.append(
                 {
                     "pool_id": base_pool_id,
@@ -18054,7 +18056,7 @@ def _merge_for_web(
                     "final_income": exact_income,
                     "apy_pct": float(exact_apy),
                     "last_tvl": exact_last_tvl,
-                    "data_quality": ("exact" if exact_full else "strict_unavailable"),
+                    "data_quality": ("exact" if exact_ok else "strict_unavailable"),
                     "data_quality_reason": exact2_reason,
                     "status": status,
                 }
@@ -18342,6 +18344,10 @@ def _build_run_job_env(
     env["TARGET_POOL_ID"] = (target_pool_id if run_mode == "strict_exact" else "")
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
+    # Allow exact engines on all supported v3 chains.
+    # This avoids false strict_required:...:chain_not_enabled when target pool is found
+    # on a fallback chain outside current UI chain selection.
+    env["V3_EXACT_TVL_CHAINS"] = ",".join(sorted(UNISWAP_V3_SUBGRAPHS.keys()))
     env["DISABLE_PDF_OUTPUT"] = "1"
     env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "1")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get(
