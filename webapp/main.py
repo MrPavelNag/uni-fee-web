@@ -18569,19 +18569,29 @@ def _prune_run_jobs_locked(now: float | None = None) -> None:
     stale_ids = [
         jid
         for jid, rec in JOBS.items()
-        if (ts_now - float((rec or {}).get("created_at") or ts_now)) > float(RUN_JOB_TTL_SEC)
+        if (
+            str((rec or {}).get("status") or "") in {"done", "failed"}
+            and (ts_now - float((rec or {}).get("created_at") or ts_now)) > float(RUN_JOB_TTL_SEC)
+        )
     ]
     for jid in stale_ids:
         JOBS.pop(str(jid), None)
     if len(JOBS) > int(RUN_JOB_LIMIT):
-        items = sorted(
-            JOBS.items(),
+        active_ids = {
+            str(jid)
+            for jid, rec in JOBS.items()
+            if str((rec or {}).get("status") or "") in {"queued", "running"}
+        }
+        terminal_items = sorted(
+            [(jid, rec) for jid, rec in JOBS.items() if str(jid) not in active_ids],
             key=lambda kv: float(((kv[1] or {}).get("created_at") or 0.0)),
             reverse=True,
         )
-        keep = {k for k, _ in items[: int(RUN_JOB_LIMIT)]}
+        reserve_for_terminal = max(0, int(RUN_JOB_LIMIT) - len(active_ids))
+        keep_terminal = {str(k) for k, _ in terminal_items[:reserve_for_terminal]}
+        keep = set(active_ids) | keep_terminal
         for k in list(JOBS.keys()):
-            if k not in keep:
+            if str(k) not in keep:
                 JOBS.pop(k, None)
 
 
