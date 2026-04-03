@@ -32152,12 +32152,14 @@ HTML_PAGE = """
         const c = colorMap[poolId] || palette[i % palette.length];
         const d = dashMap[poolId] || (i < palette.length ? "solid" : dashes[(i - palette.length) % dashes.length]);
         if (useStrictCompare) {
-          const estFeeX = estFees.map(p => new Date(p[0] * 1000));
-          const estFeeY = estFees.map(p => p[1]);
+          const estFeesSrc = estFees.length ? estFees : (Array.isArray(s.fees) ? s.fees : []);
+          const estTvlSrc = estTvl.length ? estTvl : (Array.isArray(s.tvl) ? s.tvl : []);
+          const estFeeX = estFeesSrc.map(p => new Date(p[0] * 1000));
+          const estFeeY = estFeesSrc.map(p => p[1]);
           const exFeeX = exFees.map(p => new Date(p[0] * 1000));
           const exFeeY = exFees.map(p => p[1]);
-          const estTvlX = estTvl.map(p => new Date(p[0] * 1000));
-          const estTvlY = estTvl.map(p => p[1] / 1000.0);
+          const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
+          const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
           const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
           const exTvlY = exTvl.map(p => p[1] / 1000.0);
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
@@ -32166,14 +32168,14 @@ HTML_PAGE = """
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: c, width: 2, dash: "dot"}
+              line: {color: "#64748b", width: 3.0, dash: "dot"}
             });
           }
           if (exFeeX.length) {
             feeTraces.push({
               x: exFeeX, y: exFeeY, mode: "lines", name: `${s.label} (exact)`, customdata: exHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: c, width: 2.4, dash: "solid"}
+              line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
             });
           }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
@@ -32182,14 +32184,14 @@ HTML_PAGE = """
             tvlTraces.push({
               x: estTvlX, y: estTvlY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: c, width: 2, dash: "dot"}
+              line: {color: "#64748b", width: 3.0, dash: "dot"}
             });
           }
           if (exTvlX.length) {
             tvlTraces.push({
               x: exTvlX, y: exTvlY, mode: "lines", name: `${s.label} (exact)`, customdata: exHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: c, width: 2.4, dash: "solid"}
+              line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
             });
           }
         } else {
@@ -32289,7 +32291,7 @@ HTML_PAGE = """
         const dqReason = String(r.data_quality_reason || "");
         const dqTitle = dqReason ? ` title="${escAttr(dqReason)}"` : "";
         html += `<td${dqTitle}>${escAttr(dq)}</td>`;
-        html += `<td class="mono" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(dqReason || "-")}">${escAttr(dqReason || "-")}</td>`;
+        html += `<td class="mono" style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(dqReason || "-")}">${escAttr(dqReason || "-")}</td>`;
         const statusLabel = r.status === "ok"
           ? "ok"
           : (r.status === "filtered_suffix" ? "excluded by suffix" : "filtered by fee range");
