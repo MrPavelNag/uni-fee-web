@@ -17954,7 +17954,13 @@ def _merge_for_web(
             "status": status,
         }
         rows.append(row)
-        if fees or tvl:
+        has_strict_compare = bool(
+            (v.get("strict_compare_estimated_fees") or [])
+            or (v.get("strict_compare_estimated_tvl") or [])
+            or (v.get("strict_compare_exact_fees") or [])
+            or (v.get("strict_compare_exact_tvl") or [])
+        )
+        if fees or tvl or has_strict_compare:
             chart_series.append(
                 {
                     "label": f"{row['chain']} {row['version']} {row['pair']} ...{row['pool_id'][-4:]}",
@@ -17966,6 +17972,10 @@ def _merge_for_web(
                     "pool_id": row["pool_id"],
                     "fees": fees,
                     "tvl": tvl,
+                    "strict_compare_estimated_fees": (v.get("strict_compare_estimated_fees") or []),
+                    "strict_compare_estimated_tvl": (v.get("strict_compare_estimated_tvl") or []),
+                    "strict_compare_exact_fees": (v.get("strict_compare_exact_fees") or []),
+                    "strict_compare_exact_tvl": (v.get("strict_compare_exact_tvl") or []),
                 }
             )
             if status == "ok":
@@ -18064,7 +18074,7 @@ def _run_output_dir(job_id: str) -> Path:
 
 
 def _agent_data_path(script_name: str, pair_suffix: str) -> Path:
-    if str(script_name) == "agent_v3.py":
+    if str(script_name) in {"agent_v3.py", "agent_v3_strict.py"}:
         return DATA_DIR / f"pools_v3_{pair_suffix}.json"
     return DATA_DIR / f"pools_v4_{pair_suffix}.json"
 
@@ -18667,57 +18677,81 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             return
         try:
             t_agents_total0 = time.perf_counter()
-            total_pairs = max(1, len(pairs))
-            pair_workers = _pair_worker_count(speed_mode, total_pairs)
-            _set_stage(
-                "pairs",
-                f"Running pair scans ({total_pairs} pair(s), workers={pair_workers})",
-                12,
-            )
-            pair_results: list[tuple[dict[str, dict], dict[str, Any], list[str]]] = []
-            if pair_workers <= 1 or total_pairs <= 1:
-                for idx, pair_tokens in enumerate(pairs, start=1):
-                    pair_results.append(
-                        _run_single_pair_scan(
-                            pair_index=idx,
-                            total_pairs=total_pairs,
-                            pair_tokens=pair_tokens,
-                            base_env=env,
-                            min_tvl=req.min_tvl,
-                            run_v3=run_v3,
-                            run_v4=run_v4,
-                        )
-                    )
-                    _set_stage("pairs", f"Running pair scans ({idx}/{total_pairs})", int(10 + (65 * idx / total_pairs)))
-            else:
-                with ThreadPoolExecutor(max_workers=pair_workers) as pair_ex:
-                    future_to_idx = {
-                        pair_ex.submit(
-                            _run_single_pair_scan,
-                            pair_index=idx,
-                            total_pairs=total_pairs,
-                            pair_tokens=pair_tokens,
-                            base_env=env,
-                            min_tvl=req.min_tvl,
-                            run_v3=run_v3,
-                            run_v4=run_v4,
-                        ): idx
-                        for idx, pair_tokens in enumerate(pairs, start=1)
+            if run_mode == "strict_exact":
+                _set_stage("strict", "Running strict exact agent (single pool)", 20)
+                pair_suffix = pairs_to_filename_suffix(token_pairs)
+                strict_data, strict_dbg = _run_agent_and_load_timed(
+                    script_name="agent_v3_strict.py",
+                    env=dict(env),
+                    min_tvl=req.min_tvl,
+                    logs=logs,
+                    pair_suffix=pair_suffix,
+                )
+                merged_raw.update(strict_data or {})
+                timing_debug["pairs"].append(
+                    {
+                        "pair": token_pairs,
+                        "index": 1,
+                        "agents": [strict_dbg],
+                        "merged_before": 0,
+                        "merged_after": int(len(merged_raw)),
+                        "merged_added": int(len(merged_raw)),
+                        "total_ms": int((strict_dbg or {}).get("total_ms") or 0),
                     }
-                    done_n = 0
-                    for fut in as_completed(list(future_to_idx.keys())):
-                        pair_results.append(fut.result())
-                        done_n += 1
-                        _set_stage("pairs", f"Running pair scans ({done_n}/{total_pairs})", int(10 + (65 * done_n / total_pairs)))
+                )
+                _set_stage("strict", "Strict exact agent completed", 75)
+            else:
+                total_pairs = max(1, len(pairs))
+                pair_workers = _pair_worker_count(speed_mode, total_pairs)
+                _set_stage(
+                    "pairs",
+                    f"Running pair scans ({total_pairs} pair(s), workers={pair_workers})",
+                    12,
+                )
+                pair_results: list[tuple[dict[str, dict], dict[str, Any], list[str]]] = []
+                if pair_workers <= 1 or total_pairs <= 1:
+                    for idx, pair_tokens in enumerate(pairs, start=1):
+                        pair_results.append(
+                            _run_single_pair_scan(
+                                pair_index=idx,
+                                total_pairs=total_pairs,
+                                pair_tokens=pair_tokens,
+                                base_env=env,
+                                min_tvl=req.min_tvl,
+                                run_v3=run_v3,
+                                run_v4=run_v4,
+                            )
+                        )
+                        _set_stage("pairs", f"Running pair scans ({idx}/{total_pairs})", int(10 + (65 * idx / total_pairs)))
+                else:
+                    with ThreadPoolExecutor(max_workers=pair_workers) as pair_ex:
+                        future_to_idx = {
+                            pair_ex.submit(
+                                _run_single_pair_scan,
+                                pair_index=idx,
+                                total_pairs=total_pairs,
+                                pair_tokens=pair_tokens,
+                                base_env=env,
+                                min_tvl=req.min_tvl,
+                                run_v3=run_v3,
+                                run_v4=run_v4,
+                            ): idx
+                            for idx, pair_tokens in enumerate(pairs, start=1)
+                        }
+                        done_n = 0
+                        for fut in as_completed(list(future_to_idx.keys())):
+                            pair_results.append(fut.result())
+                            done_n += 1
+                            _set_stage("pairs", f"Running pair scans ({done_n}/{total_pairs})", int(10 + (65 * done_n / total_pairs)))
 
-            pair_results.sort(key=lambda x: int((x[1] or {}).get("index") or 0))
-            for merged_piece, pair_dbg, pair_logs in pair_results:
-                pair_dbg["merged_before"] = int(len(merged_raw))
-                merged_raw.update(merged_piece or {})
-                pair_dbg["merged_after"] = int(len(merged_raw))
-                pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
-                timing_debug["pairs"].append(pair_dbg)
-                logs.extend(pair_logs or [])
+                pair_results.sort(key=lambda x: int((x[1] or {}).get("index") or 0))
+                for merged_piece, pair_dbg, pair_logs in pair_results:
+                    pair_dbg["merged_before"] = int(len(merged_raw))
+                    merged_raw.update(merged_piece or {})
+                    pair_dbg["merged_after"] = int(len(merged_raw))
+                    pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
+                    timing_debug["pairs"].append(pair_dbg)
+                    logs.extend(pair_logs or [])
             timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
         finally:
             RUN_SLOTS_SEMAPHORE.release()
@@ -18725,7 +18759,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         # Keep only pools that really match requested pairs.
         # Protects against occasional cross-token resolution artifacts (e.g. POL instead of ETH).
         t_filter0 = time.perf_counter()
-        if requested_pair_keys:
+        if requested_pair_keys and run_mode != "strict_exact":
             merged_raw = {
                 k: v
                 for k, v in merged_raw.items()
@@ -30389,7 +30423,13 @@ HTML_PAGE = """
       white-space: nowrap;
     }
     
-    .inline-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; align-items: end; justify-content: start; }
+    .inline-grid {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+      gap: 8px;
+      align-items: end;
+      justify-content: start;
+    }
     .inline-grid .filter-item input,
     .inline-grid .filter-item select {
       width: 100%;
@@ -30405,23 +30445,30 @@ HTML_PAGE = """
       line-height: 1.15;
       white-space: normal;
     }
+    .filter-item.contract-item input {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      letter-spacing: 0.01em;
+    }
     .proto-checks {
       display: flex;
-      gap: 10px;
+      gap: 8px;
       align-items: center;
       width: 100%;
       height: 42px;
-      padding: 0 4px;
+      padding: 0 8px;
       border: 1px solid #cbd5e1;
       border-radius: 8px;
       background: #f8fbff;
+      box-sizing: border-box;
+      overflow: hidden;
     }
     .proto-checks label {
       display: inline-flex;
       align-items: center;
       gap: 5px;
       font-size: 12px;
-      font-weight: 600;
+      font-weight: 700;
       color: #334155;
       padding-top: 0;
       line-height: 1;
@@ -30435,6 +30482,9 @@ HTML_PAGE = """
       flex: 0 0 auto;
       accent-color: #2563eb;
       transform: translateY(-1px);
+    }
+    @media (max-width: 1400px) {
+      .inline-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
@@ -30668,21 +30718,21 @@ HTML_PAGE = """
                   <div class="hint">Min APY<br/>%</div>
                   <input id="minApyPct" value="0" type="number" step="0.1" min="0" max="100000"/>
                 </div>
-                <div class="filter-item">
+                <div class="filter-item proto-item">
                   <div class="hint">Protocol<br/>version</div>
                   <div class="proto-checks">
                     <label><input id="protoV3" type="checkbox" checked onchange="updateChainsNote()"/> V3</label>
                     <label><input id="protoV4" type="checkbox" checked onchange="updateChainsNote()"/> V4</label>
                   </div>
                 </div>
-                <div class="filter-item">
+                <div class="filter-item mode-item">
                   <div class="hint">Calculation<br/>mode</div>
                   <div class="proto-checks">
                     <label><input id="modeFastLegacy" type="checkbox" checked onchange="syncRunModes('fast')"/> Fast legacy</label>
                     <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Strict exact</label>
                   </div>
                 </div>
-                <div class="filter-item">
+                <div class="filter-item contract-item">
                   <div class="hint">Contract<br/>address</div>
                   <input id="targetPoolId" type="text" placeholder="0x... (optional)"/>
                 </div>
@@ -31897,6 +31947,7 @@ HTML_PAGE = """
       const dashes = ["dash", "dot", "dashdot", "longdash", "longdashdot"];
       const feeTraces = [];
       const tvlTraces = [];
+      const strictMode = String(currentRequest?.run_mode || "").toLowerCase() === "strict_exact";
       let maxTs = 0;
 
       const pools = Object.keys(seriesByPool);
@@ -31904,29 +31955,81 @@ HTML_PAGE = """
         const poolId = pools[i];
         const s = seriesByPool[poolId];
         if (!visibilityMap[poolId]) continue;
-        const feeX = (s.fees || []).map(p => new Date(p[0] * 1000));
-        const feeY = (s.fees || []).map(p => p[1]);
-        const tvlX = (s.tvl || []).map(p => new Date(p[0] * 1000));
-        const tvlY = (s.tvl || []).map(p => p[1] / 1000.0);
+        const estFees = Array.isArray(s.strict_compare_estimated_fees) ? s.strict_compare_estimated_fees : [];
+        const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
+        const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
+        const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
+        const useStrictCompare = strictMode && (estFees.length || estTvl.length || exFees.length || exTvl.length);
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
           ...((s.tvl || []).map(p => Number(p[0] || 0))),
+          ...(estFees.map(p => Number(p?.[0] || 0))),
+          ...(estTvl.map(p => Number(p?.[0] || 0))),
+          ...(exFees.map(p => Number(p?.[0] || 0))),
+          ...(exTvl.map(p => Number(p?.[0] || 0))),
           0
         );
         if (localMax > maxTs) maxTs = localMax;
         const c = colorMap[poolId] || palette[i % palette.length];
         const d = dashMap[poolId] || (i < palette.length ? "solid" : dashes[(i - palette.length) % dashes.length]);
-        const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
-        feeTraces.push({
-          x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
-          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
-          line: {color: c, width: 2, dash: d}
-        });
-        tvlTraces.push({
-          x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
-          hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
-          line: {color: c, width: 2, dash: d}
-        });
+        if (useStrictCompare) {
+          const estFeeX = estFees.map(p => new Date(p[0] * 1000));
+          const estFeeY = estFees.map(p => p[1]);
+          const exFeeX = exFees.map(p => new Date(p[0] * 1000));
+          const exFeeY = exFees.map(p => p[1]);
+          const estTvlX = estTvl.map(p => new Date(p[0] * 1000));
+          const estTvlY = estTvl.map(p => p[1] / 1000.0);
+          const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
+          const exTvlY = exTvl.map(p => p[1] / 1000.0);
+          const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
+          const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
+          if (estFeeX.length) {
+            feeTraces.push({
+              x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHover,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<extra></extra>",
+              line: {color: c, width: 2, dash: "dot"}
+            });
+          }
+          if (exFeeX.length) {
+            feeTraces.push({
+              x: exFeeX, y: exFeeY, mode: "lines", name: `${s.label} (exact)`, customdata: exHover,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<extra></extra>",
+              line: {color: c, width: 2.4, dash: "solid"}
+            });
+          }
+          const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
+          const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
+          if (estTvlX.length) {
+            tvlTraces.push({
+              x: estTvlX, y: estTvlY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHoverTvl,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<extra></extra>",
+              line: {color: c, width: 2, dash: "dot"}
+            });
+          }
+          if (exTvlX.length) {
+            tvlTraces.push({
+              x: exTvlX, y: exTvlY, mode: "lines", name: `${s.label} (exact)`, customdata: exHoverTvl,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<extra></extra>",
+              line: {color: c, width: 2.4, dash: "solid"}
+            });
+          }
+        } else {
+          const feeX = (s.fees || []).map(p => new Date(p[0] * 1000));
+          const feeY = (s.fees || []).map(p => p[1]);
+          const tvlX = (s.tvl || []).map(p => new Date(p[0] * 1000));
+          const tvlY = (s.tvl || []).map(p => p[1] / 1000.0);
+          const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
+          feeTraces.push({
+            x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
+            hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
+            line: {color: c, width: 2, dash: d}
+          });
+          tvlTraces.push({
+            x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
+            hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
+            line: {color: c, width: 2, dash: d}
+          });
+        }
       }
 
       const alloc = Number(currentRequest?.lp_allocation_usd || 1000);
@@ -31940,7 +32043,7 @@ HTML_PAGE = """
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
-        showlegend: false,
+        showlegend: strictMode,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
@@ -31952,7 +32055,7 @@ HTML_PAGE = """
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
-        showlegend: false,
+        showlegend: strictMode,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
