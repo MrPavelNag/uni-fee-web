@@ -76,6 +76,13 @@ def _is_eth_address(v: str) -> bool:
     return s.startswith("0x") and len(s) == 42
 
 
+def _target_pool_id() -> str:
+    raw = str(os.environ.get("TARGET_POOL_ID", "") or "").strip().lower()
+    if _is_eth_address(raw):
+        return raw
+    return ""
+
+
 V3_EXACT_TVL_ENABLE = _env_flag("V3_EXACT_TVL_ENABLE", True)
 V3_EXACT_TVL_CHAINS = {
     c.strip().lower()
@@ -1083,6 +1090,10 @@ def main() -> None:
     print("Discovering v3 pools...")
     fresh = "TOKEN_PAIRS" in os.environ
     pools = discover_pools_v3(token_pairs, args.min_tvl, fresh_token_lookup=fresh)
+    target_pool = _target_pool_id()
+    if target_pool:
+        pools = [p for p in pools if str((p or {}).get("id") or "").strip().lower() == target_pool]
+        print(f"Target pool filter enabled: {target_pool} | matched {len(pools)}")
     max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 40))
     max_total = max(0, _env_int("MAX_POOLS_TOTAL", 300))
     pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)

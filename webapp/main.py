@@ -18203,6 +18203,7 @@ def _build_run_job_env(
     if (not mode_strict_exact) and (not mode_fast_legacy):
         mode_fast_legacy = True
     run_mode = "strict_exact" if mode_strict_exact else "fast_legacy"
+    target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
     exact_days_default = str(max(1, min(int(req.days), 7 if speed_mode == "fast" else 14)))
     # Agents resolve symbols via the same top-N cache as site catalog.
     try:
@@ -18210,6 +18211,7 @@ def _build_run_job_env(
     except Exception:
         env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH)
     env["TOKEN_PAIRS"] = token_pairs
+    env["TARGET_POOL_ID"] = target_pool_id
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
     env["DISABLE_PDF_OUTPUT"] = "1"
@@ -18402,6 +18404,7 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
         "min_tvl": float(req.min_tvl or 0.0),
         "speed_mode": str(req.speed_mode or "normal").strip().lower(),
         "run_mode": ("strict_exact" if bool(getattr(req, "mode_strict_exact", False)) else "fast_legacy"),
+        "target_pool_id": str(getattr(req, "target_pool_id", "") or "").strip().lower(),
         "min_fee_pct": float(req.min_fee_pct or 0.0),
         "max_fee_pct": float(req.max_fee_pct or 0.0),
         "min_apy_pct": float(req.min_apy_pct or 0.0),
@@ -18577,6 +18580,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     if (not mode_strict_exact) and (not mode_fast_legacy):
         mode_fast_legacy = True
     run_mode = "strict_exact" if mode_strict_exact else "fast_legacy"
+    target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
 
     with JOB_LOCK:
         job = JOBS[job_id]
@@ -18769,6 +18773,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 "include_versions": include_versions,
                 "speed_mode": speed_mode,
                 "run_mode": run_mode,
+                "target_pool_id": target_pool_id,
                 "min_fee_pct": req.min_fee_pct,
                 "max_fee_pct": req.max_fee_pct,
                 "min_apy_pct": req.min_apy_pct,
@@ -18842,6 +18847,7 @@ class PoolsRunRequest(BaseModel):
     speed_mode: str = "normal"
     mode_fast_legacy: bool = True
     mode_strict_exact: bool = False
+    target_pool_id: str = ""
     min_tvl: float = 1000.0
     days: int = 30
     min_fee_pct: float = 0.0
@@ -29642,10 +29648,17 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
     if req.min_apy_pct < 0 or req.min_apy_pct > 100000:
         raise HTTPException(status_code=400, detail="min_apy_pct must be in range 0..100000")
+    req.target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
+    if req.target_pool_id:
+        if not (req.target_pool_id.startswith("0x") and len(req.target_pool_id) == 42):
+            raise HTTPException(status_code=400, detail="target_pool_id must be a valid 0x contract address")
     req.mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
     req.mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
     if req.mode_strict_exact:
+        if not req.target_pool_id:
+            raise HTTPException(status_code=400, detail="strict exact mode requires target_pool_id")
         req.mode_fast_legacy = False
+        req.include_versions = ["v3"]
     if (not req.mode_strict_exact) and (not req.mode_fast_legacy):
         req.mode_fast_legacy = True
     req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
@@ -30669,6 +30682,10 @@ HTML_PAGE = """
                     <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Strict exact</label>
                   </div>
                 </div>
+                <div class="filter-item">
+                  <div class="hint">Contract<br/>address</div>
+                  <input id="targetPoolId" type="text" placeholder="0x... (optional)"/>
+                </div>
               </div>
             </div>
           </div>
@@ -30748,7 +30765,7 @@ HTML_PAGE = """
     const FIELD_IDS = [
       "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
       "minTvl", "days", "maxFeePct", "minFeePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache",
-      "modeFastLegacy", "modeStrictExact"
+      "modeFastLegacy", "modeStrictExact", "targetPoolId"
     ];
     let availableChains = [];
     let colorMap = {};
@@ -30803,12 +30820,19 @@ HTML_PAGE = """
     function syncRunModes(source) {
       const fast = document.getElementById("modeFastLegacy");
       const strict = document.getElementById("modeStrictExact");
+      const protoV3 = document.getElementById("protoV3");
+      const protoV4 = document.getElementById("protoV4");
       if (!fast || !strict) return;
       const src = String(source || "").toLowerCase();
       if (src === "strict" && strict.checked) fast.checked = false;
       if (src === "fast" && fast.checked) strict.checked = false;
       if (!fast.checked && !strict.checked) {
         fast.checked = true;
+      }
+      if (strict.checked) {
+        if (protoV3) protoV3.checked = true;
+        if (protoV4) protoV4.checked = false;
+        try { updateChainsNote(); } catch (_) {}
       }
       saveFormState();
     }
@@ -32222,6 +32246,7 @@ HTML_PAGE = """
         const maxFeeRaw = String(document.getElementById("maxFeePct").value ?? "").trim();
         const minFeeRaw = String(document.getElementById("minFeePct").value ?? "").trim();
         const minApyRaw = String(document.getElementById("minApyPct").value ?? "").trim();
+        const targetPoolRaw = String(document.getElementById("targetPoolId")?.value ?? "").trim().toLowerCase();
         syncRunModes("");
         if (!minTvlRaw || !daysRaw || !minFeeRaw || !maxFeeRaw || !minApyRaw) {
           setStatus("Fill all filter fields before running analysis.", "fail");
@@ -32239,7 +32264,19 @@ HTML_PAGE = """
           ignore_cache: !!document.getElementById("runIgnoreCache")?.checked,
           mode_fast_legacy: !!document.getElementById("modeFastLegacy")?.checked,
           mode_strict_exact: !!document.getElementById("modeStrictExact")?.checked,
+          target_pool_id: targetPoolRaw,
         };
+        if (payload.mode_strict_exact) {
+          payload.include_versions = ["v3"];
+          if (!payload.target_pool_id) {
+            setStatus("Strict exact requires a contract address.", "fail");
+            return;
+          }
+        }
+        if (payload.target_pool_id && !/^0x[a-f0-9]{40}$/.test(payload.target_pool_id)) {
+          setStatus("Contract address must be a valid 0x address.", "fail");
+          return;
+        }
         if (!payload.include_versions.length) {
           setStatus("Select at least one protocol (V3/V4).", "fail");
           return;
