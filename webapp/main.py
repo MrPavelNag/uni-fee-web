@@ -189,15 +189,19 @@ POSITIONS_INDEX_STOP = threading.Event()
 POSITIONS_INDEX_WORKERS: list[threading.Thread] = []
 RUN_HISTORY: dict[str, list[dict[str, Any]]] = {}
 RUN_HISTORY_LIMIT = 10
+RUN_HISTORY_SESSION_LIMIT = max(20, int(os.environ.get("RUN_HISTORY_SESSION_LIMIT", "300")))
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
-RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "120")))
+RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "24")))
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
-RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "300")))
+RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "120")))
+RUN_JOB_RESULT_TTL_SEC = max(60, int(os.environ.get("RUN_JOB_RESULT_TTL_SEC", str(20 * 60))))
 RUN_MAX_CONCURRENT = max(1, min(6, int(os.environ.get("RUN_MAX_CONCURRENT", "1"))))
 RUN_SLOT_WAIT_TIMEOUT_SEC = max(10, int(os.environ.get("RUN_SLOT_WAIT_TIMEOUT_SEC", "180")))
 RUN_MAX_ACTIVE_PER_SESSION = max(1, min(6, int(os.environ.get("RUN_MAX_ACTIVE_PER_SESSION", "2"))))
 RUN_SLOTS_SEMAPHORE = threading.BoundedSemaphore(RUN_MAX_CONCURRENT)
+RUNTIME_PRUNE_INTERVAL_SEC = max(15, int(os.environ.get("RUNTIME_PRUNE_INTERVAL_SEC", "60")))
+_LAST_RUNTIME_PRUNE_TS = 0.0
 SESSION_COOKIE_NAME = "uni_fee_sid"
 SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", str(30 * 24 * 60 * 60)))
 CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
@@ -752,30 +756,40 @@ POSITIONS_LEGACY_DISCOVERY_ENABLED = os.environ.get("POSITIONS_LEGACY_DISCOVERY_
 PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("PRICE_CACHE_TTL_SEC", "600")))
 TOKEN_PRICE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
 TOKEN_PRICE_CACHE_LOCK = threading.Lock()
+TOKEN_PRICE_CACHE_LIMIT = max(1000, int(os.environ.get("TOKEN_PRICE_CACHE_LIMIT", "20000")))
 TOKEN_SYMBOL_CACHE: dict[tuple[int, str], str] = {}
 TOKEN_SYMBOL_CACHE_LOCK = threading.Lock()
+TOKEN_SYMBOL_CACHE_LIMIT = max(1000, int(os.environ.get("TOKEN_SYMBOL_CACHE_LIMIT", "30000")))
 CONTRACT_CREATION_DATE_CACHE: dict[tuple[int, str], str] = {}
 CONTRACT_CREATION_DATE_CACHE_LOCK = threading.Lock()
+CONTRACT_CREATION_DATE_CACHE_LIMIT = max(1000, int(os.environ.get("CONTRACT_CREATION_DATE_CACHE_LIMIT", "40000")))
 POSITION_CREATION_DATE_CACHE: dict[tuple[int, str, int], str] = {}
 POSITION_CREATION_DATE_CACHE_LOCK = threading.Lock()
+POSITION_CREATION_DATE_CACHE_LIMIT = max(1000, int(os.environ.get("POSITION_CREATION_DATE_CACHE_LIMIT", "60000")))
 EXPLORER_NFT_META_CACHE: dict[tuple[int, str, int], dict[str, Any]] = {}
 EXPLORER_NFT_META_CACHE_LOCK = threading.Lock()
+EXPLORER_NFT_META_CACHE_LIMIT = max(1000, int(os.environ.get("EXPLORER_NFT_META_CACHE_LIMIT", "30000")))
 AUTO_HIDDEN_CLOSED_POSITION_IDS: set[tuple[int, str, int]] = set()
 AUTO_HIDDEN_CLOSED_POSITION_IDS_LOCK = threading.Lock()
 POSITION_CONTRACT_SNAPSHOT_TTL_SEC = max(30, int(os.environ.get("POSITION_CONTRACT_SNAPSHOT_TTL_SEC", "600")))
 POSITION_CONTRACT_SNAPSHOT_CACHE: dict[tuple[int, str, int], tuple[float, dict[str, Any]]] = {}
 POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK = threading.Lock()
+POSITION_CONTRACT_SNAPSHOT_CACHE_LIMIT = max(1000, int(os.environ.get("POSITION_CONTRACT_SNAPSHOT_CACHE_LIMIT", "20000")))
 MAJOR_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 MAJOR_ASSET_PRICE_CACHE_TTL_SEC = max(60, int(os.environ.get("MAJOR_ASSET_PRICE_CACHE_TTL_SEC", "300")))
 FEE_SERIES_CACHE_TTL_SEC = max(30, int(os.environ.get("FEE_SERIES_CACHE_TTL_SEC", "300")))
 COINGECKO_RANGE_CACHE: dict[tuple[int, str, int, int], tuple[float, list[tuple[int, float]]]] = {}
 COINGECKO_RANGE_CACHE_LOCK = threading.Lock()
+COINGECKO_RANGE_CACHE_LIMIT = max(200, int(os.environ.get("COINGECKO_RANGE_CACHE_LIMIT", "3000")))
 POOL_TVL_SERIES_CACHE: dict[tuple[str, str, str, int], tuple[float, list[tuple[int, float]]]] = {}
 POOL_TVL_SERIES_CACHE_LOCK = threading.Lock()
+POOL_TVL_SERIES_CACHE_LIMIT = max(200, int(os.environ.get("POOL_TVL_SERIES_CACHE_LIMIT", "3000")))
 POOL_VOLUME_SERIES_CACHE: dict[tuple[str, str, str, int], tuple[float, list[tuple[int, float]]]] = {}
 POOL_VOLUME_SERIES_CACHE_LOCK = threading.Lock()
+POOL_VOLUME_SERIES_CACHE_LIMIT = max(200, int(os.environ.get("POOL_VOLUME_SERIES_CACHE_LIMIT", "3000")))
 POSITION_SNAPSHOT_SERIES_CACHE: dict[tuple[str, str, int, int], tuple[float, list[tuple[int, float]]]] = {}
 POSITION_SNAPSHOT_SERIES_CACHE_LOCK = threading.Lock()
+POSITION_SNAPSHOT_SERIES_CACHE_LIMIT = max(200, int(os.environ.get("POSITION_SNAPSHOT_SERIES_CACHE_LIMIT", "3000")))
 POOL_FLOW_EVENTS_LOCK = threading.Lock()
 getcontext().prec = 48
 
@@ -16411,8 +16425,13 @@ def _is_valid_session_id(value: str) -> bool:
 
 
 def _ensure_session_cookie(request: Request, response: Response) -> str:
+    _prune_runtime_state()
     sid = request.cookies.get(SESSION_COOKIE_NAME, "")
     if _is_valid_session_id(sid):
+        with AUTH_LOCK:
+            auth = AUTH_SESSIONS.get(sid)
+            if isinstance(auth, dict):
+                auth["last_seen_ts"] = time.time()
         return sid
     sid = _new_session_id()
     response.set_cookie(
@@ -17930,8 +17949,6 @@ def _merge_for_web(
         has_strict_compare = bool(
             (v.get("strict_compare_estimated_fees") or [])
             or (v.get("strict_compare_estimated_tvl") or [])
-            or (v.get("strict_compare_exact_legacy_fees") or [])
-            or (v.get("strict_compare_exact_legacy_tvl") or [])
             or (v.get("strict_compare_exact_fees") or [])
             or (v.get("strict_compare_exact_tvl") or [])
         )
@@ -17970,36 +17987,27 @@ def _merge_for_web(
         base_version = v.get("version", "")
         base_pair = v.get("pair", "")
         base_fee_pct = float(v.get("fee_pct") or 0)
-        legacy_reason = ""
         exact2_reason = str(dq_reason or "")
         if has_strict_compare:
             est_fees = v.get("strict_compare_estimated_fees") or []
             est_tvl = v.get("strict_compare_estimated_tvl") or []
-            ex_legacy_fees = v.get("strict_compare_exact_legacy_fees") or []
-            ex_legacy_tvl = v.get("strict_compare_exact_legacy_tvl") or []
             ex_fees = v.get("strict_compare_exact_fees") or []
             ex_tvl = v.get("strict_compare_exact_tvl") or []
-            legacy_reason = str(v.get("strict_compare_exact_legacy_reason") or "strict_compare:exact_legacy")
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact2.0")
-            has_legacy = bool(ex_legacy_fees or ex_legacy_tvl)
 
             tvl_end_ts = max(
                 [0]
                 + [int(x[0]) for x in (est_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
-                + [int(x[0]) for x in (ex_legacy_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
             )
             fees_end_ts = max(
                 [0]
                 + [int(x[0]) for x in (est_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
-                + [int(x[0]) for x in (ex_legacy_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
             )
             est_tvl = _align_series_end(est_tvl, tvl_end_ts)
-            ex_legacy_tvl = _align_series_end(ex_legacy_tvl, tvl_end_ts)
             ex_tvl = _align_series_end(ex_tvl, tvl_end_ts)
             est_fees = _align_series_end(est_fees, fees_end_ts)
-            ex_legacy_fees = _align_series_end(ex_legacy_fees, fees_end_ts)
             ex_fees = _align_series_end(ex_fees, fees_end_ts)
 
             est_income = float(est_fees[-1][1]) if est_fees else 0.0
@@ -18020,28 +18028,6 @@ def _merge_for_web(
                     "status": status,
                 }
             )
-
-            if has_legacy:
-                exact_legacy_income = float(ex_legacy_fees[-1][1]) if ex_legacy_fees else 0.0
-                exact_legacy_apy = (exact_legacy_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-                exact_legacy_last_tvl = float(ex_legacy_tvl[-1][1]) if ex_legacy_tvl else 0.0
-                exact_legacy_full = bool(ex_legacy_tvl) and all(float(p[1]) > 0.0 for p in ex_legacy_tvl)
-                exact_legacy_ok = bool(exact_legacy_full and not str(legacy_reason).startswith("strict_required:"))
-                rows.append(
-                    {
-                        "pool_id": base_pool_id,
-                        "chain": base_chain,
-                        "version": base_version,
-                        "pair": f"{base_pair} (exact legacy)",
-                        "fee_pct": base_fee_pct,
-                        "final_income": exact_legacy_income,
-                        "apy_pct": float(exact_legacy_apy),
-                        "last_tvl": exact_legacy_last_tvl,
-                        "data_quality": ("exact" if exact_legacy_ok else "strict_unavailable"),
-                        "data_quality_reason": legacy_reason,
-                        "status": status,
-                    }
-                )
 
             exact_income = float(ex_fees[-1][1]) if ex_fees else 0.0
             exact_apy = (exact_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
@@ -18092,9 +18078,6 @@ def _merge_for_web(
                     "tvl": tvl,
                     "strict_compare_estimated_fees": (est_fees if has_strict_compare else (v.get("strict_compare_estimated_fees") or [])),
                     "strict_compare_estimated_tvl": (est_tvl if has_strict_compare else (v.get("strict_compare_estimated_tvl") or [])),
-                    "strict_compare_exact_legacy_fees": (ex_legacy_fees if has_strict_compare else (v.get("strict_compare_exact_legacy_fees") or [])),
-                    "strict_compare_exact_legacy_tvl": (ex_legacy_tvl if has_strict_compare else (v.get("strict_compare_exact_legacy_tvl") or [])),
-                    "strict_compare_exact_legacy_reason": legacy_reason,
                     "strict_compare_exact_fees": (ex_fees if has_strict_compare else (v.get("strict_compare_exact_fees") or [])),
                     "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
                     "strict_compare_exact2_reason": exact2_reason,
@@ -18600,6 +18583,206 @@ def _prune_run_jobs_locked(now: float | None = None) -> None:
         for k in list(JOBS.keys()):
             if k not in keep:
                 JOBS.pop(k, None)
+
+
+def _compact_job_result_inplace(job: dict[str, Any]) -> None:
+    """Drop bulky payload from old finished jobs to cap RSS."""
+    if not isinstance(job, dict):
+        return
+    result = job.get("result")
+    if not isinstance(result, dict):
+        return
+    rows = result.get("rows")
+    series = result.get("series")
+    if not rows and not series:
+        return
+    job["result"] = {
+        "request": result.get("request") or {},
+        "logs": (result.get("logs") or [])[-8:],
+        "debug_timing": result.get("debug_timing") or {},
+        "result_trimmed": True,
+        "trim_reason": "memory_prune",
+        "rows_count": int(len(rows or [])),
+        "series_count": int(len(series or [])),
+    }
+
+
+def _prune_mapping_by_limit_and_ttl(
+    cache: dict[Any, Any],
+    *,
+    limit: int,
+    now_ts: float,
+    ttl_sec: float | None = None,
+    ts_getter: Any | None = None,
+) -> None:
+    if not isinstance(cache, dict) or not cache:
+        return
+    if ttl_sec and ts_getter:
+        for k, v in list(cache.items()):
+            try:
+                ts = float(ts_getter(v) or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts <= 0.0 or (now_ts - ts) > float(ttl_sec):
+                cache.pop(k, None)
+    if len(cache) <= int(limit):
+        return
+    if ts_getter:
+        items = sorted(
+            cache.items(),
+            key=lambda kv: float(ts_getter(kv[1]) or 0.0),
+            reverse=True,
+        )
+        keep = {k for k, _ in items[: int(limit)]}
+        for k in list(cache.keys()):
+            if k not in keep:
+                cache.pop(k, None)
+    else:
+        # dict order is insertion order; drop oldest first.
+        while len(cache) > int(limit):
+            oldest = next(iter(cache.keys()), None)
+            if oldest is None:
+                break
+            cache.pop(oldest, None)
+
+
+def _prune_runtime_state(force: bool = False) -> None:
+    global _LAST_RUNTIME_PRUNE_TS
+    now = time.time()
+    if not force and (now - float(_LAST_RUNTIME_PRUNE_TS)) < float(RUNTIME_PRUNE_INTERVAL_SEC):
+        return
+    _LAST_RUNTIME_PRUNE_TS = now
+
+    with JOB_LOCK:
+        _prune_run_jobs_locked(now=now)
+        # Remove expired run cache entries even if count is below limit.
+        _prune_mapping_by_limit_and_ttl(
+            RUN_RESULT_CACHE,
+            limit=int(RUN_RESULT_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=float(RUN_RESULT_CACHE_TTL_SEC),
+            ts_getter=lambda v: (v or {}).get("ts"),
+        )
+        # Keep run-history bounded not only per-session but globally by session count.
+        for sid, items in list(RUN_HISTORY.items()):
+            if not isinstance(items, list) or not items:
+                RUN_HISTORY.pop(sid, None)
+                continue
+            del items[RUN_HISTORY_LIMIT:]
+        if len(RUN_HISTORY) > int(RUN_HISTORY_SESSION_LIMIT):
+            ranked = sorted(
+                RUN_HISTORY.items(),
+                key=lambda kv: str(((kv[1] or [{}])[0] or {}).get("ts") or ""),
+                reverse=True,
+            )
+            keep = {k for k, _ in ranked[: int(RUN_HISTORY_SESSION_LIMIT)]}
+            for sid in list(RUN_HISTORY.keys()):
+                if sid not in keep:
+                    RUN_HISTORY.pop(sid, None)
+        # Compact old finished job payloads to avoid keeping large chart datasets in RAM.
+        cutoff = now - float(RUN_JOB_RESULT_TTL_SEC)
+        for rec in JOBS.values():
+            if not isinstance(rec, dict):
+                continue
+            status = str(rec.get("status") or "")
+            if status not in {"done", "failed"}:
+                continue
+            finished_at = float(rec.get("finished_at") or rec.get("created_at") or 0.0)
+            if finished_at > 0.0 and finished_at <= cutoff:
+                _compact_job_result_inplace(rec)
+
+    with AUTH_LOCK:
+        # Nonces are short-lived by design.
+        for sid, rec in list(AUTH_NONCES.items()):
+            ts = float((rec or {}).get("issued_at_ts") or 0.0)
+            if ts <= 0.0 or (now - ts) > float(AUTH_NONCE_TTL_SEC):
+                AUTH_NONCES.pop(sid, None)
+        # Session cleanup is required on long-running instances.
+        for sid, rec in list(AUTH_SESSIONS.items()):
+            base_ts = float((rec or {}).get("last_seen_ts") or (rec or {}).get("authenticated_at_ts") or 0.0)
+            if base_ts <= 0.0 or (now - base_ts) > float(SESSION_TTL_SEC):
+                AUTH_SESSIONS.pop(sid, None)
+
+    with TOKEN_PRICE_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            TOKEN_PRICE_CACHE,
+            limit=int(TOKEN_PRICE_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=float(PRICE_CACHE_TTL_SEC),
+            ts_getter=lambda v: (v or (0.0, 0.0))[0],
+        )
+    with TOKEN_SYMBOL_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            TOKEN_SYMBOL_CACHE,
+            limit=int(TOKEN_SYMBOL_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=None,
+            ts_getter=None,
+        )
+    with CONTRACT_CREATION_DATE_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            CONTRACT_CREATION_DATE_CACHE,
+            limit=int(CONTRACT_CREATION_DATE_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=None,
+            ts_getter=None,
+        )
+    with POSITION_CREATION_DATE_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            POSITION_CREATION_DATE_CACHE,
+            limit=int(POSITION_CREATION_DATE_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=None,
+            ts_getter=None,
+        )
+    with EXPLORER_NFT_META_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            EXPLORER_NFT_META_CACHE,
+            limit=int(EXPLORER_NFT_META_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=None,
+            ts_getter=None,
+        )
+    with POSITION_CONTRACT_SNAPSHOT_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            POSITION_CONTRACT_SNAPSHOT_CACHE,
+            limit=int(POSITION_CONTRACT_SNAPSHOT_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=float(POSITION_CONTRACT_SNAPSHOT_TTL_SEC),
+            ts_getter=lambda v: (v or (0.0, {}))[0],
+        )
+    with COINGECKO_RANGE_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            COINGECKO_RANGE_CACHE,
+            limit=int(COINGECKO_RANGE_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=float(FEE_SERIES_CACHE_TTL_SEC),
+            ts_getter=lambda v: (v or (0.0, []))[0],
+        )
+    with POOL_TVL_SERIES_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            POOL_TVL_SERIES_CACHE,
+            limit=int(POOL_TVL_SERIES_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=float(FEE_SERIES_CACHE_TTL_SEC),
+            ts_getter=lambda v: (v or (0.0, []))[0],
+        )
+    with POOL_VOLUME_SERIES_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            POOL_VOLUME_SERIES_CACHE,
+            limit=int(POOL_VOLUME_SERIES_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=float(FEE_SERIES_CACHE_TTL_SEC),
+            ts_getter=lambda v: (v or (0.0, []))[0],
+        )
+    with POSITION_SNAPSHOT_SERIES_CACHE_LOCK:
+        _prune_mapping_by_limit_and_ttl(
+            POSITION_SNAPSHOT_SERIES_CACHE,
+            limit=int(POSITION_SNAPSHOT_SERIES_CACHE_LIMIT),
+            now_ts=now,
+            ttl_sec=float(FEE_SERIES_CACHE_TTL_SEC),
+            ts_getter=lambda v: (v or (0.0, []))[0],
+        )
 
 
 def _logs_indicate_incomplete_discovery(logs: list[str]) -> bool:
@@ -26039,6 +26222,8 @@ def auth_verify(req: AuthVerifyRequest, request: Request, response: Response) ->
         "wallet": (req.wallet or pending.get("wallet") or "injected")[:32],
         "chain_id": int(req.chain_id or pending.get("chain_id") or 1),
         "authenticated_at": _iso_now(),
+        "authenticated_at_ts": time.time(),
+        "last_seen_ts": time.time(),
     }
     with AUTH_LOCK:
         AUTH_NONCES.pop(sid, None)
@@ -32256,18 +32441,14 @@ HTML_PAGE = """
         if (!visibilityMap[poolId]) continue;
         const estFees = Array.isArray(s.strict_compare_estimated_fees) ? s.strict_compare_estimated_fees : [];
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
-        const exLegacyFees = Array.isArray(s.strict_compare_exact_legacy_fees) ? s.strict_compare_exact_legacy_fees : [];
-        const exLegacyTvl = Array.isArray(s.strict_compare_exact_legacy_tvl) ? s.strict_compare_exact_legacy_tvl : [];
         const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
         const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
-        const useStrictCompare = strictMode && (estFees.length || estTvl.length || exLegacyFees.length || exLegacyTvl.length || exFees.length || exTvl.length);
+        const useStrictCompare = strictMode && (estFees.length || estTvl.length || exFees.length || exTvl.length);
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
           ...((s.tvl || []).map(p => Number(p[0] || 0))),
           ...(estFees.map(p => Number(p?.[0] || 0))),
           ...(estTvl.map(p => Number(p?.[0] || 0))),
-          ...(exLegacyFees.map(p => Number(p?.[0] || 0))),
-          ...(exLegacyTvl.map(p => Number(p?.[0] || 0))),
           ...(exFees.map(p => Number(p?.[0] || 0))),
           ...(exTvl.map(p => Number(p?.[0] || 0))),
           0
@@ -32280,18 +32461,13 @@ HTML_PAGE = """
           const estTvlSrc = estTvl.length ? estTvl : (Array.isArray(s.tvl) ? s.tvl : []);
           const estFeeX = estFeesSrc.map(p => new Date(p[0] * 1000));
           const estFeeY = estFeesSrc.map(p => p[1]);
-          const exLegacyFeeX = exLegacyFees.map(p => new Date(p[0] * 1000));
-          const exLegacyFeeY = exLegacyFees.map(p => p[1]);
           const exFeeX = exFees.map(p => new Date(p[0] * 1000));
           const exFeeY = exFees.map(p => p[1]);
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
-          const exLegacyTvlX = exLegacyTvl.map(p => new Date(p[0] * 1000));
-          const exLegacyTvlY = exLegacyTvl.map(p => p[1] / 1000.0);
           const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
           const exTvlY = exTvl.map(p => p[1] / 1000.0);
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
-          const exLegacyHover = exLegacyFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact legacy"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact2.0"]);
           if (estFeeX.length) {
             feeTraces.push({
@@ -32307,15 +32483,7 @@ HTML_PAGE = """
               line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
             });
           }
-          if (exLegacyFeeX.length) {
-            feeTraces.push({
-              x: exLegacyFeeX, y: exLegacyFeeY, mode: "lines", name: `${s.label} (exact legacy)`, customdata: exLegacyHover,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: "#a855f7", width: 2.0, dash: "dash"}
-            });
-          }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
-          const exLegacyHoverTvl = exLegacyTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact legacy"]);
           const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact2.0"]);
           if (estTvlX.length) {
             tvlTraces.push({
@@ -32329,13 +32497,6 @@ HTML_PAGE = """
               x: exTvlX, y: exTvlY, mode: "lines", name: `${s.label} (exact2.0)`, customdata: exHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
-            });
-          }
-          if (exLegacyTvlX.length) {
-            tvlTraces.push({
-              x: exLegacyTvlX, y: exLegacyTvlY, mode: "lines", name: `${s.label} (exact legacy)`, customdata: exLegacyHoverTvl,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: "#a855f7", width: 2.0, dash: "dash"}
             });
           }
         } else {
