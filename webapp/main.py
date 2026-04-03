@@ -17938,6 +17938,7 @@ def _merge_for_web(
             "apy_pct": float(apy_pct),
             "last_tvl": pool_tvl_now_usd,
             "data_quality": str(v.get("data_quality") or "estimated"),
+            "data_quality_reason": str(v.get("data_quality_reason") or ""),
             "status": status,
         }
         rows.append(row)
@@ -31890,7 +31891,10 @@ HTML_PAGE = """
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
-        html += `<td>${escAttr(r.data_quality || "estimated")}</td>`;
+        const dq = String(r.data_quality || "estimated");
+        const dqReason = String(r.data_quality_reason || "");
+        const dqTitle = dqReason ? ` title="${escAttr(dqReason)}"` : "";
+        html += `<td${dqTitle}>${escAttr(dq)}</td>`;
         const statusLabel = r.status === "ok"
           ? "ok"
           : (r.status === "filtered_suffix" ? "excluded by suffix" : "filtered by fee range");
@@ -31925,7 +31929,7 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "data_quality", "status"];
+      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "data_quality", "data_quality_reason", "status"];
       const lines = [headers.join(",")];
       for (const r of rows) {
         const vals = headers.map(h => {

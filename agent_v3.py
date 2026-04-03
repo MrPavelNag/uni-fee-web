@@ -82,11 +82,11 @@ V3_EXACT_TVL_CHAINS = {
     for c in str(os.environ.get("V3_EXACT_TVL_CHAINS", "ethereum")).split(",")
     if c.strip()
 }
-V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 3))
+V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 1))
 # By default exact-days cap follows the same history window as agent day-data (FEE_DAYS),
 # i.e. the value selected in UI "History days".
 V3_EXACT_TVL_DAYS_MAX = max(1, _env_int("V3_EXACT_TVL_DAYS_MAX", int(FEE_DAYS)))
-V3_EXACT_TVL_POOL_BUDGET_SEC = max(2.0, _env_float("V3_EXACT_TVL_POOL_BUDGET_SEC", 12.0))
+V3_EXACT_TVL_POOL_BUDGET_SEC = max(2.0, _env_float("V3_EXACT_TVL_POOL_BUDGET_SEC", 90.0))
 V3_EXACT_TVL_DEBUG = _env_flag("V3_EXACT_TVL_DEBUG", False)
 
 CHAIN_ID_BY_KEY: dict[str, int] = {
@@ -860,22 +860,22 @@ def _build_exact_tvl_series_v3(
     day_start_ts: int,
     day_end_ts: int,
     budget_sec: float,
-) -> list[tuple[int, float]]:
+) -> tuple[list[tuple[int, float]], str]:
     if not fees_usd:
-        return []
+        return [], "no_fees_series"
     ck = str(chain or "").strip().lower()
     if ck not in V3_EXACT_TVL_CHAINS:
-        return []
+        return [], "chain_not_enabled"
     if len(fees_usd) > int(V3_EXACT_TVL_DAYS_MAX):
-        return []
+        return [], "days_cap"
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
-        return []
+        return [], "chain_id_unknown"
     pool_id = str(pool.get("id") or "").strip().lower()
     t0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
     t1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
     if not (_is_eth_address(pool_id) and _is_eth_address(t0) and _is_eth_address(t1)):
-        return []
+        return [], "pool_or_tokens_not_address"
 
     t0_dec = _erc20_decimals(chain_id, t0)
     t1_dec = _erc20_decimals(chain_id, t1)
@@ -883,7 +883,7 @@ def _build_exact_tvl_series_v3(
     t_started = time.perf_counter()
     for ts, _ in fees_usd:
         if (time.perf_counter() - t_started) > float(max(1.0, budget_sec)):
-            return []
+            return [], "budget_timeout"
         dts = int((int(ts) // 86400) * 86400)
         try:
             block_num = _llama_block_for_day(ck, int(dts + 86399))
@@ -897,8 +897,8 @@ def _build_exact_tvl_series_v3(
             out.append((int(ts), 0.0))
     non_zero = len([1 for _ts, v in out if float(v) > 0.0])
     if non_zero < max(3, int(len(out) * 0.6)):
-        return []
-    return out
+        return [], "insufficient_non_zero_days"
+    return out, "ok"
 
 
 def save_pdf(pools: list[dict], path: str) -> None:
@@ -1007,6 +1007,7 @@ def main() -> None:
         data["fees"] = []
         data["tvl"] = []
         tvl_quality = "estimated"
+        tvl_quality_reason = "default_scaled"
         try:
             fees_usd = data.get("_fees_usd") or []
             raw_tvl = data.get("_raw_tvl_usd") or []
@@ -1022,7 +1023,7 @@ def main() -> None:
                     if take_slot:
                         day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
                         day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
-                        exact_series = _build_exact_tvl_series_v3(
+                        exact_series, exact_reason = _build_exact_tvl_series_v3(
                             chain=str(chain),
                             pool=pool,
                             fees_usd=fees_usd,
@@ -1034,6 +1035,11 @@ def main() -> None:
                             tvl_series = exact_series
                             exact_used = True
                             tvl_quality = "exact"
+                            tvl_quality_reason = "ok"
+                        else:
+                            tvl_quality_reason = f"exact_failed:{exact_reason}"
+                    else:
+                        tvl_quality_reason = "exact_skipped:no_slots"
                 if raw_tvl and len(raw_tvl) == len(fees_usd):
                     if not exact_used:
                         anchor = 0.0
@@ -1053,6 +1059,8 @@ def main() -> None:
                                     day_tvl = float(pool_tvl_now_usd)
                                 shaped.append((int(ts), float(day_tvl)))
                             tvl_series = shaped
+                            if tvl_quality_reason == "default_scaled":
+                                tvl_quality_reason = "scaled_by_raw_tvl"
                 data["tvl"] = tvl_series
                 cumul = 0.0
                 fees_rebuilt = []
@@ -1083,10 +1091,11 @@ def main() -> None:
             "chain": chain,
             "version": "v3",
             "data_quality": tvl_quality,
+            "data_quality_reason": tvl_quality_reason,
         }
         msg = f"  [{idx+1}/{len(pools)}] {chain} {pair}: {len(data.get('fees') or [])} days"
         if V3_EXACT_TVL_DEBUG:
-            msg += f" | quality={tvl_quality}"
+            msg += f" | quality={tvl_quality} reason={tvl_quality_reason}"
         return idx, pool_id, payload, msg
 
     if pools:
