@@ -30425,8 +30425,8 @@ HTML_PAGE = """
     
     .inline-grid {
       display: grid;
-      grid-template-columns: repeat(8, minmax(0, 1fr));
-      gap: 8px;
+      grid-template-columns: repeat(7, minmax(0, 1fr)) minmax(220px, 1.8fr);
+      gap: 6px;
       align-items: end;
       justify-content: start;
     }
@@ -30435,11 +30435,11 @@ HTML_PAGE = """
       width: 100%;
       min-width: 0;
       max-width: none;
-      height: 42px;
+      height: 38px;
     }
     .filter-item .hint {
-      margin-bottom: 4px !important;
-      min-height: 34px;
+      margin-bottom: 3px !important;
+      min-height: 30px;
       display: flex;
       align-items: flex-end;
       line-height: 1.15;
@@ -30455,8 +30455,8 @@ HTML_PAGE = """
       gap: 8px;
       align-items: center;
       width: 100%;
-      height: 42px;
-      padding: 0 8px;
+      height: 38px;
+      padding: 0 6px;
       border: 1px solid #cbd5e1;
       border-radius: 8px;
       background: #f8fbff;
@@ -30467,7 +30467,7 @@ HTML_PAGE = """
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 700;
       color: #334155;
       padding-top: 0;
@@ -30483,7 +30483,7 @@ HTML_PAGE = """
       accent-color: #2563eb;
       transform: translateY(-1px);
     }
-    @media (max-width: 1400px) {
+    @media (max-width: 1500px) {
       .inline-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     }
     @media (max-width: 980px) {
@@ -30728,8 +30728,8 @@ HTML_PAGE = """
                 <div class="filter-item mode-item">
                   <div class="hint">Calculation<br/>mode</div>
                   <div class="proto-checks">
-                    <label><input id="modeFastLegacy" type="checkbox" checked onchange="syncRunModes('fast')"/> Fast legacy</label>
-                    <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Strict exact</label>
+                    <label><input id="modeFastLegacy" type="checkbox" checked onchange="syncRunModes('fast')"/> Estimated</label>
+                    <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Exact</label>
                   </div>
                 </div>
                 <div class="filter-item contract-item">
@@ -32043,7 +32043,7 @@ HTML_PAGE = """
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
-        showlegend: strictMode,
+        showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
@@ -32055,7 +32055,7 @@ HTML_PAGE = """
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
-        showlegend: strictMode,
+        showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}

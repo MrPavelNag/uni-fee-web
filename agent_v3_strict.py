@@ -51,9 +51,63 @@ def _query_pool_by_id(endpoint: str, pool_id: str) -> dict | None:
       }
     }
     """
-    data = graphql_query(endpoint, q, {"id": str(pool_id).lower()}, retries=1)
-    pool = (data.get("data") or {}).get("pool")
-    return pool if isinstance(pool, dict) and str(pool.get("id") or "") else None
+    pid = str(pool_id).lower()
+    try:
+        data = graphql_query(endpoint, q, {"id": pid}, retries=1)
+        pool = (data.get("data") or {}).get("pool")
+        if isinstance(pool, dict) and str(pool.get("id") or ""):
+            return pool
+    except Exception:
+        pass
+    # Fallback for indexers where singular entity resolver is flaky.
+    q2 = """
+    query PoolByWhere($id: String!) {
+      pools(where: { id: $id }, first: 1) {
+        id
+        feeTier
+        token0 { id symbol decimals name }
+        token1 { id symbol decimals name }
+        totalValueLockedUSD
+        totalValueLockedToken0
+        totalValueLockedToken1
+        volumeUSD
+        feesUSD
+      }
+    }
+    """
+    try:
+        data2 = graphql_query(endpoint, q2, {"id": pid}, retries=1)
+        rows = (data2.get("data") or {}).get("pools") or []
+        if isinstance(rows, list) and rows:
+            p = rows[0]
+            if isinstance(p, dict) and str(p.get("id") or ""):
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> dict:
+    return {
+        "fees": [],
+        "tvl": [],
+        "pool_id": str(pool_id or ""),
+        "fee_pct": 0.0,
+        "raw_fee_tier": 0,
+        "pool_tvl_now_usd": 0.0,
+        "pool_tvl_subgraph_usd": 0.0,
+        "tvl_multiplier": 1.0,
+        "tvl_price_source": "",
+        "pair": "target_pool",
+        "chain": str(chain or ""),
+        "version": "v3",
+        "data_quality": "strict_unavailable",
+        "data_quality_reason": str(reason or "strict_required:unknown"),
+        "strict_compare_estimated_tvl": [],
+        "strict_compare_estimated_fees": [],
+        "strict_compare_exact_tvl": [],
+        "strict_compare_exact_fees": [],
+    }
 
 
 def _compute_fee_and_raw_tvl(pool_id: str, endpoint: str) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
@@ -121,7 +175,7 @@ def main() -> None:
 
     if not target_pool:
         print("TARGET_POOL_ID is required for strict agent")
-        save_chart_data_json({}, out_path)
+        save_chart_data_json({"strict_target": _strict_unavailable_payload("", "strict_required:missing_target_pool_id")}, out_path)
         return
     os.environ["V3_EXACT_TVL_ENABLE"] = "1"
     os.environ["V3_EXACT_TVL_STRICT_MODE"] = "1"
@@ -150,7 +204,7 @@ def main() -> None:
 
     if not found_pool:
         print("Pool not found on selected chains")
-        save_chart_data_json({}, out_path)
+        save_chart_data_json({target_pool: _strict_unavailable_payload(target_pool, "strict_required:pool_not_found_on_selected_chains")}, out_path)
         return
 
     pool = dict(found_pool)
@@ -163,7 +217,16 @@ def main() -> None:
     pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, found_chain)
     if float(pool_tvl_now_usd) <= 0:
         print(f"external TVL unavailable: {price_err or 'unknown'}")
-        save_chart_data_json({}, out_path)
+        save_chart_data_json(
+            {
+                str(pool.get("id") or target_pool): _strict_unavailable_payload(
+                    str(pool.get("id") or target_pool),
+                    f"strict_required:external_tvl_unavailable:{price_err or 'unknown'}",
+                    found_chain,
+                )
+            },
+            out_path,
+        )
         return
     pool["effectiveTvlUSD"] = float(pool_tvl_now_usd)
     pool["tvl_price_source"] = str(price_source or "external")
@@ -171,7 +234,16 @@ def main() -> None:
     fees_usd, raw_tvl = _compute_fee_and_raw_tvl(str(pool.get("id") or ""), found_endpoint)
     if not fees_usd:
         print("No day-level data for pool")
-        save_chart_data_json({}, out_path)
+        save_chart_data_json(
+            {
+                str(pool.get("id") or target_pool): _strict_unavailable_payload(
+                    str(pool.get("id") or target_pool),
+                    "strict_required:no_day_data",
+                    found_chain,
+                )
+            },
+            out_path,
+        )
         return
 
     estimated_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
