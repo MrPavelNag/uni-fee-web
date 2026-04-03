@@ -10,7 +10,7 @@ import argparse
 import os
 import time
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -23,6 +23,7 @@ from config import (
     V4_CHAINS,
 )
 from agent_common import (
+    build_exact_day_window,
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
@@ -342,11 +343,8 @@ def query_pool_day_data(endpoint: str, pool_id: str, start_ts: int, end_ts: int)
 
 def compute_fee_series(pool: dict, endpoint: str) -> dict:
     """Load day-level fees; TVL/income are rebuilt from external TVL later."""
-    end = datetime.utcnow()
-    start = end - timedelta(days=FEE_DAYS)
-    # v4 subgraph: use Unix timestamps (same as v3)
-    start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    # Exact inclusive window of FEE_DAYS calendar days (UTC day starts).
+    start_ts, end_ts = build_exact_day_window(int(FEE_DAYS))
 
     rows = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
     fees_usd_series = []

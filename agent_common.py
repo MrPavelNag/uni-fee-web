@@ -80,6 +80,17 @@ def pairs_to_filename_suffix(token_pairs_str: str) -> str:
     return "_".join(unique) or "fluid_eth"
 
 
+def build_exact_day_window(days: int) -> tuple[int, int]:
+    """
+    Return [start_ts, end_ts] aligned to UTC day starts with an inclusive range
+    containing exactly `days` calendar days.
+    """
+    d = max(1, int(days or 1))
+    end_day_start = int(datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    start_day_start = int(end_day_start - (d - 1) * 86400)
+    return int(start_day_start), int(end_day_start)
+
+
 def load_dynamic_tokens() -> dict:
     """Load chain->symbol->address from data/dynamic_tokens.json."""
     if os.path.isfile(DYNAMIC_TOKENS_PATH):

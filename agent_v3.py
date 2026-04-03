@@ -13,7 +13,7 @@ import os
 import threading
 import time
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -27,6 +27,7 @@ from config import (
 )
 
 from agent_common import (
+    build_exact_day_window,
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
@@ -928,11 +929,8 @@ def discover_pools_v3(
 
 def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
     """Load day-level fees; TVL/income are rebuilt from external TVL later."""
-    end = datetime.utcnow()
-    start = end - timedelta(days=FEE_DAYS)
-    # v3 subgraph expects Unix timestamps for date_gte/date_lte
-    start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    # Exact inclusive window of FEE_DAYS calendar days (UTC day starts).
+    start_ts, end_ts = build_exact_day_window(int(FEE_DAYS))
 
     if str(pool.get("_base_schema") or "") == "goldsky_v3_alt":
         day_data = _query_base_v3_goldsky_day_data(endpoint, pool["id"], start_ts, end_ts)

@@ -11,11 +11,11 @@ Strict single-pool v3 agent.
 import argparse
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from config import DEFAULT_TOKEN_PAIRS, FEE_DAYS, LP_ALLOCATION_USD, UNISWAP_V3_SUBGRAPHS
-from agent_common import pairs_to_filename_suffix, resolve_pool_tvl_now_external, save_chart_data_json
+from agent_common import build_exact_day_window, pairs_to_filename_suffix, resolve_pool_tvl_now_external, save_chart_data_json
 from uniswap_client import get_graph_endpoint, graphql_query, query_pool_day_data
 from agent_v3 import (
     CHAIN_ID_BY_KEY,
@@ -145,10 +145,7 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> d
 
 
 def _compute_fee_and_raw_tvl(pool_id: str, endpoint: str) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
-    end = datetime.utcnow()
-    start = end - timedelta(days=FEE_DAYS)
-    start_ts = int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    end_ts = int(end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    start_ts, end_ts = build_exact_day_window(int(FEE_DAYS))
     day_data = query_pool_day_data(endpoint, pool_id, start_ts, end_ts)
     fees_usd: list[tuple[int, float]] = []
     raw_tvl: list[tuple[int, float]] = []
