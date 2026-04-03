@@ -89,6 +89,10 @@ V3_EXACT_TVL_DAYS_MAX = max(1, _env_int("V3_EXACT_TVL_DAYS_MAX", int(FEE_DAYS)))
 V3_EXACT_TVL_POOL_BUDGET_SEC = max(2.0, _env_float("V3_EXACT_TVL_POOL_BUDGET_SEC", 90.0))
 V3_EXACT_TVL_MIN_COVERAGE_EXACT = min(1.0, max(0.0, _env_float("V3_EXACT_TVL_MIN_COVERAGE_EXACT", 0.98)))
 V3_EXACT_TVL_MIN_COVERAGE_PARTIAL = min(1.0, max(0.0, _env_float("V3_EXACT_TVL_MIN_COVERAGE_PARTIAL", 0.25)))
+V3_EXACT_TVL_PROBE_DAYS = max(1, _env_int("V3_EXACT_TVL_PROBE_DAYS", 6))
+V3_EXACT_TVL_SPARSE_POINTS = max(3, _env_int("V3_EXACT_TVL_SPARSE_POINTS", 9))
+V3_EXACT_TVL_SPARSE_MIN_SUCCESS = min(1.0, max(0.0, _env_float("V3_EXACT_TVL_SPARSE_MIN_SUCCESS", 0.45)))
+V3_EXACT_TVL_SPARSE_MAX_SCALE = max(1.0, _env_float("V3_EXACT_TVL_SPARSE_MAX_SCALE", 4.0))
 V3_EXACT_TVL_DEBUG = _env_flag("V3_EXACT_TVL_DEBUG", False)
 
 CHAIN_ID_BY_KEY: dict[str, int] = {
@@ -298,6 +302,48 @@ def _balance_of_raw(chain_id: int, token: str, owner: str, block_num: int) -> in
     data = "0x70a08231" + str(owner).strip().lower().replace("0x", "").rjust(64, "0")
     out = _rpc_eth_call_hex(int(chain_id), str(token), data, hex(int(block_num)), timeout_sec=8.0)
     return int(_decode_uint_hex(out))
+
+
+def _sample_sparse_indices(total: int, points: int) -> list[int]:
+    n = int(max(0, total))
+    if n <= 0:
+        return []
+    if n <= 2:
+        return list(range(n))
+    k = int(max(2, min(int(points), n)))
+    if k >= n:
+        return list(range(n))
+    idxs = {0, n - 1}
+    if k > 2:
+        step = float(n - 1) / float(k - 1)
+        for i in range(1, k - 1):
+            idxs.add(int(round(i * step)))
+    return sorted(int(min(n - 1, max(0, x))) for x in idxs)
+
+
+def _interpolate_scales(total: int, anchors: list[tuple[int, float]]) -> list[float]:
+    n = int(max(0, total))
+    if n <= 0:
+        return []
+    if not anchors:
+        return [1.0] * n
+    pts = sorted((int(i), float(s)) for i, s in anchors)
+    out = [1.0] * n
+    first_i, first_s = pts[0]
+    for i in range(0, min(n, max(0, first_i))):
+        out[i] = first_s
+    for j in range(len(pts) - 1):
+        i0, s0 = pts[j]
+        i1, s1 = pts[j + 1]
+        if i1 <= i0:
+            continue
+        for i in range(max(0, i0), min(n, i1 + 1)):
+            t = float(i - i0) / float(max(1, i1 - i0))
+            out[i] = float(s0 + (s1 - s0) * t)
+    last_i, last_s = pts[-1]
+    for i in range(max(0, last_i), n):
+        out[i] = last_s
+    return out
 
 
 def _cap_pools(pools: list[dict], max_per_pair_chain: int, max_total: int) -> list[dict]:
@@ -859,12 +905,15 @@ def _build_exact_tvl_series_v3(
     chain: str,
     pool: dict,
     fees_usd: list[tuple[int, float]],
+    baseline_tvl: list[tuple[int, float]],
     day_start_ts: int,
     day_end_ts: int,
     budget_sec: float,
 ) -> tuple[list[tuple[int, float]], str, float]:
     if not fees_usd:
         return [], "no_fees_series", 0.0
+    if not baseline_tvl or len(baseline_tvl) != len(fees_usd):
+        return [], "baseline_mismatch", 0.0
     ck = str(chain or "").strip().lower()
     if ck not in V3_EXACT_TVL_CHAINS:
         return [], "chain_not_enabled", 0.0
@@ -879,13 +928,20 @@ def _build_exact_tvl_series_v3(
 
     t0_dec = _erc20_decimals(chain_id, t0)
     t1_dec = _erc20_decimals(chain_id, t1)
-    out: list[tuple[int, float]] = []
+    total_days = len(fees_usd)
+    sparse_idxs = _sample_sparse_indices(total_days, int(V3_EXACT_TVL_SPARSE_POINTS))
+    if not sparse_idxs:
+        return [], "no_sparse_points", 0.0
+    probe_days = min(int(V3_EXACT_TVL_PROBE_DAYS), len(sparse_idxs))
+    points: list[tuple[int, float, float]] = []  # idx, exact_tvl, baseline_tvl
+    non_zero = 0
     timed_out = False
     t_started = time.perf_counter()
-    for ts, _ in fees_usd:
+    for idx in sparse_idxs:
         if (time.perf_counter() - t_started) > float(max(1.0, budget_sec)):
             timed_out = True
             break
+        ts, _ = fees_usd[idx]
         dts = int((int(ts) // 86400) * 86400)
         try:
             block_num = _llama_block_for_day(ck, int(dts + 86399))
@@ -894,18 +950,45 @@ def _build_exact_tvl_series_v3(
             p0 = _historical_price_usd(ck, t0, dts, day_start_ts, day_end_ts)
             p1 = _historical_price_usd(ck, t1, dts, day_start_ts, day_end_ts)
             tvl = max(0.0, float(b0) * max(0.0, float(p0))) + max(0.0, float(b1) * max(0.0, float(p1)))
-            out.append((int(ts), float(tvl)))
+            base_v = float(baseline_tvl[idx][1] or 0.0)
+            points.append((int(idx), float(tvl), float(base_v)))
+            if float(tvl) > 0.0:
+                non_zero += 1
         except Exception:
-            out.append((int(ts), 0.0))
-    if not out:
+            base_v = float(baseline_tvl[idx][1] or 0.0)
+            points.append((int(idx), 0.0, float(base_v)))
+        processed = len(points)
+        if processed >= probe_days and non_zero <= 0:
+            return [], "insufficient_non_zero_days_probe", 0.0
+        remaining = max(0, len(sparse_idxs) - processed)
+        max_possible_success = float(non_zero + remaining) / float(max(1, len(sparse_idxs)))
+        if max_possible_success < float(V3_EXACT_TVL_SPARSE_MIN_SUCCESS):
+            current_success = float(non_zero) / float(max(1, processed))
+            return [], "insufficient_sparse_success_impossible", float(current_success)
+    if not points:
         return [], ("budget_timeout" if timed_out else "insufficient_non_zero_days"), 0.0
-    non_zero = len([1 for _ts, v in out if float(v) > 0.0])
-    coverage = float(non_zero) / float(max(1, len(out)))
+    sparse_success = float(non_zero) / float(max(1, len(points)))
     if non_zero <= 0:
-        return [], ("budget_timeout" if timed_out else "insufficient_non_zero_days"), float(coverage)
-    if coverage < float(V3_EXACT_TVL_MIN_COVERAGE_PARTIAL):
-        return [], ("budget_timeout" if timed_out else "insufficient_non_zero_days"), float(coverage)
-    return out, ("budget_timeout_partial" if timed_out else "ok"), float(coverage)
+        return [], ("budget_timeout" if timed_out else "insufficient_non_zero_days"), float(sparse_success)
+    if sparse_success < float(V3_EXACT_TVL_SPARSE_MIN_SUCCESS):
+        return [], ("budget_timeout" if timed_out else "insufficient_sparse_success"), float(sparse_success)
+    max_scale = float(V3_EXACT_TVL_SPARSE_MAX_SCALE)
+    min_scale = 1.0 / max(1.0, max_scale)
+    anchors: list[tuple[int, float]] = []
+    for i, ex_v, base_v in points:
+        if ex_v <= 0.0 or base_v <= 0.0:
+            continue
+        scale = max(min_scale, min(max_scale, float(ex_v) / float(base_v)))
+        anchors.append((int(i), float(scale)))
+    if not anchors:
+        return [], "insufficient_scale_anchors", float(sparse_success)
+    scales = _interpolate_scales(total_days, anchors)
+    out: list[tuple[int, float]] = []
+    for i, (ts, _) in enumerate(fees_usd):
+        base_v = float(baseline_tvl[i][1] or 0.0)
+        out.append((int(ts), max(0.0, float(base_v) * float(scales[i]))))
+    reason = "sparse_budget_partial" if timed_out else "sparse_ok"
+    return out, reason, float(sparse_success)
 
 
 def save_pdf(pools: list[dict], path: str) -> None:
@@ -1042,58 +1125,65 @@ def main() -> None:
                             tvl_quality_reason = "scaled_by_raw_tvl"
                 exact_used = False
                 if V3_EXACT_TVL_ENABLE and str(chain).strip().lower() in V3_EXACT_TVL_CHAINS and fees_usd:
-                    take_slot = False
-                    slot_reserved = False
-                    with exact_slots_lock:
-                        if exact_slots_left > 0:
-                            exact_slots_left -= 1
-                            take_slot = True
-                            slot_reserved = True
-                    if take_slot:
-                        exact_days = max(1, int(V3_EXACT_TVL_DAYS_MAX))
-                        fees_exact = fees_usd[-min(len(fees_usd), exact_days):]
-                        day_start_ts = int((int(fees_exact[0][0]) // 86400) * 86400)
-                        day_end_ts = int((int(fees_exact[-1][0]) // 86400) * 86400)
-                        exact_series, exact_reason, exact_cov = _build_exact_tvl_series_v3(
-                            chain=str(chain),
-                            pool=pool,
-                            fees_usd=fees_exact,
-                            day_start_ts=day_start_ts,
-                            day_end_ts=day_end_ts,
-                            budget_sec=float(V3_EXACT_TVL_POOL_BUDGET_SEC),
-                        )
-                        if exact_series and len(exact_series) == len(fees_exact):
-                            merged_exact = list(tvl_series)
-                            exact_points = 0
-                            exact_start = len(fees_usd) - len(fees_exact)
-                            for i, (ts, ex_v) in enumerate(exact_series):
-                                tvl_idx = exact_start + i
-                                if float(ex_v) > 0:
-                                    exact_points += 1
-                                    merged_exact[tvl_idx] = (int(ts), float(ex_v))
-                                else:
-                                    merged_exact[tvl_idx] = (
-                                        int(ts),
-                                        float(tvl_series[tvl_idx][1] if tvl_idx < len(tvl_series) else pool_tvl_now_usd),
-                                    )
-                            coverage = float(exact_points) / float(max(1, len(exact_series)))
-                            tvl_series = merged_exact
-                            exact_used = True
-                            full_window = len(fees_exact) == len(fees_usd)
-                            if full_window and coverage >= float(V3_EXACT_TVL_MIN_COVERAGE_EXACT) and exact_points == len(exact_series):
-                                tvl_quality = "exact"
-                                tvl_quality_reason = "ok"
-                            else:
-                                tvl_quality = "exact_partial"
-                                tvl_quality_reason = f"partial_coverage:{coverage:.2f}"
-                        else:
-                            tvl_quality_reason = f"exact_failed:{exact_reason}:{exact_cov:.2f}"
-                        # Return exact slot when no exact data was produced for this pool.
-                        if slot_reserved and not exact_used:
-                            with exact_slots_lock:
-                                exact_slots_left += 1
+                    chain_id = int(CHAIN_ID_BY_KEY.get(str(chain).strip().lower(), 0) or 0)
+                    rpc_ready = bool(chain_id > 0 and _rpc_urls(chain_id))
+                    if not rpc_ready:
+                        tvl_quality_reason = "exact_skipped:no_rpc_urls"
                     else:
-                        tvl_quality_reason = "exact_skipped:no_slots"
+                        take_slot = False
+                        slot_reserved = False
+                        with exact_slots_lock:
+                            if exact_slots_left > 0:
+                                exact_slots_left -= 1
+                                take_slot = True
+                                slot_reserved = True
+                        if take_slot:
+                            exact_days = max(1, int(V3_EXACT_TVL_DAYS_MAX))
+                            fees_exact = fees_usd[-min(len(fees_usd), exact_days):]
+                            day_start_ts = int((int(fees_exact[0][0]) // 86400) * 86400)
+                            day_end_ts = int((int(fees_exact[-1][0]) // 86400) * 86400)
+                            exact_series, exact_reason, exact_cov = _build_exact_tvl_series_v3(
+                                chain=str(chain),
+                                pool=pool,
+                                fees_usd=fees_exact,
+                                baseline_tvl=tvl_series[-len(fees_exact):],
+                                day_start_ts=day_start_ts,
+                                day_end_ts=day_end_ts,
+                                budget_sec=float(V3_EXACT_TVL_POOL_BUDGET_SEC),
+                            )
+                            if exact_series and len(exact_series) == len(fees_exact):
+                                merged_exact = list(tvl_series)
+                                exact_points = 0
+                                exact_start = len(fees_usd) - len(fees_exact)
+                                for i, (ts, ex_v) in enumerate(exact_series):
+                                    tvl_idx = exact_start + i
+                                    if float(ex_v) > 0:
+                                        exact_points += 1
+                                        merged_exact[tvl_idx] = (int(ts), float(ex_v))
+                                    else:
+                                        merged_exact[tvl_idx] = (
+                                            int(ts),
+                                            float(tvl_series[tvl_idx][1] if tvl_idx < len(tvl_series) else pool_tvl_now_usd),
+                                        )
+                                coverage = float(exact_points) / float(max(1, len(exact_series)))
+                                tvl_series = merged_exact
+                                exact_used = True
+                                full_window = len(fees_exact) == len(fees_usd)
+                                full_exact_mode = not str(exact_reason).startswith("sparse_")
+                                if full_exact_mode and full_window and coverage >= float(V3_EXACT_TVL_MIN_COVERAGE_EXACT) and exact_points == len(exact_series):
+                                    tvl_quality = "exact"
+                                    tvl_quality_reason = "ok"
+                                else:
+                                    tvl_quality = "exact_partial"
+                                    tvl_quality_reason = f"{exact_reason}:{coverage:.2f}"
+                            else:
+                                tvl_quality_reason = f"exact_failed:{exact_reason}:{exact_cov:.2f}"
+                            # Return exact slot when no exact data was produced for this pool.
+                            if slot_reserved and not exact_used:
+                                with exact_slots_lock:
+                                    exact_slots_left += 1
+                        else:
+                            tvl_quality_reason = "exact_skipped:no_slots"
                 data["tvl"] = tvl_series
                 cumul = 0.0
                 fees_rebuilt = []
