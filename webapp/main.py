@@ -17908,6 +17908,19 @@ def _merge_for_web(
     default_visible = 0
     days_safe = max(1, int(days or 1))
     alloc_safe = float(lp_allocation_usd or 0.0)
+
+    def _align_series_end(series: list, end_ts: int) -> list:
+        arr = [x for x in (series or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+        if not arr:
+            return []
+        out = [(int(x[0]), float(x[1])) for x in arr]
+        if int(end_ts) <= 0:
+            return out
+        last_ts = int(out[-1][0])
+        last_val = float(out[-1][1])
+        if last_ts < int(end_ts):
+            out.append((int(end_ts), float(last_val)))
+        return out
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
@@ -17957,6 +17970,8 @@ def _merge_for_web(
         base_version = v.get("version", "")
         base_pair = v.get("pair", "")
         base_fee_pct = float(v.get("fee_pct") or 0)
+        legacy_reason = ""
+        exact2_reason = str(dq_reason or "")
         if has_strict_compare:
             est_fees = v.get("strict_compare_estimated_fees") or []
             est_tvl = v.get("strict_compare_estimated_tvl") or []
@@ -17964,6 +17979,27 @@ def _merge_for_web(
             ex_legacy_tvl = v.get("strict_compare_exact_legacy_tvl") or []
             ex_fees = v.get("strict_compare_exact_fees") or []
             ex_tvl = v.get("strict_compare_exact_tvl") or []
+            legacy_reason = str(v.get("strict_compare_exact_legacy_reason") or "strict_compare:exact_legacy")
+            exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact2.0")
+
+            tvl_end_ts = max(
+                [0]
+                + [int(x[0]) for x in (est_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (ex_legacy_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (ex_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+            )
+            fees_end_ts = max(
+                [0]
+                + [int(x[0]) for x in (est_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (ex_legacy_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (ex_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+            )
+            est_tvl = _align_series_end(est_tvl, tvl_end_ts)
+            ex_legacy_tvl = _align_series_end(ex_legacy_tvl, tvl_end_ts)
+            ex_tvl = _align_series_end(ex_tvl, tvl_end_ts)
+            est_fees = _align_series_end(est_fees, fees_end_ts)
+            ex_legacy_fees = _align_series_end(ex_legacy_fees, fees_end_ts)
+            ex_fees = _align_series_end(ex_fees, fees_end_ts)
 
             est_income = float(est_fees[-1][1]) if est_fees else 0.0
             est_apy = (est_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
@@ -17999,7 +18035,7 @@ def _merge_for_web(
                     "apy_pct": float(exact_legacy_apy),
                     "last_tvl": exact_legacy_last_tvl,
                     "data_quality": ("exact" if exact_legacy_full else "strict_unavailable"),
-                    "data_quality_reason": "strict_compare:exact_legacy",
+                    "data_quality_reason": legacy_reason,
                     "status": status,
                 }
             )
@@ -18019,7 +18055,7 @@ def _merge_for_web(
                     "apy_pct": float(exact_apy),
                     "last_tvl": exact_last_tvl,
                     "data_quality": ("exact" if exact_full else "strict_unavailable"),
-                    "data_quality_reason": (dq_reason if dq_reason else "strict_compare:exact2.0"),
+                    "data_quality_reason": exact2_reason,
                     "status": status,
                 }
             )
@@ -18050,12 +18086,14 @@ def _merge_for_web(
                     "pool_id": base_pool_id,
                     "fees": fees,
                     "tvl": tvl,
-                    "strict_compare_estimated_fees": (v.get("strict_compare_estimated_fees") or []),
-                    "strict_compare_estimated_tvl": (v.get("strict_compare_estimated_tvl") or []),
-                    "strict_compare_exact_legacy_fees": (v.get("strict_compare_exact_legacy_fees") or []),
-                    "strict_compare_exact_legacy_tvl": (v.get("strict_compare_exact_legacy_tvl") or []),
-                    "strict_compare_exact_fees": (v.get("strict_compare_exact_fees") or []),
-                    "strict_compare_exact_tvl": (v.get("strict_compare_exact_tvl") or []),
+                    "strict_compare_estimated_fees": (est_fees if has_strict_compare else (v.get("strict_compare_estimated_fees") or [])),
+                    "strict_compare_estimated_tvl": (est_tvl if has_strict_compare else (v.get("strict_compare_estimated_tvl") or [])),
+                    "strict_compare_exact_legacy_fees": (ex_legacy_fees if has_strict_compare else (v.get("strict_compare_exact_legacy_fees") or [])),
+                    "strict_compare_exact_legacy_tvl": (ex_legacy_tvl if has_strict_compare else (v.get("strict_compare_exact_legacy_tvl") or [])),
+                    "strict_compare_exact_legacy_reason": legacy_reason,
+                    "strict_compare_exact_fees": (ex_fees if has_strict_compare else (v.get("strict_compare_exact_fees") or [])),
+                    "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
+                    "strict_compare_exact2_reason": exact2_reason,
                 }
             )
             if status == "ok":
@@ -18486,6 +18524,10 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
     chains = sorted(str(x).strip().lower() for x in (req.include_chains or []) if str(x).strip())
     versions = sorted(str(x).strip().lower() for x in (req.include_versions or []) if str(x).strip())
     suffixes = sorted(str(x).strip().lower() for x in (req.exclude_suffixes or []) if str(x).strip())
+    run_mode = ("strict_exact" if bool(getattr(req, "mode_strict_exact", False)) else "fast_legacy")
+    target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
+    if run_mode != "strict_exact":
+        target_pool_id = ""
     payload = {
         "pairs": pairs,
         "chains": chains,
@@ -18493,8 +18535,8 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
         "days": int(req.days or 0),
         "min_tvl": float(req.min_tvl or 0.0),
         "speed_mode": str(req.speed_mode or "normal").strip().lower(),
-        "run_mode": ("strict_exact" if bool(getattr(req, "mode_strict_exact", False)) else "fast_legacy"),
-        "target_pool_id": str(getattr(req, "target_pool_id", "") or "").strip().lower(),
+        "run_mode": run_mode,
+        "target_pool_id": target_pool_id,
         "min_fee_pct": float(req.min_fee_pct or 0.0),
         "max_fee_pct": float(req.max_fee_pct or 0.0),
         "min_apy_pct": float(req.min_apy_pct or 0.0),
@@ -18809,6 +18851,10 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     pair_suffix=pair_suffix,
                 )
                 merged_raw.update(strict2_data or {})
+                for _pid, _v2 in (strict2_data or {}).items():
+                    base2 = merged_raw.get(_pid)
+                    if isinstance(base2, dict):
+                        base2["strict_compare_exact2_reason"] = str(_v2.get("data_quality_reason") or "")
                 for _pid, _v1 in (strict1_data or {}).items():
                     base = merged_raw.get(_pid)
                     if not isinstance(base, dict):
@@ -18818,6 +18864,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                         merged_raw[_pid] = base
                     base["strict_compare_exact_legacy_tvl"] = (_v1.get("strict_compare_exact_tvl") or [])
                     base["strict_compare_exact_legacy_fees"] = (_v1.get("strict_compare_exact_fees") or [])
+                    base["strict_compare_exact_legacy_reason"] = str(_v1.get("data_quality_reason") or "")
                     if not (base.get("strict_compare_estimated_tvl") or []):
                         base["strict_compare_estimated_tvl"] = (_v1.get("strict_compare_estimated_tvl") or [])
                     if not (base.get("strict_compare_estimated_fees") or []):
@@ -29842,6 +29889,9 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         req.ignore_cache = True
         req.mode_fast_legacy = False
         req.include_versions = ["v3"]
+    else:
+        # Estimated mode must stay fully independent from exact-target input.
+        req.target_pool_id = ""
     if (not req.mode_strict_exact) and (not req.mode_fast_legacy):
         req.mode_fast_legacy = True
     req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
@@ -31134,6 +31184,8 @@ HTML_PAGE = """
     }
 
     function getTargetPoolAddressForSubmit() {
+      const strictEnabled = !!document.getElementById("modeStrictExact")?.checked;
+      if (!strictEnabled) return "";
       const el = document.getElementById("targetPoolId");
       const current = normalizeTargetPoolAddress(el?.value || "");
       if (isHexPoolAddress(current)) {
@@ -32356,7 +32408,7 @@ HTML_PAGE = """
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
-        showlegend: !!strictMode,
+        showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
@@ -32368,7 +32420,7 @@ HTML_PAGE = """
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
-        showlegend: !!strictMode,
+        showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
         yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
@@ -32693,6 +32745,9 @@ HTML_PAGE = """
           mode_strict_exact: !!document.getElementById("modeStrictExact")?.checked,
           target_pool_id: targetPoolRaw,
         };
+        if (!payload.mode_strict_exact) {
+          payload.target_pool_id = "";
+        }
         if (payload.mode_strict_exact) {
           payload.include_versions = ["v3"];
           payload.ignore_cache = true;
