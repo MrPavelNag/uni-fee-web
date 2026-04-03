@@ -82,7 +82,7 @@ V3_EXACT_TVL_CHAINS = {
     for c in str(os.environ.get("V3_EXACT_TVL_CHAINS", "ethereum")).split(",")
     if c.strip()
 }
-V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 1))
+V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 5))
 # By default exact-days cap follows the same history window as agent day-data (FEE_DAYS),
 # i.e. the value selected in UI "History days".
 V3_EXACT_TVL_DAYS_MAX = max(1, _env_int("V3_EXACT_TVL_DAYS_MAX", int(FEE_DAYS)))
@@ -1039,10 +1039,12 @@ def main() -> None:
                 exact_used = False
                 if V3_EXACT_TVL_ENABLE and str(chain).strip().lower() in V3_EXACT_TVL_CHAINS and fees_usd:
                     take_slot = False
+                    slot_reserved = False
                     with exact_slots_lock:
                         if exact_slots_left > 0:
                             exact_slots_left -= 1
                             take_slot = True
+                            slot_reserved = True
                     if take_slot:
                         day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
                         day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
@@ -1074,6 +1076,10 @@ def main() -> None:
                                 tvl_quality_reason = f"partial_coverage:{coverage:.2f}"
                         else:
                             tvl_quality_reason = f"exact_failed:{exact_reason}:{exact_cov:.2f}"
+                        # Return exact slot when no exact data was produced for this pool.
+                        if slot_reserved and not exact_used:
+                            with exact_slots_lock:
+                                exact_slots_left += 1
                     else:
                         tvl_quality_reason = "exact_skipped:no_slots"
                 data["tvl"] = tvl_series
