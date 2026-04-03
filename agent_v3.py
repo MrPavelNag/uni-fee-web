@@ -867,7 +867,7 @@ def discover_pools_v3(
                             endpoint,
                             base_addrs[0],
                             quote_addrs[0],
-                            _min_tvl(min_tvl),
+                            0.0,
                             max_results=int(discovery_cap),
                         )
                     if not pools:
@@ -876,7 +876,7 @@ def discover_pools_v3(
                             endpoint,
                             base,
                             quote,
-                            _min_tvl(min_tvl),
+                            0.0,
                             max_results=int(discovery_cap),
                         )
                 min_tvl_now = _min_tvl(min_tvl)

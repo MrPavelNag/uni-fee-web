@@ -18949,6 +18949,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
                     timing_debug["pairs"].append(pair_dbg)
                     logs.extend(pair_logs or [])
+
             timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
         finally:
             RUN_SLOTS_SEMAPHORE.release()
@@ -29892,7 +29893,6 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         req.mode_fast_legacy = False
         req.include_versions = ["v3"]
     else:
-        # Estimated mode must stay fully independent from exact-target input.
         req.target_pool_id = ""
     if (not req.mode_strict_exact) and (not req.mode_fast_legacy):
         req.mode_fast_legacy = True
