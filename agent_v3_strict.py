@@ -10,6 +10,7 @@ Strict single-pool v3 agent.
 
 import argparse
 import os
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -45,6 +46,13 @@ def _include_chains() -> list[str]:
     if include:
         return include
     return sorted(set(UNISWAP_V3_SUBGRAPHS.keys()))
+
+
+def _exact_variant() -> str:
+    v = str(os.environ.get("STRICT_EXACT_VARIANT", "exact2") or "").strip().lower()
+    if v in {"exact1", "legacy"}:
+        return "exact1"
+    return "exact2"
 
 
 def _probe_pool_on_chains(pool_id: str, chains: list[str]) -> tuple[dict | None, str, str]:
@@ -131,8 +139,6 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> d
         "data_quality_reason": str(reason or "strict_required:unknown"),
         "strict_compare_estimated_tvl": [],
         "strict_compare_estimated_fees": [],
-        "strict_compare_exact_legacy_tvl": [],
-        "strict_compare_exact_legacy_fees": [],
         "strict_compare_exact_tvl": [],
         "strict_compare_exact_fees": [],
     }
@@ -211,6 +217,7 @@ def _fetch_logs_adaptive(
     topics: list[Any],
     from_block: int,
     to_block: int,
+    deadline_ts: float | None = None,
 ) -> list[dict]:
     start = int(max(1, from_block))
     end = int(max(start, to_block))
@@ -219,6 +226,8 @@ def _fetch_logs_adaptive(
     min_step = int(max(200, int(os.environ.get("V3_EXACT2_LOG_MIN_STEP", "1000"))))
     cursor = start
     while cursor <= end:
+        if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+            raise TimeoutError("exact2_budget_timeout:eth_getLogs")
         hi = min(end, cursor + step - 1)
         params = [{
             "address": str(token).strip().lower(),
@@ -241,14 +250,28 @@ def _fetch_logs_adaptive(
     return logs
 
 
-def _collect_pool_transfer_deltas(chain_id: int, token: str, pool_id: str, from_block: int, to_block: int) -> dict[int, int]:
+def _collect_pool_transfer_deltas(
+    chain_id: int,
+    token: str,
+    pool_id: str,
+    from_block: int,
+    to_block: int,
+    deadline_ts: float | None = None,
+) -> dict[int, int]:
     pool_topic = _addr_topic(pool_id)
     by_block: dict[int, int] = {}
     for topics, sign in (
         ([TRANSFER_TOPIC, pool_topic], -1),  # from pool
         ([TRANSFER_TOPIC, None, pool_topic], 1),  # to pool
     ):
-        logs = _fetch_logs_adaptive(int(chain_id), str(token), topics, int(from_block), int(to_block))
+        logs = _fetch_logs_adaptive(
+            int(chain_id),
+            str(token),
+            topics,
+            int(from_block),
+            int(to_block),
+            deadline_ts=deadline_ts,
+        )
         for lg in logs:
             bn = _safe_hex_to_int(lg.get("blockNumber"))
             if bn <= 0:
@@ -289,7 +312,9 @@ def _build_exact2_tvl_series_v3_ledger(
     fees_usd: list[tuple[int, float]],
     day_start_ts: int,
     day_end_ts: int,
+    budget_sec: float,
 ) -> tuple[list[tuple[int, float]], str, float]:
+    deadline_ts = time.monotonic() + max(10.0, float(budget_sec))
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
@@ -312,6 +337,8 @@ def _build_exact2_tvl_series_v3_ledger(
     day_blocks: dict[int, int] = {}
     block_missing = 0
     for ts, _ in fees_usd:
+        if time.monotonic() >= deadline_ts:
+            return [], "exact2_budget_timeout:block_resolution", 0.0
         day_ts = int((int(ts) // 86400) * 86400)
         if day_ts in day_blocks:
             continue
@@ -327,8 +354,10 @@ def _build_exact2_tvl_series_v3_ledger(
     from_block = int(min(valid_blocks))
     to_block = int(latest_block)
     try:
-        deltas0 = _collect_pool_transfer_deltas(chain_id, token0, pool_id, from_block, to_block)
-        deltas1 = _collect_pool_transfer_deltas(chain_id, token1, pool_id, from_block, to_block)
+        deltas0 = _collect_pool_transfer_deltas(chain_id, token0, pool_id, from_block, to_block, deadline_ts=deadline_ts)
+        deltas1 = _collect_pool_transfer_deltas(chain_id, token1, pool_id, from_block, to_block, deadline_ts=deadline_ts)
+    except TimeoutError:
+        return [], "exact2_budget_timeout:transfer_logs", 0.0
     except Exception as e:
         return [], f"exact2_transfer_logs_failed:{e}", 0.0
 
@@ -340,6 +369,8 @@ def _build_exact2_tvl_series_v3_ledger(
     non_zero = 0
     priced_days = 0
     for ts, _fees in fees_usd:
+        if time.monotonic() >= deadline_ts:
+            return tvl_series, "exact2_budget_timeout:pricing", float(non_zero / max(1, len(fees_usd)))
         day_ts = int((int(ts) // 86400) * 86400)
         b = int(day_blocks.get(day_ts, 0))
         if b <= 0:
@@ -446,30 +477,31 @@ def main() -> None:
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
-    legacy_series, legacy_reason, legacy_cov = _build_exact_tvl_series_v3(
-        chain=found_chain,
-        pool=pool,
-        fees_usd=fees_usd,
-        baseline_tvl=estimated_tvl,
-        day_start_ts=day_start_ts,
-        day_end_ts=day_end_ts,
-        budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),
-    )
-    strict_legacy_tvl = list(legacy_series) if legacy_series else []
-    strict_legacy_fees = _rebuild_fees_cumulative(fees_usd, strict_legacy_tvl) if strict_legacy_tvl else []
-
-    exact_series, exact_reason, exact_cov = _build_exact2_tvl_series_v3_ledger(
-        chain=found_chain,
-        pool=pool,
-        fees_usd=fees_usd,
-        day_start_ts=day_start_ts,
-        day_end_ts=day_end_ts,
-    )
+    variant = _exact_variant()
+    if variant == "exact1":
+        exact_series, exact_reason, exact_cov = _build_exact_tvl_series_v3(
+            chain=found_chain,
+            pool=pool,
+            fees_usd=fees_usd,
+            baseline_tvl=estimated_tvl,
+            day_start_ts=day_start_ts,
+            day_end_ts=day_end_ts,
+            budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),
+        )
+    else:
+        exact_series, exact_reason, exact_cov = _build_exact2_tvl_series_v3_ledger(
+            chain=found_chain,
+            pool=pool,
+            fees_usd=fees_usd,
+            day_start_ts=day_start_ts,
+            day_end_ts=day_end_ts,
+            budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),
+        )
 
     strict_exact_ok = bool(exact_series and len(exact_series) == len(fees_usd) and all(float(v) > 0.0 for _ts, v in exact_series))
     if strict_exact_ok:
         data_quality = "exact"
-        data_quality_reason = "exact2.0:ok"
+        data_quality_reason = ("exact1:ok" if variant == "exact1" else "exact2.0:ok")
         final_tvl = list(exact_series)
         final_fees = _rebuild_fees_cumulative(fees_usd, final_tvl)
         strict_exact_tvl = list(exact_series)
@@ -477,8 +509,7 @@ def main() -> None:
     else:
         data_quality = "strict_unavailable"
         data_quality_reason = (
-            f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f};"
-            f"legacy:{legacy_reason}:{legacy_cov:.2f}"
+            f"strict_required:{'exact1' if variant == 'exact1' else 'exact2.0'}:{exact_reason}:{exact_cov:.2f}"
         )
         final_tvl = []
         final_fees = []
@@ -502,8 +533,6 @@ def main() -> None:
         "data_quality_reason": data_quality_reason,
         "strict_compare_estimated_tvl": estimated_tvl,
         "strict_compare_estimated_fees": estimated_fees,
-        "strict_compare_exact_legacy_tvl": strict_legacy_tvl,
-        "strict_compare_exact_legacy_fees": strict_legacy_fees,
         "strict_compare_exact_tvl": strict_exact_tvl,
         "strict_compare_exact_fees": strict_exact_fees,
     }

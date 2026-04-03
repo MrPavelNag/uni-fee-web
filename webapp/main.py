@@ -18154,7 +18154,7 @@ def _run_output_dir(job_id: str) -> Path:
 
 
 def _agent_data_path(script_name: str, pair_suffix: str) -> Path:
-    if str(script_name) in {"agent_v3.py", "agent_v3_strict.py"}:
+    if str(script_name) in {"agent_v3.py", "agent_v3_strict_exact1.py", "agent_v3_strict_exact2.py"}:
         return DATA_DIR / f"pools_v3_{pair_suffix}.json"
     return DATA_DIR / f"pools_v4_{pair_suffix}.json"
 
@@ -18758,28 +18758,69 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         try:
             t_agents_total0 = time.perf_counter()
             if run_mode == "strict_exact":
-                _set_stage("strict", "Running strict exact agent (single pool)", 20)
+                _set_stage("strict", "Running strict exact1/2.0 agents (single pool)", 20)
                 pair_suffix = pairs_to_filename_suffix(token_pairs)
-                strict_data, strict_dbg = _run_agent_and_load_timed(
-                    script_name="agent_v3_strict.py",
-                    env=dict(env),
+                try:
+                    strict_total_budget = max(20.0, float(env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")))
+                except Exception:
+                    strict_total_budget = 180.0
+                split_budget = max(10.0, strict_total_budget / 2.0)
+                base_timeout = int(env.get("AGENT_TIMEOUT_SEC", "480") or 480)
+                # Keep strict runtime bounded: each exact agent gets a tight wall-time
+                # close to its own compute budget (instead of inheriting huge global timeout).
+                per_agent_timeout = max(60, min(base_timeout, int(split_budget) + 30, 180))
+                env1 = dict(env)
+                env2 = dict(env)
+                env1["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(split_budget))
+                env2["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(split_budget))
+                env1["AGENT_TIMEOUT_SEC"] = str(per_agent_timeout)
+                env2["AGENT_TIMEOUT_SEC"] = str(per_agent_timeout)
+                logs.append(
+                    "[strict] budgets: "
+                    f"total={int(strict_total_budget)}s split={int(split_budget)}s "
+                    f"timeout_per_agent={int(per_agent_timeout)}s"
+                )
+                strict1_data, strict1_dbg = _run_agent_and_load_timed(
+                    script_name="agent_v3_strict_exact1.py",
+                    env=env1,
                     min_tvl=req.min_tvl,
                     logs=logs,
                     pair_suffix=pair_suffix,
                 )
-                merged_raw.update(strict_data or {})
+                _set_stage("strict", "Running strict exact2.0 agent (single pool)", 45)
+                strict2_data, strict2_dbg = _run_agent_and_load_timed(
+                    script_name="agent_v3_strict_exact2.py",
+                    env=env2,
+                    min_tvl=req.min_tvl,
+                    logs=logs,
+                    pair_suffix=pair_suffix,
+                )
+                merged_raw.update(strict2_data or {})
+                for _pid, _v1 in (strict1_data or {}).items():
+                    base = merged_raw.get(_pid)
+                    if not isinstance(base, dict):
+                        base = dict(_v1 or {})
+                        base.setdefault("strict_compare_exact_tvl", [])
+                        base.setdefault("strict_compare_exact_fees", [])
+                        merged_raw[_pid] = base
+                    base["strict_compare_exact_legacy_tvl"] = (_v1.get("strict_compare_exact_tvl") or [])
+                    base["strict_compare_exact_legacy_fees"] = (_v1.get("strict_compare_exact_fees") or [])
+                    if not (base.get("strict_compare_estimated_tvl") or []):
+                        base["strict_compare_estimated_tvl"] = (_v1.get("strict_compare_estimated_tvl") or [])
+                    if not (base.get("strict_compare_estimated_fees") or []):
+                        base["strict_compare_estimated_fees"] = (_v1.get("strict_compare_estimated_fees") or [])
                 timing_debug["pairs"].append(
                     {
                         "pair": token_pairs,
                         "index": 1,
-                        "agents": [strict_dbg],
+                        "agents": [strict1_dbg, strict2_dbg],
                         "merged_before": 0,
                         "merged_after": int(len(merged_raw)),
                         "merged_added": int(len(merged_raw)),
-                        "total_ms": int((strict_dbg or {}).get("total_ms") or 0),
+                        "total_ms": int((strict1_dbg or {}).get("total_ms") or 0) + int((strict2_dbg or {}).get("total_ms") or 0),
                     }
                 )
-                _set_stage("strict", "Strict exact agent completed", 75)
+                _set_stage("strict", "Strict exact1/2.0 agents completed", 75)
             else:
                 total_pairs = max(1, len(pairs))
                 pair_workers = _pair_worker_count(speed_mode, total_pairs)
