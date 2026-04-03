@@ -101,6 +101,8 @@ V3_EXACT_TVL_SPARSE_POINTS = max(3, _env_int("V3_EXACT_TVL_SPARSE_POINTS", 9))
 V3_EXACT_TVL_SPARSE_MIN_SUCCESS = min(1.0, max(0.0, _env_float("V3_EXACT_TVL_SPARSE_MIN_SUCCESS", 0.45)))
 V3_EXACT_TVL_SPARSE_MAX_SCALE = max(1.0, _env_float("V3_EXACT_TVL_SPARSE_MAX_SCALE", 4.0))
 V3_EXACT_TVL_STRICT_MODE = _env_flag("V3_EXACT_TVL_STRICT_MODE", False)
+V3_EXACT_STRICT_BLOCK_WINDOW = max(0, _env_int("V3_EXACT_STRICT_BLOCK_WINDOW", 10))
+V3_EXACT_STRICT_RPC_RETRIES = max(1, _env_int("V3_EXACT_STRICT_RPC_RETRIES", 3))
 V3_EXACT_TVL_DEBUG = _env_flag("V3_EXACT_TVL_DEBUG", False)
 
 CHAIN_ID_BY_KEY: dict[str, int] = {
@@ -310,6 +312,41 @@ def _balance_of_raw(chain_id: int, token: str, owner: str, block_num: int) -> in
     data = "0x70a08231" + str(owner).strip().lower().replace("0x", "").rjust(64, "0")
     out = _rpc_eth_call_hex(int(chain_id), str(token), data, hex(int(block_num)), timeout_sec=8.0)
     return int(_decode_uint_hex(out))
+
+
+def _strict_block_deltas(window: int) -> list[int]:
+    w = int(max(0, window))
+    deltas = [0]
+    for i in range(1, w + 1):
+        deltas.append(-i)
+        deltas.append(i)
+    return deltas
+
+
+def _pool_balances_near_block(
+    *,
+    chain_id: int,
+    token0: str,
+    token1: str,
+    pool_id: str,
+    block_num: int,
+    window: int,
+    retries: int,
+) -> tuple[int, int, int]:
+    last_err: Exception | None = None
+    for delta in _strict_block_deltas(window):
+        b = int(block_num) + int(delta)
+        if b <= 0:
+            continue
+        for _ in range(max(1, int(retries))):
+            try:
+                b0 = _balance_of_raw(chain_id, token0, pool_id, b)
+                b1 = _balance_of_raw(chain_id, token1, pool_id, b)
+                return int(b0), int(b1), int(b)
+            except Exception as e:
+                last_err = e
+                continue
+    raise RuntimeError(str(last_err or "strict balance window failed"))
 
 
 def _sample_sparse_indices(total: int, points: int) -> list[int]:
@@ -950,8 +987,17 @@ def _build_exact_tvl_series_v3(
             dts = int((int(ts) // 86400) * 86400)
             try:
                 block_num = _llama_block_for_day(ck, int(dts + 86399))
-                b0 = _balance_of_raw(chain_id, t0, pool_id, block_num) / (10 ** int(t0_dec))
-                b1 = _balance_of_raw(chain_id, t1, pool_id, block_num) / (10 ** int(t1_dec))
+                raw0, raw1, _resolved_block = _pool_balances_near_block(
+                    chain_id=chain_id,
+                    token0=t0,
+                    token1=t1,
+                    pool_id=pool_id,
+                    block_num=int(block_num),
+                    window=int(V3_EXACT_STRICT_BLOCK_WINDOW),
+                    retries=int(V3_EXACT_STRICT_RPC_RETRIES),
+                )
+                b0 = float(raw0) / (10 ** int(t0_dec))
+                b1 = float(raw1) / (10 ** int(t1_dec))
                 p0 = _historical_price_usd(ck, t0, dts, day_start_ts, day_end_ts)
                 p1 = _historical_price_usd(ck, t1, dts, day_start_ts, day_end_ts)
                 tvl = max(0.0, float(b0) * max(0.0, float(p0))) + max(0.0, float(b1) * max(0.0, float(p1)))
