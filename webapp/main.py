@@ -18196,6 +18196,13 @@ def _build_run_job_env(
     run_v4: bool,
 ) -> dict[str, str]:
     env = os.environ.copy()
+    mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
+    mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
+    if mode_strict_exact:
+        mode_fast_legacy = False
+    if (not mode_strict_exact) and (not mode_fast_legacy):
+        mode_fast_legacy = True
+    run_mode = "strict_exact" if mode_strict_exact else "fast_legacy"
     exact_days_default = str(max(1, min(int(req.days), 7 if speed_mode == "fast" else 14)))
     # Agents resolve symbols via the same top-N cache as site catalog.
     try:
@@ -18282,6 +18289,16 @@ def _build_run_job_env(
         "WEB_V3_EXACT_TVL_POOL_BUDGET_SEC_FAST" if speed_mode == "fast" else "WEB_V3_EXACT_TVL_POOL_BUDGET_SEC_NORMAL",
         "12" if speed_mode == "fast" else "20",
     )
+    env["RUN_MODE"] = run_mode
+    if run_mode == "strict_exact":
+        env["V3_EXACT_TVL_ENABLE"] = os.environ.get("WEB_V3_EXACT_STRICT_ENABLE", "1")
+        env["V3_EXACT_TVL_STRICT_MODE"] = os.environ.get("WEB_V3_EXACT_STRICT_MODE", "1")
+        env["V3_EXACT_TVL_DAYS_MAX"] = os.environ.get("WEB_V3_EXACT_STRICT_DAYS_MAX", str(max(1, int(req.days))))
+        env["V3_EXACT_TVL_MAX_POOLS"] = os.environ.get("WEB_V3_EXACT_STRICT_MAX_POOLS", "1")
+        env["V3_EXACT_TVL_POOL_BUDGET_SEC"] = os.environ.get("WEB_V3_EXACT_STRICT_POOL_BUDGET_SEC", "180")
+    else:
+        env["V3_EXACT_TVL_ENABLE"] = os.environ.get("WEB_V3_FAST_LEGACY_EXACT_ENABLE", "0")
+        env["V3_EXACT_TVL_STRICT_MODE"] = "0"
     # v4 endpoint config uses this list at import-time.
     # When UI sends "all chains", include_chains is empty; in that case force all known v4 chains.
     if run_v4:
@@ -18384,6 +18401,7 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
         "days": int(req.days or 0),
         "min_tvl": float(req.min_tvl or 0.0),
         "speed_mode": str(req.speed_mode or "normal").strip().lower(),
+        "run_mode": ("strict_exact" if bool(getattr(req, "mode_strict_exact", False)) else "fast_legacy"),
         "min_fee_pct": float(req.min_fee_pct or 0.0),
         "max_fee_pct": float(req.max_fee_pct or 0.0),
         "min_apy_pct": float(req.min_apy_pct or 0.0),
@@ -18552,13 +18570,20 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     speed_mode = str(req.speed_mode or "normal").strip().lower()
     if speed_mode not in {"normal", "fast"}:
         speed_mode = "normal"
+    mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
+    mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
+    if mode_strict_exact:
+        mode_fast_legacy = False
+    if (not mode_strict_exact) and (not mode_fast_legacy):
+        mode_fast_legacy = True
+    run_mode = "strict_exact" if mode_strict_exact else "fast_legacy"
 
     with JOB_LOCK:
         job = JOBS[job_id]
         job["status"] = "running"
         job["started_at"] = time.time()
         job["stage"] = "prepare"
-        job["stage_label"] = f"Preparing parameters ({speed_mode})"
+        job["stage_label"] = f"Preparing parameters ({speed_mode}, {run_mode})"
         job["progress"] = 5
 
     # Build selected token pairs (bounded by RUN_PAIRS_LIMIT).
@@ -18743,12 +18768,15 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 "include_chains": include_chains,
                 "include_versions": include_versions,
                 "speed_mode": speed_mode,
+                "run_mode": run_mode,
                 "min_fee_pct": req.min_fee_pct,
                 "max_fee_pct": req.max_fee_pct,
                 "min_apy_pct": req.min_apy_pct,
                 "exclude_suffixes": req.exclude_suffixes,
                 "lp_allocation_usd": float(env.get("LP_ALLOCATION_USD", "1000")),
                 "ignore_cache": bool(getattr(req, "ignore_cache", False)),
+                "mode_fast_legacy": mode_fast_legacy,
+                "mode_strict_exact": mode_strict_exact,
             },
             **result,
             "debug_timing": timing_debug,
@@ -18812,6 +18840,8 @@ class PoolsRunRequest(BaseModel):
     include_chains: list[str] = Field(default_factory=list)
     include_versions: list[str] = Field(default_factory=lambda: ["v3", "v4"])
     speed_mode: str = "normal"
+    mode_fast_legacy: bool = True
+    mode_strict_exact: bool = False
     min_tvl: float = 1000.0
     days: int = 30
     min_fee_pct: float = 0.0
@@ -29612,6 +29642,12 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
     if req.min_apy_pct < 0 or req.min_apy_pct > 100000:
         raise HTTPException(status_code=400, detail="min_apy_pct must be in range 0..100000")
+    req.mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
+    req.mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
+    if req.mode_strict_exact:
+        req.mode_fast_legacy = False
+    if (not req.mode_strict_exact) and (not req.mode_fast_legacy):
+        req.mode_fast_legacy = True
     req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
     req.include_versions = list(dict.fromkeys(req.include_versions))
     if not req.include_versions:
@@ -30626,6 +30662,13 @@ HTML_PAGE = """
                     <label><input id="protoV4" type="checkbox" checked onchange="updateChainsNote()"/> V4</label>
                   </div>
                 </div>
+                <div class="filter-item">
+                  <div class="hint">Calculation<br/>mode</div>
+                  <div class="proto-checks">
+                    <label><input id="modeFastLegacy" type="checkbox" checked onchange="syncRunModes('fast')"/> Fast legacy</label>
+                    <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Strict exact</label>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -30704,7 +30747,8 @@ HTML_PAGE = """
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
     const FIELD_IDS = [
       "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
-      "minTvl", "days", "maxFeePct", "minFeePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache"
+      "minTvl", "days", "maxFeePct", "minFeePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache",
+      "modeFastLegacy", "modeStrictExact"
     ];
     let availableChains = [];
     let colorMap = {};
@@ -30753,6 +30797,19 @@ HTML_PAGE = """
 
     function setDays(v) {
       document.getElementById("days").value = v;
+      saveFormState();
+    }
+
+    function syncRunModes(source) {
+      const fast = document.getElementById("modeFastLegacy");
+      const strict = document.getElementById("modeStrictExact");
+      if (!fast || !strict) return;
+      const src = String(source || "").toLowerCase();
+      if (src === "strict" && strict.checked) fast.checked = false;
+      if (src === "fast" && fast.checked) strict.checked = false;
+      if (!fast.checked && !strict.checked) {
+        fast.checked = true;
+      }
       saveFormState();
     }
 
@@ -31364,6 +31421,7 @@ HTML_PAGE = """
             if (box) box.checked = true;
           }
         }
+        syncRunModes("");
         updatePairBuilderUi();
       } catch (e) {
         console.warn("load form state failed", e);
@@ -32164,6 +32222,7 @@ HTML_PAGE = """
         const maxFeeRaw = String(document.getElementById("maxFeePct").value ?? "").trim();
         const minFeeRaw = String(document.getElementById("minFeePct").value ?? "").trim();
         const minApyRaw = String(document.getElementById("minApyPct").value ?? "").trim();
+        syncRunModes("");
         if (!minTvlRaw || !daysRaw || !minFeeRaw || !maxFeeRaw || !minApyRaw) {
           setStatus("Fill all filter fields before running analysis.", "fail");
           return;
@@ -32178,6 +32237,8 @@ HTML_PAGE = """
           min_fee_pct: Number(minFeeRaw),
           min_apy_pct: Number(minApyRaw),
           ignore_cache: !!document.getElementById("runIgnoreCache")?.checked,
+          mode_fast_legacy: !!document.getElementById("modeFastLegacy")?.checked,
+          mode_strict_exact: !!document.getElementById("modeStrictExact")?.checked,
         };
         if (!payload.include_versions.length) {
           setStatus("Select at least one protocol (V3/V4).", "fail");

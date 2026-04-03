@@ -93,6 +93,7 @@ V3_EXACT_TVL_PROBE_DAYS = max(1, _env_int("V3_EXACT_TVL_PROBE_DAYS", 6))
 V3_EXACT_TVL_SPARSE_POINTS = max(3, _env_int("V3_EXACT_TVL_SPARSE_POINTS", 9))
 V3_EXACT_TVL_SPARSE_MIN_SUCCESS = min(1.0, max(0.0, _env_float("V3_EXACT_TVL_SPARSE_MIN_SUCCESS", 0.45)))
 V3_EXACT_TVL_SPARSE_MAX_SCALE = max(1.0, _env_float("V3_EXACT_TVL_SPARSE_MAX_SCALE", 4.0))
+V3_EXACT_TVL_STRICT_MODE = _env_flag("V3_EXACT_TVL_STRICT_MODE", False)
 V3_EXACT_TVL_DEBUG = _env_flag("V3_EXACT_TVL_DEBUG", False)
 
 CHAIN_ID_BY_KEY: dict[str, int] = {
@@ -928,6 +929,39 @@ def _build_exact_tvl_series_v3(
 
     t0_dec = _erc20_decimals(chain_id, t0)
     t1_dec = _erc20_decimals(chain_id, t1)
+
+    # Strict mode: full day-by-day exact reconstruction (slow, highest rigor).
+    if V3_EXACT_TVL_STRICT_MODE:
+        out_strict: list[tuple[int, float]] = []
+        non_zero_strict = 0
+        timed_out = False
+        t_started = time.perf_counter()
+        for ts, _ in fees_usd:
+            if (time.perf_counter() - t_started) > float(max(1.0, budget_sec)):
+                timed_out = True
+                break
+            dts = int((int(ts) // 86400) * 86400)
+            try:
+                block_num = _llama_block_for_day(ck, int(dts + 86399))
+                b0 = _balance_of_raw(chain_id, t0, pool_id, block_num) / (10 ** int(t0_dec))
+                b1 = _balance_of_raw(chain_id, t1, pool_id, block_num) / (10 ** int(t1_dec))
+                p0 = _historical_price_usd(ck, t0, dts, day_start_ts, day_end_ts)
+                p1 = _historical_price_usd(ck, t1, dts, day_start_ts, day_end_ts)
+                tvl = max(0.0, float(b0) * max(0.0, float(p0))) + max(0.0, float(b1) * max(0.0, float(p1)))
+                out_strict.append((int(ts), float(tvl)))
+                if float(tvl) > 0.0:
+                    non_zero_strict += 1
+            except Exception:
+                out_strict.append((int(ts), 0.0))
+        if not out_strict:
+            return [], ("strict_budget_timeout" if timed_out else "strict_no_points"), 0.0
+        coverage = float(non_zero_strict) / float(max(1, len(out_strict)))
+        if non_zero_strict <= 0:
+            return [], ("strict_budget_timeout" if timed_out else "strict_insufficient_non_zero"), float(coverage)
+        if coverage < float(V3_EXACT_TVL_MIN_COVERAGE_PARTIAL):
+            return [], ("strict_budget_timeout" if timed_out else "strict_insufficient_non_zero"), float(coverage)
+        return out_strict, ("strict_budget_partial" if timed_out else "strict_ok"), float(coverage)
+
     total_days = len(fees_usd)
     sparse_idxs = _sample_sparse_indices(total_days, int(V3_EXACT_TVL_SPARSE_POINTS))
     if not sparse_idxs:
