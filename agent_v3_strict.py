@@ -11,11 +11,22 @@ Strict single-pool v3 agent.
 import argparse
 import os
 from datetime import datetime, timedelta
+from typing import Any
 
 from config import DEFAULT_TOKEN_PAIRS, FEE_DAYS, LP_ALLOCATION_USD, UNISWAP_V3_SUBGRAPHS
 from agent_common import estimate_pool_tvl_usd_external_with_meta, pairs_to_filename_suffix, save_chart_data_json
 from uniswap_client import get_graph_endpoint, graphql_query, query_pool_day_data
-from agent_v3 import _build_exact_tvl_series_v3
+from agent_v3 import (
+    CHAIN_ID_BY_KEY,
+    _balance_of_raw,
+    _erc20_decimals,
+    _historical_price_usd,
+    _llama_block_for_day,
+    _rpc_json,
+)
+
+
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
 def _is_eth_address(v: str) -> bool:
@@ -176,6 +187,182 @@ def _rebuild_fees_cumulative(fees_usd: list[tuple[int, float]], tvl_series: list
     return out
 
 
+def _addr_topic(addr: str) -> str:
+    clean = str(addr or "").strip().lower().replace("0x", "")
+    return "0x" + clean.rjust(64, "0")
+
+
+def _safe_hex_to_int(v: Any) -> int:
+    s = str(v or "0x0").strip().lower()
+    if not s.startswith("0x"):
+        return 0
+    try:
+        return int(s, 16)
+    except Exception:
+        return 0
+
+
+def _fetch_logs_adaptive(
+    chain_id: int,
+    token: str,
+    topics: list[Any],
+    from_block: int,
+    to_block: int,
+) -> list[dict]:
+    start = int(max(1, from_block))
+    end = int(max(start, to_block))
+    logs: list[dict] = []
+    step = int(max(2000, int(os.environ.get("V3_EXACT2_LOG_BLOCK_STEP", "50000"))))
+    min_step = int(max(200, int(os.environ.get("V3_EXACT2_LOG_MIN_STEP", "1000"))))
+    cursor = start
+    while cursor <= end:
+        hi = min(end, cursor + step - 1)
+        params = [{
+            "address": str(token).strip().lower(),
+            "fromBlock": hex(int(cursor)),
+            "toBlock": hex(int(hi)),
+            "topics": topics,
+        }]
+        try:
+            data = _rpc_json(int(chain_id), "eth_getLogs", params, timeout_sec=22.0)
+            part = data.get("result") or []
+            if isinstance(part, list):
+                logs.extend([x for x in part if isinstance(x, dict)])
+            cursor = hi + 1
+            if len(part) < 500 and step < 200000:
+                step = int(step * 1.2)
+        except Exception:
+            if step <= min_step:
+                raise
+            step = max(min_step, step // 2)
+    return logs
+
+
+def _collect_pool_transfer_deltas(chain_id: int, token: str, pool_id: str, from_block: int, to_block: int) -> dict[int, int]:
+    pool_topic = _addr_topic(pool_id)
+    by_block: dict[int, int] = {}
+    for topics, sign in (
+        ([TRANSFER_TOPIC, pool_topic], -1),  # from pool
+        ([TRANSFER_TOPIC, None, pool_topic], 1),  # to pool
+    ):
+        logs = _fetch_logs_adaptive(int(chain_id), str(token), topics, int(from_block), int(to_block))
+        for lg in logs:
+            bn = _safe_hex_to_int(lg.get("blockNumber"))
+            if bn <= 0:
+                continue
+            val = _safe_hex_to_int(lg.get("data"))
+            if val <= 0:
+                continue
+            by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
+    return by_block
+
+
+def _latest_block_number(chain_id: int) -> int:
+    d = _rpc_json(int(chain_id), "eth_blockNumber", [], timeout_sec=8.0)
+    b = _safe_hex_to_int(d.get("result"))
+    if b <= 0:
+        raise RuntimeError("latest_block_not_found")
+    return int(b)
+
+
+def _balances_by_boundaries_desc(latest_balance: int, deltas_by_block: dict[int, int], boundaries_desc: list[int]) -> dict[int, int]:
+    blocks_desc = sorted((int(b) for b in deltas_by_block.keys() if int(b) > 0), reverse=True)
+    out: dict[int, int] = {}
+    idx = 0
+    future_delta = 0
+    for boundary in boundaries_desc:
+        bnd = int(boundary)
+        while idx < len(blocks_desc) and int(blocks_desc[idx]) > bnd:
+            future_delta += int(deltas_by_block.get(int(blocks_desc[idx]), 0))
+            idx += 1
+        out[bnd] = int(max(0, int(latest_balance) - int(future_delta)))
+    return out
+
+
+def _build_exact2_tvl_series_v3_ledger(
+    *,
+    chain: str,
+    pool: dict,
+    fees_usd: list[tuple[int, float]],
+    day_start_ts: int,
+    day_end_ts: int,
+) -> tuple[list[tuple[int, float]], str, float]:
+    ck = str(chain or "").strip().lower()
+    chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    if chain_id <= 0:
+        return [], "exact2_unsupported_chain", 0.0
+    pool_id = str(pool.get("id") or "").strip().lower()
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    if not (pool_id and token0 and token1):
+        return [], "exact2_missing_pool_tokens", 0.0
+
+    try:
+        latest_block = _latest_block_number(chain_id)
+        dec0 = int(_erc20_decimals(chain_id, token0))
+        dec1 = int(_erc20_decimals(chain_id, token1))
+        bal0_latest = int(_balance_of_raw(chain_id, token0, pool_id, latest_block))
+        bal1_latest = int(_balance_of_raw(chain_id, token1, pool_id, latest_block))
+    except Exception as e:
+        return [], f"exact2_latest_point_failed:{e}", 0.0
+
+    day_blocks: dict[int, int] = {}
+    block_missing = 0
+    for ts, _ in fees_usd:
+        day_ts = int((int(ts) // 86400) * 86400)
+        if day_ts in day_blocks:
+            continue
+        try:
+            day_blocks[day_ts] = int(_llama_block_for_day(ck, day_ts + 86399))
+        except Exception:
+            block_missing += 1
+            day_blocks[day_ts] = 0
+
+    valid_blocks = [int(b) for b in day_blocks.values() if int(b) > 0]
+    if not valid_blocks:
+        return [], "exact2_no_day_blocks", 0.0
+    from_block = int(min(valid_blocks))
+    to_block = int(latest_block)
+    try:
+        deltas0 = _collect_pool_transfer_deltas(chain_id, token0, pool_id, from_block, to_block)
+        deltas1 = _collect_pool_transfer_deltas(chain_id, token1, pool_id, from_block, to_block)
+    except Exception as e:
+        return [], f"exact2_transfer_logs_failed:{e}", 0.0
+
+    boundaries = sorted(set(valid_blocks), reverse=True)
+    bal0_by_block = _balances_by_boundaries_desc(bal0_latest, deltas0, boundaries)
+    bal1_by_block = _balances_by_boundaries_desc(bal1_latest, deltas1, boundaries)
+
+    tvl_series: list[tuple[int, float]] = []
+    non_zero = 0
+    priced_days = 0
+    for ts, _fees in fees_usd:
+        day_ts = int((int(ts) // 86400) * 86400)
+        b = int(day_blocks.get(day_ts, 0))
+        if b <= 0:
+            tvl_series.append((int(ts), 0.0))
+            continue
+        amt0 = float(bal0_by_block.get(b, 0)) / float(10 ** max(0, dec0))
+        amt1 = float(bal1_by_block.get(b, 0)) / float(10 ** max(0, dec1))
+        p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
+        p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
+        if p0 > 0 or p1 > 0:
+            priced_days += 1
+        tvl = max(0.0, amt0 * max(0.0, p0)) + max(0.0, amt1 * max(0.0, p1))
+        if tvl > 0:
+            non_zero += 1
+        tvl_series.append((int(ts), float(tvl)))
+
+    cov = float(non_zero / max(1, len(fees_usd)))
+    if non_zero == 0:
+        return tvl_series, f"exact2_non_positive_days:block_missing={block_missing}:priced_days={priced_days}", cov
+    if block_missing > 0:
+        return tvl_series, f"exact2_partial:block_missing={block_missing}:priced_days={priced_days}", cov
+    if priced_days < max(1, len(fees_usd) // 2):
+        return tvl_series, f"exact2_partial:insufficient_prices={priced_days}", cov
+    return tvl_series, "ok", cov
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Uniswap v3 strict exact single-pool agent")
     ap.add_argument("--min-tvl", type=float, default=None, help="Min TVL USD")
@@ -256,27 +443,25 @@ def main() -> None:
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
-    exact_series, exact_reason, exact_cov = _build_exact_tvl_series_v3(
+    exact_series, exact_reason, exact_cov = _build_exact2_tvl_series_v3_ledger(
         chain=found_chain,
         pool=pool,
         fees_usd=fees_usd,
-        baseline_tvl=estimated_tvl,
         day_start_ts=day_start_ts,
         day_end_ts=day_end_ts,
-        budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),
     )
 
     strict_exact_ok = bool(exact_series and len(exact_series) == len(fees_usd) and all(float(v) > 0.0 for _ts, v in exact_series))
     if strict_exact_ok:
         data_quality = "exact"
-        data_quality_reason = "ok"
+        data_quality_reason = "exact2.0:ok"
         final_tvl = list(exact_series)
         final_fees = _rebuild_fees_cumulative(fees_usd, final_tvl)
         strict_exact_tvl = list(exact_series)
         strict_exact_fees = list(final_fees)
     else:
         data_quality = "strict_unavailable"
-        data_quality_reason = f"strict_required:{exact_reason}:{exact_cov:.2f}"
+        data_quality_reason = f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f}"
         final_tvl = []
         final_fees = []
         strict_exact_tvl = list(exact_series) if exact_series else []
