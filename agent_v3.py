@@ -155,6 +155,7 @@ _EXACT_CACHE_LOCK = threading.Lock()
 _BLOCK_BY_DAY_CACHE: dict[tuple[str, int], int] = {}
 _DECIMALS_CACHE: dict[tuple[int, str], int] = {}
 _CG_DAY_PRICE_CACHE: dict[tuple[str, str, int], float] = {}
+_RPC_PRIMARY_URL: dict[int, str] = {}
 
 
 def _rpc_urls(chain_id: int) -> list[str]:
@@ -182,6 +183,30 @@ def _rpc_json(chain_id: int, method: str, params: list, timeout_sec: float = 8.0
     urls = _rpc_urls(chain_id)
     if not urls:
         raise RuntimeError(f"no rpc urls for chain_id={chain_id}")
+    cid = int(chain_id)
+    with _EXACT_CACHE_LOCK:
+        primary = str(_RPC_PRIMARY_URL.get(cid) or "").strip()
+    if primary and primary in urls:
+        urls = [primary] + [u for u in urls if u != primary]
+    elif not primary:
+        # one-shot lightweight probe to avoid repeatedly hitting a dead first URL
+        # on every strict call (which burns the whole budget).
+        for u in list(urls):
+            try:
+                r = requests.post(
+                    u,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
+                    timeout=(2.0, 3.5),
+                )
+                r.raise_for_status()
+                d = r.json() if isinstance(r.json(), dict) else {}
+                if str(d.get("result") or "").startswith("0x"):
+                    with _EXACT_CACHE_LOCK:
+                        _RPC_PRIMARY_URL[cid] = str(u)
+                    urls = [u] + [x for x in urls if x != u]
+                    break
+            except Exception:
+                continue
     for url in urls:
         try:
             r = requests.post(
@@ -194,6 +219,8 @@ def _rpc_json(chain_id: int, method: str, params: list, timeout_sec: float = 8.0
             if d.get("error"):
                 last = RuntimeError(str(d.get("error")))
                 continue
+            with _EXACT_CACHE_LOCK:
+                _RPC_PRIMARY_URL[cid] = str(url)
             return d
         except Exception as e:
             last = e

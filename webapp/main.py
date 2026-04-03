@@ -18825,13 +18825,13 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 # Root-cause fix: exact1 and exact2 have different cost profiles.
                 # Do not split one budget in half; configure independent budgets.
                 try:
-                    exact1_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT1_POOL_BUDGET_SEC", "90")))
+                    exact1_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT1_POOL_BUDGET_SEC", "180")))
                 except Exception:
-                    exact1_budget = 90.0
+                    exact1_budget = 180.0
                 try:
-                    exact2_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180"))))
+                    exact2_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "240"))))
                 except Exception:
-                    exact2_budget = 180.0
+                    exact2_budget = 240.0
                 env1 = dict(env)
                 env2 = dict(env)
                 env1["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact1_budget))
@@ -31700,36 +31700,19 @@ HTML_PAGE = """
       };
       const tick = () => {
         const elapsed = Math.max(0, Math.floor((Date.now() - scanStartedAt) / 1000));
-        const backendTarget = Math.max(0, Math.min(99, Number(scanProgressTargetPct || 0)));
-        // Keep UI progress believable during long single-stage runs:
-        // progress can move even when backend stage percent updates are sparse.
-        let timeFloor = 10;
-        if (elapsed <= 20) {
-          timeFloor = 10 + elapsed * 3;       // quick warm-up to ~70% by 20s
-        } else {
-          timeFloor = 70 + Math.floor((elapsed - 20) / 3); // then slower climb
-        }
-        timeFloor = Math.max(0, Math.min(98, Number(timeFloor || 0)));
-        const pairProg = parsePairScanProgress(scanStageLabel);
-        // For large pair batches, do not let time-based progress run far ahead of real backend progress.
-        // This avoids long "stuck at 94%" periods while pair scans are still mid-way.
-        if (pairProg) {
-          const ratio = Math.max(0, Math.min(1, Number(pairProg.done) / Math.max(1, Number(pairProg.total))));
-          const largeBatch = Number(pairProg.total) >= 20;
-          const leadCap = largeBatch
-            ? Math.max(2, Math.round(3 + ratio * 6))   // 2..9%
-            : Math.max(4, Math.round(6 + ratio * 8));  // 4..14%
-          timeFloor = Math.min(timeFloor, backendTarget + leadCap);
-        }
-        const target = Math.max(backendTarget, timeFloor);
+        const backendTargetRaw = Math.max(0, Math.min(100, Number(scanProgressTargetPct || 0)));
+        // Realistic UI: follow backend progress and never run far ahead by timer.
+        const target = (backendTargetRaw >= 100) ? 100 : Math.min(99, backendTargetRaw);
         const current = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
         if (target > current) {
-          const step = (current < 12) ? 2 : 3;
+          const diff = target - current;
+          const step = Math.max(1, Math.min(6, Math.ceil(diff / 4)));
           scanProgressPct = Math.min(target, current + step);
         } else if (target < current) {
-          scanProgressPct = target;
+          // Backend can move backward on stage transitions; ease down slightly.
+          scanProgressPct = Math.max(target, current - 2);
         }
-        const pct = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
+        const pct = Math.max(0, Math.min(100, Number(scanProgressPct || 0)));
         const staleSec = scanLastBackendAt > 0 ? Math.max(0, Math.floor((Date.now() - scanLastBackendAt) / 1000)) : 0;
         const backendNote = staleSec >= 25 ? ` · waiting backend ${staleSec}s` : "";
         const el = document.getElementById("status");

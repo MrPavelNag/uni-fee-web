@@ -9,6 +9,7 @@ Strict single-pool v3 agent.
 """
 
 import argparse
+import json
 import os
 import time
 from datetime import datetime
@@ -29,6 +30,7 @@ from agent_v3 import (
 
 
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+_POOL_CHAIN_CACHE_PATH = os.environ.get("STRICT_POOL_CHAIN_CACHE_PATH", "data/strict_pool_chain_cache.json")
 
 
 def _is_eth_address(v: str) -> bool:
@@ -46,6 +48,92 @@ def _include_chains() -> list[str]:
     if include:
         return include
     return sorted(set(UNISWAP_V3_SUBGRAPHS.keys()))
+
+
+def _pool_chain_cache_load() -> dict[str, dict]:
+    p = str(_POOL_CHAIN_CACHE_PATH or "").strip()
+    if not p or not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _pool_chain_cache_save(cache: dict[str, dict]) -> None:
+    p = str(_POOL_CHAIN_CACHE_PATH or "").strip()
+    if not p:
+        return
+    try:
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=True, indent=2)
+    except Exception:
+        pass
+
+
+def _pool_chain_cache_get(pool_id: str) -> str:
+    pid = str(pool_id or "").strip().lower()
+    if not _is_eth_address(pid):
+        return ""
+    rec = _pool_chain_cache_load().get(pid) or {}
+    chain = str(rec.get("chain") or "").strip().lower()
+    if chain in UNISWAP_V3_SUBGRAPHS:
+        return chain
+    return ""
+
+
+def _pool_chain_cache_put(pool_id: str, chain: str) -> None:
+    pid = str(pool_id or "").strip().lower()
+    ck = str(chain or "").strip().lower()
+    if not (_is_eth_address(pid) and ck in UNISWAP_V3_SUBGRAPHS):
+        return
+    cache = _pool_chain_cache_load()
+    cache[pid] = {"chain": ck, "updated_at": int(time.time())}
+    _pool_chain_cache_save(cache)
+
+
+def _rpc_eth_call_latest(chain_id: int, to_addr: str, data_hex: str) -> str:
+    params = [{"to": str(to_addr).strip().lower(), "data": str(data_hex).strip().lower()}, "latest"]
+    d = _rpc_json(int(chain_id), "eth_call", params, timeout_sec=6.0)
+    out = str(d.get("result") or "")
+    return out if out.startswith("0x") else ""
+
+
+def _is_probably_v3_pool_on_chain(pool_id: str, chain: str) -> bool:
+    ck = str(chain or "").strip().lower()
+    cid = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    if cid <= 0:
+        return False
+    pid = str(pool_id or "").strip().lower()
+    try:
+        code_res = _rpc_json(int(cid), "eth_getCode", [pid, "latest"], timeout_sec=6.0)
+        code = str(code_res.get("result") or "").strip().lower()
+        if not code or code in {"0x", "0x0"}:
+            return False
+        token0 = _rpc_eth_call_latest(cid, pid, "0x0dfe1681")
+        token1 = _rpc_eth_call_latest(cid, pid, "0xd21220a7")
+        fee = _rpc_eth_call_latest(cid, pid, "0xddca3f43")
+        if not (token0 and token1 and fee):
+            return False
+        t0 = "0x" + token0[-40:]
+        t1 = "0x" + token1[-40:]
+        try:
+            fee_i = int(fee, 16)
+        except Exception:
+            return False
+        return _is_eth_address(t0) and _is_eth_address(t1) and t0 != t1 and fee_i > 0
+    except Exception:
+        return False
+
+
+def _detect_chain_by_rpc(pool_id: str, chains: list[str]) -> str:
+    for chain in chains:
+        if _is_probably_v3_pool_on_chain(pool_id, chain):
+            return str(chain).strip().lower()
+    return ""
 
 
 def _exact_variant() -> str:
@@ -437,12 +525,24 @@ def main() -> None:
     include_chains = _include_chains()
     print("Uniswap v3 strict agent")
     print(f"Target pool: {target_pool}")
-    print("Probing chains:", ",".join(include_chains))
+    cached_chain = _pool_chain_cache_get(target_pool)
+    rpc_detected_chain = ""
+    probe_chains = list(include_chains)
+    if cached_chain:
+        probe_chains = [cached_chain] + [c for c in probe_chains if c != cached_chain]
+        print(f"Chain cache hit: {cached_chain}")
+    else:
+        rpc_detected_chain = _detect_chain_by_rpc(target_pool, probe_chains)
+        if rpc_detected_chain:
+            _pool_chain_cache_put(target_pool, rpc_detected_chain)
+            probe_chains = [rpc_detected_chain] + [c for c in probe_chains if c != rpc_detected_chain]
+            print(f"RPC chain detected: {rpc_detected_chain}")
+    print("Probing chains:", ",".join(probe_chains))
 
-    found_pool, found_chain, found_endpoint = _probe_pool_on_chains(target_pool, include_chains)
+    found_pool, found_chain, found_endpoint = _probe_pool_on_chains(target_pool, probe_chains)
     if not found_pool:
         all_v3_chains = sorted(set(UNISWAP_V3_SUBGRAPHS.keys()))
-        fallback_chains = [c for c in all_v3_chains if c not in set(include_chains)]
+        fallback_chains = [c for c in all_v3_chains if c not in set(probe_chains)]
         if fallback_chains:
             print(f"Pool not found on selected chains, fallback probing: {','.join(fallback_chains)}")
             found_pool, found_chain, found_endpoint = _probe_pool_on_chains(target_pool, fallback_chains)
@@ -451,6 +551,7 @@ def main() -> None:
         print("Pool not found on selected chains")
         save_chart_data_json({target_pool: _strict_unavailable_payload(target_pool, "strict_required:pool_not_found_on_selected_chains")}, out_path)
         return
+    _pool_chain_cache_put(target_pool, found_chain)
 
     pool = dict(found_pool)
     pool["chain"] = found_chain
