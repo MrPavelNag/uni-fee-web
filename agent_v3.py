@@ -159,9 +159,21 @@ _CG_DAY_PRICE_CACHE: dict[tuple[str, str, int], float] = {}
 def _rpc_urls(chain_id: int) -> list[str]:
     env_key = f"V3_RPC_URLS_{int(chain_id)}"
     raw = str(os.environ.get(env_key, "") or "").strip()
-    if raw:
-        return [x.strip() for x in raw.split(",") if x.strip()]
-    return list(DEFAULT_RPC_URLS_BY_CHAIN_ID.get(int(chain_id), []))
+    defaults = list(DEFAULT_RPC_URLS_BY_CHAIN_ID.get(int(chain_id), []))
+    if not raw:
+        return defaults
+    custom = [x.strip() for x in raw.split(",") if x.strip()]
+    # Do not let a single broken custom RPC (e.g. invalid Alchemy key URL) remove
+    # resilient public fallbacks; keep custom endpoints first for priority.
+    merged: list[str] = []
+    seen: set[str] = set()
+    for u in custom + defaults:
+        k = str(u or "").strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        merged.append(k)
+    return merged
 
 
 def _rpc_json(chain_id: int, method: str, params: list, timeout_sec: float = 8.0) -> dict:

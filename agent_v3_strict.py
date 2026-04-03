@@ -18,6 +18,7 @@ from agent_common import estimate_pool_tvl_usd_external_with_meta, pairs_to_file
 from uniswap_client import get_graph_endpoint, graphql_query, query_pool_day_data
 from agent_v3 import (
     CHAIN_ID_BY_KEY,
+    _build_exact_tvl_series_v3,
     _balance_of_raw,
     _erc20_decimals,
     _historical_price_usd,
@@ -130,6 +131,8 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> d
         "data_quality_reason": str(reason or "strict_required:unknown"),
         "strict_compare_estimated_tvl": [],
         "strict_compare_estimated_fees": [],
+        "strict_compare_exact_legacy_tvl": [],
+        "strict_compare_exact_legacy_fees": [],
         "strict_compare_exact_tvl": [],
         "strict_compare_exact_fees": [],
     }
@@ -443,6 +446,18 @@ def main() -> None:
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
+    legacy_series, legacy_reason, legacy_cov = _build_exact_tvl_series_v3(
+        chain=found_chain,
+        pool=pool,
+        fees_usd=fees_usd,
+        baseline_tvl=estimated_tvl,
+        day_start_ts=day_start_ts,
+        day_end_ts=day_end_ts,
+        budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),
+    )
+    strict_legacy_tvl = list(legacy_series) if legacy_series else []
+    strict_legacy_fees = _rebuild_fees_cumulative(fees_usd, strict_legacy_tvl) if strict_legacy_tvl else []
+
     exact_series, exact_reason, exact_cov = _build_exact2_tvl_series_v3_ledger(
         chain=found_chain,
         pool=pool,
@@ -461,7 +476,10 @@ def main() -> None:
         strict_exact_fees = list(final_fees)
     else:
         data_quality = "strict_unavailable"
-        data_quality_reason = f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f}"
+        data_quality_reason = (
+            f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f};"
+            f"legacy:{legacy_reason}:{legacy_cov:.2f}"
+        )
         final_tvl = []
         final_fees = []
         strict_exact_tvl = list(exact_series) if exact_series else []
@@ -484,6 +502,8 @@ def main() -> None:
         "data_quality_reason": data_quality_reason,
         "strict_compare_estimated_tvl": estimated_tvl,
         "strict_compare_estimated_fees": estimated_fees,
+        "strict_compare_exact_legacy_tvl": strict_legacy_tvl,
+        "strict_compare_exact_legacy_fees": strict_legacy_fees,
         "strict_compare_exact_tvl": strict_exact_tvl,
         "strict_compare_exact_fees": strict_exact_fees,
     }

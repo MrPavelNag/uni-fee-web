@@ -17917,6 +17917,8 @@ def _merge_for_web(
         has_strict_compare = bool(
             (v.get("strict_compare_estimated_fees") or [])
             or (v.get("strict_compare_estimated_tvl") or [])
+            or (v.get("strict_compare_exact_legacy_fees") or [])
+            or (v.get("strict_compare_exact_legacy_tvl") or [])
             or (v.get("strict_compare_exact_fees") or [])
             or (v.get("strict_compare_exact_tvl") or [])
         )
@@ -17958,6 +17960,8 @@ def _merge_for_web(
         if has_strict_compare:
             est_fees = v.get("strict_compare_estimated_fees") or []
             est_tvl = v.get("strict_compare_estimated_tvl") or []
+            ex_legacy_fees = v.get("strict_compare_exact_legacy_fees") or []
+            ex_legacy_tvl = v.get("strict_compare_exact_legacy_tvl") or []
             ex_fees = v.get("strict_compare_exact_fees") or []
             ex_tvl = v.get("strict_compare_exact_tvl") or []
 
@@ -17976,6 +17980,26 @@ def _merge_for_web(
                     "last_tvl": est_last_tvl,
                     "data_quality": "estimated",
                     "data_quality_reason": "strict_compare:estimated",
+                    "status": status,
+                }
+            )
+
+            exact_legacy_income = float(ex_legacy_fees[-1][1]) if ex_legacy_fees else 0.0
+            exact_legacy_apy = (exact_legacy_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+            exact_legacy_last_tvl = float(ex_legacy_tvl[-1][1]) if ex_legacy_tvl else 0.0
+            exact_legacy_full = bool(ex_legacy_tvl) and all(float(p[1]) > 0.0 for p in ex_legacy_tvl)
+            rows.append(
+                {
+                    "pool_id": base_pool_id,
+                    "chain": base_chain,
+                    "version": base_version,
+                    "pair": f"{base_pair} (exact legacy)",
+                    "fee_pct": base_fee_pct,
+                    "final_income": exact_legacy_income,
+                    "apy_pct": float(exact_legacy_apy),
+                    "last_tvl": exact_legacy_last_tvl,
+                    "data_quality": ("exact" if exact_legacy_full else "strict_unavailable"),
+                    "data_quality_reason": "strict_compare:exact_legacy",
                     "status": status,
                 }
             )
@@ -18028,6 +18052,8 @@ def _merge_for_web(
                     "tvl": tvl,
                     "strict_compare_estimated_fees": (v.get("strict_compare_estimated_fees") or []),
                     "strict_compare_estimated_tvl": (v.get("strict_compare_estimated_tvl") or []),
+                    "strict_compare_exact_legacy_fees": (v.get("strict_compare_exact_legacy_fees") or []),
+                    "strict_compare_exact_legacy_tvl": (v.get("strict_compare_exact_legacy_tvl") or []),
                     "strict_compare_exact_fees": (v.get("strict_compare_exact_fees") or []),
                     "strict_compare_exact_tvl": (v.get("strict_compare_exact_tvl") or []),
                 }
@@ -32150,14 +32176,18 @@ HTML_PAGE = """
         if (!visibilityMap[poolId]) continue;
         const estFees = Array.isArray(s.strict_compare_estimated_fees) ? s.strict_compare_estimated_fees : [];
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
+        const exLegacyFees = Array.isArray(s.strict_compare_exact_legacy_fees) ? s.strict_compare_exact_legacy_fees : [];
+        const exLegacyTvl = Array.isArray(s.strict_compare_exact_legacy_tvl) ? s.strict_compare_exact_legacy_tvl : [];
         const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
         const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
-        const useStrictCompare = strictMode && (estFees.length || estTvl.length || exFees.length || exTvl.length);
+        const useStrictCompare = strictMode && (estFees.length || estTvl.length || exLegacyFees.length || exLegacyTvl.length || exFees.length || exTvl.length);
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
           ...((s.tvl || []).map(p => Number(p[0] || 0))),
           ...(estFees.map(p => Number(p?.[0] || 0))),
           ...(estTvl.map(p => Number(p?.[0] || 0))),
+          ...(exLegacyFees.map(p => Number(p?.[0] || 0))),
+          ...(exLegacyTvl.map(p => Number(p?.[0] || 0))),
           ...(exFees.map(p => Number(p?.[0] || 0))),
           ...(exTvl.map(p => Number(p?.[0] || 0))),
           0
@@ -32170,13 +32200,18 @@ HTML_PAGE = """
           const estTvlSrc = estTvl.length ? estTvl : (Array.isArray(s.tvl) ? s.tvl : []);
           const estFeeX = estFeesSrc.map(p => new Date(p[0] * 1000));
           const estFeeY = estFeesSrc.map(p => p[1]);
+          const exLegacyFeeX = exLegacyFees.map(p => new Date(p[0] * 1000));
+          const exLegacyFeeY = exLegacyFees.map(p => p[1]);
           const exFeeX = exFees.map(p => new Date(p[0] * 1000));
           const exFeeY = exFees.map(p => p[1]);
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
+          const exLegacyTvlX = exLegacyTvl.map(p => new Date(p[0] * 1000));
+          const exLegacyTvlY = exLegacyTvl.map(p => p[1] / 1000.0);
           const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
           const exTvlY = exTvl.map(p => p[1] / 1000.0);
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
+          const exLegacyHover = exLegacyFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact legacy"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact2.0"]);
           if (estFeeX.length) {
             feeTraces.push({
@@ -32192,7 +32227,15 @@ HTML_PAGE = """
               line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
             });
           }
+          if (exLegacyFeeX.length) {
+            feeTraces.push({
+              x: exLegacyFeeX, y: exLegacyFeeY, mode: "lines", name: `${s.label} (exact legacy)`, customdata: exLegacyHover,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
+              line: {color: "#a855f7", width: 2.0, dash: "dash"}
+            });
+          }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
+          const exLegacyHoverTvl = exLegacyTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact legacy"]);
           const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact2.0"]);
           if (estTvlX.length) {
             tvlTraces.push({
@@ -32206,6 +32249,13 @@ HTML_PAGE = """
               x: exTvlX, y: exTvlY, mode: "lines", name: `${s.label} (exact2.0)`, customdata: exHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
+            });
+          }
+          if (exLegacyTvlX.length) {
+            tvlTraces.push({
+              x: exLegacyTvlX, y: exLegacyTvlY, mode: "lines", name: `${s.label} (exact legacy)`, customdata: exLegacyHoverTvl,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
+              line: {color: "#a855f7", width: 2.0, dash: "dash"}
             });
           }
         } else {
