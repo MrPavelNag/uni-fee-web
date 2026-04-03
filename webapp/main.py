@@ -17911,6 +17911,9 @@ def _merge_for_web(
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
+        dq = str(v.get("data_quality") or "estimated")
+        dq_reason = str(v.get("data_quality_reason") or "").strip()
+        strict_diagnostic = bool(dq == "strict_unavailable" or str(dq_reason).startswith("strict_required:"))
         has_strict_compare = bool(
             (v.get("strict_compare_estimated_fees") or [])
             or (v.get("strict_compare_estimated_tvl") or [])
@@ -17919,7 +17922,7 @@ def _merge_for_web(
         )
         final_income = _final_income(v)
         apy_pct = (final_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-        if has_strict_compare:
+        if has_strict_compare or strict_diagnostic:
             status = "ok"
         else:
             if float(apy_pct) < float(min_apy_pct or 0.0):
@@ -17937,8 +17940,6 @@ def _merge_for_web(
             pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
         except (TypeError, ValueError):
             pool_tvl_now_usd = 0.0
-        dq = str(v.get("data_quality") or "estimated")
-        dq_reason = str(v.get("data_quality_reason") or "").strip()
         if not dq_reason:
             ver = str(v.get("version") or "").strip().lower()
             if dq == "exact":
@@ -32110,14 +32111,14 @@ HTML_PAGE = """
           if (estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHover,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<extra></extra>",
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
               line: {color: c, width: 2, dash: "dot"}
             });
           }
           if (exFeeX.length) {
             feeTraces.push({
               x: exFeeX, y: exFeeY, mode: "lines", name: `${s.label} (exact)`, customdata: exHover,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<extra></extra>",
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
               line: {color: c, width: 2.4, dash: "solid"}
             });
           }
@@ -32126,14 +32127,14 @@ HTML_PAGE = """
           if (estTvlX.length) {
             tvlTraces.push({
               x: estTvlX, y: estTvlY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHoverTvl,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<extra></extra>",
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: c, width: 2, dash: "dot"}
             });
           }
           if (exTvlX.length) {
             tvlTraces.push({
               x: exTvlX, y: exTvlY, mode: "lines", name: `${s.label} (exact)`, customdata: exHoverTvl,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<extra></extra>",
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: c, width: 2.4, dash: "solid"}
             });
           }
@@ -32145,12 +32146,12 @@ HTML_PAGE = """
           const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
           feeTraces.push({
             x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
-            hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
+            hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
             line: {color: c, width: 2, dash: d}
           });
           tvlTraces.push({
             x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
-            hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<extra></extra>",
+            hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
             line: {color: c, width: 2, dash: d}
           });
         }

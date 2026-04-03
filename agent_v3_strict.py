@@ -35,6 +35,20 @@ def _include_chains() -> list[str]:
     return sorted(set(UNISWAP_V3_SUBGRAPHS.keys()))
 
 
+def _probe_pool_on_chains(pool_id: str, chains: list[str]) -> tuple[dict | None, str, str]:
+    for chain in chains:
+        endpoint = get_graph_endpoint(chain, "v3")
+        if not endpoint:
+            continue
+        try:
+            p = _query_pool_by_id(endpoint, pool_id)
+        except Exception:
+            p = None
+        if p:
+            return p, chain, endpoint
+    return None, "", ""
+
+
 def _query_pool_by_id(endpoint: str, pool_id: str) -> dict | None:
     q = """
     query PoolById($id: String!) {
@@ -185,22 +199,13 @@ def main() -> None:
     print(f"Target pool: {target_pool}")
     print("Probing chains:", ",".join(include_chains))
 
-    found_pool = None
-    found_chain = ""
-    found_endpoint = ""
-    for chain in include_chains:
-        endpoint = get_graph_endpoint(chain, "v3")
-        if not endpoint:
-            continue
-        try:
-            p = _query_pool_by_id(endpoint, target_pool)
-        except Exception:
-            p = None
-        if p:
-            found_pool = p
-            found_chain = chain
-            found_endpoint = endpoint
-            break
+    found_pool, found_chain, found_endpoint = _probe_pool_on_chains(target_pool, include_chains)
+    if not found_pool:
+        all_v3_chains = sorted(set(UNISWAP_V3_SUBGRAPHS.keys()))
+        fallback_chains = [c for c in all_v3_chains if c not in set(include_chains)]
+        if fallback_chains:
+            print(f"Pool not found on selected chains, fallback probing: {','.join(fallback_chains)}")
+            found_pool, found_chain, found_endpoint = _probe_pool_on_chains(target_pool, fallback_chains)
 
     if not found_pool:
         print("Pool not found on selected chains")
