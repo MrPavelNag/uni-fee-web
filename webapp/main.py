@@ -18275,7 +18275,7 @@ def _build_run_job_env(
     except Exception:
         env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH)
     env["TOKEN_PAIRS"] = token_pairs
-    env["TARGET_POOL_ID"] = target_pool_id
+    env["TARGET_POOL_ID"] = (target_pool_id if run_mode == "strict_exact" else "")
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
     env["DISABLE_PDF_OUTPUT"] = "1"
@@ -30507,6 +30507,11 @@ HTML_PAGE = """
       font-size: 12px;
       letter-spacing: 0.01em;
     }
+    .mode-disabled {
+      opacity: 0.45;
+      filter: grayscale(0.15);
+      transition: opacity 0.15s ease;
+    }
     .proto-checks {
       display: flex;
       gap: 6px;
@@ -30668,7 +30673,7 @@ HTML_PAGE = """
     <div class="grid">
       <section class="card control-card">
         <div class="form-grid">
-          <div class="row">
+          <div class="row" id="runPairsRow">
             <label title="Build pair sets with each-to-each expansion">Pairs</label>
             <div>
               <div class="pair-mode-line">
@@ -30736,7 +30741,7 @@ HTML_PAGE = """
             </div>
           </div>
 
-          <div class="row">
+          <div class="row" id="runChainsRow">
             <label title="Choose chains for analysis">Include chains</label>
             <div>
               <div class="chains-wrap">
@@ -30751,27 +30756,27 @@ HTML_PAGE = """
             </div>
           </div>
 
-          <div class="row">
+          <div class="row" id="runFiltersRow">
             <label>Filters</label>
             <div>
               <div class="inline-grid">
-                <div class="filter-item">
+                <div class="filter-item" id="filterMinTvlItem">
                   <div class="hint">Min TVL<br/>(USD)</div>
                   <input id="minTvl" value="1000" type="number" min="0" max="10000000" step="1"/>
                 </div>
-                <div class="filter-item">
+                <div class="filter-item" id="filterDaysItem">
                   <div class="hint">History<br/>days</div>
                   <input id="days" value="30" type="number" min="1" max="3650" step="1"/>
                 </div>
-                <div class="filter-item">
+                <div class="filter-item" id="filterFeeRangeItem">
                   <div class="hint">Exclude fee range<br/>X% (min-max)</div>
                   <input id="feeRangePct" value="0-2" type="text" placeholder="0-2 or 0/2"/>
                 </div>
-                <div class="filter-item">
+                <div class="filter-item" id="filterMinApyItem">
                   <div class="hint">Min APY<br/>%</div>
                   <input id="minApyPct" value="0" type="number" step="0.1" min="0" max="100000"/>
                 </div>
-                <div class="filter-item proto-item">
+                <div class="filter-item proto-item" id="filterProtocolItem">
                   <div class="hint">Protocol<br/>version</div>
                   <div class="proto-checks">
                     <label><input id="protoV3" type="checkbox" checked onchange="updateChainsNote()"/> V3</label>
@@ -30785,7 +30790,7 @@ HTML_PAGE = """
                     <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Exact</label>
                   </div>
                 </div>
-                <div class="filter-item contract-item">
+                <div class="filter-item contract-item" id="filterContractItem">
                   <div class="hint">Contract address</div>
                   <input id="targetPoolId" type="text" placeholder="0x1234...abcd (optional)" onfocus="expandTargetPoolInput()" onblur="shrinkTargetPoolInput()"/>
                 </div>
@@ -30921,6 +30926,51 @@ HTML_PAGE = """
       saveFormState();
     }
 
+    function setDisabledWithDim(el, disabled) {
+      if (!el) return;
+      el.disabled = !!disabled;
+      const wrapper = el.closest(".filter-item");
+      if (wrapper) wrapper.classList.toggle("mode-disabled", !!disabled);
+    }
+
+    function applyRunModeUiState() {
+      const strict = !!document.getElementById("modeStrictExact")?.checked;
+      const pairsRow = document.getElementById("runPairsRow");
+      const chainsRow = document.getElementById("runChainsRow");
+      const filtersRow = document.getElementById("runFiltersRow");
+      if (pairsRow) pairsRow.classList.toggle("mode-disabled", strict);
+      if (chainsRow) chainsRow.classList.toggle("mode-disabled", strict);
+      if (filtersRow) filtersRow.classList.remove("mode-disabled");
+
+      const pairIds = ["stableBucketMode", "stableBucketManual", "tokenBucketMode", "tokenBucketManual"];
+      for (const id of pairIds) {
+        const el = document.getElementById(id);
+        if (el) el.disabled = strict;
+      }
+      const pairDetailsBtn = document.getElementById("pairListsDetailsBtn");
+      if (pairDetailsBtn) pairDetailsBtn.disabled = strict;
+
+      const allChainsEl = document.getElementById("allChains");
+      if (allChainsEl) allChainsEl.disabled = strict;
+      const chainInputs = document.querySelectorAll("#chainChecks input[type='checkbox']");
+      chainInputs.forEach((el) => { el.disabled = strict; });
+
+      setDisabledWithDim(document.getElementById("minTvl"), strict);
+      setDisabledWithDim(document.getElementById("feeRangePct"), strict);
+      setDisabledWithDim(document.getElementById("minApyPct"), strict);
+      const protoV3 = document.getElementById("protoV3");
+      const protoV4 = document.getElementById("protoV4");
+      if (protoV3) protoV3.disabled = strict;
+      if (protoV4) protoV4.disabled = strict;
+      const protoItem = document.getElementById("filterProtocolItem");
+      if (protoItem) protoItem.classList.toggle("mode-disabled", strict);
+
+      // Contract field is used only in Exact mode.
+      setDisabledWithDim(document.getElementById("targetPoolId"), !strict);
+      const contractItem = document.getElementById("filterContractItem");
+      if (contractItem) contractItem.classList.toggle("mode-disabled", !strict);
+    }
+
     function syncRunModes(source) {
       const fast = document.getElementById("modeFastLegacy");
       const strict = document.getElementById("modeStrictExact");
@@ -30938,6 +30988,7 @@ HTML_PAGE = """
         if (protoV4) protoV4.checked = false;
         try { updateChainsNote(); } catch (_) {}
       }
+      applyRunModeUiState();
       saveFormState();
     }
 
@@ -31601,7 +31652,10 @@ HTML_PAGE = """
     function loadFormState() {
       try {
         const raw = localStorage.getItem(FORM_STORAGE_KEY);
-        if (!raw) return;
+        if (!raw) {
+          applyRunModeUiState();
+          return;
+        }
         const state = JSON.parse(raw);
         for (const id of FIELD_IDS) {
           const el = document.getElementById(id);
@@ -32437,6 +32491,7 @@ HTML_PAGE = """
         else onChainToggle();
         updateChainsNote();
         updatePairBuilderUi();
+        applyRunModeUiState();
       } catch (e) {
         console.warn("meta load failed", e);
       }
