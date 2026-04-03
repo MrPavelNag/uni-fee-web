@@ -504,7 +504,9 @@ def main() -> None:
             chain=found_chain,
             pool=pool,
             fees_usd=fees_usd,
-            baseline_tvl=estimated_tvl,
+            # exact1 expects baseline length to exactly match fees_usd length.
+            # Use day-aligned base series (without now-anchor).
+            baseline_tvl=estimated_tvl_base,
             day_start_ts=day_start_ts,
             day_end_ts=day_end_ts,
             budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),

@@ -18815,25 +18815,27 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 )
 
                 _set_stage("strict", "Running strict exact1/2.0 agents (single pool)", 28)
-                try:
-                    strict_total_budget = max(20.0, float(env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")))
-                except Exception:
-                    strict_total_budget = 180.0
-                split_budget = max(10.0, strict_total_budget / 2.0)
                 base_timeout = int(env.get("AGENT_TIMEOUT_SEC", "480") or 480)
-                # Keep strict runtime bounded: each exact agent gets a tight wall-time
-                # close to its own compute budget (instead of inheriting huge global timeout).
-                per_agent_timeout = max(60, min(base_timeout, int(split_budget) + 30, 180))
+                # Root-cause fix: exact1 and exact2 have different cost profiles.
+                # Do not split one budget in half; configure independent budgets.
+                try:
+                    exact1_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT1_POOL_BUDGET_SEC", "90")))
+                except Exception:
+                    exact1_budget = 90.0
+                try:
+                    exact2_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180"))))
+                except Exception:
+                    exact2_budget = 180.0
                 env1 = dict(env)
                 env2 = dict(env)
-                env1["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(split_budget))
-                env2["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(split_budget))
-                env1["AGENT_TIMEOUT_SEC"] = str(per_agent_timeout)
-                env2["AGENT_TIMEOUT_SEC"] = str(per_agent_timeout)
+                env1["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact1_budget))
+                env2["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
+                env1["AGENT_TIMEOUT_SEC"] = str(max(60, min(base_timeout, int(exact1_budget) + 30, 180)))
+                env2["AGENT_TIMEOUT_SEC"] = str(max(60, min(base_timeout, int(exact2_budget) + 30, 240)))
                 logs.append(
                     "[strict] budgets: "
-                    f"total={int(strict_total_budget)}s split={int(split_budget)}s "
-                    f"timeout_per_agent={int(per_agent_timeout)}s"
+                    f"exact1={int(exact1_budget)}s timeout1={env1['AGENT_TIMEOUT_SEC']}s "
+                    f"exact2={int(exact2_budget)}s timeout2={env2['AGENT_TIMEOUT_SEC']}s"
                 )
                 strict1_data, strict1_dbg = _run_agent_and_load_timed(
                     script_name="agent_v3_strict_exact1.py",
