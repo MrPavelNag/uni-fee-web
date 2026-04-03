@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import time
+import requests
 from datetime import datetime
 from typing import Any
 
@@ -318,6 +319,95 @@ def _safe_hex_to_int(v: Any) -> int:
         return 0
 
 
+def _alchemy_api_key() -> str:
+    for k in ("ALCHEMY_TRANSFERS_API_KEY", "ALCHEMY_API_KEY", "ALCHEMY_KEY"):
+        v = str(os.environ.get(k, "") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _alchemy_url_for_chain(chain: str) -> str:
+    ck = str(chain or "").strip().lower()
+    key = _alchemy_api_key()
+    if not key:
+        return ""
+    net = {
+        "ethereum": "eth-mainnet",
+        "arbitrum": "arb-mainnet",
+        "optimism": "opt-mainnet",
+        "base": "base-mainnet",
+        "polygon": "polygon-mainnet",
+    }.get(ck, "")
+    if not net:
+        return ""
+    return f"https://{net}.g.alchemy.com/v2/{key}"
+
+
+def _alchemy_fetch_transfer_deltas(
+    *,
+    chain: str,
+    token: str,
+    pool_id: str,
+    from_block: int,
+    to_block: int,
+    deadline_ts: float | None = None,
+) -> dict[int, int]:
+    url = _alchemy_url_for_chain(chain)
+    if not url:
+        raise RuntimeError("alchemy_not_configured_for_chain")
+
+    def _fetch_direction(direction: str) -> list[dict]:
+        out: list[dict] = []
+        page_key = ""
+        while True:
+            if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+                raise TimeoutError("exact2_budget_timeout:alchemy_transfers")
+            params: dict[str, Any] = {
+                "fromBlock": hex(int(from_block)),
+                "toBlock": hex(int(to_block)),
+                "contractAddresses": [str(token).strip().lower()],
+                "category": ["erc20"],
+                "excludeZeroValue": True,
+                "withMetadata": False,
+                "maxCount": "0x3e8",
+            }
+            if direction == "to":
+                params["toAddress"] = str(pool_id).strip().lower()
+            else:
+                params["fromAddress"] = str(pool_id).strip().lower()
+            if page_key:
+                params["pageKey"] = page_key
+            body = {"jsonrpc": "2.0", "id": 1, "method": "alchemy_getAssetTransfers", "params": [params]}
+            r = requests.post(url, json=body, timeout=(3.0, 12.0))
+            r.raise_for_status()
+            data = r.json() if isinstance(r.json(), dict) else {}
+            if data.get("error"):
+                raise RuntimeError(str(data.get("error")))
+            res = data.get("result") or {}
+            items = res.get("transfers") or []
+            if isinstance(items, list):
+                out.extend([x for x in items if isinstance(x, dict)])
+            page_key = str(res.get("pageKey") or "").strip()
+            if not page_key:
+                break
+        return out
+
+    by_block: dict[int, int] = {}
+    for direction, sign in (("from", -1), ("to", 1)):
+        rows = _fetch_direction(direction)
+        for tr in rows:
+            bn = _safe_hex_to_int(tr.get("blockNum"))
+            if bn <= 0:
+                continue
+            raw = ((tr.get("rawContract") or {}).get("value"))
+            val = _safe_hex_to_int(raw)
+            if val <= 0:
+                continue
+            by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
+    return by_block
+
+
 def _fetch_logs_adaptive(
     chain_id: int,
     token: str,
@@ -359,12 +449,27 @@ def _fetch_logs_adaptive(
 
 def _collect_pool_transfer_deltas(
     chain_id: int,
+    chain: str,
     token: str,
     pool_id: str,
     from_block: int,
     to_block: int,
     deadline_ts: float | None = None,
 ) -> dict[int, int]:
+    # Prefer Alchemy Transfers API when configured: it is significantly more
+    # reliable for long ERC20 transfer scans than raw eth_getLogs on public RPC.
+    try:
+        return _alchemy_fetch_transfer_deltas(
+            chain=str(chain),
+            token=str(token),
+            pool_id=str(pool_id),
+            from_block=int(from_block),
+            to_block=int(to_block),
+            deadline_ts=deadline_ts,
+        )
+    except Exception:
+        pass
+
     pool_topic = _addr_topic(pool_id)
     by_block: dict[int, int] = {}
     for topics, sign in (
@@ -461,8 +566,8 @@ def _build_exact2_tvl_series_v3_ledger(
     from_block = int(min(valid_blocks))
     to_block = int(latest_block)
     try:
-        deltas0 = _collect_pool_transfer_deltas(chain_id, token0, pool_id, from_block, to_block, deadline_ts=deadline_ts)
-        deltas1 = _collect_pool_transfer_deltas(chain_id, token1, pool_id, from_block, to_block, deadline_ts=deadline_ts)
+        deltas0 = _collect_pool_transfer_deltas(chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=deadline_ts)
+        deltas1 = _collect_pool_transfer_deltas(chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=deadline_ts)
     except TimeoutError:
         return [], "exact2_budget_timeout:transfer_logs", 0.0
     except Exception as e:
