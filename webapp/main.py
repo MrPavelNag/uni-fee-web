@@ -29745,6 +29745,7 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
     if req.mode_strict_exact:
         if not req.target_pool_id:
             raise HTTPException(status_code=400, detail="strict exact mode requires target_pool_id")
+        req.ignore_cache = True
         req.mode_fast_legacy = False
         req.include_versions = ["v3"]
     if (not req.mode_strict_exact) and (not req.mode_fast_legacy):
@@ -30969,6 +30970,19 @@ HTML_PAGE = """
       setDisabledWithDim(document.getElementById("targetPoolId"), !strict);
       const contractItem = document.getElementById("filterContractItem");
       if (contractItem) contractItem.classList.toggle("mode-disabled", !strict);
+
+      // In strict mode always bypass result cache to avoid stale rows.
+      const ignoreCache = document.getElementById("runIgnoreCache");
+      const ignoreCacheLabel = ignoreCache ? ignoreCache.closest(".run-ignore-cache") : null;
+      if (ignoreCache) {
+        if (strict) {
+          ignoreCache.checked = true;
+          ignoreCache.disabled = true;
+        } else {
+          ignoreCache.disabled = false;
+        }
+      }
+      if (ignoreCacheLabel) ignoreCacheLabel.classList.toggle("mode-disabled", strict);
     }
 
     function syncRunModes(source) {
@@ -32563,6 +32577,7 @@ HTML_PAGE = """
         };
         if (payload.mode_strict_exact) {
           payload.include_versions = ["v3"];
+          payload.ignore_cache = true;
           if (!payload.target_pool_id) {
             setStatus("Strict exact requires a contract address.", "fail");
             return;
