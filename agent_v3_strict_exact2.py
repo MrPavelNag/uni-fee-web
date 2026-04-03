@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""
-Strict single-pool v3 exact2.0 (ledger) agent wrapper.
-"""
-
-import os
-
-os.environ["STRICT_EXACT_VARIANT"] = "exact2"
+"""Strict single-pool v3 exact2.0 (ledger) agent wrapper."""
 
 from agent_v3_strict import main
 

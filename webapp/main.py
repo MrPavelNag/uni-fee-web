@@ -18179,7 +18179,7 @@ def _run_output_dir(job_id: str) -> Path:
 
 
 def _agent_data_path(script_name: str, pair_suffix: str) -> Path:
-    if str(script_name) in {"agent_v3.py", "agent_v3_strict_exact1.py", "agent_v3_strict_exact2.py"}:
+    if str(script_name) in {"agent_v3.py", "agent_v3_strict_exact2.py"}:
         return DATA_DIR / f"pools_v3_{pair_suffix}.json"
     return DATA_DIR / f"pools_v4_{pair_suffix}.json"
 

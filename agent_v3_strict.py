@@ -11,6 +11,7 @@ Strict single-pool v3 agent.
 import argparse
 import json
 import os
+import sqlite3
 import time
 import requests
 from datetime import datetime
@@ -21,7 +22,6 @@ from agent_common import build_exact_day_window, pairs_to_filename_suffix, resol
 from uniswap_client import get_graph_endpoint, graphql_query, query_pool_day_data
 from agent_v3 import (
     CHAIN_ID_BY_KEY,
-    _build_exact_tvl_series_v3,
     _balance_of_raw,
     _erc20_decimals,
     _historical_price_usd,
@@ -32,6 +32,7 @@ from agent_v3 import (
 
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 _POOL_CHAIN_CACHE_PATH = os.environ.get("STRICT_POOL_CHAIN_CACHE_PATH", "data/strict_pool_chain_cache.json")
+_EXACT2_CACHE_DB_PATH = os.environ.get("STRICT_EXACT2_CACHE_DB_PATH", "data/exact2_daily_cache.sqlite3")
 
 
 def _is_eth_address(v: str) -> bool:
@@ -135,13 +136,6 @@ def _detect_chain_by_rpc(pool_id: str, chains: list[str]) -> str:
         if _is_probably_v3_pool_on_chain(pool_id, chain):
             return str(chain).strip().lower()
     return ""
-
-
-def _exact_variant() -> str:
-    v = str(os.environ.get("STRICT_EXACT_VARIANT", "exact2") or "").strip().lower()
-    if v in {"exact1", "legacy"}:
-        return "exact1"
-    return "exact2"
 
 
 def _probe_pool_on_chains(pool_id: str, chains: list[str]) -> tuple[dict | None, str, str]:
@@ -517,6 +511,276 @@ def _balances_by_boundaries_desc(latest_balance: int, deltas_by_block: dict[int,
     return out
 
 
+def _exact2_cache_conn() -> sqlite3.Connection:
+    p = str(_EXACT2_CACHE_DB_PATH or "").strip()
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    conn = sqlite3.connect(p)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS exact2_daily_tvl (
+            chain TEXT NOT NULL,
+            pool_id TEXT NOT NULL,
+            day_ts INTEGER NOT NULL,
+            tvl_usd REAL NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(chain, pool_id, day_ts)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_exact2_daily_tvl_lookup ON exact2_daily_tvl(chain, pool_id, day_ts)"
+    )
+    return conn
+
+
+def _exact2_cache_load(
+    *,
+    chain: str,
+    pool_id: str,
+    day_ts_list: list[int],
+) -> dict[int, float]:
+    days = sorted({int(x) for x in (day_ts_list or []) if int(x) > 0})
+    if not days:
+        return {}
+    ck = str(chain or "").strip().lower()
+    pid = str(pool_id or "").strip().lower()
+    if not (ck and pid):
+        return {}
+    qmarks = ",".join(["?"] * len(days))
+    sql = (
+        "SELECT day_ts, tvl_usd FROM exact2_daily_tvl "
+        f"WHERE chain=? AND pool_id=? AND day_ts IN ({qmarks})"
+    )
+    try:
+        with _exact2_cache_conn() as conn:
+            rows = conn.execute(sql, (ck, pid, *days)).fetchall()
+    except Exception:
+        return {}
+    out: dict[int, float] = {}
+    for r in rows:
+        try:
+            d = int(r[0])
+            v = float(r[1] or 0.0)
+        except Exception:
+            continue
+        if d > 0:
+            out[d] = max(0.0, v)
+    return out
+
+
+def _exact2_cache_upsert(
+    *,
+    chain: str,
+    pool_id: str,
+    series: list[tuple[int, float]],
+) -> None:
+    ck = str(chain or "").strip().lower()
+    pid = str(pool_id or "").strip().lower()
+    if not (ck and pid):
+        return
+    now_i = int(time.time())
+    rows: list[tuple[str, str, int, float, int]] = []
+    for ts, tvl in (series or []):
+        day_ts = int((int(ts) // 86400) * 86400)
+        try:
+            v = float(tvl or 0.0)
+        except Exception:
+            v = 0.0
+        if day_ts <= 0:
+            continue
+        rows.append((ck, pid, day_ts, max(0.0, v), now_i))
+    if not rows:
+        return
+    try:
+        with _exact2_cache_conn() as conn:
+            conn.executemany(
+                """
+                INSERT INTO exact2_daily_tvl(chain, pool_id, day_ts, tvl_usd, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chain, pool_id, day_ts) DO UPDATE SET
+                    tvl_usd=excluded.tvl_usd,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+            conn.commit()
+    except Exception:
+        return
+
+
+def _strict_exact2_source() -> str:
+    """Select exact2 source: rpc (default), goldsky, auto."""
+    src = str(os.environ.get("STRICT_EXACT2_SOURCE", "rpc") or "").strip().lower()
+    if src in {"goldsky", "auto", "rpc"}:
+        return src
+    return "rpc"
+
+
+def _goldsky_graphql_url() -> str:
+    return str(os.environ.get("GOLDSKY_GRAPHQL_URL", "") or "").strip()
+
+
+def _goldsky_headers() -> dict[str, str]:
+    h: dict[str, str] = {"Content-Type": "application/json"}
+    api_key = str(
+        os.environ.get("GOLDSKY_API_KEY")
+        or os.environ.get("GOLDSKY_KEY")
+        or os.environ.get("GOLDSKY_TOKEN")
+        or ""
+    ).strip()
+    if api_key:
+        # Some endpoints expect x-api-key, some accept bearer token.
+        h["x-api-key"] = api_key
+        h["Authorization"] = f"Bearer {api_key}"
+    return h
+
+
+def _goldsky_fetch_exact2_tvl_series(
+    *,
+    pool_id: str,
+    fees_usd: list[tuple[int, float]],
+    day_start_ts: int,
+    day_end_ts: int,
+    budget_sec: float,
+) -> tuple[list[tuple[int, float]], str, float]:
+    """
+    Read precomputed daily TVL from Goldsky GraphQL.
+    Expects Uniswap-like pool day entities (poolDayDatas / poolDayData).
+    """
+    url = _goldsky_graphql_url()
+    if not url:
+        return [], "exact2_goldsky_not_configured:url_missing", 0.0
+    if not fees_usd:
+        return [], "exact2_goldsky_no_fee_days", 0.0
+
+    timeout_total = max(6.0, float(min(25.0, budget_sec)))
+    timeout_tuple = (3.0, timeout_total)
+    p = str(pool_id or "").strip().lower()
+    ts_from = int(day_start_ts)
+    ts_to = int(day_end_ts + 86399)
+
+    # Try common schema variants. Unknown fields are normal across deployments.
+    attempts: list[tuple[str, str]] = [
+        (
+            "poolDayDatas",
+            """
+            query Q($pool:String!, $from:Int!, $to:Int!) {
+              poolDayDatas(
+                where: { pool: $pool, date_gte: $from, date_lte: $to }
+                orderBy: date
+                orderDirection: asc
+                first: 2000
+              ) {
+                date
+                tvlUSD
+                totalValueLockedUSD
+              }
+            }
+            """,
+        ),
+        (
+            "poolDayData",
+            """
+            query Q($pool:String!, $from:Int!, $to:Int!) {
+              poolDayData(
+                where: { pool: $pool, date_gte: $from, date_lte: $to }
+                orderBy: date
+                orderDirection: asc
+                first: 2000
+              ) {
+                date
+                tvlUSD
+                totalValueLockedUSD
+              }
+            }
+            """,
+        ),
+        (
+            "poolDayDatas",
+            """
+            query Q($pool:String!, $from:Int!, $to:Int!) {
+              poolDayDatas(
+                where: { pool: $pool, dayStartTimestamp_gte: $from, dayStartTimestamp_lte: $to }
+                orderBy: dayStartTimestamp
+                orderDirection: asc
+                first: 2000
+              ) {
+                dayStartTimestamp
+                tvlUSD
+                totalValueLockedUSD
+              }
+            }
+            """,
+        ),
+    ]
+
+    rows: list[dict[str, Any]] = []
+    last_err = ""
+    for key, query in attempts:
+        try:
+            body = {
+                "query": query,
+                "variables": {"pool": p, "from": int(ts_from), "to": int(ts_to)},
+            }
+            r = requests.post(url, json=body, headers=_goldsky_headers(), timeout=timeout_tuple)
+            r.raise_for_status()
+            payload = r.json() if isinstance(r.json(), dict) else {}
+            errs = payload.get("errors") or []
+            if errs:
+                msg = str(errs[0]) if isinstance(errs, list) and errs else str(errs)
+                last_err = f"{key}:{msg}"[:180]
+                continue
+            data = payload.get("data") or {}
+            got = data.get(key) or []
+            if isinstance(got, list) and got:
+                rows = [x for x in got if isinstance(x, dict)]
+                break
+        except Exception as e:
+            last_err = f"{key}:{e}"[:180]
+            continue
+
+    if not rows:
+        return [], f"exact2_goldsky_no_rows:{last_err or 'empty'}", 0.0
+
+    by_day_tvl: dict[int, float] = {}
+    for r in rows:
+        raw_day = r.get("date")
+        if raw_day is None:
+            raw_day = r.get("dayStartTimestamp")
+        try:
+            d = int(raw_day)
+        except Exception:
+            continue
+        day_ts = int((int(d) // 86400) * 86400)
+        tvl_raw = r.get("tvlUSD")
+        if tvl_raw is None:
+            tvl_raw = r.get("totalValueLockedUSD")
+        try:
+            tvl = float(tvl_raw or 0.0)
+        except Exception:
+            tvl = 0.0
+        if tvl < 0:
+            tvl = 0.0
+        by_day_tvl[day_ts] = float(tvl)
+
+    out: list[tuple[int, float]] = []
+    non_zero = 0
+    for ts, _ in fees_usd:
+        day_ts = int((int(ts) // 86400) * 86400)
+        v = float(by_day_tvl.get(day_ts, 0.0))
+        if v > 0:
+            non_zero += 1
+        out.append((int(ts), v))
+    cov = float(non_zero / max(1, len(fees_usd)))
+    if non_zero == 0:
+        return out, "exact2_goldsky_non_positive_days", cov
+    if non_zero < len(fees_usd):
+        return out, f"exact2_goldsky_partial:{non_zero}/{len(fees_usd)}", cov
+    return out, "ok", cov
+
+
 def _build_exact2_tvl_series_v3_ledger(
     *,
     chain: str,
@@ -526,12 +790,58 @@ def _build_exact2_tvl_series_v3_ledger(
     day_end_ts: int,
     budget_sec: float,
 ) -> tuple[list[tuple[int, float]], str, float]:
+    pool_id = str(pool.get("id") or "").strip().lower()
+    day_keys = [int((int(ts) // 86400) * 86400) for ts, _ in (fees_usd or []) if int(ts) > 0]
+    cached_by_day = _exact2_cache_load(chain=str(chain), pool_id=pool_id, day_ts_list=day_keys)
+    if day_keys and all(int(d) in cached_by_day for d in day_keys):
+        hit_series = [(int(ts), float(cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0))) for ts, _ in fees_usd]
+        hit_cov = float(sum(1 for _ts, v in hit_series if float(v) > 0.0) / max(1, len(hit_series)))
+        return hit_series, "exact2_cache:ok", hit_cov
+
+    src = _strict_exact2_source()
+    if src in {"goldsky", "auto"}:
+        gs_series, gs_reason, gs_cov = _goldsky_fetch_exact2_tvl_series(
+            pool_id=pool_id,
+            fees_usd=fees_usd,
+            day_start_ts=day_start_ts,
+            day_end_ts=day_end_ts,
+            budget_sec=budget_sec,
+        )
+        if gs_series and cached_by_day:
+            gs_by_day = {
+                int((int(ts) // 86400) * 86400): float(v)
+                for ts, v in gs_series
+                if int(ts) > 0
+            }
+            gs_series = [
+                (
+                    int(ts),
+                    float(
+                        gs_by_day.get(
+                            int((int(ts) // 86400) * 86400),
+                            cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0),
+                        )
+                    ),
+                )
+                for ts, _ in fees_usd
+            ]
+            gs_cov = float(sum(1 for _ts, v in gs_series if float(v) > 0.0) / max(1, len(gs_series)))
+            gs_reason = "exact2_goldsky:cache_enriched"
+        if gs_reason == "ok" or gs_reason.startswith("exact2_goldsky:"):
+            _exact2_cache_upsert(chain=str(chain), pool_id=pool_id, series=gs_series)
+            if gs_reason == "ok":
+                return gs_series, "exact2_goldsky:ok", gs_cov
+            if src == "goldsky":
+                return gs_series, gs_reason, gs_cov
+        if src == "goldsky":
+            # Explicit source choice: do not fallback to RPC reconstruction.
+            return gs_series, gs_reason, gs_cov
+
     deadline_ts = time.monotonic() + max(10.0, float(budget_sec))
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
         return [], "exact2_unsupported_chain", 0.0
-    pool_id = str(pool.get("id") or "").strip().lower()
     token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
     token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
     if not (pool_id and token0 and token1):
@@ -599,6 +909,26 @@ def _build_exact2_tvl_series_v3_ledger(
             non_zero += 1
         tvl_series.append((int(ts), float(tvl)))
 
+    if tvl_series and cached_by_day:
+        rpc_by_day = {
+            int((int(ts) // 86400) * 86400): float(v)
+            for ts, v in tvl_series
+            if int(ts) > 0
+        }
+        tvl_series = [
+            (
+                int(ts),
+                float(
+                    rpc_by_day.get(
+                        int((int(ts) // 86400) * 86400),
+                        cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0),
+                    )
+                ),
+            )
+            for ts, _ in fees_usd
+        ]
+        non_zero = sum(1 for _ts, v in tvl_series if float(v) > 0.0)
+    _exact2_cache_upsert(chain=str(chain), pool_id=pool_id, series=tvl_series)
     cov = float(non_zero / max(1, len(fees_usd)))
     if non_zero == 0:
         return tvl_series, f"exact2_non_positive_days:block_missing={block_missing}:priced_days={priced_days}", cov
@@ -704,33 +1034,20 @@ def main() -> None:
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
-    variant = _exact_variant()
-    if variant == "exact1":
-        exact_series, exact_reason, exact_cov = _build_exact_tvl_series_v3(
-            chain=found_chain,
-            pool=pool,
-            fees_usd=fees_usd,
-            # exact1 expects baseline length to exactly match fees_usd length.
-            # Use day-aligned base series (without now-anchor).
-            baseline_tvl=estimated_tvl_base,
-            day_start_ts=day_start_ts,
-            day_end_ts=day_end_ts,
-            budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),
-        )
-    else:
-        exact_series, exact_reason, exact_cov = _build_exact2_tvl_series_v3_ledger(
-            chain=found_chain,
-            pool=pool,
-            fees_usd=fees_usd,
-            day_start_ts=day_start_ts,
-            day_end_ts=day_end_ts,
-            budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),
-        )
+    print(f"exact2 source: {_strict_exact2_source()}")
+    exact_series, exact_reason, exact_cov = _build_exact2_tvl_series_v3_ledger(
+        chain=found_chain,
+        pool=pool,
+        fees_usd=fees_usd,
+        day_start_ts=day_start_ts,
+        day_end_ts=day_end_ts,
+        budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),
+    )
 
     strict_exact_ok = bool(exact_series and len(exact_series) == len(fees_usd) and all(float(v) > 0.0 for _ts, v in exact_series))
     if strict_exact_ok:
         data_quality = "exact"
-        data_quality_reason = ("exact1:ok" if variant == "exact1" else "exact2.0:ok")
+        data_quality_reason = "exact2.0:ok"
         final_tvl_base = list(exact_series)
         final_fees_base = _rebuild_fees_cumulative(fees_usd, final_tvl_base)
         final_tvl = _append_now_tvl_anchor(final_tvl_base, float(pool_tvl_now_usd))
@@ -739,9 +1056,7 @@ def main() -> None:
         strict_exact_fees = list(final_fees)
     else:
         data_quality = "strict_unavailable"
-        data_quality_reason = (
-            f"strict_required:{'exact1' if variant == 'exact1' else 'exact2.0'}:{exact_reason}:{exact_cov:.2f}"
-        )
+        data_quality_reason = f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f}"
         final_tvl = []
         final_fees = []
         if exact_series:
