@@ -23,10 +23,10 @@ from config import (
     V4_CHAINS,
 )
 from agent_common import (
-    estimate_pool_tvl_usd_external_with_meta,
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
+    resolve_pool_tvl_now_external,
     save_chart_data_json,
     save_dynamic_token,
     _normalize_fee_pct,
@@ -462,12 +462,10 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
             kept = 0
             skipped_missing_price = 0
             for p in pools:
-                ext_tvl, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                ext_tvl, price_source, price_err = resolve_pool_tvl_now_external(p, chain, write_back=True)
                 if float(ext_tvl) <= 0:
                     skipped_missing_price += 1
                     continue
-                p["effectiveTvlUSD"] = float(ext_tvl)
-                p["tvl_price_source"] = str(price_source or "external")
                 if float(ext_tvl) < float(min_tvl):
                     continue
                 p["chain"] = chain
@@ -577,15 +575,13 @@ def main() -> None:
         series = compute_fee_series(pool, endpoint)
         # Hard rule: TVL "now" must always come from reserves * external prices.
         # Never trust prefilled pool TVL fields for current-point valuation.
-        pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
+        pool_tvl_now_usd, price_source, price_err = resolve_pool_tvl_now_external(pool, chain, write_back=True)
         if float(pool_tvl_now_usd) <= 0:
             msg = (
                 f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: "
                 f"skipped (external TVL unavailable: {price_err or 'unknown'})"
             )
             return idx, None, None, msg
-        pool["effectiveTvlUSD"] = float(pool_tvl_now_usd)
-        pool["tvl_price_source"] = str(price_source or "external")
         # Build TVL and profitability strictly from external TVL (no subgraph TVL dependency).
         series["fees"] = []
         series["tvl"] = []

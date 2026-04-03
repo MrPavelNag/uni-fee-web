@@ -196,6 +196,30 @@ def estimate_pool_tvl_usd_external(pool: dict, chain: str) -> float:
     return float(tvl)
 
 
+def resolve_pool_tvl_now_external(
+    pool: dict,
+    chain: str,
+    *,
+    write_back: bool = True,
+) -> tuple[float, str, str]:
+    """
+    Canonical "TVL now" rule used across the whole app:
+    current reserves * external token USD prices.
+
+    Returns: (tvl_usd, price_source, error)
+    Optionally writes canonical fields back into `pool`.
+    """
+    tvl_usd, price_source, err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
+    if write_back:
+        try:
+            if float(tvl_usd) > 0:
+                pool["effectiveTvlUSD"] = float(tvl_usd)
+            pool["tvl_price_source"] = str(price_source or pool.get("tvl_price_source") or "external")
+        except Exception:
+            pass
+    return float(tvl_usd), str(price_source or ""), str(err or "")
+
+
 def save_chart(pool_chart_data: dict[str, dict], path: str) -> None:
     """Plot cumulative fees and TVL. pool_chart_data: {pool_id -> {fees, tvl, pool_id, fee_pct, pair, chain, version}}."""
     import matplotlib.dates as mdates

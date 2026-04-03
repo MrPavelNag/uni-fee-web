@@ -27,11 +27,11 @@ from config import (
 )
 
 from agent_common import (
-    estimate_pool_tvl_usd_external_with_meta,
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
     parse_token_pairs,
+    resolve_pool_tvl_now_external,
     save_chart_data_json,
     save_dynamic_token,
 )
@@ -882,7 +882,7 @@ def discover_pools_v3(
                 filtered_pools: list[dict] = []
                 skipped_missing_price = 0
                 for p in pools:
-                    ext_tvl, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                    ext_tvl, price_source, price_err = resolve_pool_tvl_now_external(p, chain, write_back=True)
                     if float(ext_tvl) <= 0:
                         skipped_missing_price += 1
                         pid = str((p or {}).get("id") or "")
@@ -891,8 +891,6 @@ def discover_pools_v3(
                             f"pool={pid} reason={price_err or 'unknown'}"
                         )
                         continue
-                    p["effectiveTvlUSD"] = float(ext_tvl)
-                    p["tvl_price_source"] = str(price_source or "external")
                     if float(ext_tvl) >= float(min_tvl_now):
                         filtered_pools.append(p)
                 pools = filtered_pools
@@ -1186,15 +1184,13 @@ def main() -> None:
         data = compute_fee_and_tvl_series(pool, endpoint)
         # Hard rule: TVL "now" must always come from reserves * external prices.
         # Never trust prefilled pool TVL fields for current-point valuation.
-        pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, chain)
+        pool_tvl_now_usd, price_source, price_err = resolve_pool_tvl_now_external(pool, chain, write_back=True)
         if float(pool_tvl_now_usd) <= 0:
             msg = (
                 f"  [{idx+1}/{len(pools)}] {chain} {pair}: "
                 f"skipped (external TVL unavailable: {price_err or 'unknown'})"
             )
             return idx, None, None, msg
-        pool["effectiveTvlUSD"] = float(pool_tvl_now_usd)
-        pool["tvl_price_source"] = str(price_source or "external")
         # Build TVL and profitability strictly from external TVL (no subgraph TVL dependency).
         data["fees"] = []
         data["tvl"] = []

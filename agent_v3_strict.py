@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from config import DEFAULT_TOKEN_PAIRS, FEE_DAYS, LP_ALLOCATION_USD, UNISWAP_V3_SUBGRAPHS
-from agent_common import estimate_pool_tvl_usd_external_with_meta, pairs_to_filename_suffix, save_chart_data_json
+from agent_common import pairs_to_filename_suffix, resolve_pool_tvl_now_external, save_chart_data_json
 from uniswap_client import get_graph_endpoint, graphql_query, query_pool_day_data
 from agent_v3 import (
     CHAIN_ID_BY_KEY,
@@ -462,7 +462,7 @@ def main() -> None:
     t1 = str(((pool.get("token1") or {}).get("symbol") or "?"))
     pool["pair_label"] = f"{t0}/{t1}"
 
-    pool_tvl_now_usd, price_source, price_err = estimate_pool_tvl_usd_external_with_meta(pool, found_chain)
+    pool_tvl_now_usd, price_source, price_err = resolve_pool_tvl_now_external(pool, found_chain, write_back=True)
     if float(pool_tvl_now_usd) <= 0:
         print(f"external TVL unavailable: {price_err or 'unknown'}")
         save_chart_data_json(

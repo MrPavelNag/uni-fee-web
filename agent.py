@@ -24,7 +24,7 @@ from config import (
     UNISWAP_V3_SUBGRAPHS,
     UNISWAP_V4_SUBGRAPHS,
 )
-from agent_common import estimate_pool_tvl_usd_external_with_meta, get_token_addresses
+from agent_common import get_token_addresses, resolve_pool_tvl_now_external
 from uniswap_client import (
     get_graph_endpoint,
     query_pool_day_data,
@@ -173,13 +173,11 @@ def discover_pools(
                     print(f"  [{chain}] {version} {base}/{quote}: {e}")
                     pools = []
                 for p in pools:
-                    ext_tvl, src, _ = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                    ext_tvl, src, _ = resolve_pool_tvl_now_external(p, chain, write_back=True)
                     if float(ext_tvl) <= 0:
                         continue
                     if float(ext_tvl) < float(min_tvl_val):
                         continue
-                    p["effectiveTvlUSD"] = float(ext_tvl)
-                    p["tvl_price_source"] = str(src or "external")
                     p["chain"] = chain
                     p["version"] = version
                     p["pair_label"] = f"{base}/{quote}"
@@ -378,7 +376,7 @@ def main() -> None:
         if endpoint:
             try:
                 data = compute_fee_and_tvl_series(p, endpoint)
-                pool_tvl_now_usd, _, _ = estimate_pool_tvl_usd_external_with_meta(p, chain)
+                pool_tvl_now_usd, _, _ = resolve_pool_tvl_now_external(p, chain, write_back=True)
                 if float(pool_tvl_now_usd) <= 0:
                     continue
                 fees_usd = data.get("_fees_usd") or []

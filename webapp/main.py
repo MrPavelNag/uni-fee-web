@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-from agent_common import estimate_pool_tvl_usd_external_with_meta, load_chart_data_json, pairs_to_filename_suffix
+from agent_common import load_chart_data_json, pairs_to_filename_suffix, resolve_pool_tvl_now_external
 from config import GOLDSKY_ENDPOINTS, TOKEN_ADDRESSES, UNISWAP_V3_SUBGRAPHS, UNISWAP_V4_SUBGRAPHS
 from uniswap_client import get_graph_endpoint, graphql_query
 
@@ -5594,7 +5594,7 @@ def _enrich_tvl_background(rows: list[dict[str, Any]], max_seconds: int = 25) ->
             if not pos:
                 continue
             pool = pos.get("pool") or {}
-            ext_pool_tvl_usd, _, _ = estimate_pool_tvl_usd_external_with_meta(pool, chain_key)
+            ext_pool_tvl_usd, _, _ = resolve_pool_tvl_now_external(pool, chain_key, write_back=True)
             pool_tvl_usd = _safe_float(ext_pool_tvl_usd) or _safe_float(r.get("pool_tvl_usd"))
             new_tvl: float | None = _estimate_position_tvl_usd_from_detail_external(pos, pool, chain_id)
             new_mode = "exact-external-bg"
