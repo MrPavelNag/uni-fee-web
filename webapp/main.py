@@ -17981,6 +17981,7 @@ def _merge_for_web(
             ex_tvl = v.get("strict_compare_exact_tvl") or []
             legacy_reason = str(v.get("strict_compare_exact_legacy_reason") or "strict_compare:exact_legacy")
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact2.0")
+            has_legacy = bool(ex_legacy_fees or ex_legacy_tvl)
 
             tvl_end_ts = max(
                 [0]
@@ -18020,26 +18021,27 @@ def _merge_for_web(
                 }
             )
 
-            exact_legacy_income = float(ex_legacy_fees[-1][1]) if ex_legacy_fees else 0.0
-            exact_legacy_apy = (exact_legacy_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-            exact_legacy_last_tvl = float(ex_legacy_tvl[-1][1]) if ex_legacy_tvl else 0.0
-            exact_legacy_full = bool(ex_legacy_tvl) and all(float(p[1]) > 0.0 for p in ex_legacy_tvl)
-            exact_legacy_ok = bool(exact_legacy_full and not str(legacy_reason).startswith("strict_required:"))
-            rows.append(
-                {
-                    "pool_id": base_pool_id,
-                    "chain": base_chain,
-                    "version": base_version,
-                    "pair": f"{base_pair} (exact legacy)",
-                    "fee_pct": base_fee_pct,
-                    "final_income": exact_legacy_income,
-                    "apy_pct": float(exact_legacy_apy),
-                    "last_tvl": exact_legacy_last_tvl,
-                    "data_quality": ("exact" if exact_legacy_ok else "strict_unavailable"),
-                    "data_quality_reason": legacy_reason,
-                    "status": status,
-                }
-            )
+            if has_legacy:
+                exact_legacy_income = float(ex_legacy_fees[-1][1]) if ex_legacy_fees else 0.0
+                exact_legacy_apy = (exact_legacy_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+                exact_legacy_last_tvl = float(ex_legacy_tvl[-1][1]) if ex_legacy_tvl else 0.0
+                exact_legacy_full = bool(ex_legacy_tvl) and all(float(p[1]) > 0.0 for p in ex_legacy_tvl)
+                exact_legacy_ok = bool(exact_legacy_full and not str(legacy_reason).startswith("strict_required:"))
+                rows.append(
+                    {
+                        "pool_id": base_pool_id,
+                        "chain": base_chain,
+                        "version": base_version,
+                        "pair": f"{base_pair} (exact legacy)",
+                        "fee_pct": base_fee_pct,
+                        "final_income": exact_legacy_income,
+                        "apy_pct": float(exact_legacy_apy),
+                        "last_tvl": exact_legacy_last_tvl,
+                        "data_quality": ("exact" if exact_legacy_ok else "strict_unavailable"),
+                        "data_quality_reason": legacy_reason,
+                        "status": status,
+                    }
+                )
 
             exact_income = float(ex_fees[-1][1]) if ex_fees else 0.0
             exact_apy = (exact_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
@@ -18820,37 +18822,19 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     pair_suffix=pair_suffix,
                 )
 
-                _set_stage("strict", "Running strict exact1/2.0 agents (single pool)", 28)
+                _set_stage("strict", "Running strict exact2.0 agent (single pool)", 28)
                 base_timeout = int(env.get("AGENT_TIMEOUT_SEC", "480") or 480)
-                # Root-cause fix: exact1 and exact2 have different cost profiles.
-                # Do not split one budget in half; configure independent budgets.
-                try:
-                    exact1_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT1_POOL_BUDGET_SEC", "180")))
-                except Exception:
-                    exact1_budget = 180.0
                 try:
                     exact2_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "240"))))
                 except Exception:
                     exact2_budget = 240.0
-                env1 = dict(env)
                 env2 = dict(env)
-                env1["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact1_budget))
                 env2["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
-                env1["AGENT_TIMEOUT_SEC"] = str(max(60, min(base_timeout, int(exact1_budget) + 30, 180)))
                 env2["AGENT_TIMEOUT_SEC"] = str(max(60, min(base_timeout, int(exact2_budget) + 30, 240)))
                 logs.append(
                     "[strict] budgets: "
-                    f"exact1={int(exact1_budget)}s timeout1={env1['AGENT_TIMEOUT_SEC']}s "
                     f"exact2={int(exact2_budget)}s timeout2={env2['AGENT_TIMEOUT_SEC']}s"
                 )
-                strict1_data, strict1_dbg = _run_agent_and_load_timed(
-                    script_name="agent_v3_strict_exact1.py",
-                    env=env1,
-                    min_tvl=req.min_tvl,
-                    logs=logs,
-                    pair_suffix=pair_suffix,
-                )
-                _set_stage("strict", "Running strict exact2.0 agent (single pool)", 45)
                 strict2_data, strict2_dbg = _run_agent_and_load_timed(
                     script_name="agent_v3_strict_exact2.py",
                     env=env2,
@@ -18863,20 +18847,6 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     base2 = merged_raw.get(_pid)
                     if isinstance(base2, dict):
                         base2["strict_compare_exact2_reason"] = str(_v2.get("data_quality_reason") or "")
-                for _pid, _v1 in (strict1_data or {}).items():
-                    base = merged_raw.get(_pid)
-                    if not isinstance(base, dict):
-                        base = dict(_v1 or {})
-                        base.setdefault("strict_compare_exact_tvl", [])
-                        base.setdefault("strict_compare_exact_fees", [])
-                        merged_raw[_pid] = base
-                    base["strict_compare_exact_legacy_tvl"] = (_v1.get("strict_compare_exact_tvl") or [])
-                    base["strict_compare_exact_legacy_fees"] = (_v1.get("strict_compare_exact_fees") or [])
-                    base["strict_compare_exact_legacy_reason"] = str(_v1.get("data_quality_reason") or "")
-                    if not (base.get("strict_compare_estimated_tvl") or []):
-                        base["strict_compare_estimated_tvl"] = (_v1.get("strict_compare_estimated_tvl") or [])
-                    if not (base.get("strict_compare_estimated_fees") or []):
-                        base["strict_compare_estimated_fees"] = (_v1.get("strict_compare_estimated_fees") or [])
                 for _pid, _ve in (est_data or {}).items():
                     base = merged_raw.get(_pid)
                     if not isinstance(base, dict):
@@ -18891,18 +18861,17 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     {
                         "pair": token_pairs,
                         "index": 1,
-                        "agents": [est_dbg, strict1_dbg, strict2_dbg],
+                        "agents": [est_dbg, strict2_dbg],
                         "merged_before": 0,
                         "merged_after": int(len(merged_raw)),
                         "merged_added": int(len(merged_raw)),
                         "total_ms": (
                             int((est_dbg or {}).get("total_ms") or 0)
-                            + int((strict1_dbg or {}).get("total_ms") or 0)
                             + int((strict2_dbg or {}).get("total_ms") or 0)
                         ),
                     }
                 )
-                _set_stage("strict", "Strict exact1/2.0 agents completed", 75)
+                _set_stage("strict", "Strict exact2.0 agent completed", 75)
             else:
                 total_pairs = max(1, len(pairs))
                 pair_workers = _pair_worker_count(speed_mode, total_pairs)
