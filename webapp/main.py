@@ -30663,6 +30663,7 @@ HTML_PAGE = """
       apy_pct: (r) => Number(r.apy_pct || 0),
       last_tvl: (r) => Number(r.last_tvl || 0),
       data_quality: (r) => String(r.data_quality || ""),
+      data_quality_reason: (r) => String(r.data_quality_reason || ""),
       status: (r) => r.status || ""
     };
 
@@ -31824,7 +31825,7 @@ HTML_PAGE = """
       const endDate = maxTs > 0 ? new Date(maxTs * 1000) : new Date();
       const startDate = new Date(endDate.getTime() - days * 24 * 3600 * 1000);
       Plotly.newPlot("feesChart", feeTraces, {
-        title: `Cumulative Fees (LP allocation: $${formatUsd(alloc)})${scopeSuffix}`,
+        title: {text: `Cumulative Fees (LP allocation: $${formatUsd(alloc)})${scopeSuffix}`, font: {size: 14}},
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
@@ -31836,7 +31837,7 @@ HTML_PAGE = """
         installChartTitleHint("feesChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
       });
       Plotly.newPlot("tvlChart", tvlTraces, {
-        title: `TVL dynamics (thousands USD)${scopeSuffix}`,
+        title: {text: `TVL dynamics (thousands USD)${scopeSuffix}`, font: {size: 14}},
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#f8fbff",
         font: {color: "#0f172a"},
@@ -31860,7 +31861,7 @@ HTML_PAGE = """
       const table = document.getElementById("resultTable");
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
-        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["data_quality", "Data quality"], ["status", "Status"]
+        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["data_quality", "Data quality"], ["data_quality_reason", "Quality reason"], ["status", "Status"]
       ];
 
       let html = "<tr>";
@@ -31895,6 +31896,7 @@ HTML_PAGE = """
         const dqReason = String(r.data_quality_reason || "");
         const dqTitle = dqReason ? ` title="${escAttr(dqReason)}"` : "";
         html += `<td${dqTitle}>${escAttr(dq)}</td>`;
+        html += `<td class="mono" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(dqReason || "-")}">${escAttr(dqReason || "-")}</td>`;
         const statusLabel = r.status === "ok"
           ? "ok"
           : (r.status === "filtered_suffix" ? "excluded by suffix" : "filtered by fee range");
@@ -32344,10 +32346,10 @@ HTML_PAGE = """
       };
       const scopeSuffix = getChartScopeSuffix();
       const pairHintText = getChartPairsHintText();
-      Plotly.newPlot("feesChart", baseline, {title: `Cumulative Fees${scopeSuffix}`, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "Cumulative fee (USD)"}}, {displaylogo: false, responsive: true}).then(() => {
+      Plotly.newPlot("feesChart", baseline, {title: {text: `Cumulative Fees${scopeSuffix}`, font: {size: 14}}, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "Cumulative fee (USD)"}}, {displaylogo: false, responsive: true}).then(() => {
         installChartTitleHint("feesChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
       });
-      Plotly.newPlot("tvlChart", baseline, {title: `TVL dynamics (thousands USD)${scopeSuffix}`, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "TVL (k USD)"}}, {displaylogo: false, responsive: true}).then(() => {
+      Plotly.newPlot("tvlChart", baseline, {title: {text: `TVL dynamics (thousands USD)${scopeSuffix}`, font: {size: 14}}, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "TVL (k USD)"}}, {displaylogo: false, responsive: true}).then(() => {
         installChartTitleHint("tvlChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
       });
     }
