@@ -87,6 +87,8 @@ V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 1))
 # i.e. the value selected in UI "History days".
 V3_EXACT_TVL_DAYS_MAX = max(1, _env_int("V3_EXACT_TVL_DAYS_MAX", int(FEE_DAYS)))
 V3_EXACT_TVL_POOL_BUDGET_SEC = max(2.0, _env_float("V3_EXACT_TVL_POOL_BUDGET_SEC", 90.0))
+V3_EXACT_TVL_MIN_COVERAGE_EXACT = min(1.0, max(0.0, _env_float("V3_EXACT_TVL_MIN_COVERAGE_EXACT", 0.98)))
+V3_EXACT_TVL_MIN_COVERAGE_PARTIAL = min(1.0, max(0.0, _env_float("V3_EXACT_TVL_MIN_COVERAGE_PARTIAL", 0.25)))
 V3_EXACT_TVL_DEBUG = _env_flag("V3_EXACT_TVL_DEBUG", False)
 
 CHAIN_ID_BY_KEY: dict[str, int] = {
@@ -860,22 +862,20 @@ def _build_exact_tvl_series_v3(
     day_start_ts: int,
     day_end_ts: int,
     budget_sec: float,
-) -> tuple[list[tuple[int, float]], str]:
+) -> tuple[list[tuple[int, float]], str, float]:
     if not fees_usd:
-        return [], "no_fees_series"
+        return [], "no_fees_series", 0.0
     ck = str(chain or "").strip().lower()
     if ck not in V3_EXACT_TVL_CHAINS:
-        return [], "chain_not_enabled"
-    if len(fees_usd) > int(V3_EXACT_TVL_DAYS_MAX):
-        return [], "days_cap"
+        return [], "chain_not_enabled", 0.0
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
-        return [], "chain_id_unknown"
+        return [], "chain_id_unknown", 0.0
     pool_id = str(pool.get("id") or "").strip().lower()
     t0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
     t1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
     if not (_is_eth_address(pool_id) and _is_eth_address(t0) and _is_eth_address(t1)):
-        return [], "pool_or_tokens_not_address"
+        return [], "pool_or_tokens_not_address", 0.0
 
     t0_dec = _erc20_decimals(chain_id, t0)
     t1_dec = _erc20_decimals(chain_id, t1)
@@ -883,7 +883,7 @@ def _build_exact_tvl_series_v3(
     t_started = time.perf_counter()
     for ts, _ in fees_usd:
         if (time.perf_counter() - t_started) > float(max(1.0, budget_sec)):
-            return [], "budget_timeout"
+            return [], "budget_timeout", 0.0
         dts = int((int(ts) // 86400) * 86400)
         try:
             block_num = _llama_block_for_day(ck, int(dts + 86399))
@@ -896,9 +896,12 @@ def _build_exact_tvl_series_v3(
         except Exception:
             out.append((int(ts), 0.0))
     non_zero = len([1 for _ts, v in out if float(v) > 0.0])
-    if non_zero < max(3, int(len(out) * 0.6)):
-        return [], "insufficient_non_zero_days"
-    return out, "ok"
+    coverage = float(non_zero) / float(max(1, len(out)))
+    if non_zero <= 0:
+        return [], "insufficient_non_zero_days", float(coverage)
+    if coverage < float(V3_EXACT_TVL_MIN_COVERAGE_PARTIAL):
+        return [], "insufficient_non_zero_days", float(coverage)
+    return out, "ok", float(coverage)
 
 
 def save_pdf(pools: list[dict], path: str) -> None:
@@ -1013,6 +1016,26 @@ def main() -> None:
             raw_tvl = data.get("_raw_tvl_usd") or []
             if fees_usd and pool_tvl_now_usd > 0:
                 tvl_series = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
+                if raw_tvl and len(raw_tvl) == len(fees_usd):
+                    anchor = 0.0
+                    for _, rv in reversed(raw_tvl):
+                        rvf = float(rv or 0.0)
+                        if rvf > 0:
+                            anchor = rvf
+                            break
+                    if anchor > 0:
+                        shaped: list[tuple[int, float]] = []
+                        for i, (ts, _) in enumerate(fees_usd):
+                            rv = float(raw_tvl[i][1] or 0.0)
+                            if rv > 0:
+                                day_tvl = float(pool_tvl_now_usd) * (rv / anchor)
+                                day_tvl = max(float(pool_tvl_now_usd) * 0.2, min(float(pool_tvl_now_usd) * 5.0, day_tvl))
+                            else:
+                                day_tvl = float(pool_tvl_now_usd)
+                            shaped.append((int(ts), float(day_tvl)))
+                        tvl_series = shaped
+                        if tvl_quality_reason == "default_scaled":
+                            tvl_quality_reason = "scaled_by_raw_tvl"
                 exact_used = False
                 if V3_EXACT_TVL_ENABLE and str(chain).strip().lower() in V3_EXACT_TVL_CHAINS and fees_usd:
                     take_slot = False
@@ -1023,7 +1046,7 @@ def main() -> None:
                     if take_slot:
                         day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
                         day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
-                        exact_series, exact_reason = _build_exact_tvl_series_v3(
+                        exact_series, exact_reason, exact_cov = _build_exact_tvl_series_v3(
                             chain=str(chain),
                             pool=pool,
                             fees_usd=fees_usd,
@@ -1032,35 +1055,27 @@ def main() -> None:
                             budget_sec=float(V3_EXACT_TVL_POOL_BUDGET_SEC),
                         )
                         if exact_series and len(exact_series) == len(fees_usd):
-                            tvl_series = exact_series
+                            merged_exact: list[tuple[int, float]] = []
+                            exact_points = 0
+                            for i, (ts, ex_v) in enumerate(exact_series):
+                                if float(ex_v) > 0:
+                                    exact_points += 1
+                                    merged_exact.append((int(ts), float(ex_v)))
+                                else:
+                                    merged_exact.append((int(ts), float(tvl_series[i][1] if i < len(tvl_series) else pool_tvl_now_usd)))
+                            coverage = float(exact_points) / float(max(1, len(exact_series)))
+                            tvl_series = merged_exact
                             exact_used = True
-                            tvl_quality = "exact"
-                            tvl_quality_reason = "ok"
+                            if coverage >= float(V3_EXACT_TVL_MIN_COVERAGE_EXACT) and exact_points == len(exact_series):
+                                tvl_quality = "exact"
+                                tvl_quality_reason = "ok"
+                            else:
+                                tvl_quality = "exact_partial"
+                                tvl_quality_reason = f"partial_coverage:{coverage:.2f}"
                         else:
-                            tvl_quality_reason = f"exact_failed:{exact_reason}"
+                            tvl_quality_reason = f"exact_failed:{exact_reason}:{exact_cov:.2f}"
                     else:
                         tvl_quality_reason = "exact_skipped:no_slots"
-                if raw_tvl and len(raw_tvl) == len(fees_usd):
-                    if not exact_used:
-                        anchor = 0.0
-                        for _, rv in reversed(raw_tvl):
-                            rvf = float(rv or 0.0)
-                            if rvf > 0:
-                                anchor = rvf
-                                break
-                        if anchor > 0:
-                            shaped: list[tuple[int, float]] = []
-                            for i, (ts, _) in enumerate(fees_usd):
-                                rv = float(raw_tvl[i][1] or 0.0)
-                                if rv > 0:
-                                    day_tvl = float(pool_tvl_now_usd) * (rv / anchor)
-                                    day_tvl = max(float(pool_tvl_now_usd) * 0.2, min(float(pool_tvl_now_usd) * 5.0, day_tvl))
-                                else:
-                                    day_tvl = float(pool_tvl_now_usd)
-                                shaped.append((int(ts), float(day_tvl)))
-                            tvl_series = shaped
-                            if tvl_quality_reason == "default_scaled":
-                                tvl_quality_reason = "scaled_by_raw_tvl"
                 data["tvl"] = tvl_series
                 cumul = 0.0
                 fees_rebuilt = []
