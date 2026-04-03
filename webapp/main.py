@@ -17928,6 +17928,18 @@ def _merge_for_web(
             pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
         except (TypeError, ValueError):
             pool_tvl_now_usd = 0.0
+        dq = str(v.get("data_quality") or "estimated")
+        dq_reason = str(v.get("data_quality_reason") or "").strip()
+        if not dq_reason:
+            ver = str(v.get("version") or "").strip().lower()
+            if dq == "exact":
+                dq_reason = "ok"
+            elif ver == "v4":
+                dq_reason = "v4_estimated_mode"
+            elif ver == "v3":
+                dq_reason = "v3_estimated_legacy_or_cache"
+            else:
+                dq_reason = "not_reported"
         row = {
             "pool_id": v.get("pool_id", pool_id),
             "chain": v.get("chain", ""),
@@ -17937,8 +17949,8 @@ def _merge_for_web(
             "final_income": final_income,
             "apy_pct": float(apy_pct),
             "last_tvl": pool_tvl_now_usd,
-            "data_quality": str(v.get("data_quality") or "estimated"),
-            "data_quality_reason": str(v.get("data_quality_reason") or ""),
+            "data_quality": dq,
+            "data_quality_reason": dq_reason,
             "status": status,
         }
         rows.append(row)
