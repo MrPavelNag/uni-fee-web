@@ -18196,6 +18196,7 @@ def _build_run_job_env(
     run_v4: bool,
 ) -> dict[str, str]:
     env = os.environ.copy()
+    exact_days_default = str(max(1, min(int(req.days), 14 if speed_mode == "fast" else 30)))
     # Agents resolve symbols via the same top-N cache as site catalog.
     try:
         env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH.resolve())
@@ -18264,6 +18265,18 @@ def _build_run_job_env(
     env["V3_BASE_FALLBACK_READ_TIMEOUT_SEC"] = os.environ.get(
         "WEB_V3_BASE_FALLBACK_READ_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_V3_BASE_FALLBACK_READ_TIMEOUT_SEC_NORMAL",
         "4" if speed_mode == "fast" else "6",
+    )
+    env["V3_EXACT_TVL_DAYS_MAX"] = os.environ.get(
+        "WEB_V3_EXACT_TVL_DAYS_MAX_FAST" if speed_mode == "fast" else "WEB_V3_EXACT_TVL_DAYS_MAX_NORMAL",
+        exact_days_default,
+    )
+    env["V3_EXACT_TVL_MAX_POOLS"] = os.environ.get(
+        "WEB_V3_EXACT_TVL_MAX_POOLS_FAST" if speed_mode == "fast" else "WEB_V3_EXACT_TVL_MAX_POOLS_NORMAL",
+        "2" if speed_mode == "fast" else "4",
+    )
+    env["V3_EXACT_TVL_POOL_BUDGET_SEC"] = os.environ.get(
+        "WEB_V3_EXACT_TVL_POOL_BUDGET_SEC_FAST" if speed_mode == "fast" else "WEB_V3_EXACT_TVL_POOL_BUDGET_SEC_NORMAL",
+        "25" if speed_mode == "fast" else "45",
     )
     # v4 endpoint config uses this list at import-time.
     # When UI sends "all chains", include_chains is empty; in that case force all known v4 chains.

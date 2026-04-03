@@ -880,10 +880,12 @@ def _build_exact_tvl_series_v3(
     t0_dec = _erc20_decimals(chain_id, t0)
     t1_dec = _erc20_decimals(chain_id, t1)
     out: list[tuple[int, float]] = []
+    timed_out = False
     t_started = time.perf_counter()
     for ts, _ in fees_usd:
         if (time.perf_counter() - t_started) > float(max(1.0, budget_sec)):
-            return [], "budget_timeout", 0.0
+            timed_out = True
+            break
         dts = int((int(ts) // 86400) * 86400)
         try:
             block_num = _llama_block_for_day(ck, int(dts + 86399))
@@ -895,13 +897,15 @@ def _build_exact_tvl_series_v3(
             out.append((int(ts), float(tvl)))
         except Exception:
             out.append((int(ts), 0.0))
+    if not out:
+        return [], ("budget_timeout" if timed_out else "insufficient_non_zero_days"), 0.0
     non_zero = len([1 for _ts, v in out if float(v) > 0.0])
     coverage = float(non_zero) / float(max(1, len(out)))
     if non_zero <= 0:
-        return [], "insufficient_non_zero_days", float(coverage)
+        return [], ("budget_timeout" if timed_out else "insufficient_non_zero_days"), float(coverage)
     if coverage < float(V3_EXACT_TVL_MIN_COVERAGE_PARTIAL):
-        return [], "insufficient_non_zero_days", float(coverage)
-    return out, "ok", float(coverage)
+        return [], ("budget_timeout" if timed_out else "insufficient_non_zero_days"), float(coverage)
+    return out, ("budget_timeout_partial" if timed_out else "ok"), float(coverage)
 
 
 def save_pdf(pools: list[dict], path: str) -> None:
@@ -1046,29 +1050,37 @@ def main() -> None:
                             take_slot = True
                             slot_reserved = True
                     if take_slot:
-                        day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
-                        day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
+                        exact_days = max(1, int(V3_EXACT_TVL_DAYS_MAX))
+                        fees_exact = fees_usd[-min(len(fees_usd), exact_days):]
+                        day_start_ts = int((int(fees_exact[0][0]) // 86400) * 86400)
+                        day_end_ts = int((int(fees_exact[-1][0]) // 86400) * 86400)
                         exact_series, exact_reason, exact_cov = _build_exact_tvl_series_v3(
                             chain=str(chain),
                             pool=pool,
-                            fees_usd=fees_usd,
+                            fees_usd=fees_exact,
                             day_start_ts=day_start_ts,
                             day_end_ts=day_end_ts,
                             budget_sec=float(V3_EXACT_TVL_POOL_BUDGET_SEC),
                         )
-                        if exact_series and len(exact_series) == len(fees_usd):
-                            merged_exact: list[tuple[int, float]] = []
+                        if exact_series and len(exact_series) == len(fees_exact):
+                            merged_exact = list(tvl_series)
                             exact_points = 0
+                            exact_start = len(fees_usd) - len(fees_exact)
                             for i, (ts, ex_v) in enumerate(exact_series):
+                                tvl_idx = exact_start + i
                                 if float(ex_v) > 0:
                                     exact_points += 1
-                                    merged_exact.append((int(ts), float(ex_v)))
+                                    merged_exact[tvl_idx] = (int(ts), float(ex_v))
                                 else:
-                                    merged_exact.append((int(ts), float(tvl_series[i][1] if i < len(tvl_series) else pool_tvl_now_usd)))
+                                    merged_exact[tvl_idx] = (
+                                        int(ts),
+                                        float(tvl_series[tvl_idx][1] if tvl_idx < len(tvl_series) else pool_tvl_now_usd),
+                                    )
                             coverage = float(exact_points) / float(max(1, len(exact_series)))
                             tvl_series = merged_exact
                             exact_used = True
-                            if coverage >= float(V3_EXACT_TVL_MIN_COVERAGE_EXACT) and exact_points == len(exact_series):
+                            full_window = len(fees_exact) == len(fees_usd)
+                            if full_window and coverage >= float(V3_EXACT_TVL_MIN_COVERAGE_EXACT) and exact_points == len(exact_series):
                                 tvl_quality = "exact"
                                 tvl_quality_reason = "ok"
                             else:
@@ -1120,8 +1132,9 @@ def main() -> None:
         return idx, pool_id, payload, msg
 
     if pools:
+        pools_for_series = sorted(pools, key=_pool_tvl_usd, reverse=True)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(_process_pool, i, p) for i, p in enumerate(pools)]
+            futures = [ex.submit(_process_pool, i, p) for i, p in enumerate(pools_for_series)]
             for fut in as_completed(futures):
                 try:
                     _, pool_id, payload, msg = fut.result()
