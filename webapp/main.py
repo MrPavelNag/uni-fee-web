@@ -21559,6 +21559,44 @@ def _render_positions_page() -> str:
       if (v.length <= 8) return v;
       return `${v.slice(0, 4)}...${v.slice(-4)}`;
     }
+
+    function formatQualityReasonShort(rawReason, qualityTag) {
+      const raw = String(rawReason || "").trim();
+      if (!raw) return "-";
+      const dq = String(qualityTag || "").trim().toLowerCase();
+      const covMatch = raw.match(/(?:^|:)cov=([0-9]*\.?[0-9]+)/i);
+      const filledMatch = raw.match(/(?:^|:)filled=(\d+)/i);
+      const covPct = covMatch ? `${Math.round(Number(covMatch[1]) * 100)}%` : "";
+      const filledDays = filledMatch ? `${Number(filledMatch[1])}d` : "";
+
+      if (raw.startsWith("strict_compare:estimated:")) {
+        if (raw.includes("coingecko+defillama")) return "Estimated (CoinGecko + DefiLlama)";
+        return "Estimated mode";
+      }
+      if (raw.startsWith("exact2.0:ok")) return "Exact 2.0 complete";
+      if (raw.startsWith("exact2_cache:ok")) return "Exact 2.0 from cache";
+      if (raw.startsWith("exact2.0:partial_blend:")) {
+        const parts = [];
+        if (covPct) parts.push(`exact ${covPct}`);
+        if (filledDays) parts.push(`filled ${filledDays}`);
+        return `Exact 2.0 + estimate fill${parts.length ? ` (${parts.join(", ")})` : ""}`;
+      }
+      if (raw.includes("source_conflict_scale")) return "Exact rejected: scale conflict vs estimated";
+      if (raw.includes("source_conflict_anchor_jump")) return "Exact rejected: sharp jump near current TVL";
+      if (raw.includes("source_conflict_level_shift")) return "Exact rejected: level shift vs current TVL";
+      if (raw.includes("one_leg_quantity_collapse")) return "Partial exact: one token balance missing";
+      if (raw.includes("exact2_budget_timeout:block_resolution")) return "Exact timeout: day block resolution";
+      if (raw.includes("exact2_budget_timeout:pricing")) return "Exact timeout: historical pricing";
+      if (raw.includes("exact2_partial:block_missing")) return "Partial exact: missing day blocks";
+      if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
+      if (raw.includes("exact2_partial:transfer_logs_timeout")) return "Partial exact: transfer log timeout";
+      if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found on selected chains";
+      if (raw.includes("missing_target_pool_id")) return "Target pool is required";
+      if (dq === "exact") return "Exact";
+      if (dq === "exact_partial") return "Exact partial";
+      if (dq === "strict_unavailable") return "Strict exact unavailable";
+      return raw.replace(/[:_]+/g, " ").replace(/\s+/g, " ").trim();
+    }
     function getTrustedSpamKeys() {
       try {
         const raw = localStorage.getItem("positions_trusted_spam_keys");
@@ -31246,8 +31284,7 @@ HTML_PAGE = """
       apy_pct: (r) => Number(r.apy_pct || 0),
       last_tvl: (r) => Number(r.last_tvl || 0),
       data_quality: (r) => String(r.data_quality || ""),
-      data_quality_reason: (r) => String(r.data_quality_reason || ""),
-      status: (r) => r.status || ""
+      data_quality_reason: (r) => String(r.data_quality_reason || "")
     };
 
     let lastRows = [];
@@ -32640,7 +32677,7 @@ HTML_PAGE = """
       const table = document.getElementById("resultTable");
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
-        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["data_quality", "Data quality"], ["data_quality_reason", "Quality reason"], ["status", "Status"]
+        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["data_quality", "Data quality"], ["data_quality_reason", "Quality reason"]
       ];
 
       let html = "<tr>";
@@ -32671,15 +32708,13 @@ HTML_PAGE = """
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
-        const dq = String(r.data_quality || "estimated");
+        const dqRaw = String(r.data_quality || "estimated");
+        const dq = (String(r.status || "ok") === "ok") ? dqRaw : "нет данных";
         const dqReason = String(r.data_quality_reason || "");
-        const dqTitle = dqReason ? ` title="${escAttr(dqReason)}"` : "";
+        const dqReasonShort = formatQualityReasonShort(dqReason, dq);
+        const dqTitle = (dqReason || dqRaw) ? ` title="${escAttr(dqReason || dqRaw)}"` : "";
         html += `<td${dqTitle}>${escAttr(dq)}</td>`;
-        html += `<td class="mono" style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(dqReason || "-")}">${escAttr(dqReason || "-")}</td>`;
-        const statusLabel = r.status === "ok"
-          ? "ok"
-          : (r.status === "filtered_suffix" ? "excluded by suffix" : "filtered by fee range");
-        html += `<td>${statusLabel}</td>`;
+        html += `<td style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(dqReason || "-")}">${escAttr(dqReasonShort || "-")}</td>`;
         html += "</tr>";
       }
       table.innerHTML = html;
@@ -32710,7 +32745,7 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "data_quality", "data_quality_reason", "status"];
+      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "data_quality", "data_quality_reason"];
       const lines = [headers.join(",")];
       for (const r of rows) {
         const vals = headers.map(h => {

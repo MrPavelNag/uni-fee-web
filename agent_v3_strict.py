@@ -1236,9 +1236,9 @@ def main() -> None:
     )
 
     try:
-        partial_min_cov = max(0.0, min(1.0, float(os.environ.get("STRICT_EXACT2_PARTIAL_MIN_COVERAGE", "0.65"))))
+        partial_min_cov = max(0.0, min(1.0, float(os.environ.get("STRICT_EXACT2_PARTIAL_MIN_COVERAGE", "0.50"))))
     except Exception:
-        partial_min_cov = 0.65
+        partial_min_cov = 0.50
 
     exact_base = _normalize_exact_series_to_fees(fees_usd, list(exact_series or []))
     structural_cov = float(exact_cov)
