@@ -499,7 +499,7 @@ def _alchemy_fetch_transfer_deltas(
     from_block: int,
     to_block: int,
     deadline_ts: float | None = None,
-) -> dict[int, int]:
+) -> tuple[dict[int, int], bool]:
     url = _alchemy_url_for_chain(chain)
     if not url:
         raise RuntimeError("alchemy_not_configured_for_chain")
@@ -513,6 +513,7 @@ def _alchemy_fetch_transfer_deltas(
         max_pages = 120
 
     by_block: dict[int, int] = {}
+    timed_out = False
     t0 = time.monotonic()
     for direction, sign in (("from", -1), ("to", 1)):
         page_key = ""
@@ -522,14 +523,17 @@ def _alchemy_fetch_transfer_deltas(
         dir_t0 = time.monotonic()
         while True:
             if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
-                raise TimeoutError("exact2_budget_timeout:alchemy_transfers")
+                timed_out = True
+                break
             if pages_used >= int(max_pages):
-                raise TimeoutError("exact2_budget_timeout:alchemy_page_cap")
+                timed_out = True
+                break
             left = float(req_timeout)
             if deadline_ts is not None:
                 left = max(0.5, min(float(req_timeout), float(deadline_ts) - time.monotonic()))
                 if left <= 0.55:
-                    raise TimeoutError("exact2_budget_timeout:alchemy_transfers")
+                    timed_out = True
+                    break
             params: dict[str, Any] = {
                 "fromBlock": hex(int(from_block)),
                 "toBlock": hex(int(to_block)),
@@ -549,7 +553,11 @@ def _alchemy_fetch_transfer_deltas(
                 seen_keys.add(page_key)
                 params["pageKey"] = page_key
             body = {"jsonrpc": "2.0", "id": 1, "method": "alchemy_getAssetTransfers", "params": [params]}
-            r = requests.post(url, json=body, timeout=(2.0, float(left)))
+            try:
+                r = requests.post(url, json=body, timeout=(2.0, float(left)))
+            except requests.Timeout:
+                timed_out = True
+                break
             r.raise_for_status()
             payload = r.json()
             data = payload if isinstance(payload, dict) else {}
@@ -579,12 +587,18 @@ def _alchemy_fetch_transfer_deltas(
                 )
             if not page_key:
                 break
+        if timed_out:
+            _strict_debug(
+                f"alchemy dir={direction} token={str(token)[:10]}.. budget timeout "
+                f"pages={pages_used} items={items_used} elapsed={time.monotonic() - dir_t0:.1f}s"
+            )
+            break
         _strict_debug(
             f"alchemy dir={direction} token={str(token)[:10]}.. done pages={pages_used} items={items_used} "
             f"elapsed={time.monotonic() - dir_t0:.1f}s"
         )
     _strict_debug(f"alchemy token={str(token)[:10]}.. total elapsed={time.monotonic() - t0:.1f}s blocks={len(by_block)}")
-    return by_block
+    return by_block, bool(timed_out)
 
 
 def _fetch_logs_adaptive(
@@ -645,7 +659,7 @@ def _collect_pool_transfer_deltas(
     to_block: int,
     deadline_ts: float | None = None,
 ) -> tuple[dict[int, int], int, bool]:
-    out = _alchemy_fetch_transfer_deltas(
+    out, timed_out = _alchemy_fetch_transfer_deltas(
         chain=str(chain),
         token=str(token),
         pool_id=str(pool_id),
@@ -653,7 +667,7 @@ def _collect_pool_transfer_deltas(
         to_block=int(to_block),
         deadline_ts=deadline_ts,
     )
-    return out, int(from_block), False
+    return out, int(from_block), bool(timed_out)
 
 
 def _latest_block_number(chain_id: int) -> int:
@@ -1389,8 +1403,14 @@ def main() -> None:
 
     exact_has_signal = bool(exact_base and any(float(v) > 0.0 for _ts, v in exact_base))
     partial_blended = False
+    allow_estimate_fill = str(os.environ.get("STRICT_EXACT_ALLOW_ESTIMATE_FILL", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     exact_effective = list(exact_base)
-    if exact_base and len(exact_base) == len(estimated_tvl_base) and float(exact_cov) >= float(partial_min_cov):
+    if allow_estimate_fill and exact_base and len(exact_base) == len(estimated_tvl_base) and float(exact_cov) >= float(partial_min_cov):
         blended, filled = _blend_exact_with_estimated(exact_base, estimated_tvl_base)
         if filled > 0:
             exact_effective = list(blended)
