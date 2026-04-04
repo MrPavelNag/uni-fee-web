@@ -1300,9 +1300,9 @@ def main() -> None:
     if strict_exact_ok:
         data_quality = ("exact_partial" if partial_blended else "exact")
         data_quality_reason = (
-            f"exact2.0:partial_blend:cov={exact_cov:.2f}:scov={structural_cov:.2f}:filled={partial_filled_days}"
+            f"exact:partial_blend:cov={exact_cov:.2f}:scov={structural_cov:.2f}:filled={partial_filled_days}"
             if partial_blended
-            else "exact2.0:ok"
+            else "exact:ok"
         )
         final_tvl_base = list(exact_base)
         final_fees_base = _rebuild_fees_cumulative(fees_usd, final_tvl_base)
@@ -1314,23 +1314,23 @@ def main() -> None:
         data_quality = "strict_unavailable"
         if scale_conflict:
             data_quality_reason = (
-                f"strict_required:exact2.0:source_conflict_scale:ratio={scale_ratio:.2f}:"
+                f"strict_required:exact:source_conflict_scale:ratio={scale_ratio:.2f}:"
                 f"cov={exact_cov:.2f}:scov={structural_cov:.2f}"
             )
         elif one_leg_conflict:
-            data_quality_reason = f"strict_required:exact2.0:{exact_reason}:cov={exact_cov:.2f}:scov={structural_cov:.2f}"
+            data_quality_reason = f"strict_required:exact:{exact_reason}:cov={exact_cov:.2f}:scov={structural_cov:.2f}"
         elif anchor_conflict:
             data_quality_reason = (
-                f"strict_required:exact2.0:source_conflict_anchor_jump:anchor_ratio={anchor_ratio:.2f}:"
+                f"strict_required:exact:source_conflict_anchor_jump:anchor_ratio={anchor_ratio:.2f}:"
                 f"tail_med={tail_med:.2f}:cov={exact_cov:.2f}:scov={structural_cov:.2f}"
             )
         elif level_conflict:
             data_quality_reason = (
-                f"strict_required:exact2.0:source_conflict_level_shift:whole_ratio={whole_ratio:.2f}:"
+                f"strict_required:exact:source_conflict_level_shift:whole_ratio={whole_ratio:.2f}:"
                 f"whole_med={whole_med:.2f}:cov={exact_cov:.2f}:scov={structural_cov:.2f}"
             )
         else:
-            data_quality_reason = f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f}"
+            data_quality_reason = f"strict_required:exact:{exact_reason}:{exact_cov:.2f}"
         _warn_fallback_once(
             f"strict_unavailable:{target_pool}:{data_quality_reason}",
             f"strict exact unavailable; fallback to compare-only output, reason={data_quality_reason}",

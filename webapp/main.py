@@ -18000,7 +18000,7 @@ def _merge_for_web(
             est_tvl = v.get("strict_compare_estimated_tvl") or []
             ex_fees = v.get("strict_compare_exact_fees") or []
             ex_tvl = v.get("strict_compare_exact_tvl") or []
-            exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact2.0")
+            exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
 
             tvl_end_ts = max(
                 [0]
@@ -18048,7 +18048,7 @@ def _merge_for_web(
                     "pool_id": base_pool_id,
                     "chain": base_chain,
                     "version": base_version,
-                    "pair": f"{base_pair} (exact2.0)",
+                    "pair": f"{base_pair} (exact)",
                     "fee_pct": base_fee_pct,
                     "final_income": exact_income,
                     "apy_pct": float(exact_apy),
@@ -19064,7 +19064,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             t_agents_total0 = time.perf_counter()
             if run_mode == "strict_exact":
                 pair_suffix = pairs_to_filename_suffix(token_pairs)
-                _set_stage("strict", "Running strict exact2.0 agent (single pool)", 22)
+                _set_stage("strict", "Running strict exact agent (single pool)", 22)
                 base_timeout = int(env.get("AGENT_TIMEOUT_SEC", "480") or 480)
                 try:
                     exact2_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "240"))))
@@ -19100,7 +19100,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                         "total_ms": int((strict2_dbg or {}).get("total_ms") or 0),
                     }
                 )
-                _set_stage("strict", "Strict exact2.0 agent completed", 78)
+                _set_stage("strict", "Strict exact agent completed", 78)
             else:
                 total_pairs = max(1, len(pairs))
                 pair_workers = _pair_worker_count(speed_mode, total_pairs)
@@ -21573,13 +21573,13 @@ def _render_positions_page() -> str:
         if (raw.includes("coingecko+defillama")) return "Estimated (CoinGecko + DefiLlama)";
         return "Estimated mode";
       }
-      if (raw.startsWith("exact2.0:ok")) return "Exact 2.0 complete";
-      if (raw.startsWith("exact2_cache:ok")) return "Exact 2.0 from cache";
-      if (raw.startsWith("exact2.0:partial_blend:")) {
+      if (raw.startsWith("exact:ok") || raw.startsWith("exact2.0:ok")) return "Exact complete";
+      if (raw.startsWith("exact2_cache:ok")) return "Exact from cache";
+      if (raw.startsWith("exact:partial_blend:") || raw.startsWith("exact2.0:partial_blend:")) {
         const parts = [];
         if (covPct) parts.push(`exact ${covPct}`);
         if (filledDays) parts.push(`filled ${filledDays}`);
-        return `Exact 2.0 + estimate fill${parts.length ? ` (${parts.join(", ")})` : ""}`;
+        return `Exact + estimate fill${parts.length ? ` (${parts.join(", ")})` : ""}`;
       }
       if (raw.includes("source_conflict_scale")) return "Exact rejected: scale conflict vs estimated";
       if (raw.includes("source_conflict_anchor_jump")) return "Exact rejected: sharp jump near current TVL";
@@ -32584,7 +32584,7 @@ HTML_PAGE = """
           const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
           const exTvlY = exTvl.map(p => p[1] / 1000.0);
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
-          const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact2.0"]);
+          const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           if (estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHover,
@@ -32594,13 +32594,13 @@ HTML_PAGE = """
           }
           if (exFeeX.length) {
             feeTraces.push({
-              x: exFeeX, y: exFeeY, mode: "lines", name: `${s.label} (exact2.0)`, customdata: exHover,
+              x: exFeeX, y: exFeeY, mode: "lines", name: `${s.label} (exact)`, customdata: exHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
               line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
             });
           }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
-          const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact2.0"]);
+          const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           if (estTvlX.length) {
             tvlTraces.push({
               x: estTvlX, y: estTvlY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHoverTvl,
@@ -32610,7 +32610,7 @@ HTML_PAGE = """
           }
           if (exTvlX.length) {
             tvlTraces.push({
-              x: exTvlX, y: exTvlY, mode: "lines", name: `${s.label} (exact2.0)`, customdata: exHoverTvl,
+              x: exTvlX, y: exTvlY, mode: "lines", name: `${s.label} (exact)`, customdata: exHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
             });
@@ -32671,6 +32671,44 @@ HTML_PAGE = """
       if (!v) return "";
       if (v.length <= 8) return v;
       return `${v.slice(0, 4)}...${v.slice(-4)}`;
+    }
+
+    function formatQualityReasonShort(rawReason, qualityTag) {
+      const raw = String(rawReason || "").trim();
+      if (!raw) return "-";
+      const dq = String(qualityTag || "").trim().toLowerCase();
+      const covMatch = raw.match(/(?:^|:)cov=([0-9]*\.?[0-9]+)/i);
+      const filledMatch = raw.match(/(?:^|:)filled=(\d+)/i);
+      const covPct = covMatch ? `${Math.round(Number(covMatch[1]) * 100)}%` : "";
+      const filledDays = filledMatch ? `${Number(filledMatch[1])}d` : "";
+
+      if (raw.startsWith("strict_compare:estimated:")) {
+        if (raw.includes("coingecko+defillama")) return "Estimated (CoinGecko + DefiLlama)";
+        return "Estimated mode";
+      }
+      if (raw.startsWith("exact:ok") || raw.startsWith("exact2.0:ok")) return "Exact complete";
+      if (raw.startsWith("exact2_cache:ok")) return "Exact from cache";
+      if (raw.startsWith("exact:partial_blend:") || raw.startsWith("exact2.0:partial_blend:")) {
+        const parts = [];
+        if (covPct) parts.push(`exact ${covPct}`);
+        if (filledDays) parts.push(`filled ${filledDays}`);
+        return `Exact + estimate fill${parts.length ? ` (${parts.join(", ")})` : ""}`;
+      }
+      if (raw.includes("source_conflict_scale")) return "Exact rejected: scale conflict vs estimated";
+      if (raw.includes("source_conflict_anchor_jump")) return "Exact rejected: sharp jump near current TVL";
+      if (raw.includes("source_conflict_level_shift")) return "Exact rejected: level shift vs current TVL";
+      if (raw.includes("one_leg_quantity_collapse")) return "Partial exact: one token balance missing";
+      if (raw.includes("exact2_budget_timeout:block_resolution")) return "Exact timeout: day block resolution";
+      if (raw.includes("exact2_budget_timeout:pricing")) return "Exact timeout: historical pricing";
+      if (raw.includes("exact2_partial:block_missing")) return "Partial exact: missing day blocks";
+      if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
+      if (raw.includes("exact2_partial:transfer_logs_timeout")) return "Partial exact: transfer log timeout";
+      if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found on selected chains";
+      if (raw.includes("missing_target_pool_id")) return "Target pool is required";
+      if (dq === "exact") return "Exact";
+      if (dq === "exact_partial") return "Exact partial";
+      if (dq === "strict_unavailable") return "Strict exact unavailable";
+      return raw.replace(/[:_]+/g, " ").replace(/\s+/g, " ").trim();
     }
 
     function renderTable(rows) {

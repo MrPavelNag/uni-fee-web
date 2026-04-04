@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict single-pool v3 exact2.0 (ledger) agent wrapper."""
+"""Strict single-pool v3 exact (ledger) agent wrapper."""
 
 from agent_v3_strict import main
 
