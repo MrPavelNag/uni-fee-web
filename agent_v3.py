@@ -157,6 +157,7 @@ _EXACT_CACHE_LOCK = threading.Lock()
 _BLOCK_BY_DAY_CACHE: dict[tuple[str, int], int] = {}
 _DECIMALS_CACHE: dict[tuple[int, str], int] = {}
 _CG_DAY_PRICE_CACHE: dict[tuple[str, str, int], float] = {}
+_LLAMA_DAY_PRICE_CACHE: dict[tuple[str, str, int], float] = {}
 _CG_BACKOFF_UNTIL: dict[tuple[str, str], float] = {}
 _CG_GLOBAL_BACKOFF_UNTIL: float = 0.0
 _CG_LAST_REQ_TS: float = 0.0
@@ -457,14 +458,20 @@ def _historical_price_usd(chain_key: str, token: str, day_ts: int, day_start: in
         if px and float(px) > 0:
             return float(px)
     lk = LLAMA_CHAIN_BY_KEY.get(ck, ck)
+    with _EXACT_CACHE_LOCK:
+        lp = _LLAMA_DAY_PRICE_CACHE.get((lk, tk, dts))
+        if lp and float(lp) > 0:
+            return float(lp)
     try:
         u = f"https://coins.llama.fi/prices/historical/{int(dts + 86399)}/{lk}:{tk}"
-        r = requests.get(u, timeout=(3.0, 8.0))
+        r = requests.get(u, timeout=(2.0, 4.0))
         r.raise_for_status()
         data = r.json() if isinstance(r.json(), dict) else {}
         coin = (data.get("coins") or {}).get(f"{lk}:{tk}") or {}
         p = float(coin.get("price") or 0.0)
         if p > 0:
+            with _EXACT_CACHE_LOCK:
+                _LLAMA_DAY_PRICE_CACHE[(lk, tk, dts)] = float(p)
             _warn_fallback_once(
                 f"price_fallback_llama:{ck}:{tk}",
                 f"historical price source fallback: llama used for token={tk} chain={ck}",

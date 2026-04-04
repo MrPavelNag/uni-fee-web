@@ -907,8 +907,12 @@ def _build_exact2_tvl_series_v3_ledger(
 
     total_budget = max(10.0, float(budget_sec))
     # Snapshot mode: reserve time for price valuation after balance snapshots.
-    pricing_budget = max(8.0, min(90.0, total_budget * 0.30))
-    balance_budget = max(6.0, total_budget - pricing_budget)
+    try:
+        pricing_share = max(0.35, min(0.95, float(os.environ.get("STRICT_EXACT2_PRICING_BUDGET_SHARE", "0.75"))))
+    except Exception:
+        pricing_share = 0.75
+    pricing_budget = min(max(20.0, total_budget * pricing_share), max(10.0, total_budget - 10.0))
+    balance_budget = max(10.0, total_budget - pricing_budget)
     deadline_balance = time.monotonic() + balance_budget
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
@@ -1250,7 +1254,6 @@ def main() -> None:
     strict_exact_partial_ok = bool(
         exact_has_signal
         and len(exact_base) == len(fees_usd)
-        and float(exact_cov) >= float(partial_min_cov)
         and not one_leg_conflict
         and not scale_conflict
         and not anchor_conflict
@@ -1269,7 +1272,7 @@ def main() -> None:
     elif strict_exact_partial_ok:
         data_quality = "exact_partial"
         missing_days = int(sum(1 for _ts, v in exact_base if float(v or 0.0) <= 0.0))
-        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}"
+        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}:reason={exact_reason}"
         final_tvl = []
         final_fees = []
         strict_exact_tvl_base = list(exact_base)
