@@ -498,32 +498,52 @@ def _historical_price_usd(chain_key: str, token: str, day_ts: int, day_start: in
             f"coingecko cache fill exception; fallback to llama for token={tk} chain={ck}",
         )
         pass
+    cg_px = 0.0
     with _EXACT_CACHE_LOCK:
         px = _CG_DAY_PRICE_CACHE.get((ck, tk, dts))
         if px and float(px) > 0:
-            return float(px)
+            cg_px = float(px)
     lk = LLAMA_CHAIN_BY_KEY.get(ck, ck)
+    ll_px = 0.0
     with _EXACT_CACHE_LOCK:
         lp = _LLAMA_DAY_PRICE_CACHE.get((lk, tk, dts))
         if lp and float(lp) > 0:
-            return float(lp)
-    try:
-        u = f"https://coins.llama.fi/prices/historical/{int(dts + 86399)}/{lk}:{tk}"
-        r = requests.get(u, timeout=(2.0, 4.0))
-        r.raise_for_status()
-        data = r.json() if isinstance(r.json(), dict) else {}
-        coin = (data.get("coins") or {}).get(f"{lk}:{tk}") or {}
-        p = float(coin.get("price") or 0.0)
-        if p > 0:
-            with _EXACT_CACHE_LOCK:
-                _LLAMA_DAY_PRICE_CACHE[(lk, tk, dts)] = float(p)
-            _warn_fallback_once(
-                f"price_fallback_llama:{ck}:{tk}",
-                f"historical price source fallback: llama used for token={tk} chain={ck}",
-            )
-            return p
-    except Exception:
-        pass
+            ll_px = float(lp)
+    if ll_px <= 0.0:
+        try:
+            u = f"https://coins.llama.fi/prices/historical/{int(dts + 86399)}/{lk}:{tk}"
+            r = requests.get(u, timeout=(2.0, 4.0))
+            r.raise_for_status()
+            data = r.json() if isinstance(r.json(), dict) else {}
+            coin = (data.get("coins") or {}).get(f"{lk}:{tk}") or {}
+            p = float(coin.get("price") or 0.0)
+            if p > 0:
+                ll_px = float(p)
+                with _EXACT_CACHE_LOCK:
+                    _LLAMA_DAY_PRICE_CACHE[(lk, tk, dts)] = float(p)
+        except Exception:
+            pass
+    if cg_px > 0.0 and ll_px > 0.0:
+        try:
+            max_div = max(0.05, min(2.0, float(os.environ.get("HIST_PRICE_MAX_SOURCE_DIVERGENCE", "0.35"))))
+        except Exception:
+            max_div = 0.35
+        rel = abs(float(cg_px) - float(ll_px)) / max(1e-12, max(float(cg_px), float(ll_px)))
+        if rel <= float(max_div):
+            return float((float(cg_px) + float(ll_px)) / 2.0)
+        _warn_fallback_once(
+            f"hist_price_source_conflict:{ck}:{tk}:{dts}",
+            f"historical price conflict cg={cg_px:.6g} llama={ll_px:.6g}; using llama for token={tk} chain={ck}",
+        )
+        return float(ll_px)
+    if ll_px > 0.0:
+        _warn_fallback_once(
+            f"price_fallback_llama:{ck}:{tk}",
+            f"historical price source fallback: llama used for token={tk} chain={ck}",
+        )
+        return float(ll_px)
+    if cg_px > 0.0:
+        return float(cg_px)
     _warn_fallback_once(
         f"price_fallback_zero:{ck}:{tk}",
         f"historical price unavailable from coingecko+llama; returning 0 for token={tk} chain={ck}",

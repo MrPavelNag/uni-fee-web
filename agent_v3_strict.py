@@ -1310,8 +1310,8 @@ def main() -> None:
         final_fees_base = _rebuild_fees_cumulative(fees_usd, final_tvl_base)
         final_tvl = _append_now_tvl_anchor(final_tvl_base, float(pool_tvl_now_usd))
         final_fees = _append_now_fee_anchor(final_fees_base)
-        strict_exact_tvl = list(final_tvl)
-        strict_exact_fees = list(final_fees)
+        strict_exact_tvl = list(final_tvl_base)
+        strict_exact_fees = list(final_fees_base)
     elif strict_exact_partial_ok:
         data_quality = "exact_partial"
         missing_days = int(sum(1 for _ts, v in exact_base if float(v or 0.0) <= 0.0))
@@ -1332,8 +1332,8 @@ def main() -> None:
         final_fees = []
         strict_exact_tvl_base = list(exact_base)
         strict_exact_fees_base = _rebuild_fees_cumulative(fees_usd, strict_exact_tvl_base)
-        strict_exact_tvl = _append_now_tvl_anchor(strict_exact_tvl_base, float(pool_tvl_now_usd))
-        strict_exact_fees = _append_now_fee_anchor(strict_exact_fees_base)
+        strict_exact_tvl = list(strict_exact_tvl_base)
+        strict_exact_fees = list(strict_exact_fees_base)
     else:
         data_quality = "strict_unavailable"
         if scale_conflict:
@@ -1369,13 +1369,12 @@ def main() -> None:
         if exact_base:
             strict_exact_tvl_base = list(exact_base)
             strict_exact_fees_base = _rebuild_fees_cumulative(fees_usd, strict_exact_tvl_base)
-            strict_exact_tvl = _append_now_tvl_anchor(strict_exact_tvl_base, float(pool_tvl_now_usd))
-            strict_exact_fees = _append_now_fee_anchor(strict_exact_fees_base)
+            strict_exact_tvl = list(strict_exact_tvl_base)
+            strict_exact_fees = list(strict_exact_fees_base)
         else:
-            # Even when strict reconstruction fails, today's exact TVL point is known
-            # from external reserves*prices and must not be displayed as zero.
-            strict_exact_tvl = _append_now_tvl_anchor([], float(pool_tvl_now_usd))
-            strict_exact_fees = _append_now_fee_anchor([])
+            # No exact points available for strict compare series.
+            strict_exact_tvl = []
+            strict_exact_fees = []
 
     payload = {
         "fees": final_fees,
