@@ -19149,12 +19149,12 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 _set_stage("strict", "Running strict exact agent (single pool)", 22)
                 base_timeout = int(env.get("AGENT_TIMEOUT_SEC", "480") or 480)
                 try:
-                    exact2_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "240"))))
+                    exact2_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "120"))))
                 except Exception:
-                    exact2_budget = 240.0
+                    exact2_budget = 120.0
                 env2 = dict(env)
                 env2["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
-                env2["AGENT_TIMEOUT_SEC"] = str(max(60, min(base_timeout, int(exact2_budget) + 30, 240)))
+                env2["AGENT_TIMEOUT_SEC"] = str(max(60, min(base_timeout, int(exact2_budget) + 20, 180)))
                 logs.append(
                     "[strict] budgets: "
                     f"exact2={int(exact2_budget)}s timeout2={env2['AGENT_TIMEOUT_SEC']}s"
