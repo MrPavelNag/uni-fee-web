@@ -157,6 +157,10 @@ _EXACT_CACHE_LOCK = threading.Lock()
 _BLOCK_BY_DAY_CACHE: dict[tuple[str, int], int] = {}
 _DECIMALS_CACHE: dict[tuple[int, str], int] = {}
 _CG_DAY_PRICE_CACHE: dict[tuple[str, str, int], float] = {}
+_CG_BACKOFF_UNTIL: dict[tuple[str, str], float] = {}
+_CG_GLOBAL_BACKOFF_UNTIL: float = 0.0
+_CG_LAST_REQ_TS: float = 0.0
+_CG_HTTP_LOCK = threading.Lock()
 _RPC_PRIMARY_URL: dict[int, str] = {}
 
 
@@ -290,13 +294,21 @@ def _llama_block_for_day(chain_key: str, day_ts: int) -> int:
 
 
 def _coingecko_fill_price_cache(chain_key: str, token: str, day_start: int, day_end: int) -> None:
+    global _CG_GLOBAL_BACKOFF_UNTIL
+    global _CG_LAST_REQ_TS
     ck = str(chain_key or "").strip().lower()
     tk = str(token or "").strip().lower()
     if not (_is_eth_address(tk) and day_start > 0 and day_end >= day_start):
         return
     with _EXACT_CACHE_LOCK:
         exists = all((ck, tk, d) in _CG_DAY_PRICE_CACHE for d in range(day_start, day_end + 1, 86400))
+        backoff_until = float(_CG_BACKOFF_UNTIL.get((ck, tk), 0.0))
+        global_backoff_until = float(_CG_GLOBAL_BACKOFF_UNTIL)
     if exists:
+        return
+    if time.time() < backoff_until:
+        return
+    if time.time() < global_backoff_until:
         return
     platform = COINGECKO_PLATFORM_BY_KEY.get(ck, "")
     if not platform:
@@ -304,9 +316,42 @@ def _coingecko_fill_price_cache(chain_key: str, token: str, day_start: int, day_
     url = f"https://api.coingecko.com/api/v3/coins/{platform}/contract/{tk}/market_chart/range"
     headers = {"User-Agent": "uni-fee-agent/1.0"}
     params = {"vs_currency": "usd", "from": int(day_start), "to": int(day_end + 86399)}
-    r = requests.get(url, headers=headers, params=params, timeout=(4.0, 14.0))
-    r.raise_for_status()
-    d = r.json() if isinstance(r.json(), dict) else {}
+    try:
+        # Global throttle to avoid burst 429 from concurrent strict runs.
+        with _CG_HTTP_LOCK:
+            with _EXACT_CACHE_LOCK:
+                wait_global_until = float(_CG_GLOBAL_BACKOFF_UNTIL)
+                now = float(time.time())
+                if now < wait_global_until:
+                    return
+                min_gap = max(0.25, float(os.environ.get("COINGECKO_MIN_REQ_GAP_SEC", "1.2")))
+                last_ts = float(_CG_LAST_REQ_TS)
+            sleep_sec = max(0.0, min_gap - max(0.0, now - last_ts))
+            if sleep_sec > 0:
+                time.sleep(min(2.5, sleep_sec))
+            r = requests.get(url, headers=headers, params=params, timeout=(4.0, 14.0))
+            with _EXACT_CACHE_LOCK:
+                _CG_LAST_REQ_TS = float(time.time())
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        resp = getattr(e, "response", None)
+        status = int(getattr(resp, "status_code", 0) or 0)
+        if status == 429:
+            retry_after = str((getattr(resp, "headers", {}) or {}).get("Retry-After", "")).strip()
+            try:
+                cool_sec = max(20.0, min(300.0, float(retry_after)))
+            except Exception:
+                cool_sec = 90.0
+            with _EXACT_CACHE_LOCK:
+                _CG_BACKOFF_UNTIL[(ck, tk)] = float(time.time() + cool_sec)
+                _CG_GLOBAL_BACKOFF_UNTIL = max(float(_CG_GLOBAL_BACKOFF_UNTIL), float(time.time() + cool_sec))
+        return
+    except Exception:
+        return
+    try:
+        d = r.json() if isinstance(r.json(), dict) else {}
+    except Exception:
+        return
     pts = d.get("prices") if isinstance(d, dict) else None
     if not isinstance(pts, list):
         return
@@ -330,7 +375,10 @@ def _historical_price_usd(chain_key: str, token: str, day_ts: int, day_start: in
     ck = str(chain_key or "").strip().lower()
     tk = str(token or "").strip().lower()
     dts = int((int(day_ts) // 86400) * 86400)
-    _coingecko_fill_price_cache(ck, tk, int(day_start), int(day_end))
+    try:
+        _coingecko_fill_price_cache(ck, tk, int(day_start), int(day_end))
+    except Exception:
+        pass
     with _EXACT_CACHE_LOCK:
         px = _CG_DAY_PRICE_CACHE.get((ck, tk, dts))
         if px and float(px) > 0:
