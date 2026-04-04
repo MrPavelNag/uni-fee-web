@@ -18459,6 +18459,10 @@ def _run_subprocess(script_name: str, env: dict[str, str], min_tvl: float, logs:
         if proc.stderr:
             logs.append(proc.stderr[-4000:])
         if proc.returncode != 0:
+            err_tail = str(proc.stderr or proc.stdout or "").strip()
+            if err_tail:
+                err_tail = err_tail[-700:]
+                raise RuntimeError(f"{script_name} failed with code {proc.returncode}: {err_tail}")
             raise RuntimeError(f"{script_name} failed with code {proc.returncode}")
         return int(round(max(0.0, time.perf_counter() - t0) * 1000.0))
     except subprocess.TimeoutExpired as e:
