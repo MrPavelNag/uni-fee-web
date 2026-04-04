@@ -19154,7 +19154,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     exact2_budget = 120.0
                 env2 = dict(env)
                 env2["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
-                env2["AGENT_TIMEOUT_SEC"] = str(max(60, min(base_timeout, int(exact2_budget) + 20, 180)))
+                env2["AGENT_TIMEOUT_SEC"] = str(max(60, min(base_timeout, int(exact2_budget) + 20, 150)))
                 logs.append(
                     "[strict] budgets: "
                     f"exact2={int(exact2_budget)}s timeout2={env2['AGENT_TIMEOUT_SEC']}s"

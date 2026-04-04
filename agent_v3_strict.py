@@ -498,6 +498,11 @@ def _alchemy_fetch_transfer_deltas(
                 raise TimeoutError("exact2_budget_timeout:alchemy_transfers")
             if pages_used >= int(max_pages):
                 raise TimeoutError("exact2_budget_timeout:alchemy_page_cap")
+            left = float(req_timeout)
+            if deadline_ts is not None:
+                left = max(0.5, min(float(req_timeout), float(deadline_ts) - time.monotonic()))
+                if left <= 0.55:
+                    raise TimeoutError("exact2_budget_timeout:alchemy_transfers")
             params: dict[str, Any] = {
                 "fromBlock": hex(int(from_block)),
                 "toBlock": hex(int(to_block)),
@@ -517,7 +522,7 @@ def _alchemy_fetch_transfer_deltas(
                 seen_keys.add(page_key)
                 params["pageKey"] = page_key
             body = {"jsonrpc": "2.0", "id": 1, "method": "alchemy_getAssetTransfers", "params": [params]}
-            r = requests.post(url, json=body, timeout=(2.0, float(req_timeout)))
+            r = requests.post(url, json=body, timeout=(2.0, float(left)))
             r.raise_for_status()
             payload = r.json()
             data = payload if isinstance(payload, dict) else {}
