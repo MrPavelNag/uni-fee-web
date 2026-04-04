@@ -74,6 +74,17 @@ def _token_decimals_from_pool(pool: dict, key: str) -> int:
     return 0
 
 
+def _symbol_decimals_hint(symbol: str) -> int:
+    s = str(symbol or "").strip().upper()
+    hints = {
+        "USDT": 6,
+        "USDC": 6,
+        "USDC.E": 6,
+        "WBTC": 8,
+    }
+    return int(hints.get(s, 0) or 0)
+
+
 def _include_chains() -> list[str]:
     include = [c.strip().lower() for c in str(os.environ.get("INCLUDE_CHAINS", "")).split(",") if c.strip()]
     if include:
@@ -971,6 +982,8 @@ def _build_exact2_tvl_series_v3_ledger(
     rpc_source = "alchemy" if any("g.alchemy.com" in str(u or "").lower() for u in _rpc_urls(int(chain_id))) else "public"
     token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
     token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    token0_symbol = str(((pool.get("token0") or {}).get("symbol") or "")).strip()
+    token1_symbol = str(((pool.get("token1") or {}).get("symbol") or "")).strip()
     if not (pool_id and token0 and token1):
         return [], "exact2_missing_pool_tokens", 0.0
 
@@ -978,6 +991,12 @@ def _build_exact2_tvl_series_v3_ledger(
         latest_block = _latest_block_number(chain_id)
         dec0 = int(_token_decimals_from_pool(pool, "token0") or _erc20_decimals(chain_id, token0))
         dec1 = int(_token_decimals_from_pool(pool, "token1") or _erc20_decimals(chain_id, token1))
+        h0 = _symbol_decimals_hint(token0_symbol)
+        h1 = _symbol_decimals_hint(token1_symbol)
+        if dec0 == 18 and h0 in {6, 8}:
+            dec0 = int(h0)
+        if dec1 == 18 and h1 in {6, 8}:
+            dec1 = int(h1)
     except Exception as e:
         return [], f"exact2_latest_point_failed:{e}", 0.0
 
@@ -1145,7 +1164,12 @@ def _build_exact2_tvl_series_v3_ledger(
             f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}",
             cov,
         )
-    return tvl_series, f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}", cov
+    return (
+        tvl_series,
+        f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:"
+        f"rpc={rpc_source}:dec0={dec0}:dec1={dec1}",
+        cov,
+    )
 
 
 def main() -> None:
