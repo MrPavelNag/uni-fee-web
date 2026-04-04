@@ -38,6 +38,7 @@ _POOL_CHAIN_CACHE_PATH = os.environ.get("STRICT_POOL_CHAIN_CACHE_PATH", "data/st
 _EXACT2_CACHE_DB_PATH = os.environ.get("STRICT_EXACT2_CACHE_DB_PATH", "data/exact2_daily_cache.sqlite3")
 _WARN_LOCK = threading.Lock()
 _FALLBACK_WARNED: set[str] = set()
+_RPC_BLOCK_BY_DAY_CACHE: dict[tuple[int, int], int] = {}
 
 
 def _warn_fallback_once(key: str, message: str) -> None:
@@ -593,6 +594,43 @@ def _latest_block_number(chain_id: int) -> int:
     return int(b)
 
 
+def _block_ts(chain_id: int, block_num: int) -> int:
+    d = _rpc_json(int(chain_id), "eth_getBlockByNumber", [hex(int(block_num)), False], timeout_sec=6.0)
+    blk = d.get("result") or {}
+    if not isinstance(blk, dict):
+        return 0
+    ts = _safe_hex_to_int(blk.get("timestamp"))
+    return int(ts) if ts > 0 else 0
+
+
+def _rpc_block_for_day(chain_id: int, day_ts: int, latest_block: int) -> int:
+    key = (int(chain_id), int(day_ts))
+    with _WARN_LOCK:
+        cached = _RPC_BLOCK_BY_DAY_CACHE.get(key)
+    if cached and int(cached) > 0:
+        return int(cached)
+    target = int(day_ts) + 86399
+    lo = 1
+    hi = int(max(1, latest_block))
+    best = 0
+    for _ in range(28):
+        if lo > hi:
+            break
+        mid = (lo + hi) // 2
+        ts = _block_ts(int(chain_id), int(mid))
+        if ts <= 0:
+            break
+        if ts <= target:
+            best = int(mid)
+            lo = int(mid) + 1
+        else:
+            hi = int(mid) - 1
+    if best > 0:
+        with _WARN_LOCK:
+            _RPC_BLOCK_BY_DAY_CACHE[key] = int(best)
+    return int(best)
+
+
 def _balances_by_boundaries_desc(latest_balance: int, deltas_by_block: dict[int, int], boundaries_desc: list[int]) -> dict[int, int]:
     blocks_desc = sorted((int(b) for b in deltas_by_block.keys() if int(b) > 0), reverse=True)
     out: dict[int, int] = {}
@@ -924,7 +962,7 @@ def _build_exact2_tvl_series_v3_ledger(
         return [], "exact2_missing_pool_tokens", 0.0
 
     try:
-        _latest_block_number(chain_id)
+        latest_block = _latest_block_number(chain_id)
         dec0 = int(_erc20_decimals(chain_id, token0))
         dec1 = int(_erc20_decimals(chain_id, token1))
     except Exception as e:
@@ -941,8 +979,15 @@ def _build_exact2_tvl_series_v3_ledger(
         try:
             day_blocks[day_ts] = int(_llama_block_for_day(ck, day_ts + 86399))
         except Exception:
-            block_missing += 1
-            day_blocks[day_ts] = 0
+            try:
+                rb = _rpc_block_for_day(int(chain_id), int(day_ts), int(latest_block))
+            except Exception:
+                rb = 0
+            if int(rb) > 0:
+                day_blocks[day_ts] = int(rb)
+            else:
+                block_missing += 1
+                day_blocks[day_ts] = 0
 
     valid_blocks = [int(b) for b in day_blocks.values() if int(b) > 0]
     if not valid_blocks:
