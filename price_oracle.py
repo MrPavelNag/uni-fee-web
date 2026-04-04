@@ -1,10 +1,10 @@
 """
 External token price oracle for project scripts.
 
-Priority:
-1) Dexscreener
-2) CoinGecko
-3) DefiLlama
+Priority (stability-first for canonical TVL):
+1) CoinGecko
+2) DefiLlama
+3) Dexscreener (last-resort fallback)
 """
 
 import os
@@ -34,6 +34,18 @@ def _cache_ttl_sec() -> float:
         return max(30.0, float(os.environ.get("TOKEN_PRICE_CACHE_TTL_SEC", "180")))
     except Exception:
         return 180.0
+
+
+def _allow_dexscreener_fallback() -> bool:
+    v = str(os.environ.get("TOKEN_PRICE_ALLOW_DEXSCREENER_FALLBACK", "0") or "").strip().lower()
+    return v in {"1", "true", "yes", "on"}
+
+
+def _max_source_divergence() -> float:
+    try:
+        return max(0.05, min(0.95, float(os.environ.get("TOKEN_PRICE_MAX_SOURCE_DIVERGENCE", "0.35"))))
+    except Exception:
+        return 0.35
 
 
 def _norm_chain(chain: str) -> str:
@@ -101,6 +113,10 @@ def _cache_get(chain: str, addr: str) -> tuple[float, str]:
             return 0.0, ""
         ts, px, src = rec
         if (now - float(ts)) > ttl or float(px) <= 0:
+            return 0.0, ""
+        # Conservative mode: ignore noisy cache entries sourced from Dexscreener
+        # unless explicit fallback is enabled.
+        if str(src or "").strip().lower() == "dexscreener" and not _allow_dexscreener_fallback():
             return 0.0, ""
         return float(px), str(src or "")
 
@@ -224,23 +240,57 @@ def get_token_prices_usd(chain: str, token_addresses: list[str]) -> tuple[dict[s
     if not pending:
         return prices, sources, errors
 
-    for fetcher_name, fetcher in (
-        ("dexscreener", _fetch_dexscreener),
-        ("coingecko", _fetch_coingecko),
-        ("defillama", _fetch_defillama),
-    ):
-        if not pending:
-            break
-        got_prices, got_sources = fetcher(chain, pending)
-        for a in list(pending):
-            px = _safe_float(got_prices.get(a))
-            if px <= 0:
-                continue
-            src = str(got_sources.get(a) or fetcher_name)
-            prices[a] = px
+    # Canonical TVL should prefer slower but more stable aggregators first.
+    # Dexscreener is useful as fallback, but can be noisy for certain tokens/pairs.
+    # Stability-first canonical path:
+    # 1) coingecko + defillama cross-check
+    # 2) optional dexscreener fallback only when explicitly enabled
+    cg_prices, _cg_sources = _fetch_coingecko(chain, pending)
+    ll_prices, _ll_sources = _fetch_defillama(chain, pending)
+    unresolved: list[str] = []
+    max_div = _max_source_divergence()
+
+    for a in list(pending):
+        cg = _safe_float(cg_prices.get(a))
+        ll = _safe_float(ll_prices.get(a))
+        chosen = 0.0
+        src = ""
+        if cg > 0 and ll > 0:
+            rel = abs(cg - ll) / max(cg, ll)
+            if rel <= max_div:
+                chosen = (cg + ll) / 2.0
+                src = "coingecko+defillama"
+            else:
+                errors.append(
+                    f"price_divergence chain={_norm_chain(chain)} token={a} cg={cg:.10g} llama={ll:.10g} rel={rel:.3f}"
+                )
+        elif cg > 0:
+            chosen = cg
+            src = "coingecko"
+        elif ll > 0:
+            chosen = ll
+            src = "defillama"
+        if chosen > 0:
+            prices[a] = chosen
             sources[a] = src
-            _cache_put(chain, a, px, src)
-            pending.remove(a)
+            _cache_put(chain, a, chosen, src)
+        else:
+            unresolved.append(a)
+
+    if unresolved and _allow_dexscreener_fallback():
+        dex_prices, _dex_sources = _fetch_dexscreener(chain, unresolved)
+        still_unresolved: list[str] = []
+        for a in unresolved:
+            px = _safe_float(dex_prices.get(a))
+            if px > 0:
+                prices[a] = px
+                sources[a] = "dexscreener"
+                _cache_put(chain, a, px, "dexscreener")
+            else:
+                still_unresolved.append(a)
+        pending = still_unresolved
+    else:
+        pending = unresolved
 
     if pending:
         errors.append(

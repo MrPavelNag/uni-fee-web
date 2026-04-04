@@ -276,6 +276,28 @@ def _rebuild_fees_cumulative(fees_usd: list[tuple[int, float]], tvl_series: list
     return out
 
 
+def _blend_exact_with_estimated(
+    exact_series: list[tuple[int, float]],
+    estimated_series: list[tuple[int, float]],
+) -> tuple[list[tuple[int, float]], int]:
+    out: list[tuple[int, float]] = []
+    filled = 0
+    n = min(len(exact_series or []), len(estimated_series or []))
+    for i in range(n):
+        ts = int(exact_series[i][0])
+        ex_v = float(exact_series[i][1] or 0.0)
+        if ex_v > 0:
+            out.append((ts, ex_v))
+            continue
+        est_v = float(estimated_series[i][1] or 0.0)
+        if est_v > 0:
+            out.append((ts, est_v))
+            filled += 1
+        else:
+            out.append((ts, 0.0))
+    return out, filled
+
+
 def _append_now_tvl_anchor(tvl_series: list[tuple[int, float]], now_tvl_usd: float) -> list[tuple[int, float]]:
     out = list(tvl_series or [])
     now_ts = int(datetime.utcnow().timestamp())
@@ -407,21 +429,24 @@ def _fetch_logs_adaptive(
     to_block: int,
     deadline_ts: float | None = None,
     on_log: Any | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], int, bool]:
     start = int(max(1, from_block))
     end = int(max(start, to_block))
     logs: list[dict] = []
     step = int(max(2000, int(os.environ.get("V3_EXACT2_LOG_BLOCK_STEP", "50000"))))
     min_step = int(max(200, int(os.environ.get("V3_EXACT2_LOG_MIN_STEP", "1000"))))
-    cursor = start
-    while cursor <= end:
+    # Scan backwards: when budget is tight, we preserve most recent blocks first.
+    cursor = end
+    timed_out = False
+    while cursor >= start:
         if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
-            raise TimeoutError("exact2_budget_timeout:eth_getLogs")
-        hi = min(end, cursor + step - 1)
+            timed_out = True
+            break
+        lo = max(start, cursor - step + 1)
         params = [{
             "address": str(token).strip().lower(),
-            "fromBlock": hex(int(cursor)),
-            "toBlock": hex(int(hi)),
+            "fromBlock": hex(int(lo)),
+            "toBlock": hex(int(cursor)),
             "topics": topics,
         }]
         try:
@@ -434,14 +459,15 @@ def _fetch_logs_adaptive(
                             on_log(x)
                 else:
                     logs.extend([x for x in part if isinstance(x, dict)])
-            cursor = hi + 1
+            cursor = lo - 1
             if len(part) < 500 and step < 200000:
                 step = int(step * 1.2)
         except Exception:
             if step <= min_step:
                 raise
             step = max(min_step, step // 2)
-    return logs
+    covered_from = int(max(start, cursor + 1))
+    return logs, covered_from, timed_out
 
 
 def _collect_pool_transfer_deltas(
@@ -452,11 +478,11 @@ def _collect_pool_transfer_deltas(
     from_block: int,
     to_block: int,
     deadline_ts: float | None = None,
-) -> dict[int, int]:
+) -> tuple[dict[int, int], int, bool]:
     # Prefer Alchemy Transfers API when configured: it is significantly more
     # reliable for long ERC20 transfer scans than raw eth_getLogs on public RPC.
     try:
-        return _alchemy_fetch_transfer_deltas(
+        out = _alchemy_fetch_transfer_deltas(
             chain=str(chain),
             token=str(token),
             pool_id=str(pool_id),
@@ -464,11 +490,14 @@ def _collect_pool_transfer_deltas(
             to_block=int(to_block),
             deadline_ts=deadline_ts,
         )
+        return out, int(from_block), False
     except Exception:
         pass
 
     pool_topic = _addr_topic(pool_id)
     by_block: dict[int, int] = {}
+    covered_from = int(from_block)
+    timed_out = False
     for topics, sign in (
         ([TRANSFER_TOPIC, pool_topic], -1),  # from pool
         ([TRANSFER_TOPIC, None, pool_topic], 1),  # to pool
@@ -481,7 +510,7 @@ def _collect_pool_transfer_deltas(
             if val <= 0:
                 return
             by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
-        _fetch_logs_adaptive(
+        _unused_logs, local_covered_from, local_timed_out = _fetch_logs_adaptive(
             int(chain_id),
             str(token),
             topics,
@@ -490,7 +519,9 @@ def _collect_pool_transfer_deltas(
             deadline_ts=deadline_ts,
             on_log=_consume_log,
         )
-    return by_block
+        covered_from = max(int(covered_from), int(local_covered_from))
+        timed_out = bool(timed_out or local_timed_out)
+    return by_block, covered_from, timed_out
 
 
 def _latest_block_number(chain_id: int) -> int:
@@ -880,28 +911,34 @@ def _build_exact2_tvl_series_v3_ledger(
     from_block = int(min(valid_blocks))
     to_block = int(latest_block)
     try:
-        deltas0 = _collect_pool_transfer_deltas(chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=deadline_ts)
-        deltas1 = _collect_pool_transfer_deltas(chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=deadline_ts)
-    except TimeoutError:
-        return [], "exact2_budget_timeout:transfer_logs", 0.0
+        deltas0, covered0_from, timeout0 = _collect_pool_transfer_deltas(
+            chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=deadline_ts
+        )
+        deltas1, covered1_from, timeout1 = _collect_pool_transfer_deltas(
+            chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=deadline_ts
+        )
     except Exception as e:
         return [], f"exact2_transfer_logs_failed:{e}", 0.0
 
     boundaries = sorted(set(valid_blocks), reverse=True)
     bal0_by_block = _balances_by_boundaries_desc(bal0_latest, deltas0, boundaries)
     bal1_by_block = _balances_by_boundaries_desc(bal1_latest, deltas1, boundaries)
+    covered_from = int(max(int(from_block), int(covered0_from), int(covered1_from)))
+    transfer_logs_timed_out = bool(timeout0 or timeout1)
 
     tvl_series: list[tuple[int, float]] = []
     non_zero = 0
     priced_days = 0
+    covered_days = 0
     for ts, _fees in fees_usd:
         if time.monotonic() >= deadline_ts:
             return tvl_series, "exact2_budget_timeout:pricing", float(non_zero / max(1, len(fees_usd)))
         day_ts = int((int(ts) // 86400) * 86400)
         b = int(day_blocks.get(day_ts, 0))
-        if b <= 0:
+        if b <= 0 or int(b) < int(covered_from):
             tvl_series.append((int(ts), 0.0))
             continue
+        covered_days += 1
         amt0 = float(bal0_by_block.get(b, 0)) / float(10 ** max(0, dec0))
         amt1 = float(bal1_by_block.get(b, 0)) / float(10 ** max(0, dec1))
         p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
@@ -936,6 +973,8 @@ def _build_exact2_tvl_series_v3_ledger(
     cov = float(non_zero / max(1, len(fees_usd)))
     if non_zero == 0:
         return tvl_series, f"exact2_non_positive_days:block_missing={block_missing}:priced_days={priced_days}", cov
+    if transfer_logs_timed_out:
+        return tvl_series, f"exact2_partial:transfer_logs_timeout:covered_days={covered_days}/{len(fees_usd)}", cov
     if block_missing > 0:
         return tvl_series, f"exact2_partial:block_missing={block_missing}:priced_days={priced_days}", cov
     if priced_days < max(1, len(fees_usd) // 2):
@@ -1048,11 +1087,34 @@ def main() -> None:
         budget_sec=float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")),
     )
 
-    strict_exact_ok = bool(exact_series and len(exact_series) == len(fees_usd) and all(float(v) > 0.0 for _ts, v in exact_series))
+    try:
+        partial_min_cov = max(0.0, min(1.0, float(os.environ.get("STRICT_EXACT2_PARTIAL_MIN_COVERAGE", "0.65"))))
+    except Exception:
+        partial_min_cov = 0.65
+
+    exact_base = list(exact_series or [])
+    partial_blended = False
+    partial_filled_days = 0
+    if (
+        exact_base
+        and len(exact_base) == len(estimated_tvl_base)
+        and float(exact_cov) >= float(partial_min_cov)
+    ):
+        blended, filled = _blend_exact_with_estimated(exact_base, estimated_tvl_base)
+        if filled > 0:
+            exact_base = blended
+            partial_blended = True
+            partial_filled_days = int(filled)
+
+    strict_exact_ok = bool(exact_base and len(exact_base) == len(fees_usd) and all(float(v) > 0.0 for _ts, v in exact_base))
     if strict_exact_ok:
-        data_quality = "exact"
-        data_quality_reason = "exact2.0:ok"
-        final_tvl_base = list(exact_series)
+        data_quality = ("exact_partial" if partial_blended else "exact")
+        data_quality_reason = (
+            f"exact2.0:partial_blend:cov={exact_cov:.2f}:filled={partial_filled_days}"
+            if partial_blended
+            else "exact2.0:ok"
+        )
+        final_tvl_base = list(exact_base)
         final_fees_base = _rebuild_fees_cumulative(fees_usd, final_tvl_base)
         final_tvl = _append_now_tvl_anchor(final_tvl_base, float(pool_tvl_now_usd))
         final_fees = _append_now_fee_anchor(final_fees_base)
@@ -1063,8 +1125,8 @@ def main() -> None:
         data_quality_reason = f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f}"
         final_tvl = []
         final_fees = []
-        if exact_series:
-            strict_exact_tvl_base = list(exact_series)
+        if exact_base:
+            strict_exact_tvl_base = list(exact_base)
             strict_exact_fees_base = _rebuild_fees_cumulative(fees_usd, strict_exact_tvl_base)
             strict_exact_tvl = _append_now_tvl_anchor(strict_exact_tvl_base, float(pool_tvl_now_usd))
             strict_exact_fees = _append_now_fee_anchor(strict_exact_fees_base)

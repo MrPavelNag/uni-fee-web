@@ -18031,7 +18031,9 @@ def _merge_for_web(
                     "apy_pct": float(est_apy),
                     "last_tvl": est_last_tvl,
                     "data_quality": "estimated",
-                    "data_quality_reason": "strict_compare:estimated",
+                    "data_quality_reason": (
+                        f"strict_compare:estimated:{str(v.get('tvl_price_source') or 'unknown')}"
+                    ),
                     "status": status,
                 }
             )
