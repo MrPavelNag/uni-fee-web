@@ -32591,11 +32591,28 @@ HTML_PAGE = """
           const estFeeX = estFeesSrc.map(p => new Date(p[0] * 1000));
           const estFeeY = estFeesSrc.map(p => p[1]);
           const exFeeX = exFees.map(p => new Date(p[0] * 1000));
-          const fillByTs = new Map(
+          let fillByTs = new Map(
             exFillMask
               .filter(p => Array.isArray(p) && p.length >= 2)
               .map(p => [Number(p[0] || 0), Number(p[1] || 0) > 0])
           );
+          if (!fillByTs.size && String(s.strict_compare_exact2_reason || "").includes("partial_blend")) {
+            const estTvlByTs = new Map(
+              estTvlSrc
+                .filter(p => Array.isArray(p) && p.length >= 2)
+                .map(p => [Number(p[0] || 0), Number(p[1] || 0)])
+            );
+            fillByTs = new Map();
+            for (const p of exTvl) {
+              if (!Array.isArray(p) || p.length < 2) continue;
+              const ts = Number(p[0] || 0);
+              const exv = Number(p[1] || 0);
+              const estv = Number(estTvlByTs.get(ts) || 0);
+              if (ts > 0 && exv > 0 && estv > 0 && Math.abs(exv - estv) <= 0.01) {
+                fillByTs.set(ts, true);
+              }
+            }
+          }
           const exFeeYExact = exFees.map(p => (fillByTs.get(Number(p?.[0] || 0)) ? null : p[1]));
           const exFeeYFill = exFees.map(p => (fillByTs.get(Number(p?.[0] || 0)) ? p[1] : null));
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
