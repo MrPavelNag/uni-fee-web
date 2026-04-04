@@ -456,11 +456,26 @@ def _alchemy_api_key() -> str:
         v = str(os.environ.get(k, "") or "").strip()
         if v:
             return v
+    # Fallback: extract key tail from configured Alchemy RPC URL(s).
+    for k, v in os.environ.items():
+        kk = str(k or "").strip().upper()
+        if not kk.startswith("ALCHEMY_RPC_URL_"):
+            continue
+        url = str(v or "").strip()
+        if ".g.alchemy.com/v2/" not in url:
+            continue
+        tail = url.rsplit("/v2/", 1)[-1].strip().strip("/")
+        if tail:
+            return tail
     return ""
 
 
 def _alchemy_url_for_chain(chain: str) -> str:
     ck = str(chain or "").strip().lower()
+    cu = ck.upper()
+    direct = str(os.environ.get(f"ALCHEMY_RPC_URL_{cu}", "") or "").strip()
+    if ".g.alchemy.com/v2/" in direct:
+        return direct
     key = _alchemy_api_key()
     if not key:
         return ""
@@ -977,11 +992,22 @@ def _build_exact2_tvl_series_v3_ledger(
     total_budget = max(10.0, float(budget_sec))
     # Snapshot mode: reserve time for price valuation after balance snapshots.
     try:
-        pricing_share = max(0.35, min(0.95, float(os.environ.get("STRICT_EXACT2_PRICING_BUDGET_SHARE", "0.75"))))
+        pricing_share = max(0.30, min(0.90, float(os.environ.get("STRICT_EXACT2_PRICING_BUDGET_SHARE", "0.55"))))
     except Exception:
-        pricing_share = 0.75
-    pricing_budget = min(max(20.0, total_budget * pricing_share), max(10.0, total_budget - 10.0))
-    balance_budget = max(10.0, total_budget - pricing_budget)
+        pricing_share = 0.55
+    pricing_budget = min(max(12.0, total_budget * pricing_share), max(8.0, total_budget - 8.0))
+    try:
+        min_balance_budget = max(
+            8.0,
+            min(
+                max(8.0, total_budget - 8.0),
+                float(os.environ.get("STRICT_EXACT2_BALANCE_BUDGET_MIN_SEC", "25")),
+            ),
+        )
+    except Exception:
+        min_balance_budget = max(8.0, min(max(8.0, total_budget - 8.0), 25.0))
+    balance_budget = max(min_balance_budget, total_budget - pricing_budget)
+    pricing_budget = max(8.0, total_budget - balance_budget)
     deadline_balance = time.monotonic() + balance_budget
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)

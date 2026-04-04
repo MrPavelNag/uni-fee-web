@@ -21648,6 +21648,8 @@ def _render_positions_page() -> str:
     function formatQualityReasonShort(rawReason, qualityTag) {
       const raw = String(rawReason || "").trim();
       if (!raw) return "-";
+      const dbg = raw.match(/dbg=t_blocks=([0-9]*\\.?[0-9]+),t_alchemy=([0-9]*\\.?[0-9]+),t_pricing=([0-9]*\\.?[0-9]+),t_total=([0-9]*\\.?[0-9]+)/i);
+      const dbgTail = dbg ? ` (b:${Number(dbg[1]).toFixed(1)}s a:${Number(dbg[2]).toFixed(1)}s p:${Number(dbg[3]).toFixed(1)}s)` : "";
       const dq = String(qualityTag || "").trim().toLowerCase();
       const covMatch = raw.match(/(?:^|:)cov=([0-9]*\.?[0-9]+)/i);
       const filledMatch = raw.match(/(?:^|:)filled=(\d+)/i);
@@ -21671,16 +21673,16 @@ def _render_positions_page() -> str:
       if (raw.includes("source_conflict_anchor_jump")) return "Exact rejected: sharp jump near current TVL";
       if (raw.includes("source_conflict_level_shift")) return "Exact rejected: level shift vs current TVL";
       if (raw.includes("one_leg_quantity_collapse")) return "Partial exact: one token balance missing";
-      if (raw.includes("exact2_budget_timeout:block_resolution")) return "Exact timeout: day block resolution";
-      if (raw.includes("exact2_budget_timeout:pricing")) return "Exact timeout: historical pricing";
+      if (raw.includes("exact2_budget_timeout:block_resolution")) return `Exact timeout: day block resolution${dbgTail}`;
+      if (raw.includes("exact2_budget_timeout:pricing")) return `Exact timeout: historical pricing${dbgTail}`;
       if (raw.includes("exact2_partial:block_missing")) return "Partial exact: missing day blocks";
       if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
-      if (raw.includes("exact2_partial:transfer_logs_timeout")) return "Partial exact: transfer log timeout";
+      if (raw.includes("exact2_partial:transfer_logs_timeout")) return `Partial exact: transfer log timeout${dbgTail}`;
       if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found on selected chains";
       if (raw.includes("missing_target_pool_id")) return "Target pool is required";
       if (dq === "exact") return "Exact";
       if (dq === "exact_partial") return "Exact partial";
-      if (dq === "strict_unavailable") return "Strict exact unavailable";
+      if (dq === "strict_unavailable") return `Strict exact unavailable${dbgTail}`;
       return raw.replace(/[:_]+/g, " ").replace(/\s+/g, " ").trim();
     }
     function getTrustedSpamKeys() {
@@ -32768,6 +32770,8 @@ HTML_PAGE = """
     function formatQualityReasonShort(rawReason, qualityTag) {
       const raw = String(rawReason || "").trim();
       if (!raw) return "-";
+      const dbg = raw.match(/dbg=t_blocks=([0-9]*\\.?[0-9]+),t_alchemy=([0-9]*\\.?[0-9]+),t_pricing=([0-9]*\\.?[0-9]+),t_total=([0-9]*\\.?[0-9]+)/i);
+      const dbgTail = dbg ? ` (b:${Number(dbg[1]).toFixed(1)}s a:${Number(dbg[2]).toFixed(1)}s p:${Number(dbg[3]).toFixed(1)}s)` : "";
       const dq = String(qualityTag || "").trim().toLowerCase();
       const covMatch = raw.match(/(?:^|:)cov=([0-9]*\.?[0-9]+)/i);
       const filledMatch = raw.match(/(?:^|:)filled=(\d+)/i);
@@ -32790,16 +32794,16 @@ HTML_PAGE = """
       if (raw.includes("source_conflict_anchor_jump")) return "Exact rejected: sharp jump near current TVL";
       if (raw.includes("source_conflict_level_shift")) return "Exact rejected: level shift vs current TVL";
       if (raw.includes("one_leg_quantity_collapse")) return "Partial exact: one token balance missing";
-      if (raw.includes("exact2_budget_timeout:block_resolution")) return "Exact timeout: day block resolution";
-      if (raw.includes("exact2_budget_timeout:pricing")) return "Exact timeout: historical pricing";
+      if (raw.includes("exact2_budget_timeout:block_resolution")) return `Exact timeout: day block resolution${dbgTail}`;
+      if (raw.includes("exact2_budget_timeout:pricing")) return `Exact timeout: historical pricing${dbgTail}`;
       if (raw.includes("exact2_partial:block_missing")) return "Partial exact: missing day blocks";
       if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
-      if (raw.includes("exact2_partial:transfer_logs_timeout")) return "Partial exact: transfer log timeout";
+      if (raw.includes("exact2_partial:transfer_logs_timeout")) return `Partial exact: transfer log timeout${dbgTail}`;
       if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found on selected chains";
       if (raw.includes("missing_target_pool_id")) return "Target pool is required";
       if (dq === "exact") return "Exact";
       if (dq === "exact_partial") return "Exact partial";
-      if (dq === "strict_unavailable") return "Strict exact unavailable";
+      if (dq === "strict_unavailable") return `Strict exact unavailable${dbgTail}`;
       return raw.replace(/[:_]+/g, " ").replace(/\s+/g, " ").trim();
     }
 
