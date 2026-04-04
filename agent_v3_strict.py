@@ -406,6 +406,7 @@ def _fetch_logs_adaptive(
     from_block: int,
     to_block: int,
     deadline_ts: float | None = None,
+    on_log: Any | None = None,
 ) -> list[dict]:
     start = int(max(1, from_block))
     end = int(max(start, to_block))
@@ -427,7 +428,12 @@ def _fetch_logs_adaptive(
             data = _rpc_json(int(chain_id), "eth_getLogs", params, timeout_sec=22.0)
             part = data.get("result") or []
             if isinstance(part, list):
-                logs.extend([x for x in part if isinstance(x, dict)])
+                if callable(on_log):
+                    for x in part:
+                        if isinstance(x, dict):
+                            on_log(x)
+                else:
+                    logs.extend([x for x in part if isinstance(x, dict)])
             cursor = hi + 1
             if len(part) < 500 and step < 200000:
                 step = int(step * 1.2)
@@ -467,22 +473,23 @@ def _collect_pool_transfer_deltas(
         ([TRANSFER_TOPIC, pool_topic], -1),  # from pool
         ([TRANSFER_TOPIC, None, pool_topic], 1),  # to pool
     ):
-        logs = _fetch_logs_adaptive(
+        def _consume_log(lg: dict) -> None:
+            bn = _safe_hex_to_int(lg.get("blockNumber"))
+            if bn <= 0:
+                return
+            val = _safe_hex_to_int(lg.get("data"))
+            if val <= 0:
+                return
+            by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
+        _fetch_logs_adaptive(
             int(chain_id),
             str(token),
             topics,
             int(from_block),
             int(to_block),
             deadline_ts=deadline_ts,
+            on_log=_consume_log,
         )
-        for lg in logs:
-            bn = _safe_hex_to_int(lg.get("blockNumber"))
-            if bn <= 0:
-                continue
-            val = _safe_hex_to_int(lg.get("data"))
-            if val <= 0:
-                continue
-            by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
     return by_block
 
 

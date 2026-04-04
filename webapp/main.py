@@ -47,11 +47,6 @@ from uniswap_client import get_graph_endpoint, graphql_query
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-JOB_STATUS_DIR = DATA_DIR / "job_status"
-try:
-    JOB_STATUS_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
 
 
 def _resolve_catalog_dir() -> Path:
@@ -82,6 +77,13 @@ except Exception:
     # Fallback for platforms without mounted persistent disk (or no write access).
     CATALOG_DIR = DATA_DIR
     CATALOG_DIR.mkdir(parents=True, exist_ok=True)
+JOB_STATUS_DIR = CATALOG_DIR / "job_status"
+try:
+    JOB_STATUS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    JOB_STATUS_DIR = DATA_DIR / "job_status"
+    with contextlib.suppress(Exception):
+        JOB_STATUS_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN_CATALOG_PATH = CATALOG_DIR / "token_catalog.json"
 CHAIN_CATALOG_PATH = CATALOG_DIR / "chain_catalog.json"
 PAIR_LISTS_CATALOG_PATH = CATALOG_DIR / "pair_lists_catalog.json"
@@ -19055,21 +19057,8 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         try:
             t_agents_total0 = time.perf_counter()
             if run_mode == "strict_exact":
-                _set_stage("strict", "Running strict estimated baseline (single pool)", 18)
                 pair_suffix = pairs_to_filename_suffix(token_pairs)
-                env_est = dict(env)
-                env_est["V3_EXACT_TVL_ENABLE"] = "0"
-                env_est["V3_EXACT_TVL_STRICT_MODE"] = "0"
-                env_est["AGENT_TIMEOUT_SEC"] = str(max(60, min(int(env.get("AGENT_TIMEOUT_SEC", "480") or 480), 150)))
-                est_data, est_dbg = _run_agent_and_load_timed(
-                    script_name="agent_v3.py",
-                    env=env_est,
-                    min_tvl=req.min_tvl,
-                    logs=logs,
-                    pair_suffix=pair_suffix,
-                )
-
-                _set_stage("strict", "Running strict exact2.0 agent (single pool)", 28)
+                _set_stage("strict", "Running strict exact2.0 agent (single pool)", 22)
                 base_timeout = int(env.get("AGENT_TIMEOUT_SEC", "480") or 480)
                 try:
                     exact2_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "240"))))
@@ -19094,31 +19083,18 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     base2 = merged_raw.get(_pid)
                     if isinstance(base2, dict):
                         base2["strict_compare_exact2_reason"] = str(_v2.get("data_quality_reason") or "")
-                for _pid, _ve in (est_data or {}).items():
-                    base = merged_raw.get(_pid)
-                    if not isinstance(base, dict):
-                        continue
-                    est_tvl = (_ve.get("tvl") or [])
-                    est_fees = (_ve.get("fees") or [])
-                    if est_tvl:
-                        base["strict_compare_estimated_tvl"] = est_tvl
-                    if est_fees:
-                        base["strict_compare_estimated_fees"] = est_fees
                 timing_debug["pairs"].append(
                     {
                         "pair": token_pairs,
                         "index": 1,
-                        "agents": [est_dbg, strict2_dbg],
+                        "agents": [strict2_dbg],
                         "merged_before": 0,
                         "merged_after": int(len(merged_raw)),
                         "merged_added": int(len(merged_raw)),
-                        "total_ms": (
-                            int((est_dbg or {}).get("total_ms") or 0)
-                            + int((strict2_dbg or {}).get("total_ms") or 0)
-                        ),
+                        "total_ms": int((strict2_dbg or {}).get("total_ms") or 0),
                     }
                 )
-                _set_stage("strict", "Strict exact2.0 agent completed", 75)
+                _set_stage("strict", "Strict exact2.0 agent completed", 78)
             else:
                 total_pairs = max(1, len(pairs))
                 pair_workers = _pair_worker_count(speed_mode, total_pairs)
@@ -30212,8 +30188,33 @@ def job_status(job_id: str) -> dict[str, Any]:
     if not job:
         snap = _job_snapshot_load(job_id)
         if isinstance(snap, dict) and snap:
+            status = str(snap.get("status") or "")
+            if status in {"queued", "running"}:
+                # Process restart or worker crash: the in-memory runner is gone.
+                snap["status"] = "failed"
+                snap["stage"] = "failed"
+                snap["stage_label"] = "Interrupted by service restart"
+                snap["progress"] = 100
+                if not str(snap.get("error") or "").strip():
+                    snap["error"] = "Scan interrupted because service instance restarted."
+                snap["finished_at"] = float(snap.get("finished_at") or time.time())
+                _job_snapshot_save(snap)
             return _json_safe(snap)
-        raise HTTPException(status_code=404, detail="Job not found")
+        # Last-resort compatibility: avoid 404 loops in UI polling after restarts.
+        return _json_safe(
+            {
+                "id": str(job_id),
+                "status": "failed",
+                "stage": "failed",
+                "stage_label": "Job state lost after restart",
+                "progress": 100,
+                "created_at": time.time(),
+                "started_at": 0.0,
+                "finished_at": time.time(),
+                "result": {"logs": [], "debug_timing": {"total_ms": 0, "stage_ms": {}, "pairs": []}},
+                "error": "Job not found after service restart. Please run scan again.",
+            }
+        )
     return _json_safe(job)
 
 
