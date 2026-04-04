@@ -499,7 +499,7 @@ def _alchemy_fetch_transfer_deltas(
     from_block: int,
     to_block: int,
     deadline_ts: float | None = None,
-) -> tuple[dict[int, int], bool]:
+) -> tuple[dict[int, int], bool, int]:
     url = _alchemy_url_for_chain(chain)
     if not url:
         raise RuntimeError("alchemy_not_configured_for_chain")
@@ -597,8 +597,19 @@ def _alchemy_fetch_transfer_deltas(
             f"alchemy dir={direction} token={str(token)[:10]}.. done pages={pages_used} items={items_used} "
             f"elapsed={time.monotonic() - dir_t0:.1f}s"
         )
-    _strict_debug(f"alchemy token={str(token)[:10]}.. total elapsed={time.monotonic() - t0:.1f}s blocks={len(by_block)}")
-    return by_block, bool(timed_out)
+    covered_from = int(from_block)
+    if timed_out:
+        # Conservative: only trust history down to the earliest block actually seen.
+        # Older days become uncovered and should not be rendered as exact.
+        if by_block:
+            covered_from = int(min(int(b) for b in by_block.keys() if int(b) > 0))
+        else:
+            covered_from = int(to_block) + 1
+    _strict_debug(
+        f"alchemy token={str(token)[:10]}.. total elapsed={time.monotonic() - t0:.1f}s "
+        f"blocks={len(by_block)} covered_from={covered_from}"
+    )
+    return by_block, bool(timed_out), int(covered_from)
 
 
 def _fetch_logs_adaptive(
@@ -659,7 +670,7 @@ def _collect_pool_transfer_deltas(
     to_block: int,
     deadline_ts: float | None = None,
 ) -> tuple[dict[int, int], int, bool]:
-    out, timed_out = _alchemy_fetch_transfer_deltas(
+    out, timed_out, covered_from = _alchemy_fetch_transfer_deltas(
         chain=str(chain),
         token=str(token),
         pool_id=str(pool_id),
@@ -667,7 +678,7 @@ def _collect_pool_transfer_deltas(
         to_block=int(to_block),
         deadline_ts=deadline_ts,
     )
-    return out, int(from_block), bool(timed_out)
+    return out, int(covered_from), bool(timed_out)
 
 
 def _latest_block_number(chain_id: int) -> int:
