@@ -24,10 +24,11 @@ from config import DEFAULT_TOKEN_PAIRS, FEE_DAYS, LP_ALLOCATION_USD, UNISWAP_V3_
 from agent_common import build_exact_day_window, pairs_to_filename_suffix, resolve_pool_tvl_now_external, save_chart_data_json
 from uniswap_client import get_graph_endpoint, graphql_query, query_pool_day_data
 from agent_v3 import (
+    _balance_of_raw,
     CHAIN_ID_BY_KEY,
     _erc20_decimals,
+    _historical_price_usd,
     _llama_block_for_day,
-    _pool_balances_near_block,
     _rpc_primary_url,
     _rpc_json,
     _rpc_urls,
@@ -39,7 +40,6 @@ _POOL_CHAIN_CACHE_PATH = os.environ.get("STRICT_POOL_CHAIN_CACHE_PATH", "data/st
 _EXACT2_CACHE_DB_PATH = os.environ.get("STRICT_EXACT2_CACHE_DB_PATH", "data/exact2_daily_cache.sqlite3")
 _WARN_LOCK = threading.Lock()
 _FALLBACK_WARNED: set[str] = set()
-_STRICT_LLAMA_PRICE_CACHE: dict[tuple[str, str, int], float] = {}
 
 
 def _warn_fallback_once(key: str, message: str) -> None:
@@ -51,42 +51,6 @@ def _warn_fallback_once(key: str, message: str) -> None:
             return
         _FALLBACK_WARNED.add(k)
     print(f"[WARN][strict] {message}")
-
-
-def _historical_price_usd_strict(chain_key: str, token: str, day_ts: int) -> float:
-    ck = str(chain_key or "").strip().lower()
-    tk = str(token or "").strip().lower()
-    dts = int((int(day_ts) // 86400) * 86400)
-    lk = {
-        "ethereum": "ethereum",
-        "optimism": "optimism",
-        "bsc": "bsc",
-        "unichain": "unichain",
-        "polygon": "polygon",
-        "base": "base",
-        "arbitrum": "arbitrum",
-        "avalanche": "avax",
-        "celo": "celo",
-    }.get(ck, ck)
-    key = (str(lk), str(tk), int(dts))
-    with _WARN_LOCK:
-        c = _STRICT_LLAMA_PRICE_CACHE.get(key)
-    if c and float(c) > 0:
-        return float(c)
-    try:
-        u = f"https://coins.llama.fi/prices/historical/{int(dts + 86399)}/{lk}:{tk}"
-        r = requests.get(u, timeout=(2.0, 4.0))
-        r.raise_for_status()
-        data = r.json() if isinstance(r.json(), dict) else {}
-        coin = (data.get("coins") or {}).get(f"{lk}:{tk}") or {}
-        p = float(coin.get("price") or 0.0)
-        if p > 0:
-            with _WARN_LOCK:
-                _STRICT_LLAMA_PRICE_CACHE[key] = float(p)
-            return float(p)
-    except Exception:
-        return 0.0
-    return 0.0
 
 
 def _is_eth_address(v: str) -> bool:
@@ -362,6 +326,28 @@ def _normalize_exact_series_to_fees(
     return [(int(ts), float(by_ts.get(int(ts), 0.0))) for ts, _ in (fees_usd or [])]
 
 
+def _blend_exact_with_estimated(
+    exact_series: list[tuple[int, float]],
+    estimated_series: list[tuple[int, float]],
+) -> tuple[list[tuple[int, float]], int]:
+    out: list[tuple[int, float]] = []
+    filled = 0
+    n = min(len(exact_series or []), len(estimated_series or []))
+    for i in range(n):
+        ts = int(exact_series[i][0])
+        ex_v = float(exact_series[i][1] or 0.0)
+        if ex_v > 0:
+            out.append((ts, ex_v))
+            continue
+        est_v = float(estimated_series[i][1] or 0.0)
+        if est_v > 0:
+            out.append((ts, est_v))
+            filled += 1
+        else:
+            out.append((ts, 0.0))
+    return out, filled
+
+
 def _median(values: list[float]) -> float:
     arr = sorted(float(x) for x in (values or []) if float(x) > 0.0)
     if not arr:
@@ -600,49 +586,15 @@ def _collect_pool_transfer_deltas(
     to_block: int,
     deadline_ts: float | None = None,
 ) -> tuple[dict[int, int], int, bool]:
-    # Prefer Alchemy Transfers API when configured: it is significantly more
-    # reliable for long ERC20 transfer scans than raw eth_getLogs on public RPC.
-    try:
-        out = _alchemy_fetch_transfer_deltas(
-            chain=str(chain),
-            token=str(token),
-            pool_id=str(pool_id),
-            from_block=int(from_block),
-            to_block=int(to_block),
-            deadline_ts=deadline_ts,
-        )
-        return out, int(from_block), False
-    except Exception:
-        pass
-
-    pool_topic = _addr_topic(pool_id)
-    by_block: dict[int, int] = {}
-    covered_from = int(from_block)
-    timed_out = False
-    for topics, sign in (
-        ([TRANSFER_TOPIC, pool_topic], -1),  # from pool
-        ([TRANSFER_TOPIC, None, pool_topic], 1),  # to pool
-    ):
-        def _consume_log(lg: dict) -> None:
-            bn = _safe_hex_to_int(lg.get("blockNumber"))
-            if bn <= 0:
-                return
-            val = _safe_hex_to_int(lg.get("data"))
-            if val <= 0:
-                return
-            by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
-        _unused_logs, local_covered_from, local_timed_out = _fetch_logs_adaptive(
-            int(chain_id),
-            str(token),
-            topics,
-            int(from_block),
-            int(to_block),
-            deadline_ts=deadline_ts,
-            on_log=_consume_log,
-        )
-        covered_from = max(int(covered_from), int(local_covered_from))
-        timed_out = bool(timed_out or local_timed_out)
-    return by_block, covered_from, timed_out
+    out = _alchemy_fetch_transfer_deltas(
+        chain=str(chain),
+        token=str(token),
+        pool_id=str(pool_id),
+        from_block=int(from_block),
+        to_block=int(to_block),
+        deadline_ts=deadline_ts,
+    )
+    return out, int(from_block), False
 
 
 def _latest_block_number(chain_id: int) -> int:
@@ -953,15 +905,14 @@ def _build_exact2_tvl_series_v3_ledger(
 ) -> tuple[list[tuple[int, float]], str, float]:
     pool_id = str(pool.get("id") or "").strip().lower()
     day_keys = [int((int(ts) // 86400) * 86400) for ts, _ in (fees_usd or []) if int(ts) > 0]
-    cached_by_day = _exact2_cache_load(chain=str(chain), pool_id=pool_id, day_ts_list=day_keys)
-    if day_keys and all(int(d) in cached_by_day for d in day_keys):
-        hit_series = [(int(ts), float(cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0))) for ts, _ in fees_usd]
-        hit_cov = float(sum(1 for _ts, v in hit_series if float(v) > 0.0) / max(1, len(hit_series)))
-        _warn_fallback_once(
-            f"exact2_cache_hit:{chain}:{pool_id}",
-            f"exact2 history served from cache: chain={chain} pool={pool_id}",
-        )
-        return hit_series, "exact2_cache:ok", hit_cov
+    use_cache = str(os.environ.get("STRICT_EXACT2_USE_CACHE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    cached_by_day: dict[int, float] = {}
+    if use_cache:
+        cached_by_day = _exact2_cache_load(chain=str(chain), pool_id=pool_id, day_ts_list=day_keys)
+        if day_keys and all(int(d) in cached_by_day for d in day_keys):
+            hit_series = [(int(ts), float(cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0))) for ts, _ in fees_usd]
+            hit_cov = float(sum(1 for _ts, v in hit_series if float(v) > 0.0) / max(1, len(hit_series)))
+            return hit_series, "exact2_cache:ok", hit_cov
 
     # Strict path is deterministic: only RPC snapshot source.
 
@@ -1020,9 +971,26 @@ def _build_exact2_tvl_series_v3_ledger(
     valid_blocks = [int(b) for b in day_blocks.values() if int(b) > 0]
     if not valid_blocks:
         return [], "exact2_no_day_blocks", 0.0
-    transfer_logs_timed_out = False
-    balance_mode = _strict_exact2_balance_mode()
-    by_day_balances: dict[int, tuple[float, float]] = {}
+    from_block = int(min(valid_blocks))
+    to_block = int(latest_block)
+    try:
+        deltas0, covered0_from, timeout0 = _collect_pool_transfer_deltas(
+            chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=deadline_balance
+        )
+        deltas1, covered1_from, timeout1 = _collect_pool_transfer_deltas(
+            chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=deadline_balance
+        )
+    except Exception as e:
+        return [], f"exact2_alchemy_transfers_failed:{e}", 0.0
+
+    boundaries = sorted(set(valid_blocks), reverse=True)
+    bal0_latest = int(_balance_of_raw(chain_id, token0, pool_id, latest_block, timeout_sec=6.0))
+    bal1_latest = int(_balance_of_raw(chain_id, token1, pool_id, latest_block, timeout_sec=6.0))
+    bal0_by_block = _balances_by_boundaries_desc(bal0_latest, deltas0, boundaries)
+    bal1_by_block = _balances_by_boundaries_desc(bal1_latest, deltas1, boundaries)
+    covered_from = int(max(int(from_block), int(covered0_from), int(covered1_from)))
+    transfer_logs_timed_out = bool(timeout0 or timeout1)
+    balance_mode = "alchemy"
 
     tvl_series: list[tuple[int, float]] = []
     non_zero = 0
@@ -1044,33 +1012,11 @@ def _build_exact2_tvl_series_v3_ledger(
             return tvl_series, f"exact2_budget_timeout:pricing:mode={balance_mode}", processed_cov
         day_ts = int((int(ts) // 86400) * 86400)
         b = int(day_blocks.get(day_ts, 0))
-        if b <= 0:
+        if b <= 0 or int(b) < int(covered_from):
             tvl_series.append((int(ts), 0.0))
             continue
-        if day_ts not in by_day_balances:
-            if time.monotonic() >= deadline_balance:
-                tvl_series.append((int(ts), 0.0))
-                continue
-            try:
-                # Use direct historical balance snapshots by block as primary source of quantities.
-                b0_raw, b1_raw, _used_block = _pool_balances_near_block(
-                    chain_id=int(chain_id),
-                    token0=str(token0),
-                    token1=str(token1),
-                    pool_id=str(pool_id),
-                    block_num=int(b),
-                    window=int(max(0, int(os.environ.get("STRICT_EXACT2_BALANCE_WINDOW", "8")))),
-                    retries=int(max(1, int(os.environ.get("STRICT_EXACT2_BALANCE_RETRIES", "3")))),
-                    deadline_ts=float(deadline_balance),
-                    timeout_sec=float(max(1.5, float(os.environ.get("STRICT_EXACT2_BALANCE_CALL_TIMEOUT_SEC", "3.0")))),
-                )
-                amt0_s = float(int(b0_raw)) / float(10 ** max(0, dec0))
-                amt1_s = float(int(b1_raw)) / float(10 ** max(0, dec1))
-                by_day_balances[day_ts] = (float(max(0.0, amt0_s)), float(max(0.0, amt1_s)))
-            except Exception:
-                snapshot_fail_days += 1
-                by_day_balances[day_ts] = (0.0, 0.0)
-        amt0, amt1 = by_day_balances.get(day_ts, (0.0, 0.0))
+        amt0 = float(bal0_by_block.get(int(b), 0)) / float(10 ** max(0, dec0))
+        amt1 = float(bal1_by_block.get(int(b), 0)) / float(10 ** max(0, dec1))
         if amt0 <= 0.0 and amt1 <= 0.0:
             tvl_series.append((int(ts), 0.0))
             continue
@@ -1079,8 +1025,8 @@ def _build_exact2_tvl_series_v3_ledger(
         elif amt1 <= 0.0 and amt0 > 0.0:
             one_leg_days_1 += 1
         covered_days += 1
-        p0 = float(_historical_price_usd_strict(ck, token0, int(ts)))
-        p1 = float(_historical_price_usd_strict(ck, token1, int(ts)))
+        p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
+        p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
         # Keep historical valuation rule aligned with TVL-now rule:
         # if one leg price is missing, infer from pool token ratio.
         if p0 <= 0 and p1 > 0 and ratio01 > 0:
@@ -1322,10 +1268,18 @@ def main() -> None:
         )
 
     exact_has_signal = bool(exact_base and any(float(v) > 0.0 for _ts, v in exact_base))
+    partial_blended = False
+    exact_effective = list(exact_base)
+    if exact_base and len(exact_base) == len(estimated_tvl_base) and float(exact_cov) >= float(partial_min_cov):
+        blended, filled = _blend_exact_with_estimated(exact_base, estimated_tvl_base)
+        if filled > 0:
+            exact_effective = list(blended)
+            partial_filled_days = int(filled)
+            partial_blended = True
     strict_exact_ok = bool(
-        exact_base
-        and len(exact_base) == len(fees_usd)
-        and all(float(v) > 0.0 for _ts, v in exact_base)
+        exact_effective
+        and len(exact_effective) == len(fees_usd)
+        and all(float(v) > 0.0 for _ts, v in exact_effective)
         and not one_leg_conflict
         and not scale_conflict
         and not anchor_conflict
@@ -1337,9 +1291,13 @@ def main() -> None:
         and len(exact_base) == len(fees_usd)
     )
     if strict_exact_ok:
-        data_quality = "exact"
-        data_quality_reason = "exact:ok"
-        final_tvl_base = list(exact_base)
+        data_quality = ("exact_partial" if partial_blended else "exact")
+        data_quality_reason = (
+            f"exact:partial_blend:cov={exact_cov:.2f}:filled={partial_filled_days}"
+            if partial_blended
+            else "exact:ok"
+        )
+        final_tvl_base = list(exact_effective)
         final_fees_base = _rebuild_fees_cumulative(fees_usd, final_tvl_base)
         final_tvl = _append_now_tvl_anchor(final_tvl_base, float(pool_tvl_now_usd))
         final_fees = _append_now_fee_anchor(final_fees_base)
