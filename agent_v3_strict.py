@@ -479,13 +479,25 @@ def _alchemy_fetch_transfer_deltas(
     url = _alchemy_url_for_chain(chain)
     if not url:
         raise RuntimeError("alchemy_not_configured_for_chain")
+    try:
+        req_timeout = max(2.0, min(12.0, float(os.environ.get("STRICT_ALCHEMY_REQ_TIMEOUT_SEC", "6.0"))))
+    except Exception:
+        req_timeout = 6.0
+    try:
+        max_pages = max(10, int(os.environ.get("STRICT_ALCHEMY_MAX_PAGES", "120")))
+    except Exception:
+        max_pages = 120
 
     by_block: dict[int, int] = {}
     for direction, sign in (("from", -1), ("to", 1)):
         page_key = ""
+        pages_used = 0
+        seen_keys: set[str] = set()
         while True:
             if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
                 raise TimeoutError("exact2_budget_timeout:alchemy_transfers")
+            if pages_used >= int(max_pages):
+                raise TimeoutError("exact2_budget_timeout:alchemy_page_cap")
             params: dict[str, Any] = {
                 "fromBlock": hex(int(from_block)),
                 "toBlock": hex(int(to_block)),
@@ -500,9 +512,12 @@ def _alchemy_fetch_transfer_deltas(
             else:
                 params["fromAddress"] = str(pool_id).strip().lower()
             if page_key:
+                if page_key in seen_keys:
+                    raise RuntimeError("alchemy_pagekey_loop")
+                seen_keys.add(page_key)
                 params["pageKey"] = page_key
             body = {"jsonrpc": "2.0", "id": 1, "method": "alchemy_getAssetTransfers", "params": [params]}
-            r = requests.post(url, json=body, timeout=(3.0, 12.0))
+            r = requests.post(url, json=body, timeout=(2.0, float(req_timeout)))
             r.raise_for_status()
             payload = r.json()
             data = payload if isinstance(payload, dict) else {}
@@ -523,6 +538,7 @@ def _alchemy_fetch_transfer_deltas(
                         continue
                     by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
             page_key = str(res.get("pageKey") or "").strip()
+            pages_used += 1
             if not page_key:
                 break
     return by_block
