@@ -1009,9 +1009,12 @@ def _build_exact2_tvl_series_v3_ledger(
     one_leg_days_1 = 0
     ratio01 = float(pool.get("token0Price") or 0.0) if pool.get("token0Price") is not None else 0.0
     deadline_pricing = time.monotonic() + pricing_budget
-    for ts, _fees in fees_usd:
+    for idx, (ts, _fees) in enumerate(fees_usd):
         if time.monotonic() >= deadline_pricing:
-            processed_cov = float(len(tvl_series) / max(1, len(fees_usd)))
+            tvl_series.append((int(ts), 0.0))
+            for j in range(idx + 1, len(fees_usd)):
+                tvl_series.append((int(fees_usd[j][0]), 0.0))
+            processed_cov = float(sum(1 for _ts, v in tvl_series if float(v) > 0.0) / max(1, len(fees_usd)))
             return tvl_series, f"exact2_budget_timeout:pricing:mode={balance_mode}", processed_cov
         day_ts = int((int(ts) // 86400) * 86400)
         b = int(day_blocks.get(day_ts, 0))
@@ -1045,14 +1048,8 @@ def _build_exact2_tvl_series_v3_ledger(
             continue
         if amt0 <= 0.0 and amt1 > 0.0:
             one_leg_days_0 += 1
-            # Treat one-leg snapshots as missing quantity points.
-            tvl_series.append((int(ts), 0.0))
-            continue
         elif amt1 <= 0.0 and amt0 > 0.0:
             one_leg_days_1 += 1
-            # Treat one-leg snapshots as missing quantity points.
-            tvl_series.append((int(ts), 0.0))
-            continue
         covered_days += 1
         p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
         p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
@@ -1106,7 +1103,11 @@ def _build_exact2_tvl_series_v3_ledger(
             f"priced_days={priced_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}",
             cov,
         )
-    if covered_days >= max(3, len(fees_usd) // 2) and one_leg_ratio >= 0.5:
+    try:
+        one_leg_max_ratio = max(0.5, min(1.0, float(os.environ.get("STRICT_EXACT2_ONE_LEG_MAX_RATIO", "0.95"))))
+    except Exception:
+        one_leg_max_ratio = 0.95
+    if covered_days >= max(3, len(fees_usd) // 2) and one_leg_ratio >= float(one_leg_max_ratio):
         return (
             tvl_series,
             f"exact2_partial:one_leg_quantity_collapse:mode={balance_mode}:one_leg_ratio={one_leg_ratio:.2f}:"
