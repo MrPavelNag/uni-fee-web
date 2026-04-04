@@ -357,6 +357,60 @@ def _blend_exact_with_estimated(
     return out, filled
 
 
+def _smooth_sparse_exact_series(
+    series: list[tuple[int, float]],
+    *,
+    max_missing_ratio: float = 0.50,
+) -> tuple[list[tuple[int, float]], int]:
+    """Fill gaps in exact series from neighboring exact points only.
+
+    No estimate blending here: linear interpolation between known exact points,
+    and edge carry from the closest known point. Applied only when missing ratio
+    is within tolerated threshold (default 50%).
+    """
+    arr = [(int(ts), float(v or 0.0)) for ts, v in (series or [])]
+    n = len(arr)
+    if n == 0:
+        return arr, 0
+    miss_idx = [i for i, (_ts, v) in enumerate(arr) if float(v) <= 0.0]
+    if not miss_idx:
+        return arr, 0
+    miss_ratio = float(len(miss_idx) / max(1, n))
+    if miss_ratio > float(max_missing_ratio):
+        return arr, 0
+
+    out = list(arr)
+    known = [i for i, (_ts, v) in enumerate(arr) if float(v) > 0.0]
+    if not known:
+        return arr, 0
+
+    filled = 0
+    for i in miss_idx:
+        left = next((k for k in range(i - 1, -1, -1) if float(out[k][1]) > 0.0), None)
+        right = next((k for k in range(i + 1, n) if float(out[k][1]) > 0.0), None)
+        ts_i = int(out[i][0])
+        if left is not None and right is not None and right != left:
+            ts_l, v_l = out[left]
+            ts_r, v_r = out[right]
+            if int(ts_r) > int(ts_l):
+                alpha = float((ts_i - int(ts_l)) / max(1, int(ts_r) - int(ts_l)))
+                v = float(v_l + (v_r - v_l) * alpha)
+            else:
+                v = float((float(v_l) + float(v_r)) / 2.0)
+            out[i] = (ts_i, max(0.0, v))
+            filled += 1
+            continue
+        if left is not None:
+            out[i] = (ts_i, max(0.0, float(out[left][1])))
+            filled += 1
+            continue
+        if right is not None:
+            out[i] = (ts_i, max(0.0, float(out[right][1])))
+            filled += 1
+            continue
+    return out, int(filled)
+
+
 def _median(values: list[float]) -> float:
     arr = sorted(float(x) for x in (values or []) if float(x) > 0.0)
     if not arr:
@@ -592,7 +646,8 @@ def _alchemy_fetch_transfer_deltas(
                 f"alchemy dir={direction} token={str(token)[:10]}.. budget timeout "
                 f"pages={pages_used} items={items_used} elapsed={time.monotonic() - dir_t0:.1f}s"
             )
-            break
+            # Continue with the opposite direction to salvage additional history.
+            continue
         _strict_debug(
             f"alchemy dir={direction} token={str(token)[:10]}.. done pages={pages_used} items={items_used} "
             f"elapsed={time.monotonic() - dir_t0:.1f}s"
@@ -1090,11 +1145,17 @@ def _build_exact2_tvl_series_v3_ledger(
     to_block = int(latest_block)
     t_transfers = time.monotonic()
     try:
+        # Split remaining transfer budget across both pool tokens so one busy leg
+        # cannot starve the other and force strict_unavailable with zero series.
+        rem_balance = max(2.0, float(deadline_balance) - time.monotonic())
+        per_token_budget = max(1.0, rem_balance / 2.0)
+        token_deadline_0 = time.monotonic() + per_token_budget
         deltas0, covered0_from, timeout0 = _collect_pool_transfer_deltas(
-            chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=deadline_balance
+            chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=token_deadline_0
         )
+        token_deadline_1 = time.monotonic() + per_token_budget
         deltas1, covered1_from, timeout1 = _collect_pool_transfer_deltas(
-            chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=deadline_balance
+            chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=token_deadline_1
         )
     except Exception as e:
         t_transfers_elapsed = max(0.0, time.monotonic() - t_transfers)
@@ -1110,7 +1171,12 @@ def _build_exact2_tvl_series_v3_ledger(
     bal1_latest = int(_balance_of_raw(chain_id, token1, pool_id, latest_block, timeout_sec=6.0))
     bal0_by_block = _balances_by_boundaries_desc(bal0_latest, deltas0, boundaries)
     bal1_by_block = _balances_by_boundaries_desc(bal1_latest, deltas1, boundaries)
-    covered_from = int(max(int(from_block), int(covered0_from), int(covered1_from)))
+    covered_candidates = [int(from_block)]
+    if deltas0:
+        covered_candidates.append(int(covered0_from))
+    if deltas1:
+        covered_candidates.append(int(covered1_from))
+    covered_from = int(max(covered_candidates))
     transfer_logs_timed_out = bool(timeout0 or timeout1)
     balance_mode = "alchemy"
 
@@ -1457,6 +1523,29 @@ def main() -> None:
     elif strict_exact_partial_ok:
         data_quality = "exact_partial"
         missing_days = int(sum(1 for _ts, v in exact_base if float(v or 0.0) <= 0.0))
+        try:
+            smooth_enabled = str(os.environ.get("STRICT_EXACT2_SMOOTH_ENABLE", "1")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        except Exception:
+            smooth_enabled = True
+        try:
+            smooth_max_missing_ratio = max(
+                0.0,
+                min(1.0, float(os.environ.get("STRICT_EXACT2_SMOOTH_MAX_MISSING_RATIO", "0.50"))),
+            )
+        except Exception:
+            smooth_max_missing_ratio = 0.50
+        smooth_filled_days = 0
+        exact_for_output = list(exact_base)
+        if smooth_enabled and missing_days > 0:
+            smoothed, smooth_filled_days = _smooth_sparse_exact_series(
+                exact_base,
+                max_missing_ratio=float(smooth_max_missing_ratio),
+            )
+            if int(smooth_filled_days) > 0:
+                exact_for_output = list(smoothed)
+                missing_days = int(sum(1 for _ts, v in exact_for_output if float(v or 0.0) <= 0.0))
         flags: list[str] = []
         if one_leg_conflict:
             flags.append("one_leg")
@@ -1469,10 +1558,11 @@ def main() -> None:
         if clone_conflict:
             flags.append("clone")
         flg = f":conflicts={','.join(flags)}" if flags else ""
-        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}:reason={exact_reason}{flg}"
+        sm = f":smoothed={int(smooth_filled_days)}" if int(smooth_filled_days) > 0 else ""
+        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}{sm}:reason={exact_reason}{flg}"
         final_tvl = []
         final_fees = []
-        strict_exact_tvl_base = list(exact_base)
+        strict_exact_tvl_base = list(exact_for_output)
         strict_exact_fees_base = _rebuild_fees_cumulative(fees_usd, strict_exact_tvl_base)
         strict_exact_tvl = list(strict_exact_tvl_base)
         strict_exact_fees = list(strict_exact_fees_base)
