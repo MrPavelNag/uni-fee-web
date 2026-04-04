@@ -26,7 +26,6 @@ from uniswap_client import get_graph_endpoint, graphql_query, query_pool_day_dat
 from agent_v3 import (
     CHAIN_ID_BY_KEY,
     _erc20_decimals,
-    _historical_price_usd,
     _llama_block_for_day,
     _pool_balances_near_block,
     _rpc_primary_url,
@@ -40,6 +39,7 @@ _POOL_CHAIN_CACHE_PATH = os.environ.get("STRICT_POOL_CHAIN_CACHE_PATH", "data/st
 _EXACT2_CACHE_DB_PATH = os.environ.get("STRICT_EXACT2_CACHE_DB_PATH", "data/exact2_daily_cache.sqlite3")
 _WARN_LOCK = threading.Lock()
 _FALLBACK_WARNED: set[str] = set()
+_STRICT_LLAMA_PRICE_CACHE: dict[tuple[str, str, int], float] = {}
 
 
 def _warn_fallback_once(key: str, message: str) -> None:
@@ -50,7 +50,43 @@ def _warn_fallback_once(key: str, message: str) -> None:
         if k in _FALLBACK_WARNED:
             return
         _FALLBACK_WARNED.add(k)
-    print(f"[WARN][fallback] {message}")
+    print(f"[WARN][strict] {message}")
+
+
+def _historical_price_usd_strict(chain_key: str, token: str, day_ts: int) -> float:
+    ck = str(chain_key or "").strip().lower()
+    tk = str(token or "").strip().lower()
+    dts = int((int(day_ts) // 86400) * 86400)
+    lk = {
+        "ethereum": "ethereum",
+        "optimism": "optimism",
+        "bsc": "bsc",
+        "unichain": "unichain",
+        "polygon": "polygon",
+        "base": "base",
+        "arbitrum": "arbitrum",
+        "avalanche": "avax",
+        "celo": "celo",
+    }.get(ck, ck)
+    key = (str(lk), str(tk), int(dts))
+    with _WARN_LOCK:
+        c = _STRICT_LLAMA_PRICE_CACHE.get(key)
+    if c and float(c) > 0:
+        return float(c)
+    try:
+        u = f"https://coins.llama.fi/prices/historical/{int(dts + 86399)}/{lk}:{tk}"
+        r = requests.get(u, timeout=(2.0, 4.0))
+        r.raise_for_status()
+        data = r.json() if isinstance(r.json(), dict) else {}
+        coin = (data.get("coins") or {}).get(f"{lk}:{tk}") or {}
+        p = float(coin.get("price") or 0.0)
+        if p > 0:
+            with _WARN_LOCK:
+                _STRICT_LLAMA_PRICE_CACHE[key] = float(p)
+            return float(p)
+    except Exception:
+        return 0.0
+    return 0.0
 
 
 def _is_eth_address(v: str) -> bool:
@@ -1025,6 +1061,8 @@ def _build_exact2_tvl_series_v3_ledger(
                     block_num=int(b),
                     window=int(max(0, int(os.environ.get("STRICT_EXACT2_BALANCE_WINDOW", "8")))),
                     retries=int(max(1, int(os.environ.get("STRICT_EXACT2_BALANCE_RETRIES", "3")))),
+                    deadline_ts=float(deadline_balance),
+                    timeout_sec=float(max(1.5, float(os.environ.get("STRICT_EXACT2_BALANCE_CALL_TIMEOUT_SEC", "3.0")))),
                 )
                 amt0_s = float(int(b0_raw)) / float(10 ** max(0, dec0))
                 amt1_s = float(int(b1_raw)) / float(10 ** max(0, dec1))
@@ -1041,8 +1079,8 @@ def _build_exact2_tvl_series_v3_ledger(
         elif amt1 <= 0.0 and amt0 > 0.0:
             one_leg_days_1 += 1
         covered_days += 1
-        p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
-        p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
+        p0 = float(_historical_price_usd_strict(ck, token0, int(ts)))
+        p1 = float(_historical_price_usd_strict(ck, token1, int(ts)))
         # Keep historical valuation rule aligned with TVL-now rule:
         # if one leg price is missing, infer from pool token ratio.
         if p0 <= 0 and p1 > 0 and ratio01 > 0:

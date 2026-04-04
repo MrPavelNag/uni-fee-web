@@ -562,9 +562,9 @@ def _historical_price_usd(chain_key: str, token: str, day_ts: int, day_start: in
     return 0.0
 
 
-def _balance_of_raw(chain_id: int, token: str, owner: str, block_num: int) -> int:
+def _balance_of_raw(chain_id: int, token: str, owner: str, block_num: int, timeout_sec: float = 8.0) -> int:
     data = "0x70a08231" + str(owner).strip().lower().replace("0x", "").rjust(64, "0")
-    out = _rpc_eth_call_hex(int(chain_id), str(token), data, hex(int(block_num)), timeout_sec=8.0)
+    out = _rpc_eth_call_hex(int(chain_id), str(token), data, hex(int(block_num)), timeout_sec=float(timeout_sec))
     return int(_decode_uint_hex(out))
 
 
@@ -586,16 +586,22 @@ def _pool_balances_near_block(
     block_num: int,
     window: int,
     retries: int,
+    deadline_ts: float | None = None,
+    timeout_sec: float = 8.0,
 ) -> tuple[int, int, int]:
     last_err: Exception | None = None
     for delta in _strict_block_deltas(window):
+        if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+            raise TimeoutError("strict_balance_deadline")
         b = int(block_num) + int(delta)
         if b <= 0:
             continue
         for _ in range(max(1, int(retries))):
+            if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+                raise TimeoutError("strict_balance_deadline")
             try:
-                b0 = _balance_of_raw(chain_id, token0, pool_id, b)
-                b1 = _balance_of_raw(chain_id, token1, pool_id, b)
+                b0 = _balance_of_raw(chain_id, token0, pool_id, b, timeout_sec=float(timeout_sec))
+                b1 = _balance_of_raw(chain_id, token1, pool_id, b, timeout_sec=float(timeout_sec))
                 return int(b0), int(b1), int(b)
             except Exception as e:
                 last_err = e
@@ -1233,6 +1239,7 @@ def _build_exact_tvl_series_v3(
         non_zero_strict = 0
         timed_out = False
         t_started = time.perf_counter()
+        strict_deadline = time.monotonic() + float(max(1.0, budget_sec))
         for ts, _ in fees_usd:
             if (time.perf_counter() - t_started) > float(max(1.0, budget_sec)):
                 timed_out = True
@@ -1248,6 +1255,8 @@ def _build_exact_tvl_series_v3(
                     block_num=int(block_num),
                     window=int(V3_EXACT_STRICT_BLOCK_WINDOW),
                     retries=int(V3_EXACT_STRICT_RPC_RETRIES),
+                    deadline_ts=float(strict_deadline),
+                    timeout_sec=float(max(1.5, min(4.0, float(max(1.0, budget_sec) / 20.0)))),
                 )
                 b0 = float(raw0) / (10 ** int(t0_dec))
                 b1 = float(raw1) / (10 ** int(t1_dec))
