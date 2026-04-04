@@ -63,6 +63,17 @@ def _target_pool_id() -> str:
     return raw if _is_eth_address(raw) else ""
 
 
+def _token_decimals_from_pool(pool: dict, key: str) -> int:
+    try:
+        t = pool.get(key) or {}
+        d = int(t.get("decimals") or 0)
+        if 0 < d <= 36:
+            return int(d)
+    except Exception:
+        pass
+    return 0
+
+
 def _include_chains() -> list[str]:
     include = [c.strip().lower() for c in str(os.environ.get("INCLUDE_CHAINS", "")).split(",") if c.strip()]
     if include:
@@ -965,8 +976,8 @@ def _build_exact2_tvl_series_v3_ledger(
 
     try:
         latest_block = _latest_block_number(chain_id)
-        dec0 = int(_erc20_decimals(chain_id, token0))
-        dec1 = int(_erc20_decimals(chain_id, token1))
+        dec0 = int(_token_decimals_from_pool(pool, "token0") or _erc20_decimals(chain_id, token0))
+        dec1 = int(_token_decimals_from_pool(pool, "token1") or _erc20_decimals(chain_id, token1))
     except Exception as e:
         return [], f"exact2_latest_point_failed:{e}", 0.0
 

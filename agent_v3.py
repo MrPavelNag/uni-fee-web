@@ -355,15 +355,20 @@ def _erc20_decimals(chain_id: int, token: str) -> int:
     with _EXACT_CACHE_LOCK:
         if key in _DECIMALS_CACHE:
             return int(_DECIMALS_CACHE[key])
+    ok = False
     try:
         out = _rpc_eth_call_hex(int(chain_id), str(token), "0x313ce567", "latest", timeout_sec=6.0)
         dec = int(_decode_uint_hex(out))
         if dec <= 0 or dec > 36:
             dec = 18
+        else:
+            ok = True
     except Exception:
         dec = 18
-    with _EXACT_CACHE_LOCK:
-        _DECIMALS_CACHE[key] = int(dec)
+    # Cache only verified on-chain decimals; do not persist fallback=18 on transient RPC failures.
+    if ok:
+        with _EXACT_CACHE_LOCK:
+            _DECIMALS_CACHE[key] = int(dec)
     return int(dec)
 
 
