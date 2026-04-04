@@ -18098,6 +18098,7 @@ def _merge_for_web(
                     "strict_compare_exact_fees": (ex_fees if has_strict_compare else (v.get("strict_compare_exact_fees") or [])),
                     "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
                     "strict_compare_exact2_reason": exact2_reason,
+                    "pool_tvl_now_usd": pool_tvl_now_usd,
                 }
             )
             if status == "ok":
@@ -32660,6 +32661,22 @@ HTML_PAGE = """
         if (localMax > maxTs) maxTs = localMax;
         const c = colorMap[poolId] || palette[i % palette.length];
         const d = dashMap[poolId] || (i < palette.length ? "solid" : dashes[(i - palette.length) % dashes.length]);
+        const sanitizeExactTvlK = (exactPts, estimatedPts, poolNowUsd) => {
+          const estByTs = new Map((Array.isArray(estimatedPts) ? estimatedPts : []).map((p) => [Number(p?.[0] || 0), Number(p?.[1] || 0)]));
+          const nowK = Math.max(0, Number(poolNowUsd || 0) / 1000.0);
+          return (Array.isArray(exactPts) ? exactPts : []).map((p) => {
+            const ts = Number(p?.[0] || 0);
+            const vUsd = Number(p?.[1] || 0);
+            if (!(vUsd > 0)) return null;
+            const vK = vUsd / 1000.0;
+            const estUsd = Number(estByTs.get(ts) || 0);
+            const estK = estUsd > 0 ? (estUsd / 1000.0) : 0.0;
+            // Guard chart scale from clearly broken strict outliers.
+            const upper = Math.max(0.0, (estK > 0 ? estK * 4.0 : 0.0), (nowK > 0 ? nowK * 4.0 : 0.0));
+            if (upper > 0 && vK > upper) return null;
+            return vK;
+          });
+        };
         if (useStrictCompare) {
           const estFeesSrc = estFees.length ? estFees : (Array.isArray(s.fees) ? s.fees : []);
           const estTvlSrc = estTvl.length ? estTvl : (Array.isArray(s.tvl) ? s.tvl : []);
@@ -32673,10 +32690,7 @@ HTML_PAGE = """
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
           const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
-          const exTvlYExact = exTvl.map(p => {
-            const v = Number(p?.[1] || 0);
-            return v > 0 ? (v / 1000.0) : null;
-          });
+          const exTvlYExact = sanitizeExactTvlK(exTvl, estTvlSrc, Number(s.pool_tvl_now_usd || 0));
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           if (estFeeX.length) {
