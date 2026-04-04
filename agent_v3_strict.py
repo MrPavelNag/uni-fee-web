@@ -240,6 +240,7 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> d
         "strict_compare_estimated_fees": [],
         "strict_compare_exact_tvl": [],
         "strict_compare_exact_fees": [],
+        "strict_compare_exact_fill_mask": [],
     }
 
 
@@ -295,23 +296,27 @@ def _rebuild_fees_cumulative(fees_usd: list[tuple[int, float]], tvl_series: list
 def _blend_exact_with_estimated(
     exact_series: list[tuple[int, float]],
     estimated_series: list[tuple[int, float]],
-) -> tuple[list[tuple[int, float]], int]:
+) -> tuple[list[tuple[int, float]], int, list[bool]]:
     out: list[tuple[int, float]] = []
     filled = 0
+    fill_mask: list[bool] = []
     n = min(len(exact_series or []), len(estimated_series or []))
     for i in range(n):
         ts = int(exact_series[i][0])
         ex_v = float(exact_series[i][1] or 0.0)
         if ex_v > 0:
             out.append((ts, ex_v))
+            fill_mask.append(False)
             continue
         est_v = float(estimated_series[i][1] or 0.0)
         if est_v > 0:
             out.append((ts, est_v))
             filled += 1
+            fill_mask.append(True)
         else:
             out.append((ts, 0.0))
-    return out, filled
+            fill_mask.append(False)
+    return out, filled, fill_mask
 
 
 def _normalize_exact_series_to_fees(
@@ -347,6 +352,30 @@ def _series_scale_ratio(
         if ex_v > 0.0 and est_v > 0.0:
             ratios.append(float(ex_v / est_v))
     return _median(ratios)
+
+
+def _series_clone_ratio(
+    exact_series: list[tuple[int, float]],
+    estimated_series: list[tuple[int, float]],
+    *,
+    abs_eps: float = 0.01,
+) -> float:
+    n = min(len(exact_series or []), len(estimated_series or []))
+    if n <= 0:
+        return 0.0
+    same = 0
+    used = 0
+    for i in range(n):
+        ex_v = float(exact_series[i][1] or 0.0)
+        est_v = float(estimated_series[i][1] or 0.0)
+        if ex_v <= 0.0 or est_v <= 0.0:
+            continue
+        used += 1
+        if abs(ex_v - est_v) <= float(abs_eps):
+            same += 1
+    if used <= 0:
+        return 0.0
+    return float(same / used)
 
 
 def _series_tail_median(series: list[tuple[int, float]], tail_n: int = 5) -> float:
@@ -1241,6 +1270,8 @@ def main() -> None:
         partial_min_cov = 0.50
 
     exact_base = _normalize_exact_series_to_fees(fees_usd, list(exact_series or []))
+    exact_raw_base = list(exact_base)
+    exact_filled_base = list(exact_raw_base)
     structural_cov = float(exact_cov)
     one_leg_conflict = bool(str(exact_reason).startswith("exact2_partial:one_leg_quantity_collapse"))
     scale_ratio = _series_scale_ratio(exact_base, estimated_tvl_base)
@@ -1273,29 +1304,46 @@ def main() -> None:
     )
     partial_blended = False
     partial_filled_days = 0
+    fill_mask_base: list[bool] = [False for _ in range(len(exact_base or []))]
     if (
         exact_base
         and len(exact_base) == len(estimated_tvl_base)
         and float(exact_cov) >= float(partial_min_cov)
     ):
-        blended, filled = _blend_exact_with_estimated(exact_base, estimated_tvl_base)
+        blended, filled, mask = _blend_exact_with_estimated(exact_raw_base, estimated_tvl_base)
         if filled > 0:
-            exact_base = blended
+            exact_filled_base = blended
             partial_blended = True
             partial_filled_days = int(filled)
+            fill_mask_base = list(mask)
             _warn_fallback_once(
                 f"exact2_partial_blend:{target_pool}",
                 f"exact2 partial blend applied with estimated series; filled_days={partial_filled_days}",
             )
+    try:
+        max_clone_ratio = max(0.5, min(1.0, float(os.environ.get("STRICT_EXACT_MAX_CLONE_RATIO", "0.90"))))
+    except Exception:
+        max_clone_ratio = 0.90
+    clone_ratio = _series_clone_ratio(exact_raw_base, estimated_tvl_base, abs_eps=0.01)
+    clone_conflict = bool(
+        float(clone_ratio) >= float(max_clone_ratio)
+        and float(exact_cov) >= float(partial_min_cov)
+    )
+    if clone_conflict:
+        _warn_fallback_once(
+            f"exact_clone_conflict:{target_pool}",
+            f"exact series clones estimated to cents; clone_ratio={clone_ratio:.2f}",
+        )
 
     strict_exact_ok = bool(
         exact_base
         and len(exact_base) == len(fees_usd)
-        and all(float(v) > 0.0 for _ts, v in exact_base)
+        and all(float(v) > 0.0 for _ts, v in exact_filled_base)
         and not one_leg_conflict
         and not scale_conflict
         and not anchor_conflict
         and not level_conflict
+        and not clone_conflict
     )
     if strict_exact_ok:
         data_quality = ("exact_partial" if partial_blended else "exact")
@@ -1304,12 +1352,14 @@ def main() -> None:
             if partial_blended
             else "exact:ok"
         )
-        final_tvl_base = list(exact_base)
+        final_tvl_base = list(exact_filled_base)
         final_fees_base = _rebuild_fees_cumulative(fees_usd, final_tvl_base)
         final_tvl = _append_now_tvl_anchor(final_tvl_base, float(pool_tvl_now_usd))
         final_fees = _append_now_fee_anchor(final_fees_base)
         strict_exact_tvl = list(final_tvl)
         strict_exact_fees = list(final_fees)
+        strict_exact_fill_mask = [(int(ts), int(1 if (i < len(fill_mask_base) and bool(fill_mask_base[i])) else 0)) for i, (ts, _v) in enumerate(final_tvl_base)]
+        strict_exact_fill_mask = _append_now_fee_anchor(strict_exact_fill_mask)
     else:
         data_quality = "strict_unavailable"
         if scale_conflict:
@@ -1329,6 +1379,11 @@ def main() -> None:
                 f"strict_required:exact:source_conflict_level_shift:whole_ratio={whole_ratio:.2f}:"
                 f"whole_med={whole_med:.2f}:cov={exact_cov:.2f}:scov={structural_cov:.2f}"
             )
+        elif clone_conflict:
+            data_quality_reason = (
+                f"strict_required:exact:source_conflict_clone:clone_ratio={clone_ratio:.2f}:"
+                f"cov={exact_cov:.2f}:scov={structural_cov:.2f}:filled={partial_filled_days}"
+            )
         else:
             data_quality_reason = f"strict_required:exact:{exact_reason}:{exact_cov:.2f}"
         _warn_fallback_once(
@@ -1337,16 +1392,19 @@ def main() -> None:
         )
         final_tvl = []
         final_fees = []
-        if exact_base:
-            strict_exact_tvl_base = list(exact_base)
+        if exact_filled_base:
+            strict_exact_tvl_base = list(exact_filled_base)
             strict_exact_fees_base = _rebuild_fees_cumulative(fees_usd, strict_exact_tvl_base)
             strict_exact_tvl = _append_now_tvl_anchor(strict_exact_tvl_base, float(pool_tvl_now_usd))
             strict_exact_fees = _append_now_fee_anchor(strict_exact_fees_base)
+            strict_exact_fill_mask = [(int(ts), int(1 if (i < len(fill_mask_base) and bool(fill_mask_base[i])) else 0)) for i, (ts, _v) in enumerate(strict_exact_tvl_base)]
+            strict_exact_fill_mask = _append_now_fee_anchor(strict_exact_fill_mask)
         else:
             # Even when strict reconstruction fails, today's exact TVL point is known
             # from external reserves*prices and must not be displayed as zero.
             strict_exact_tvl = _append_now_tvl_anchor([], float(pool_tvl_now_usd))
             strict_exact_fees = _append_now_fee_anchor([])
+            strict_exact_fill_mask = _append_now_fee_anchor([])
 
     payload = {
         "fees": final_fees,
@@ -1367,6 +1425,7 @@ def main() -> None:
         "strict_compare_estimated_fees": estimated_fees,
         "strict_compare_exact_tvl": strict_exact_tvl,
         "strict_compare_exact_fees": strict_exact_fees,
+        "strict_compare_exact_fill_mask": strict_exact_fill_mask,
     }
 
     save_chart_data_json({str(pool.get("id") or ""): payload}, out_path)

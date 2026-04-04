@@ -18000,6 +18000,7 @@ def _merge_for_web(
             est_tvl = v.get("strict_compare_estimated_tvl") or []
             ex_fees = v.get("strict_compare_exact_fees") or []
             ex_tvl = v.get("strict_compare_exact_tvl") or []
+            ex_fill_mask = v.get("strict_compare_exact_fill_mask") or []
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
 
             tvl_end_ts = max(
@@ -18043,6 +18044,15 @@ def _merge_for_web(
             exact_last_tvl = float(ex_tvl[-1][1]) if ex_tvl else 0.0
             exact_full = bool(ex_tvl) and all(float(p[1]) > 0.0 for p in ex_tvl)
             exact_ok = bool(exact_full and not str(exact2_reason).startswith("strict_required:"))
+            exact_dq = str(v.get("data_quality") or "").strip().lower()
+            if not exact_ok:
+                exact_quality = "strict_unavailable"
+            elif exact_dq in {"exact_partial", "exact"}:
+                exact_quality = exact_dq
+            elif "partial_blend" in str(exact2_reason):
+                exact_quality = "exact_partial"
+            else:
+                exact_quality = "exact"
             rows.append(
                 {
                     "pool_id": base_pool_id,
@@ -18053,7 +18063,7 @@ def _merge_for_web(
                     "final_income": exact_income,
                     "apy_pct": float(exact_apy),
                     "last_tvl": exact_last_tvl,
-                    "data_quality": ("exact" if exact_ok else "strict_unavailable"),
+                    "data_quality": exact_quality,
                     "data_quality_reason": exact2_reason,
                     "status": status,
                 }
@@ -18089,6 +18099,7 @@ def _merge_for_web(
                     "strict_compare_estimated_tvl": (est_tvl if has_strict_compare else (v.get("strict_compare_estimated_tvl") or [])),
                     "strict_compare_exact_fees": (ex_fees if has_strict_compare else (v.get("strict_compare_exact_fees") or [])),
                     "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
+                    "strict_compare_exact_fill_mask": (ex_fill_mask if has_strict_compare else (v.get("strict_compare_exact_fill_mask") or [])),
                     "strict_compare_exact2_reason": exact2_reason,
                 }
             )
@@ -21582,6 +21593,7 @@ def _render_positions_page() -> str:
         return `Exact + estimate fill${parts.length ? ` (${parts.join(", ")})` : ""}`;
       }
       if (raw.includes("source_conflict_scale")) return "Exact rejected: scale conflict vs estimated";
+      if (raw.includes("source_conflict_clone")) return "Exact rejected: duplicates estimated values";
       if (raw.includes("source_conflict_anchor_jump")) return "Exact rejected: sharp jump near current TVL";
       if (raw.includes("source_conflict_level_shift")) return "Exact rejected: level shift vs current TVL";
       if (raw.includes("one_leg_quantity_collapse")) return "Partial exact: one token balance missing";
@@ -32559,6 +32571,7 @@ HTML_PAGE = """
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
         const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
         const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
+        const exFillMask = Array.isArray(s.strict_compare_exact_fill_mask) ? s.strict_compare_exact_fill_mask : [];
         const useStrictCompare = strictMode && (estFees.length || estTvl.length || exFees.length || exTvl.length);
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
@@ -32578,13 +32591,21 @@ HTML_PAGE = """
           const estFeeX = estFeesSrc.map(p => new Date(p[0] * 1000));
           const estFeeY = estFeesSrc.map(p => p[1]);
           const exFeeX = exFees.map(p => new Date(p[0] * 1000));
-          const exFeeY = exFees.map(p => p[1]);
+          const fillByTs = new Map(
+            exFillMask
+              .filter(p => Array.isArray(p) && p.length >= 2)
+              .map(p => [Number(p[0] || 0), Number(p[1] || 0) > 0])
+          );
+          const exFeeYExact = exFees.map(p => (fillByTs.get(Number(p?.[0] || 0)) ? null : p[1]));
+          const exFeeYFill = exFees.map(p => (fillByTs.get(Number(p?.[0] || 0)) ? p[1] : null));
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
           const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
-          const exTvlY = exTvl.map(p => p[1] / 1000.0);
+          const exTvlYExact = exTvl.map(p => (fillByTs.get(Number(p?.[0] || 0)) ? null : (p[1] / 1000.0)));
+          const exTvlYFill = exTvl.map(p => (fillByTs.get(Number(p?.[0] || 0)) ? (p[1] / 1000.0) : null));
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
+          const exHoverFill = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact fill"]);
           if (estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHover,
@@ -32594,13 +32615,21 @@ HTML_PAGE = """
           }
           if (exFeeX.length) {
             feeTraces.push({
-              x: exFeeX, y: exFeeY, mode: "lines", name: `${s.label} (exact)`, customdata: exHover,
+              x: exFeeX, y: exFeeYExact, mode: "lines", name: `${s.label} (exact)`, customdata: exHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
               line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
             });
+            if (exFeeYFill.some(v => v != null)) {
+              feeTraces.push({
+                x: exFeeX, y: exFeeYFill, mode: "lines", name: `${s.label} (exact fill)`, customdata: exHoverFill,
+                hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
+                line: {color: "rgba(29,78,216,0.55)", width: 2.4, dash: "dot"}
+              });
+            }
           }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
+          const exHoverTvlFill = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact fill"]);
           if (estTvlX.length) {
             tvlTraces.push({
               x: estTvlX, y: estTvlY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHoverTvl,
@@ -32610,10 +32639,17 @@ HTML_PAGE = """
           }
           if (exTvlX.length) {
             tvlTraces.push({
-              x: exTvlX, y: exTvlY, mode: "lines", name: `${s.label} (exact)`, customdata: exHoverTvl,
+              x: exTvlX, y: exTvlYExact, mode: "lines", name: `${s.label} (exact)`, customdata: exHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
             });
+            if (exTvlYFill.some(v => v != null)) {
+              tvlTraces.push({
+                x: exTvlX, y: exTvlYFill, mode: "lines", name: `${s.label} (exact fill)`, customdata: exHoverTvlFill,
+                hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
+                line: {color: "rgba(29,78,216,0.55)", width: 2.4, dash: "dot"}
+              });
+            }
           }
         } else {
           const feeX = (s.fees || []).map(p => new Date(p[0] * 1000));
