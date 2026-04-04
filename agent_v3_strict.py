@@ -53,6 +53,15 @@ def _warn_fallback_once(key: str, message: str) -> None:
     print(f"[WARN][strict] {message}")
 
 
+def _strict_debug_enabled() -> bool:
+    return str(os.environ.get("STRICT_DEBUG_TIMING", "1")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _strict_debug(msg: str) -> None:
+    if _strict_debug_enabled():
+        print(f"[strict][timing] {msg}")
+
+
 def _is_eth_address(v: str) -> bool:
     s = str(v or "").strip().lower()
     return s.startswith("0x") and len(s) == 42
@@ -489,10 +498,13 @@ def _alchemy_fetch_transfer_deltas(
         max_pages = 120
 
     by_block: dict[int, int] = {}
+    t0 = time.monotonic()
     for direction, sign in (("from", -1), ("to", 1)):
         page_key = ""
         pages_used = 0
+        items_used = 0
         seen_keys: set[str] = set()
+        dir_t0 = time.monotonic()
         while True:
             if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
                 raise TimeoutError("exact2_budget_timeout:alchemy_transfers")
@@ -531,6 +543,7 @@ def _alchemy_fetch_transfer_deltas(
             res = data.get("result") or {}
             items = res.get("transfers") or []
             if isinstance(items, list):
+                items_used += int(len(items))
                 for tr in items:
                     if not isinstance(tr, dict):
                         continue
@@ -544,8 +557,18 @@ def _alchemy_fetch_transfer_deltas(
                     by_block[bn] = int(by_block.get(bn, 0)) + int(sign * val)
             page_key = str(res.get("pageKey") or "").strip()
             pages_used += 1
+            if _strict_debug_enabled() and pages_used % 25 == 0:
+                _strict_debug(
+                    f"alchemy dir={direction} token={str(token)[:10]}.. pages={pages_used} items={items_used} "
+                    f"elapsed={time.monotonic() - dir_t0:.1f}s"
+                )
             if not page_key:
                 break
+        _strict_debug(
+            f"alchemy dir={direction} token={str(token)[:10]}.. done pages={pages_used} items={items_used} "
+            f"elapsed={time.monotonic() - dir_t0:.1f}s"
+        )
+    _strict_debug(f"alchemy token={str(token)[:10]}.. total elapsed={time.monotonic() - t0:.1f}s blocks={len(by_block)}")
     return by_block
 
 
@@ -924,6 +947,7 @@ def _build_exact2_tvl_series_v3_ledger(
     day_end_ts: int,
     budget_sec: float,
 ) -> tuple[list[tuple[int, float]], str, float]:
+    run_t0 = time.monotonic()
     pool_id = str(pool.get("id") or "").strip().lower()
     day_keys = [int((int(ts) // 86400) * 86400) for ts, _ in (fees_usd or []) if int(ts) > 0]
     use_cache = str(os.environ.get("STRICT_EXACT2_USE_CACHE", "0")).strip().lower() in {"1", "true", "yes", "on"}
@@ -977,6 +1001,7 @@ def _build_exact2_tvl_series_v3_ledger(
 
     day_blocks: dict[int, int] = {}
     block_missing = 0
+    t_blocks = time.monotonic()
     for ts, _ in fees_usd:
         if time.monotonic() >= deadline_balance:
             return [], "exact2_budget_timeout:block_resolution", 0.0
@@ -988,12 +1013,16 @@ def _build_exact2_tvl_series_v3_ledger(
         except Exception:
             block_missing += 1
             day_blocks[day_ts] = 0
+    _strict_debug(
+        f"block_resolution done days={len(day_blocks)} missing={block_missing} elapsed={time.monotonic() - t_blocks:.1f}s"
+    )
 
     valid_blocks = [int(b) for b in day_blocks.values() if int(b) > 0]
     if not valid_blocks:
         return [], "exact2_no_day_blocks", 0.0
     from_block = int(min(valid_blocks))
     to_block = int(latest_block)
+    t_transfers = time.monotonic()
     try:
         deltas0, covered0_from, timeout0 = _collect_pool_transfer_deltas(
             chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=deadline_balance
@@ -1003,6 +1032,10 @@ def _build_exact2_tvl_series_v3_ledger(
         )
     except Exception as e:
         return [], f"exact2_alchemy_transfers_failed:{e}", 0.0
+    _strict_debug(
+        f"transfer_collection done blocks0={len(deltas0)} blocks1={len(deltas1)} "
+        f"elapsed={time.monotonic() - t_transfers:.1f}s"
+    )
 
     boundaries = sorted(set(valid_blocks), reverse=True)
     bal0_latest = int(_balance_of_raw(chain_id, token0, pool_id, latest_block, timeout_sec=6.0))
@@ -1024,12 +1057,17 @@ def _build_exact2_tvl_series_v3_ledger(
     one_leg_days_1 = 0
     ratio01 = float(pool.get("token0Price") or 0.0) if pool.get("token0Price") is not None else 0.0
     deadline_pricing = time.monotonic() + pricing_budget
+    t_pricing = time.monotonic()
     for idx, (ts, _fees) in enumerate(fees_usd):
         if time.monotonic() >= deadline_pricing:
             tvl_series.append((int(ts), 0.0))
             for j in range(idx + 1, len(fees_usd)):
                 tvl_series.append((int(fees_usd[j][0]), 0.0))
             processed_cov = float(sum(1 for _ts, v in tvl_series if float(v) > 0.0) / max(1, len(fees_usd)))
+            _strict_debug(
+                f"pricing timeout processed={idx+1}/{len(fees_usd)} elapsed={time.monotonic() - t_pricing:.1f}s "
+                f"total_elapsed={time.monotonic() - run_t0:.1f}s"
+            )
             return tvl_series, f"exact2_budget_timeout:pricing:mode={balance_mode}", processed_cov
         day_ts = int((int(ts) // 86400) * 86400)
         b = int(day_blocks.get(day_ts, 0))
@@ -1064,6 +1102,10 @@ def _build_exact2_tvl_series_v3_ledger(
         if tvl > 0:
             non_zero += 1
         tvl_series.append((int(ts), float(tvl)))
+    _strict_debug(
+        f"pricing done processed={len(fees_usd)}/{len(fees_usd)} non_zero={non_zero} "
+        f"elapsed={time.monotonic() - t_pricing:.1f}s total_elapsed={time.monotonic() - run_t0:.1f}s"
+    )
 
     if tvl_series and cached_by_day:
         rpc_by_day = {
