@@ -1,8 +1,8 @@
 {
-  "strict_target": {
+  "0x5969efdde3cf5c0d9a88ae51e47d721096a97203": {
     "fees": [],
     "tvl": [],
-    "pool_id": "",
+    "pool_id": "0x5969efdde3cf5c0d9a88ae51e47d721096a97203",
     "fee_pct": 0.0,
     "raw_fee_tier": 0,
     "pool_tvl_now_usd": 0.0,
@@ -13,7 +13,7 @@
     "chain": "",
     "version": "v3",
     "data_quality": "strict_unavailable",
-    "data_quality_reason": "strict_required:missing_target_pool_id",
+    "data_quality_reason": "strict_required:pool_not_found_on_selected_chains",
     "strict_compare_estimated_tvl": [],
     "strict_compare_estimated_fees": [],
     "strict_compare_exact_tvl": [],

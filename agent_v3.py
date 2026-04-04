@@ -328,6 +328,12 @@ def _rpc_json(chain_id: int, method: str, params: list, timeout_sec: float = 8.0
     raise RuntimeError(str(last or "rpc failed"))
 
 
+def _rpc_primary_url(chain_id: int) -> str:
+    cid = int(chain_id)
+    with _EXACT_CACHE_LOCK:
+        return str(_RPC_PRIMARY_URL.get(cid) or "").strip()
+
+
 def _rpc_eth_call_hex(chain_id: int, to: str, data_hex: str, block_hex: str, timeout_sec: float = 8.0) -> str:
     d = _rpc_json(
         int(chain_id),

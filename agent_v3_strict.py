@@ -29,6 +29,7 @@ from agent_v3 import (
     _historical_price_usd,
     _llama_block_for_day,
     _pool_balances_near_block,
+    _rpc_primary_url,
     _rpc_json,
     _rpc_urls,
 )
@@ -980,6 +981,7 @@ def _build_exact2_tvl_series_v3_ledger(
     if chain_id <= 0:
         return [], "exact2_unsupported_chain", 0.0
     rpc_source = "alchemy" if any("g.alchemy.com" in str(u or "").lower() for u in _rpc_urls(int(chain_id))) else "public"
+    rpc_host = ""
     token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
     token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
     token0_symbol = str(((pool.get("token0") or {}).get("symbol") or "")).strip()
@@ -989,6 +991,9 @@ def _build_exact2_tvl_series_v3_ledger(
 
     try:
         latest_block = _latest_block_number(chain_id)
+        rpc_host = str(_rpc_primary_url(chain_id) or "").strip().lower()
+        if rpc_host:
+            rpc_source = ("alchemy" if "g.alchemy.com" in rpc_host else "public")
         dec0 = int(_token_decimals_from_pool(pool, "token0") or _erc20_decimals(chain_id, token0))
         dec1 = int(_token_decimals_from_pool(pool, "token1") or _erc20_decimals(chain_id, token1))
         h0 = _symbol_decimals_hint(token0_symbol)
@@ -1167,7 +1172,7 @@ def _build_exact2_tvl_series_v3_ledger(
     return (
         tvl_series,
         f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:"
-        f"rpc={rpc_source}:dec0={dec0}:dec1={dec1}",
+        f"rpc={rpc_source}:dec0={dec0}:dec1={dec1}:rpc_host={rpc_host}",
         cov,
     )
 

@@ -18369,6 +18369,11 @@ def _build_run_job_env(
         if not str(env.get(key, "") or "").strip():
             env[key] = str(rpc_url)
 
+    strict_mode = (run_mode == "strict_exact")
+    strict_allow_public_fallback = str(env.get("STRICT_RPC_ALLOW_PUBLIC_FALLBACK", "0") or "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
     def _prepend_rpc(chain_key: str, chain_id: int) -> None:
         ck = str(chain_key or "").strip().lower()
         cu = ck.upper()
@@ -18383,6 +18388,9 @@ def _build_run_job_env(
         if not chain_rpc:
             return
         key = f"V3_RPC_URLS_{cid}"
+        if strict_mode and ("g.alchemy.com" in str(chain_rpc).lower()) and not strict_allow_public_fallback:
+            env[key] = str(chain_rpc)
+            return
         existing = [x.strip() for x in str(env.get(key, "") or "").split(",") if x.strip()]
         merged: list[str] = []
         seen: set[str] = set()
