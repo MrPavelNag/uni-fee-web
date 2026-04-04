@@ -18328,6 +18328,72 @@ def _build_run_job_env(
     run_v4: bool,
 ) -> dict[str, str]:
     env = os.environ.copy()
+    # Per-chain RPC routing (no shared/global RPC across chains).
+    # Priority for each chain:
+    # 1) chain-specific env (ALCHEMY_RPC_URL_<CHAIN>/RPC_URL_<CHAIN>/WEB3_RPC_URL_<CHAIN>)
+    # 2) chain-id specific env (ALCHEMY_RPC_URL_<ID>/RPC_URL_<ID>)
+    # 3) existing V3_RPC_URLS_<ID> list (kept as fallback list)
+    chain_id_by_key = {
+        "ethereum": 1,
+        "optimism": 10,
+        "bsc": 56,
+        "unichain": 130,
+        "polygon": 137,
+        "base": 8453,
+        "arbitrum": 42161,
+        "avalanche": 43114,
+        "celo": 42220,
+    }
+
+    # Keep explicit user-provided Alchemy defaults only per chain.
+    arb_alchemy_url = "https://arb-mainnet.g.alchemy.com/v2/Ik0heQiNfzyztV2MGhKEe"
+    polygon_alchemy_url = "https://polygon-mainnet.g.alchemy.com/v2/Ik0heQiNfzyztV2MGhKEe"
+    # Public per-chain defaults (used only when env for that chain is not set).
+    public_rpc_defaults = {
+        "ETHEREUM": "https://ethereum-rpc.publicnode.com",
+        "OPTIMISM": "https://optimism-rpc.publicnode.com",
+        "BSC": "https://bsc-dataseed.binance.org",
+        "UNICHAIN": "https://mainnet.unichain.org",
+        "POLYGON": "https://polygon-bor-rpc.publicnode.com",
+        "BASE": "https://base-rpc.publicnode.com",
+        "ARBITRUM": "https://arbitrum-one-rpc.publicnode.com",
+        "AVALANCHE": "https://api.avax.network/ext/bc/C/rpc",
+        "CELO": "https://forno.celo.org",
+    }
+    if not str(env.get("ALCHEMY_RPC_URL_ARBITRUM", "") or "").strip():
+        env["ALCHEMY_RPC_URL_ARBITRUM"] = arb_alchemy_url
+    if not str(env.get("ALCHEMY_RPC_URL_POLYGON", "") or "").strip():
+        env["ALCHEMY_RPC_URL_POLYGON"] = polygon_alchemy_url
+    for chain_u, rpc_url in public_rpc_defaults.items():
+        key = f"RPC_URL_{chain_u}"
+        if not str(env.get(key, "") or "").strip():
+            env[key] = str(rpc_url)
+
+    def _prepend_rpc(chain_key: str, chain_id: int) -> None:
+        ck = str(chain_key or "").strip().lower()
+        cu = ck.upper()
+        cid = int(chain_id)
+        chain_rpc = (
+            str(env.get(f"ALCHEMY_RPC_URL_{cu}", "") or "").strip()
+            or str(env.get(f"RPC_URL_{cu}", "") or "").strip()
+            or str(env.get(f"WEB3_RPC_URL_{cu}", "") or "").strip()
+            or str(env.get(f"ALCHEMY_RPC_URL_{cid}", "") or "").strip()
+            or str(env.get(f"RPC_URL_{cid}", "") or "").strip()
+        )
+        if not chain_rpc:
+            return
+        key = f"V3_RPC_URLS_{cid}"
+        existing = [x.strip() for x in str(env.get(key, "") or "").split(",") if x.strip()]
+        merged: list[str] = []
+        seen: set[str] = set()
+        for u in [chain_rpc] + existing:
+            if u and u not in seen:
+                merged.append(u)
+                seen.add(u)
+        env[key] = ",".join(merged)
+
+    for _ck, _cid in chain_id_by_key.items():
+        _prepend_rpc(_ck, _cid)
     mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
     mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
     if mode_strict_exact:

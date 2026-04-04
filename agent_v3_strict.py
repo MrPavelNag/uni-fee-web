@@ -30,6 +30,7 @@ from agent_v3 import (
     _llama_block_for_day,
     _pool_balances_near_block,
     _rpc_json,
+    _rpc_urls,
 )
 
 
@@ -956,6 +957,7 @@ def _build_exact2_tvl_series_v3_ledger(
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
         return [], "exact2_unsupported_chain", 0.0
+    rpc_source = "alchemy" if any("g.alchemy.com" in str(u or "").lower() for u in _rpc_urls(int(chain_id))) else "public"
     token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
     token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
     if not (pool_id and token0 and token1):
@@ -1101,37 +1103,37 @@ def _build_exact2_tvl_series_v3_ledger(
         return (
             tvl_series,
             f"exact2_non_positive_days:mode={balance_mode}:block_missing={block_missing}:"
-            f"priced_days={priced_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}",
+            f"priced_days={priced_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}",
             cov,
         )
     if covered_days >= max(3, len(fees_usd) // 2) and one_leg_ratio >= 0.5:
         return (
             tvl_series,
             f"exact2_partial:one_leg_quantity_collapse:mode={balance_mode}:one_leg_ratio={one_leg_ratio:.2f}:"
-            f"leg0={one_leg_days_0}:leg1={one_leg_days_1}:covered_days={covered_days}:qty_cov={qty_cov:.2f}",
+            f"leg0={one_leg_days_0}:leg1={one_leg_days_1}:covered_days={covered_days}:qty_cov={qty_cov:.2f}:rpc={rpc_source}",
             cov,
         )
     if transfer_logs_timed_out:
         return (
             tvl_series,
             f"exact2_partial:transfer_logs_timeout:mode={balance_mode}:covered_days={covered_days}/{len(fees_usd)}:"
-            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}",
+            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}:rpc={rpc_source}",
             cov,
         )
     if block_missing > 0:
         return (
             tvl_series,
             f"exact2_partial:block_missing={block_missing}:mode={balance_mode}:priced_days={priced_days}:"
-            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}",
+            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}",
             cov,
         )
     if priced_days < max(1, len(fees_usd) // 2):
         return (
             tvl_series,
-            f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}",
+            f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}",
             cov,
         )
-    return tvl_series, f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}", cov
+    return tvl_series, f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}", cov
 
 
 def main() -> None:
@@ -1299,11 +1301,6 @@ def main() -> None:
     strict_exact_partial_ok = bool(
         exact_has_signal
         and len(exact_base) == len(fees_usd)
-        and not one_leg_conflict
-        and not scale_conflict
-        and not anchor_conflict
-        and not level_conflict
-        and not clone_conflict
     )
     if strict_exact_ok:
         data_quality = "exact"
@@ -1317,7 +1314,19 @@ def main() -> None:
     elif strict_exact_partial_ok:
         data_quality = "exact_partial"
         missing_days = int(sum(1 for _ts, v in exact_base if float(v or 0.0) <= 0.0))
-        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}:reason={exact_reason}"
+        flags: list[str] = []
+        if one_leg_conflict:
+            flags.append("one_leg")
+        if scale_conflict:
+            flags.append("scale")
+        if anchor_conflict:
+            flags.append("anchor")
+        if level_conflict:
+            flags.append("level")
+        if clone_conflict:
+            flags.append("clone")
+        flg = f":conflicts={','.join(flags)}" if flags else ""
+        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}:reason={exact_reason}{flg}"
         final_tvl = []
         final_fees = []
         strict_exact_tvl_base = list(exact_base)

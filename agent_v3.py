@@ -178,7 +178,49 @@ def _warn_fallback_once(key: str, message: str) -> None:
 
 
 def _alchemy_api_key() -> str:
-    for k in ("ALCHEMY_API_KEY", "ALCHEMY_KEY", "ALCHEMY_TRANSFERS_API_KEY"):
+    for k in (
+        "ALCHEMY_API_KEY",
+        "ALCHEMY_KEY",
+        "ALCHEMY_TRANSFERS_API_KEY",
+        "ALCHEMY_APP_KEY",
+        "ALCHEMY_HTTP_KEY",
+    ):
+        v = str(os.environ.get(k, "") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _chain_name_for_id(chain_id: int) -> str:
+    return {
+        1: "ethereum",
+        10: "optimism",
+        56: "bsc",
+        130: "unichain",
+        137: "polygon",
+        8453: "base",
+        42161: "arbitrum",
+        43114: "avalanche",
+        42220: "celo",
+    }.get(int(chain_id), "")
+
+
+def _env_rpc_url_for_chainid(chain_id: int) -> str:
+    cid = int(chain_id)
+    cname = _chain_name_for_id(cid).upper()
+    keys = [
+        f"ALCHEMY_RPC_URL_{cid}",
+        f"RPC_URL_{cid}",
+    ]
+    if cname:
+        keys.extend(
+            [
+                f"ALCHEMY_RPC_URL_{cname}",
+                f"RPC_URL_{cname}",
+                f"WEB3_RPC_URL_{cname}",
+            ]
+        )
+    for k in keys:
         v = str(os.environ.get(k, "") or "").strip()
         if v:
             return v
@@ -186,6 +228,9 @@ def _alchemy_api_key() -> str:
 
 
 def _alchemy_rpc_url(chain_id: int) -> str:
+    direct = _env_rpc_url_for_chainid(int(chain_id))
+    if direct:
+        return str(direct)
     key = _alchemy_api_key()
     if not key:
         return ""
