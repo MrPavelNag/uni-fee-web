@@ -2,6 +2,8 @@
 Shared logic for Uniswap pool fee agents (v3, v4, merge).
 """
 
+from __future__ import annotations
+
 import json
 import os
 import math

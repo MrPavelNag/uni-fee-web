@@ -1,0 +1,22 @@
+{
+  "strict_target": {
+    "fees": [],
+    "tvl": [],
+    "pool_id": "",
+    "fee_pct": 0.0,
+    "raw_fee_tier": 0,
+    "pool_tvl_now_usd": 0.0,
+    "pool_tvl_subgraph_usd": 0.0,
+    "tvl_multiplier": 1.0,
+    "tvl_price_source": "",
+    "pair": "target_pool",
+    "chain": "",
+    "version": "v3",
+    "data_quality": "strict_unavailable",
+    "data_quality_reason": "strict_required:missing_target_pool_id",
+    "strict_compare_estimated_tvl": [],
+    "strict_compare_estimated_fees": [],
+    "strict_compare_exact_tvl": [],
+    "strict_compare_exact_fees": []
+  }
+}

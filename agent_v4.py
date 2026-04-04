@@ -6,6 +6,8 @@ Uses: The Graph (THE_GRAPH_API_KEY) or V4_OVERRIDE_* for Ormi.
 Output: data/pools_v4_{suffix}.json in agent_merge format.
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import time

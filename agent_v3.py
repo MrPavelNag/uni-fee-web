@@ -8,6 +8,8 @@ Agent 1: Uniswap v3 (base version).
 - Saves chart data to data/pools_v3_{suffix}.json
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import threading

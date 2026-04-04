@@ -8,6 +8,8 @@ Strict single-pool v3 agent.
 - Outputs to data/pools_v3_{suffix}.json (same format as v3 agent).
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -915,7 +917,11 @@ def _build_exact2_tvl_series_v3_ledger(
             # Explicit source choice: do not fallback to RPC reconstruction.
             return gs_series, gs_reason, gs_cov
 
-    deadline_ts = time.monotonic() + max(10.0, float(budget_sec))
+    total_budget = max(10.0, float(budget_sec))
+    # Reserve a dedicated slice for pricing so logs cannot consume all budget.
+    pricing_budget = max(8.0, min(90.0, total_budget * 0.30))
+    logs_budget = max(6.0, total_budget - pricing_budget)
+    deadline_logs = time.monotonic() + logs_budget
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
@@ -937,7 +943,7 @@ def _build_exact2_tvl_series_v3_ledger(
     day_blocks: dict[int, int] = {}
     block_missing = 0
     for ts, _ in fees_usd:
-        if time.monotonic() >= deadline_ts:
+        if time.monotonic() >= deadline_logs:
             return [], "exact2_budget_timeout:block_resolution", 0.0
         day_ts = int((int(ts) // 86400) * 86400)
         if day_ts in day_blocks:
@@ -955,10 +961,10 @@ def _build_exact2_tvl_series_v3_ledger(
     to_block = int(latest_block)
     try:
         deltas0, covered0_from, timeout0 = _collect_pool_transfer_deltas(
-            chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=deadline_ts
+            chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=deadline_logs
         )
         deltas1, covered1_from, timeout1 = _collect_pool_transfer_deltas(
-            chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=deadline_ts
+            chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=deadline_logs
         )
     except Exception as e:
         return [], f"exact2_transfer_logs_failed:{e}", 0.0
@@ -978,8 +984,9 @@ def _build_exact2_tvl_series_v3_ledger(
     one_leg_days_0 = 0
     one_leg_days_1 = 0
     ratio01 = float(pool.get("token0Price") or 0.0) if pool.get("token0Price") is not None else 0.0
+    deadline_pricing = time.monotonic() + pricing_budget
     for ts, _fees in fees_usd:
-        if time.monotonic() >= deadline_ts:
+        if time.monotonic() >= deadline_pricing:
             processed_cov = float(len(tvl_series) / max(1, len(fees_usd)))
             return tvl_series, "exact2_budget_timeout:pricing", processed_cov
         day_ts = int((int(ts) // 86400) * 86400)
