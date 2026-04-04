@@ -240,7 +240,6 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> d
         "strict_compare_estimated_fees": [],
         "strict_compare_exact_tvl": [],
         "strict_compare_exact_fees": [],
-        "strict_compare_exact_fill_mask": [],
     }
 
 
@@ -291,32 +290,6 @@ def _rebuild_fees_cumulative(fees_usd: list[tuple[int, float]], tvl_series: list
             cumul += float(fees_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day))
         out.append((int(ts), float(cumul)))
     return out
-
-
-def _blend_exact_with_estimated(
-    exact_series: list[tuple[int, float]],
-    estimated_series: list[tuple[int, float]],
-) -> tuple[list[tuple[int, float]], int, list[bool]]:
-    out: list[tuple[int, float]] = []
-    filled = 0
-    fill_mask: list[bool] = []
-    n = min(len(exact_series or []), len(estimated_series or []))
-    for i in range(n):
-        ts = int(exact_series[i][0])
-        ex_v = float(exact_series[i][1] or 0.0)
-        if ex_v > 0:
-            out.append((ts, ex_v))
-            fill_mask.append(False)
-            continue
-        est_v = float(estimated_series[i][1] or 0.0)
-        if est_v > 0:
-            out.append((ts, est_v))
-            filled += 1
-            fill_mask.append(True)
-        else:
-            out.append((ts, 0.0))
-            fill_mask.append(False)
-    return out, filled, fill_mask
 
 
 def _normalize_exact_series_to_fees(
@@ -930,52 +903,7 @@ def _build_exact2_tvl_series_v3_ledger(
         )
         return hit_series, "exact2_cache:ok", hit_cov
 
-    src = _strict_exact2_source()
-    if src in {"goldsky", "auto"}:
-        gs_series, gs_reason, gs_cov = _goldsky_fetch_exact2_tvl_series(
-            pool_id=pool_id,
-            fees_usd=fees_usd,
-            day_start_ts=day_start_ts,
-            day_end_ts=day_end_ts,
-            budget_sec=budget_sec,
-        )
-        if gs_series and cached_by_day:
-            gs_by_day = {
-                int((int(ts) // 86400) * 86400): float(v)
-                for ts, v in gs_series
-                if int(ts) > 0
-            }
-            gs_series = [
-                (
-                    int(ts),
-                    float(
-                        gs_by_day.get(
-                            int((int(ts) // 86400) * 86400),
-                            cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0),
-                        )
-                    ),
-                )
-                for ts, _ in fees_usd
-            ]
-            gs_cov = float(sum(1 for _ts, v in gs_series if float(v) > 0.0) / max(1, len(gs_series)))
-            gs_reason = "exact2_goldsky:cache_enriched"
-        if gs_reason == "ok" or gs_reason.startswith("exact2_goldsky:"):
-            _exact2_cache_upsert(chain=str(chain), pool_id=pool_id, series=gs_series)
-            if gs_reason == "ok":
-                return gs_series, "exact2_goldsky:ok", gs_cov
-            if src == "goldsky":
-                _warn_fallback_once(
-                    f"exact2_goldsky_nonperfect:{chain}:{pool_id}",
-                    f"exact2 goldsky returned partial reason={gs_reason}; using goldsky result as requested",
-                )
-                return gs_series, gs_reason, gs_cov
-        if src == "goldsky":
-            # Explicit source choice: do not fallback to RPC reconstruction.
-            return gs_series, gs_reason, gs_cov
-        _warn_fallback_once(
-            f"exact2_goldsky_to_rpc:{chain}:{pool_id}",
-            f"exact2 source fallback: goldsky -> rpc, reason={gs_reason}",
-        )
+    # Strict path is deterministic: only RPC snapshot source.
 
     total_budget = max(10.0, float(budget_sec))
     # Snapshot mode: reserve time for price valuation after balance snapshots.
@@ -1025,6 +953,7 @@ def _build_exact2_tvl_series_v3_ledger(
     priced_days_both = 0
     imputed_days = 0
     covered_days = 0
+    snapshot_fail_days = 0
     one_leg_days_0 = 0
     one_leg_days_1 = 0
     ratio01 = float(pool.get("token0Price") or 0.0) if pool.get("token0Price") is not None else 0.0
@@ -1050,13 +979,14 @@ def _build_exact2_tvl_series_v3_ledger(
                     token1=str(token1),
                     pool_id=str(pool_id),
                     block_num=int(b),
-                    window=int(max(0, int(os.environ.get("STRICT_EXACT2_BALANCE_WINDOW", "2")))),
-                    retries=int(max(1, int(os.environ.get("STRICT_EXACT2_BALANCE_RETRIES", "2")))),
+                    window=int(max(0, int(os.environ.get("STRICT_EXACT2_BALANCE_WINDOW", "8")))),
+                    retries=int(max(1, int(os.environ.get("STRICT_EXACT2_BALANCE_RETRIES", "3")))),
                 )
                 amt0_s = float(int(b0_raw)) / float(10 ** max(0, dec0))
                 amt1_s = float(int(b1_raw)) / float(10 ** max(0, dec1))
                 by_day_balances[day_ts] = (float(max(0.0, amt0_s)), float(max(0.0, amt1_s)))
             except Exception:
+                snapshot_fail_days += 1
                 by_day_balances[day_ts] = (0.0, 0.0)
         amt0, amt1 = by_day_balances.get(day_ts, (0.0, 0.0))
         if amt0 <= 0.0 and amt1 <= 0.0:
@@ -1122,7 +1052,7 @@ def _build_exact2_tvl_series_v3_ledger(
         return (
             tvl_series,
             f"exact2_non_positive_days:mode={balance_mode}:block_missing={block_missing}:"
-            f"priced_days={priced_days}:qty_cov={qty_cov:.2f}",
+            f"priced_days={priced_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}",
             cov,
         )
     if covered_days >= max(3, len(fees_usd) // 2) and one_leg_ratio >= 0.5:
@@ -1143,16 +1073,16 @@ def _build_exact2_tvl_series_v3_ledger(
         return (
             tvl_series,
             f"exact2_partial:block_missing={block_missing}:mode={balance_mode}:priced_days={priced_days}:"
-            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}",
+            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}",
             cov,
         )
     if priced_days < max(1, len(fees_usd) // 2):
         return (
             tvl_series,
-            f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}:qty_cov={qty_cov:.2f}",
+            f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}",
             cov,
         )
-    return tvl_series, f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}", cov
+    return tvl_series, f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}", cov
 
 
 def main() -> None:
@@ -1191,16 +1121,6 @@ def main() -> None:
     print("Probing chains:", ",".join(probe_chains))
 
     found_pool, found_chain, found_endpoint = _probe_pool_on_chains(target_pool, probe_chains)
-    if not found_pool:
-        all_v3_chains = sorted(set(UNISWAP_V3_SUBGRAPHS.keys()))
-        fallback_chains = [c for c in all_v3_chains if c not in set(probe_chains)]
-        if fallback_chains:
-            print(f"Pool not found on selected chains, fallback probing: {','.join(fallback_chains)}")
-            _warn_fallback_once(
-                f"probe_chain_fallback:{target_pool}",
-                f"chain probing fallback triggered for pool={target_pool}; extra_chains={','.join(fallback_chains)}",
-            )
-            found_pool, found_chain, found_endpoint = _probe_pool_on_chains(target_pool, fallback_chains)
 
     if not found_pool:
         print("Pool not found on selected chains")
@@ -1270,8 +1190,6 @@ def main() -> None:
         partial_min_cov = 0.50
 
     exact_base = _normalize_exact_series_to_fees(fees_usd, list(exact_series or []))
-    exact_raw_base = list(exact_base)
-    exact_filled_base = list(exact_raw_base)
     structural_cov = float(exact_cov)
     one_leg_conflict = bool(str(exact_reason).startswith("exact2_partial:one_leg_quantity_collapse"))
     scale_ratio = _series_scale_ratio(exact_base, estimated_tvl_base)
@@ -1302,29 +1220,12 @@ def main() -> None:
         and float(exact_cov) >= float(partial_min_cov)
         and (float(whole_ratio) > float(max_anchor_drift) or float(whole_ratio) < (1.0 / float(max_anchor_drift)))
     )
-    partial_blended = False
     partial_filled_days = 0
-    fill_mask_base: list[bool] = [False for _ in range(len(exact_base or []))]
-    if (
-        exact_base
-        and len(exact_base) == len(estimated_tvl_base)
-        and float(exact_cov) >= float(partial_min_cov)
-    ):
-        blended, filled, mask = _blend_exact_with_estimated(exact_raw_base, estimated_tvl_base)
-        if filled > 0:
-            exact_filled_base = blended
-            partial_blended = True
-            partial_filled_days = int(filled)
-            fill_mask_base = list(mask)
-            _warn_fallback_once(
-                f"exact2_partial_blend:{target_pool}",
-                f"exact2 partial blend applied with estimated series; filled_days={partial_filled_days}",
-            )
     try:
         max_clone_ratio = max(0.5, min(1.0, float(os.environ.get("STRICT_EXACT_MAX_CLONE_RATIO", "0.90"))))
     except Exception:
         max_clone_ratio = 0.90
-    clone_ratio = _series_clone_ratio(exact_raw_base, estimated_tvl_base, abs_eps=0.01)
+    clone_ratio = _series_clone_ratio(exact_base, estimated_tvl_base, abs_eps=0.01)
     clone_conflict = bool(
         float(clone_ratio) >= float(max_clone_ratio)
         and float(exact_cov) >= float(partial_min_cov)
@@ -1335,10 +1236,21 @@ def main() -> None:
             f"exact series clones estimated to cents; clone_ratio={clone_ratio:.2f}",
         )
 
+    exact_has_signal = bool(exact_base and any(float(v) > 0.0 for _ts, v in exact_base))
     strict_exact_ok = bool(
         exact_base
         and len(exact_base) == len(fees_usd)
-        and all(float(v) > 0.0 for _ts, v in exact_filled_base)
+        and all(float(v) > 0.0 for _ts, v in exact_base)
+        and not one_leg_conflict
+        and not scale_conflict
+        and not anchor_conflict
+        and not level_conflict
+        and not clone_conflict
+    )
+    strict_exact_partial_ok = bool(
+        exact_has_signal
+        and len(exact_base) == len(fees_usd)
+        and float(exact_cov) >= float(partial_min_cov)
         and not one_leg_conflict
         and not scale_conflict
         and not anchor_conflict
@@ -1346,20 +1258,24 @@ def main() -> None:
         and not clone_conflict
     )
     if strict_exact_ok:
-        data_quality = ("exact_partial" if partial_blended else "exact")
-        data_quality_reason = (
-            f"exact:partial_blend:cov={exact_cov:.2f}:scov={structural_cov:.2f}:filled={partial_filled_days}"
-            if partial_blended
-            else "exact:ok"
-        )
-        final_tvl_base = list(exact_filled_base)
+        data_quality = "exact"
+        data_quality_reason = "exact:ok"
+        final_tvl_base = list(exact_base)
         final_fees_base = _rebuild_fees_cumulative(fees_usd, final_tvl_base)
         final_tvl = _append_now_tvl_anchor(final_tvl_base, float(pool_tvl_now_usd))
         final_fees = _append_now_fee_anchor(final_fees_base)
         strict_exact_tvl = list(final_tvl)
         strict_exact_fees = list(final_fees)
-        strict_exact_fill_mask = [(int(ts), int(1 if (i < len(fill_mask_base) and bool(fill_mask_base[i])) else 0)) for i, (ts, _v) in enumerate(final_tvl_base)]
-        strict_exact_fill_mask = _append_now_fee_anchor(strict_exact_fill_mask)
+    elif strict_exact_partial_ok:
+        data_quality = "exact_partial"
+        missing_days = int(sum(1 for _ts, v in exact_base if float(v or 0.0) <= 0.0))
+        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}"
+        final_tvl = []
+        final_fees = []
+        strict_exact_tvl_base = list(exact_base)
+        strict_exact_fees_base = _rebuild_fees_cumulative(fees_usd, strict_exact_tvl_base)
+        strict_exact_tvl = _append_now_tvl_anchor(strict_exact_tvl_base, float(pool_tvl_now_usd))
+        strict_exact_fees = _append_now_fee_anchor(strict_exact_fees_base)
     else:
         data_quality = "strict_unavailable"
         if scale_conflict:
@@ -1382,7 +1298,7 @@ def main() -> None:
         elif clone_conflict:
             data_quality_reason = (
                 f"strict_required:exact:source_conflict_clone:clone_ratio={clone_ratio:.2f}:"
-                f"cov={exact_cov:.2f}:scov={structural_cov:.2f}:filled={partial_filled_days}"
+                f"cov={exact_cov:.2f}:scov={structural_cov:.2f}"
             )
         else:
             data_quality_reason = f"strict_required:exact:{exact_reason}:{exact_cov:.2f}"
@@ -1392,19 +1308,16 @@ def main() -> None:
         )
         final_tvl = []
         final_fees = []
-        if exact_filled_base:
-            strict_exact_tvl_base = list(exact_filled_base)
+        if exact_base:
+            strict_exact_tvl_base = list(exact_base)
             strict_exact_fees_base = _rebuild_fees_cumulative(fees_usd, strict_exact_tvl_base)
             strict_exact_tvl = _append_now_tvl_anchor(strict_exact_tvl_base, float(pool_tvl_now_usd))
             strict_exact_fees = _append_now_fee_anchor(strict_exact_fees_base)
-            strict_exact_fill_mask = [(int(ts), int(1 if (i < len(fill_mask_base) and bool(fill_mask_base[i])) else 0)) for i, (ts, _v) in enumerate(strict_exact_tvl_base)]
-            strict_exact_fill_mask = _append_now_fee_anchor(strict_exact_fill_mask)
         else:
             # Even when strict reconstruction fails, today's exact TVL point is known
             # from external reserves*prices and must not be displayed as zero.
             strict_exact_tvl = _append_now_tvl_anchor([], float(pool_tvl_now_usd))
             strict_exact_fees = _append_now_fee_anchor([])
-            strict_exact_fill_mask = _append_now_fee_anchor([])
 
     payload = {
         "fees": final_fees,
@@ -1425,7 +1338,6 @@ def main() -> None:
         "strict_compare_estimated_fees": estimated_fees,
         "strict_compare_exact_tvl": strict_exact_tvl,
         "strict_compare_exact_fees": strict_exact_fees,
-        "strict_compare_exact_fill_mask": strict_exact_fill_mask,
     }
 
     save_chart_data_json({str(pool.get("id") or ""): payload}, out_path)

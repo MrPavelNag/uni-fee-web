@@ -176,23 +176,59 @@ def _warn_fallback_once(key: str, message: str) -> None:
     print(f"[WARN][fallback] {message}")
 
 
+def _alchemy_api_key() -> str:
+    for k in ("ALCHEMY_API_KEY", "ALCHEMY_KEY", "ALCHEMY_TRANSFERS_API_KEY"):
+        v = str(os.environ.get(k, "") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _alchemy_rpc_url(chain_id: int) -> str:
+    key = _alchemy_api_key()
+    if not key:
+        return ""
+    net = {
+        1: "eth-mainnet",
+        10: "opt-mainnet",
+        137: "polygon-mainnet",
+        8453: "base-mainnet",
+        42161: "arb-mainnet",
+    }.get(int(chain_id), "")
+    if not net:
+        return ""
+    return f"https://{net}.g.alchemy.com/v2/{key}"
+
+
 def _rpc_urls(chain_id: int) -> list[str]:
     env_key = f"V3_RPC_URLS_{int(chain_id)}"
     raw = str(os.environ.get(env_key, "") or "").strip()
     defaults = list(DEFAULT_RPC_URLS_BY_CHAIN_ID.get(int(chain_id), []))
+    auto_alchemy = _alchemy_rpc_url(int(chain_id))
     if not raw:
-        return defaults
+        urls = ([auto_alchemy] if auto_alchemy else []) + defaults
+        if auto_alchemy:
+            _warn_fallback_once(
+                f"rpc_auto_alchemy:{int(chain_id)}",
+                f"strict rpc source priority: auto alchemy enabled for chain_id={int(chain_id)}",
+            )
+        return urls
     custom = [x.strip() for x in raw.split(",") if x.strip()]
     # Do not let a single broken custom RPC (e.g. invalid Alchemy key URL) remove
     # resilient public fallbacks; keep custom endpoints first for priority.
     merged: list[str] = []
     seen: set[str] = set()
-    for u in custom + defaults:
+    for u in (([auto_alchemy] if auto_alchemy else []) + custom + defaults):
         k = str(u or "").strip()
         if not k or k in seen:
             continue
         seen.add(k)
         merged.append(k)
+    if auto_alchemy:
+        _warn_fallback_once(
+            f"rpc_auto_alchemy:{int(chain_id)}",
+            f"strict rpc source priority: auto alchemy enabled for chain_id={int(chain_id)}",
+        )
     return merged
 
 
