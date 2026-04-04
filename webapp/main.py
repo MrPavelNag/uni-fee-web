@@ -204,7 +204,7 @@ RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "120")))
 RUN_JOB_RESULT_TTL_SEC = max(60, int(os.environ.get("RUN_JOB_RESULT_TTL_SEC", str(20 * 60))))
 RUN_MAX_CONCURRENT = max(1, min(6, int(os.environ.get("RUN_MAX_CONCURRENT", "1"))))
-RUN_SLOT_WAIT_TIMEOUT_SEC = max(10, int(os.environ.get("RUN_SLOT_WAIT_TIMEOUT_SEC", "180")))
+RUN_SLOT_WAIT_TIMEOUT_SEC = min(600, max(10, int(os.environ.get("RUN_SLOT_WAIT_TIMEOUT_SEC", "180"))))
 RUN_MAX_ACTIVE_PER_SESSION = max(1, min(6, int(os.environ.get("RUN_MAX_ACTIVE_PER_SESSION", "2"))))
 RUN_SLOTS_SEMAPHORE = threading.BoundedSemaphore(RUN_MAX_CONCURRENT)
 RUNTIME_PRUNE_INTERVAL_SEC = max(15, int(os.environ.get("RUNTIME_PRUNE_INTERVAL_SEC", "60")))
@@ -18328,6 +18328,13 @@ def _build_run_job_env(
     run_v4: bool,
 ) -> dict[str, str]:
     env = os.environ.copy()
+    mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
+    mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
+    if mode_strict_exact:
+        mode_fast_legacy = False
+    if (not mode_strict_exact) and (not mode_fast_legacy):
+        mode_fast_legacy = True
+    run_mode = "strict_exact" if mode_strict_exact else "fast_legacy"
     # Per-chain RPC routing (no shared/global RPC across chains).
     # Priority for each chain:
     # 1) chain-specific env (ALCHEMY_RPC_URL_<CHAIN>/RPC_URL_<CHAIN>/WEB3_RPC_URL_<CHAIN>)
@@ -18402,13 +18409,6 @@ def _build_run_job_env(
 
     for _ck, _cid in chain_id_by_key.items():
         _prepend_rpc(_ck, _cid)
-    mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
-    mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
-    if mode_strict_exact:
-        mode_fast_legacy = False
-    if (not mode_strict_exact) and (not mode_fast_legacy):
-        mode_fast_legacy = True
-    run_mode = "strict_exact" if mode_strict_exact else "fast_legacy"
     target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
     exact_days_default = str(max(1, min(int(req.days), 7 if speed_mode == "fast" else 14)))
     # Agents resolve symbols via the same top-N cache as site catalog.
@@ -19109,8 +19109,11 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     continue
                 if str((_j or {}).get("status") or "") == "running":
                     running_jobs += 1
-        if running_jobs > 0:
-            _set_stage("queue", f"Waiting for scan slot ({running_jobs} active run(s))", 8)
+        wait_label = (
+            f"Waiting for scan slot ({running_jobs} active run(s), "
+            f"timeout={int(RUN_SLOT_WAIT_TIMEOUT_SEC)}s)"
+        )
+        _set_stage("queue", wait_label, 8)
         t_lock_wait0 = time.perf_counter()
         slot_acquired = RUN_SLOTS_SEMAPHORE.acquire(timeout=float(RUN_SLOT_WAIT_TIMEOUT_SEC))
         timing_debug["stage_ms"]["run_lock_wait"] = int(round(max(0.0, time.perf_counter() - t_lock_wait0) * 1000.0))
@@ -19149,12 +19152,12 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 _set_stage("strict", "Running strict exact agent (single pool)", 22)
                 base_timeout = int(env.get("AGENT_TIMEOUT_SEC", "480") or 480)
                 try:
-                    exact2_budget = max(20.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "120"))))
+                    exact2_budget = max(15.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "60"))))
                 except Exception:
-                    exact2_budget = 120.0
+                    exact2_budget = 60.0
                 env2 = dict(env)
                 env2["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
-                env2["AGENT_TIMEOUT_SEC"] = str(max(60, min(base_timeout, int(exact2_budget) + 20, 150)))
+                env2["AGENT_TIMEOUT_SEC"] = str(max(45, min(base_timeout, int(exact2_budget) + 15, 90)))
                 logs.append(
                     "[strict] budgets: "
                     f"exact2={int(exact2_budget)}s timeout2={env2['AGENT_TIMEOUT_SEC']}s"

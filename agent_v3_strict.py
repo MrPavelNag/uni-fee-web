@@ -489,11 +489,11 @@ def _alchemy_fetch_transfer_deltas(
     if not url:
         raise RuntimeError("alchemy_not_configured_for_chain")
     try:
-        req_timeout = max(2.0, min(12.0, float(os.environ.get("STRICT_ALCHEMY_REQ_TIMEOUT_SEC", "6.0"))))
+        req_timeout = max(1.5, min(8.0, float(os.environ.get("STRICT_ALCHEMY_REQ_TIMEOUT_SEC", "4.0"))))
     except Exception:
         req_timeout = 6.0
     try:
-        max_pages = max(10, int(os.environ.get("STRICT_ALCHEMY_MAX_PAGES", "120")))
+        max_pages = max(10, int(os.environ.get("STRICT_ALCHEMY_MAX_PAGES", "60")))
     except Exception:
         max_pages = 120
 
@@ -948,6 +948,19 @@ def _build_exact2_tvl_series_v3_ledger(
     budget_sec: float,
 ) -> tuple[list[tuple[int, float]], str, float]:
     run_t0 = time.monotonic()
+    t_blocks_elapsed = 0.0
+    t_transfers_elapsed = 0.0
+    t_pricing_elapsed = 0.0
+
+    def _reason_with_timing(reason: str) -> str:
+        return (
+            f"{str(reason or '').strip()}"
+            f":dbg=t_blocks={t_blocks_elapsed:.1f},"
+            f"t_alchemy={t_transfers_elapsed:.1f},"
+            f"t_pricing={t_pricing_elapsed:.1f},"
+            f"t_total={max(0.0, time.monotonic() - run_t0):.1f}"
+        )
+
     pool_id = str(pool.get("id") or "").strip().lower()
     day_keys = [int((int(ts) // 86400) * 86400) for ts, _ in (fees_usd or []) if int(ts) > 0]
     use_cache = str(os.environ.get("STRICT_EXACT2_USE_CACHE", "0")).strip().lower() in {"1", "true", "yes", "on"}
@@ -957,7 +970,7 @@ def _build_exact2_tvl_series_v3_ledger(
         if day_keys and all(int(d) in cached_by_day for d in day_keys):
             hit_series = [(int(ts), float(cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0))) for ts, _ in fees_usd]
             hit_cov = float(sum(1 for _ts, v in hit_series if float(v) > 0.0) / max(1, len(hit_series)))
-            return hit_series, "exact2_cache:ok", hit_cov
+            return hit_series, _reason_with_timing("exact2_cache:ok"), hit_cov
 
     # Strict path is deterministic: only RPC snapshot source.
 
@@ -973,7 +986,7 @@ def _build_exact2_tvl_series_v3_ledger(
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
-        return [], "exact2_unsupported_chain", 0.0
+        return [], _reason_with_timing("exact2_unsupported_chain"), 0.0
     rpc_source = "alchemy" if any("g.alchemy.com" in str(u or "").lower() for u in _rpc_urls(int(chain_id))) else "public"
     rpc_host = ""
     token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
@@ -997,14 +1010,15 @@ def _build_exact2_tvl_series_v3_ledger(
         if dec1 == 18 and h1 in {6, 8}:
             dec1 = int(h1)
     except Exception as e:
-        return [], f"exact2_latest_point_failed:{e}", 0.0
+        return [], _reason_with_timing(f"exact2_latest_point_failed:{e}"), 0.0
 
     day_blocks: dict[int, int] = {}
     block_missing = 0
     t_blocks = time.monotonic()
     for ts, _ in fees_usd:
         if time.monotonic() >= deadline_balance:
-            return [], "exact2_budget_timeout:block_resolution", 0.0
+            t_blocks_elapsed = max(0.0, time.monotonic() - t_blocks)
+            return [], _reason_with_timing("exact2_budget_timeout:block_resolution"), 0.0
         day_ts = int((int(ts) // 86400) * 86400)
         if day_ts in day_blocks:
             continue
@@ -1013,13 +1027,14 @@ def _build_exact2_tvl_series_v3_ledger(
         except Exception:
             block_missing += 1
             day_blocks[day_ts] = 0
+    t_blocks_elapsed = max(0.0, time.monotonic() - t_blocks)
     _strict_debug(
         f"block_resolution done days={len(day_blocks)} missing={block_missing} elapsed={time.monotonic() - t_blocks:.1f}s"
     )
 
     valid_blocks = [int(b) for b in day_blocks.values() if int(b) > 0]
     if not valid_blocks:
-        return [], "exact2_no_day_blocks", 0.0
+        return [], _reason_with_timing("exact2_no_day_blocks"), 0.0
     from_block = int(min(valid_blocks))
     to_block = int(latest_block)
     t_transfers = time.monotonic()
@@ -1031,7 +1046,9 @@ def _build_exact2_tvl_series_v3_ledger(
             chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=deadline_balance
         )
     except Exception as e:
-        return [], f"exact2_alchemy_transfers_failed:{e}", 0.0
+        t_transfers_elapsed = max(0.0, time.monotonic() - t_transfers)
+        return [], _reason_with_timing(f"exact2_alchemy_transfers_failed:{e}"), 0.0
+    t_transfers_elapsed = max(0.0, time.monotonic() - t_transfers)
     _strict_debug(
         f"transfer_collection done blocks0={len(deltas0)} blocks1={len(deltas1)} "
         f"elapsed={time.monotonic() - t_transfers:.1f}s"
@@ -1064,11 +1081,12 @@ def _build_exact2_tvl_series_v3_ledger(
             for j in range(idx + 1, len(fees_usd)):
                 tvl_series.append((int(fees_usd[j][0]), 0.0))
             processed_cov = float(sum(1 for _ts, v in tvl_series if float(v) > 0.0) / max(1, len(fees_usd)))
+            t_pricing_elapsed = max(0.0, time.monotonic() - t_pricing)
             _strict_debug(
                 f"pricing timeout processed={idx+1}/{len(fees_usd)} elapsed={time.monotonic() - t_pricing:.1f}s "
                 f"total_elapsed={time.monotonic() - run_t0:.1f}s"
             )
-            return tvl_series, f"exact2_budget_timeout:pricing:mode={balance_mode}", processed_cov
+            return tvl_series, _reason_with_timing(f"exact2_budget_timeout:pricing:mode={balance_mode}"), processed_cov
         day_ts = int((int(ts) // 86400) * 86400)
         b = int(day_blocks.get(day_ts, 0))
         if b <= 0 or int(b) < int(covered_from):
@@ -1102,6 +1120,7 @@ def _build_exact2_tvl_series_v3_ledger(
         if tvl > 0:
             non_zero += 1
         tvl_series.append((int(ts), float(tvl)))
+    t_pricing_elapsed = max(0.0, time.monotonic() - t_pricing)
     _strict_debug(
         f"pricing done processed={len(fees_usd)}/{len(fees_usd)} non_zero={non_zero} "
         f"elapsed={time.monotonic() - t_pricing:.1f}s total_elapsed={time.monotonic() - run_t0:.1f}s"
@@ -1136,8 +1155,10 @@ def _build_exact2_tvl_series_v3_ledger(
     if non_zero == 0:
         return (
             tvl_series,
-            f"exact2_non_positive_days:mode={balance_mode}:block_missing={block_missing}:"
-            f"priced_days={priced_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}",
+            _reason_with_timing(
+                f"exact2_non_positive_days:mode={balance_mode}:block_missing={block_missing}:"
+                f"priced_days={priced_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}"
+            ),
             cov,
         )
     try:
@@ -1147,34 +1168,44 @@ def _build_exact2_tvl_series_v3_ledger(
     if covered_days >= max(3, len(fees_usd) // 2) and one_leg_ratio >= float(one_leg_max_ratio):
         return (
             tvl_series,
-            f"exact2_partial:one_leg_quantity_collapse:mode={balance_mode}:one_leg_ratio={one_leg_ratio:.2f}:"
-            f"leg0={one_leg_days_0}:leg1={one_leg_days_1}:covered_days={covered_days}:qty_cov={qty_cov:.2f}:rpc={rpc_source}",
+            _reason_with_timing(
+                f"exact2_partial:one_leg_quantity_collapse:mode={balance_mode}:one_leg_ratio={one_leg_ratio:.2f}:"
+                f"leg0={one_leg_days_0}:leg1={one_leg_days_1}:covered_days={covered_days}:qty_cov={qty_cov:.2f}:rpc={rpc_source}"
+            ),
             cov,
         )
     if transfer_logs_timed_out:
         return (
             tvl_series,
-            f"exact2_partial:transfer_logs_timeout:mode={balance_mode}:covered_days={covered_days}/{len(fees_usd)}:"
-            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}:rpc={rpc_source}",
+            _reason_with_timing(
+                f"exact2_partial:transfer_logs_timeout:mode={balance_mode}:covered_days={covered_days}/{len(fees_usd)}:"
+                f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}:rpc={rpc_source}"
+            ),
             cov,
         )
     if block_missing > 0:
         return (
             tvl_series,
-            f"exact2_partial:block_missing={block_missing}:mode={balance_mode}:priced_days={priced_days}:"
-            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}",
+            _reason_with_timing(
+                f"exact2_partial:block_missing={block_missing}:mode={balance_mode}:priced_days={priced_days}:"
+                f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}"
+            ),
             cov,
         )
     if priced_days < max(1, len(fees_usd) // 2):
         return (
             tvl_series,
-            f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}",
+            _reason_with_timing(
+                f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:rpc={rpc_source}"
+            ),
             cov,
         )
     return (
         tvl_series,
-        f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:"
-        f"rpc={rpc_source}:dec0={dec0}:dec1={dec1}:rpc_host={rpc_host}",
+        _reason_with_timing(
+            f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}:snapshot_fail_days={snapshot_fail_days}:"
+            f"rpc={rpc_source}:dec0={dec0}:dec1={dec1}:rpc_host={rpc_host}"
+        ),
         cov,
     )
 
