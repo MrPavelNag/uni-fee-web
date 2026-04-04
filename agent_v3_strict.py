@@ -24,10 +24,10 @@ from agent_common import build_exact_day_window, pairs_to_filename_suffix, resol
 from uniswap_client import get_graph_endpoint, graphql_query, query_pool_day_data
 from agent_v3 import (
     CHAIN_ID_BY_KEY,
-    _balance_of_raw,
     _erc20_decimals,
     _historical_price_usd,
     _llama_block_for_day,
+    _pool_balances_near_block,
     _rpc_json,
 )
 
@@ -698,6 +698,11 @@ def _strict_exact2_source() -> str:
     return "rpc"
 
 
+def _strict_exact2_balance_mode() -> str:
+    v = str(os.environ.get("STRICT_EXACT2_BALANCE_MODE", "snapshot") or "").strip().lower()
+    return "transfer" if v == "transfer" else "snapshot"
+
+
 def _goldsky_graphql_url() -> str:
     return str(os.environ.get("GOLDSKY_GRAPHQL_URL", "") or "").strip()
 
@@ -918,10 +923,10 @@ def _build_exact2_tvl_series_v3_ledger(
             return gs_series, gs_reason, gs_cov
 
     total_budget = max(10.0, float(budget_sec))
-    # Reserve a dedicated slice for pricing so logs cannot consume all budget.
+    # Snapshot mode: reserve time for price valuation after balance snapshots.
     pricing_budget = max(8.0, min(90.0, total_budget * 0.30))
-    logs_budget = max(6.0, total_budget - pricing_budget)
-    deadline_logs = time.monotonic() + logs_budget
+    balance_budget = max(6.0, total_budget - pricing_budget)
+    deadline_balance = time.monotonic() + balance_budget
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
@@ -932,18 +937,16 @@ def _build_exact2_tvl_series_v3_ledger(
         return [], "exact2_missing_pool_tokens", 0.0
 
     try:
-        latest_block = _latest_block_number(chain_id)
+        _latest_block_number(chain_id)
         dec0 = int(_erc20_decimals(chain_id, token0))
         dec1 = int(_erc20_decimals(chain_id, token1))
-        bal0_latest = int(_balance_of_raw(chain_id, token0, pool_id, latest_block))
-        bal1_latest = int(_balance_of_raw(chain_id, token1, pool_id, latest_block))
     except Exception as e:
         return [], f"exact2_latest_point_failed:{e}", 0.0
 
     day_blocks: dict[int, int] = {}
     block_missing = 0
     for ts, _ in fees_usd:
-        if time.monotonic() >= deadline_logs:
+        if time.monotonic() >= deadline_balance:
             return [], "exact2_budget_timeout:block_resolution", 0.0
         day_ts = int((int(ts) // 86400) * 86400)
         if day_ts in day_blocks:
@@ -957,23 +960,9 @@ def _build_exact2_tvl_series_v3_ledger(
     valid_blocks = [int(b) for b in day_blocks.values() if int(b) > 0]
     if not valid_blocks:
         return [], "exact2_no_day_blocks", 0.0
-    from_block = int(min(valid_blocks))
-    to_block = int(latest_block)
-    try:
-        deltas0, covered0_from, timeout0 = _collect_pool_transfer_deltas(
-            chain_id, ck, token0, pool_id, from_block, to_block, deadline_ts=deadline_logs
-        )
-        deltas1, covered1_from, timeout1 = _collect_pool_transfer_deltas(
-            chain_id, ck, token1, pool_id, from_block, to_block, deadline_ts=deadline_logs
-        )
-    except Exception as e:
-        return [], f"exact2_transfer_logs_failed:{e}", 0.0
-
-    boundaries = sorted(set(valid_blocks), reverse=True)
-    bal0_by_block = _balances_by_boundaries_desc(bal0_latest, deltas0, boundaries)
-    bal1_by_block = _balances_by_boundaries_desc(bal1_latest, deltas1, boundaries)
-    covered_from = int(max(int(from_block), int(covered0_from), int(covered1_from)))
-    transfer_logs_timed_out = bool(timeout0 or timeout1)
+    transfer_logs_timed_out = False
+    balance_mode = _strict_exact2_balance_mode()
+    by_day_balances: dict[int, tuple[float, float]] = {}
 
     tvl_series: list[tuple[int, float]] = []
     non_zero = 0
@@ -988,15 +977,37 @@ def _build_exact2_tvl_series_v3_ledger(
     for ts, _fees in fees_usd:
         if time.monotonic() >= deadline_pricing:
             processed_cov = float(len(tvl_series) / max(1, len(fees_usd)))
-            return tvl_series, "exact2_budget_timeout:pricing", processed_cov
+            return tvl_series, f"exact2_budget_timeout:pricing:mode={balance_mode}", processed_cov
         day_ts = int((int(ts) // 86400) * 86400)
         b = int(day_blocks.get(day_ts, 0))
-        if b <= 0 or int(b) < int(covered_from):
+        if b <= 0:
+            tvl_series.append((int(ts), 0.0))
+            continue
+        if day_ts not in by_day_balances:
+            if time.monotonic() >= deadline_balance:
+                tvl_series.append((int(ts), 0.0))
+                continue
+            try:
+                # Use direct historical balance snapshots by block as primary source of quantities.
+                b0_raw, b1_raw, _used_block = _pool_balances_near_block(
+                    chain_id=int(chain_id),
+                    token0=str(token0),
+                    token1=str(token1),
+                    pool_id=str(pool_id),
+                    block_num=int(b),
+                    window=int(max(0, int(os.environ.get("STRICT_EXACT2_BALANCE_WINDOW", "2")))),
+                    retries=int(max(1, int(os.environ.get("STRICT_EXACT2_BALANCE_RETRIES", "2")))),
+                )
+                amt0_s = float(int(b0_raw)) / float(10 ** max(0, dec0))
+                amt1_s = float(int(b1_raw)) / float(10 ** max(0, dec1))
+                by_day_balances[day_ts] = (float(max(0.0, amt0_s)), float(max(0.0, amt1_s)))
+            except Exception:
+                by_day_balances[day_ts] = (0.0, 0.0)
+        amt0, amt1 = by_day_balances.get(day_ts, (0.0, 0.0))
+        if amt0 <= 0.0 and amt1 <= 0.0:
             tvl_series.append((int(ts), 0.0))
             continue
         covered_days += 1
-        amt0 = float(bal0_by_block.get(b, 0)) / float(10 ** max(0, dec0))
-        amt1 = float(bal1_by_block.get(b, 0)) / float(10 ** max(0, dec1))
         if amt0 <= 0.0 and amt1 > 0.0:
             one_leg_days_0 += 1
         elif amt1 <= 0.0 and amt0 > 0.0:
@@ -1038,37 +1049,41 @@ def _build_exact2_tvl_series_v3_ledger(
             for ts, _ in fees_usd
         ]
         non_zero = sum(1 for _ts, v in tvl_series if float(v) > 0.0)
-    if not transfer_logs_timed_out:
+    if not transfer_logs_timed_out and covered_days > 0:
         _exact2_cache_upsert(chain=str(chain), pool_id=pool_id, series=tvl_series)
-    cov = float(non_zero / max(1, len(fees_usd)))
+    cov = float(covered_days / max(1, len(fees_usd)))
     dominant_one_leg = max(int(one_leg_days_0), int(one_leg_days_1))
     one_leg_ratio = float(dominant_one_leg / max(1, covered_days))
     if non_zero == 0:
-        return tvl_series, f"exact2_non_positive_days:block_missing={block_missing}:priced_days={priced_days}", cov
+        return (
+            tvl_series,
+            f"exact2_non_positive_days:mode={balance_mode}:block_missing={block_missing}:priced_days={priced_days}",
+            cov,
+        )
     if covered_days >= max(3, len(fees_usd) // 2) and one_leg_ratio >= 0.5:
         return (
             tvl_series,
-            f"exact2_partial:one_leg_quantity_collapse:one_leg_ratio={one_leg_ratio:.2f}:"
+            f"exact2_partial:one_leg_quantity_collapse:mode={balance_mode}:one_leg_ratio={one_leg_ratio:.2f}:"
             f"leg0={one_leg_days_0}:leg1={one_leg_days_1}:covered_days={covered_days}",
             cov,
         )
     if transfer_logs_timed_out:
         return (
             tvl_series,
-            f"exact2_partial:transfer_logs_timeout:covered_days={covered_days}/{len(fees_usd)}:"
+            f"exact2_partial:transfer_logs_timeout:mode={balance_mode}:covered_days={covered_days}/{len(fees_usd)}:"
             f"priced_both={priced_days_both}:imputed={imputed_days}",
             cov,
         )
     if block_missing > 0:
         return (
             tvl_series,
-            f"exact2_partial:block_missing={block_missing}:priced_days={priced_days}:"
+            f"exact2_partial:block_missing={block_missing}:mode={balance_mode}:priced_days={priced_days}:"
             f"priced_both={priced_days_both}:imputed={imputed_days}",
             cov,
         )
     if priced_days < max(1, len(fees_usd) // 2):
-        return tvl_series, f"exact2_partial:insufficient_prices={priced_days}", cov
-    return tvl_series, "ok", cov
+        return tvl_series, f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}", cov
+    return tvl_series, f"ok:mode={balance_mode}", cov
 
 
 def main() -> None:
@@ -1182,7 +1197,7 @@ def main() -> None:
         partial_min_cov = 0.65
 
     exact_base = _normalize_exact_series_to_fees(fees_usd, list(exact_series or []))
-    structural_cov = float(len(exact_series or []) / max(1, len(fees_usd)))
+    structural_cov = float(exact_cov)
     one_leg_conflict = bool(str(exact_reason).startswith("exact2_partial:one_leg_quantity_collapse"))
     scale_ratio = _series_scale_ratio(exact_base, estimated_tvl_base)
     try:
@@ -1191,7 +1206,7 @@ def main() -> None:
         max_scale_drift = 1.8
     scale_conflict = bool(
         scale_ratio > 0.0
-        and max(float(exact_cov), float(structural_cov)) >= float(partial_min_cov)
+        and float(exact_cov) >= float(partial_min_cov)
         and (float(scale_ratio) > float(max_scale_drift) or float(scale_ratio) < (1.0 / float(max_scale_drift)))
     )
     try:
@@ -1204,12 +1219,12 @@ def main() -> None:
     whole_ratio = (float(pool_tvl_now_usd) / max(1e-12, float(whole_med))) if whole_med > 0 else 0.0
     anchor_conflict = bool(
         tail_med > 0.0
-        and max(float(exact_cov), float(structural_cov)) >= float(partial_min_cov)
+        and float(exact_cov) >= float(partial_min_cov)
         and (float(anchor_ratio) > float(max_anchor_drift) or float(anchor_ratio) < (1.0 / float(max_anchor_drift)))
     )
     level_conflict = bool(
         whole_med > 0.0
-        and max(float(exact_cov), float(structural_cov)) >= float(partial_min_cov)
+        and float(exact_cov) >= float(partial_min_cov)
         and (float(whole_ratio) > float(max_anchor_drift) or float(whole_ratio) < (1.0 / float(max_anchor_drift)))
     )
     partial_blended = False
@@ -1217,7 +1232,7 @@ def main() -> None:
     if (
         exact_base
         and len(exact_base) == len(estimated_tvl_base)
-        and max(float(exact_cov), float(structural_cov)) >= float(partial_min_cov)
+        and float(exact_cov) >= float(partial_min_cov)
     ):
         blended, filled = _blend_exact_with_estimated(exact_base, estimated_tvl_base)
         if filled > 0:
