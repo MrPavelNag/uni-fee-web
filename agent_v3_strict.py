@@ -308,6 +308,39 @@ def _normalize_exact_series_to_fees(
     return [(int(ts), float(by_ts.get(int(ts), 0.0))) for ts, _ in (fees_usd or [])]
 
 
+def _median(values: list[float]) -> float:
+    arr = sorted(float(x) for x in (values or []) if float(x) > 0.0)
+    if not arr:
+        return 0.0
+    n = len(arr)
+    mid = n // 2
+    if (n % 2) == 1:
+        return float(arr[mid])
+    return float((arr[mid - 1] + arr[mid]) / 2.0)
+
+
+def _series_scale_ratio(
+    exact_series: list[tuple[int, float]],
+    estimated_series: list[tuple[int, float]],
+) -> float:
+    n = min(len(exact_series or []), len(estimated_series or []))
+    ratios: list[float] = []
+    for i in range(n):
+        ex_v = float(exact_series[i][1] or 0.0)
+        est_v = float(estimated_series[i][1] or 0.0)
+        if ex_v > 0.0 and est_v > 0.0:
+            ratios.append(float(ex_v / est_v))
+    return _median(ratios)
+
+
+def _series_tail_median(series: list[tuple[int, float]], tail_n: int = 5) -> float:
+    arr = [float(v or 0.0) for _ts, v in (series or []) if float(v or 0.0) > 0.0]
+    if not arr:
+        return 0.0
+    n = max(1, int(tail_n))
+    return _median(arr[-n:])
+
+
 def _append_now_tvl_anchor(tvl_series: list[tuple[int, float]], now_tvl_usd: float) -> list[tuple[int, float]]:
     out = list(tvl_series or [])
     now_ts = int(datetime.utcnow().timestamp())
@@ -939,7 +972,12 @@ def _build_exact2_tvl_series_v3_ledger(
     tvl_series: list[tuple[int, float]] = []
     non_zero = 0
     priced_days = 0
+    priced_days_both = 0
+    imputed_days = 0
     covered_days = 0
+    one_leg_days_0 = 0
+    one_leg_days_1 = 0
+    ratio01 = float(pool.get("token0Price") or 0.0) if pool.get("token0Price") is not None else 0.0
     for ts, _fees in fees_usd:
         if time.monotonic() >= deadline_ts:
             processed_cov = float(len(tvl_series) / max(1, len(fees_usd)))
@@ -952,10 +990,24 @@ def _build_exact2_tvl_series_v3_ledger(
         covered_days += 1
         amt0 = float(bal0_by_block.get(b, 0)) / float(10 ** max(0, dec0))
         amt1 = float(bal1_by_block.get(b, 0)) / float(10 ** max(0, dec1))
+        if amt0 <= 0.0 and amt1 > 0.0:
+            one_leg_days_0 += 1
+        elif amt1 <= 0.0 and amt0 > 0.0:
+            one_leg_days_1 += 1
         p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
         p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
+        # Keep historical valuation rule aligned with TVL-now rule:
+        # if one leg price is missing, infer from pool token ratio.
+        if p0 <= 0 and p1 > 0 and ratio01 > 0:
+            p0 = p1 * ratio01
+            imputed_days += 1
+        if p1 <= 0 and p0 > 0 and ratio01 > 0:
+            p1 = p0 / ratio01
+            imputed_days += 1
         if p0 > 0 or p1 > 0:
             priced_days += 1
+        if p0 > 0 and p1 > 0:
+            priced_days_both += 1
         tvl = max(0.0, amt0 * max(0.0, p0)) + max(0.0, amt1 * max(0.0, p1))
         if tvl > 0:
             non_zero += 1
@@ -970,24 +1022,43 @@ def _build_exact2_tvl_series_v3_ledger(
         tvl_series = [
             (
                 int(ts),
-                float(
-                    rpc_by_day.get(
-                        int((int(ts) // 86400) * 86400),
-                        cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0),
-                    )
-                ),
+                float((
+                    rpc_by_day.get(int((int(ts) // 86400) * 86400), 0.0)
+                    if float(rpc_by_day.get(int((int(ts) // 86400) * 86400), 0.0)) > 0.0
+                    else cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0)
+                )),
             )
             for ts, _ in fees_usd
         ]
         non_zero = sum(1 for _ts, v in tvl_series if float(v) > 0.0)
-    _exact2_cache_upsert(chain=str(chain), pool_id=pool_id, series=tvl_series)
+    if not transfer_logs_timed_out:
+        _exact2_cache_upsert(chain=str(chain), pool_id=pool_id, series=tvl_series)
     cov = float(non_zero / max(1, len(fees_usd)))
+    dominant_one_leg = max(int(one_leg_days_0), int(one_leg_days_1))
+    one_leg_ratio = float(dominant_one_leg / max(1, covered_days))
     if non_zero == 0:
         return tvl_series, f"exact2_non_positive_days:block_missing={block_missing}:priced_days={priced_days}", cov
+    if covered_days >= max(3, len(fees_usd) // 2) and one_leg_ratio >= 0.5:
+        return (
+            tvl_series,
+            f"exact2_partial:one_leg_quantity_collapse:one_leg_ratio={one_leg_ratio:.2f}:"
+            f"leg0={one_leg_days_0}:leg1={one_leg_days_1}:covered_days={covered_days}",
+            cov,
+        )
     if transfer_logs_timed_out:
-        return tvl_series, f"exact2_partial:transfer_logs_timeout:covered_days={covered_days}/{len(fees_usd)}", cov
+        return (
+            tvl_series,
+            f"exact2_partial:transfer_logs_timeout:covered_days={covered_days}/{len(fees_usd)}:"
+            f"priced_both={priced_days_both}:imputed={imputed_days}",
+            cov,
+        )
     if block_missing > 0:
-        return tvl_series, f"exact2_partial:block_missing={block_missing}:priced_days={priced_days}", cov
+        return (
+            tvl_series,
+            f"exact2_partial:block_missing={block_missing}:priced_days={priced_days}:"
+            f"priced_both={priced_days_both}:imputed={imputed_days}",
+            cov,
+        )
     if priced_days < max(1, len(fees_usd) // 2):
         return tvl_series, f"exact2_partial:insufficient_prices={priced_days}", cov
     return tvl_series, "ok", cov
@@ -1105,6 +1176,35 @@ def main() -> None:
 
     exact_base = _normalize_exact_series_to_fees(fees_usd, list(exact_series or []))
     structural_cov = float(len(exact_series or []) / max(1, len(fees_usd)))
+    one_leg_conflict = bool(str(exact_reason).startswith("exact2_partial:one_leg_quantity_collapse"))
+    scale_ratio = _series_scale_ratio(exact_base, estimated_tvl_base)
+    try:
+        max_scale_drift = max(1.05, float(os.environ.get("STRICT_EXACT2_MAX_SCALE_DRIFT", "1.8")))
+    except Exception:
+        max_scale_drift = 1.8
+    scale_conflict = bool(
+        scale_ratio > 0.0
+        and max(float(exact_cov), float(structural_cov)) >= float(partial_min_cov)
+        and (float(scale_ratio) > float(max_scale_drift) or float(scale_ratio) < (1.0 / float(max_scale_drift)))
+    )
+    try:
+        max_anchor_drift = max(1.05, float(os.environ.get("STRICT_EXACT2_MAX_ANCHOR_DRIFT", "1.8")))
+    except Exception:
+        max_anchor_drift = 1.8
+    tail_med = _series_tail_median(exact_base, tail_n=5)
+    whole_med = _series_tail_median(exact_base, tail_n=max(1, len(exact_base)))
+    anchor_ratio = (float(pool_tvl_now_usd) / max(1e-12, float(tail_med))) if tail_med > 0 else 0.0
+    whole_ratio = (float(pool_tvl_now_usd) / max(1e-12, float(whole_med))) if whole_med > 0 else 0.0
+    anchor_conflict = bool(
+        tail_med > 0.0
+        and max(float(exact_cov), float(structural_cov)) >= float(partial_min_cov)
+        and (float(anchor_ratio) > float(max_anchor_drift) or float(anchor_ratio) < (1.0 / float(max_anchor_drift)))
+    )
+    level_conflict = bool(
+        whole_med > 0.0
+        and max(float(exact_cov), float(structural_cov)) >= float(partial_min_cov)
+        and (float(whole_ratio) > float(max_anchor_drift) or float(whole_ratio) < (1.0 / float(max_anchor_drift)))
+    )
     partial_blended = False
     partial_filled_days = 0
     if (
@@ -1118,7 +1218,15 @@ def main() -> None:
             partial_blended = True
             partial_filled_days = int(filled)
 
-    strict_exact_ok = bool(exact_base and len(exact_base) == len(fees_usd) and all(float(v) > 0.0 for _ts, v in exact_base))
+    strict_exact_ok = bool(
+        exact_base
+        and len(exact_base) == len(fees_usd)
+        and all(float(v) > 0.0 for _ts, v in exact_base)
+        and not one_leg_conflict
+        and not scale_conflict
+        and not anchor_conflict
+        and not level_conflict
+    )
     if strict_exact_ok:
         data_quality = ("exact_partial" if partial_blended else "exact")
         data_quality_reason = (
@@ -1134,7 +1242,25 @@ def main() -> None:
         strict_exact_fees = list(final_fees)
     else:
         data_quality = "strict_unavailable"
-        data_quality_reason = f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f}"
+        if scale_conflict:
+            data_quality_reason = (
+                f"strict_required:exact2.0:source_conflict_scale:ratio={scale_ratio:.2f}:"
+                f"cov={exact_cov:.2f}:scov={structural_cov:.2f}"
+            )
+        elif one_leg_conflict:
+            data_quality_reason = f"strict_required:exact2.0:{exact_reason}:cov={exact_cov:.2f}:scov={structural_cov:.2f}"
+        elif anchor_conflict:
+            data_quality_reason = (
+                f"strict_required:exact2.0:source_conflict_anchor_jump:anchor_ratio={anchor_ratio:.2f}:"
+                f"tail_med={tail_med:.2f}:cov={exact_cov:.2f}:scov={structural_cov:.2f}"
+            )
+        elif level_conflict:
+            data_quality_reason = (
+                f"strict_required:exact2.0:source_conflict_level_shift:whole_ratio={whole_ratio:.2f}:"
+                f"whole_med={whole_med:.2f}:cov={exact_cov:.2f}:scov={structural_cov:.2f}"
+            )
+        else:
+            data_quality_reason = f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f}"
         final_tvl = []
         final_fees = []
         if exact_base:
