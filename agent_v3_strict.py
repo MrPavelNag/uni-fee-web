@@ -298,6 +298,16 @@ def _blend_exact_with_estimated(
     return out, filled
 
 
+def _normalize_exact_series_to_fees(
+    fees_usd: list[tuple[int, float]],
+    exact_series: list[tuple[int, float]],
+) -> list[tuple[int, float]]:
+    by_ts: dict[int, float] = {}
+    for ts, v in (exact_series or []):
+        by_ts[int(ts)] = float(v or 0.0)
+    return [(int(ts), float(by_ts.get(int(ts), 0.0))) for ts, _ in (fees_usd or [])]
+
+
 def _append_now_tvl_anchor(tvl_series: list[tuple[int, float]], now_tvl_usd: float) -> list[tuple[int, float]]:
     out = list(tvl_series or [])
     now_ts = int(datetime.utcnow().timestamp())
@@ -932,7 +942,8 @@ def _build_exact2_tvl_series_v3_ledger(
     covered_days = 0
     for ts, _fees in fees_usd:
         if time.monotonic() >= deadline_ts:
-            return tvl_series, "exact2_budget_timeout:pricing", float(non_zero / max(1, len(fees_usd)))
+            processed_cov = float(len(tvl_series) / max(1, len(fees_usd)))
+            return tvl_series, "exact2_budget_timeout:pricing", processed_cov
         day_ts = int((int(ts) // 86400) * 86400)
         b = int(day_blocks.get(day_ts, 0))
         if b <= 0 or int(b) < int(covered_from):
@@ -1092,13 +1103,14 @@ def main() -> None:
     except Exception:
         partial_min_cov = 0.65
 
-    exact_base = list(exact_series or [])
+    exact_base = _normalize_exact_series_to_fees(fees_usd, list(exact_series or []))
+    structural_cov = float(len(exact_series or []) / max(1, len(fees_usd)))
     partial_blended = False
     partial_filled_days = 0
     if (
         exact_base
         and len(exact_base) == len(estimated_tvl_base)
-        and float(exact_cov) >= float(partial_min_cov)
+        and max(float(exact_cov), float(structural_cov)) >= float(partial_min_cov)
     ):
         blended, filled = _blend_exact_with_estimated(exact_base, estimated_tvl_base)
         if filled > 0:
@@ -1110,7 +1122,7 @@ def main() -> None:
     if strict_exact_ok:
         data_quality = ("exact_partial" if partial_blended else "exact")
         data_quality_reason = (
-            f"exact2.0:partial_blend:cov={exact_cov:.2f}:filled={partial_filled_days}"
+            f"exact2.0:partial_blend:cov={exact_cov:.2f}:scov={structural_cov:.2f}:filled={partial_filled_days}"
             if partial_blended
             else "exact2.0:ok"
         )
