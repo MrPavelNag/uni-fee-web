@@ -161,7 +161,19 @@ _CG_BACKOFF_UNTIL: dict[tuple[str, str], float] = {}
 _CG_GLOBAL_BACKOFF_UNTIL: float = 0.0
 _CG_LAST_REQ_TS: float = 0.0
 _CG_HTTP_LOCK = threading.Lock()
+_FALLBACK_WARNED: set[str] = set()
 _RPC_PRIMARY_URL: dict[int, str] = {}
+
+
+def _warn_fallback_once(key: str, message: str) -> None:
+    k = str(key or "").strip()
+    if not k:
+        return
+    with _EXACT_CACHE_LOCK:
+        if k in _FALLBACK_WARNED:
+            return
+        _FALLBACK_WARNED.add(k)
+    print(f"[WARN][fallback] {message}")
 
 
 def _rpc_urls(chain_id: int) -> list[str]:
@@ -307,8 +319,16 @@ def _coingecko_fill_price_cache(chain_key: str, token: str, day_start: int, day_
     if exists:
         return
     if time.time() < backoff_until:
+        _warn_fallback_once(
+            f"cg_token_backoff:{ck}:{tk}",
+            f"coingecko token cooldown active; skip token={tk} chain={ck}",
+        )
         return
     if time.time() < global_backoff_until:
+        _warn_fallback_once(
+            f"cg_global_backoff:{ck}",
+            f"coingecko global cooldown active; skip request on chain={ck}",
+        )
         return
     platform = COINGECKO_PLATFORM_BY_KEY.get(ck, "")
     if not platform:
@@ -345,8 +365,21 @@ def _coingecko_fill_price_cache(chain_key: str, token: str, day_start: int, day_
             with _EXACT_CACHE_LOCK:
                 _CG_BACKOFF_UNTIL[(ck, tk)] = float(time.time() + cool_sec)
                 _CG_GLOBAL_BACKOFF_UNTIL = max(float(_CG_GLOBAL_BACKOFF_UNTIL), float(time.time() + cool_sec))
+            _warn_fallback_once(
+                f"cg_429:{ck}:{tk}",
+                f"coingecko rate-limited (429); fallback to llama for token={tk} chain={ck}; cooldown={cool_sec:.0f}s",
+            )
+            return
+        _warn_fallback_once(
+            f"cg_http_error:{ck}:{tk}:{status}",
+            f"coingecko http error={status}; fallback to llama for token={tk} chain={ck}",
+        )
         return
     except Exception:
+        _warn_fallback_once(
+            f"cg_request_error:{ck}:{tk}",
+            f"coingecko request failed; fallback to llama for token={tk} chain={ck}",
+        )
         return
     try:
         d = r.json() if isinstance(r.json(), dict) else {}
@@ -378,6 +411,10 @@ def _historical_price_usd(chain_key: str, token: str, day_ts: int, day_start: in
     try:
         _coingecko_fill_price_cache(ck, tk, int(day_start), int(day_end))
     except Exception:
+        _warn_fallback_once(
+            f"cg_fill_exception:{ck}:{tk}",
+            f"coingecko cache fill exception; fallback to llama for token={tk} chain={ck}",
+        )
         pass
     with _EXACT_CACHE_LOCK:
         px = _CG_DAY_PRICE_CACHE.get((ck, tk, dts))
@@ -392,9 +429,17 @@ def _historical_price_usd(chain_key: str, token: str, day_ts: int, day_start: in
         coin = (data.get("coins") or {}).get(f"{lk}:{tk}") or {}
         p = float(coin.get("price") or 0.0)
         if p > 0:
+            _warn_fallback_once(
+                f"price_fallback_llama:{ck}:{tk}",
+                f"historical price source fallback: llama used for token={tk} chain={ck}",
+            )
             return p
     except Exception:
         pass
+    _warn_fallback_once(
+        f"price_fallback_zero:{ck}:{tk}",
+        f"historical price unavailable from coingecko+llama; returning 0 for token={tk} chain={ck}",
+    )
     return 0.0
 
 
@@ -912,6 +957,10 @@ def discover_pools_v3(
                                 except Exception:
                                     fb_read_timeout = 6.0
                                 print("  [base] v3 fallback: goldsky timeout; trying thegraph endpoint")
+                                _warn_fallback_once(
+                                    "base_v3_goldsky_to_thegraph",
+                                    "base v3 discovery source fallback: goldsky timeout -> thegraph endpoint",
+                                )
                                 prev_read_timeout = os.environ.get("GRAPHQL_READ_TIMEOUT_SEC")
                                 try:
                                     os.environ["GRAPHQL_READ_TIMEOUT_SEC"] = str(fb_read_timeout)

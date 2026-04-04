@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import time
+import threading
 import requests
 from datetime import datetime
 from typing import Any
@@ -35,6 +36,19 @@ from agent_v3 import (
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 _POOL_CHAIN_CACHE_PATH = os.environ.get("STRICT_POOL_CHAIN_CACHE_PATH", "data/strict_pool_chain_cache.json")
 _EXACT2_CACHE_DB_PATH = os.environ.get("STRICT_EXACT2_CACHE_DB_PATH", "data/exact2_daily_cache.sqlite3")
+_WARN_LOCK = threading.Lock()
+_FALLBACK_WARNED: set[str] = set()
+
+
+def _warn_fallback_once(key: str, message: str) -> None:
+    k = str(key or "").strip()
+    if not k:
+        return
+    with _WARN_LOCK:
+        if k in _FALLBACK_WARNED:
+            return
+        _FALLBACK_WARNED.add(k)
+    print(f"[WARN][fallback] {message}")
 
 
 def _is_eth_address(v: str) -> bool:
@@ -881,6 +895,10 @@ def _build_exact2_tvl_series_v3_ledger(
     if day_keys and all(int(d) in cached_by_day for d in day_keys):
         hit_series = [(int(ts), float(cached_by_day.get(int((int(ts) // 86400) * 86400), 0.0))) for ts, _ in fees_usd]
         hit_cov = float(sum(1 for _ts, v in hit_series if float(v) > 0.0) / max(1, len(hit_series)))
+        _warn_fallback_once(
+            f"exact2_cache_hit:{chain}:{pool_id}",
+            f"exact2 history served from cache: chain={chain} pool={pool_id}",
+        )
         return hit_series, "exact2_cache:ok", hit_cov
 
     src = _strict_exact2_source()
@@ -917,10 +935,18 @@ def _build_exact2_tvl_series_v3_ledger(
             if gs_reason == "ok":
                 return gs_series, "exact2_goldsky:ok", gs_cov
             if src == "goldsky":
+                _warn_fallback_once(
+                    f"exact2_goldsky_nonperfect:{chain}:{pool_id}",
+                    f"exact2 goldsky returned partial reason={gs_reason}; using goldsky result as requested",
+                )
                 return gs_series, gs_reason, gs_cov
         if src == "goldsky":
             # Explicit source choice: do not fallback to RPC reconstruction.
             return gs_series, gs_reason, gs_cov
+        _warn_fallback_once(
+            f"exact2_goldsky_to_rpc:{chain}:{pool_id}",
+            f"exact2 source fallback: goldsky -> rpc, reason={gs_reason}",
+        )
 
     total_budget = max(10.0, float(budget_sec))
     # Snapshot mode: reserve time for price valuation after balance snapshots.
@@ -1007,11 +1033,17 @@ def _build_exact2_tvl_series_v3_ledger(
         if amt0 <= 0.0 and amt1 <= 0.0:
             tvl_series.append((int(ts), 0.0))
             continue
-        covered_days += 1
         if amt0 <= 0.0 and amt1 > 0.0:
             one_leg_days_0 += 1
+            # Treat one-leg snapshots as missing quantity points.
+            tvl_series.append((int(ts), 0.0))
+            continue
         elif amt1 <= 0.0 and amt0 > 0.0:
             one_leg_days_1 += 1
+            # Treat one-leg snapshots as missing quantity points.
+            tvl_series.append((int(ts), 0.0))
+            continue
+        covered_days += 1
         p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
         p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
         # Keep historical valuation rule aligned with TVL-now rule:
@@ -1051,39 +1083,47 @@ def _build_exact2_tvl_series_v3_ledger(
         non_zero = sum(1 for _ts, v in tvl_series if float(v) > 0.0)
     if not transfer_logs_timed_out and covered_days > 0:
         _exact2_cache_upsert(chain=str(chain), pool_id=pool_id, series=tvl_series)
-    cov = float(covered_days / max(1, len(fees_usd)))
+    # Coverage for strict quality gates must reflect usable exact TVL points,
+    # not just successful quantity snapshot reads.
+    cov = float(non_zero / max(1, len(fees_usd)))
+    qty_cov = float(covered_days / max(1, len(fees_usd)))
     dominant_one_leg = max(int(one_leg_days_0), int(one_leg_days_1))
     one_leg_ratio = float(dominant_one_leg / max(1, covered_days))
     if non_zero == 0:
         return (
             tvl_series,
-            f"exact2_non_positive_days:mode={balance_mode}:block_missing={block_missing}:priced_days={priced_days}",
+            f"exact2_non_positive_days:mode={balance_mode}:block_missing={block_missing}:"
+            f"priced_days={priced_days}:qty_cov={qty_cov:.2f}",
             cov,
         )
     if covered_days >= max(3, len(fees_usd) // 2) and one_leg_ratio >= 0.5:
         return (
             tvl_series,
             f"exact2_partial:one_leg_quantity_collapse:mode={balance_mode}:one_leg_ratio={one_leg_ratio:.2f}:"
-            f"leg0={one_leg_days_0}:leg1={one_leg_days_1}:covered_days={covered_days}",
+            f"leg0={one_leg_days_0}:leg1={one_leg_days_1}:covered_days={covered_days}:qty_cov={qty_cov:.2f}",
             cov,
         )
     if transfer_logs_timed_out:
         return (
             tvl_series,
             f"exact2_partial:transfer_logs_timeout:mode={balance_mode}:covered_days={covered_days}/{len(fees_usd)}:"
-            f"priced_both={priced_days_both}:imputed={imputed_days}",
+            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}",
             cov,
         )
     if block_missing > 0:
         return (
             tvl_series,
             f"exact2_partial:block_missing={block_missing}:mode={balance_mode}:priced_days={priced_days}:"
-            f"priced_both={priced_days_both}:imputed={imputed_days}",
+            f"priced_both={priced_days_both}:imputed={imputed_days}:qty_cov={qty_cov:.2f}",
             cov,
         )
     if priced_days < max(1, len(fees_usd) // 2):
-        return tvl_series, f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}", cov
-    return tvl_series, f"ok:mode={balance_mode}", cov
+        return (
+            tvl_series,
+            f"exact2_partial:insufficient_prices={priced_days}:mode={balance_mode}:qty_cov={qty_cov:.2f}",
+            cov,
+        )
+    return tvl_series, f"ok:mode={balance_mode}:qty_cov={qty_cov:.2f}", cov
 
 
 def main() -> None:
@@ -1127,6 +1167,10 @@ def main() -> None:
         fallback_chains = [c for c in all_v3_chains if c not in set(probe_chains)]
         if fallback_chains:
             print(f"Pool not found on selected chains, fallback probing: {','.join(fallback_chains)}")
+            _warn_fallback_once(
+                f"probe_chain_fallback:{target_pool}",
+                f"chain probing fallback triggered for pool={target_pool}; extra_chains={','.join(fallback_chains)}",
+            )
             found_pool, found_chain, found_endpoint = _probe_pool_on_chains(target_pool, fallback_chains)
 
     if not found_pool:
@@ -1239,6 +1283,10 @@ def main() -> None:
             exact_base = blended
             partial_blended = True
             partial_filled_days = int(filled)
+            _warn_fallback_once(
+                f"exact2_partial_blend:{target_pool}",
+                f"exact2 partial blend applied with estimated series; filled_days={partial_filled_days}",
+            )
 
     strict_exact_ok = bool(
         exact_base
@@ -1283,6 +1331,10 @@ def main() -> None:
             )
         else:
             data_quality_reason = f"strict_required:exact2.0:{exact_reason}:{exact_cov:.2f}"
+        _warn_fallback_once(
+            f"strict_unavailable:{target_pool}:{data_quality_reason}",
+            f"strict exact unavailable; fallback to compare-only output, reason={data_quality_reason}",
+        )
         final_tvl = []
         final_fees = []
         if exact_base:
