@@ -411,6 +411,46 @@ def _smooth_sparse_exact_series(
     return out, int(filled)
 
 
+def _suppress_exact_outliers(
+    series: list[tuple[int, float]],
+    *,
+    estimated_series: list[tuple[int, float]] | None = None,
+    pool_tvl_now_usd: float = 0.0,
+    max_ratio_vs_est: float = 2.2,
+    max_ratio_vs_now: float = 2.2,
+    max_jump_ratio: float = 2.5,
+) -> tuple[list[tuple[int, float]], int]:
+    """Drop clearly broken exact spikes by setting them to zero."""
+    arr = [(int(ts), float(v or 0.0)) for ts, v in (series or [])]
+    n = len(arr)
+    if n == 0:
+        return arr, 0
+    est_by_ts = {int(ts): float(v or 0.0) for ts, v in (estimated_series or [])}
+    out = list(arr)
+    dropped = 0
+    for i, (ts, v) in enumerate(arr):
+        if float(v) <= 0.0:
+            continue
+        upper_bounds: list[float] = []
+        est_v = float(est_by_ts.get(int(ts), 0.0))
+        if est_v > 0.0:
+            upper_bounds.append(float(est_v) * float(max_ratio_vs_est))
+        if float(pool_tvl_now_usd) > 0.0:
+            upper_bounds.append(float(pool_tvl_now_usd) * float(max_ratio_vs_now))
+        if upper_bounds and float(v) > min(upper_bounds):
+            out[i] = (int(ts), 0.0)
+            dropped += 1
+            continue
+        # Local spike check against neighbors.
+        left = next((float(out[k][1]) for k in range(i - 1, -1, -1) if float(out[k][1]) > 0.0), 0.0)
+        right = next((float(out[k][1]) for k in range(i + 1, n) if float(out[k][1]) > 0.0), 0.0)
+        neigh_max = max(left, right)
+        if neigh_max > 0.0 and float(v) > float(neigh_max) * float(max_jump_ratio):
+            out[i] = (int(ts), 0.0)
+            dropped += 1
+    return out, int(dropped)
+
+
 def _median(values: list[float]) -> float:
     arr = sorted(float(x) for x in (values or []) if float(x) > 0.0)
     if not arr:
@@ -1537,6 +1577,7 @@ def main() -> None:
         except Exception:
             smooth_max_missing_ratio = 0.50
         smooth_filled_days = 0
+        outlier_dropped_days = 0
         exact_for_output = list(exact_base)
         if smooth_enabled and missing_days > 0:
             smoothed, smooth_filled_days = _smooth_sparse_exact_series(
@@ -1545,6 +1586,29 @@ def main() -> None:
             )
             if int(smooth_filled_days) > 0:
                 exact_for_output = list(smoothed)
+                missing_days = int(sum(1 for _ts, v in exact_for_output if float(v or 0.0) <= 0.0))
+        try:
+            outlier_filter_enabled = str(os.environ.get("STRICT_EXACT2_OUTLIER_FILTER_ENABLE", "1")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        except Exception:
+            outlier_filter_enabled = True
+        if outlier_filter_enabled and exact_for_output:
+            filtered, outlier_dropped_days = _suppress_exact_outliers(
+                exact_for_output,
+                estimated_series=estimated_tvl_base,
+                pool_tvl_now_usd=float(pool_tvl_now_usd),
+            )
+            if int(outlier_dropped_days) > 0:
+                exact_for_output = list(filtered)
+                # Re-smooth only points we intentionally dropped as outliers.
+                sm2, fill2 = _smooth_sparse_exact_series(
+                    exact_for_output,
+                    max_missing_ratio=float(smooth_max_missing_ratio),
+                )
+                if int(fill2) > 0:
+                    exact_for_output = list(sm2)
+                    smooth_filled_days += int(fill2)
                 missing_days = int(sum(1 for _ts, v in exact_for_output if float(v or 0.0) <= 0.0))
         flags: list[str] = []
         if one_leg_conflict:
@@ -1559,7 +1623,8 @@ def main() -> None:
             flags.append("clone")
         flg = f":conflicts={','.join(flags)}" if flags else ""
         sm = f":smoothed={int(smooth_filled_days)}" if int(smooth_filled_days) > 0 else ""
-        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}{sm}:reason={exact_reason}{flg}"
+        od = f":outliers={int(outlier_dropped_days)}" if int(outlier_dropped_days) > 0 else ""
+        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}{sm}{od}:reason={exact_reason}{flg}"
         final_tvl = []
         final_fees = []
         strict_exact_tvl_base = list(exact_for_output)
