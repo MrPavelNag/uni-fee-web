@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import time
 import threading
 import requests
 from datetime import datetime
+from decimal import Decimal, getcontext
 from typing import Any
 
 from config import DEFAULT_TOKEN_PAIRS, FEE_DAYS, LP_ALLOCATION_USD, UNISWAP_V3_SUBGRAPHS
@@ -41,6 +43,8 @@ _POOL_CHAIN_CACHE_PATH = os.environ.get("STRICT_POOL_CHAIN_CACHE_PATH", "data/st
 _EXACT2_CACHE_DB_PATH = os.environ.get("STRICT_EXACT2_CACHE_DB_PATH", "data/exact2_daily_cache.sqlite3")
 _WARN_LOCK = threading.Lock()
 _FALLBACK_WARNED: set[str] = set()
+_Q96 = Decimal(2**96)
+getcontext().prec = 80
 
 
 def _warn_fallback_once(key: str, message: str) -> None:
@@ -82,6 +86,105 @@ def _token_decimals_from_pool(pool: dict, key: str) -> int:
     except Exception:
         pass
     return 0
+
+
+def _hex_words(data_hex: str) -> list[str]:
+    h = str(data_hex or "").strip().lower()
+    if h.startswith("0x"):
+        h = h[2:]
+    if not h:
+        return []
+    if len(h) % 64 != 0:
+        h = h.zfill((len(h) + 63) // 64 * 64)
+    return [h[i : i + 64] for i in range(0, len(h), 64)]
+
+
+def _decode_uint_word(word: str) -> int:
+    try:
+        return int(str(word or "0"), 16)
+    except Exception:
+        return 0
+
+
+def _decode_int24_from_word(word: str) -> int:
+    x = _decode_uint_word(word) & 0xFFFFFF
+    if x & 0x800000:
+        x -= 0x1000000
+    return int(x)
+
+
+def _sqrt_ratio_x96_at_tick(tick: int) -> Decimal:
+    power = Decimal(int(tick)) / Decimal(2)
+    return (Decimal("1.0001") ** power) * _Q96
+
+
+def _amounts_from_liquidity_segment(liq: Decimal, sqrt_lo: Decimal, sqrt_hi: Decimal) -> tuple[Decimal, Decimal]:
+    if liq <= 0 or sqrt_hi <= sqrt_lo:
+        return Decimal(0), Decimal(0)
+    amount0 = liq * (_Q96 * (sqrt_hi - sqrt_lo) / (sqrt_hi * sqrt_lo))
+    amount1 = liq * ((sqrt_hi - sqrt_lo) / _Q96)
+    return amount0, amount1
+
+
+def _v3_active_window_amounts(
+    *,
+    liquidity: int,
+    current_tick: int,
+    tick_spacing: int,
+    sqrt_price_x96: int,
+) -> tuple[float, float, str]:
+    if int(liquidity) <= 0 or int(tick_spacing) <= 0 or int(sqrt_price_x96) <= 0:
+        return 0.0, 0.0, "active_window_inputs_invalid"
+    lower = math.floor(int(current_tick) / int(tick_spacing)) * int(tick_spacing)
+    upper = lower + int(tick_spacing)
+    sqrt_lo = _sqrt_ratio_x96_at_tick(lower)
+    sqrt_hi = _sqrt_ratio_x96_at_tick(upper)
+    sqrt_p = Decimal(int(sqrt_price_x96))
+    liq = Decimal(int(liquidity))
+    if not (sqrt_lo < sqrt_p < sqrt_hi):
+        sqrt_p = min(max(sqrt_p, sqrt_lo + Decimal(1)), sqrt_hi - Decimal(1))
+    a0, _ = _amounts_from_liquidity_segment(liq, sqrt_p, sqrt_hi)
+    _, a1 = _amounts_from_liquidity_segment(liq, sqrt_lo, sqrt_p)
+    return float(max(Decimal(0), a0)), float(max(Decimal(0), a1)), "active_window"
+
+
+def _v3_pool_state_now(chain_id: int, pool_id: str) -> tuple[int, int, int, int, str]:
+    p = str(pool_id or "").strip().lower()
+    if not _is_eth_address(p):
+        return 0, 0, 0, 0, "invalid_pool_id"
+    try:
+        slot0 = _rpc_json(
+            int(chain_id),
+            "eth_call",
+            [{"to": p, "data": "0x3850c7bd"}, "latest"],
+            timeout_sec=8.0,
+        )
+        liq = _rpc_json(
+            int(chain_id),
+            "eth_call",
+            [{"to": p, "data": "0x1a686502"}, "latest"],
+            timeout_sec=8.0,
+        )
+        spacing = _rpc_json(
+            int(chain_id),
+            "eth_call",
+            [{"to": p, "data": "0xd0c93a7c"}, "latest"],
+            timeout_sec=8.0,
+        )
+    except Exception as e:
+        return 0, 0, 0, 0, f"pool_state_failed:{e}"
+    slot_words = _hex_words(str((slot0 or {}).get("result") or ""))
+    liq_words = _hex_words(str((liq or {}).get("result") or ""))
+    sp_words = _hex_words(str((spacing or {}).get("result") or ""))
+    if len(slot_words) < 2:
+        return 0, 0, 0, 0, "slot0_missing"
+    sqrt_price_x96 = int(_decode_uint_word(slot_words[0]))
+    tick = int(_decode_int24_from_word(slot_words[1]))
+    liquidity = int(_decode_uint_word(liq_words[0])) if liq_words else 0
+    tick_spacing = int(_decode_int24_from_word(sp_words[0])) if sp_words else 0
+    if tick_spacing <= 0:
+        tick_spacing = 10
+    return sqrt_price_x96, tick, liquidity, tick_spacing, ""
 
 
 def _symbol_decimals_hint(symbol: str) -> int:
@@ -293,31 +396,42 @@ def _compute_fee_and_raw_tvl(pool_id: str, endpoint: str) -> tuple[list[tuple[in
     return fees_usd, raw_tvl
 
 
-def _resolve_pool_tvl_now_onchain(pool: dict, chain: str) -> tuple[float, str, str]:
+def _resolve_pool_tvl_now_onchain(pool: dict, chain: str) -> tuple[float, str, str, dict[str, Any]]:
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
-        return 0.0, "", "unsupported_chain"
+        return 0.0, "", "unsupported_chain", {}
     pool_id = str(pool.get("id") or "").strip().lower()
     token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
     token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
     if not (pool_id and token0 and token1):
-        return 0.0, "", "missing_pool_tokens"
+        return 0.0, "", "missing_pool_tokens", {}
     try:
         latest_block = int(_rpc_json(chain_id, "eth_blockNumber", [], timeout_sec=8.0).get("result", "0x0"), 16)
     except Exception as e:
-        return 0.0, "", f"latest_block_failed:{e}"
+        return 0.0, "", f"latest_block_failed:{e}", {}
     if latest_block <= 0:
-        return 0.0, "", "latest_block_not_found"
+        return 0.0, "", "latest_block_not_found", {}
     try:
         dec0 = int(_token_decimals_from_pool(pool, "token0") or _erc20_decimals(chain_id, token0))
         dec1 = int(_token_decimals_from_pool(pool, "token1") or _erc20_decimals(chain_id, token1))
         b0 = int(_balance_of_raw(chain_id, token0, pool_id, latest_block, timeout_sec=8.0))
         b1 = int(_balance_of_raw(chain_id, token1, pool_id, latest_block, timeout_sec=8.0))
     except Exception as e:
-        return 0.0, "", f"onchain_balance_failed:{e}"
+        return 0.0, "", f"onchain_balance_failed:{e}", {}
     amt0 = float(b0) / float(10 ** max(0, dec0))
     amt1 = float(b1) / float(10 ** max(0, dec1))
+
+    sqrt_p, tick_now, liq_now, tick_spacing, state_err = _v3_pool_state_now(chain_id, pool_id)
+    act0_raw, act1_raw, _act_src = _v3_active_window_amounts(
+        liquidity=int(liq_now),
+        current_tick=int(tick_now),
+        tick_spacing=int(tick_spacing),
+        sqrt_price_x96=int(sqrt_p),
+    )
+    act0 = float(act0_raw) / float(10 ** max(0, dec0))
+    act1 = float(act1_raw) / float(10 ** max(0, dec1))
+
     prices, sources, errs = get_token_prices_usd(ck, [token0, token1])
     p0 = float(prices.get(token0) or 0.0)
     p1 = float(prices.get(token1) or 0.0)
@@ -327,14 +441,35 @@ def _resolve_pool_tvl_now_onchain(pool: dict, chain: str) -> tuple[float, str, s
     if p1 <= 0 and p0 > 0 and ratio01 > 0:
         p1 = p0 / ratio01
     if p0 <= 0 and p1 <= 0:
-        return 0.0, "", ";".join([str(x) for x in errs if str(x).strip()]) or "price_unavailable"
-    tvl = max(0.0, amt0 * max(0.0, p0)) + max(0.0, amt1 * max(0.0, p1))
+        return 0.0, "", ";".join([str(x) for x in errs if str(x).strip()]) or "price_unavailable", {}
+    tvl_full = max(0.0, amt0 * max(0.0, p0)) + max(0.0, amt1 * max(0.0, p1))
+    tvl_active = max(0.0, act0 * max(0.0, p0)) + max(0.0, act1 * max(0.0, p1))
+    tvl = float(tvl_full if tvl_full > 0.0 else tvl_active)
     src0 = str(sources.get(token0) or "")
     src1 = str(sources.get(token1) or "")
     src = src0 or src1
     if src0 and src1 and src0 != src1:
         src = f"{src0}+{src1}"
-    return float(tvl), f"onchain_balance*price:{src}", ""
+    state_src = "slot0+liquidity" if not state_err else f"state_unavailable:{state_err}"
+    source = f"onchain_full_pool+price:{src}:alt=active_window:{state_src}"
+    dbg = {
+        "latest_block": int(latest_block),
+        "decimals0": int(dec0),
+        "decimals1": int(dec1),
+        "amount0_full_pool": float(amt0),
+        "amount1_full_pool": float(amt1),
+        "amount0_active_window": float(max(0.0, act0)),
+        "amount1_active_window": float(max(0.0, act1)),
+        "tvl_full_pool_usd": float(tvl_full),
+        "tvl_active_window_usd": float(tvl_active),
+        "quantity_source": "full_pool_balanceOf",
+        "quantity_source_secondary": "active_window_slot0_liquidity",
+        "pool_state_error": str(state_err or ""),
+        "current_tick": int(tick_now),
+        "pool_liquidity": int(liq_now),
+        "tick_spacing": int(tick_spacing),
+    }
+    return float(tvl), source, "", dbg
 
 
 def _build_estimated_tvl(fees_usd: list[tuple[int, float]], raw_tvl: list[tuple[int, float]], pool_tvl_now_usd: float) -> list[tuple[int, float]]:
@@ -1585,7 +1720,7 @@ def main() -> None:
     t1 = str(((pool.get("token1") or {}).get("symbol") or "?"))
     pool["pair_label"] = f"{t0}/{t1}"
 
-    pool_tvl_now_usd, price_source, price_err = _resolve_pool_tvl_now_onchain(pool, found_chain)
+    pool_tvl_now_usd, price_source, price_err, tvl_now_debug = _resolve_pool_tvl_now_onchain(pool, found_chain)
     if float(pool_tvl_now_usd) <= 0:
         print(f"external TVL unavailable: {price_err or 'unknown'}")
         save_chart_data_json(
@@ -1876,6 +2011,7 @@ def main() -> None:
         "version": "v3",
         "data_quality": data_quality,
         "data_quality_reason": data_quality_reason,
+        "strict_debug": {"v3_tvl_now": (tvl_now_debug or {})},
         "strict_compare_estimated_tvl": estimated_tvl,
         "strict_compare_estimated_fees": estimated_fees,
         "strict_compare_exact_tvl": strict_exact_tvl,
