@@ -752,6 +752,12 @@ def _one_point_exact_tvl(fees_usd: list[tuple[int, float]], tvl_now: float) -> l
     return out
 
 
+def _one_point_marker_tvl(fees_usd: list[tuple[int, float]], tvl_now: float) -> list[tuple[int, float]]:
+    if not fees_usd:
+        return []
+    return [(int(fees_usd[-1][0]), float(max(0.0, tvl_now)))]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Uniswap v4 strict exact2 single-pool agent")
     ap.add_argument("--min-tvl", type=float, default=None)
@@ -830,7 +836,11 @@ def main() -> None:
     if raw_tvl_positive_days > 0:
         estimated_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
         estimated_fees = _rebuild_fees_cumulative(fees_usd, estimated_tvl)
+    else:
+        # No historical day-shape: still expose a single estimate marker at TVL NOW.
+        estimated_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
     exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
+    exact_active_tvl = _one_point_marker_tvl(fees_usd, float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0))
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
     reason = (
         f"exact_v4_2_onchain_quantities:one_point_now:cov={exact_cov:.2f}"
@@ -857,6 +867,7 @@ def main() -> None:
         "strict_compare_estimated_tvl": estimated_tvl,
         "strict_compare_estimated_fees": estimated_fees,
         "strict_compare_exact_tvl": exact_tvl,
+        "strict_compare_exact_active_tvl": exact_active_tvl,
         "strict_compare_exact_fees": [],
         "strict_estimated_shape_missing": bool(raw_tvl_positive_days <= 0),
     }

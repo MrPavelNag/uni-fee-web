@@ -376,6 +376,7 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> d
         "strict_compare_estimated_tvl": [],
         "strict_compare_estimated_fees": [],
         "strict_compare_exact_tvl": [],
+        "strict_compare_exact_active_tvl": [],
         "strict_compare_exact_fees": [],
     }
 
@@ -2015,6 +2016,16 @@ def main() -> None:
         "strict_compare_estimated_tvl": estimated_tvl,
         "strict_compare_estimated_fees": estimated_fees,
         "strict_compare_exact_tvl": strict_exact_tvl,
+        "strict_compare_exact_active_tvl": (
+            [
+                (
+                    int(fees_usd[-1][0]),
+                    float(max(0.0, (tvl_now_debug or {}).get("tvl_active_window_usd") or 0.0)),
+                )
+            ]
+            if fees_usd
+            else []
+        ),
         "strict_compare_exact_fees": strict_exact_fees,
     }
 

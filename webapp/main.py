@@ -17971,6 +17971,7 @@ def _merge_for_web(
             or (v.get("strict_compare_estimated_tvl") or [])
             or (v.get("strict_compare_exact_fees") or [])
             or (v.get("strict_compare_exact_tvl") or [])
+            or (v.get("strict_compare_exact_active_tvl") or [])
         )
         final_income = _final_income(v)
         apy_pct = (final_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
@@ -18013,6 +18014,7 @@ def _merge_for_web(
             est_tvl = v.get("strict_compare_estimated_tvl") or []
             ex_fees = v.get("strict_compare_exact_fees") or []
             ex_tvl = v.get("strict_compare_exact_tvl") or []
+            ex_active_tvl = v.get("strict_compare_exact_active_tvl") or []
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
 
             tvl_end_ts = max(
@@ -18027,6 +18029,7 @@ def _merge_for_web(
             )
             est_tvl = _align_series_end(est_tvl, tvl_end_ts)
             ex_tvl = _align_series_end(ex_tvl, tvl_end_ts)
+            ex_active_tvl = _align_series_end(ex_active_tvl, tvl_end_ts)
             est_fees = _align_series_end(est_fees, fees_end_ts)
             ex_fees = _align_series_end(ex_fees, fees_end_ts)
 
@@ -18113,6 +18116,7 @@ def _merge_for_web(
                     "strict_compare_estimated_tvl": (est_tvl if has_strict_compare else (v.get("strict_compare_estimated_tvl") or [])),
                     "strict_compare_exact_fees": (ex_fees if has_strict_compare else (v.get("strict_compare_exact_fees") or [])),
                     "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
+                    "strict_compare_exact_active_tvl": (ex_active_tvl if has_strict_compare else (v.get("strict_compare_exact_active_tvl") or [])),
                     "strict_compare_exact2_reason": exact2_reason,
                     "pool_tvl_now_usd": pool_tvl_now_usd,
                 }
@@ -32872,7 +32876,8 @@ HTML_PAGE = """
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
         const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
         const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
-        const useStrictCompare = strictMode && (estFees.length || estTvl.length || exFees.length || exTvl.length);
+        const exActiveTvl = Array.isArray(s.strict_compare_exact_active_tvl) ? s.strict_compare_exact_active_tvl : [];
+        const useStrictCompare = strictMode && (estFees.length || estTvl.length || exFees.length || exTvl.length || exActiveTvl.length);
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
           ...((s.tvl || []).map(p => Number(p[0] || 0))),
@@ -32880,6 +32885,7 @@ HTML_PAGE = """
           ...(estTvl.map(p => Number(p?.[0] || 0))),
           ...(exFees.map(p => Number(p?.[0] || 0))),
           ...(exTvl.map(p => Number(p?.[0] || 0))),
+          ...(exActiveTvl.map(p => Number(p?.[0] || 0))),
           0
         );
         if (localMax > maxTs) maxTs = localMax;
@@ -32915,6 +32921,8 @@ HTML_PAGE = """
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
           const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
           const exTvlYExact = sanitizeExactTvlK(exTvl, estTvlSrc, Number(s.pool_tvl_now_usd || 0));
+          const exActX = exActiveTvl.map(p => new Date(p[0] * 1000));
+          const exActY = sanitizeExactTvlK(exActiveTvl, estTvlSrc, Number(s.pool_tvl_now_usd || 0));
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           if (estFeeX.length) {
@@ -32934,6 +32942,7 @@ HTML_PAGE = """
           }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
+          const exActHoverTvl = exActX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active-window"]);
           if (estTvlX.length) {
             tvlTraces.push({
               x: estTvlX, y: estTvlY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHoverTvl,
@@ -32947,6 +32956,13 @@ HTML_PAGE = """
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: "#1d4ed8", width: 1.8, dash: "solid"},
               marker: {size: 5, color: "#1d4ed8"}
+            });
+          }
+          if (exActX.length) {
+            tvlTraces.push({
+              x: exActX, y: exActY, mode: "markers", name: `${s.label} (exact active-window)`, customdata: exActHoverTvl,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
+              marker: {size: 8, color: "#0ea5e9", symbol: "diamond"}
             });
           }
         } else {
