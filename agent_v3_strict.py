@@ -1617,9 +1617,9 @@ def main() -> None:
         )
         return
 
-    # Strict chart should stay fully on-chain by default for TVL base.
-    # Keep estimated compare as flat on-chain TVL-now anchor (no subgraph TVL shape).
-    estimated_tvl_base = _build_estimated_tvl(fees_usd, [], float(pool_tvl_now_usd))
+    # Estimated compare: keep historical shape from subgraph raw TVL,
+    # but anchor level with on-chain TVL-now (Alchemy).
+    estimated_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
     estimated_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_tvl_base)
     estimated_tvl = _append_now_tvl_anchor(estimated_tvl_base, float(pool_tvl_now_usd))
     estimated_fees = _append_now_fee_anchor(estimated_fees_base)
