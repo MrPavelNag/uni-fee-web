@@ -21749,6 +21749,21 @@ def _render_positions_page() -> str:
     function formatQualityReasonShort(rawReason, qualityTag) {
       const raw = String(rawReason || "").trim();
       if (!raw) return "-";
+      const friendlyPriceSource = (s) => {
+        const x = String(s || "").toLowerCase();
+        if (!x) return "unknown";
+        if (x.includes("coingecko+defillama")) return "CoinGecko/DefiLlama";
+        if (x.includes("coingecko")) return "CoinGecko";
+        if (x.includes("defillama")) return "DefiLlama";
+        if (x.includes("dexscreener")) return "Dexscreener";
+        return "unknown";
+      };
+      const friendlyOnchainSource = (s) => {
+        const x = String(s || "").toLowerCase();
+        if (x.includes("state=state_view") || x.includes("onchain_state_view")) return "StateView";
+        if (x.includes("state=pool_manager") || x.includes("onchain_pool_manager")) return "PoolManager";
+        return "on-chain";
+      };
       const dbg = raw.match(/dbg=t_blocks=([0-9]*\\.?[0-9]+),t_alchemy=([0-9]*\\.?[0-9]+),t_pricing=([0-9]*\\.?[0-9]+),t_total=([0-9]*\\.?[0-9]+)/i);
       const dbgTail = dbg ? ` (b:${Number(dbg[1]).toFixed(1)}s a:${Number(dbg[2]).toFixed(1)}s p:${Number(dbg[3]).toFixed(1)}s)` : "";
       const dq = String(qualityTag || "").trim().toLowerCase();
@@ -21759,7 +21774,7 @@ def _render_positions_page() -> str:
 
       if (raw.startsWith("strict_compare:estimated:")) {
         if (raw.includes("shape_missing")) return "Estimated unavailable: no v4 day TVL shape";
-        if (raw.includes("coingecko+defillama")) return "Estimated (CoinGecko + DefiLlama)";
+        if (raw.includes("coingecko+defillama")) return "Estimated: CoinGecko/DefiLlama";
         return "Estimated mode";
       }
       if (raw.startsWith("exact:ok") || raw.startsWith("exact2.0:ok")) return "Exact complete";
@@ -21793,12 +21808,15 @@ def _render_positions_page() -> str:
         const pos = (raw.match(/(?:^|:)raw_pos=(\\d+)/i) || [])[1];
         const zero = (raw.match(/(?:^|:)raw_zero=(\\d+)/i) || [])[1];
         const cov = (raw.match(/(?:^|:)cov=([0-9]*\\.?[0-9]+)/i) || [])[1];
+        const src = (raw.match(/(?:^|:)src=([^\\s]+)/i) || [])[1] || "";
+        const psrc = friendlyPriceSource(src);
+        const onchain = friendlyOnchainSource(src);
         const covTxt = cov ? `${Math.round(Number(cov) * 100)}%` : "";
         const parts = [];
         if (covTxt) parts.push(`cov ${covTxt}`);
         if (days) parts.push(`days ${days}`);
         if (pos || zero) parts.push(`raw ${pos || 0}/${zero || 0}`);
-        return `V4 exact2 partial (${mode}${parts.length ? `; ${parts.join(", ")}` : ""})`;
+        return `V4 exact2: ${onchain} + ${psrc} (${mode}${parts.length ? `; ${parts.join(", ")}` : ""})`;
       }
       if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found in selected chains";
       if (raw.includes("missing_target_pool_id")) return "Target pool is required";
@@ -32992,6 +33010,21 @@ HTML_PAGE = """
     function formatQualityReasonShort(rawReason, qualityTag) {
       const raw = String(rawReason || "").trim();
       if (!raw) return "-";
+      const friendlyPriceSource = (s) => {
+        const x = String(s || "").toLowerCase();
+        if (!x) return "unknown";
+        if (x.includes("coingecko+defillama")) return "CoinGecko/DefiLlama";
+        if (x.includes("coingecko")) return "CoinGecko";
+        if (x.includes("defillama")) return "DefiLlama";
+        if (x.includes("dexscreener")) return "Dexscreener";
+        return "unknown";
+      };
+      const friendlyOnchainSource = (s) => {
+        const x = String(s || "").toLowerCase();
+        if (x.includes("state=state_view") || x.includes("onchain_state_view")) return "StateView";
+        if (x.includes("state=pool_manager") || x.includes("onchain_pool_manager")) return "PoolManager";
+        return "on-chain";
+      };
       const dbg = raw.match(/dbg=t_blocks=([0-9]*\\.?[0-9]+),t_alchemy=([0-9]*\\.?[0-9]+),t_pricing=([0-9]*\\.?[0-9]+),t_total=([0-9]*\\.?[0-9]+)/i);
       const dbgTail = dbg ? ` (b:${Number(dbg[1]).toFixed(1)}s a:${Number(dbg[2]).toFixed(1)}s p:${Number(dbg[3]).toFixed(1)}s)` : "";
       const dq = String(qualityTag || "").trim().toLowerCase();
@@ -33002,7 +33035,7 @@ HTML_PAGE = """
 
       if (raw.startsWith("strict_compare:estimated:")) {
         if (raw.includes("shape_missing")) return "Estimated unavailable: no v4 day TVL shape";
-        if (raw.includes("coingecko+defillama")) return "Estimated (CoinGecko + DefiLlama)";
+        if (raw.includes("coingecko+defillama")) return "Estimated: CoinGecko/DefiLlama";
         return "Estimated mode";
       }
       if (raw.startsWith("exact:ok") || raw.startsWith("exact2.0:ok")) return "Exact complete";
@@ -33035,12 +33068,15 @@ HTML_PAGE = """
         const pos = (raw.match(/(?:^|:)raw_pos=(\\d+)/i) || [])[1];
         const zero = (raw.match(/(?:^|:)raw_zero=(\\d+)/i) || [])[1];
         const cov = (raw.match(/(?:^|:)cov=([0-9]*\\.?[0-9]+)/i) || [])[1];
+        const src = (raw.match(/(?:^|:)src=([^\\s]+)/i) || [])[1] || "";
+        const psrc = friendlyPriceSource(src);
+        const onchain = friendlyOnchainSource(src);
         const covTxt = cov ? `${Math.round(Number(cov) * 100)}%` : "";
         const parts = [];
         if (covTxt) parts.push(`cov ${covTxt}`);
         if (days) parts.push(`days ${days}`);
         if (pos || zero) parts.push(`raw ${pos || 0}/${zero || 0}`);
-        return `V4 exact2 partial (${mode}${parts.length ? `; ${parts.join(", ")}` : ""})`;
+        return `V4 exact2: ${onchain} + ${psrc} (${mode}${parts.length ? `; ${parts.join(", ")}` : ""})`;
       }
       if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found in selected chains";
       if (raw.includes("missing_target_pool_id")) return "Target pool is required";

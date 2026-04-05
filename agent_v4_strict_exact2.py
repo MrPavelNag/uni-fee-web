@@ -137,6 +137,7 @@ def _query_v4_pool_by_id(endpoint: str, pool_id: str) -> dict | None:
       pool(id: $id) {
         id
         feeTier
+        tickSpacing
         liquidity
         totalValueLockedUSD
         token0Price
@@ -568,8 +569,8 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
         dbg["error"] = "pool_manager_not_configured"
         return 0.0, "", "strict_required:v4_exact2:pool_manager_not_configured", dbg
 
-    t0 = time.monotonic()
-    deadline = t0 + max(10.0, float(budget_sec))
+    _t0 = time.monotonic()
+    _deadline = _t0 + max(10.0, float(budget_sec))
 
     latest = _rpc_latest_block(chain_id, timeout_sec=8.0)
     if latest <= 0:
@@ -577,25 +578,25 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
         return 0.0, "", "strict_required:v4_exact2:latest_block_not_found", dbg
     dbg["latest_block"] = int(latest)
 
-    init_meta, init_err = _pool_init_meta(chain_id, pool_manager, pool_id, latest)
-    if not init_meta:
-        dbg["error"] = str(init_err or "init_meta_unavailable")
-        dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
-        return 0.0, "", str(init_err or "strict_required:v4_exact2:init_meta_unavailable"), dbg
-    token0 = str(init_meta.get("currency0") or "").lower()
-    token1 = str(init_meta.get("currency1") or "").lower()
-    tick_spacing = int(init_meta.get("tick_spacing") or 0)
-    init_block = int(init_meta.get("block") or 0)
+    # one-point mode: no historical log scan; use pool metadata + on-chain slot0/liquidity only
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    tick_spacing = int(pool.get("tickSpacing") or 0)
+    if tick_spacing <= 0:
+        fee_tier = int(pool.get("feeTier") or 0)
+        # Standard v3/v4-like default mapping
+        tick_spacing = {100: 1, 500: 10, 3000: 60, 10000: 200}.get(fee_tier, 10)
+    init_block = 0
     dbg["token0"] = token0
     dbg["token1"] = token1
     dbg["tick_spacing"] = int(tick_spacing)
     dbg["init_block"] = int(init_block)
     if not token0 or not token1:
-        dbg["error"] = "init_tokens_missing"
-        return 0.0, "", "strict_required:v4_exact2:init_tokens_missing", dbg
+        dbg["error"] = "pool_tokens_missing"
+        return 0.0, "", "strict_required:v4_exact2:pool_tokens_missing", dbg
     if tick_spacing <= 0:
-        dbg["error"] = "init_tick_spacing_missing"
-        return 0.0, "", "strict_required:v4_exact2:init_tick_spacing_missing", dbg
+        dbg["error"] = "tick_spacing_missing"
+        return 0.0, "", "strict_required:v4_exact2:tick_spacing_missing", dbg
 
     sqrt_price_x96, current_tick, pool_liquidity, state_src_or_err = _read_v4_slot0_liquidity(chain_id, ck, pool_id)
     if sqrt_price_x96 <= 0:
@@ -605,41 +606,18 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     dbg["current_tick"] = int(current_tick)
     dbg["pool_liquidity"] = int(pool_liquidity)
 
-    ticks, ticks_status = _fetch_modified_ticks(
-        chain_id,
-        pool_manager,
-        pool_id,
-        max(0, int(init_block)),
-        int(latest),
-        deadline_ts=deadline,
-    )
-    dbg["ticks_status"] = str(ticks_status or "ok")
-    dbg["ticks_count"] = int(len(ticks))
-    a0_raw = 0.0
-    a1_raw = 0.0
-    qty_src_or_err = ""
-    if ticks:
-        a0_raw, a1_raw, qty_src_or_err = _compute_pool_token_amounts_onchain(
-            chain_id,
-            ck,
-            pool_id,
-            tick_spacing,
-            current_tick,
-            sqrt_price_x96,
-            ticks,
-            deadline_ts=deadline,
-        )
-    dbg["full_scan_qty_mode"] = str(qty_src_or_err or "")
-    if (a0_raw <= 0.0 and a1_raw <= 0.0) and str(ticks_status or "") in {"timeout", "empty"}:
-        # Still pure on-chain: fast approximation from active liquidity range only.
-        a0_raw, a1_raw, qty_src_or_err = _active_window_amounts(pool_liquidity, current_tick, tick_spacing, sqrt_price_x96)
+    # one-point quantity mode: fast active-window approximation from on-chain state
+    dbg["ticks_status"] = "skipped_one_point_mode"
+    dbg["ticks_count"] = 0
+    a0_raw, a1_raw, qty_src_or_err = _active_window_amounts(pool_liquidity, current_tick, tick_spacing, sqrt_price_x96)
+    dbg["full_scan_qty_mode"] = "disabled"
     dbg["quantity_source"] = str(qty_src_or_err or "")
     dbg["amount0_raw"] = float(a0_raw or 0.0)
     dbg["amount1_raw"] = float(a1_raw or 0.0)
     if a0_raw <= 0.0 and a1_raw <= 0.0:
-        dbg["error"] = str(qty_src_or_err or f"quantities_unavailable:{ticks_status or 'unknown'}")
+        dbg["error"] = str(qty_src_or_err or "quantities_unavailable")
         dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
-        return 0.0, "", str(qty_src_or_err or f"strict_required:v4_exact2:quantities_unavailable:{ticks_status or 'unknown'}"), dbg
+        return 0.0, "", str(qty_src_or_err or "strict_required:v4_exact2:quantities_unavailable"), dbg
 
     d0 = int(_erc20_decimals(chain_id, token0))
     d1 = int(_erc20_decimals(chain_id, token1))
@@ -684,10 +662,7 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     psrc = s0 or s1
     if s0 and s1 and s0 != s1:
         psrc = f"{s0}+{s1}"
-    src = (
-        f"v4_exact2:pure_onchain_qty={qty_src_or_err}"
-        f":state={state_src_or_err}:liq={int(pool_liquidity)}:tick={int(current_tick)}:price={psrc}"
-    )
+    src = f"v4_exact2:one_point_qty={qty_src_or_err}:state={state_src_or_err}:liq={int(pool_liquidity)}:tick={int(current_tick)}:price={psrc}"
     dbg["price_source"] = str(psrc or "")
     dbg["tvl_now_usd"] = float(tvl)
     dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
@@ -816,7 +791,7 @@ def main() -> None:
     exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
     reason = (
-        f"exact_v4_2_onchain_quantities:points=1:cov={exact_cov:.2f}"
+        f"exact_v4_2_onchain_quantities:one_point_now:cov={exact_cov:.2f}"
         f":days={len(fees_usd)}:raw_pos={raw_tvl_positive_days}:raw_zero={raw_tvl_zero_days}"
         f":src={price_source or 'onchain'}"
     )
