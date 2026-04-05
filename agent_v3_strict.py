@@ -163,7 +163,7 @@ def _v3_active_positions_amounts_from_subgraph(
     if int(sqrt_price_x96) <= 0:
         return 0.0, 0.0, "active_positions_invalid_price", {"active_positions_count": 0}
 
-    q = """
+    q_filtered = """
     query ActivePositions($pool: String!, $tick: BigInt!, $last: String!) {
       positions(
         first: 1000
@@ -175,6 +175,25 @@ def _v3_active_positions_amounts_from_subgraph(
           id_gt: $last
           tickLower_: { tickIdx_lt: $tick }
           tickUpper_: { tickIdx_gt: $tick }
+        }
+      ) {
+        id
+        liquidity
+        tickLower { tickIdx }
+        tickUpper { tickIdx }
+      }
+    }
+    """
+    q_unfiltered = """
+    query ActivePositionsUnfiltered($pool: String!, $last: String!) {
+      positions(
+        first: 1000
+        orderBy: id
+        orderDirection: asc
+        where: {
+          pool: $pool
+          liquidity_gt: "0"
+          id_gt: $last
         }
       ) {
         id
@@ -197,69 +216,88 @@ def _v3_active_positions_amounts_from_subgraph(
         sqrt_cache[x] = v
         return v
 
-    total0 = Decimal(0)
-    total1 = Decimal(0)
-    scanned = 0
-    last_id = ""
-    pages = 0
-    max_pages = int(max(1, int(os.environ.get("STRICT_V3_ACTIVE_POS_MAX_PAGES", "30") or 30)))
-    max_rows = int(max(1000, int(os.environ.get("STRICT_V3_ACTIVE_POS_MAX_ROWS", "30000") or 30000)))
-    while pages < max_pages and scanned < max_rows:
-        try:
-            data = graphql_query(
-                ep,
-                q,
-                {"pool": pid, "tick": str(int(current_tick)), "last": str(last_id)},
-                retries=1,
-            )
-        except Exception as e:
-            return float(total0), float(total1), f"active_positions_query_failed:{e}", {
-                "active_positions_count": int(scanned),
-                "active_positions_pages": int(pages),
-            }
-        rows = ((data or {}).get("data") or {}).get("positions") or []
-        if not isinstance(rows, list) or not rows:
-            break
-        pages += 1
-        for r in rows:
+    max_pages = int(max(1, int(os.environ.get("STRICT_V3_ACTIVE_POS_MAX_PAGES", "40") or 40)))
+    max_rows = int(max(1000, int(os.environ.get("STRICT_V3_ACTIVE_POS_MAX_ROWS", "50000") or 50000)))
+
+    def _scan(query_text: str, *, use_tick_filter: bool) -> tuple[Decimal, Decimal, int, int, int, str]:
+        total0 = Decimal(0)
+        total1 = Decimal(0)
+        scanned = 0
+        visited = 0
+        last_id = ""
+        pages = 0
+        err = ""
+        while pages < max_pages and visited < max_rows:
+            vars_payload = {"pool": pid, "last": str(last_id)}
+            if use_tick_filter:
+                vars_payload["tick"] = str(int(current_tick))
             try:
-                liq = int(str((r or {}).get("liquidity") or "0"))
-                lo = int(str((((r or {}).get("tickLower") or {}).get("tickIdx") or "0")))
-                hi = int(str((((r or {}).get("tickUpper") or {}).get("tickIdx") or "0")))
-            except Exception:
-                continue
-            if liq <= 0 or hi <= lo:
-                continue
-            # Strictly in-range only: both token sides are non-zero at current price.
-            if not (lo < int(current_tick) < hi):
-                continue
-            sqrt_lo = _sqrt_tick(lo)
-            sqrt_hi = _sqrt_tick(hi)
-            if sqrt_p <= sqrt_lo:
-                a0, _ = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_hi)
-                a1 = Decimal(0)
-            elif sqrt_p >= sqrt_hi:
-                a0 = Decimal(0)
-                _, a1 = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_hi)
-            else:
+                data = graphql_query(ep, query_text, vars_payload, retries=1)
+            except Exception as e:
+                err = f"active_positions_query_failed:{e}"
+                break
+            rows = ((data or {}).get("data") or {}).get("positions") or []
+            if not isinstance(rows, list) or not rows:
+                break
+            pages += 1
+            for r in rows:
+                try:
+                    liq = int(str((r or {}).get("liquidity") or "0"))
+                    lo = int(str((((r or {}).get("tickLower") or {}).get("tickIdx") or "0")))
+                    hi = int(str((((r or {}).get("tickUpper") or {}).get("tickIdx") or "0")))
+                except Exception:
+                    continue
+                visited += 1
+                if liq <= 0 or hi <= lo:
+                    continue
+                # Strict in-range criterion: both token sides must be non-zero.
+                if not (lo < int(current_tick) < hi):
+                    continue
+                sqrt_lo = _sqrt_tick(lo)
+                sqrt_hi = _sqrt_tick(hi)
+                if not (sqrt_lo < sqrt_p < sqrt_hi):
+                    continue
                 a0, _ = _amounts_from_liquidity_segment(Decimal(liq), sqrt_p, sqrt_hi)
                 _, a1 = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_p)
-            if a0 <= 0 or a1 <= 0:
-                continue
-            total0 += max(Decimal(0), a0)
-            total1 += max(Decimal(0), a1)
-            scanned += 1
-        last_id = str((rows[-1] or {}).get("id") or last_id)
-        if len(rows) < 1000:
-            break
-    src = "active_positions_subgraph"
-    if scanned >= max_rows:
-        src = "active_positions_partial_row_cap"
+                if a0 <= 0 or a1 <= 0:
+                    continue
+                total0 += a0
+                total1 += a1
+                scanned += 1
+                if visited >= max_rows:
+                    break
+            last_id = str((rows[-1] or {}).get("id") or last_id)
+            if len(rows) < 1000:
+                break
+        return total0, total1, scanned, pages, visited, err
+
+    total0, total1, scanned, pages, visited, err = _scan(q_filtered, use_tick_filter=True)
+    source_base = "active_positions_subgraph_filtered"
+    if err:
+        source_base = "active_positions_filtered_error"
+    # Some indexers can ignore/deny nested tick filters and return no rows.
+    # Fallback: scan pool positions and apply strict in-range check locally.
+    if scanned <= 0:
+        f_total0, f_total1, f_scanned, f_pages, f_visited, f_err = _scan(q_unfiltered, use_tick_filter=False)
+        if f_scanned > 0 or (not err and not f_err):
+            total0, total1, scanned, pages, visited = f_total0, f_total1, f_scanned, f_pages, f_visited
+            source_base = "active_positions_subgraph_local_filter"
+            err = f_err
+        elif f_err and not err:
+            err = f_err
+            source_base = "active_positions_local_filter_error"
+
+    src = source_base
+    if scanned >= max_rows or visited >= max_rows:
+        src = f"{source_base}_partial_row_cap"
     elif pages >= max_pages:
-        src = "active_positions_partial_page_cap"
+        src = f"{source_base}_partial_page_cap"
+    if err:
+        src = f"{src}:{err}"
     return float(total0), float(total1), src, {
         "active_positions_count": int(scanned),
         "active_positions_pages": int(pages),
+        "active_positions_rows_visited": int(visited),
     }
 
 
