@@ -173,7 +173,7 @@ def _v3_active_positions_amounts_from_subgraph(
           pool: $pool
           liquidity_gt: "0"
           id_gt: $last
-          tickLower_: { tickIdx_lte: $tick }
+          tickLower_: { tickIdx_lt: $tick }
           tickUpper_: { tickIdx_gt: $tick }
         }
       ) {
@@ -230,6 +230,9 @@ def _v3_active_positions_amounts_from_subgraph(
                 continue
             if liq <= 0 or hi <= lo:
                 continue
+            # Strictly in-range only: both token sides are non-zero at current price.
+            if not (lo < int(current_tick) < hi):
+                continue
             sqrt_lo = _sqrt_tick(lo)
             sqrt_hi = _sqrt_tick(hi)
             if sqrt_p <= sqrt_lo:
@@ -241,6 +244,8 @@ def _v3_active_positions_amounts_from_subgraph(
             else:
                 a0, _ = _amounts_from_liquidity_segment(Decimal(liq), sqrt_p, sqrt_hi)
                 _, a1 = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_p)
+            if a0 <= 0 or a1 <= 0:
+                continue
             total0 += max(Decimal(0), a0)
             total1 += max(Decimal(0), a1)
             scanned += 1
