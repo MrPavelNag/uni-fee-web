@@ -31315,8 +31315,8 @@ HTML_PAGE = """
     }
     .mode-filter-line {
       display: grid;
-      grid-template-columns: 94px 1fr;
-      gap: 6px;
+      grid-template-columns: 112px 1fr;
+      gap: 10px;
       align-items: stretch;
       margin-bottom: 6px;
     }
@@ -31324,10 +31324,11 @@ HTML_PAGE = """
     .mode-filter-wrap {
       position: relative;
       display: grid;
-      grid-template-columns: 94px 1fr;
-      column-gap: 8px;
+      grid-template-columns: 112px 1fr;
+      column-gap: 14px;
       row-gap: 8px;
       align-items: center;
+      padding-left: 18px;
     }
     .mode-filter-wrap::before {
       content: "";
@@ -31336,7 +31337,7 @@ HTML_PAGE = """
       top: 50%;
       transform: translateY(-50%);
       height: 112px;
-      width: 94px;
+      width: 112px;
       border: 1px solid #d1dbe9;
       border-radius: 12px;
       background: linear-gradient(180deg, rgba(248, 251, 255, 0.9) 0%, rgba(242, 247, 255, 0.9) 100%);
@@ -31356,12 +31357,7 @@ HTML_PAGE = """
     }
     .mode-filter-wrap .inline-grid {
       grid-column: 2;
-    }
-    #estimatedModeLine .mode-check {
-      transform: translateY(-6px);
-    }
-    #exactModeLine .mode-check {
-      transform: translateY(6px);
+      margin-left: 8px;
     }
     .mode-check {
       display: flex;
@@ -31388,11 +31384,11 @@ HTML_PAGE = """
       accent-color: #2563eb;
     }
     .estimated-grid {
-      grid-template-columns: 98px 92px 120px 92px 118px;
+      grid-template-columns: 92px 86px 112px 86px 110px;
       gap: 4px;
     }
     .exact-grid {
-      grid-template-columns: 92px minmax(360px, 560px);
+      grid-template-columns: 104px minmax(420px, 680px);
       gap: 4px;
     }
     .estimated-grid .filter-item .hint,
@@ -31435,7 +31431,7 @@ HTML_PAGE = """
       letter-spacing: 0.01em;
     }
     .filter-item.contract-item {
-      max-width: 560px;
+      max-width: 700px;
     }
     .contract-input-row {
       display: grid;
@@ -31449,6 +31445,8 @@ HTML_PAGE = """
       color: #64748b;
       line-height: 1.2;
       margin: 0;
+      text-align: right;
+      justify-self: end;
     }
     .mode-disabled {
       opacity: 0.45;
