@@ -129,6 +129,8 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "", stri
         "strict_compare_estimated_active_tvl": [],
         "strict_compare_estimated_active_fees": [],
         "strict_compare_exact_tvl": [],
+        "strict_compare_exact_active_tvl": [],
+        "strict_compare_exact_active_fees": [],
         "strict_compare_exact_fees": [],
     }
 
@@ -746,6 +748,73 @@ def _rebuild_fees_cumulative(fees_usd: list[tuple[int, float]], tvl_series: list
     return out
 
 
+def _append_now_tvl_anchor(tvl_series: list[tuple[int, float]], now_tvl_usd: float) -> list[tuple[int, float]]:
+    out = list(tvl_series or [])
+    now_ts = int(time.time())
+    now_tvl = float(max(0.0, now_tvl_usd))
+    if out and int(out[-1][0]) >= now_ts - 3600:
+        out[-1] = (int(out[-1][0]), now_tvl)
+    else:
+        out.append((now_ts, now_tvl))
+    return out
+
+
+def _append_now_fee_anchor(fee_series: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    out = list(fee_series or [])
+    now_ts = int(time.time())
+    last_val = float(out[-1][1]) if out else 0.0
+    if out and int(out[-1][0]) >= now_ts - 3600:
+        out[-1] = (int(out[-1][0]), last_val)
+    else:
+        out.append((now_ts, last_val))
+    return out
+
+
+def _sparse_series_every_n_days(series: list[tuple[int, float]], step_days: int = 5) -> list[tuple[int, float]]:
+    arr: list[tuple[int, float]] = []
+    seen_ts: set[int] = set()
+    for ts, v in sorted((series or []), key=lambda x: int(x[0])):
+        t = int(ts)
+        if t in seen_ts:
+            continue
+        seen_ts.add(t)
+        arr.append((t, float(v)))
+    if not arr:
+        return []
+    step_sec = max(86400, int(max(1, int(step_days)) * 86400))
+    first_ts = int(arr[0][0])
+    last_ts = int(arr[-1][0])
+    targets: list[int] = []
+    cur = int((first_ts // 86400) * 86400)
+    end = int((last_ts // 86400) * 86400)
+    while cur <= end:
+        targets.append(int(cur))
+        cur += step_sec
+    if not targets or targets[-1] != int(last_ts):
+        targets.append(int(last_ts))
+
+    out: list[tuple[int, float]] = []
+    used_idx: set[int] = set()
+    for target in targets:
+        best_i = -1
+        best_d = 10**30
+        for i, (ts, _v) in enumerate(arr):
+            if i in used_idx:
+                continue
+            d = abs(int(ts) - int(target))
+            if d < best_d:
+                best_d = d
+                best_i = i
+        if best_i < 0:
+            continue
+        used_idx.add(best_i)
+        out.append((int(arr[best_i][0]), float(arr[best_i][1])))
+    out = sorted(out, key=lambda x: int(x[0]))
+    if out and int(out[-1][0]) != int(last_ts):
+        out.append((int(last_ts), float(arr[-1][1])))
+    return out
+
+
 def _one_point_exact_tvl(fees_usd: list[tuple[int, float]], tvl_now: float) -> list[tuple[int, float]]:
     if not fees_usd:
         return []
@@ -837,20 +906,51 @@ def main() -> None:
     estimated_fees: list[tuple[int, float]] = []
     estimated_active_tvl: list[tuple[int, float]] = []
     estimated_active_fees: list[tuple[int, float]] = []
+    exact_tvl: list[tuple[int, float]] = []
+    exact_fees: list[tuple[int, float]] = []
+    exact_active_tvl: list[tuple[int, float]] = []
+    exact_active_fees: list[tuple[int, float]] = []
     tvl_active_now = float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0)
+
+    try:
+        exact_step_days = max(1, int(os.environ.get("STRICT_V4_EXACT_STEP_DAYS", "5")))
+    except Exception:
+        exact_step_days = 5
+
     if raw_tvl_positive_days > 0:
-        estimated_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
-        estimated_fees = _rebuild_fees_cumulative(fees_usd, estimated_tvl)
+        estimated_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
+        estimated_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_tvl_base)
+        estimated_tvl = _append_now_tvl_anchor(estimated_tvl_base, float(pool_tvl_now_usd))
+        estimated_fees = _append_now_fee_anchor(estimated_fees_base)
+
+        # Align V4 exact compare behavior with V3 exact compare:
+        # exact series = sparse points over exact-now anchored shape + explicit NOW anchor.
+        exact_tvl = _sparse_series_every_n_days(estimated_tvl_base, exact_step_days)
+        exact_tvl = _append_now_tvl_anchor(exact_tvl, float(pool_tvl_now_usd))
+        exact_fees = _sparse_series_every_n_days(estimated_fees_base, exact_step_days)
+        exact_fees = _append_now_fee_anchor(exact_fees)
+
         if tvl_active_now > 0.0:
-            estimated_active_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
-            estimated_active_fees = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl)
+            estimated_active_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
+            estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl_base)
+            estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
+            estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
+
+            exact_active_tvl = _sparse_series_every_n_days(estimated_active_tvl_base, exact_step_days)
+            exact_active_tvl = _append_now_tvl_anchor(exact_active_tvl, float(tvl_active_now))
+            exact_active_fees = _sparse_series_every_n_days(estimated_active_fees_base, exact_step_days)
+            exact_active_fees = _append_now_fee_anchor(exact_active_fees)
     else:
         # No historical day-shape: still expose a single estimate marker at TVL NOW.
         estimated_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
+        exact_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
         if tvl_active_now > 0.0:
             estimated_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
-    exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
-    exact_active_tvl = _one_point_marker_tvl(fees_usd, float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0))
+            exact_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
+    if (not exact_tvl) and fees_usd:
+        exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
+    if (not exact_active_tvl) and fees_usd and tvl_active_now > 0.0:
+        exact_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
     reason = (
         f"exact_v4_2_onchain_quantities:one_point_now:cov={exact_cov:.2f}"
@@ -880,7 +980,8 @@ def main() -> None:
         "strict_compare_estimated_active_fees": estimated_active_fees,
         "strict_compare_exact_tvl": exact_tvl,
         "strict_compare_exact_active_tvl": exact_active_tvl,
-        "strict_compare_exact_fees": [],
+        "strict_compare_exact_active_fees": exact_active_fees,
+        "strict_compare_exact_fees": exact_fees,
         "strict_estimated_shape_missing": bool(raw_tvl_positive_days <= 0),
     }
     save_chart_data_json({str(pool.get("id") or ""): payload}, out_path)
