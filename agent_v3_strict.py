@@ -39,6 +39,8 @@ from agent_v3 import (
 
 
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+V3_MINT_TOPIC = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"
+V3_BURN_TOPIC = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c"
 _POOL_CHAIN_CACHE_PATH = os.environ.get("STRICT_POOL_CHAIN_CACHE_PATH", "data/strict_pool_chain_cache.json")
 _EXACT2_CACHE_DB_PATH = os.environ.get("STRICT_EXACT2_CACHE_DB_PATH", "data/exact2_daily_cache.sqlite3")
 _WARN_LOCK = threading.Lock()
@@ -301,6 +303,109 @@ def _v3_active_positions_amounts_from_subgraph(
     }
 
 
+def _v3_active_positions_amounts_onchain_logs(
+    *,
+    chain_id: int,
+    pool_id: str,
+    current_tick: int,
+    sqrt_price_x96: int,
+    from_block: int,
+    to_block: int,
+) -> tuple[float, float, str, dict[str, Any]]:
+    if int(sqrt_price_x96) <= 0:
+        return 0.0, 0.0, "active_positions_onchain_invalid_price", {"active_positions_ranges": 0}
+    start_block = int(max(1, int(from_block)))
+    end_block = int(max(start_block, int(to_block)))
+    by_range_liq: dict[tuple[int, int], int] = {}
+    scanned_logs = 0
+
+    def _on_log(log: dict) -> None:
+        nonlocal scanned_logs
+        scanned_logs += 1
+        topics = log.get("topics") or []
+        if not isinstance(topics, list) or len(topics) < 4:
+            return
+        t0 = str(topics[0] or "").strip().lower()
+        if t0 not in {V3_MINT_TOPIC, V3_BURN_TOPIC}:
+            return
+        try:
+            lo = int(_decode_int24_from_word(str(topics[2] or "")))
+            hi = int(_decode_int24_from_word(str(topics[3] or "")))
+        except Exception:
+            return
+        if hi <= lo:
+            return
+        words = _hex_words(str(log.get("data") or ""))
+        amt = 0
+        if t0 == V3_MINT_TOPIC:
+            # Mint data: sender, amount, amount0, amount1.
+            amt = int(_decode_uint_word(words[1])) if len(words) >= 2 else 0
+            sign = 1
+        else:
+            # Burn data: amount, amount0, amount1.
+            amt = int(_decode_uint_word(words[0])) if len(words) >= 1 else 0
+            sign = -1
+        if amt <= 0:
+            return
+        k = (int(lo), int(hi))
+        by_range_liq[k] = int(by_range_liq.get(k, 0)) + int(sign) * int(amt)
+
+    try:
+        _logs, _covered_from, _timed_out = _fetch_logs_adaptive(
+            int(chain_id),
+            str(pool_id).strip().lower(),
+            [V3_MINT_TOPIC],
+            int(start_block),
+            int(end_block),
+            deadline_ts=(time.monotonic() + max(3.0, float(os.environ.get("STRICT_V3_ACTIVE_ONCHAIN_BUDGET_SEC", "20")))),
+            on_log=_on_log,
+        )
+        _logs2, _covered_from2, _timed_out2 = _fetch_logs_adaptive(
+            int(chain_id),
+            str(pool_id).strip().lower(),
+            [V3_BURN_TOPIC],
+            int(start_block),
+            int(end_block),
+            deadline_ts=(time.monotonic() + max(3.0, float(os.environ.get("STRICT_V3_ACTIVE_ONCHAIN_BUDGET_SEC", "20")))),
+            on_log=_on_log,
+        )
+        timed_out = bool(_timed_out or _timed_out2)
+        covered_from = int(min(_covered_from, _covered_from2))
+    except Exception as e:
+        return 0.0, 0.0, f"active_positions_onchain_logs_failed:{e}", {"active_positions_ranges": 0}
+
+    sqrt_p = Decimal(int(sqrt_price_x96))
+    total0 = Decimal(0)
+    total1 = Decimal(0)
+    ranges_used = 0
+    for (lo, hi), liq_raw in by_range_liq.items():
+        liq = int(liq_raw)
+        if liq <= 0:
+            continue
+        if not (int(lo) < int(current_tick) < int(hi)):
+            continue
+        sqrt_lo = _sqrt_ratio_x96_at_tick(int(lo))
+        sqrt_hi = _sqrt_ratio_x96_at_tick(int(hi))
+        if not (sqrt_lo < sqrt_p < sqrt_hi):
+            continue
+        a0, _ = _amounts_from_liquidity_segment(Decimal(liq), sqrt_p, sqrt_hi)
+        _, a1 = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_p)
+        if a0 <= 0 or a1 <= 0:
+            continue
+        total0 += a0
+        total1 += a1
+        ranges_used += 1
+    src = "active_positions_onchain_logs"
+    if timed_out:
+        src = "active_positions_onchain_logs_partial_timeout"
+    return float(total0), float(total1), src, {
+        "active_positions_ranges": int(ranges_used),
+        "active_positions_logs_scanned": int(scanned_logs),
+        "active_positions_covered_from_block": int(covered_from),
+        "active_positions_timed_out": bool(timed_out),
+    }
+
+
 def _v3_pool_state_now(chain_id: int, pool_id: str) -> tuple[int, int, int, int, str]:
     p = str(pool_id or "").strip().lower()
     if not _is_eth_address(p):
@@ -463,6 +568,8 @@ def _query_pool_by_id(endpoint: str, pool_id: str) -> dict | None:
     query PoolById($id: String!) {
       pool(id: $id) {
         id
+        createdAtBlockNumber
+        createdAtTimestamp
         feeTier
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
@@ -487,6 +594,8 @@ def _query_pool_by_id(endpoint: str, pool_id: str) -> dict | None:
     query PoolByWhere($id: String!) {
       pools(where: { id: $id }, first: 1) {
         id
+        createdAtBlockNumber
+        createdAtTimestamp
         feeTier
         token0 { id symbol decimals name }
         token1 { id symbol decimals name }
@@ -585,6 +694,20 @@ def _resolve_pool_tvl_now_onchain(pool: dict, chain: str, endpoint: str = "") ->
         current_tick=int(tick_now),
         sqrt_price_x96=int(sqrt_p),
     )
+    if float(act0_raw) <= 0.0 and float(act1_raw) <= 0.0 and "no field `positions`" in str(_act_src).lower():
+        created_at_block = int(pool.get("createdAtBlockNumber") or 1)
+        og0, og1, og_src, og_dbg = _v3_active_positions_amounts_onchain_logs(
+            chain_id=int(chain_id),
+            pool_id=pool_id,
+            current_tick=int(tick_now),
+            sqrt_price_x96=int(sqrt_p),
+            from_block=int(created_at_block),
+            to_block=int(latest_block),
+        )
+        if float(og0) > 0.0 or float(og1) > 0.0:
+            act0_raw, act1_raw = float(og0), float(og1)
+        _act_src = str(og_src or _act_src)
+        _act_dbg = dict(og_dbg or {})
     act0 = float(act0_raw) / float(10 ** max(0, dec0))
     act1 = float(act1_raw) / float(10 ** max(0, dec1))
 
@@ -619,10 +742,12 @@ def _resolve_pool_tvl_now_onchain(pool: dict, chain: str, endpoint: str = "") ->
         "tvl_full_pool_usd": float(tvl_full),
         "tvl_active_window_usd": float(tvl_active),
         "quantity_source": "full_pool_balanceOf",
-        "quantity_source_secondary": "active_positions_subgraph",
+        "quantity_source_secondary": "active_positions",
         "active_positions_source": str(_act_src or ""),
         "active_positions_count": int((_act_dbg or {}).get("active_positions_count") or 0),
         "active_positions_pages": int((_act_dbg or {}).get("active_positions_pages") or 0),
+        "active_positions_ranges": int((_act_dbg or {}).get("active_positions_ranges") or 0),
+        "active_positions_logs_scanned": int((_act_dbg or {}).get("active_positions_logs_scanned") or 0),
         "pool_state_error": str(state_err or ""),
         "current_tick": int(tick_now),
         "pool_liquidity": int(liq_now),
@@ -866,6 +991,30 @@ def _append_now_fee_anchor(fee_series: list[tuple[int, float]]) -> list[tuple[in
         out[-1] = (int(out[-1][0]), last_val)
     else:
         out.append((now_ts, last_val))
+    return out
+
+
+def _sparse_sample_series(series: list[tuple[int, float]], points: int = 5) -> list[tuple[int, float]]:
+    arr: list[tuple[int, float]] = []
+    seen_ts: set[int] = set()
+    for ts, v in sorted((series or []), key=lambda x: int(x[0])):
+        t = int(ts)
+        if t in seen_ts:
+            continue
+        seen_ts.add(t)
+        arr.append((t, float(v)))
+    if not arr:
+        return []
+    n_req = max(1, int(points))
+    n = min(n_req, len(arr))
+    if n == len(arr):
+        return arr
+    if n == 1:
+        return [arr[-1]]
+    idxs = sorted(set(int(round(i * (len(arr) - 1) / (n - 1))) for i in range(n)))
+    out = [arr[i] for i in idxs if 0 <= i < len(arr)]
+    if out and out[-1][0] != arr[-1][0]:
+        out.append(arr[-1])
     return out
 
 
@@ -1920,11 +2069,21 @@ def main() -> None:
     tvl_active_now = float((tvl_now_debug or {}).get("tvl_active_window_usd") or 0.0)
     estimated_active_tvl: list[tuple[int, float]] = []
     estimated_active_fees: list[tuple[int, float]] = []
+    exact_active_tvl: list[tuple[int, float]] = []
     if tvl_active_now > 0.0:
         estimated_active_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
         estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl_base)
         estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
         estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
+        try:
+            active_points = max(1, int(os.environ.get("STRICT_V3_ACTIVE_WINDOW_POINTS", "5")))
+        except Exception:
+            active_points = 5
+        # Exact active-window is intentionally sparse for performance:
+        # keep a small set of representative points including TVL NOW.
+        exact_active_tvl = _sparse_sample_series(estimated_active_tvl, active_points)
+        if exact_active_tvl:
+            exact_active_tvl[-1] = (int(exact_active_tvl[-1][0]), float(max(0.0, tvl_active_now)))
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
@@ -2184,16 +2343,7 @@ def main() -> None:
         "strict_compare_estimated_active_tvl": estimated_active_tvl,
         "strict_compare_estimated_active_fees": estimated_active_fees,
         "strict_compare_exact_tvl": strict_exact_tvl,
-        "strict_compare_exact_active_tvl": (
-            [
-                (
-                    int(fees_usd[-1][0]),
-                    float(max(0.0, (tvl_now_debug or {}).get("tvl_active_window_usd") or 0.0)),
-                )
-            ]
-            if fees_usd
-            else []
-        ),
+        "strict_compare_exact_active_tvl": exact_active_tvl,
         "strict_compare_exact_fees": strict_exact_fees,
     }
 
