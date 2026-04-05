@@ -86,6 +86,32 @@ _V4_TOPIC_INITIALIZE = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e61
 _V4_TOPIC_MODIFY_LIQ = "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec"
 
 
+def _keccak256_hex(data: bytes) -> str:
+    try:
+        from eth_hash.auto import keccak as _keccak  # type: ignore
+
+        h = _keccak(data)
+        return "0x" + bytes(h).hex()
+    except Exception:
+        return ""
+
+
+def _v4_swap_topic_candidates() -> list[str]:
+    # Candidate signatures used across v4 indexers/ABIs.
+    sigs = [
+        b"Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)",
+        b"Swap(bytes32,address,int128,int128,uint160,uint128,int24)",
+        b"Swap(bytes32,address,address,int128,int128,uint160,uint128,int24)",
+        b"Swap(bytes32,address,address,int256,int256,uint160,uint128,int24)",
+    ]
+    out: list[str] = []
+    for sig in sigs:
+        t0 = _keccak256_hex(sig)
+        if t0 and t0 not in out:
+            out.append(t0.lower())
+    return out
+
+
 def _is_hex(v: str, n_hex: int) -> bool:
     s = str(v or "").strip().lower()
     if not s.startswith("0x"):
@@ -717,6 +743,214 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     return float(tvl), src, "", dbg
 
 
+def _guess_v4_swap_topic(chain_id: int, pool_manager: str, pool_id: str, latest_block: int) -> tuple[str, str]:
+    pid = str(pool_id or "").strip().lower()
+    hi = int(latest_block)
+    step = 48_000
+    try:
+        max_back = max(48_000, int(os.environ.get("STRICT_V4_SWAP_TOPIC_SCAN_BLOCKS", "180000")))
+    except Exception:
+        max_back = 180_000
+    scanned = 0
+    # 1) Try known signature candidates first.
+    for t0 in _v4_swap_topic_candidates():
+        cur_hi = int(hi)
+        scanned = 0
+        while cur_hi >= 0 and scanned <= max_back:
+            cur_lo = max(0, cur_hi - step + 1)
+            try:
+                rows = _rpc_get_logs(chain_id, pool_manager, cur_lo, cur_hi, [str(t0), pid], timeout_sec=10.0)
+            except Exception:
+                rows = []
+            if rows:
+                return str(t0), "candidate_topic1_poolid"
+            scanned += (cur_hi - cur_lo + 1)
+            cur_hi = cur_lo - 1
+
+    # 2) Fallback: infer by most frequent unknown topic0 with swap-like payload.
+    rows: list[dict[str, Any]] = []
+    cur_hi = int(hi)
+    scanned = 0
+    while cur_hi >= 0 and scanned <= max_back and not rows:
+        cur_lo = max(0, cur_hi - step + 1)
+        try:
+            rows = _rpc_get_logs(chain_id, pool_manager, cur_lo, cur_hi, [None, pid], timeout_sec=12.0)
+        except Exception:
+            rows = []
+        scanned += (cur_hi - cur_lo + 1)
+        cur_hi = cur_lo - 1
+    counts: dict[str, int] = {}
+    for lg in rows:
+        topics = [str(x or "").strip().lower() for x in (lg.get("topics") or [])]
+        if not topics:
+            continue
+        t0 = topics[0]
+        if t0 in {_V4_TOPIC_INITIALIZE, _V4_TOPIC_MODIFY_LIQ}:
+            continue
+        words = _hex_words(str(lg.get("data") or ""))
+        if len(words) < 2:
+            continue
+        a0 = _decode_int_word(words[0], bits=256)
+        a1 = _decode_int_word(words[1], bits=256)
+        if a0 == 0 or a1 == 0:
+            continue
+        if a0 * a1 >= 0:
+            continue
+        counts[t0] = int(counts.get(t0, 0)) + 1
+    if not counts:
+        counts_data0: dict[str, int] = {}
+        pid_word = str(pid[2:]).zfill(64)
+        for lg in rows:
+            topics = [str(x or "").strip().lower() for x in (lg.get("topics") or [])]
+            if not topics:
+                continue
+            t0 = topics[0]
+            if t0 in {_V4_TOPIC_INITIALIZE, _V4_TOPIC_MODIFY_LIQ}:
+                continue
+            words = _hex_words(str(lg.get("data") or ""))
+            if len(words) < 3:
+                continue
+            if str(words[0]).lower() != pid_word:
+                continue
+            a0 = _decode_int_word(words[1], bits=256)
+            a1 = _decode_int_word(words[2], bits=256)
+            if a0 == 0 or a1 == 0 or (a0 * a1) >= 0:
+                continue
+            counts_data0[t0] = int(counts_data0.get(t0, 0)) + 1
+        if counts_data0:
+            t0_best = max(counts_data0.items(), key=lambda kv: int(kv[1]))[0]
+            return str(t0_best), "inferred_data0_poolid"
+        return "", "not_found"
+    t0_best = max(counts.items(), key=lambda kv: int(kv[1]))[0]
+    return str(t0_best), "inferred_topic1_poolid"
+
+
+def _v4_onchain_swap_fee_daily(
+    *,
+    chain: str,
+    chain_id: int,
+    pool: dict[str, Any],
+    pool_id: str,
+    fee_pct: float,
+    latest_block: int,
+    day_count: int,
+    budget_sec: float,
+) -> tuple[dict[int, float], dict[str, Any]]:
+    out_dbg: dict[str, Any] = {"source": "onchain_swap_logs"}
+    pm, _sv = _onchain_addresses_for_chain(chain)
+    if not pm:
+        out_dbg["error"] = "pool_manager_not_configured"
+        return {}, out_dbg
+    topic0, topic_src = _guess_v4_swap_topic(int(chain_id), pm, str(pool_id), int(latest_block))
+    out_dbg["swap_topic_source"] = str(topic_src)
+    out_dbg["swap_topic0"] = str(topic0 or "")
+    if not topic0:
+        out_dbg["error"] = "swap_topic_not_found"
+        return {}, out_dbg
+
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    d0 = int(_erc20_decimals(chain_id, token0)) if token0 else 18
+    d1 = int(_erc20_decimals(chain_id, token1)) if token1 else 18
+    d0 = d0 if 0 < d0 <= 36 else 18
+    d1 = d1 if 0 < d1 <= 36 else 18
+    prices, _sources, _errs = get_token_prices_usd(str(chain), [token0, token1])
+    p0 = float(prices.get(token0) or 0.0)
+    p1 = float(prices.get(token1) or 0.0)
+    out_dbg["token0_price_usd"] = float(p0)
+    out_dbg["token1_price_usd"] = float(p1)
+    if p0 <= 0.0 and p1 <= 0.0:
+        out_dbg["error"] = "token_prices_unavailable"
+        return {}, out_dbg
+
+    # Conservative per-chain block time for day-range approximation.
+    block_time_sec = {
+        "ethereum": 12.0,
+        "arbitrum": 0.25,
+        "base": 2.0,
+        "optimism": 2.0,
+        "polygon": 2.0,
+        "bsc": 3.0,
+        "avalanche": 2.0,
+        "celo": 5.0,
+        "unichain": 1.0,
+    }.get(str(chain or "").strip().lower(), 3.0)
+    lookback_blocks = int(max(20_000, (max(1, int(day_count)) * 86400.0 / max(0.2, float(block_time_sec))) * 1.25))
+    from_block = max(0, int(latest_block) - lookback_blocks)
+    to_block = int(latest_block)
+    out_dbg["from_block"] = int(from_block)
+    out_dbg["to_block"] = int(to_block)
+
+    deadline_ts = time.monotonic() + max(8.0, float(budget_sec))
+    rows: list[dict[str, Any]] = []
+    step = 48_000
+    cur = int(from_block)
+    while cur <= int(to_block):
+        if time.monotonic() >= deadline_ts:
+            out_dbg["timeout"] = True
+            break
+        hi = min(int(to_block), cur + step - 1)
+        try:
+            if str(topic_src).endswith("data0_poolid"):
+                part = _rpc_get_logs(int(chain_id), pm, cur, hi, [str(topic0)], timeout_sec=12.0)
+            else:
+                part = _rpc_get_logs(int(chain_id), pm, cur, hi, [str(topic0), str(pool_id).strip().lower()], timeout_sec=12.0)
+        except Exception:
+            part = []
+        if part:
+            rows.extend(part)
+        cur = hi + 1
+    out_dbg["swap_logs"] = int(len(rows))
+    if not rows:
+        return {}, out_dbg
+
+    now_ts = int(time.time())
+    latest_b = int(latest_block)
+    day_fees: dict[int, float] = {}
+    used = 0
+    pid_word = str(str(pool_id).strip().lower()[2:]).zfill(64)
+    for lg in rows:
+        try:
+            bno = int(str(lg.get("blockNumber") or "0x0"), 16)
+        except Exception:
+            bno = 0
+        words = _hex_words(str(lg.get("data") or ""))
+        if len(words) < 2:
+            continue
+        if str(topic_src).endswith("data0_poolid"):
+            if len(words) < 3:
+                continue
+            if str(words[0]).lower() != pid_word:
+                continue
+            a0_raw = int(_decode_int_word(words[1], bits=256))
+            a1_raw = int(_decode_int_word(words[2], bits=256))
+        else:
+            a0_raw = int(_decode_int_word(words[0], bits=256))
+            a1_raw = int(_decode_int_word(words[1], bits=256))
+        if a0_raw == 0 or a1_raw == 0 or (a0_raw * a1_raw) >= 0:
+            continue
+        a0 = abs(float(a0_raw)) / float(10**d0)
+        a1 = abs(float(a1_raw)) / float(10**d1)
+        usd0 = a0 * max(0.0, float(p0))
+        usd1 = a1 * max(0.0, float(p1))
+        if usd0 <= 0.0 and usd1 <= 0.0:
+            continue
+        # Conservative notional: use smaller side value to reduce decode outliers.
+        gross_usd = min(x for x in [usd0, usd1] if x > 0.0)
+        if gross_usd <= 0.0:
+            continue
+        fee_usd = float(gross_usd) * max(0.0, float(fee_pct))
+        if fee_usd <= 0.0:
+            continue
+        ts = int(now_ts - max(0, latest_b - max(0, int(bno))) * float(block_time_sec))
+        day_ts = (int(ts) // 86400) * 86400
+        day_fees[day_ts] = float(day_fees.get(day_ts, 0.0) + fee_usd)
+        used += 1
+    out_dbg["swap_logs_used"] = int(used)
+    out_dbg["day_points"] = int(len(day_fees))
+    return day_fees, out_dbg
+
+
 def _build_estimated_tvl(fees_usd: list[tuple[int, float]], raw_tvl: list[tuple[int, float]], tvl_now: float) -> list[tuple[int, float]]:
     out = [(int(ts), float(tvl_now)) for ts, _ in fees_usd]
     if raw_tvl and len(raw_tvl) == len(fees_usd):
@@ -868,7 +1102,6 @@ def main() -> None:
         if ts <= 0:
             continue
         fees_usd.append((ts, max(0.0, float(r.get("feesUSD") or 0.0))))
-        fees_sanity_usd.append((ts, max(0.0, float(r.get("volumeUSD") or 0.0)) * max(0.0, float(fee_pct))))
         raw_tvl.append((ts, max(0.0, float(r.get("tvlUSD") or 0.0))))
     if not fees_usd:
         save_chart_data_json(
@@ -906,6 +1139,22 @@ def main() -> None:
     strict_dbg["raw_tvl_positive_days"] = int(raw_tvl_positive_days)
     strict_dbg["raw_tvl_zero_days"] = int(raw_tvl_zero_days)
     strict_dbg["budget_sec"] = float(budget_sec)
+    chain_id = int(CHAIN_ID_BY_KEY.get(str(found_chain or "").strip().lower(), 0) or 0)
+    swap_day_fees, swap_dbg = _v4_onchain_swap_fee_daily(
+        chain=str(found_chain),
+        chain_id=int(chain_id),
+        pool=pool,
+        pool_id=str(pool.get("id") or ""),
+        fee_pct=float(fee_pct),
+        latest_block=int((strict_dbg or {}).get("latest_block") or 0),
+        day_count=max(1, int(FEE_DAYS)),
+        budget_sec=max(8.0, float(budget_sec) * 0.5),
+    )
+    strict_dbg["sanity_fee_source"] = "onchain_swap_logs"
+    strict_dbg["sanity_swap_debug"] = dict(swap_dbg or {})
+    for ts, _ in (fees_usd or []):
+        day_ts = (int(ts) // 86400) * 86400
+        fees_sanity_usd.append((int(ts), float(swap_day_fees.get(day_ts, 0.0))))
 
     estimated_tvl: list[tuple[int, float]] = []
     estimated_fees: list[tuple[int, float]] = []

@@ -18038,14 +18038,14 @@ def _merge_for_web(
             if float(apy_pct) < float(min_apy_pct or 0.0):
                 filtered_out += 1
                 continue
-            if excluded_by_suffix(v, pool_id):
-                status = "filtered_suffix"
-            elif in_fee_range(v):
-                status = "ok"
-            else:
-                status = "filtered_fee_range"
-            if status != "ok":
-                filtered_out += 1
+        if excluded_by_suffix(v, pool_id):
+            status = "filtered_suffix"
+        elif in_fee_range(v):
+            status = "ok"
+        else:
+            status = "filtered_fee_range"
+        if status != "ok":
+            filtered_out += 1
         try:
             pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
         except (TypeError, ValueError):
@@ -18215,7 +18215,7 @@ def _merge_for_web(
                     apy=ex_sanity_apy,
                     last_tvl=exact_last_tvl,
                     data_quality=("exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"),
-                    data_quality_reason=f"Exact full sanity-check (volumeUSD*fee; {src_lbl})",
+                    data_quality_reason=f"Exact full sanity-check (on-chain swap logs; {src_lbl})",
                     status=status,
                 )
             if ex_active_sanity_fees and ex_active_tvl:
@@ -18234,7 +18234,7 @@ def _merge_for_web(
                     apy=ex_act_sanity_apy,
                     last_tvl=ex_act_last_tvl,
                     data_quality=("exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"),
-                    data_quality_reason=f"Exact active sanity-check (volumeUSD*fee; {src_lbl})",
+                    data_quality_reason=f"Exact active sanity-check (on-chain swap logs; {src_lbl})",
                     status=status,
                 )
         else:
@@ -19416,10 +19416,10 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     strict_data, strict_dbg = _run_agent_and_load_timed(
                         script_name=script_name,
                         env=env_cur,
-                        min_tvl=req.min_tvl,
-                        logs=logs,
-                        pair_suffix=pair_suffix,
-                    )
+                            min_tvl=req.min_tvl,
+                            logs=logs,
+                            pair_suffix=pair_suffix,
+                        )
                     for _pid, _row in (strict_data or {}).items():
                         if not isinstance(_row, dict):
                             continue
@@ -31695,7 +31695,7 @@ HTML_PAGE = """
                       <option value="meme_top20">top 20 memes</option>
                     </select>
                     <input id="stableBucketManual" placeholder="e.g. usdt,usdc,dai"/>
-                  </div>
+                </div>
                 </div>
                 <div class="pair-bucket">
                   <div class="pair-bucket-row">
@@ -31721,7 +31721,7 @@ HTML_PAGE = """
                       <option value="meme_top20">top 20 memes</option>
                     </select>
                     <input id="tokenBucketManual" placeholder="e.g. eth,wbtc,sol"/>
-                  </div>
+                </div>
                 </div>
               </div>
               <div class="hint" style="margin-top:6px">Note: scanning one pair across all chains typically takes about 20-30 seconds.</div>
@@ -31754,29 +31754,29 @@ HTML_PAGE = """
                 <div class="inline-grid estimated-grid">
                   <div class="filter-item" id="filterMinTvlItem">
                     <div class="hint">Min TVL (USD)</div>
-                    <input id="minTvl" value="1000" type="number" min="0" max="10000000" step="1"/>
-                  </div>
+                  <input id="minTvl" value="1000" type="number" min="0" max="10000000" step="1"/>
+                </div>
                   <div class="filter-item" id="filterDaysEstimatedItem">
                     <div class="hint">History days</div>
                     <input id="daysEstimated" value="30" type="number" min="1" max="3650" step="1" oninput="syncDaysFromEstimated()"/>
-                  </div>
+                </div>
                   <div class="filter-item" id="filterFeeRangeItem">
                     <div class="hint">Fee range % (min-max)</div>
                     <input id="feeRangePct" value="0-2" type="text" placeholder="0-2 or 0/2"/>
-                  </div>
+                </div>
                   <div class="filter-item" id="filterMinApyItem">
                     <div class="hint">Min APY %</div>
                     <input id="minApyPct" value="0" type="number" step="0.1" min="0" max="100000"/>
-                  </div>
+                </div>
                   <div class="filter-item proto-item" id="filterProtocolItem">
                     <div class="hint">Protocol version</div>
-                    <div class="proto-checks">
+                  <div class="proto-checks">
                       <label><input id="protoV3" type="checkbox" checked onchange="updateChainsNote()"/> V3</label>
                       <label><input id="protoV4" type="checkbox" checked onchange="updateChainsNote()"/> V4</label>
-                    </div>
                   </div>
                 </div>
               </div>
+            </div>
               <div class="mode-filter-line" id="exactModeLine">
                 <div class="mode-check mode-item">
                   <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Exact</label>
@@ -32509,8 +32509,8 @@ HTML_PAGE = """
     function renderPoolRunDebug(result) {
       const el = document.getElementById("poolRunDebug");
       if (!el) return;
-      el.style.display = "none";
-      el.innerHTML = "";
+        el.style.display = "none";
+        el.innerHTML = "";
     }
 
     function setHomeSectionCollapsed(key, collapsed) {
@@ -32826,8 +32826,8 @@ HTML_PAGE = """
           const k = [a, b].sort().join("|");
           if (seen.has(k)) continue;
           seen.add(k);
-          out.push(`${a},${b}`);
-        }
+        out.push(`${a},${b}`);
+      }
       }
       return {pairs: out, valid: out.length > 0};
     }
@@ -33437,18 +33437,18 @@ HTML_PAGE = """
           const feeY = (s.fees || []).map(p => p[1]);
           const tvlX = (s.tvl || []).map(p => new Date(p[0] * 1000));
           const tvlY = (s.tvl || []).map(p => p[1] / 1000.0);
-          const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
+        const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
           if (!showAll) continue;
-          feeTraces.push({
-            x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
+        feeTraces.push({
+          x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
             hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-            line: {color: c, width: 2, dash: d}
-          });
-          tvlTraces.push({
-            x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
+          line: {color: c, width: 2, dash: d}
+        });
+        tvlTraces.push({
+          x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
             hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-            line: {color: c, width: 2, dash: d}
-          });
+          line: {color: c, width: 2, dash: d}
+        });
         }
       }
 
