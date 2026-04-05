@@ -148,6 +148,116 @@ def _v3_active_window_amounts(
     return float(max(Decimal(0), a0)), float(max(Decimal(0), a1)), "active_window"
 
 
+def _v3_active_positions_amounts_from_subgraph(
+    endpoint: str,
+    pool_id: str,
+    current_tick: int,
+    sqrt_price_x96: int,
+) -> tuple[float, float, str, dict[str, Any]]:
+    ep = str(endpoint or "").strip()
+    pid = str(pool_id or "").strip().lower()
+    if not ep:
+        return 0.0, 0.0, "active_positions_no_endpoint", {"active_positions_count": 0}
+    if not pid:
+        return 0.0, 0.0, "active_positions_invalid_pool", {"active_positions_count": 0}
+    if int(sqrt_price_x96) <= 0:
+        return 0.0, 0.0, "active_positions_invalid_price", {"active_positions_count": 0}
+
+    q = """
+    query ActivePositions($pool: String!, $tick: BigInt!, $last: String!) {
+      positions(
+        first: 1000
+        orderBy: id
+        orderDirection: asc
+        where: {
+          pool: $pool
+          liquidity_gt: "0"
+          id_gt: $last
+          tickLower_: { tickIdx_lte: $tick }
+          tickUpper_: { tickIdx_gt: $tick }
+        }
+      ) {
+        id
+        liquidity
+        tickLower { tickIdx }
+        tickUpper { tickIdx }
+      }
+    }
+    """
+
+    sqrt_p = Decimal(int(sqrt_price_x96))
+    sqrt_cache: dict[int, Decimal] = {}
+
+    def _sqrt_tick(t: int) -> Decimal:
+        x = int(t)
+        v = sqrt_cache.get(x)
+        if v is not None:
+            return v
+        v = _sqrt_ratio_x96_at_tick(x)
+        sqrt_cache[x] = v
+        return v
+
+    total0 = Decimal(0)
+    total1 = Decimal(0)
+    scanned = 0
+    last_id = ""
+    pages = 0
+    max_pages = int(max(1, int(os.environ.get("STRICT_V3_ACTIVE_POS_MAX_PAGES", "30") or 30)))
+    max_rows = int(max(1000, int(os.environ.get("STRICT_V3_ACTIVE_POS_MAX_ROWS", "30000") or 30000)))
+    while pages < max_pages and scanned < max_rows:
+        try:
+            data = graphql_query(
+                ep,
+                q,
+                {"pool": pid, "tick": str(int(current_tick)), "last": str(last_id)},
+                retries=1,
+            )
+        except Exception as e:
+            return float(total0), float(total1), f"active_positions_query_failed:{e}", {
+                "active_positions_count": int(scanned),
+                "active_positions_pages": int(pages),
+            }
+        rows = ((data or {}).get("data") or {}).get("positions") or []
+        if not isinstance(rows, list) or not rows:
+            break
+        pages += 1
+        for r in rows:
+            try:
+                liq = int(str((r or {}).get("liquidity") or "0"))
+                lo = int(str((((r or {}).get("tickLower") or {}).get("tickIdx") or "0")))
+                hi = int(str((((r or {}).get("tickUpper") or {}).get("tickIdx") or "0")))
+            except Exception:
+                continue
+            if liq <= 0 or hi <= lo:
+                continue
+            sqrt_lo = _sqrt_tick(lo)
+            sqrt_hi = _sqrt_tick(hi)
+            if sqrt_p <= sqrt_lo:
+                a0, _ = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_hi)
+                a1 = Decimal(0)
+            elif sqrt_p >= sqrt_hi:
+                a0 = Decimal(0)
+                _, a1 = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_hi)
+            else:
+                a0, _ = _amounts_from_liquidity_segment(Decimal(liq), sqrt_p, sqrt_hi)
+                _, a1 = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_p)
+            total0 += max(Decimal(0), a0)
+            total1 += max(Decimal(0), a1)
+            scanned += 1
+        last_id = str((rows[-1] or {}).get("id") or last_id)
+        if len(rows) < 1000:
+            break
+    src = "active_positions_subgraph"
+    if scanned >= max_rows:
+        src = "active_positions_partial_row_cap"
+    elif pages >= max_pages:
+        src = "active_positions_partial_page_cap"
+    return float(total0), float(total1), src, {
+        "active_positions_count": int(scanned),
+        "active_positions_pages": int(pages),
+    }
+
+
 def _v3_pool_state_now(chain_id: int, pool_id: str) -> tuple[int, int, int, int, str]:
     p = str(pool_id or "").strip().lower()
     if not _is_eth_address(p):
@@ -399,7 +509,7 @@ def _compute_fee_and_raw_tvl(pool_id: str, endpoint: str) -> tuple[list[tuple[in
     return fees_usd, raw_tvl
 
 
-def _resolve_pool_tvl_now_onchain(pool: dict, chain: str) -> tuple[float, str, str, dict[str, Any]]:
+def _resolve_pool_tvl_now_onchain(pool: dict, chain: str, endpoint: str = "") -> tuple[float, str, str, dict[str, Any]]:
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
@@ -426,10 +536,10 @@ def _resolve_pool_tvl_now_onchain(pool: dict, chain: str) -> tuple[float, str, s
     amt1 = float(b1) / float(10 ** max(0, dec1))
 
     sqrt_p, tick_now, liq_now, tick_spacing, state_err = _v3_pool_state_now(chain_id, pool_id)
-    act0_raw, act1_raw, _act_src = _v3_active_window_amounts(
-        liquidity=int(liq_now),
+    act0_raw, act1_raw, _act_src, _act_dbg = _v3_active_positions_amounts_from_subgraph(
+        endpoint=str(endpoint or ""),
+        pool_id=pool_id,
         current_tick=int(tick_now),
-        tick_spacing=int(tick_spacing),
         sqrt_price_x96=int(sqrt_p),
     )
     act0 = float(act0_raw) / float(10 ** max(0, dec0))
@@ -454,7 +564,7 @@ def _resolve_pool_tvl_now_onchain(pool: dict, chain: str) -> tuple[float, str, s
     if src0 and src1 and src0 != src1:
         src = f"{src0}+{src1}"
     state_src = "slot0+liquidity" if not state_err else f"state_unavailable:{state_err}"
-    source = f"onchain_full_pool+price:{src}:alt=active_window:{state_src}"
+    source = f"onchain_full_pool+price:{src}:alt=active_positions:{_act_src}:{state_src}"
     dbg = {
         "latest_block": int(latest_block),
         "decimals0": int(dec0),
@@ -466,7 +576,10 @@ def _resolve_pool_tvl_now_onchain(pool: dict, chain: str) -> tuple[float, str, s
         "tvl_full_pool_usd": float(tvl_full),
         "tvl_active_window_usd": float(tvl_active),
         "quantity_source": "full_pool_balanceOf",
-        "quantity_source_secondary": "active_window_slot0_liquidity",
+        "quantity_source_secondary": "active_positions_subgraph",
+        "active_positions_source": str(_act_src or ""),
+        "active_positions_count": int((_act_dbg or {}).get("active_positions_count") or 0),
+        "active_positions_pages": int((_act_dbg or {}).get("active_positions_pages") or 0),
         "pool_state_error": str(state_err or ""),
         "current_tick": int(tick_now),
         "pool_liquidity": int(liq_now),
@@ -1723,7 +1836,7 @@ def main() -> None:
     t1 = str(((pool.get("token1") or {}).get("symbol") or "?"))
     pool["pair_label"] = f"{t0}/{t1}"
 
-    pool_tvl_now_usd, price_source, price_err, tvl_now_debug = _resolve_pool_tvl_now_onchain(pool, found_chain)
+    pool_tvl_now_usd, price_source, price_err, tvl_now_debug = _resolve_pool_tvl_now_onchain(pool, found_chain, found_endpoint)
     if float(pool_tvl_now_usd) <= 0:
         print(f"external TVL unavailable: {price_err or 'unknown'}")
         save_chart_data_json(
