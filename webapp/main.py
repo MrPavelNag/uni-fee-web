@@ -31322,7 +31322,6 @@ HTML_PAGE = """
     }
     .mode-filter-line:last-child { margin-bottom: 0; }
     .mode-filter-wrap {
-      position: relative;
       display: grid;
       grid-template-columns: 112px 1fr;
       column-gap: 14px;
@@ -31331,29 +31330,21 @@ HTML_PAGE = """
       padding-left: 18px;
     }
     .mode-filter-wrap::before {
-      content: "";
-      position: absolute;
-      left: 0;
-      top: 50%;
-      transform: translateY(-50%);
-      height: 112px;
-      width: 112px;
-      border: 1px solid #d1dbe9;
-      border-radius: 12px;
-      background: linear-gradient(180deg, rgba(248, 251, 255, 0.9) 0%, rgba(242, 247, 255, 0.9) 100%);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
-      pointer-events: none;
+      display: none;
     }
     .mode-filter-wrap .mode-filter-line {
       display: contents;
     }
     .mode-filter-wrap .mode-check {
       grid-column: 1;
-      position: relative;
-      z-index: 1;
-      justify-self: stretch;
-      background: #f4f8ff;
-      border-color: #b9c9df;
+      justify-self: start;
+      margin-top: 0;
+    }
+    #estimatedModeLine .mode-check {
+      margin-top: 32px;
+    }
+    #exactModeLine .mode-check {
+      margin-top: 34px;
     }
     .mode-filter-wrap .inline-grid {
       grid-column: 2;
@@ -31362,11 +31353,11 @@ HTML_PAGE = """
     .mode-check {
       display: flex;
       align-items: center;
-      height: 34px;
-      border: 1px solid #cbd5e1;
-      border-radius: 8px;
-      background: #f8fbff;
-      padding: 0 10px;
+      height: auto;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      padding: 0;
       white-space: nowrap;
     }
     .mode-check label {
@@ -31388,7 +31379,7 @@ HTML_PAGE = """
       gap: 4px;
     }
     .exact-grid {
-      grid-template-columns: 104px minmax(420px, 680px);
+      grid-template-columns: 86px minmax(420px, 680px);
       gap: 4px;
     }
     .estimated-grid .filter-item .hint,
