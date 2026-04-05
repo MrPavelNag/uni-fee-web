@@ -132,6 +132,8 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "", stri
         "strict_compare_exact_active_tvl": [],
         "strict_compare_exact_active_fees": [],
         "strict_compare_exact_fees": [],
+        "strict_compare_exact_sanity_fees": [],
+        "strict_compare_exact_active_sanity_fees": [],
     }
 
 
@@ -857,13 +859,16 @@ def main() -> None:
     start_ts, end_ts = build_exact_day_window(int(FEE_DAYS))
     day_rows = query_pool_day_data(endpoint, str(pool.get("id") or ""), start_ts, end_ts)
     fees_usd: list[tuple[int, float]] = []
+    fees_sanity_usd: list[tuple[int, float]] = []
     raw_tvl: list[tuple[int, float]] = []
+    fee_pct = int(pool.get("feeTier") or 0) / 10000.0
     for r in day_rows:
         d = int(r.get("date") or 0)
         ts = int(d if d > 1e9 else d * 86400)
         if ts <= 0:
             continue
         fees_usd.append((ts, max(0.0, float(r.get("feesUSD") or 0.0))))
+        fees_sanity_usd.append((ts, max(0.0, float(r.get("volumeUSD") or 0.0)) * max(0.0, float(fee_pct))))
         raw_tvl.append((ts, max(0.0, float(r.get("tvlUSD") or 0.0))))
     if not fees_usd:
         save_chart_data_json(
@@ -908,8 +913,10 @@ def main() -> None:
     estimated_active_fees: list[tuple[int, float]] = []
     exact_tvl: list[tuple[int, float]] = []
     exact_fees: list[tuple[int, float]] = []
+    exact_sanity_fees: list[tuple[int, float]] = []
     exact_active_tvl: list[tuple[int, float]] = []
     exact_active_fees: list[tuple[int, float]] = []
+    exact_active_sanity_fees: list[tuple[int, float]] = []
     tvl_active_now = float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0)
 
     try:
@@ -929,6 +936,9 @@ def main() -> None:
         exact_tvl = _append_now_tvl_anchor(exact_tvl, float(pool_tvl_now_usd))
         exact_fees = _sparse_series_every_n_days(estimated_fees_base, exact_step_days)
         exact_fees = _append_now_fee_anchor(exact_fees)
+        sanity_fees_base = _rebuild_fees_cumulative(fees_sanity_usd, estimated_tvl_base)
+        exact_sanity_fees = _sparse_series_every_n_days(sanity_fees_base, exact_step_days)
+        exact_sanity_fees = _append_now_fee_anchor(exact_sanity_fees)
 
         if tvl_active_now > 0.0:
             estimated_active_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
@@ -940,6 +950,9 @@ def main() -> None:
             exact_active_tvl = _append_now_tvl_anchor(exact_active_tvl, float(tvl_active_now))
             exact_active_fees = _sparse_series_every_n_days(estimated_active_fees_base, exact_step_days)
             exact_active_fees = _append_now_fee_anchor(exact_active_fees)
+            sanity_active_fees_base = _rebuild_fees_cumulative(fees_sanity_usd, estimated_active_tvl_base)
+            exact_active_sanity_fees = _sparse_series_every_n_days(sanity_active_fees_base, exact_step_days)
+            exact_active_sanity_fees = _append_now_fee_anchor(exact_active_sanity_fees)
     else:
         # No historical day-shape from subgraph:
         # - keep TVL visualization as one-point marker (do not invent TVL shape),
@@ -951,6 +964,9 @@ def main() -> None:
         estimated_fees = _append_now_fee_anchor(estimated_fees_base)
         exact_fees = _sparse_series_every_n_days(estimated_fees_base, exact_step_days)
         exact_fees = _append_now_fee_anchor(exact_fees)
+        sanity_fees_base = _rebuild_fees_cumulative(fees_sanity_usd, est_flat_tvl_for_fees)
+        exact_sanity_fees = _sparse_series_every_n_days(sanity_fees_base, exact_step_days)
+        exact_sanity_fees = _append_now_fee_anchor(exact_sanity_fees)
         if tvl_active_now > 0.0:
             estimated_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
             exact_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
@@ -959,6 +975,9 @@ def main() -> None:
             estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
             exact_active_fees = _sparse_series_every_n_days(estimated_active_fees_base, exact_step_days)
             exact_active_fees = _append_now_fee_anchor(exact_active_fees)
+            sanity_active_fees_base = _rebuild_fees_cumulative(fees_sanity_usd, est_active_flat_tvl_for_fees)
+            exact_active_sanity_fees = _sparse_series_every_n_days(sanity_active_fees_base, exact_step_days)
+            exact_active_sanity_fees = _append_now_fee_anchor(exact_active_sanity_fees)
     if (not exact_tvl) and fees_usd:
         exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
     if (not exact_active_tvl) and fees_usd and tvl_active_now > 0.0:
@@ -994,6 +1013,8 @@ def main() -> None:
         "strict_compare_exact_active_tvl": exact_active_tvl,
         "strict_compare_exact_active_fees": exact_active_fees,
         "strict_compare_exact_fees": exact_fees,
+        "strict_compare_exact_sanity_fees": exact_sanity_fees,
+        "strict_compare_exact_active_sanity_fees": exact_active_sanity_fees,
         "strict_estimated_shape_missing": bool(raw_tvl_positive_days <= 0),
     }
     save_chart_data_json({str(pool.get("id") or ""): payload}, out_path)

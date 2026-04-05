@@ -18076,6 +18076,8 @@ def _merge_for_web(
             ex_tvl = v.get("strict_compare_exact_tvl") or []
             ex_active_tvl = v.get("strict_compare_exact_active_tvl") or []
             ex_active_fees = v.get("strict_compare_exact_active_fees") or []
+            ex_sanity_fees = v.get("strict_compare_exact_sanity_fees") or []
+            ex_active_sanity_fees = v.get("strict_compare_exact_active_sanity_fees") or []
             if (not ex_active_fees) and est_active_fees:
                 ex_active_fees = list(est_active_fees)
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
@@ -18094,6 +18096,8 @@ def _merge_for_web(
                 + [int(x[0]) for x in (est_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (ex_sanity_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (ex_active_sanity_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(now_ts)]
             )
             est_tvl = _align_series_end(est_tvl, tvl_end_ts)
@@ -18104,6 +18108,8 @@ def _merge_for_web(
             est_active_fees = _align_series_end(est_active_fees, fees_end_ts)
             ex_fees = _align_series_end(ex_fees, fees_end_ts)
             ex_active_fees = _align_series_end(ex_active_fees, fees_end_ts)
+            ex_sanity_fees = _align_series_end(ex_sanity_fees, fees_end_ts)
+            ex_active_sanity_fees = _align_series_end(ex_active_sanity_fees, fees_end_ts)
 
             src_lbl = _short_source_label(str(v.get("tvl_price_source") or ""))
             est_income = float(est_fees[-1][1]) if est_fees else 0.0
@@ -18230,6 +18236,8 @@ def _merge_for_web(
                     "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
                     "strict_compare_exact_active_tvl": (ex_active_tvl if has_strict_compare else (v.get("strict_compare_exact_active_tvl") or [])),
                     "strict_compare_exact_active_fees": (ex_active_fees if has_strict_compare else (v.get("strict_compare_exact_active_fees") or [])),
+                    "strict_compare_exact_sanity_fees": (ex_sanity_fees if has_strict_compare else (v.get("strict_compare_exact_sanity_fees") or [])),
+                    "strict_compare_exact_active_sanity_fees": (ex_active_sanity_fees if has_strict_compare else (v.get("strict_compare_exact_active_sanity_fees") or [])),
                     "strict_compare_exact2_reason": exact2_reason,
                     "pool_tvl_now_usd": pool_tvl_now_usd,
                 }
@@ -31338,13 +31346,14 @@ HTML_PAGE = """
     .mode-filter-wrap .mode-check {
       grid-column: 1;
       justify-self: start;
+      align-self: start;
       margin-top: 0;
     }
     #estimatedModeLine .mode-check {
-      margin-top: 32px;
+      margin-top: 0;
     }
     #exactModeLine .mode-check {
-      margin-top: 34px;
+      margin-top: 0;
     }
     .mode-filter-wrap .inline-grid {
       grid-column: 2;
@@ -33115,9 +33124,15 @@ HTML_PAGE = """
         const estActiveTvl = Array.isArray(s.strict_compare_estimated_active_tvl) ? s.strict_compare_estimated_active_tvl : [];
         const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
         const exActiveFees = Array.isArray(s.strict_compare_exact_active_fees) ? s.strict_compare_exact_active_fees : [];
+        const exSanityFees = Array.isArray(s.strict_compare_exact_sanity_fees) ? s.strict_compare_exact_sanity_fees : [];
+        const exActiveSanityFees = Array.isArray(s.strict_compare_exact_active_sanity_fees) ? s.strict_compare_exact_active_sanity_fees : [];
         const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
         const exActiveTvl = Array.isArray(s.strict_compare_exact_active_tvl) ? s.strict_compare_exact_active_tvl : [];
-        const useStrictCompare = strictMode && (estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length || exFees.length || exActiveFees.length || exTvl.length || exActiveTvl.length);
+        const useStrictCompare = strictMode && (
+          estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length ||
+          exFees.length || exActiveFees.length || exTvl.length || exActiveTvl.length ||
+          exSanityFees.length || exActiveSanityFees.length
+        );
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
           ...((s.tvl || []).map(p => Number(p[0] || 0))),
@@ -33127,6 +33142,8 @@ HTML_PAGE = """
           ...(estActiveTvl.map(p => Number(p?.[0] || 0))),
           ...(exFees.map(p => Number(p?.[0] || 0))),
           ...(exActiveFees.map(p => Number(p?.[0] || 0))),
+          ...(exSanityFees.map(p => Number(p?.[0] || 0))),
+          ...(exActiveSanityFees.map(p => Number(p?.[0] || 0))),
           ...(exTvl.map(p => Number(p?.[0] || 0))),
           ...(exActiveTvl.map(p => Number(p?.[0] || 0))),
           0
@@ -33185,6 +33202,16 @@ HTML_PAGE = """
             const v = Number(p?.[1] || 0);
             return v > 0 ? v : null;
           });
+          const exSanityFeeX = exSanityFees.map(p => new Date(p[0] * 1000));
+          const exSanityFeeY = exSanityFees.map(p => {
+            const v = Number(p?.[1] || 0);
+            return v > 0 ? v : null;
+          });
+          const exActSanityFeeX = exActiveSanityFees.map(p => new Date(p[0] * 1000));
+          const exActSanityFeeY = exActiveSanityFees.map(p => {
+            const v = Number(p?.[1] || 0);
+            return v > 0 ? v : null;
+          });
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
           const estActTvlX = estTvlActSrc.map(p => new Date(p[0] * 1000));
@@ -33195,14 +33222,42 @@ HTML_PAGE = """
           );
           const exActX = exActiveTvl.map(p => new Date(p[0] * 1000));
           const exActY = sanitizeExactTvlK(exActiveTvl, estTvlSrc.length ? estTvlSrc : estTvlActSrc, Number(s.pool_tvl_now_usd || 0));
+          const lastPositiveK = (arr, idx = 1, scale = 1.0) => {
+            const src = Array.isArray(arr) ? arr : [];
+            for (let j = src.length - 1; j >= 0; j--) {
+              const row = src[j];
+              const v = Number(Array.isArray(row) ? row[idx] : NaN);
+              if (Number.isFinite(v) && v > 0) return v / scale;
+            }
+            return 0;
+          };
+          const fullAnchorK = (() => {
+            const fromExact = lastPositiveK(exTvl, 1, 1000.0);
+            if (fromExact > 0) return fromExact;
+            const nowUsd = Number(s.pool_tvl_now_usd || 0);
+            return nowUsd > 0 ? (nowUsd / 1000.0) : 0;
+          })();
+          const activeAnchorK = (() => {
+            const fromExactActive = lastPositiveK(exActiveTvl, 1, 1000.0);
+            if (fromExactActive > 0) return fromExactActive;
+            return 0;
+          })();
+          const exSanityTvlX = exSanityFeeX.slice();
+          const exSanityTvlY = exSanityTvlX.map(() => (fullAnchorK > 0 ? fullAnchorK : null));
+          const exActSanityTvlX = exActSanityFeeX.slice();
+          const exActSanityTvlY = exActSanityTvlX.map(() => (activeAnchorK > 0 ? activeAnchorK : null));
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const estActHover = estActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           const exActHover = exActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
+          const exSanityHover = exSanityFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact full sanity"]);
+          const exActSanityHover = exActSanityFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active sanity"]);
           const COLOR_FULL = "#1d4ed8";          // blue
           const COLOR_ACTIVE = "#166534";        // darker green
           const COLOR_FULL_EST = "#60a5fa";      // light blue
           const COLOR_ACTIVE_EST = "#15803d";    // darker green (estimated active)
+          const COLOR_FULL_SANITY = "#2563eb";   // blue (sanity)
+          const COLOR_ACTIVE_SANITY = "#15803d"; // green (sanity)
           if (estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated full)`, customdata: estHover,
@@ -33233,10 +33288,28 @@ HTML_PAGE = """
               marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
             });
           }
+          if (exSanityFeeX.length) {
+            feeTraces.push({
+              x: exSanityFeeX, y: exSanityFeeY, mode: "lines+markers", name: `${s.label} (exact full sanity-check)`, customdata: exSanityHover,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
+              line: {color: COLOR_FULL_SANITY, width: 1.6, dash: "dashdot"},
+              marker: {size: 5, color: COLOR_FULL_SANITY, symbol: "circle-open"}
+            });
+          }
+          if (exActSanityFeeX.length) {
+            feeTraces.push({
+              x: exActSanityFeeX, y: exActSanityFeeY, mode: "lines+markers", name: `${s.label} (exact active sanity-check)`, customdata: exActSanityHover,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
+              line: {color: COLOR_ACTIVE_SANITY, width: 1.6, dash: "dashdot"},
+              marker: {size: 6, color: COLOR_ACTIVE_SANITY, symbol: "diamond-open"}
+            });
+          }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const estActHoverTvl = estActTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
           const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           const exActHoverTvl = exActX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
+          const exSanityHoverTvl = exSanityTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact full sanity"]);
+          const exActSanityHoverTvl = exActSanityTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active sanity"]);
           if (estTvlX.length) {
             const estSingle = estTvlX.length === 1;
             tvlTraces.push({
@@ -33269,6 +33342,22 @@ HTML_PAGE = """
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: COLOR_ACTIVE, width: 1.8, dash: "solid"},
               marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
+            });
+          }
+          if (exSanityTvlX.length) {
+            tvlTraces.push({
+              x: exSanityTvlX, y: exSanityTvlY, mode: "lines+markers", name: `${s.label} (exact full sanity-check)`, customdata: exSanityHoverTvl,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
+              line: {color: COLOR_FULL_SANITY, width: 1.6, dash: "dashdot"},
+              marker: {size: 5, color: COLOR_FULL_SANITY, symbol: "circle-open"}
+            });
+          }
+          if (exActSanityTvlX.length) {
+            tvlTraces.push({
+              x: exActSanityTvlX, y: exActSanityTvlY, mode: "lines+markers", name: `${s.label} (exact active sanity-check)`, customdata: exActSanityHoverTvl,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
+              line: {color: COLOR_ACTIVE_SANITY, width: 1.6, dash: "dashdot"},
+              marker: {size: 6, color: COLOR_ACTIVE_SANITY, symbol: "diamond-open"}
             });
           }
         } else {
