@@ -140,6 +140,8 @@ def _query_v4_pool_by_id(endpoint: str, pool_id: str) -> dict | None:
         tickSpacing
         liquidity
         totalValueLockedUSD
+        totalValueLockedToken0
+        totalValueLockedToken1
         token0Price
         token1Price
         token0 { id symbol decimals }
@@ -606,10 +608,49 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     dbg["current_tick"] = int(current_tick)
     dbg["pool_liquidity"] = int(pool_liquidity)
 
-    # one-point quantity mode: fast active-window approximation from on-chain state
+    # one-point quantity modes available simultaneously:
+    # - full_pool: token balances from subgraph (total pool TVL semantics)
+    # - active_window: on-chain active-range approximation from slot0+liquidity
+    # Primary output defaults to full_pool when available.
     dbg["ticks_status"] = "skipped_one_point_mode"
     dbg["ticks_count"] = 0
-    a0_raw, a1_raw, qty_src_or_err = _active_window_amounts(pool_liquidity, current_tick, tick_spacing, sqrt_price_x96)
+    d0 = int(_erc20_decimals(chain_id, token0))
+    d1 = int(_erc20_decimals(chain_id, token1))
+    d0 = d0 if 0 < d0 <= 36 else 18
+    d1 = d1 if 0 < d1 <= 36 else 18
+    dbg["decimals0"] = int(d0)
+    dbg["decimals1"] = int(d1)
+
+    qty_src_or_err = ""
+    full_available = False
+    try:
+        a0_full = max(0.0, float(pool.get("totalValueLockedToken0") or 0.0))
+        a1_full = max(0.0, float(pool.get("totalValueLockedToken1") or 0.0))
+    except Exception:
+        a0_full, a1_full = 0.0, 0.0
+    if a0_full > 0.0 or a1_full > 0.0:
+        full_available = True
+    a0_full_raw = float(a0_full * (10 ** d0))
+    a1_full_raw = float(a1_full * (10 ** d1))
+
+    a0_active_raw, a1_active_raw, active_src = _active_window_amounts(pool_liquidity, current_tick, tick_spacing, sqrt_price_x96)
+    dbg["quantity_mode_full_available"] = bool(full_available)
+    dbg["quantity_mode_active_available"] = bool((a0_active_raw > 0.0) or (a1_active_raw > 0.0))
+    dbg["amount0_full_pool"] = float(a0_full)
+    dbg["amount1_full_pool"] = float(a1_full)
+    dbg["amount0_active_window"] = float(a0_active_raw / (10 ** d0)) if d0 > 0 else 0.0
+    dbg["amount1_active_window"] = float(a1_active_raw / (10 ** d1)) if d1 > 0 else 0.0
+
+    if full_available:
+        a0_raw = float(a0_full_raw)
+        a1_raw = float(a1_full_raw)
+        qty_src_or_err = "subgraph_tokens_full_pool"
+        dbg["quantity_source_secondary"] = str(active_src or "")
+    else:
+        a0_raw = float(a0_active_raw)
+        a1_raw = float(a1_active_raw)
+        qty_src_or_err = str(active_src or "pure_onchain_active_window")
+        dbg["quantity_source_secondary"] = "subgraph_tokens_full_pool_unavailable"
     dbg["full_scan_qty_mode"] = "disabled"
     dbg["quantity_source"] = str(qty_src_or_err or "")
     dbg["amount0_raw"] = float(a0_raw or 0.0)
@@ -619,14 +660,8 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
         dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
         return 0.0, "", str(qty_src_or_err or "strict_required:v4_exact2:quantities_unavailable"), dbg
 
-    d0 = int(_erc20_decimals(chain_id, token0))
-    d1 = int(_erc20_decimals(chain_id, token1))
-    d0 = d0 if 0 < d0 <= 36 else 18
-    d1 = d1 if 0 < d1 <= 36 else 18
     a0 = float(a0_raw / (10 ** d0))
     a1 = float(a1_raw / (10 ** d1))
-    dbg["decimals0"] = int(d0)
-    dbg["decimals1"] = int(d1)
     dbg["amount0"] = float(a0)
     dbg["amount1"] = float(a1)
 
@@ -653,6 +688,10 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
         return 0.0, "", (";".join(str(x) for x in errs if str(x).strip()) or "strict_required:v4_exact2:price_unavailable"), dbg
 
     tvl = max(0.0, a0 * max(0.0, p0)) + max(0.0, a1 * max(0.0, p1))
+    tvl_full = max(0.0, float(a0_full) * max(0.0, p0)) + max(0.0, float(a1_full) * max(0.0, p1))
+    tvl_active = max(0.0, float(a0_active_raw / (10 ** d0)) * max(0.0, p0)) + max(0.0, float(a1_active_raw / (10 ** d1)) * max(0.0, p1))
+    dbg["tvl_full_pool_usd"] = float(tvl_full)
+    dbg["tvl_active_window_usd"] = float(tvl_active)
     if tvl <= 0:
         dbg["error"] = "computed_tvl_zero"
         dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
@@ -662,7 +701,10 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     psrc = s0 or s1
     if s0 and s1 and s0 != s1:
         psrc = f"{s0}+{s1}"
-    src = f"v4_exact2:one_point_qty={qty_src_or_err}:state={state_src_or_err}:liq={int(pool_liquidity)}:tick={int(current_tick)}:price={psrc}"
+    src = (
+        f"v4_exact2:one_point_qty={qty_src_or_err}:alt={dbg.get('quantity_source_secondary')}"
+        f":state={state_src_or_err}:liq={int(pool_liquidity)}:tick={int(current_tick)}:price={psrc}"
+    )
     dbg["price_source"] = str(psrc or "")
     dbg["tvl_now_usd"] = float(tvl)
     dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
