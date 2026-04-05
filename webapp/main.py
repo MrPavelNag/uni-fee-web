@@ -18034,6 +18034,7 @@ def _merge_for_web(
         base_fee_pct = float(v.get("fee_pct") or 0)
         exact2_reason = str(dq_reason or "")
         if has_strict_compare:
+            now_ts = int(time.time())
             est_fees = v.get("strict_compare_estimated_fees") or []
             est_tvl = v.get("strict_compare_estimated_tvl") or []
             est_active_fees = v.get("strict_compare_estimated_active_fees") or []
@@ -18052,6 +18053,7 @@ def _merge_for_web(
                 + [int(x[0]) for x in (est_active_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_active_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(now_ts)]
             )
             fees_end_ts = max(
                 [0]
@@ -18059,6 +18061,7 @@ def _merge_for_web(
                 + [int(x[0]) for x in (est_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(now_ts)]
             )
             est_tvl = _align_series_end(est_tvl, tvl_end_ts)
             est_active_tvl = _align_series_end(est_active_tvl, tvl_end_ts)
@@ -24199,8 +24202,50 @@ def _render_positions_page() -> str:
       let lastPollWall = Date.now();
       let anchorServerElapsed = 0;
       let lastPayload = null;
+      let displayProgress = 0;
+      let progressTarget = 0;
+      let lastProgressWall = Date.now();
+      let progressStageKey = "";
+      let progressStageStartedWall = Date.now();
+      let progressStageStartPct = 0;
       function smoothElapsedSec() {
         return anchorServerElapsed + (Date.now() - lastPollWall) / 1000;
+      }
+      function smoothProgressPct(payload) {
+        const now = Date.now();
+        const dt = Math.max(0.05, (now - lastProgressWall) / 1000);
+        const st = String(payload?.status || "").trim().toLowerCase();
+        const rawTarget = Math.max(0, Math.min(100, Number(payload?.progress || 0)));
+        const stageKey = String(payload?.stage || payload?.stage_label || "").trim().toLowerCase();
+        if (stageKey && stageKey !== progressStageKey) {
+          progressStageKey = stageKey;
+          progressStageStartedWall = now;
+          progressStageStartPct = Math.max(displayProgress, rawTarget);
+        }
+        progressTarget = Math.max(progressTarget, rawTarget, displayProgress);
+        let effectiveTarget = progressTarget;
+        // When backend progress is sparse (e.g. strict stage), creep forward smoothly.
+        if (st !== "queued" && st !== "done" && st !== "failed") {
+          const stageElapsed = Math.max(0, (now - progressStageStartedWall) / 1000);
+          const creepCap = Math.min(99, progressTarget + 18);
+          const creepTarget = Math.min(creepCap, progressStageStartPct + stageElapsed * 0.35);
+          effectiveTarget = Math.max(effectiveTarget, creepTarget);
+        }
+        if (st === "done") {
+          displayProgress = 100;
+        } else if (st === "queued") {
+          displayProgress = Math.min(displayProgress, 3);
+        } else {
+          const maxStep = Math.max(0.5, dt * 6.0); // ~6%/s max visual speed
+          if (displayProgress < effectiveTarget) {
+            displayProgress = Math.min(effectiveTarget, displayProgress + maxStep);
+          } else if (displayProgress > effectiveTarget) {
+            displayProgress = effectiveTarget;
+          }
+          displayProgress = Math.max(0, Math.min(99, displayProgress));
+        }
+        lastProgressWall = now;
+        return Number(displayProgress || 0);
       }
       function setProgressFromStatus(status, progress) {
         if (status === "queued") setPosProgressBar(progId, 0, true);
@@ -24252,14 +24297,14 @@ def _render_positions_page() -> str:
           stage_label: statusFallbackLabel(stageLabel, status, partialRendered),
         });
       }
-      function formatJobStatusLine(payload) {
+      function formatJobStatusLine(payload, progressOverride = null) {
         const st = String(payload.status || "").trim().toLowerCase();
         const lab = String(payload.stage_label || payload.stage || "").trim() || "…";
         const elapsedSec = Math.max(0, smoothElapsedSec());
         const elapsedTxt = formatScanDuration(elapsedSec);
         const parts = [lab];
         if (st !== "queued" && st !== "done" && st !== "failed") {
-          const p = Math.min(99, Math.max(0, Number(payload.progress || 0)));
+          const p = Math.min(99, Math.max(0, Number(progressOverride == null ? payload.progress : progressOverride) || 0));
           parts.push(`${Math.round(p)}%`);
         }
         if (elapsedTxt) parts.push(elapsedTxt);
@@ -24268,7 +24313,10 @@ def _render_positions_page() -> str:
       try {
         tickTimer = setInterval(() => {
           if (!lastPayload) return;
-          statusSink(formatJobStatusLine(lastPayload), false);
+          const st = String(lastPayload.status || "");
+          const pDisp = smoothProgressPct(lastPayload);
+          setProgressFromStatus(st, pDisp);
+          statusSink(formatJobStatusLine(lastPayload, pDisp), false);
         }, 500);
         while (true) {
           const r = await fetch(`/api/positions/scan/job/${encodeURIComponent(jid)}`);
@@ -24284,7 +24332,8 @@ def _render_positions_page() -> str:
           if (typeof onTick === "function") {
             try { onTick(data); } catch (_) {}
           }
-          setProgressFromStatus(st, progress);
+          const pDisp = smoothProgressPct(data);
+          setProgressFromStatus(st, pDisp);
           maybeApplyPartialResult(partial, false);
           if (st === "done") {
             maybeApplyPartialResult(partial, true);
@@ -24298,7 +24347,7 @@ def _render_positions_page() -> str:
             return Object.assign({__partial: true}, partial);
           }
           lastPayload = withFallbackStageLabel(data, st, stageLabel);
-          statusSink(formatJobStatusLine(lastPayload), false);
+          statusSink(formatJobStatusLine(lastPayload, pDisp), false);
           await new Promise((resolve) => setTimeout(resolve, 1200));
         }
       } finally {
@@ -33023,9 +33072,9 @@ HTML_PAGE = """
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           const exActHover = exActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
           const COLOR_FULL = "#1d4ed8";          // blue
-          const COLOR_ACTIVE = "#16a34a";        // green
+          const COLOR_ACTIVE = "#166534";        // darker green
           const COLOR_FULL_EST = "#60a5fa";      // light blue
-          const COLOR_ACTIVE_EST = "#86efac";    // light green
+          const COLOR_ACTIVE_EST = "#15803d";    // darker green (estimated active)
           if (estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated full)`, customdata: estHover,
@@ -33088,9 +33137,10 @@ HTML_PAGE = """
           }
           if (exActX.length) {
             tvlTraces.push({
-              x: exActX, y: exActY, mode: "markers", name: `${s.label} (exact active)`, customdata: exActHoverTvl,
+              x: exActX, y: exActY, mode: "lines+markers", name: `${s.label} (exact active)`, customdata: exActHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              marker: {size: 8, color: COLOR_ACTIVE, symbol: "diamond"}
+              line: {color: COLOR_ACTIVE, width: 1.8, dash: "solid"},
+              marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
             });
           }
         } else {
@@ -33249,15 +33299,32 @@ HTML_PAGE = """
       for (const r of rows) {
         const cls = r.status === "ok" ? "ok-row" : "error-row";
         const pairLbl = String(r.pair || "").toLowerCase();
-        const isEstimatedRow = pairLbl.includes("(estimated)");
-        const isExactRow = pairLbl.includes("(exact)");
-        const color = isEstimatedRow
-          ? "#64748b"
-          : (isExactRow ? "#1d4ed8" : (colorMap[r.pool_id] || "#94a3b8"));
-        const dash = isEstimatedRow
-          ? "dot"
-          : (isExactRow ? "solid" : (dashMap[r.pool_id] || "solid"));
-        const swatchWidth = isEstimatedRow ? 3.0 : (isExactRow ? 1.8 : 3.0);
+        const isEstFull = pairLbl.includes("(estimated full)");
+        const isEstActive = pairLbl.includes("(estimated active)");
+        const isExFull = pairLbl.includes("(exact full)");
+        const isExActive = pairLbl.includes("(exact active)");
+        const isEstimatedRow = isEstFull || isEstActive;
+        const isExactRow = isExFull || isExActive;
+        let color = colorMap[r.pool_id] || "#94a3b8";
+        let dash = dashMap[r.pool_id] || "solid";
+        let swatchWidth = 3.0;
+        if (isEstFull) {
+          color = "#60a5fa";
+          dash = "dot";
+          swatchWidth = 3.0;
+        } else if (isEstActive) {
+          color = "#15803d";
+          dash = "dash";
+          swatchWidth = 2.4;
+        } else if (isExFull) {
+          color = "#1d4ed8";
+          dash = "solid";
+          swatchWidth = 1.8;
+        } else if (isExActive) {
+          color = "#166534";
+          dash = "solid";
+          swatchWidth = 1.8;
+        }
         const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
         const visible = !!visibilityMap[r.pool_id];
         const hasSeries = !!seriesByPool[r.pool_id];
