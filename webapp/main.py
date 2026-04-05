@@ -33036,7 +33036,7 @@ HTML_PAGE = """
               x: estTvlX, y: estTvlY, mode: (estSingle ? "markers" : "lines"), name: `${s.label} (estimated)`, customdata: estHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: "#64748b", width: 3.0, dash: "dot"},
-              marker: (estSingle ? {size: 8, color: "#64748b", symbol: "circle"} : undefined)
+              ...(estSingle ? {marker: {size: 8, color: "#64748b", symbol: "circle"}} : {})
             });
           }
           if (estActTvlX.length) {
@@ -33045,7 +33045,7 @@ HTML_PAGE = """
               x: estActTvlX, y: estActTvlY, mode: (estActSingle ? "markers" : "lines"), name: `${s.label} (estimated active-window)`, customdata: estActHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: "#94a3b8", width: 2.4, dash: "dash"},
-              marker: (estActSingle ? {size: 8, color: "#94a3b8", symbol: "square"} : undefined)
+              ...(estActSingle ? {marker: {size: 8, color: "#94a3b8", symbol: "square"}} : {})
             });
           }
           if (exTvlX.length) {
