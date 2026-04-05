@@ -19158,7 +19158,11 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     exact2_budget = 60.0
                 env2 = dict(env)
                 env2["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
-                env2["AGENT_TIMEOUT_SEC"] = str(max(45, min(base_timeout, int(exact2_budget) + 15, 90)))
+                # Strict exact can legitimately run longer than pool budget due to:
+                # chain probing, block resolution, subprocess startup and JSON IO.
+                # Keep a healthy timeout headroom instead of hard 90s cap.
+                strict_timeout_target = int(max(75, int(exact2_budget) + 75))
+                env2["AGENT_TIMEOUT_SEC"] = str(max(75, min(base_timeout, strict_timeout_target, 300)))
                 logs.append(
                     "[strict] budgets: "
                     f"exact2={int(exact2_budget)}s timeout2={env2['AGENT_TIMEOUT_SEC']}s"
