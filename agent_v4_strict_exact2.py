@@ -624,7 +624,21 @@ def _v4_onchain_historical_tvl_snapshots(
     step_days: int,
     strict_dbg: dict[str, Any],
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]], dict[str, Any]]:
-    dbg: dict[str, Any] = {"source": "onchain_historical_snapshots"}
+    t_fn0 = time.monotonic()
+    dbg: dict[str, Any] = {
+        "source": "onchain_historical_snapshots",
+        "stage_ms": {},
+        "counters": {
+            "targets_total": 0,
+            "targets_done": 0,
+            "block_resolve_fail": 0,
+            "slot0_fail": 0,
+            "active_points": 0,
+            "full_points": 0,
+            "full_fallback_points": 0,
+        },
+        "samples": {"block_resolve_fail_ts": [], "slot0_fail_ts": []},
+    }
     if not day_ts:
         return [], [], dbg
     ck = str(chain or "").strip().lower()
@@ -639,7 +653,9 @@ def _v4_onchain_historical_tvl_snapshots(
     d1 = int(_erc20_decimals(chain_id, token1)) if token1 else 18
     d0 = d0 if 0 < d0 <= 36 else 18
     d1 = d1 if 0 < d1 <= 36 else 18
+    t_price0 = time.monotonic()
     prices, _srcs, _errs = get_token_prices_usd(ck, [token0, token1])
+    dbg["stage_ms"]["prices_lookup"] = int(round(max(0.0, time.monotonic() - t_price0) * 1000.0))
     p0 = float(prices.get(token0) or 0.0)
     p1 = float(prices.get(token1) or 0.0)
     if p0 <= 0 and p1 <= 0:
@@ -654,6 +670,7 @@ def _v4_onchain_historical_tvl_snapshots(
         targets.append(int(base[-1]))
     targets = sorted({int(x) for x in targets if int(x) > 0})
     dbg["targets"] = int(len(targets))
+    dbg["counters"]["targets_total"] = int(len(targets))
 
     # Prepare full-pool tick universe (on-chain). If timeout/error: fallback to active*ratio.
     t0 = time.monotonic()
@@ -663,6 +680,7 @@ def _v4_onchain_historical_tvl_snapshots(
     snapshot_deadline_ts = t0 + total_budget
     ticks: list[int] = []
     ticks_status = ""
+    t_ticks0 = time.monotonic()
     init_meta, init_err = _pool_init_meta(chain_id, pm, pool_id, int(latest_block))
     if init_meta and int(init_meta.get("block") or 0) > 0:
         from_block = int(init_meta.get("block") or 0)
@@ -676,6 +694,7 @@ def _v4_onchain_historical_tvl_snapshots(
         )
     else:
         ticks_status = str(init_err or "init_meta_unavailable")
+    dbg["stage_ms"]["ticks_prepare"] = int(round(max(0.0, time.monotonic() - t_ticks0) * 1000.0))
     dbg["ticks_status"] = str(ticks_status or "ok")
     dbg["ticks_count"] = int(len(ticks or []))
 
@@ -692,10 +711,16 @@ def _v4_onchain_historical_tvl_snapshots(
             break
         b = _first_block_at_or_after_ts(chain_id, int(ts), int(latest_block))
         if b <= 0:
+            dbg["counters"]["block_resolve_fail"] = int(dbg["counters"]["block_resolve_fail"]) + 1
+            if len(dbg["samples"]["block_resolve_fail_ts"]) < 6:
+                dbg["samples"]["block_resolve_fail_ts"].append(int(ts))
             continue
         block_tag = hex(int(b))
         sqrt_price_x96, current_tick, pool_liquidity, _src = _read_v4_slot0_liquidity(chain_id, ck, pool_id, block_tag=block_tag)
         if sqrt_price_x96 <= 0:
+            dbg["counters"]["slot0_fail"] = int(dbg["counters"]["slot0_fail"]) + 1
+            if len(dbg["samples"]["slot0_fail_ts"]) < 6:
+                dbg["samples"]["slot0_fail_ts"].append(int(ts))
             continue
         # active TVL (on-chain)
         a0_act_raw, a1_act_raw, _act_src = _active_window_amounts(pool_liquidity, current_tick, int(pool.get("tickSpacing") or 10), sqrt_price_x96)
@@ -703,6 +728,7 @@ def _v4_onchain_historical_tvl_snapshots(
         a1_act = float(a1_act_raw / (10**d1))
         tvl_act = max(0.0, a0_act * max(0.0, p0)) + max(0.0, a1_act * max(0.0, p1))
         active_out.append((int(ts), float(tvl_act)))
+        dbg["counters"]["active_points"] = int(dbg["counters"]["active_points"]) + 1
 
         tvl_full = 0.0
         if ticks:
@@ -722,9 +748,13 @@ def _v4_onchain_historical_tvl_snapshots(
             tvl_full = max(0.0, a0_full * max(0.0, p0)) + max(0.0, a1_full * max(0.0, p1))
         if tvl_full <= 0.0 and tvl_act > 0.0 and full_to_active_ratio > 0.0:
             tvl_full = float(tvl_act * full_to_active_ratio)
+            dbg["counters"]["full_fallback_points"] = int(dbg["counters"]["full_fallback_points"]) + 1
         full_out.append((int(ts), float(max(0.0, tvl_full))))
+        dbg["counters"]["full_points"] = int(dbg["counters"]["full_points"]) + 1
+        dbg["counters"]["targets_done"] = int(dbg["counters"]["targets_done"]) + 1
 
     dbg["snapshots_done"] = int(min(len(full_out), len(active_out)))
+    dbg["elapsed_ms"] = int(round(max(0.0, time.monotonic() - t_fn0) * 1000.0))
     return full_out, active_out, dbg
 
 
@@ -985,12 +1015,28 @@ def _v4_onchain_swap_fee_daily(
     day_count: int,
     budget_sec: float,
 ) -> tuple[dict[int, float], dict[str, Any]]:
-    out_dbg: dict[str, Any] = {"source": "onchain_swap_logs"}
+    t_fn0 = time.monotonic()
+    out_dbg: dict[str, Any] = {
+        "source": "onchain_swap_logs",
+        "stage_ms": {},
+        "counters": {
+            "windows_scanned": 0,
+            "rpc_log_rows": 0,
+            "decoded_rows": 0,
+            "reject_poolid_data_mismatch": 0,
+            "reject_sign_or_zero": 0,
+            "reject_usd_zero": 0,
+            "reject_gross_zero": 0,
+            "reject_fee_zero": 0,
+        },
+    }
     pm, _sv = _onchain_addresses_for_chain(chain)
     if not pm:
         out_dbg["error"] = "pool_manager_not_configured"
         return {}, out_dbg
+    t_topic0 = time.monotonic()
     topic0, topic_src = _guess_v4_swap_topic(int(chain_id), pm, str(pool_id), int(latest_block))
+    out_dbg["stage_ms"]["topic_discovery"] = int(round(max(0.0, time.monotonic() - t_topic0) * 1000.0))
     out_dbg["swap_topic_source"] = str(topic_src)
     out_dbg["swap_topic0"] = str(topic0 or "")
     if not topic0:
@@ -1003,7 +1049,9 @@ def _v4_onchain_swap_fee_daily(
     d1 = int(_erc20_decimals(chain_id, token1)) if token1 else 18
     d0 = d0 if 0 < d0 <= 36 else 18
     d1 = d1 if 0 < d1 <= 36 else 18
+    t_price0 = time.monotonic()
     prices, _sources, _errs = get_token_prices_usd(str(chain), [token0, token1])
+    out_dbg["stage_ms"]["prices_lookup"] = int(round(max(0.0, time.monotonic() - t_price0) * 1000.0))
     p0 = float(prices.get(token0) or 0.0)
     p1 = float(prices.get(token1) or 0.0)
     out_dbg["token0_price_usd"] = float(p0)
@@ -1039,6 +1087,7 @@ def _v4_onchain_swap_fee_daily(
             out_dbg["timeout"] = True
             break
         hi = min(int(to_block), cur + step - 1)
+        out_dbg["counters"]["windows_scanned"] = int(out_dbg["counters"]["windows_scanned"]) + 1
         try:
             if str(topic_src).endswith("data0_poolid"):
                 part = _rpc_get_logs(int(chain_id), pm, cur, hi, [str(topic0)], timeout_sec=12.0)
@@ -1048,6 +1097,7 @@ def _v4_onchain_swap_fee_daily(
             part = []
         if part:
             rows.extend(part)
+            out_dbg["counters"]["rpc_log_rows"] = int(out_dbg["counters"]["rpc_log_rows"]) + int(len(part))
         cur = hi + 1
     out_dbg["swap_logs"] = int(len(rows))
     if not rows:
@@ -1070,6 +1120,7 @@ def _v4_onchain_swap_fee_daily(
             if len(words) < 3:
                 continue
             if str(words[0]).lower() != pid_word:
+                out_dbg["counters"]["reject_poolid_data_mismatch"] = int(out_dbg["counters"]["reject_poolid_data_mismatch"]) + 1
                 continue
             a0_raw = int(_decode_int_word(words[1], bits=256))
             a1_raw = int(_decode_int_word(words[2], bits=256))
@@ -1077,19 +1128,24 @@ def _v4_onchain_swap_fee_daily(
             a0_raw = int(_decode_int_word(words[0], bits=256))
             a1_raw = int(_decode_int_word(words[1], bits=256))
         if a0_raw == 0 or a1_raw == 0 or (a0_raw * a1_raw) >= 0:
+            out_dbg["counters"]["reject_sign_or_zero"] = int(out_dbg["counters"]["reject_sign_or_zero"]) + 1
             continue
+        out_dbg["counters"]["decoded_rows"] = int(out_dbg["counters"]["decoded_rows"]) + 1
         a0 = abs(float(a0_raw)) / float(10**d0)
         a1 = abs(float(a1_raw)) / float(10**d1)
         usd0 = a0 * max(0.0, float(p0))
         usd1 = a1 * max(0.0, float(p1))
         if usd0 <= 0.0 and usd1 <= 0.0:
+            out_dbg["counters"]["reject_usd_zero"] = int(out_dbg["counters"]["reject_usd_zero"]) + 1
             continue
         # Conservative notional: use smaller side value to reduce decode outliers.
         gross_usd = min(x for x in [usd0, usd1] if x > 0.0)
         if gross_usd <= 0.0:
+            out_dbg["counters"]["reject_gross_zero"] = int(out_dbg["counters"]["reject_gross_zero"]) + 1
             continue
         fee_usd = float(gross_usd) * max(0.0, float(fee_pct))
         if fee_usd <= 0.0:
+            out_dbg["counters"]["reject_fee_zero"] = int(out_dbg["counters"]["reject_fee_zero"]) + 1
             continue
         ts = int(now_ts - max(0, latest_b - max(0, int(bno))) * float(block_time_sec))
         day_ts = (int(ts) // 86400) * 86400
@@ -1097,6 +1153,7 @@ def _v4_onchain_swap_fee_daily(
         used += 1
     out_dbg["swap_logs_used"] = int(used)
     out_dbg["day_points"] = int(len(day_fees))
+    out_dbg["elapsed_ms"] = int(round(max(0.0, time.monotonic() - t_fn0) * 1000.0))
     return day_fees, out_dbg
 
 
@@ -1288,6 +1345,7 @@ def main() -> None:
     strict_dbg["raw_tvl_positive_days"] = int(raw_tvl_positive_days)
     strict_dbg["raw_tvl_zero_days"] = int(raw_tvl_zero_days)
     strict_dbg["budget_sec"] = float(budget_sec)
+    strict_dbg["debug_profile"] = "v4_exact2_extended_debug"
     chain_id = int(CHAIN_ID_BY_KEY.get(str(found_chain or "").strip().lower(), 0) or 0)
     swap_day_fees, swap_dbg = _v4_onchain_swap_fee_daily(
         chain=str(found_chain),
@@ -1330,6 +1388,12 @@ def main() -> None:
         exact_step_days = max(1, int(os.environ.get("STRICT_V4_EXACT_STEP_DAYS", "5")))
     except Exception:
         exact_step_days = 5
+    strict_dbg["debug_config"] = {
+        "exact_step_days": int(exact_step_days),
+        "onchain_history_enable": bool(onchain_hist_enable),
+        "onchain_history_budget_sec": float(onchain_hist_budget),
+        "swap_topic_scan_blocks": int(os.environ.get("STRICT_V4_SWAP_TOPIC_SCAN_BLOCKS", "180000") or 180000),
+    }
     onchain_hist_full_tvl: list[tuple[int, float]] = []
     onchain_hist_active_tvl: list[tuple[int, float]] = []
     if onchain_hist_enable and int(chain_id) > 0:

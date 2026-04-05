@@ -5,27 +5,27 @@
     "pool_id": "0x4a24fcf3c1cbebd80d09537c7aa15adf2d228aa1b9ba1b0e5fb82e66dc96c0d2",
     "fee_pct": 0.05,
     "raw_fee_tier": 500,
-    "pool_tvl_now_usd": 372462.5358800803,
-    "pool_tvl_subgraph_usd": -188094277.69615853,
+    "pool_tvl_now_usd": 379421.8944429611,
+    "pool_tvl_subgraph_usd": -188292721.74439967,
     "tvl_multiplier": 1.0,
-    "tvl_price_source": "v4_exact2:one_point_qty=subgraph_tokens_full_pool:alt=pure_onchain_active_window:state=state_view:liq=683280368096:tick=65153:price=coingecko+defillama",
+    "tvl_price_source": "v4_exact2:one_point_qty=subgraph_tokens_full_pool:alt=pure_onchain_active_window:state=state_view:liq=683280368096:tick=65160:price=coingecko+defillama",
     "pair": "WBTC/USDT",
     "chain": "ethereum",
     "version": "v4",
     "data_quality": "exact_partial",
-    "data_quality_reason": "exact_v4_2_onchain_quantities:one_point_now:cov=1.00:days=29:raw_pos=0:raw_zero=29:src=v4_exact2:one_point_qty=subgraph_tokens_full_pool:alt=pure_onchain_active_window:state=state_view:liq=683280368096:tick=65153:price=coingecko+defillama",
+    "data_quality_reason": "exact_v4_2_onchain_quantities:one_point_now:cov=1.00:days=6:raw_pos=0:raw_zero=6:src=v4_exact2:one_point_qty=subgraph_tokens_full_pool:alt=pure_onchain_active_window:state=state_view:liq=683280368096:tick=65160:price=coingecko+defillama",
     "strict_debug": {
       "pool_id": "0x4a24fcf3c1cbebd80d09537c7aa15adf2d228aa1b9ba1b0e5fb82e66dc96c0d2",
       "chain": "ethereum",
       "budget_sec": 90.0,
       "stages": {},
-      "latest_block": 24816283,
+      "latest_block": 24816329,
       "token0": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
       "token1": "0xdac17f958d2ee523a2206206994597c13d831ec7",
       "tick_spacing": 10,
       "init_block": 0,
       "state_source": "state_view",
-      "current_tick": 65153,
+      "current_tick": 65160,
       "pool_liquidity": 683280368096,
       "ticks_status": "skipped_one_point_mode",
       "ticks_count": 0,
@@ -34,475 +34,225 @@
       "quantity_mode_full_available": true,
       "quantity_mode_active_available": true,
       "amount0_full_pool": 0.0,
-      "amount1_full_pool": 372554.587287,
-      "amount0_active_window": 0.09110695148625608,
-      "amount1_active_window": 2724.174719095734,
+      "amount1_full_pool": 379520.583769,
+      "amount0_active_window": 0.11951635563782492,
+      "amount1_active_window": 802.5987258316956,
       "quantity_source_secondary": "pure_onchain_active_window",
       "full_scan_qty_mode": "disabled",
       "quantity_source": "subgraph_tokens_full_pool",
       "amount0_raw": 0.0,
-      "amount1_raw": 372554587287.0,
+      "amount1_raw": 379520583769.0,
       "amount0": 0.0,
-      "amount1": 372554.587287,
-      "tvl_full_pool_usd": 372462.5358800803,
-      "tvl_active_window_usd": 8866.299857297006,
+      "amount1": 379520.583769,
+      "tvl_full_pool_usd": 379421.8944429611,
+      "tvl_active_window_usd": 8863.435576647362,
       "price_source": "coingecko+defillama",
-      "tvl_now_usd": 372462.5358800803,
-      "elapsed_sec": 1.491,
-      "day_rows": 29,
-      "fees_days": 29,
+      "tvl_now_usd": 379421.8944429611,
+      "elapsed_sec": 2.845,
+      "day_rows": 6,
+      "fees_days": 6,
       "raw_tvl_positive_days": 0,
-      "raw_tvl_zero_days": 29,
+      "raw_tvl_zero_days": 6,
+      "debug_profile": "v4_exact2_extended_debug",
       "sanity_fee_source": "onchain_swap_logs",
       "sanity_swap_debug": {
         "source": "onchain_swap_logs",
-        "swap_topic_source": "not_found",
-        "swap_topic0": "",
-        "error": "swap_topic_not_found"
+        "stage_ms": {
+          "topic_discovery": 24122,
+          "prices_lookup": 0
+        },
+        "counters": {
+          "windows_scanned": 2,
+          "rpc_log_rows": 896,
+          "decoded_rows": 896,
+          "reject_poolid_data_mismatch": 0,
+          "reject_sign_or_zero": 0,
+          "reject_usd_zero": 0,
+          "reject_gross_zero": 0,
+          "reject_fee_zero": 0
+        },
+        "swap_topic_source": "inferred_topic1_poolid",
+        "swap_topic0": "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f",
+        "token0_price_usd": 67447.21685176234,
+        "token1_price_usd": 0.9997399631791802,
+        "from_block": 24753329,
+        "to_block": 24816329,
+        "swap_logs": 896,
+        "swap_logs_used": 896,
+        "day_points": 3,
+        "elapsed_ms": 36965
+      },
+      "debug_config": {
+        "exact_step_days": 5,
+        "onchain_history_enable": true,
+        "onchain_history_budget_sec": 12.0,
+        "swap_topic_scan_blocks": 48000
       },
       "onchain_history_debug": {
         "source": "onchain_historical_snapshots",
-        "targets": 7,
+        "stage_ms": {
+          "prices_lookup": 0,
+          "ticks_prepare": 15734
+        },
+        "counters": {
+          "targets_total": 2,
+          "targets_done": 0,
+          "block_resolve_fail": 0,
+          "slot0_fail": 0,
+          "active_points": 0,
+          "full_points": 0,
+          "full_fallback_points": 0
+        },
+        "samples": {
+          "block_resolve_fail_ts": [],
+          "slot0_fail_ts": []
+        },
+        "targets": 2,
         "ticks_status": "timeout",
         "ticks_count": 0,
         "timeout": true,
-        "snapshots_done": 2
+        "snapshots_done": 0,
+        "elapsed_ms": 15734
       }
     },
     "strict_compare_estimated_tvl": [
       [
-        1772928000,
-        111943.89537032328
-      ],
-      [
-        1773360000,
-        135794.28056793337
-      ],
-      [
-        1775426179,
-        372462.5358800803
+        1775347200,
+        379421.8944429611
       ]
     ],
     "strict_compare_estimated_fees": [
       [
-        1772928000,
-        1.5645303484894642
-      ],
-      [
-        1773014400,
-        3.7082915810083126
-      ],
-      [
-        1773100800,
-        6.206143727652633
-      ],
-      [
-        1773187200,
-        8.152518843305305
-      ],
-      [
-        1773273600,
-        11.4373175444333
-      ],
-      [
-        1773360000,
-        13.63496049600902
-      ],
-      [
-        1773446400,
-        14.151756178552889
-      ],
-      [
-        1773532800,
-        15.081762346585288
-      ],
-      [
-        1773619200,
-        17.779652079344167
-      ],
-      [
-        1773705600,
-        21.924844305601834
-      ],
-      [
-        1773792000,
-        28.179607908837177
-      ],
-      [
-        1773878400,
-        35.53198929779654
-      ],
-      [
-        1773964800,
-        41.78777927390031
-      ],
-      [
-        1774051200,
-        43.68903165548902
-      ],
-      [
-        1774137600,
-        49.09442101079312
-      ],
-      [
-        1774224000,
-        59.7935120433239
-      ],
-      [
-        1774310400,
-        65.95952512149583
-      ],
-      [
-        1774396800,
-        71.2881624390942
-      ],
-      [
-        1774483200,
-        76.64766637790132
-      ],
-      [
-        1774569600,
-        83.34843417317195
-      ],
-      [
-        1774656000,
-        85.4595262160602
-      ],
-      [
-        1774742400,
-        89.17580744357805
-      ],
-      [
-        1774828800,
-        94.90104616158115
-      ],
-      [
         1774915200,
-        101.22414639968345
+        6.207121897288324
       ],
       [
         1775001600,
-        105.92571149370234
+        10.82245085740134
       ],
       [
         1775088000,
-        111.75869126042302
+        16.54844207580371
       ],
       [
         1775174400,
-        113.59744055768189
+        18.353465022911763
       ],
       [
         1775260800,
-        114.54899463404423
+        19.28756568895075
       ],
       [
         1775347200,
-        115.74683543109218
+        20.50635963992852
       ],
       [
-        1775426179,
-        115.74683543109218
+        1775426721,
+        20.50635963992852
       ]
     ],
     "strict_compare_estimated_active_tvl": [
       [
-        1772928000,
-        2664.77309241842
-      ],
-      [
-        1773360000,
-        3232.5205743883466
-      ],
-      [
-        1775426179,
-        8866.299857297006
+        1775347200,
+        8863.435576647362
       ]
     ],
     "strict_compare_estimated_active_fees": [
       [
-        1772928000,
-        65.72402811079562
-      ],
-      [
-        1773014400,
-        155.78084525399564
-      ],
-      [
-        1773100800,
-        260.7125935330659
-      ],
-      [
-        1773187200,
-        342.47745858590304
-      ],
-      [
-        1773273600,
-        480.4678800434866
-      ],
-      [
-        1773360000,
-        572.7882030505205
-      ],
-      [
-        1773446400,
-        594.49816476513
-      ],
-      [
-        1773532800,
-        633.5665993212183
-      ],
-      [
-        1773619200,
-        746.9016847076207
-      ],
-      [
-        1773705600,
-        921.036197768519
-      ],
-      [
-        1773792000,
-        1183.7912534836873
-      ],
-      [
-        1773878400,
-        1492.6559051382924
-      ],
-      [
-        1773964800,
-        1755.454077536574
-      ],
-      [
-        1774051200,
-        1835.3233910937693
-      ],
-      [
-        1774137600,
-        2062.3972617162253
-      ],
-      [
-        1774224000,
-        2511.853138657784
-      ],
-      [
-        1774310400,
-        2770.879892132125
-      ],
-      [
-        1774396800,
-        2994.729502459085
-      ],
-      [
-        1774483200,
-        3219.8757822191233
-      ],
-      [
-        1774569600,
-        3501.3669347336677
-      ],
-      [
-        1774656000,
-        3590.051358724052
-      ],
-      [
-        1774742400,
-        3746.167839366837
-      ],
-      [
-        1774828800,
-        3986.678194954602
-      ],
-      [
         1774915200,
-        4252.30399006791
+        265.71163393036784
       ],
       [
         1775001600,
-        4449.811054537688
+        463.2825241771863
       ],
       [
         1775088000,
-        4694.847481301661
+        708.3981361611085
       ],
       [
         1775174400,
-        4772.091115864856
+        785.66673254028
       ],
       [
         1775260800,
-        4812.064751994166
+        825.6532864272101
       ],
       [
         1775347200,
-        4862.38459544971
+        877.8268601861256
       ],
       [
-        1775426179,
-        4862.38459544971
+        1775426721,
+        877.8268601861256
       ]
     ],
     "strict_compare_exact_tvl": [
       [
-        1772928000,
-        111943.89537032328
-      ],
-      [
-        1773360000,
-        135794.28056793337
-      ],
-      [
-        1775426179,
-        372462.5358800803
+        1775347200,
+        379421.8944429611
       ]
     ],
     "strict_compare_exact_active_tvl": [
       [
-        1772928000,
-        2664.77309241842
-      ],
-      [
-        1773360000,
-        3232.5205743883466
-      ],
-      [
-        1775426179,
-        8866.299857297006
+        1775347200,
+        8863.435576647362
       ]
     ],
     "strict_compare_exact_active_fees": [
       [
-        1772928000,
-        65.72402811079562
-      ],
-      [
-        1773360000,
-        572.7882030505205
-      ],
-      [
-        1773792000,
-        1183.7912534836873
-      ],
-      [
-        1774224000,
-        2511.853138657784
-      ],
-      [
-        1774656000,
-        3590.051358724052
-      ],
-      [
-        1775088000,
-        4694.847481301661
+        1774915200,
+        265.71163393036784
       ],
       [
         1775347200,
-        4862.38459544971
+        877.8268601861256
       ],
       [
-        1775426179,
-        4862.38459544971
+        1775426721,
+        877.8268601861256
       ]
     ],
     "strict_compare_exact_fees": [
       [
-        1772928000,
-        1.5645303484894642
-      ],
-      [
-        1773360000,
-        13.63496049600902
-      ],
-      [
-        1773792000,
-        28.179607908837177
-      ],
-      [
-        1774224000,
-        59.7935120433239
-      ],
-      [
-        1774656000,
-        85.4595262160602
-      ],
-      [
-        1775088000,
-        111.75869126042302
+        1774915200,
+        6.207121897288324
       ],
       [
         1775347200,
-        115.74683543109218
+        20.50635963992852
       ],
       [
-        1775426179,
-        115.74683543109218
+        1775426721,
+        20.50635963992852
       ]
     ],
     "strict_compare_exact_sanity_fees": [
       [
-        1772928000,
-        0.0
-      ],
-      [
-        1773360000,
-        0.0
-      ],
-      [
-        1773792000,
-        0.0
-      ],
-      [
-        1774224000,
-        0.0
-      ],
-      [
-        1774656000,
-        0.0
-      ],
-      [
-        1775088000,
+        1774915200,
         0.0
       ],
       [
         1775347200,
-        0.0
+        230.2247120579883
       ],
       [
-        1775426179,
-        0.0
+        1775426721,
+        230.2247120579883
       ]
     ],
     "strict_compare_exact_active_sanity_fees": [
       [
-        1772928000,
-        0.0
-      ],
-      [
-        1773360000,
-        0.0
-      ],
-      [
-        1773792000,
-        0.0
-      ],
-      [
-        1774224000,
-        0.0
-      ],
-      [
-        1774656000,
-        0.0
-      ],
-      [
-        1775088000,
+        1774915200,
         0.0
       ],
       [
         1775347200,
-        0.0
+        9855.354127780392
       ],
       [
-        1775426179,
-        0.0
+        1775426721,
+        9855.354127780392
       ]
     ],
     "strict_estimated_shape_missing": true

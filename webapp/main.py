@@ -18203,6 +18203,16 @@ def _merge_for_web(
             if ex_sanity_fees:
                 ex_sanity_income = float(ex_sanity_fees[-1][1]) if ex_sanity_fees else 0.0
                 ex_sanity_apy = (ex_sanity_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+                sanity_dbg = ((v.get("strict_debug") or {}).get("sanity_swap_debug") or {})
+                sanity_err = str((sanity_dbg.get("error") or "")).strip()
+                sanity_ok = bool(ex_sanity_income > 0.0)
+                sanity_quality = ("exact_partial" if (exact_quality != "strict_unavailable" and sanity_ok) else "strict_unavailable")
+                sanity_reason = (
+                    f"Exact full sanity-check (on-chain swap logs; {src_lbl})"
+                    if sanity_ok
+                    else f"strict_required:v4_exact2:onchain_swap_logs:{sanity_err or 'no_data'}"
+                )
+                sanity_status = (status if sanity_ok else "strict_unavailable")
                 _append_compare_row(
                     pool_id=base_pool_id,
                     chain=base_chain,
@@ -18214,14 +18224,24 @@ def _merge_for_web(
                     income=ex_sanity_income,
                     apy=ex_sanity_apy,
                     last_tvl=exact_last_tvl,
-                    data_quality=("exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"),
-                    data_quality_reason=f"Exact full sanity-check (on-chain swap logs; {src_lbl})",
-                    status=status,
+                    data_quality=sanity_quality,
+                    data_quality_reason=sanity_reason,
+                    status=sanity_status,
                 )
             if ex_active_sanity_fees and ex_active_tvl:
                 ex_act_sanity_income = float(ex_active_sanity_fees[-1][1]) if ex_active_sanity_fees else 0.0
                 ex_act_sanity_apy = (ex_act_sanity_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
                 ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
+                sanity_dbg = ((v.get("strict_debug") or {}).get("sanity_swap_debug") or {})
+                sanity_err = str((sanity_dbg.get("error") or "")).strip()
+                sanity_ok = bool(ex_act_sanity_income > 0.0)
+                sanity_quality = ("exact_partial" if (exact_quality != "strict_unavailable" and sanity_ok) else "strict_unavailable")
+                sanity_reason = (
+                    f"Exact active sanity-check (on-chain swap logs; {src_lbl})"
+                    if sanity_ok
+                    else f"strict_required:v4_exact2:onchain_swap_logs:{sanity_err or 'no_data'}"
+                )
+                sanity_status = (status if sanity_ok else "strict_unavailable")
                 _append_compare_row(
                     pool_id=base_pool_id,
                     chain=base_chain,
@@ -18233,9 +18253,9 @@ def _merge_for_web(
                     income=ex_act_sanity_income,
                     apy=ex_act_sanity_apy,
                     last_tvl=ex_act_last_tvl,
-                    data_quality=("exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"),
-                    data_quality_reason=f"Exact active sanity-check (on-chain swap logs; {src_lbl})",
-                    status=status,
+                    data_quality=sanity_quality,
+                    data_quality_reason=sanity_reason,
+                    status=sanity_status,
                 )
         else:
             row = {
