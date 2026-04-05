@@ -2358,8 +2358,10 @@ def main() -> None:
         exact_step_days = 5
     if strict_exact_tvl:
         strict_exact_tvl = _sparse_series_every_n_days(strict_exact_tvl, exact_step_days)
+        strict_exact_tvl = _append_now_tvl_anchor(strict_exact_tvl, float(pool_tvl_now_usd))
     if strict_exact_fees:
         strict_exact_fees = _sparse_series_every_n_days(strict_exact_fees, exact_step_days)
+        strict_exact_fees = _append_now_fee_anchor(strict_exact_fees)
 
     payload = {
         "fees": final_fees,
