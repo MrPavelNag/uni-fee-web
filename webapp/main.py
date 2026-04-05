@@ -18041,6 +18041,9 @@ def _merge_for_web(
             ex_fees = v.get("strict_compare_exact_fees") or []
             ex_tvl = v.get("strict_compare_exact_tvl") or []
             ex_active_tvl = v.get("strict_compare_exact_active_tvl") or []
+            ex_active_fees = v.get("strict_compare_exact_active_fees") or []
+            if (not ex_active_fees) and est_active_fees:
+                ex_active_fees = list(est_active_fees)
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
 
             tvl_end_ts = max(
@@ -18055,6 +18058,7 @@ def _merge_for_web(
                 + [int(x[0]) for x in (est_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (est_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (ex_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
             )
             est_tvl = _align_series_end(est_tvl, tvl_end_ts)
             est_active_tvl = _align_series_end(est_active_tvl, tvl_end_ts)
@@ -18063,6 +18067,7 @@ def _merge_for_web(
             est_fees = _align_series_end(est_fees, fees_end_ts)
             est_active_fees = _align_series_end(est_active_fees, fees_end_ts)
             ex_fees = _align_series_end(ex_fees, fees_end_ts)
+            ex_active_fees = _align_series_end(ex_active_fees, fees_end_ts)
 
             src_lbl = _short_source_label(str(v.get("tvl_price_source") or ""))
             est_income = float(est_fees[-1][1]) if est_fees else 0.0
@@ -18075,13 +18080,13 @@ def _merge_for_web(
                     "pool_id": base_pool_id,
                     "chain": base_chain,
                     "version": base_version,
-                    "pair": f"{base_pair} (estimated)",
+                        "pair": f"{base_pair} (estimated full)",
                     "fee_pct": base_fee_pct,
                     "final_income": est_income,
                     "apy_pct": float(est_apy),
                     "last_tvl": est_last_tvl,
                     "data_quality": "estimated",
-                    "data_quality_reason": f"Estimate full-pool anchor ({src_lbl})",
+                    "data_quality_reason": f"Estimate full anchor ({src_lbl})",
                     "status": status,
                 }
             )
@@ -18095,13 +18100,13 @@ def _merge_for_web(
                         "pool_id": base_pool_id,
                         "chain": base_chain,
                         "version": base_version,
-                        "pair": f"{base_pair} (estimated active-window)",
+                        "pair": f"{base_pair} (estimated active)",
                         "fee_pct": base_fee_pct,
                         "final_income": est_act_income,
                         "apy_pct": float(est_act_apy),
                         "last_tvl": float(est_act_last_tvl),
                         "data_quality": "estimated",
-                        "data_quality_reason": f"Estimate active-window anchor ({src_lbl})",
+                        "data_quality_reason": f"Estimate active anchor ({src_lbl})",
                         "status": status,
                     }
                 )
@@ -18124,30 +18129,32 @@ def _merge_for_web(
                     "pool_id": base_pool_id,
                     "chain": base_chain,
                     "version": base_version,
-                    "pair": f"{base_pair} (exact)",
+                    "pair": f"{base_pair} (exact full)",
                     "fee_pct": base_fee_pct,
                     "final_income": exact_income,
                     "apy_pct": float(exact_apy),
                     "last_tvl": exact_last_tvl,
                     "data_quality": exact_quality,
-                    "data_quality_reason": f"Exact full-pool now ({src_lbl})",
+                    "data_quality_reason": f"Exact full now ({src_lbl})",
                     "status": status,
                 }
             )
             if ex_active_tvl:
                 ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
+                ex_act_income = float(ex_active_fees[-1][1]) if ex_active_fees else 0.0
+                ex_act_apy = (ex_act_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
                 rows.append(
                     {
                         "pool_id": base_pool_id,
                         "chain": base_chain,
                         "version": base_version,
-                        "pair": f"{base_pair} (exact active-window)",
+                        "pair": f"{base_pair} (exact active)",
                         "fee_pct": base_fee_pct,
-                        "final_income": 0.0,
-                        "apy_pct": 0.0,
+                        "final_income": ex_act_income,
+                        "apy_pct": float(ex_act_apy),
                         "last_tvl": float(ex_act_last_tvl),
                         "data_quality": "exact_partial",
-                        "data_quality_reason": f"Exact active-window now ({src_lbl})",
+                        "data_quality_reason": f"Exact active now ({src_lbl})",
                         "status": status,
                     }
                 )
@@ -18185,6 +18192,7 @@ def _merge_for_web(
                     "strict_compare_exact_fees": (ex_fees if has_strict_compare else (v.get("strict_compare_exact_fees") or [])),
                     "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
                     "strict_compare_exact_active_tvl": (ex_active_tvl if has_strict_compare else (v.get("strict_compare_exact_active_tvl") or [])),
+                    "strict_compare_exact_active_fees": (ex_active_fees if has_strict_compare else (v.get("strict_compare_exact_active_fees") or [])),
                     "strict_compare_exact2_reason": exact2_reason,
                     "pool_tvl_now_usd": pool_tvl_now_usd,
                 }
@@ -21839,6 +21847,8 @@ def _render_positions_page() -> str:
       const dbg = raw.match(/dbg=t_blocks=([0-9]*\\.?[0-9]+),t_alchemy=([0-9]*\\.?[0-9]+),t_pricing=([0-9]*\\.?[0-9]+),t_total=([0-9]*\\.?[0-9]+)/i);
       const dbgTail = dbg ? ` (b:${Number(dbg[1]).toFixed(1)}s a:${Number(dbg[2]).toFixed(1)}s p:${Number(dbg[3]).toFixed(1)}s)` : "";
       const dq = String(qualityTag || "").trim().toLowerCase();
+      if (/^Estimate\\s+(full|active)\\b/i.test(raw)) return raw;
+      if (/^Exact\\s+(full|active)\\b/i.test(raw)) return raw;
       const covMatch = raw.match(/(?:^|:)cov=([0-9]*\.?[0-9]+)/i);
       const filledMatch = raw.match(/(?:^|:)filled=(\d+)/i);
       const covPct = covMatch ? `${Math.round(Number(covMatch[1]) * 100)}%` : "";
@@ -21874,7 +21884,7 @@ def _render_positions_page() -> str:
       }
       if (raw.startsWith("exact_v4_2_onchain_quantities:")) {
         const mode = raw.includes("pure_onchain_active_window")
-          ? "active-window"
+          ? "active"
           : (raw.includes("pure_onchain_ticks") ? "tick-scan" : "onchain");
         const days = (raw.match(/(?:^|:)days=(\\d+)/i) || [])[1];
         const pos = (raw.match(/(?:^|:)raw_pos=(\\d+)/i) || [])[1];
@@ -32945,9 +32955,10 @@ HTML_PAGE = """
         const estActiveFees = Array.isArray(s.strict_compare_estimated_active_fees) ? s.strict_compare_estimated_active_fees : [];
         const estActiveTvl = Array.isArray(s.strict_compare_estimated_active_tvl) ? s.strict_compare_estimated_active_tvl : [];
         const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
+        const exActiveFees = Array.isArray(s.strict_compare_exact_active_fees) ? s.strict_compare_exact_active_fees : [];
         const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
         const exActiveTvl = Array.isArray(s.strict_compare_exact_active_tvl) ? s.strict_compare_exact_active_tvl : [];
-        const useStrictCompare = strictMode && (estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length || exFees.length || exTvl.length || exActiveTvl.length);
+        const useStrictCompare = strictMode && (estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length || exFees.length || exActiveFees.length || exTvl.length || exActiveTvl.length);
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
           ...((s.tvl || []).map(p => Number(p[0] || 0))),
@@ -32956,6 +32967,7 @@ HTML_PAGE = """
           ...(estActiveFees.map(p => Number(p?.[0] || 0))),
           ...(estActiveTvl.map(p => Number(p?.[0] || 0))),
           ...(exFees.map(p => Number(p?.[0] || 0))),
+          ...(exActiveFees.map(p => Number(p?.[0] || 0))),
           ...(exTvl.map(p => Number(p?.[0] || 0))),
           ...(exActiveTvl.map(p => Number(p?.[0] || 0))),
           0
@@ -32993,6 +33005,11 @@ HTML_PAGE = """
             const v = Number(p?.[1] || 0);
             return v > 0 ? v : null;
           });
+          const exActFeeX = exActiveFees.map(p => new Date(p[0] * 1000));
+          const exActFeeYExact = exActiveFees.map(p => {
+            const v = Number(p?.[1] || 0);
+            return v > 0 ? v : null;
+          });
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
           const estActTvlX = estTvlActSrc.map(p => new Date(p[0] * 1000));
@@ -33002,65 +33019,78 @@ HTML_PAGE = """
           const exActX = exActiveTvl.map(p => new Date(p[0] * 1000));
           const exActY = sanitizeExactTvlK(exActiveTvl, estTvlSrc.length ? estTvlSrc : estTvlActSrc, Number(s.pool_tvl_now_usd || 0));
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
-          const estActHover = estActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active-window"]);
+          const estActHover = estActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
+          const exActHover = exActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
+          const COLOR_FULL = "#1d4ed8";          // blue
+          const COLOR_ACTIVE = "#16a34a";        // green
+          const COLOR_FULL_EST = "#60a5fa";      // light blue
+          const COLOR_ACTIVE_EST = "#86efac";    // light green
           if (estFeeX.length) {
             feeTraces.push({
-              x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHover,
+              x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated full)`, customdata: estHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: "#64748b", width: 3.0, dash: "dot"}
+              line: {color: COLOR_FULL_EST, width: 3.0, dash: "dot"}
             });
           }
           if (estActFeeX.length) {
             feeTraces.push({
-              x: estActFeeX, y: estActFeeY, mode: "lines", name: `${s.label} (estimated active-window)`, customdata: estActHover,
+              x: estActFeeX, y: estActFeeY, mode: "lines", name: `${s.label} (estimated active)`, customdata: estActHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: "#94a3b8", width: 2.4, dash: "dash"}
+              line: {color: COLOR_ACTIVE_EST, width: 2.4, dash: "dash"}
             });
           }
           if (exFeeX.length) {
             feeTraces.push({
-              x: exFeeX, y: exFeeYExact, mode: "lines+markers", name: `${s.label} (exact)`, customdata: exHover,
+              x: exFeeX, y: exFeeYExact, mode: "lines+markers", name: `${s.label} (exact full)`, customdata: exHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: "#1d4ed8", width: 1.8, dash: "solid"},
-              marker: {size: 5, color: "#1d4ed8"}
+              line: {color: COLOR_FULL, width: 1.8, dash: "solid"},
+              marker: {size: 5, color: COLOR_FULL}
+            });
+          }
+          if (exActFeeX.length) {
+            feeTraces.push({
+              x: exActFeeX, y: exActFeeYExact, mode: "lines+markers", name: `${s.label} (exact active)`, customdata: exActHover,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
+              line: {color: COLOR_ACTIVE, width: 1.8, dash: "solid"},
+              marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
             });
           }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
-          const estActHoverTvl = estActTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active-window"]);
+          const estActHoverTvl = estActTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
           const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
-          const exActHoverTvl = exActX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active-window"]);
+          const exActHoverTvl = exActX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
           if (estTvlX.length) {
             const estSingle = estTvlX.length === 1;
             tvlTraces.push({
-              x: estTvlX, y: estTvlY, mode: (estSingle ? "markers" : "lines"), name: `${s.label} (estimated)`, customdata: estHoverTvl,
+              x: estTvlX, y: estTvlY, mode: (estSingle ? "markers" : "lines"), name: `${s.label} (estimated full)`, customdata: estHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: "#64748b", width: 3.0, dash: "dot"},
-              ...(estSingle ? {marker: {size: 8, color: "#64748b", symbol: "circle"}} : {})
+              line: {color: COLOR_FULL_EST, width: 3.0, dash: "dot"},
+              ...(estSingle ? {marker: {size: 8, color: COLOR_FULL_EST, symbol: "circle"}} : {})
             });
           }
           if (estActTvlX.length) {
             const estActSingle = estActTvlX.length === 1;
             tvlTraces.push({
-              x: estActTvlX, y: estActTvlY, mode: (estActSingle ? "markers" : "lines"), name: `${s.label} (estimated active-window)`, customdata: estActHoverTvl,
+              x: estActTvlX, y: estActTvlY, mode: (estActSingle ? "markers" : "lines"), name: `${s.label} (estimated active)`, customdata: estActHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: "#94a3b8", width: 2.4, dash: "dash"},
-              ...(estActSingle ? {marker: {size: 8, color: "#94a3b8", symbol: "square"}} : {})
+              line: {color: COLOR_ACTIVE_EST, width: 2.4, dash: "dash"},
+              ...(estActSingle ? {marker: {size: 8, color: COLOR_ACTIVE_EST, symbol: "square"}} : {})
             });
           }
           if (exTvlX.length) {
             tvlTraces.push({
-              x: exTvlX, y: exTvlYExact, mode: "lines+markers", name: `${s.label} (exact)`, customdata: exHoverTvl,
+              x: exTvlX, y: exTvlYExact, mode: "lines+markers", name: `${s.label} (exact full)`, customdata: exHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: "#1d4ed8", width: 1.8, dash: "solid"},
-              marker: {size: 5, color: "#1d4ed8"}
+              line: {color: COLOR_FULL, width: 1.8, dash: "solid"},
+              marker: {size: 5, color: COLOR_FULL}
             });
           }
           if (exActX.length) {
             tvlTraces.push({
-              x: exActX, y: exActY, mode: "markers", name: `${s.label} (exact active-window)`, customdata: exActHoverTvl,
+              x: exActX, y: exActY, mode: "markers", name: `${s.label} (exact active)`, customdata: exActHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              marker: {size: 8, color: "#0ea5e9", symbol: "diamond"}
+              marker: {size: 8, color: COLOR_ACTIVE, symbol: "diamond"}
             });
           }
         } else {
@@ -33142,6 +33172,8 @@ HTML_PAGE = """
       const dbg = raw.match(/dbg=t_blocks=([0-9]*\\.?[0-9]+),t_alchemy=([0-9]*\\.?[0-9]+),t_pricing=([0-9]*\\.?[0-9]+),t_total=([0-9]*\\.?[0-9]+)/i);
       const dbgTail = dbg ? ` (b:${Number(dbg[1]).toFixed(1)}s a:${Number(dbg[2]).toFixed(1)}s p:${Number(dbg[3]).toFixed(1)}s)` : "";
       const dq = String(qualityTag || "").trim().toLowerCase();
+      if (/^Estimate\\s+(full|active)\\b/i.test(raw)) return raw;
+      if (/^Exact\\s+(full|active)\\b/i.test(raw)) return raw;
       const covMatch = raw.match(/(?:^|:)cov=([0-9]*\.?[0-9]+)/i);
       const filledMatch = raw.match(/(?:^|:)filled=(\d+)/i);
       const covPct = covMatch ? `${Math.round(Number(covMatch[1]) * 100)}%` : "";
@@ -33176,7 +33208,7 @@ HTML_PAGE = """
       }
       if (raw.startsWith("exact_v4_2_onchain_quantities:")) {
         const mode = raw.includes("pure_onchain_active_window")
-          ? "active-window"
+          ? "active"
           : (raw.includes("pure_onchain_ticks") ? "tick-scan" : "onchain");
         const days = (raw.match(/(?:^|:)days=(\\d+)/i) || [])[1];
         const pos = (raw.match(/(?:^|:)raw_pos=(\\d+)/i) || [])[1];

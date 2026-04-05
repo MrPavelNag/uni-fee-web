@@ -641,6 +641,7 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> d
         "strict_compare_estimated_active_fees": [],
         "strict_compare_exact_tvl": [],
         "strict_compare_exact_active_tvl": [],
+        "strict_compare_exact_active_fees": [],
         "strict_compare_exact_fees": [],
     }
 
@@ -994,7 +995,7 @@ def _append_now_fee_anchor(fee_series: list[tuple[int, float]]) -> list[tuple[in
     return out
 
 
-def _sparse_sample_series(series: list[tuple[int, float]], points: int = 5) -> list[tuple[int, float]]:
+def _sparse_series_every_n_days(series: list[tuple[int, float]], step_days: int = 5) -> list[tuple[int, float]]:
     arr: list[tuple[int, float]] = []
     seen_ts: set[int] = set()
     for ts, v in sorted((series or []), key=lambda x: int(x[0])):
@@ -1005,16 +1006,39 @@ def _sparse_sample_series(series: list[tuple[int, float]], points: int = 5) -> l
         arr.append((t, float(v)))
     if not arr:
         return []
-    n_req = max(1, int(points))
-    n = min(n_req, len(arr))
-    if n == len(arr):
-        return arr
-    if n == 1:
-        return [arr[-1]]
-    idxs = sorted(set(int(round(i * (len(arr) - 1) / (n - 1))) for i in range(n)))
-    out = [arr[i] for i in idxs if 0 <= i < len(arr)]
-    if out and out[-1][0] != arr[-1][0]:
-        out.append(arr[-1])
+    step_sec = max(86400, int(max(1, int(step_days)) * 86400))
+    first_ts = int(arr[0][0])
+    last_ts = int(arr[-1][0])
+    # Build target timeline: one point every N days + force TVL NOW (last point).
+    targets: list[int] = []
+    cur = int((first_ts // 86400) * 86400)
+    end = int((last_ts // 86400) * 86400)
+    while cur <= end:
+        targets.append(int(cur))
+        cur += step_sec
+    if not targets or targets[-1] != int(last_ts):
+        targets.append(int(last_ts))
+
+    # For each target day pick nearest available point.
+    out: list[tuple[int, float]] = []
+    used_idx: set[int] = set()
+    for target in targets:
+        best_i = -1
+        best_d = 10**30
+        for i, (ts, _v) in enumerate(arr):
+            if i in used_idx:
+                continue
+            d = abs(int(ts) - int(target))
+            if d < best_d:
+                best_d = d
+                best_i = i
+        if best_i < 0:
+            continue
+        used_idx.add(best_i)
+        out.append((int(arr[best_i][0]), float(arr[best_i][1])))
+    out = sorted(out, key=lambda x: int(x[0]))
+    if out and int(out[-1][0]) != int(last_ts):
+        out.append((int(last_ts), float(arr[-1][1])))
     return out
 
 
@@ -2070,20 +2094,24 @@ def main() -> None:
     estimated_active_tvl: list[tuple[int, float]] = []
     estimated_active_fees: list[tuple[int, float]] = []
     exact_active_tvl: list[tuple[int, float]] = []
+    exact_active_fees: list[tuple[int, float]] = []
     if tvl_active_now > 0.0:
         estimated_active_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
         estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl_base)
         estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
         estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
         try:
-            active_points = max(1, int(os.environ.get("STRICT_V3_ACTIVE_WINDOW_POINTS", "5")))
+            active_step_days = max(1, int(os.environ.get("STRICT_V3_ACTIVE_WINDOW_STEP_DAYS", "5")))
         except Exception:
-            active_points = 5
+            active_step_days = 5
         # Exact active-window is intentionally sparse for performance:
-        # keep a small set of representative points including TVL NOW.
-        exact_active_tvl = _sparse_sample_series(estimated_active_tvl, active_points)
+        # one point every N days + TVL NOW; if target day missing pick nearest day.
+        exact_active_tvl = _sparse_series_every_n_days(estimated_active_tvl, active_step_days)
+        exact_active_fees = _sparse_series_every_n_days(estimated_active_fees, active_step_days)
         if exact_active_tvl:
             exact_active_tvl[-1] = (int(exact_active_tvl[-1][0]), float(max(0.0, tvl_active_now)))
+        if exact_active_fees and estimated_active_fees:
+            exact_active_fees[-1] = (int(exact_active_fees[-1][0]), float(max(0.0, estimated_active_fees[-1][1])))
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
@@ -2322,6 +2350,17 @@ def main() -> None:
             strict_exact_tvl = []
             strict_exact_fees = []
 
+    # Keep exact full-pool compare sparse for performance/readability:
+    # one point every N days (nearest day if target day missing).
+    try:
+        exact_step_days = max(1, int(os.environ.get("STRICT_V3_EXACT_STEP_DAYS", "5")))
+    except Exception:
+        exact_step_days = 5
+    if strict_exact_tvl:
+        strict_exact_tvl = _sparse_series_every_n_days(strict_exact_tvl, exact_step_days)
+    if strict_exact_fees:
+        strict_exact_fees = _sparse_series_every_n_days(strict_exact_fees, exact_step_days)
+
     payload = {
         "fees": final_fees,
         "tvl": final_tvl,
@@ -2344,6 +2383,7 @@ def main() -> None:
         "strict_compare_estimated_active_fees": estimated_active_fees,
         "strict_compare_exact_tvl": strict_exact_tvl,
         "strict_compare_exact_active_tvl": exact_active_tvl,
+        "strict_compare_exact_active_fees": exact_active_fees,
         "strict_compare_exact_fees": strict_exact_fees,
     }
 
