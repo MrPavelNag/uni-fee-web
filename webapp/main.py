@@ -17982,6 +17982,39 @@ def _merge_for_web(
         elif "dexscreener" in s:
             price = "Dexscreener"
         return f"{onchain} + {price}"
+
+    def _append_compare_row(
+        *,
+        pool_id: str,
+        chain: str,
+        version: str,
+        base_pair: str,
+        branch: str,
+        anchor_type: str,
+        fee_pct: float,
+        income: float,
+        apy: float,
+        last_tvl: float,
+        data_quality: str,
+        data_quality_reason: str,
+        status: str,
+    ) -> None:
+        rows.append(
+            {
+                "pool_id": str(pool_id or ""),
+                "chain": str(chain or ""),
+                "version": str(version or ""),
+                "pair": f"{str(base_pair or '')} ({str(branch or '').strip()})",
+                "anchor_type": str(anchor_type or ""),
+                "fee_pct": float(fee_pct or 0.0),
+                "final_income": float(income or 0.0),
+                "apy_pct": float(apy or 0.0),
+                "last_tvl": float(last_tvl or 0.0),
+                "data_quality": str(data_quality or ""),
+                "data_quality_reason": str(data_quality_reason or ""),
+                "status": str(status or ""),
+            }
+        )
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
@@ -18078,42 +18111,40 @@ def _merge_for_web(
             est_last_tvl = _last_positive_value(est_tvl) if est_tvl else float(pool_tvl_now_usd)
             if est_last_tvl <= 0.0:
                 est_last_tvl = float(pool_tvl_now_usd)
-            rows.append(
-                {
-                    "pool_id": base_pool_id,
-                    "chain": base_chain,
-                    "version": base_version,
-                        "pair": f"{base_pair} (estimated)",
-                    "anchor_type": "Full",
-                    "fee_pct": base_fee_pct,
-                    "final_income": est_income,
-                    "apy_pct": float(est_apy),
-                    "last_tvl": est_last_tvl,
-                    "data_quality": "estimated",
-                    "data_quality_reason": f"Estimate full anchor ({src_lbl})",
-                    "status": status,
-                }
+            _append_compare_row(
+                pool_id=base_pool_id,
+                chain=base_chain,
+                version=base_version,
+                base_pair=base_pair,
+                branch="estimated",
+                anchor_type="Full",
+                fee_pct=base_fee_pct,
+                income=est_income,
+                apy=est_apy,
+                last_tvl=est_last_tvl,
+                data_quality="estimated",
+                data_quality_reason=f"Estimate full anchor ({src_lbl})",
+                status=status,
             )
 
             if est_active_tvl:
                 est_act_income = float(est_active_fees[-1][1]) if est_active_fees else 0.0
                 est_act_apy = (est_act_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
                 est_act_last_tvl = _last_positive_value(est_active_tvl) if est_active_tvl else 0.0
-                rows.append(
-                    {
-                        "pool_id": base_pool_id,
-                        "chain": base_chain,
-                        "version": base_version,
-                        "pair": f"{base_pair} (estimated)",
-                        "anchor_type": "Active",
-                        "fee_pct": base_fee_pct,
-                        "final_income": est_act_income,
-                        "apy_pct": float(est_act_apy),
-                        "last_tvl": float(est_act_last_tvl),
-                        "data_quality": "estimated",
-                        "data_quality_reason": f"Estimate active anchor ({src_lbl})",
-                        "status": status,
-                    }
+                _append_compare_row(
+                    pool_id=base_pool_id,
+                    chain=base_chain,
+                    version=base_version,
+                    base_pair=base_pair,
+                    branch="estimated",
+                    anchor_type="Active",
+                    fee_pct=base_fee_pct,
+                    income=est_act_income,
+                    apy=est_act_apy,
+                    last_tvl=est_act_last_tvl,
+                    data_quality="estimated",
+                    data_quality_reason=f"Estimate active anchor ({src_lbl})",
+                    status=status,
                 )
 
             exact_income = float(ex_fees[-1][1]) if ex_fees else 0.0
@@ -18129,41 +18160,39 @@ def _merge_for_web(
                 exact_quality = "exact_partial"
             else:
                 exact_quality = "exact"
-            rows.append(
-                {
-                    "pool_id": base_pool_id,
-                    "chain": base_chain,
-                    "version": base_version,
-                    "pair": f"{base_pair} (exact)",
-                    "anchor_type": "Full",
-                    "fee_pct": base_fee_pct,
-                    "final_income": exact_income,
-                    "apy_pct": float(exact_apy),
-                    "last_tvl": exact_last_tvl,
-                    "data_quality": exact_quality,
-                    "data_quality_reason": f"Exact full now ({src_lbl})",
-                    "status": status,
-                }
+            _append_compare_row(
+                pool_id=base_pool_id,
+                chain=base_chain,
+                version=base_version,
+                base_pair=base_pair,
+                branch="exact",
+                anchor_type="Full",
+                fee_pct=base_fee_pct,
+                income=exact_income,
+                apy=exact_apy,
+                last_tvl=exact_last_tvl,
+                data_quality=exact_quality,
+                data_quality_reason=f"Exact full now ({src_lbl})",
+                status=status,
             )
             if ex_active_tvl:
                 ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
                 ex_act_income = float(ex_active_fees[-1][1]) if ex_active_fees else 0.0
                 ex_act_apy = (ex_act_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-                rows.append(
-                    {
-                        "pool_id": base_pool_id,
-                        "chain": base_chain,
-                        "version": base_version,
-                        "pair": f"{base_pair} (exact)",
-                        "anchor_type": "Active",
-                        "fee_pct": base_fee_pct,
-                        "final_income": ex_act_income,
-                        "apy_pct": float(ex_act_apy),
-                        "last_tvl": float(ex_act_last_tvl),
-                        "data_quality": "exact_partial",
-                        "data_quality_reason": f"Exact active now ({src_lbl})",
-                        "status": status,
-                    }
+                _append_compare_row(
+                    pool_id=base_pool_id,
+                    chain=base_chain,
+                    version=base_version,
+                    base_pair=base_pair,
+                    branch="exact",
+                    anchor_type="Active",
+                    fee_pct=base_fee_pct,
+                    income=ex_act_income,
+                    apy=ex_act_apy,
+                    last_tvl=ex_act_last_tvl,
+                    data_quality=("exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"),
+                    data_quality_reason=f"Exact active now ({src_lbl})",
+                    status=status,
                 )
         else:
             row = {
@@ -31292,6 +31321,43 @@ HTML_PAGE = """
       margin-bottom: 6px;
     }
     .mode-filter-line:last-child { margin-bottom: 0; }
+    .mode-filter-wrap {
+      position: relative;
+      display: grid;
+      grid-template-columns: 94px 1fr;
+      column-gap: 8px;
+      row-gap: 8px;
+      align-items: center;
+    }
+    .mode-filter-wrap::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: -4px;
+      bottom: -4px;
+      width: 94px;
+      border: 1px solid #d1dbe9;
+      border-radius: 12px;
+      background: rgba(248, 251, 255, 0.55);
+      pointer-events: none;
+    }
+    .mode-filter-wrap .mode-filter-line {
+      display: contents;
+    }
+    .mode-filter-wrap .mode-check {
+      grid-column: 1;
+      position: relative;
+      z-index: 1;
+    }
+    .mode-filter-wrap .inline-grid {
+      grid-column: 2;
+    }
+    #estimatedModeLine .mode-check {
+      transform: translateY(-4px);
+    }
+    #exactModeLine .mode-check {
+      transform: translateY(4px);
+    }
     .mode-check {
       display: flex;
       align-items: center;
@@ -31427,6 +31493,12 @@ HTML_PAGE = """
       .row label { padding-top: 0; }
       .inline-grid { grid-template-columns: 1fr 1fr; }
       .mode-filter-line { grid-template-columns: 1fr; }
+      .mode-filter-wrap { grid-template-columns: 1fr; row-gap: 8px; }
+      .mode-filter-wrap::before { display: none; }
+      .mode-filter-wrap .mode-check,
+      .mode-filter-wrap .inline-grid { grid-column: 1; }
+      #estimatedModeLine .mode-check,
+      #exactModeLine .mode-check { transform: none; }
       .estimated-grid, .exact-grid { grid-template-columns: 1fr; }
       .summary-strip { gap: 6px; }
       .summary-box { min-width: 150px; }
@@ -31634,7 +31706,7 @@ HTML_PAGE = """
 
           <div class="row" id="runFiltersRow">
             <label>Filters</label>
-            <div>
+            <div class="mode-filter-wrap">
               <div class="mode-filter-line" id="estimatedModeLine">
                 <div class="mode-check mode-item">
                   <label><input id="modeFastLegacy" type="checkbox" checked onchange="syncRunModes('fast')"/> Estimated</label>
@@ -31737,6 +31809,23 @@ HTML_PAGE = """
     </div>
   </div>
   <script>
+    function statusCodeForRow(r) {
+      const dq = String(r?.data_quality || "").trim().toLowerCase();
+      const reason = String(r?.data_quality_reason || "").trim();
+      if (reason.startsWith("strict_required:")) return reason;
+      if (dq === "strict_unavailable") return (reason || "strict_unavailable");
+      const hasRawDiag = (
+        reason.startsWith("exact:")
+        || reason.startsWith("exact2")
+        || reason.includes("source_conflict")
+        || reason.includes("one_leg")
+        || reason.includes("timeout")
+        || reason.includes("partial")
+      );
+      if (hasRawDiag) return `ok | ${reason}`;
+      return "ok";
+    }
+
     const SORTABLE = {
       color: (r) => r.pool_id || "",
       visibility: (r) => r.pool_id || "",
@@ -31744,13 +31833,7 @@ HTML_PAGE = """
       version: (r) => r.version || "",
       pair: (r) => r.pair || "",
       anchor_type: (r) => String(r.anchor_type || "").toLowerCase(),
-      status_code: (r) => {
-        const dq = String(r.data_quality || "").trim().toLowerCase();
-        const reason = String(r.data_quality_reason || "").trim();
-        if (reason.startsWith("strict_required:")) return reason;
-        if (dq === "strict_unavailable") return (reason || "strict_unavailable");
-        return "ok";
-      },
+      status_code: (r) => statusCodeForRow(r),
       fee_pct: (r) => Number(r.fee_pct || 0),
       final_income: (r) => Number(r.final_income || 0),
       apy_pct: (r) => Number(r.apy_pct || 0),
@@ -33317,22 +33400,6 @@ HTML_PAGE = """
 
     function renderTable(rows) {
       const table = document.getElementById("resultTable");
-      const statusCodeForRow = (r) => {
-        const dq = String(r?.data_quality || "").trim().toLowerCase();
-        const reason = String(r?.data_quality_reason || "").trim();
-        if (reason.startsWith("strict_required:")) return reason;
-        if (dq === "strict_unavailable") return (reason || "strict_unavailable");
-        const hasRawDiag = (
-          reason.startsWith("exact:")
-          || reason.startsWith("exact2")
-          || reason.includes("source_conflict")
-          || reason.includes("one_leg")
-          || reason.includes("timeout")
-          || reason.includes("partial")
-        );
-        if (hasRawDiag) return `ok | ${reason}`;
-        return "ok";
-      };
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
         ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["anchor_type", "Anchor"], ["status_code", "Status"]
@@ -33349,12 +33416,10 @@ HTML_PAGE = """
         const cls = r.status === "ok" ? "ok-row" : "error-row";
         const pairLbl = String(r.pair || "").toLowerCase();
         const anchorType = String(r.anchor_type || "").trim().toLowerCase();
-        const isEstFull = isEstimatedRow && anchorType === "full";
-        const isEstActive = isEstimatedRow && anchorType === "active";
-        const isExFull = isExactRow && anchorType === "full";
-        const isExActive = isExactRow && anchorType === "active";
-        const isEstimatedRow = isEstFull || isEstActive;
-        const isExactRow = isExFull || isExActive;
+        const isEstFull = pairLbl.includes("(estimated)") && anchorType === "full";
+        const isEstActive = pairLbl.includes("(estimated)") && anchorType === "active";
+        const isExFull = pairLbl.includes("(exact)") && anchorType === "full";
+        const isExActive = pairLbl.includes("(exact)") && anchorType === "active";
         let color = colorMap[r.pool_id] || "#94a3b8";
         let dash = dashMap[r.pool_id] || "solid";
         let swatchWidth = 3.0;
@@ -33427,7 +33492,7 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "anchor_type", "status_code", "data_quality_reason"];
+      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "anchor_type", "status_code"];
       const lines = [headers.join(",")];
       for (const r of rows) {
         const vals = headers.map(h => {
@@ -33437,23 +33502,7 @@ HTML_PAGE = """
           } else if (h === "anchor_type") {
             rawVal = String(r.anchor_type || "");
           } else if (h === "status_code") {
-            const reason = String(r.data_quality_reason || "").trim();
-            const dq = String(r.data_quality || "").trim().toLowerCase();
-            if (reason.startsWith("strict_required:")) {
-              rawVal = reason;
-            } else if (dq === "strict_unavailable") {
-              rawVal = reason || "strict_unavailable";
-            } else {
-              const hasRawDiag = (
-                reason.startsWith("exact:")
-                || reason.startsWith("exact2")
-                || reason.includes("source_conflict")
-                || reason.includes("one_leg")
-                || reason.includes("timeout")
-                || reason.includes("partial")
-              );
-              rawVal = hasRawDiag ? (`ok | ${reason}`) : "ok";
-            }
+            rawVal = statusCodeForRow(r);
           } else {
             rawVal = r[h];
           }

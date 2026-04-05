@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sqlite3
 import time
@@ -126,28 +125,6 @@ def _amounts_from_liquidity_segment(liq: Decimal, sqrt_lo: Decimal, sqrt_hi: Dec
     amount0 = liq * (_Q96 * (sqrt_hi - sqrt_lo) / (sqrt_hi * sqrt_lo))
     amount1 = liq * ((sqrt_hi - sqrt_lo) / _Q96)
     return amount0, amount1
-
-
-def _v3_active_window_amounts(
-    *,
-    liquidity: int,
-    current_tick: int,
-    tick_spacing: int,
-    sqrt_price_x96: int,
-) -> tuple[float, float, str]:
-    if int(liquidity) <= 0 or int(tick_spacing) <= 0 or int(sqrt_price_x96) <= 0:
-        return 0.0, 0.0, "active_window_inputs_invalid"
-    lower = math.floor(int(current_tick) / int(tick_spacing)) * int(tick_spacing)
-    upper = lower + int(tick_spacing)
-    sqrt_lo = _sqrt_ratio_x96_at_tick(lower)
-    sqrt_hi = _sqrt_ratio_x96_at_tick(upper)
-    sqrt_p = Decimal(int(sqrt_price_x96))
-    liq = Decimal(int(liquidity))
-    if not (sqrt_lo < sqrt_p < sqrt_hi):
-        sqrt_p = min(max(sqrt_p, sqrt_lo + Decimal(1)), sqrt_hi - Decimal(1))
-    a0, _ = _amounts_from_liquidity_segment(liq, sqrt_p, sqrt_hi)
-    _, a1 = _amounts_from_liquidity_segment(liq, sqrt_lo, sqrt_p)
-    return float(max(Decimal(0), a0)), float(max(Decimal(0), a1)), "active_window"
 
 
 def _v3_active_positions_amounts_from_subgraph(
