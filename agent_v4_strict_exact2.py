@@ -808,8 +808,11 @@ def main() -> None:
     strict_dbg["raw_tvl_zero_days"] = int(raw_tvl_zero_days)
     strict_dbg["budget_sec"] = float(budget_sec)
 
-    estimated_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
-    estimated_fees = _rebuild_fees_cumulative(fees_usd, estimated_tvl)
+    estimated_tvl: list[tuple[int, float]] = []
+    estimated_fees: list[tuple[int, float]] = []
+    if raw_tvl_positive_days > 0:
+        estimated_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
+        estimated_fees = _rebuild_fees_cumulative(fees_usd, estimated_tvl)
     exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
     reason = (
@@ -838,6 +841,7 @@ def main() -> None:
         "strict_compare_estimated_fees": estimated_fees,
         "strict_compare_exact_tvl": exact_tvl,
         "strict_compare_exact_fees": [],
+        "strict_estimated_shape_missing": bool(raw_tvl_positive_days <= 0),
     }
     save_chart_data_json({str(pool.get("id") or ""): payload}, out_path)
     print(f"Saved strict v4 exact2 output: {out_path}")

@@ -16240,6 +16240,9 @@ def _scan_aave_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                 continue
             chain_obj = ((s.get("market") or {}).get("chain") or {})
             chain_id = int(chain_obj.get("chainId") or 0)
+            est_reason = f"strict_compare:estimated:{str(v.get('tvl_price_source') or 'unknown')}"
+            if bool(v.get("strict_estimated_shape_missing", False)) or ("raw_pos=0" in str(exact2_reason or "")):
+                est_reason += ":shape_missing"
             rows.append(
                 {
                     "address": owner,
@@ -18046,9 +18049,7 @@ def _merge_for_web(
                     "apy_pct": float(est_apy),
                     "last_tvl": est_last_tvl,
                     "data_quality": "estimated",
-                    "data_quality_reason": (
-                        f"strict_compare:estimated:{str(v.get('tvl_price_source') or 'unknown')}"
-                    ),
+                    "data_quality_reason": est_reason,
                     "status": status,
                 }
             )
@@ -21757,6 +21758,7 @@ def _render_positions_page() -> str:
       const filledDays = filledMatch ? `${Number(filledMatch[1])}d` : "";
 
       if (raw.startsWith("strict_compare:estimated:")) {
+        if (raw.includes("shape_missing")) return "Estimated unavailable: no v4 day TVL shape";
         if (raw.includes("coingecko+defillama")) return "Estimated (CoinGecko + DefiLlama)";
         return "Estimated mode";
       }
@@ -32999,6 +33001,7 @@ HTML_PAGE = """
       const filledDays = filledMatch ? `${Number(filledMatch[1])}d` : "";
 
       if (raw.startsWith("strict_compare:estimated:")) {
+        if (raw.includes("shape_missing")) return "Estimated unavailable: no v4 day TVL shape";
         if (raw.includes("coingecko+defillama")) return "Estimated (CoinGecko + DefiLlama)";
         return "Estimated mode";
       }

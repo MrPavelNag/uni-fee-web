@@ -320,6 +320,7 @@ def save_chart_data_json(pool_chart_data: dict[str, dict], path: str) -> None:
             "strict_compare_estimated_fees": v.get("strict_compare_estimated_fees") or [],
             "strict_compare_exact_tvl": v.get("strict_compare_exact_tvl") or [],
             "strict_compare_exact_fees": v.get("strict_compare_exact_fees") or [],
+            "strict_estimated_shape_missing": bool(v.get("strict_estimated_shape_missing", False)),
         }
     os.makedirs("data", exist_ok=True)
     with open(path, "w") as f:
