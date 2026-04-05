@@ -21779,6 +21779,25 @@ def _render_positions_page() -> str:
       if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
       if (raw.includes("exact2_partial:transfer_logs_timeout")) return `Partial exact: transfer log timeout${dbgTail}`;
       if (raw.includes("strict_required:v4:target_pool_id_must_be_pool_id_64hex")) return "V4 exact: use pool id (0x + 64 hex), not contract address";
+      if (raw.includes("strict_required:v4_exact2:")) {
+        const tail = raw.split("strict_required:v4_exact2:")[1] || "unknown";
+        return `V4 exact2 unavailable: ${tail.replace(/[:_]+/g, " ").replace(/\\s+/g, " ").trim()}`;
+      }
+      if (raw.startsWith("exact_v4_2_onchain_quantities:")) {
+        const mode = raw.includes("pure_onchain_active_window")
+          ? "active-window"
+          : (raw.includes("pure_onchain_ticks") ? "tick-scan" : "onchain");
+        const days = (raw.match(/(?:^|:)days=(\\d+)/i) || [])[1];
+        const pos = (raw.match(/(?:^|:)raw_pos=(\\d+)/i) || [])[1];
+        const zero = (raw.match(/(?:^|:)raw_zero=(\\d+)/i) || [])[1];
+        const cov = (raw.match(/(?:^|:)cov=([0-9]*\\.?[0-9]+)/i) || [])[1];
+        const covTxt = cov ? `${Math.round(Number(cov) * 100)}%` : "";
+        const parts = [];
+        if (covTxt) parts.push(`cov ${covTxt}`);
+        if (days) parts.push(`days ${days}`);
+        if (pos || zero) parts.push(`raw ${pos || 0}/${zero || 0}`);
+        return `V4 exact2 partial (${mode}${parts.length ? `; ${parts.join(", ")}` : ""})`;
+      }
       if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found in selected chains";
       if (raw.includes("missing_target_pool_id")) return "Target pool is required";
       if (dq === "exact") return "Exact";
@@ -33001,6 +33020,25 @@ HTML_PAGE = """
       if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
       if (raw.includes("exact2_partial:transfer_logs_timeout")) return `Partial exact: transfer log timeout${dbgTail}`;
       if (raw.includes("strict_required:v4:target_pool_id_must_be_pool_id_64hex")) return "V4 exact: use pool id (0x + 64 hex), not contract address";
+      if (raw.includes("strict_required:v4_exact2:")) {
+        const tail = raw.split("strict_required:v4_exact2:")[1] || "unknown";
+        return `V4 exact2 unavailable: ${tail.replace(/[:_]+/g, " ").replace(/\\s+/g, " ").trim()}`;
+      }
+      if (raw.startsWith("exact_v4_2_onchain_quantities:")) {
+        const mode = raw.includes("pure_onchain_active_window")
+          ? "active-window"
+          : (raw.includes("pure_onchain_ticks") ? "tick-scan" : "onchain");
+        const days = (raw.match(/(?:^|:)days=(\\d+)/i) || [])[1];
+        const pos = (raw.match(/(?:^|:)raw_pos=(\\d+)/i) || [])[1];
+        const zero = (raw.match(/(?:^|:)raw_zero=(\\d+)/i) || [])[1];
+        const cov = (raw.match(/(?:^|:)cov=([0-9]*\\.?[0-9]+)/i) || [])[1];
+        const covTxt = cov ? `${Math.round(Number(cov) * 100)}%` : "";
+        const parts = [];
+        if (covTxt) parts.push(`cov ${covTxt}`);
+        if (days) parts.push(`days ${days}`);
+        if (pos || zero) parts.push(`raw ${pos || 0}/${zero || 0}`);
+        return `V4 exact2 partial (${mode}${parts.length ? `; ${parts.join(", ")}` : ""})`;
+      }
       if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found in selected chains";
       if (raw.includes("missing_target_pool_id")) return "Target pool is required";
       if (dq === "exact") return "Exact";

@@ -107,7 +107,7 @@ def _include_chains() -> list[str]:
     return sorted(UNISWAP_V4_SUBGRAPHS.keys())
 
 
-def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> dict:
+def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "", strict_debug: dict[str, Any] | None = None) -> dict:
     return {
         "fees": [],
         "tvl": [],
@@ -123,6 +123,7 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> d
         "version": "v4",
         "data_quality": "strict_unavailable",
         "data_quality_reason": str(reason or "strict_required:v4_exact2:unknown"),
+        "strict_debug": dict(strict_debug or {}),
         "strict_compare_estimated_tvl": [],
         "strict_compare_estimated_fees": [],
         "strict_compare_exact_tvl": [],
@@ -543,40 +544,66 @@ def _compute_pool_token_amounts_onchain(
     return float(max(Decimal(0), amount0_raw)), float(max(Decimal(0), amount1_raw)), src
 
 
-def _resolve_pool_tvl_now_onchain_v4_exact2(pool: dict, chain: str, budget_sec: float) -> tuple[float, str, str]:
+def _resolve_pool_tvl_now_onchain_v4_exact2(
+    pool: dict, chain: str, budget_sec: float
+) -> tuple[float, str, str, dict[str, Any]]:
     pool_id = str(pool.get("id") or "").strip().lower()
+    dbg: dict[str, Any] = {
+        "pool_id": pool_id,
+        "chain": str(chain or ""),
+        "budget_sec": float(max(10.0, float(budget_sec))),
+        "stages": {},
+    }
+    t_start = time.monotonic()
     if not _is_hex(pool_id, 64):
-        return 0.0, "", "strict_required:v4_exact2:pool_id_must_be_64hex"
+        dbg["error"] = "pool_id_must_be_64hex"
+        return 0.0, "", "strict_required:v4_exact2:pool_id_must_be_64hex", dbg
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
-        return 0.0, "", "strict_required:v4_exact2:unsupported_chain"
+        dbg["error"] = "unsupported_chain"
+        return 0.0, "", "strict_required:v4_exact2:unsupported_chain", dbg
     pool_manager, _state_view = _onchain_addresses_for_chain(ck)
     if not pool_manager:
-        return 0.0, "", "strict_required:v4_exact2:pool_manager_not_configured"
+        dbg["error"] = "pool_manager_not_configured"
+        return 0.0, "", "strict_required:v4_exact2:pool_manager_not_configured", dbg
 
     t0 = time.monotonic()
     deadline = t0 + max(10.0, float(budget_sec))
 
     latest = _rpc_latest_block(chain_id, timeout_sec=8.0)
     if latest <= 0:
-        return 0.0, "", "strict_required:v4_exact2:latest_block_not_found"
+        dbg["error"] = "latest_block_not_found"
+        return 0.0, "", "strict_required:v4_exact2:latest_block_not_found", dbg
+    dbg["latest_block"] = int(latest)
 
     init_meta, init_err = _pool_init_meta(chain_id, pool_manager, pool_id, latest)
     if not init_meta:
-        return 0.0, "", str(init_err or "strict_required:v4_exact2:init_meta_unavailable")
+        dbg["error"] = str(init_err or "init_meta_unavailable")
+        dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
+        return 0.0, "", str(init_err or "strict_required:v4_exact2:init_meta_unavailable"), dbg
     token0 = str(init_meta.get("currency0") or "").lower()
     token1 = str(init_meta.get("currency1") or "").lower()
     tick_spacing = int(init_meta.get("tick_spacing") or 0)
     init_block = int(init_meta.get("block") or 0)
+    dbg["token0"] = token0
+    dbg["token1"] = token1
+    dbg["tick_spacing"] = int(tick_spacing)
+    dbg["init_block"] = int(init_block)
     if not token0 or not token1:
-        return 0.0, "", "strict_required:v4_exact2:init_tokens_missing"
+        dbg["error"] = "init_tokens_missing"
+        return 0.0, "", "strict_required:v4_exact2:init_tokens_missing", dbg
     if tick_spacing <= 0:
-        return 0.0, "", "strict_required:v4_exact2:init_tick_spacing_missing"
+        dbg["error"] = "init_tick_spacing_missing"
+        return 0.0, "", "strict_required:v4_exact2:init_tick_spacing_missing", dbg
 
     sqrt_price_x96, current_tick, pool_liquidity, state_src_or_err = _read_v4_slot0_liquidity(chain_id, ck, pool_id)
     if sqrt_price_x96 <= 0:
-        return 0.0, "", str(state_src_or_err or "strict_required:v4_exact2:slot0_unavailable")
+        dbg["error"] = str(state_src_or_err or "slot0_unavailable")
+        return 0.0, "", str(state_src_or_err or "strict_required:v4_exact2:slot0_unavailable"), dbg
+    dbg["state_source"] = str(state_src_or_err or "")
+    dbg["current_tick"] = int(current_tick)
+    dbg["pool_liquidity"] = int(pool_liquidity)
 
     ticks, ticks_status = _fetch_modified_ticks(
         chain_id,
@@ -586,6 +613,8 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(pool: dict, chain: str, budget_sec: 
         int(latest),
         deadline_ts=deadline,
     )
+    dbg["ticks_status"] = str(ticks_status or "ok")
+    dbg["ticks_count"] = int(len(ticks))
     a0_raw = 0.0
     a1_raw = 0.0
     qty_src_or_err = ""
@@ -600,11 +629,17 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(pool: dict, chain: str, budget_sec: 
             ticks,
             deadline_ts=deadline,
         )
+    dbg["full_scan_qty_mode"] = str(qty_src_or_err or "")
     if (a0_raw <= 0.0 and a1_raw <= 0.0) and str(ticks_status or "") in {"timeout", "empty"}:
         # Still pure on-chain: fast approximation from active liquidity range only.
         a0_raw, a1_raw, qty_src_or_err = _active_window_amounts(pool_liquidity, current_tick, tick_spacing, sqrt_price_x96)
+    dbg["quantity_source"] = str(qty_src_or_err or "")
+    dbg["amount0_raw"] = float(a0_raw or 0.0)
+    dbg["amount1_raw"] = float(a1_raw or 0.0)
     if a0_raw <= 0.0 and a1_raw <= 0.0:
-        return 0.0, "", str(qty_src_or_err or f"strict_required:v4_exact2:quantities_unavailable:{ticks_status or 'unknown'}")
+        dbg["error"] = str(qty_src_or_err or f"quantities_unavailable:{ticks_status or 'unknown'}")
+        dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
+        return 0.0, "", str(qty_src_or_err or f"strict_required:v4_exact2:quantities_unavailable:{ticks_status or 'unknown'}"), dbg
 
     d0 = int(_erc20_decimals(chain_id, token0))
     d1 = int(_erc20_decimals(chain_id, token1))
@@ -612,6 +647,10 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(pool: dict, chain: str, budget_sec: 
     d1 = d1 if 0 < d1 <= 36 else 18
     a0 = float(a0_raw / (10 ** d0))
     a1 = float(a1_raw / (10 ** d1))
+    dbg["decimals0"] = int(d0)
+    dbg["decimals1"] = int(d1)
+    dbg["amount0"] = float(a0)
+    dbg["amount1"] = float(a1)
 
     prices, sources, errs = get_token_prices_usd(ck, [token0, token1])
     p0 = float(prices.get(token0) or 0.0)
@@ -630,11 +669,16 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(pool: dict, chain: str, budget_sec: 
         if p1 <= 0 and p0 > 0 and ratio01 > 0:
             p1 = p0 / ratio01
     if p0 <= 0 and p1 <= 0:
-        return 0.0, "", (";".join(str(x) for x in errs if str(x).strip()) or "strict_required:v4_exact2:price_unavailable")
+        dbg["error"] = "price_unavailable"
+        dbg["price_errors"] = [str(x) for x in errs if str(x).strip()]
+        dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
+        return 0.0, "", (";".join(str(x) for x in errs if str(x).strip()) or "strict_required:v4_exact2:price_unavailable"), dbg
 
     tvl = max(0.0, a0 * max(0.0, p0)) + max(0.0, a1 * max(0.0, p1))
     if tvl <= 0:
-        return 0.0, "", "strict_required:v4_exact2:computed_tvl_zero"
+        dbg["error"] = "computed_tvl_zero"
+        dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
+        return 0.0, "", "strict_required:v4_exact2:computed_tvl_zero", dbg
     s0 = str(sources.get(token0) or "")
     s1 = str(sources.get(token1) or "")
     psrc = s0 or s1
@@ -644,7 +688,10 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(pool: dict, chain: str, budget_sec: 
         f"v4_exact2:pure_onchain_qty={qty_src_or_err}"
         f":state={state_src_or_err}:liq={int(pool_liquidity)}:tick={int(current_tick)}:price={psrc}"
     )
-    return float(tvl), src, ""
+    dbg["price_source"] = str(psrc or "")
+    dbg["tvl_now_usd"] = float(tvl)
+    dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
+    return float(tvl), src, "", dbg
 
 
 def _build_estimated_tvl(fees_usd: list[tuple[int, float]], raw_tvl: list[tuple[int, float]], tvl_now: float) -> list[tuple[int, float]]:
@@ -735,7 +782,9 @@ def main() -> None:
         budget_sec = max(20.0, float(os.environ.get("WEB_V4_EXACT_POOL_BUDGET_SEC", "90")))
     except Exception:
         budget_sec = 90.0
-    pool_tvl_now_usd, price_source, price_err = _resolve_pool_tvl_now_onchain_v4_exact2(pool, found_chain, budget_sec=float(budget_sec))
+    pool_tvl_now_usd, price_source, price_err, strict_dbg = _resolve_pool_tvl_now_onchain_v4_exact2(
+        pool, found_chain, budget_sec=float(budget_sec)
+    )
     if float(pool_tvl_now_usd) <= 0:
         save_chart_data_json(
             {
@@ -743,17 +792,31 @@ def main() -> None:
                     str(pool.get("id") or target_pool),
                     f"strict_required:v4_exact2:external_tvl_unavailable:{price_err or 'unknown'}",
                     found_chain,
+                    strict_dbg,
                 )
             },
             out_path,
         )
         return
 
+    raw_tvl_positive_days = int(sum(1 for _ts, v in raw_tvl if float(v or 0.0) > 0.0))
+    raw_tvl_zero_days = int(max(0, len(raw_tvl) - raw_tvl_positive_days))
+    strict_dbg = dict(strict_dbg or {})
+    strict_dbg["day_rows"] = int(len(day_rows))
+    strict_dbg["fees_days"] = int(len(fees_usd))
+    strict_dbg["raw_tvl_positive_days"] = int(raw_tvl_positive_days)
+    strict_dbg["raw_tvl_zero_days"] = int(raw_tvl_zero_days)
+    strict_dbg["budget_sec"] = float(budget_sec)
+
     estimated_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
     estimated_fees = _rebuild_fees_cumulative(fees_usd, estimated_tvl)
     exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
-    reason = f"exact_v4_2_onchain_quantities:points=1:cov={exact_cov:.2f}:src={price_source or 'onchain'}"
+    reason = (
+        f"exact_v4_2_onchain_quantities:points=1:cov={exact_cov:.2f}"
+        f":days={len(fees_usd)}:raw_pos={raw_tvl_positive_days}:raw_zero={raw_tvl_zero_days}"
+        f":src={price_source or 'onchain'}"
+    )
 
     payload = {
         "fees": [],
@@ -770,6 +833,7 @@ def main() -> None:
         "version": "v4",
         "data_quality": "exact_partial",
         "data_quality_reason": str(reason),
+        "strict_debug": strict_dbg,
         "strict_compare_estimated_tvl": estimated_tvl,
         "strict_compare_estimated_fees": estimated_fees,
         "strict_compare_exact_tvl": exact_tvl,
