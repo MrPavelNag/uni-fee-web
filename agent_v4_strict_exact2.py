@@ -251,8 +251,8 @@ def _encode_int24_word(v: int) -> str:
     return ("f" * 58) + format(x, "06x") if (x & 0x800000) else ("0" * 58) + format(x, "06x")
 
 
-def _rpc_eth_call(chain_id: int, to: str, data: str, *, timeout_sec: float = 8.0) -> str:
-    payload = [{"to": str(to or "").strip().lower(), "data": str(data or "")}, "latest"]
+def _rpc_eth_call(chain_id: int, to: str, data: str, *, timeout_sec: float = 8.0, block_tag: str = "latest") -> str:
+    payload = [{"to": str(to or "").strip().lower(), "data": str(data or "")}, str(block_tag or "latest")]
     res = _rpc_json(int(chain_id), "eth_call", payload, timeout_sec=float(timeout_sec)) or {}
     return str(res.get("result") or "")
 
@@ -263,6 +263,38 @@ def _rpc_latest_block(chain_id: int, timeout_sec: float = 8.0) -> int:
         return int(str(res.get("result") or "0x0"), 16)
     except Exception:
         return 0
+
+
+def _rpc_block_timestamp(chain_id: int, block_number: int, timeout_sec: float = 8.0) -> int:
+    try:
+        out = _rpc_json(int(chain_id), "eth_getBlockByNumber", [hex(max(0, int(block_number))), False], timeout_sec=float(timeout_sec)) or {}
+        ts_hex = str((out.get("result") or {}).get("timestamp") or "0x0")
+        return int(ts_hex, 16) if str(ts_hex).startswith("0x") else int(str(ts_hex) or "0")
+    except Exception:
+        return 0
+
+
+def _first_block_at_or_after_ts(chain_id: int, target_ts: int, latest_block: int) -> int:
+    cid = int(chain_id)
+    t = int(target_ts)
+    hi0 = int(latest_block)
+    if cid <= 0 or t <= 0 or hi0 <= 0:
+        return 0
+    lo, hi = 0, hi0
+    ans = hi0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        ts_mid = _rpc_block_timestamp(cid, mid, timeout_sec=8.0)
+        if ts_mid <= 0:
+            # retry toward newer side
+            lo = mid + 1
+            continue
+        if ts_mid >= t:
+            ans = mid
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return int(ans)
 
 
 def _rpc_get_logs(
@@ -376,15 +408,15 @@ def _pool_init_meta(chain_id: int, pool_manager: str, pool_id: str, latest_block
     return cand[0], ""
 
 
-def _read_v4_slot0_liquidity(chain_id: int, chain: str, pool_id: str) -> tuple[int, int, int, str]:
+def _read_v4_slot0_liquidity(chain_id: int, chain: str, pool_id: str, *, block_tag: str = "latest") -> tuple[int, int, int, str]:
     pid = str(pool_id or "").strip().lower()
     pm, sv = _onchain_addresses_for_chain(chain)
     targets = [t for t in [sv, pm] if t]
     last_err = ""
     for target in targets:
         try:
-            slot_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_SLOT0_SELECTOR + pid[2:], timeout_sec=8.0)
-            liq_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_LIQUIDITY_SELECTOR + pid[2:], timeout_sec=8.0)
+            slot_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_SLOT0_SELECTOR + pid[2:], timeout_sec=8.0, block_tag=block_tag)
+            liq_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_LIQUIDITY_SELECTOR + pid[2:], timeout_sec=8.0, block_tag=block_tag)
             slot_words = _hex_words(slot_hex)
             liq_words = _hex_words(liq_hex)
             if len(slot_words) < 2 or not liq_words:
@@ -447,7 +479,7 @@ def _fetch_modified_ticks(
     return sorted(ticks), ""
 
 
-def _read_tick_liquidity_net(chain_id: int, chain: str, pool_id: str, tick: int) -> tuple[int, int, str]:
+def _read_tick_liquidity_net(chain_id: int, chain: str, pool_id: str, tick: int, *, block_tag: str = "latest") -> tuple[int, int, str]:
     pid = str(pool_id or "").strip().lower()
     pm, sv = _onchain_addresses_for_chain(chain)
     targets = [t for t in [sv, pm] if t]
@@ -455,7 +487,7 @@ def _read_tick_liquidity_net(chain_id: int, chain: str, pool_id: str, tick: int)
     last_err = ""
     for target in targets:
         try:
-            out = _rpc_eth_call(int(chain_id), target, calldata, timeout_sec=8.0)
+            out = _rpc_eth_call(int(chain_id), target, calldata, timeout_sec=8.0, block_tag=block_tag)
             words = _hex_words(out)
             if len(words) < 2:
                 last_err = "empty_tick_liquidity"
@@ -520,6 +552,7 @@ def _compute_pool_token_amounts_onchain(
     ticks: list[int],
     *,
     deadline_ts: float | None = None,
+    block_tag: str = "latest",
 ) -> tuple[float, float, str]:
     if int(tick_spacing) <= 0:
         return 0.0, 0.0, "strict_required:v4_exact2:invalid_tick_spacing"
@@ -533,7 +566,7 @@ def _compute_pool_token_amounts_onchain(
     for t in ticks:
         if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
             return 0.0, 0.0, "strict_required:v4_exact2:tick_scan_timeout"
-        _gross, net, src = _read_tick_liquidity_net(chain_id, chain, pool_id, int(t))
+        _gross, net, src = _read_tick_liquidity_net(chain_id, chain, pool_id, int(t), block_tag=block_tag)
         src_tag = src_tag or str(src)
         if int(net) != 0:
             tick_to_net[int(t)] = int(net)
@@ -577,6 +610,122 @@ def _compute_pool_token_amounts_onchain(
 
     src = f"pure_onchain_ticks:{src_tag or 'state'}:ticks={len(sorted_ticks)}"
     return float(max(Decimal(0), amount0_raw)), float(max(Decimal(0), amount1_raw)), src
+
+
+def _v4_onchain_historical_tvl_snapshots(
+    *,
+    pool: dict[str, Any],
+    chain: str,
+    chain_id: int,
+    day_ts: list[int],
+    latest_block: int,
+    fee_pct: float,
+    budget_sec: float,
+    step_days: int,
+    strict_dbg: dict[str, Any],
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]], dict[str, Any]]:
+    dbg: dict[str, Any] = {"source": "onchain_historical_snapshots"}
+    if not day_ts:
+        return [], [], dbg
+    ck = str(chain or "").strip().lower()
+    pool_id = str(pool.get("id") or "").strip().lower()
+    pm, _sv = _onchain_addresses_for_chain(ck)
+    if not pm:
+        dbg["error"] = "pool_manager_not_configured"
+        return [], [], dbg
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    d0 = int(_erc20_decimals(chain_id, token0)) if token0 else 18
+    d1 = int(_erc20_decimals(chain_id, token1)) if token1 else 18
+    d0 = d0 if 0 < d0 <= 36 else 18
+    d1 = d1 if 0 < d1 <= 36 else 18
+    prices, _srcs, _errs = get_token_prices_usd(ck, [token0, token1])
+    p0 = float(prices.get(token0) or 0.0)
+    p1 = float(prices.get(token1) or 0.0)
+    if p0 <= 0 and p1 <= 0:
+        dbg["error"] = "prices_unavailable"
+        return [], [], dbg
+
+    # Build sparse target timestamps based on requested step (1 point / N days).
+    base = sorted({int(x) for x in day_ts if int(x) > 0})
+    sparse = _sparse_series_every_n_days([(int(ts), 1.0) for ts in base], int(step_days))
+    targets = [int(ts) for ts, _ in sparse]
+    if base and (not targets or targets[-1] != base[-1]):
+        targets.append(int(base[-1]))
+    targets = sorted({int(x) for x in targets if int(x) > 0})
+    dbg["targets"] = int(len(targets))
+
+    # Prepare full-pool tick universe (on-chain). If timeout/error: fallback to active*ratio.
+    t0 = time.monotonic()
+    total_budget = max(12.0, float(budget_sec))
+    ticks_budget = max(4.0, float(total_budget) * 0.45)
+    ticks_deadline_ts = t0 + ticks_budget
+    snapshot_deadline_ts = t0 + total_budget
+    ticks: list[int] = []
+    ticks_status = ""
+    init_meta, init_err = _pool_init_meta(chain_id, pm, pool_id, int(latest_block))
+    if init_meta and int(init_meta.get("block") or 0) > 0:
+        from_block = int(init_meta.get("block") or 0)
+        ticks, ticks_status = _fetch_modified_ticks(
+            chain_id,
+            pm,
+            pool_id,
+            from_block,
+            int(latest_block),
+            deadline_ts=ticks_deadline_ts,
+        )
+    else:
+        ticks_status = str(init_err or "init_meta_unavailable")
+    dbg["ticks_status"] = str(ticks_status or "ok")
+    dbg["ticks_count"] = int(len(ticks or []))
+
+    full_out: list[tuple[int, float]] = []
+    active_out: list[tuple[int, float]] = []
+    # fallback ratio from NOW anchors (if tick scan unavailable on historical block)
+    now_full = float((strict_dbg or {}).get("tvl_full_pool_usd") or 0.0)
+    now_act = float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0)
+    full_to_active_ratio = (now_full / now_act) if (now_full > 0 and now_act > 0) else 0.0
+
+    for ts in targets:
+        if time.monotonic() >= snapshot_deadline_ts:
+            dbg["timeout"] = True
+            break
+        b = _first_block_at_or_after_ts(chain_id, int(ts), int(latest_block))
+        if b <= 0:
+            continue
+        block_tag = hex(int(b))
+        sqrt_price_x96, current_tick, pool_liquidity, _src = _read_v4_slot0_liquidity(chain_id, ck, pool_id, block_tag=block_tag)
+        if sqrt_price_x96 <= 0:
+            continue
+        # active TVL (on-chain)
+        a0_act_raw, a1_act_raw, _act_src = _active_window_amounts(pool_liquidity, current_tick, int(pool.get("tickSpacing") or 10), sqrt_price_x96)
+        a0_act = float(a0_act_raw / (10**d0))
+        a1_act = float(a1_act_raw / (10**d1))
+        tvl_act = max(0.0, a0_act * max(0.0, p0)) + max(0.0, a1_act * max(0.0, p1))
+        active_out.append((int(ts), float(tvl_act)))
+
+        tvl_full = 0.0
+        if ticks:
+            a0_full_raw, a1_full_raw, _full_src = _compute_pool_token_amounts_onchain(
+                chain_id,
+                ck,
+                pool_id,
+                int(pool.get("tickSpacing") or 10),
+                int(current_tick),
+                int(sqrt_price_x96),
+                ticks,
+                deadline_ts=snapshot_deadline_ts,
+                block_tag=block_tag,
+            )
+            a0_full = float(a0_full_raw / (10**d0))
+            a1_full = float(a1_full_raw / (10**d1))
+            tvl_full = max(0.0, a0_full * max(0.0, p0)) + max(0.0, a1_full * max(0.0, p1))
+        if tvl_full <= 0.0 and tvl_act > 0.0 and full_to_active_ratio > 0.0:
+            tvl_full = float(tvl_act * full_to_active_ratio)
+        full_out.append((int(ts), float(max(0.0, tvl_full))))
+
+    dbg["snapshots_done"] = int(min(len(full_out), len(active_out)))
+    return full_out, active_out, dbg
 
 
 def _resolve_pool_tvl_now_onchain_v4_exact2(
@@ -1156,6 +1305,15 @@ def main() -> None:
         day_ts = (int(ts) // 86400) * 86400
         fees_sanity_usd.append((int(ts), float(swap_day_fees.get(day_ts, 0.0))))
 
+    try:
+        onchain_hist_enable = str(os.environ.get("STRICT_V4_ONCHAIN_HISTORY_ENABLE", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        onchain_hist_enable = True
+    try:
+        onchain_hist_budget = max(10.0, float(os.environ.get("STRICT_V4_ONCHAIN_HISTORY_BUDGET_SEC", str(max(20.0, float(budget_sec) * 0.75)))))
+    except Exception:
+        onchain_hist_budget = max(20.0, float(budget_sec) * 0.75)
+
     estimated_tvl: list[tuple[int, float]] = []
     estimated_fees: list[tuple[int, float]] = []
     estimated_active_tvl: list[tuple[int, float]] = []
@@ -1172,6 +1330,23 @@ def main() -> None:
         exact_step_days = max(1, int(os.environ.get("STRICT_V4_EXACT_STEP_DAYS", "5")))
     except Exception:
         exact_step_days = 5
+    onchain_hist_full_tvl: list[tuple[int, float]] = []
+    onchain_hist_active_tvl: list[tuple[int, float]] = []
+    if onchain_hist_enable and int(chain_id) > 0:
+        hist_full, hist_active, hist_dbg = _v4_onchain_historical_tvl_snapshots(
+            pool=pool,
+            chain=str(found_chain),
+            chain_id=int(chain_id),
+            day_ts=[int(ts) for ts, _ in (fees_usd or [])],
+            latest_block=int((strict_dbg or {}).get("latest_block") or 0),
+            fee_pct=float(fee_pct),
+            budget_sec=float(onchain_hist_budget),
+            step_days=int(exact_step_days),
+            strict_dbg=strict_dbg,
+        )
+        onchain_hist_full_tvl = list(hist_full or [])
+        onchain_hist_active_tvl = list(hist_active or [])
+        strict_dbg["onchain_history_debug"] = dict(hist_dbg or {})
 
     if raw_tvl_positive_days > 0:
         estimated_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
@@ -1202,6 +1377,10 @@ def main() -> None:
             sanity_active_fees_base = _rebuild_fees_cumulative(fees_sanity_usd, estimated_active_tvl_base)
             exact_active_sanity_fees = _sparse_series_every_n_days(sanity_active_fees_base, exact_step_days)
             exact_active_sanity_fees = _append_now_fee_anchor(exact_active_sanity_fees)
+        if onchain_hist_full_tvl:
+            exact_tvl = _append_now_tvl_anchor(list(onchain_hist_full_tvl), float(pool_tvl_now_usd))
+        if onchain_hist_active_tvl and tvl_active_now > 0.0:
+            exact_active_tvl = _append_now_tvl_anchor(list(onchain_hist_active_tvl), float(tvl_active_now))
     else:
         # No historical day-shape from subgraph:
         # - keep TVL visualization as one-point marker (do not invent TVL shape),
@@ -1227,6 +1406,13 @@ def main() -> None:
             sanity_active_fees_base = _rebuild_fees_cumulative(fees_sanity_usd, est_active_flat_tvl_for_fees)
             exact_active_sanity_fees = _sparse_series_every_n_days(sanity_active_fees_base, exact_step_days)
             exact_active_sanity_fees = _append_now_fee_anchor(exact_active_sanity_fees)
+        if onchain_hist_full_tvl:
+            exact_tvl = _append_now_tvl_anchor(list(onchain_hist_full_tvl), float(pool_tvl_now_usd))
+            # Mirror exact history into estimated view only when subgraph shape is missing.
+            estimated_tvl = list(exact_tvl)
+        if onchain_hist_active_tvl and tvl_active_now > 0.0:
+            exact_active_tvl = _append_now_tvl_anchor(list(onchain_hist_active_tvl), float(tvl_active_now))
+            estimated_active_tvl = list(exact_active_tvl)
     if (not exact_tvl) and fees_usd:
         exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
     if (not exact_active_tvl) and fees_usd and tvl_active_now > 0.0:
