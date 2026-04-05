@@ -19226,18 +19226,19 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     env_v3 = dict(env)
                     env_v3["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
                     strict_timeout_target = int(max(75, int(exact2_budget) + 75))
-                    env_v3["AGENT_TIMEOUT_SEC"] = str(max(75, min(base_timeout, strict_timeout_target, 300)))
+                    env_v3["AGENT_TIMEOUT_SEC"] = str(max(75, min(300, max(base_timeout, strict_timeout_target))))
                     logs.append(f"[strict][v3] budget={int(exact2_budget)}s timeout={env_v3['AGENT_TIMEOUT_SEC']}s")
                     strict_agents.append(("agent_v3_strict_exact2.py", env_v3, "v3"))
                 if run_v4:
                     try:
-                        v4_budget = max(15.0, float(os.environ.get("WEB_V4_EXACT_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "60"))))
+                        v4_budget = max(15.0, float(os.environ.get("WEB_V4_EXACT_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "45"))))
                     except Exception:
-                        v4_budget = 60.0
+                        v4_budget = 45.0
                     env_v4 = dict(env)
                     env_v4["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(v4_budget))
-                    strict_timeout_target_v4 = int(max(75, int(v4_budget) + 75))
-                    env_v4["AGENT_TIMEOUT_SEC"] = str(max(75, min(base_timeout, strict_timeout_target_v4, 300)))
+                    env_v4["WEB_V4_EXACT_POOL_BUDGET_SEC"] = str(int(v4_budget))
+                    strict_timeout_target_v4 = int(max(90, int(v4_budget) + 45))
+                    env_v4["AGENT_TIMEOUT_SEC"] = str(max(90, min(300, max(base_timeout, strict_timeout_target_v4))))
                     v4_variant = "exact2"
                     v4_script = "agent_v4_strict_exact2.py"
                     logs.append(
