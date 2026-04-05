@@ -235,6 +235,18 @@ def _decode_int24_from_word(word: str) -> int:
     return int(x)
 
 
+def _parse_int_any(v: Any, default: int = 0) -> int:
+    s = str(v or "").strip().lower()
+    if not s:
+        return int(default)
+    try:
+        if s.startswith("0x"):
+            return int(s, 16)
+        return int(s, 10)
+    except Exception:
+        return int(default)
+
+
 def _decode_address_from_topic(topic_word: str) -> str:
     w = str(topic_word or "").strip().lower()
     if w.startswith("0x"):
@@ -922,14 +934,24 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     return float(tvl), src, "", dbg
 
 
-def _guess_v4_swap_topic(chain_id: int, pool_manager: str, pool_id: str, latest_block: int) -> tuple[str, str]:
+def _guess_v4_swap_topic(
+    chain_id: int,
+    pool_manager: str,
+    pool_id: str,
+    latest_block: int,
+    *,
+    max_back_blocks: int | None = None,
+) -> tuple[str, str]:
     pid = str(pool_id or "").strip().lower()
     hi = int(latest_block)
     step = 48_000
-    try:
-        max_back = max(48_000, int(os.environ.get("STRICT_V4_SWAP_TOPIC_SCAN_BLOCKS", "180000")))
-    except Exception:
-        max_back = 180_000
+    if max_back_blocks is not None and int(max_back_blocks) > 0:
+        max_back = int(max_back_blocks)
+    else:
+        try:
+            max_back = max(48_000, int(os.environ.get("STRICT_V4_SWAP_TOPIC_SCAN_BLOCKS", "180000")))
+        except Exception:
+            max_back = 180_000
     scanned = 0
     # 1) Try known signature candidates first.
     for t0 in _v4_swap_topic_candidates():
@@ -1022,6 +1044,10 @@ def _v4_onchain_swap_fee_daily(
         "counters": {
             "windows_scanned": 0,
             "rpc_log_rows": 0,
+            "rpc_errors": 0,
+            "block_ts_rpc_calls": 0,
+            "block_ts_cache_hits": 0,
+            "block_ts_fallback_approx": 0,
             "decoded_rows": 0,
             "reject_poolid_data_mismatch": 0,
             "reject_sign_or_zero": 0,
@@ -1035,7 +1061,40 @@ def _v4_onchain_swap_fee_daily(
         out_dbg["error"] = "pool_manager_not_configured"
         return {}, out_dbg
     t_topic0 = time.monotonic()
-    topic0, topic_src = _guess_v4_swap_topic(int(chain_id), pm, str(pool_id), int(latest_block))
+    # Conservative per-chain block time for day-range approximation.
+    block_time_sec = {
+        "ethereum": 12.0,
+        "arbitrum": 0.25,
+        "base": 2.0,
+        "optimism": 2.0,
+        "polygon": 2.0,
+        "bsc": 3.0,
+        "avalanche": 2.0,
+        "celo": 5.0,
+        "unichain": 1.0,
+    }.get(str(chain or "").strip().lower(), 3.0)
+    lookback_blocks = int(max(20_000, (max(1, int(day_count)) * 86400.0 / max(0.2, float(block_time_sec))) * 1.25))
+    try:
+        env_scan = max(48_000, int(os.environ.get("STRICT_V4_SWAP_TOPIC_SCAN_BLOCKS", "180000")))
+    except Exception:
+        env_scan = 180_000
+    topic_scan_blocks = min(1_500_000, max(int(env_scan), int(lookback_blocks) + 48_000))
+    out_dbg["topic_scan_blocks"] = int(topic_scan_blocks)
+    cand = _v4_swap_topic_candidates()
+    topic0 = str(cand[0] if cand else "").strip().lower()
+    topic_src = "known_signature"
+    try:
+        discovery_enabled = str(os.environ.get("STRICT_V4_SWAP_TOPIC_DISCOVERY", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        discovery_enabled = False
+    if discovery_enabled or (not topic0):
+        topic0, topic_src = _guess_v4_swap_topic(
+            int(chain_id),
+            pm,
+            str(pool_id),
+            int(latest_block),
+            max_back_blocks=int(topic_scan_blocks),
+        )
     out_dbg["stage_ms"]["topic_discovery"] = int(round(max(0.0, time.monotonic() - t_topic0) * 1000.0))
     out_dbg["swap_topic_source"] = str(topic_src)
     out_dbg["swap_topic0"] = str(topic0 or "")
@@ -1060,19 +1119,6 @@ def _v4_onchain_swap_fee_daily(
         out_dbg["error"] = "token_prices_unavailable"
         return {}, out_dbg
 
-    # Conservative per-chain block time for day-range approximation.
-    block_time_sec = {
-        "ethereum": 12.0,
-        "arbitrum": 0.25,
-        "base": 2.0,
-        "optimism": 2.0,
-        "polygon": 2.0,
-        "bsc": 3.0,
-        "avalanche": 2.0,
-        "celo": 5.0,
-        "unichain": 1.0,
-    }.get(str(chain or "").strip().lower(), 3.0)
-    lookback_blocks = int(max(20_000, (max(1, int(day_count)) * 86400.0 / max(0.2, float(block_time_sec))) * 1.25))
     from_block = max(0, int(latest_block) - lookback_blocks)
     to_block = int(latest_block)
     out_dbg["from_block"] = int(from_block)
@@ -1080,25 +1126,37 @@ def _v4_onchain_swap_fee_daily(
 
     deadline_ts = time.monotonic() + max(8.0, float(budget_sec))
     rows: list[dict[str, Any]] = []
-    step = 48_000
-    cur = int(from_block)
-    while cur <= int(to_block):
+    base_step = 12_000
+    step_cur = int(base_step)
+    min_step = 750
+    cur_hi = int(to_block)
+    while cur_hi >= int(from_block):
         if time.monotonic() >= deadline_ts:
             out_dbg["timeout"] = True
             break
-        hi = min(int(to_block), cur + step - 1)
+        lo = max(int(from_block), int(cur_hi) - max(1, int(step_cur)) + 1)
         out_dbg["counters"]["windows_scanned"] = int(out_dbg["counters"]["windows_scanned"]) + 1
         try:
             if str(topic_src).endswith("data0_poolid"):
-                part = _rpc_get_logs(int(chain_id), pm, cur, hi, [str(topic0)], timeout_sec=12.0)
+                part = _rpc_get_logs(int(chain_id), pm, lo, cur_hi, [str(topic0)], timeout_sec=20.0)
             else:
-                part = _rpc_get_logs(int(chain_id), pm, cur, hi, [str(topic0), str(pool_id).strip().lower()], timeout_sec=12.0)
-        except Exception:
+                part = _rpc_get_logs(int(chain_id), pm, lo, cur_hi, [str(topic0), str(pool_id).strip().lower()], timeout_sec=20.0)
+        except Exception as e:
+            out_dbg["counters"]["rpc_errors"] = int(out_dbg["counters"]["rpc_errors"]) + 1
+            out_dbg["last_rpc_error"] = str(e)[:220]
+            # Retry same block window with smaller range on provider errors/timeouts.
+            if int(step_cur) > int(min_step):
+                step_cur = max(int(min_step), int(step_cur // 2))
+                continue
+            # Window already small: skip this chunk and proceed.
             part = []
         if part:
             rows.extend(part)
             out_dbg["counters"]["rpc_log_rows"] = int(out_dbg["counters"]["rpc_log_rows"]) + int(len(part))
-        cur = hi + 1
+            # Recover to larger windows gradually after successful responses.
+            if int(step_cur) < int(base_step):
+                step_cur = min(int(base_step), int(step_cur * 2))
+        cur_hi = lo - 1
     out_dbg["swap_logs"] = int(len(rows))
     if not rows:
         return {}, out_dbg
@@ -1108,11 +1166,9 @@ def _v4_onchain_swap_fee_daily(
     day_fees: dict[int, float] = {}
     used = 0
     pid_word = str(str(pool_id).strip().lower()[2:]).zfill(64)
+    ts_cache: dict[int, int] = {}
     for lg in rows:
-        try:
-            bno = int(str(lg.get("blockNumber") or "0x0"), 16)
-        except Exception:
-            bno = 0
+        bno = _parse_int_any(lg.get("blockNumber"), default=0)
         words = _hex_words(str(lg.get("data") or ""))
         if len(words) < 2:
             continue
@@ -1147,7 +1203,18 @@ def _v4_onchain_swap_fee_daily(
         if fee_usd <= 0.0:
             out_dbg["counters"]["reject_fee_zero"] = int(out_dbg["counters"]["reject_fee_zero"]) + 1
             continue
-        ts = int(now_ts - max(0, latest_b - max(0, int(bno))) * float(block_time_sec))
+        if int(bno) in ts_cache:
+            ts = int(ts_cache[int(bno)])
+            out_dbg["counters"]["block_ts_cache_hits"] = int(out_dbg["counters"]["block_ts_cache_hits"]) + 1
+        else:
+            ts = 0
+            if time.monotonic() < (deadline_ts - 1.0):
+                ts = int(_rpc_block_timestamp(int(chain_id), int(bno), timeout_sec=8.0))
+                out_dbg["counters"]["block_ts_rpc_calls"] = int(out_dbg["counters"]["block_ts_rpc_calls"]) + 1
+            if ts <= 0:
+                ts = int(now_ts - max(0, latest_b - max(0, int(bno))) * float(block_time_sec))
+                out_dbg["counters"]["block_ts_fallback_approx"] = int(out_dbg["counters"]["block_ts_fallback_approx"]) + 1
+            ts_cache[int(bno)] = int(ts)
         day_ts = (int(ts) // 86400) * 86400
         day_fees[day_ts] = float(day_fees.get(day_ts, 0.0) + fee_usd)
         used += 1
@@ -1359,9 +1426,37 @@ def main() -> None:
     )
     strict_dbg["sanity_fee_source"] = "onchain_swap_logs"
     strict_dbg["sanity_swap_debug"] = dict(swap_dbg or {})
+    swap_keys = sorted(int(k) for k in (swap_day_fees or {}).keys())
+    map_exact = 0
+    map_near = 0
+    map_miss = 0
     for ts, _ in (fees_usd or []):
         day_ts = (int(ts) // 86400) * 86400
-        fees_sanity_usd.append((int(ts), float(swap_day_fees.get(day_ts, 0.0))))
+        val = swap_day_fees.get(day_ts, None)
+        if val is not None:
+            map_exact += 1
+            fees_sanity_usd.append((int(ts), float(val)))
+            continue
+        # Tolerant day-bucket match (timezone / block-time approximation drift): nearest within +/- 1 day.
+        best_k = None
+        best_d = 10**30
+        for k in swap_keys:
+            d = abs(int(k) - int(day_ts))
+            if d < best_d:
+                best_d = d
+                best_k = int(k)
+        if best_k is not None and int(best_d) <= 86400:
+            map_near += 1
+            fees_sanity_usd.append((int(ts), float(swap_day_fees.get(best_k, 0.0))))
+        else:
+            map_miss += 1
+            fees_sanity_usd.append((int(ts), 0.0))
+    strict_dbg["sanity_swap_day_map"] = {
+        "swap_day_points": int(len(swap_keys)),
+        "exact_match": int(map_exact),
+        "nearest_1d_match": int(map_near),
+        "miss": int(map_miss),
+    }
 
     try:
         onchain_hist_enable = str(os.environ.get("STRICT_V4_ONCHAIN_HISTORY_ENABLE", "1")).strip().lower() in {"1", "true", "yes", "on"}
