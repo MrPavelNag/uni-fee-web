@@ -21,8 +21,9 @@ from datetime import datetime
 from typing import Any
 
 from config import DEFAULT_TOKEN_PAIRS, FEE_DAYS, LP_ALLOCATION_USD, UNISWAP_V3_SUBGRAPHS
-from agent_common import build_exact_day_window, pairs_to_filename_suffix, resolve_pool_tvl_now_external, save_chart_data_json
+from agent_common import build_exact_day_window, pairs_to_filename_suffix, save_chart_data_json
 from uniswap_client import get_graph_endpoint, graphql_query, query_pool_day_data
+from price_oracle import get_token_prices_usd
 from agent_v3 import (
     _balance_of_raw,
     CHAIN_ID_BY_KEY,
@@ -290,6 +291,50 @@ def _compute_fee_and_raw_tvl(pool_id: str, endpoint: str) -> tuple[list[tuple[in
         rv = float(d.get("tvlUSD") or 0.0)
         raw_tvl.append((ts, max(0.0, rv)))
     return fees_usd, raw_tvl
+
+
+def _resolve_pool_tvl_now_onchain(pool: dict, chain: str) -> tuple[float, str, str]:
+    ck = str(chain or "").strip().lower()
+    chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    if chain_id <= 0:
+        return 0.0, "", "unsupported_chain"
+    pool_id = str(pool.get("id") or "").strip().lower()
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    if not (pool_id and token0 and token1):
+        return 0.0, "", "missing_pool_tokens"
+    try:
+        latest_block = int(_rpc_json(chain_id, "eth_blockNumber", [], timeout_sec=8.0).get("result", "0x0"), 16)
+    except Exception as e:
+        return 0.0, "", f"latest_block_failed:{e}"
+    if latest_block <= 0:
+        return 0.0, "", "latest_block_not_found"
+    try:
+        dec0 = int(_token_decimals_from_pool(pool, "token0") or _erc20_decimals(chain_id, token0))
+        dec1 = int(_token_decimals_from_pool(pool, "token1") or _erc20_decimals(chain_id, token1))
+        b0 = int(_balance_of_raw(chain_id, token0, pool_id, latest_block, timeout_sec=8.0))
+        b1 = int(_balance_of_raw(chain_id, token1, pool_id, latest_block, timeout_sec=8.0))
+    except Exception as e:
+        return 0.0, "", f"onchain_balance_failed:{e}"
+    amt0 = float(b0) / float(10 ** max(0, dec0))
+    amt1 = float(b1) / float(10 ** max(0, dec1))
+    prices, sources, errs = get_token_prices_usd(ck, [token0, token1])
+    p0 = float(prices.get(token0) or 0.0)
+    p1 = float(prices.get(token1) or 0.0)
+    ratio01 = float(pool.get("token0Price") or 0.0) if pool.get("token0Price") is not None else 0.0
+    if p0 <= 0 and p1 > 0 and ratio01 > 0:
+        p0 = p1 * ratio01
+    if p1 <= 0 and p0 > 0 and ratio01 > 0:
+        p1 = p0 / ratio01
+    if p0 <= 0 and p1 <= 0:
+        return 0.0, "", ";".join([str(x) for x in errs if str(x).strip()]) or "price_unavailable"
+    tvl = max(0.0, amt0 * max(0.0, p0)) + max(0.0, amt1 * max(0.0, p1))
+    src0 = str(sources.get(token0) or "")
+    src1 = str(sources.get(token1) or "")
+    src = src0 or src1
+    if src0 and src1 and src0 != src1:
+        src = f"{src0}+{src1}"
+    return float(tvl), f"onchain_balance*price:{src}", ""
 
 
 def _build_estimated_tvl(fees_usd: list[tuple[int, float]], raw_tvl: list[tuple[int, float]], pool_tvl_now_usd: float) -> list[tuple[int, float]]:
@@ -1118,11 +1163,11 @@ def _build_exact2_tvl_series_v3_ledger(
     # Sparse exact-point mode (default): build a small set of fully reliable points
     # via balanceOf at historical day blocks through Alchemy RPC.
     try:
-        sparse_points = max(0, int(os.environ.get("STRICT_EXACT2_SPARSE_POINTS", "5")))
+        # 0 => all available days (on-chain points for each day).
+        sparse_points = int(os.environ.get("STRICT_EXACT2_SPARSE_POINTS", "0"))
     except Exception:
-        sparse_points = 5
-    if int(sparse_points) >= 2:
-        return _build_exact2_tvl_series_v3_sparse_points(
+        sparse_points = 0
+    return _build_exact2_tvl_series_v3_sparse_points(
             chain=chain,
             pool=pool,
             fees_usd=fees_usd,
@@ -1441,13 +1486,16 @@ def _build_exact2_tvl_series_v3_sparse_points(
     if not valid_idx:
         return [(int(ts), 0.0) for ts, _ in fees_usd], "exact2_sparse_points:no_day_blocks", 0.0
 
-    p = max(2, min(int(points), len(valid_idx)))
-    if p == 1:
-        pick_positions = [0]
+    if int(points) <= 0:
+        picked_idx = list(valid_idx)
     else:
-        pick_positions = sorted({int(round(i * (len(valid_idx) - 1) / (p - 1))) for i in range(p)})
-    picked_idx = [valid_idx[pos] for pos in pick_positions if 0 <= pos < len(valid_idx)]
-    picked_idx = sorted(set(picked_idx))
+        p = max(2, min(int(points), len(valid_idx)))
+        if p == 1:
+            pick_positions = [0]
+        else:
+            pick_positions = sorted({int(round(i * (len(valid_idx) - 1) / (p - 1))) for i in range(p)})
+        picked_idx = [valid_idx[pos] for pos in pick_positions if 0 <= pos < len(valid_idx)]
+        picked_idx = sorted(set(picked_idx))
 
     deadline = time.monotonic() + max(8.0, float(budget_sec))
     out = [(int(ts), 0.0) for ts, _ in fees_usd]
@@ -1479,8 +1527,9 @@ def _build_exact2_tvl_series_v3_sparse_points(
             ok_points += 1
 
     cov = float(ok_points / max(1, n))
+    mode = "all_days" if int(points) <= 0 else f"points={len(picked_idx)}"
     reason = (
-        f"exact2_sparse_points:points={len(picked_idx)}:ok={ok_points}:"
+        f"exact2_sparse_points:{mode}:ok={ok_points}:"
         f"cov={cov:.2f}:budget={float(budget_sec):.1f}:elapsed={max(0.0, time.monotonic()-run_t0):.1f}"
     )
     return out, reason, cov
@@ -1536,7 +1585,7 @@ def main() -> None:
     t1 = str(((pool.get("token1") or {}).get("symbol") or "?"))
     pool["pair_label"] = f"{t0}/{t1}"
 
-    pool_tvl_now_usd, price_source, price_err = resolve_pool_tvl_now_external(pool, found_chain, write_back=True)
+    pool_tvl_now_usd, price_source, price_err = _resolve_pool_tvl_now_onchain(pool, found_chain)
     if float(pool_tvl_now_usd) <= 0:
         print(f"external TVL unavailable: {price_err or 'unknown'}")
         save_chart_data_json(
@@ -1568,7 +1617,9 @@ def main() -> None:
         )
         return
 
-    estimated_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
+    # Strict chart should stay fully on-chain by default for TVL base.
+    # Keep estimated compare as flat on-chain TVL-now anchor (no subgraph TVL shape).
+    estimated_tvl_base = _build_estimated_tvl(fees_usd, [], float(pool_tvl_now_usd))
     estimated_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_tvl_base)
     estimated_tvl = _append_now_tvl_anchor(estimated_tvl_base, float(pool_tvl_now_usd))
     estimated_fees = _append_now_fee_anchor(estimated_fees_base)
@@ -1683,7 +1734,7 @@ def main() -> None:
         data_quality = "exact_partial"
         missing_days = int(sum(1 for _ts, v in exact_base if float(v or 0.0) <= 0.0))
         try:
-            smooth_enabled = str(os.environ.get("STRICT_EXACT2_SMOOTH_ENABLE", "1")).strip().lower() in {
+            smooth_enabled = str(os.environ.get("STRICT_EXACT2_SMOOTH_ENABLE", "0")).strip().lower() in {
                 "1", "true", "yes", "on"
             }
         except Exception:
