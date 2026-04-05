@@ -16240,9 +16240,6 @@ def _scan_aave_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                 continue
             chain_obj = ((s.get("market") or {}).get("chain") or {})
             chain_id = int(chain_obj.get("chainId") or 0)
-            est_reason = f"strict_compare:estimated:{str(v.get('tvl_price_source') or 'unknown')}"
-            if bool(v.get("strict_estimated_shape_missing", False)) or ("raw_pos=0" in str(exact2_reason or "")):
-                est_reason += ":shape_missing"
             rows.append(
                 {
                     "address": owner,
@@ -18038,6 +18035,9 @@ def _merge_for_web(
             est_last_tvl = _last_positive_value(est_tvl) if est_tvl else float(pool_tvl_now_usd)
             if est_last_tvl <= 0.0:
                 est_last_tvl = float(pool_tvl_now_usd)
+            est_reason = f"strict_compare:estimated:{str(v.get('tvl_price_source') or 'unknown')}"
+            if bool(v.get("strict_estimated_shape_missing", False)) or ("raw_pos=0" in str(exact2_reason or "")):
+                est_reason += ":shape_missing"
             rows.append(
                 {
                     "pool_id": base_pool_id,
