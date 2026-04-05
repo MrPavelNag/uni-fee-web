@@ -32706,9 +32706,10 @@ HTML_PAGE = """
           }
           if (exFeeX.length) {
             feeTraces.push({
-              x: exFeeX, y: exFeeYExact, mode: "lines", name: `${s.label} (exact)`, customdata: exHover,
+              x: exFeeX, y: exFeeYExact, mode: "lines+markers", name: `${s.label} (exact)`, customdata: exHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
+              line: {color: "#1d4ed8", width: 1.8, dash: "solid"},
+              marker: {size: 5, color: "#1d4ed8"}
             });
           }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
@@ -32722,9 +32723,10 @@ HTML_PAGE = """
           }
           if (exTvlX.length) {
             tvlTraces.push({
-              x: exTvlX, y: exTvlYExact, mode: "lines", name: `${s.label} (exact)`, customdata: exHoverTvl,
+              x: exTvlX, y: exTvlYExact, mode: "lines+markers", name: `${s.label} (exact)`, customdata: exHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: "#1d4ed8", width: 1.8, dash: "solid"}
+              line: {color: "#1d4ed8", width: 1.8, dash: "solid"},
+              marker: {size: 5, color: "#1d4ed8"}
             });
           }
         } else {

@@ -609,22 +609,30 @@ def _alchemy_fetch_transfer_deltas(
     by_block: dict[int, int] = {}
     timed_out = False
     t0 = time.monotonic()
-    for direction, sign in (("from", -1), ("to", 1)):
+    directions = [("from", -1), ("to", 1)]
+    for idx, (direction, sign) in enumerate(directions):
         page_key = ""
         pages_used = 0
         items_used = 0
         seen_keys: set[str] = set()
         dir_t0 = time.monotonic()
+        dir_deadline_ts = deadline_ts
+        if deadline_ts is not None:
+            now = time.monotonic()
+            left_total = max(0.0, float(deadline_ts) - now)
+            dirs_left = max(1, len(directions) - int(idx))
+            # Reserve a fair share of remaining time for each direction.
+            dir_deadline_ts = now + max(0.8, left_total / float(dirs_left))
         while True:
-            if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
+            if dir_deadline_ts is not None and time.monotonic() >= float(dir_deadline_ts):
                 timed_out = True
                 break
             if pages_used >= int(max_pages):
                 timed_out = True
                 break
             left = float(req_timeout)
-            if deadline_ts is not None:
-                left = max(0.5, min(float(req_timeout), float(deadline_ts) - time.monotonic()))
+            if dir_deadline_ts is not None:
+                left = max(0.5, min(float(req_timeout), float(dir_deadline_ts) - time.monotonic()))
                 if left <= 0.55:
                     timed_out = True
                     break
@@ -1107,6 +1115,23 @@ def _build_exact2_tvl_series_v3_ledger(
             hit_cov = float(sum(1 for _ts, v in hit_series if float(v) > 0.0) / max(1, len(hit_series)))
             return hit_series, _reason_with_timing("exact2_cache:ok"), hit_cov
 
+    # Sparse exact-point mode (default): build a small set of fully reliable points
+    # via balanceOf at historical day blocks through Alchemy RPC.
+    try:
+        sparse_points = max(0, int(os.environ.get("STRICT_EXACT2_SPARSE_POINTS", "5")))
+    except Exception:
+        sparse_points = 5
+    if int(sparse_points) >= 2:
+        return _build_exact2_tvl_series_v3_sparse_points(
+            chain=chain,
+            pool=pool,
+            fees_usd=fees_usd,
+            day_start_ts=day_start_ts,
+            day_end_ts=day_end_ts,
+            points=int(sparse_points),
+            budget_sec=float(budget_sec),
+        )
+
     # Strict path is deterministic: only RPC snapshot source.
 
     total_budget = max(10.0, float(budget_sec))
@@ -1367,6 +1392,100 @@ def _build_exact2_tvl_series_v3_ledger(
     )
 
 
+def _build_exact2_tvl_series_v3_sparse_points(
+    *,
+    chain: str,
+    pool: dict,
+    fees_usd: list[tuple[int, float]],
+    day_start_ts: int,
+    day_end_ts: int,
+    points: int,
+    budget_sec: float,
+) -> tuple[list[tuple[int, float]], str, float]:
+    run_t0 = time.monotonic()
+    ck = str(chain or "").strip().lower()
+    chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    if chain_id <= 0:
+        return [], "exact2_sparse_points:unsupported_chain", 0.0
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    pool_id = str(pool.get("id") or "").strip().lower()
+    if not (token0 and token1 and pool_id):
+        return [], "exact2_sparse_points:missing_pool_tokens", 0.0
+
+    try:
+        dec0 = int(_token_decimals_from_pool(pool, "token0") or _erc20_decimals(chain_id, token0))
+        dec1 = int(_token_decimals_from_pool(pool, "token1") or _erc20_decimals(chain_id, token1))
+    except Exception as e:
+        return [], f"exact2_sparse_points:decimals_failed:{e}", 0.0
+
+    try:
+        ratio01 = float(pool.get("token0Price") or 0.0) if pool.get("token0Price") is not None else 0.0
+    except Exception:
+        ratio01 = 0.0
+
+    day_blocks: dict[int, int] = {}
+    for ts, _ in fees_usd:
+        d = int((int(ts) // 86400) * 86400)
+        if d in day_blocks:
+            continue
+        try:
+            day_blocks[d] = int(_llama_block_for_day(ck, d + 86399))
+        except Exception:
+            day_blocks[d] = 0
+
+    n = len(fees_usd)
+    if n <= 0:
+        return [], "exact2_sparse_points:no_days", 0.0
+    valid_idx = [i for i, (ts, _f) in enumerate(fees_usd) if int(day_blocks.get(int((int(ts) // 86400) * 86400), 0)) > 0]
+    if not valid_idx:
+        return [(int(ts), 0.0) for ts, _ in fees_usd], "exact2_sparse_points:no_day_blocks", 0.0
+
+    p = max(2, min(int(points), len(valid_idx)))
+    if p == 1:
+        pick_positions = [0]
+    else:
+        pick_positions = sorted({int(round(i * (len(valid_idx) - 1) / (p - 1))) for i in range(p)})
+    picked_idx = [valid_idx[pos] for pos in pick_positions if 0 <= pos < len(valid_idx)]
+    picked_idx = sorted(set(picked_idx))
+
+    deadline = time.monotonic() + max(8.0, float(budget_sec))
+    out = [(int(ts), 0.0) for ts, _ in fees_usd]
+    ok_points = 0
+    for i in picked_idx:
+        if time.monotonic() >= deadline:
+            break
+        ts = int(fees_usd[i][0])
+        day_ts = int((ts // 86400) * 86400)
+        b = int(day_blocks.get(day_ts, 0))
+        if b <= 0:
+            continue
+        try:
+            bal0 = int(_balance_of_raw(chain_id, token0, pool_id, b, timeout_sec=6.0))
+            bal1 = int(_balance_of_raw(chain_id, token1, pool_id, b, timeout_sec=6.0))
+        except Exception:
+            continue
+        amt0 = float(bal0) / float(10 ** max(0, dec0))
+        amt1 = float(bal1) / float(10 ** max(0, dec1))
+        p0 = float(_historical_price_usd(ck, token0, ts, int(day_start_ts), int(day_end_ts)))
+        p1 = float(_historical_price_usd(ck, token1, ts, int(day_start_ts), int(day_end_ts)))
+        if p0 <= 0 and p1 > 0 and ratio01 > 0:
+            p0 = p1 * ratio01
+        if p1 <= 0 and p0 > 0 and ratio01 > 0:
+            p1 = p0 / ratio01
+        tvl = max(0.0, amt0 * max(0.0, p0)) + max(0.0, amt1 * max(0.0, p1))
+        if tvl > 0.0:
+            out[i] = (ts, float(tvl))
+            ok_points += 1
+
+    cov = float(ok_points / max(1, n))
+    reason = (
+        f"exact2_sparse_points:points={len(picked_idx)}:ok={ok_points}:"
+        f"cov={cov:.2f}:budget={float(budget_sec):.1f}:elapsed={max(0.0, time.monotonic()-run_t0):.1f}"
+    )
+    return out, reason, cov
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Uniswap v3 strict exact single-pool agent")
     ap.add_argument("--min-tvl", type=float, default=None, help="Min TVL USD")
@@ -1610,6 +1729,20 @@ def main() -> None:
                     exact_for_output = list(sm2)
                     smooth_filled_days += int(fill2)
                 missing_days = int(sum(1 for _ts, v in exact_for_output if float(v or 0.0) <= 0.0))
+        # Diagnostics only (no value re-scaling):
+        # helps understand why exact partial level differs from estimated / TVL-now.
+        ex_last = 0.0
+        est_last = 0.0
+        for _ts, _v in reversed(exact_for_output):
+            if float(_v) > 0.0:
+                ex_last = float(_v)
+                break
+        for _ts, _v in reversed(estimated_tvl_base):
+            if float(_v) > 0.0:
+                est_last = float(_v)
+                break
+        lvl_ratio_est = (float(ex_last) / max(1e-12, float(est_last))) if est_last > 0.0 else 0.0
+        lvl_ratio_now = (float(ex_last) / max(1e-12, float(pool_tvl_now_usd))) if float(pool_tvl_now_usd) > 0.0 else 0.0
         flags: list[str] = []
         if one_leg_conflict:
             flags.append("one_leg")
@@ -1624,7 +1757,11 @@ def main() -> None:
         flg = f":conflicts={','.join(flags)}" if flags else ""
         sm = f":smoothed={int(smooth_filled_days)}" if int(smooth_filled_days) > 0 else ""
         od = f":outliers={int(outlier_dropped_days)}" if int(outlier_dropped_days) > 0 else ""
-        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}{sm}{od}:reason={exact_reason}{flg}"
+        lv = (
+            f":lvl_ex_est={lvl_ratio_est:.2f}:lvl_ex_now={lvl_ratio_now:.2f}:"
+            f"last_ex={ex_last:.2f}:last_est={est_last:.2f}:now={float(pool_tvl_now_usd):.2f}"
+        )
+        data_quality_reason = f"exact:partial_raw:cov={exact_cov:.2f}:missing={missing_days}{sm}{od}{lv}:reason={exact_reason}{flg}"
         final_tvl = []
         final_fees = []
         strict_exact_tvl_base = list(exact_for_output)
