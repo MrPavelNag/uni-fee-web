@@ -19168,47 +19168,71 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             t_agents_total0 = time.perf_counter()
             if run_mode == "strict_exact":
                 pair_suffix = pairs_to_filename_suffix(token_pairs)
-                _set_stage("strict", "Running strict exact agent (single pool)", 22)
+                _set_stage("strict", "Running strict exact agent(s) (single pool)", 22)
                 base_timeout = int(env.get("AGENT_TIMEOUT_SEC", "480") or 480)
-                try:
-                    exact2_budget = max(15.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "60"))))
-                except Exception:
-                    exact2_budget = 60.0
-                env2 = dict(env)
-                env2["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
-                # Strict exact can legitimately run longer than pool budget due to:
-                # chain probing, block resolution, subprocess startup and JSON IO.
-                # Keep a healthy timeout headroom instead of hard 90s cap.
-                strict_timeout_target = int(max(75, int(exact2_budget) + 75))
-                env2["AGENT_TIMEOUT_SEC"] = str(max(75, min(base_timeout, strict_timeout_target, 300)))
-                logs.append(
-                    "[strict] budgets: "
-                    f"exact2={int(exact2_budget)}s timeout2={env2['AGENT_TIMEOUT_SEC']}s"
-                )
-                strict2_data, strict2_dbg = _run_agent_and_load_timed(
-                    script_name="agent_v3_strict_exact2.py",
-                    env=env2,
-                    min_tvl=req.min_tvl,
-                    logs=logs,
-                    pair_suffix=pair_suffix,
-                )
-                merged_raw.update(strict2_data or {})
-                for _pid, _v2 in (strict2_data or {}).items():
-                    base2 = merged_raw.get(_pid)
-                    if isinstance(base2, dict):
-                        base2["strict_compare_exact2_reason"] = str(_v2.get("data_quality_reason") or "")
+                strict_agents: list[tuple[str, dict[str, str], str]] = []
+                if run_v3:
+                    try:
+                        exact2_budget = max(15.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "60"))))
+                    except Exception:
+                        exact2_budget = 60.0
+                    env_v3 = dict(env)
+                    env_v3["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
+                    strict_timeout_target = int(max(75, int(exact2_budget) + 75))
+                    env_v3["AGENT_TIMEOUT_SEC"] = str(max(75, min(base_timeout, strict_timeout_target, 300)))
+                    logs.append(f"[strict][v3] budget={int(exact2_budget)}s timeout={env_v3['AGENT_TIMEOUT_SEC']}s")
+                    strict_agents.append(("agent_v3_strict_exact2.py", env_v3, "v3"))
+                if run_v4:
+                    try:
+                        v4_budget = max(15.0, float(os.environ.get("WEB_V4_EXACT_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "60"))))
+                    except Exception:
+                        v4_budget = 60.0
+                    env_v4 = dict(env)
+                    env_v4["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(v4_budget))
+                    strict_timeout_target_v4 = int(max(75, int(v4_budget) + 75))
+                    env_v4["AGENT_TIMEOUT_SEC"] = str(max(75, min(base_timeout, strict_timeout_target_v4, 300)))
+                    logs.append(f"[strict][v4] budget={int(v4_budget)}s timeout={env_v4['AGENT_TIMEOUT_SEC']}s")
+                    strict_agents.append(("agent_v4_strict_exact.py", env_v4, "v4"))
+
+                strict_dbg_list: list[dict[str, Any]] = []
+                for idx_agent, (script_name, env_cur, tag) in enumerate(strict_agents, start=1):
+                    _set_stage("strict", f"Running strict exact {tag} ({idx_agent}/{len(strict_agents)})", int(20 + (55 * idx_agent / max(1, len(strict_agents)))))
+                    strict_data, strict_dbg = _run_agent_and_load_timed(
+                        script_name=script_name,
+                        env=env_cur,
+                        min_tvl=req.min_tvl,
+                        logs=logs,
+                        pair_suffix=pair_suffix,
+                    )
+                    for _pid, _row in (strict_data or {}).items():
+                        if not isinstance(_row, dict):
+                            continue
+                        prev = merged_raw.get(_pid)
+                        if isinstance(prev, dict):
+                            prev_q = str(prev.get("data_quality") or "").strip().lower()
+                            cur_q = str(_row.get("data_quality") or "").strip().lower()
+                            # Do not replace a valid/partial row with strict_unavailable from another strict engine.
+                            if prev_q in {"exact", "exact_partial", "estimated"} and cur_q == "strict_unavailable":
+                                continue
+                        merged_raw[_pid] = _row
+                    for _pid, _v2 in (strict_data or {}).items():
+                        base2 = merged_raw.get(_pid)
+                        if isinstance(base2, dict):
+                            base2["strict_compare_exact2_reason"] = str(_v2.get("data_quality_reason") or "")
+                    strict_dbg_list.append(strict_dbg)
+
                 timing_debug["pairs"].append(
                     {
                         "pair": token_pairs,
                         "index": 1,
-                        "agents": [strict2_dbg],
+                        "agents": strict_dbg_list,
                         "merged_before": 0,
                         "merged_after": int(len(merged_raw)),
                         "merged_added": int(len(merged_raw)),
-                        "total_ms": int((strict2_dbg or {}).get("total_ms") or 0),
+                        "total_ms": int(sum(int((x or {}).get("total_ms") or 0) for x in strict_dbg_list)),
                     }
                 )
-                _set_stage("strict", "Strict exact agent completed", 78)
+                _set_stage("strict", "Strict exact agent(s) completed", 78)
             else:
                 total_pairs = max(1, len(pairs))
                 pair_workers = _pair_worker_count(speed_mode, total_pairs)
@@ -30240,8 +30264,10 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         raise HTTPException(status_code=400, detail="min_apy_pct must be in range 0..100000")
     req.target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
     if req.target_pool_id:
-        if not (req.target_pool_id.startswith("0x") and len(req.target_pool_id) == 42):
-            raise HTTPException(status_code=400, detail="target_pool_id must be a valid 0x contract address")
+        is_hex_addr = req.target_pool_id.startswith("0x") and len(req.target_pool_id) == 42
+        is_hex_pool_id = req.target_pool_id.startswith("0x") and len(req.target_pool_id) == 66
+        if not (is_hex_addr or is_hex_pool_id):
+            raise HTTPException(status_code=400, detail="target_pool_id must be a valid 0x address (40 hex) or pool id (64 hex)")
     req.mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
     req.mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
     if req.mode_strict_exact:
@@ -30249,7 +30275,6 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
             raise HTTPException(status_code=400, detail="strict exact mode requires target_pool_id")
         req.ignore_cache = True
         req.mode_fast_legacy = False
-        req.include_versions = ["v3"]
     else:
         req.target_pool_id = ""
     if (not req.mode_strict_exact) and (not req.mode_fast_legacy):
@@ -31497,10 +31522,10 @@ HTML_PAGE = """
       setDisabledWithDim(document.getElementById("minApyPct"), strict);
       const protoV3 = document.getElementById("protoV3");
       const protoV4 = document.getElementById("protoV4");
-      if (protoV3) protoV3.disabled = strict;
-      if (protoV4) protoV4.disabled = strict;
+      if (protoV3) protoV3.disabled = false;
+      if (protoV4) protoV4.disabled = false;
       const protoItem = document.getElementById("filterProtocolItem");
-      if (protoItem) protoItem.classList.toggle("mode-disabled", strict);
+      if (protoItem) protoItem.classList.remove("mode-disabled");
 
       // Contract field is used only in Exact mode.
       setDisabledWithDim(document.getElementById("targetPoolId"), !strict);
@@ -31534,8 +31559,6 @@ HTML_PAGE = """
         fast.checked = true;
       }
       if (strict.checked) {
-        if (protoV3) protoV3.checked = true;
-        if (protoV4) protoV4.checked = false;
         try { updateChainsNote(); } catch (_) {}
       }
       applyRunModeUiState();
@@ -31555,7 +31578,7 @@ HTML_PAGE = """
     }
 
     function isHexPoolAddress(v) {
-      return /^0x[a-f0-9]{40}$/.test(String(v || ""));
+      return /^0x([a-f0-9]{40}|[a-f0-9]{64})$/.test(String(v || ""));
     }
 
     function shortAddress4x4(v) {
