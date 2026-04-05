@@ -31102,27 +31102,27 @@ HTML_PAGE = """
     }
     .mode-filter-line {
       display: grid;
-      grid-template-columns: 120px 1fr;
-      gap: 8px;
+      grid-template-columns: 94px 1fr;
+      gap: 6px;
       align-items: end;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
     }
     .mode-filter-line:last-child { margin-bottom: 0; }
     .mode-check {
       display: flex;
       align-items: center;
-      height: 34px;
+      height: 30px;
       border: 1px solid #cbd5e1;
       border-radius: 8px;
       background: #f8fbff;
-      padding: 0 10px;
+      padding: 0 8px;
       white-space: nowrap;
     }
     .mode-check label {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      font-size: 12px;
+      gap: 5px;
+      font-size: 11px;
       font-weight: 700;
       color: #334155;
       margin: 0;
@@ -31133,10 +31133,27 @@ HTML_PAGE = """
       accent-color: #2563eb;
     }
     .estimated-grid {
-      grid-template-columns: repeat(5, minmax(90px, 1fr));
+      grid-template-columns: 98px 92px 120px 92px 118px;
+      gap: 4px;
     }
     .exact-grid {
-      grid-template-columns: 140px minmax(360px, 1fr);
+      grid-template-columns: 92px minmax(300px, 1fr);
+      gap: 4px;
+    }
+    .estimated-grid .filter-item .hint,
+    .exact-grid .filter-item .hint {
+      min-height: 20px;
+      font-size: 10px;
+      margin-bottom: 2px !important;
+      line-height: 1.05;
+    }
+    .estimated-grid .filter-item input,
+    .estimated-grid .filter-item select,
+    .exact-grid .filter-item input,
+    .exact-grid .filter-item select {
+      height: 30px;
+      padding: 4px 6px;
+      font-size: 12px;
     }
     .inline-grid .filter-item input,
     .inline-grid .filter-item select {
@@ -31201,8 +31218,8 @@ HTML_PAGE = """
     }
     @media (max-width: 1500px) {
       .inline-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-      .estimated-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .exact-grid { grid-template-columns: 120px minmax(0, 1fr); }
+      .estimated-grid { grid-template-columns: repeat(5, minmax(76px, 1fr)); }
+      .exact-grid { grid-template-columns: 86px minmax(220px, 1fr); }
     }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
@@ -31627,7 +31644,7 @@ HTML_PAGE = """
       if (pairsRow) pairsRow.classList.toggle("mode-disabled", strict);
       if (chainsRow) chainsRow.classList.remove("mode-disabled");
       if (filtersRow) filtersRow.classList.remove("mode-disabled");
-      if (estimatedLine) estimatedLine.classList.toggle("mode-disabled", !fast);
+      if (estimatedLine) estimatedLine.classList.remove("mode-disabled");
       if (exactLine) exactLine.classList.toggle("mode-disabled", !strict);
 
       const pairIds = ["stableBucketMode", "stableBucketManual", "tokenBucketMode", "tokenBucketManual"];

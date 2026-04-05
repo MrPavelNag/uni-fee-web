@@ -55,6 +55,59 @@ def _pool_tvl_usd(pool: dict) -> float:
         return 0.0
 
 
+def _resolve_pool_tvl_now_onchain_v3(pool: dict, chain: str) -> tuple[float, str, str]:
+    ck = str(chain or "").strip().lower()
+    chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    if chain_id <= 0:
+        return 0.0, "", "unsupported_chain"
+    pool_id = str((pool or {}).get("id") or "").strip().lower()
+    token0 = str((((pool or {}).get("token0") or {}).get("id") or "").strip().lower())
+    token1 = str((((pool or {}).get("token1") or {}).get("id") or "").strip().lower())
+    if not (pool_id and token0 and token1):
+        return 0.0, "", "missing_pool_tokens"
+    try:
+        latest_hex = str((_rpc_json(chain_id, "eth_blockNumber", [], timeout_sec=8.0) or {}).get("result") or "0x0")
+        latest_block = int(latest_hex, 16)
+    except Exception as e:
+        return 0.0, "", f"latest_block_failed:{e}"
+    if latest_block <= 0:
+        return 0.0, "", "latest_block_not_found"
+    try:
+        d0 = int((((pool or {}).get("token0") or {}).get("decimals") or 0))
+        d1 = int((((pool or {}).get("token1") or {}).get("decimals") or 0))
+        if d0 <= 0 or d0 > 36:
+            d0 = int(_erc20_decimals(chain_id, token0))
+        if d1 <= 0 or d1 > 36:
+            d1 = int(_erc20_decimals(chain_id, token1))
+        b0 = int(_balance_of_raw(chain_id, token0, pool_id, latest_block, timeout_sec=8.0))
+        b1 = int(_balance_of_raw(chain_id, token1, pool_id, latest_block, timeout_sec=8.0))
+    except Exception as e:
+        return 0.0, "", f"onchain_balance_failed:{e}"
+
+    # Reuse canonical external pricing path, but with on-chain reserve amounts.
+    p = dict(pool or {})
+    t0 = dict((p.get("token0") or {}))
+    t1 = dict((p.get("token1") or {}))
+    t0["id"] = token0
+    t1["id"] = token1
+    t0["decimals"] = int(d0)
+    t1["decimals"] = int(d1)
+    p["token0"] = t0
+    p["token1"] = t1
+    p["totalValueLockedToken0"] = str(float(b0) / float(10 ** max(0, d0)))
+    p["totalValueLockedToken1"] = str(float(b1) / float(10 ** max(0, d1)))
+    tvl_usd, price_source, err = resolve_pool_tvl_now_external(p, ck, write_back=True)
+    if float(tvl_usd) > 0:
+        try:
+            pool["effectiveTvlUSD"] = float(tvl_usd)
+            pool["tvl_price_source"] = str(price_source or "")
+            pool["pool_tvl_now_usd"] = float(tvl_usd)
+            pool["pool_tvl_now_source"] = "onchain_balance*price"
+        except Exception:
+            pass
+    return float(tvl_usd), str(price_source or ""), str(err or "")
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
@@ -1134,7 +1187,7 @@ def discover_pools_v3(
                 filtered_pools: list[dict] = []
                 skipped_missing_price = 0
                 for p in pools:
-                    ext_tvl, price_source, price_err = resolve_pool_tvl_now_external(p, chain, write_back=True)
+                    ext_tvl, price_source, price_err = _resolve_pool_tvl_now_onchain_v3(p, chain)
                     if float(ext_tvl) <= 0:
                         skipped_missing_price += 1
                         pid = str((p or {}).get("id") or "")
@@ -1436,7 +1489,7 @@ def main() -> None:
         data = compute_fee_and_tvl_series(pool, endpoint)
         # Hard rule: TVL "now" must always come from reserves * external prices.
         # Never trust prefilled pool TVL fields for current-point valuation.
-        pool_tvl_now_usd, price_source, price_err = resolve_pool_tvl_now_external(pool, chain, write_back=True)
+        pool_tvl_now_usd, price_source, price_err = _resolve_pool_tvl_now_onchain_v3(pool, chain)
         if float(pool_tvl_now_usd) <= 0:
             msg = (
                 f"  [{idx+1}/{len(pools)}] {chain} {pair}: "
