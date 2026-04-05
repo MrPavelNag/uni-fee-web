@@ -941,12 +941,24 @@ def main() -> None:
             exact_active_fees = _sparse_series_every_n_days(estimated_active_fees_base, exact_step_days)
             exact_active_fees = _append_now_fee_anchor(exact_active_fees)
     else:
-        # No historical day-shape: still expose a single estimate marker at TVL NOW.
+        # No historical day-shape from subgraph:
+        # - keep TVL visualization as one-point marker (do not invent TVL shape),
+        # - but still compute cumulative fees from feesUSD on a flat NOW anchor.
         estimated_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
         exact_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
+        est_flat_tvl_for_fees = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in (fees_usd or [])]
+        estimated_fees_base = _rebuild_fees_cumulative(fees_usd, est_flat_tvl_for_fees)
+        estimated_fees = _append_now_fee_anchor(estimated_fees_base)
+        exact_fees = _sparse_series_every_n_days(estimated_fees_base, exact_step_days)
+        exact_fees = _append_now_fee_anchor(exact_fees)
         if tvl_active_now > 0.0:
             estimated_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
             exact_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
+            est_active_flat_tvl_for_fees = [(int(ts), float(tvl_active_now)) for ts, _ in (fees_usd or [])]
+            estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, est_active_flat_tvl_for_fees)
+            estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
+            exact_active_fees = _sparse_series_every_n_days(estimated_active_fees_base, exact_step_days)
+            exact_active_fees = _append_now_fee_anchor(exact_active_fees)
     if (not exact_tvl) and fees_usd:
         exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
     if (not exact_active_tvl) and fees_usd and tvl_active_now > 0.0:

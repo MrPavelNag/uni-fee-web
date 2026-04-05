@@ -31384,9 +31384,9 @@ HTML_PAGE = """
     }
     .estimated-grid .filter-item .hint,
     .exact-grid .filter-item .hint {
-      min-height: 20px;
+      min-height: 16px;
       font-size: 11px;
-      margin-bottom: 3px !important;
+      margin-bottom: 2px !important;
       line-height: 1.15;
       white-space: nowrap;
     }
@@ -31408,8 +31408,8 @@ HTML_PAGE = """
       font-size: 13px;
     }
     .filter-item .hint {
-      margin-bottom: 3px !important;
-      min-height: 20px;
+      margin-bottom: 2px !important;
+      min-height: 16px;
       display: flex;
       align-items: flex-start;
       line-height: 1.15;
