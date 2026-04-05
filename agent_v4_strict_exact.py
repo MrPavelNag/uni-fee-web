@@ -23,6 +23,53 @@ from agent_v4 import get_endpoint, query_pool_day_data
 from price_oracle import get_token_prices_usd
 from uniswap_client import graphql_query
 
+V4_ONCHAIN_BY_CHAIN: dict[str, dict[str, str]] = {
+    # Official Uniswap v4 deployments:
+    # https://docs.uniswap.org/contracts/v4/deployments
+    "ethereum": {
+        "pool_manager": "0x000000000004444c5dc75cb358380d2e3de08a90",
+        "state_view": "0x7ffe42c4a5deea5b0fec41c94c136cf115597227",
+    },
+    "arbitrum": {
+        "pool_manager": "0x360e68faccca8ca495c1b759fd9eee466db9fb32",
+        "state_view": "0x76fd297e2d437cd7f76d50f01afe6160f86e9990",
+    },
+    "base": {
+        "pool_manager": "0x498581ff718922c3f8e6a244956af099b2652b2b",
+        "state_view": "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71",
+    },
+    "unichain": {
+        "pool_manager": "0x1f98400000000000000000000000000000000004",
+        "state_view": "0x86e8631a016f9068c3f085faf484ee3f5fdee8f2",
+    },
+    "polygon": {
+        "pool_manager": "0x67366782805870060151383f4bbff9dab53e5cd6",
+        "state_view": "0x5ea1bd7974c8a611cbab0bdcafcb1d9cc9b3ba5a",
+    },
+    "optimism": {
+        "pool_manager": "0x9a13f98cb987694c9f086b1f5eb990eea8264ec3",
+        "state_view": "0xc18a3169788f4f75a170290584eca6395c75ecdb",
+    },
+    "bsc": {
+        "pool_manager": "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df",
+        "state_view": "0xd13dd3d6e93f276fafc9db9e6bb47c1180aee0c4",
+    },
+    "celo": {
+        "pool_manager": "0x288dc841a52fca2707c6947b3a777c5e56cd87bc",
+        "state_view": "0xbc21f8720babf4b20d195ee5c6e99c52b76f2bfb",
+    },
+    "avalanche": {
+        "pool_manager": "0x06380c0e0912312b5150364b9dc4542ba0dbbc85",
+        "state_view": "0xc3c9e198c735a4b97e3e683f391ccbdd60b69286",
+    },
+}
+
+# Function selectors for v4 pool state reads by poolId (bytes32).
+# getSlot0(bytes32) -> (sqrtPriceX96, tick, protocolFee, lpFee)
+_V4_GET_SLOT0_SELECTOR = "0xc815641c"
+# getLiquidity(bytes32) -> uint128
+_V4_GET_LIQUIDITY_SELECTOR = "0xfa6793d5"
+
 
 def _is_hex(v: str, n_hex: int) -> bool:
     s = str(v or "").strip().lower()
@@ -108,12 +155,69 @@ def _find_pool_on_chains(pool_id: str, chains: list[str]) -> tuple[dict | None, 
     return None, "", ""
 
 
+def _hex_words(data_hex: str) -> list[str]:
+    h = str(data_hex or "").strip().lower()
+    if h.startswith("0x"):
+        h = h[2:]
+    if not h:
+        return []
+    if len(h) % 64 != 0:
+        h = h.zfill((len(h) + 63) // 64 * 64)
+    return [h[i : i + 64] for i in range(0, len(h), 64)]
+
+
+def _decode_uint_word(word: str) -> int:
+    try:
+        return int(str(word or "0"), 16)
+    except Exception:
+        return 0
+
+
+def _rpc_eth_call(chain_id: int, to: str, data: str, *, timeout_sec: float = 8.0) -> str:
+    payload = [{"to": str(to or "").strip().lower(), "data": str(data or "")}, "latest"]
+    res = _rpc_json(int(chain_id), "eth_call", payload, timeout_sec=float(timeout_sec)) or {}
+    return str(res.get("result") or "")
+
+
+def _onchain_addresses_for_chain(chain: str) -> tuple[str, str]:
+    item = V4_ONCHAIN_BY_CHAIN.get(str(chain or "").strip().lower()) or {}
+    pm = str(item.get("pool_manager") or "").strip().lower()
+    sv = str(item.get("state_view") or "").strip().lower()
+    return pm, sv
+
+
+def _read_v4_slot0_liquidity(chain_id: int, chain: str, pool_id: str) -> tuple[int, int, str]:
+    pid = str(pool_id or "").strip().lower()
+    if not _is_hex(pid, 64):
+        return 0, 0, "strict_required:v4:pool_id_must_be_64hex"
+    pm, sv = _onchain_addresses_for_chain(chain)
+    if not sv and not pm:
+        return 0, 0, "strict_required:v4:onchain_contracts_not_configured"
+
+    targets = [t for t in [sv, pm] if t]
+    last_err = ""
+    for target in targets:
+        try:
+            slot_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_SLOT0_SELECTOR + pid[2:], timeout_sec=8.0)
+            liq_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_LIQUIDITY_SELECTOR + pid[2:], timeout_sec=8.0)
+            slot_words = _hex_words(slot_hex)
+            liq_words = _hex_words(liq_hex)
+            sqrt_price_x96 = _decode_uint_word(slot_words[0]) if slot_words else 0
+            liquidity = _decode_uint_word(liq_words[0]) if liq_words else 0
+            if sqrt_price_x96 > 0:
+                src = "state_view" if target == sv else "pool_manager"
+                return int(sqrt_price_x96), int(liquidity), src
+            last_err = "zero_slot0"
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return 0, 0, f"strict_required:v4:onchain_pool_state_failed:{last_err or 'unknown'}"
+
+
 def _resolve_pool_tvl_now_onchain_v4(pool: dict, chain: str) -> tuple[float, str, str]:
-    # For v4 strict agent, use only one Alchemy-backed on-chain point for TVL NOW.
-    # Requires a pool address-like id; bytes32 pool ids cannot be queried via ERC20 balanceOf directly.
+    # For v4 strict agent, use one Alchemy-backed on-chain point for TVL NOW.
+    # For bytes32 pool ids, read slot0/liquidity via StateView/PoolManager.
     pool_id = str(pool.get("id") or "").strip().lower()
-    if not _is_hex(pool_id, 40):
-        return 0.0, "", "strict_required:v4:alchemy_tvl_now_requires_address_pool_id"
     ck = str(chain or "").strip().lower()
     chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if chain_id <= 0:
@@ -129,24 +233,52 @@ def _resolve_pool_tvl_now_onchain_v4(pool: dict, chain: str) -> tuple[float, str
         return 0.0, "", f"strict_required:v4:latest_block_failed:{e}"
     if latest <= 0:
         return 0.0, "", "strict_required:v4:latest_block_not_found"
-    try:
-        d0 = int(((pool.get("token0") or {}).get("decimals") or 0))
-        d1 = int(((pool.get("token1") or {}).get("decimals") or 0))
-        if d0 <= 0 or d0 > 36:
-            d0 = int(_erc20_decimals(chain_id, token0))
-        if d1 <= 0 or d1 > 36:
-            d1 = int(_erc20_decimals(chain_id, token1))
-        b0 = int(_balance_of_raw(chain_id, token0, pool_id, latest, timeout_sec=8.0))
-        b1 = int(_balance_of_raw(chain_id, token1, pool_id, latest, timeout_sec=8.0))
-    except Exception as e:
-        return 0.0, "", f"strict_required:v4:onchain_balance_failed:{e}"
-    a0 = float(b0) / float(10 ** max(0, d0))
-    a1 = float(b1) / float(10 ** max(0, d1))
+    sqrt_price_x96 = 0
+    pool_liquidity = 0
+    state_source = ""
+    if _is_hex(pool_id, 64):
+        sqrt_price_x96, pool_liquidity, state_source_or_err = _read_v4_slot0_liquidity(chain_id, ck, pool_id)
+        if sqrt_price_x96 <= 0:
+            return 0.0, "", str(state_source_or_err or "strict_required:v4:onchain_pool_state_unavailable")
+        state_source = str(state_source_or_err or "state_view")
+
+    # token quantities:
+    # - bytes32 v4 pool id: use subgraph token balances (no direct per-pool ERC20 balanceOf path)
+    # - address-like pool id fallback: use direct balanceOf on pool address
+    if _is_hex(pool_id, 64):
+        try:
+            a0 = max(0.0, float(pool.get("totalValueLockedToken0") or 0.0))
+            a1 = max(0.0, float(pool.get("totalValueLockedToken1") or 0.0))
+        except Exception:
+            a0, a1 = 0.0, 0.0
+    else:
+        try:
+            d0 = int(((pool.get("token0") or {}).get("decimals") or 0))
+            d1 = int(((pool.get("token1") or {}).get("decimals") or 0))
+            if d0 <= 0 or d0 > 36:
+                d0 = int(_erc20_decimals(chain_id, token0))
+            if d1 <= 0 or d1 > 36:
+                d1 = int(_erc20_decimals(chain_id, token1))
+            b0 = int(_balance_of_raw(chain_id, token0, pool_id, latest, timeout_sec=8.0))
+            b1 = int(_balance_of_raw(chain_id, token1, pool_id, latest, timeout_sec=8.0))
+            a0 = float(b0) / float(10 ** max(0, d0))
+            a1 = float(b1) / float(10 ** max(0, d1))
+        except Exception as e:
+            return 0.0, "", f"strict_required:v4:onchain_balance_failed:{e}"
+    if a0 <= 0.0 and a1 <= 0.0:
+        return 0.0, "", "strict_required:v4:token_amounts_unavailable"
     prices, sources, errs = get_token_prices_usd(ck, [token0, token1])
     p0 = float(prices.get(token0) or 0.0)
     p1 = float(prices.get(token1) or 0.0)
     try:
         ratio01 = float(pool.get("token0Price") or 0.0)
+        if ratio01 <= 0 and sqrt_price_x96 > 0:
+            q = float((int(sqrt_price_x96) * int(sqrt_price_x96)) / (2 ** 192))
+            if q > 0:
+                # pool token0Price in subgraph is token1 per token0.
+                dec0 = int(((pool.get("token0") or {}).get("decimals") or 18))
+                dec1 = int(((pool.get("token1") or {}).get("decimals") or 18))
+                ratio01 = float(q * (10 ** (dec0 - dec1)))
     except Exception:
         ratio01 = 0.0
     if p0 <= 0 and p1 > 0 and ratio01 > 0:
@@ -161,6 +293,8 @@ def _resolve_pool_tvl_now_onchain_v4(pool: dict, chain: str) -> tuple[float, str
     src = s0 or s1
     if s0 and s1 and s0 != s1:
         src = f"{s0}+{s1}"
+    if _is_hex(pool_id, 64):
+        return float(tvl), f"onchain_{state_source}:qty=subgraph_tokens:liq={int(pool_liquidity)}:price={src}", ""
     return float(tvl), f"onchain_balance*price:{src}", ""
 
 

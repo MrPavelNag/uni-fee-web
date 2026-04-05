@@ -1,8 +1,8 @@
 {
-  "0x20c3a15e34e5d88aeba004b0753af69e4f6bea80eae2263f7a92e919cd33cc56": {
+  "0x4a24fcf3c1cbebd80d09537c7aa15adf2d228aa1b9ba1b0e5fb82e66dc96c0d2": {
     "fees": [],
     "tvl": [],
-    "pool_id": "0x20c3a15e34e5d88aeba004b0753af69e4f6bea80eae2263f7a92e919cd33cc56",
+    "pool_id": "0x4a24fcf3c1cbebd80d09537c7aa15adf2d228aa1b9ba1b0e5fb82e66dc96c0d2",
     "fee_pct": 0.0,
     "raw_fee_tier": 0,
     "pool_tvl_now_usd": 0.0,
@@ -10,10 +10,10 @@
     "tvl_multiplier": 1.0,
     "tvl_price_source": "",
     "pair": "target_pool",
-    "chain": "",
+    "chain": "ethereum",
     "version": "v4",
     "data_quality": "strict_unavailable",
-    "data_quality_reason": "strict_required:v4:pool_not_found_on_selected_chains",
+    "data_quality_reason": "strict_required:v4:external_tvl_unavailable:strict_required:v4:alchemy_tvl_now_requires_address_pool_id",
     "strict_compare_estimated_tvl": [],
     "strict_compare_estimated_fees": [],
     "strict_compare_exact_tvl": [],

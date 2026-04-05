@@ -21772,7 +21772,8 @@ def _render_positions_page() -> str:
       if (raw.includes("exact2_partial:block_missing")) return "Partial exact: missing day blocks";
       if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
       if (raw.includes("exact2_partial:transfer_logs_timeout")) return `Partial exact: transfer log timeout${dbgTail}`;
-      if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found on selected chains";
+      if (raw.includes("strict_required:v4:target_pool_id_must_be_pool_id_64hex")) return "V4 exact: use pool id (0x + 64 hex), not contract address";
+      if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found in selected chains";
       if (raw.includes("missing_target_pool_id")) return "Target pool is required";
       if (dq === "exact") return "Exact";
       if (dq === "exact_partial") return "Exact partial";
@@ -32993,7 +32994,8 @@ HTML_PAGE = """
       if (raw.includes("exact2_partial:block_missing")) return "Partial exact: missing day blocks";
       if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
       if (raw.includes("exact2_partial:transfer_logs_timeout")) return `Partial exact: transfer log timeout${dbgTail}`;
-      if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found on selected chains";
+      if (raw.includes("strict_required:v4:target_pool_id_must_be_pool_id_64hex")) return "V4 exact: use pool id (0x + 64 hex), not contract address";
+      if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found in selected chains";
       if (raw.includes("missing_target_pool_id")) return "Target pool is required";
       if (dq === "exact") return "Exact";
       if (dq === "exact_partial") return "Exact partial";
