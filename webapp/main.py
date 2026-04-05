@@ -30330,7 +30330,9 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
             if pid.startswith("0x") and len(pid) == 66:
                 req.include_versions = ["v4"]
             elif pid.startswith("0x") and len(pid) == 42:
-                req.include_versions = ["v3", "v4"]
+                # Address-like target pool ids map naturally to v3 pool contracts.
+                # v4 exact expects a pool id hash (bytes32, 0x + 64 hex).
+                req.include_versions = ["v3"]
     else:
         req.target_pool_id = ""
     if (not req.mode_strict_exact) and (not req.mode_fast_legacy):

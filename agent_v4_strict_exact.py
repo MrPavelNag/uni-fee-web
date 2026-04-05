@@ -39,6 +39,10 @@ def _target_pool_id() -> str:
     return ""
 
 
+def _is_pool_id_64(v: str) -> bool:
+    return _is_hex(str(v or "").strip().lower(), 64)
+
+
 def _include_chains() -> list[str]:
     include = [c.strip().lower() for c in str(os.environ.get("INCLUDE_CHAINS", "")).split(",") if c.strip()]
     if include:
@@ -214,6 +218,17 @@ def main() -> None:
 
     if not target_pool:
         save_chart_data_json({"strict_target": _strict_unavailable_payload("", "strict_required:v4:missing_target_pool_id")}, out_path)
+        return
+    if not _is_pool_id_64(target_pool):
+        save_chart_data_json(
+            {
+                "strict_target": _strict_unavailable_payload(
+                    target_pool,
+                    "strict_required:v4:target_pool_id_must_be_pool_id_64hex",
+                )
+            },
+            out_path,
+        )
         return
 
     chains = _include_chains()
