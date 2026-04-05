@@ -18200,6 +18200,43 @@ def _merge_for_web(
                     data_quality_reason=f"Exact active now ({src_lbl})",
                     status=status,
                 )
+            if ex_sanity_fees:
+                ex_sanity_income = float(ex_sanity_fees[-1][1]) if ex_sanity_fees else 0.0
+                ex_sanity_apy = (ex_sanity_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+                _append_compare_row(
+                    pool_id=base_pool_id,
+                    chain=base_chain,
+                    version=base_version,
+                    base_pair=base_pair,
+                    branch="exact sanity",
+                    anchor_type="Full",
+                    fee_pct=base_fee_pct,
+                    income=ex_sanity_income,
+                    apy=ex_sanity_apy,
+                    last_tvl=exact_last_tvl,
+                    data_quality=("exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"),
+                    data_quality_reason=f"Exact full sanity-check (volumeUSD*fee; {src_lbl})",
+                    status=status,
+                )
+            if ex_active_sanity_fees and ex_active_tvl:
+                ex_act_sanity_income = float(ex_active_sanity_fees[-1][1]) if ex_active_sanity_fees else 0.0
+                ex_act_sanity_apy = (ex_act_sanity_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+                ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
+                _append_compare_row(
+                    pool_id=base_pool_id,
+                    chain=base_chain,
+                    version=base_version,
+                    base_pair=base_pair,
+                    branch="exact sanity",
+                    anchor_type="Active",
+                    fee_pct=base_fee_pct,
+                    income=ex_act_sanity_income,
+                    apy=ex_act_sanity_apy,
+                    last_tvl=ex_act_last_tvl,
+                    data_quality=("exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"),
+                    data_quality_reason=f"Exact active sanity-check (volumeUSD*fee; {src_lbl})",
+                    status=status,
+                )
         else:
             row = {
                 "pool_id": base_pool_id,
@@ -33099,10 +33136,37 @@ HTML_PAGE = """
     }
 
     function togglePoolVisibility(el) {
+      const rowKey = String(el?.dataset?.rowKey || "").trim();
       const poolId = el?.dataset?.poolId;
-      if (!poolId) return;
-      visibilityMap[poolId] = !!el.checked;
+      if (rowKey) {
+        visibilityMap[rowKey] = !!el.checked;
+      } else if (poolId) {
+        visibilityMap[makeVisibilityKey(poolId, "all", "all")] = !!el.checked;
+      } else {
+        return;
+      }
       redrawCharts();
+    }
+
+    function rowBranchFromLabel(pairLabel) {
+      const p = String(pairLabel || "").toLowerCase();
+      if (p.includes("(exact sanity)")) return "exact_sanity";
+      if (p.includes("(estimated)")) return "estimated";
+      if (p.includes("(exact)")) return "exact";
+      return "all";
+    }
+
+    function makeVisibilityKey(poolId, branch, anchorType) {
+      const pid = String(poolId || "");
+      const b = String(branch || "all").toLowerCase();
+      const a = String(anchorType || "all").toLowerCase();
+      return `${pid}::${b}::${a}`;
+    }
+
+    function rowVisibilityKey(r) {
+      const branch = rowBranchFromLabel(r?.pair || "");
+      const anchor = String(r?.anchor_type || "").trim().toLowerCase() || "all";
+      return makeVisibilityKey(r?.pool_id || "", branch, anchor);
     }
 
     function redrawCharts() {
@@ -33117,7 +33181,14 @@ HTML_PAGE = """
       for (let i = 0; i < pools.length; i++) {
         const poolId = pools[i];
         const s = seriesByPool[poolId];
-        if (!visibilityMap[poolId]) continue;
+        const showAll = !!visibilityMap[makeVisibilityKey(poolId, "all", "all")];
+        const showEstFull = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "full")];
+        const showEstActive = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "active")];
+        const showExFull = !!visibilityMap[makeVisibilityKey(poolId, "exact", "full")];
+        const showExActive = !!visibilityMap[makeVisibilityKey(poolId, "exact", "active")];
+        const showExSanityFull = !!visibilityMap[makeVisibilityKey(poolId, "exact_sanity", "full")];
+        const showExSanityActive = !!visibilityMap[makeVisibilityKey(poolId, "exact_sanity", "active")];
+        if (!(showAll || showEstFull || showEstActive || showExFull || showExActive || showExSanityFull || showExSanityActive)) continue;
         const estFees = Array.isArray(s.strict_compare_estimated_fees) ? s.strict_compare_estimated_fees : [];
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
         const estActiveFees = Array.isArray(s.strict_compare_estimated_active_fees) ? s.strict_compare_estimated_active_fees : [];
@@ -33182,6 +33253,18 @@ HTML_PAGE = """
             out[i] = lastValid;
           }
           return out;
+        };
+        const isSparseFlatTvl = (arr) => {
+          const vals = (Array.isArray(arr) ? arr : [])
+            .map((v) => Number(v))
+            .filter((v) => Number.isFinite(v) && v > 0);
+          if (!vals.length) return true;
+          if (vals.length <= 2) {
+            const lo = Math.min(...vals);
+            const hi = Math.max(...vals);
+            return Math.abs(hi - lo) <= Math.max(1e-9, Math.abs(hi) * 1e-6);
+          }
+          return false;
         };
         if (useStrictCompare) {
           const estFeesSrc = estFees.length ? estFees : (Array.isArray(s.fees) ? s.fees : []);
@@ -33258,21 +33341,21 @@ HTML_PAGE = """
           const COLOR_ACTIVE_EST = "#15803d";    // darker green (estimated active)
           const COLOR_FULL_SANITY = "#2563eb";   // blue (sanity)
           const COLOR_ACTIVE_SANITY = "#15803d"; // green (sanity)
-          if (estFeeX.length) {
+          if (showEstFull && estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated full)`, customdata: estHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
               line: {color: COLOR_FULL_EST, width: 3.0, dash: "dot"}
             });
           }
-          if (estActFeeX.length) {
+          if (showEstActive && estActFeeX.length) {
             feeTraces.push({
               x: estActFeeX, y: estActFeeY, mode: "lines", name: `${s.label} (estimated active)`, customdata: estActHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
               line: {color: COLOR_ACTIVE_EST, width: 2.4, dash: "dash"}
             });
           }
-          if (exFeeX.length) {
+          if (showExFull && exFeeX.length) {
             feeTraces.push({
               x: exFeeX, y: exFeeYExact, mode: "lines+markers", name: `${s.label} (exact full)`, customdata: exHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
@@ -33280,7 +33363,7 @@ HTML_PAGE = """
               marker: {size: 5, color: COLOR_FULL}
             });
           }
-          if (exActFeeX.length) {
+          if (showExActive && exActFeeX.length) {
             feeTraces.push({
               x: exActFeeX, y: exActFeeYExact, mode: "lines+markers", name: `${s.label} (exact active)`, customdata: exActHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
@@ -33288,7 +33371,7 @@ HTML_PAGE = """
               marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
             });
           }
-          if (exSanityFeeX.length) {
+          if (showExSanityFull && exSanityFeeX.length) {
             feeTraces.push({
               x: exSanityFeeX, y: exSanityFeeY, mode: "lines+markers", name: `${s.label} (exact full sanity-check)`, customdata: exSanityHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
@@ -33296,7 +33379,7 @@ HTML_PAGE = """
               marker: {size: 5, color: COLOR_FULL_SANITY, symbol: "circle-open"}
             });
           }
-          if (exActSanityFeeX.length) {
+          if (showExSanityActive && exActSanityFeeX.length) {
             feeTraces.push({
               x: exActSanityFeeX, y: exActSanityFeeY, mode: "lines+markers", name: `${s.label} (exact active sanity-check)`, customdata: exActSanityHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
@@ -33310,8 +33393,8 @@ HTML_PAGE = """
           const exActHoverTvl = exActX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
           const exSanityHoverTvl = exSanityTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact full sanity"]);
           const exActSanityHoverTvl = exActSanityTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active sanity"]);
-          if (estTvlX.length) {
-            const estSingle = estTvlX.length === 1;
+          if (showEstFull && estTvlX.length) {
+            const estSingle = estTvlX.length === 1 || isSparseFlatTvl(estTvlY);
             tvlTraces.push({
               x: estTvlX, y: estTvlY, mode: (estSingle ? "markers" : "lines"), name: `${s.label} (estimated full)`, customdata: estHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
@@ -33319,8 +33402,8 @@ HTML_PAGE = """
               ...(estSingle ? {marker: {size: 8, color: COLOR_FULL_EST, symbol: "circle"}} : {})
             });
           }
-          if (estActTvlX.length) {
-            const estActSingle = estActTvlX.length === 1;
+          if (showEstActive && estActTvlX.length) {
+            const estActSingle = estActTvlX.length === 1 || isSparseFlatTvl(estActTvlY);
             tvlTraces.push({
               x: estActTvlX, y: estActTvlY, mode: (estActSingle ? "markers" : "lines"), name: `${s.label} (estimated active)`, customdata: estActHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
@@ -33328,44 +33411,34 @@ HTML_PAGE = """
               ...(estActSingle ? {marker: {size: 8, color: COLOR_ACTIVE_EST, symbol: "square"}} : {})
             });
           }
-          if (exTvlX.length) {
+          if (showExFull && exTvlX.length) {
+            const exFlat = isSparseFlatTvl(exTvlYExact);
             tvlTraces.push({
-              x: exTvlX, y: exTvlYExact, mode: "lines+markers", name: `${s.label} (exact full)`, customdata: exHoverTvl,
+              x: exTvlX, y: exTvlYExact, mode: (exFlat ? "markers" : "lines+markers"), name: `${s.label} (exact full)`, customdata: exHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: COLOR_FULL, width: 1.8, dash: "solid"},
               marker: {size: 5, color: COLOR_FULL}
             });
           }
-          if (exActX.length) {
+          if (showExActive && exActX.length) {
+            const exActFlat = isSparseFlatTvl(exActY);
             tvlTraces.push({
-              x: exActX, y: exActY, mode: "lines+markers", name: `${s.label} (exact active)`, customdata: exActHoverTvl,
+              x: exActX, y: exActY, mode: (exActFlat ? "markers" : "lines+markers"), name: `${s.label} (exact active)`, customdata: exActHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: COLOR_ACTIVE, width: 1.8, dash: "solid"},
               marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
             });
           }
-          if (exSanityTvlX.length) {
-            tvlTraces.push({
-              x: exSanityTvlX, y: exSanityTvlY, mode: "lines+markers", name: `${s.label} (exact full sanity-check)`, customdata: exSanityHoverTvl,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: COLOR_FULL_SANITY, width: 1.6, dash: "dashdot"},
-              marker: {size: 5, color: COLOR_FULL_SANITY, symbol: "circle-open"}
-            });
-          }
-          if (exActSanityTvlX.length) {
-            tvlTraces.push({
-              x: exActSanityTvlX, y: exActSanityTvlY, mode: "lines+markers", name: `${s.label} (exact active sanity-check)`, customdata: exActSanityHoverTvl,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: COLOR_ACTIVE_SANITY, width: 1.6, dash: "dashdot"},
-              marker: {size: 6, color: COLOR_ACTIVE_SANITY, symbol: "diamond-open"}
-            });
-          }
+          // TVL sanity traces are intentionally not drawn:
+          // they use the same full/active anchors as exact TVL and visually overlap.
+          // Keep sanity-check comparison on the Fees chart where sources differ.
         } else {
           const feeX = (s.fees || []).map(p => new Date(p[0] * 1000));
           const feeY = (s.fees || []).map(p => p[1]);
           const tvlX = (s.tvl || []).map(p => new Date(p[0] * 1000));
           const tvlY = (s.tvl || []).map(p => p[1] / 1000.0);
           const hoverData = feeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || ""]);
+          if (!showAll) continue;
           feeTraces.push({
             x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
             hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
@@ -33521,6 +33594,8 @@ HTML_PAGE = """
         const isEstActive = pairLbl.includes("(estimated)") && anchorType === "active";
         const isExFull = pairLbl.includes("(exact)") && anchorType === "full";
         const isExActive = pairLbl.includes("(exact)") && anchorType === "active";
+        const isExSanityFull = pairLbl.includes("(exact sanity)") && anchorType === "full";
+        const isExSanityActive = pairLbl.includes("(exact sanity)") && anchorType === "active";
         let color = colorMap[r.pool_id] || "#94a3b8";
         let dash = dashMap[r.pool_id] || "solid";
         let swatchWidth = 3.0;
@@ -33540,16 +33615,25 @@ HTML_PAGE = """
           color = "#166534";
           dash = "solid";
           swatchWidth = 1.8;
+        } else if (isExSanityFull) {
+          color = "#2563eb";
+          dash = "dashdot";
+          swatchWidth = 1.6;
+        } else if (isExSanityActive) {
+          color = "#15803d";
+          dash = "dashdot";
+          swatchWidth = 1.6;
         }
         const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
-        const visible = !!visibilityMap[r.pool_id];
+        const rowKey = rowVisibilityKey(r);
+        const visible = !!visibilityMap[rowKey];
         const hasSeries = !!seriesByPool[r.pool_id];
         const disabled = hasSeries ? "" : "disabled";
         const poolIdDisplay = shortStartEnd4(r.pool_id || "");
         const poolIdRaw = String(r.pool_id || "");
         html += `<tr class="${cls}">`;
         html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};border-top-width:${swatchWidth}px;"></span></td>`;
-        html += `<td><input type="checkbox" data-pool-id="${r.pool_id}" ${visible ? "checked" : ""} ${disabled} onchange="togglePoolVisibility(this)"/></td>`;
+        html += `<td><input type="checkbox" data-pool-id="${r.pool_id}" data-row-key="${escAttr(rowKey)}" ${visible ? "checked" : ""} ${disabled} onchange="togglePoolVisibility(this)"/></td>`;
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
         html += `<td>${r.pair}</td>`;
@@ -33599,7 +33683,7 @@ HTML_PAGE = """
         const vals = headers.map(h => {
           let rawVal;
           if (h === "visibility") {
-            rawVal = !!visibilityMap[r.pool_id];
+            rawVal = !!visibilityMap[rowVisibilityKey(r)];
           } else if (h === "anchor_type") {
             rawVal = String(r.anchor_type || "");
           } else if (h === "status_code") {
@@ -34010,7 +34094,12 @@ HTML_PAGE = """
         colorMap[s.pool_id] = c;
         dashMap[s.pool_id] = d;
         seriesByPool[s.pool_id] = s;
-        visibilityMap[s.pool_id] = (s.status === "ok");
+        const allKey = makeVisibilityKey(s.pool_id, "all", "all");
+        if (visibilityMap[allKey] === undefined) visibilityMap[allKey] = (s.status === "ok");
+      }
+      for (const r of (result.rows || [])) {
+        const key = rowVisibilityKey(r);
+        if (visibilityMap[key] === undefined) visibilityMap[key] = (r.status === "ok");
       }
 
       const daysForApy = Number(result?.request?.days || getDaysValue());
