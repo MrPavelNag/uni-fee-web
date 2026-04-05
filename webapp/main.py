@@ -17960,6 +17960,28 @@ def _merge_for_web(
         if last_ts < int(end_ts):
             out.append((int(end_ts), float(last_val)))
         return out
+
+    def _short_source_label(src_raw: str) -> str:
+        s = str(src_raw or "").strip().lower()
+        if not s:
+            return "unknown source"
+        onchain = "on-chain"
+        if "state_view" in s:
+            onchain = "StateView"
+        elif "pool_manager" in s:
+            onchain = "PoolManager"
+        elif "onchain_balance" in s or "full_pool" in s:
+            onchain = "on-chain balances"
+        price = "price feed"
+        if "coingecko+defillama" in s:
+            price = "CoinGecko/DefiLlama"
+        elif "coingecko" in s:
+            price = "CoinGecko"
+        elif "defillama" in s:
+            price = "DefiLlama"
+        elif "dexscreener" in s:
+            price = "Dexscreener"
+        return f"{onchain} + {price}"
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
@@ -17969,6 +17991,8 @@ def _merge_for_web(
         has_strict_compare = bool(
             (v.get("strict_compare_estimated_fees") or [])
             or (v.get("strict_compare_estimated_tvl") or [])
+            or (v.get("strict_compare_estimated_active_fees") or [])
+            or (v.get("strict_compare_estimated_active_tvl") or [])
             or (v.get("strict_compare_exact_fees") or [])
             or (v.get("strict_compare_exact_tvl") or [])
             or (v.get("strict_compare_exact_active_tvl") or [])
@@ -18012,6 +18036,8 @@ def _merge_for_web(
         if has_strict_compare:
             est_fees = v.get("strict_compare_estimated_fees") or []
             est_tvl = v.get("strict_compare_estimated_tvl") or []
+            est_active_fees = v.get("strict_compare_estimated_active_fees") or []
+            est_active_tvl = v.get("strict_compare_estimated_active_tvl") or []
             ex_fees = v.get("strict_compare_exact_fees") or []
             ex_tvl = v.get("strict_compare_exact_tvl") or []
             ex_active_tvl = v.get("strict_compare_exact_active_tvl") or []
@@ -18020,27 +18046,30 @@ def _merge_for_web(
             tvl_end_ts = max(
                 [0]
                 + [int(x[0]) for x in (est_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (est_active_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (ex_active_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
             )
             fees_end_ts = max(
                 [0]
                 + [int(x[0]) for x in (est_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+                + [int(x[0]) for x in (est_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
             )
             est_tvl = _align_series_end(est_tvl, tvl_end_ts)
+            est_active_tvl = _align_series_end(est_active_tvl, tvl_end_ts)
             ex_tvl = _align_series_end(ex_tvl, tvl_end_ts)
             ex_active_tvl = _align_series_end(ex_active_tvl, tvl_end_ts)
             est_fees = _align_series_end(est_fees, fees_end_ts)
+            est_active_fees = _align_series_end(est_active_fees, fees_end_ts)
             ex_fees = _align_series_end(ex_fees, fees_end_ts)
 
+            src_lbl = _short_source_label(str(v.get("tvl_price_source") or ""))
             est_income = float(est_fees[-1][1]) if est_fees else 0.0
             est_apy = (est_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
             est_last_tvl = _last_positive_value(est_tvl) if est_tvl else float(pool_tvl_now_usd)
             if est_last_tvl <= 0.0:
                 est_last_tvl = float(pool_tvl_now_usd)
-            est_reason = f"strict_compare:estimated:{str(v.get('tvl_price_source') or 'unknown')}"
-            if bool(v.get("strict_estimated_shape_missing", False)) or ("raw_pos=0" in str(exact2_reason or "")):
-                est_reason += ":shape_missing"
             rows.append(
                 {
                     "pool_id": base_pool_id,
@@ -18052,10 +18081,30 @@ def _merge_for_web(
                     "apy_pct": float(est_apy),
                     "last_tvl": est_last_tvl,
                     "data_quality": "estimated",
-                    "data_quality_reason": est_reason,
+                    "data_quality_reason": f"Estimate full-pool anchor ({src_lbl})",
                     "status": status,
                 }
             )
+
+            if est_active_tvl:
+                est_act_income = float(est_active_fees[-1][1]) if est_active_fees else 0.0
+                est_act_apy = (est_act_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+                est_act_last_tvl = _last_positive_value(est_active_tvl) if est_active_tvl else 0.0
+                rows.append(
+                    {
+                        "pool_id": base_pool_id,
+                        "chain": base_chain,
+                        "version": base_version,
+                        "pair": f"{base_pair} (estimated active-window)",
+                        "fee_pct": base_fee_pct,
+                        "final_income": est_act_income,
+                        "apy_pct": float(est_act_apy),
+                        "last_tvl": float(est_act_last_tvl),
+                        "data_quality": "estimated",
+                        "data_quality_reason": f"Estimate active-window anchor ({src_lbl})",
+                        "status": status,
+                    }
+                )
 
             exact_income = float(ex_fees[-1][1]) if ex_fees else 0.0
             exact_apy = (exact_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
@@ -18081,10 +18130,27 @@ def _merge_for_web(
                     "apy_pct": float(exact_apy),
                     "last_tvl": exact_last_tvl,
                     "data_quality": exact_quality,
-                    "data_quality_reason": exact2_reason,
+                    "data_quality_reason": f"Exact full-pool now ({src_lbl})",
                     "status": status,
                 }
             )
+            if ex_active_tvl:
+                ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
+                rows.append(
+                    {
+                        "pool_id": base_pool_id,
+                        "chain": base_chain,
+                        "version": base_version,
+                        "pair": f"{base_pair} (exact active-window)",
+                        "fee_pct": base_fee_pct,
+                        "final_income": 0.0,
+                        "apy_pct": 0.0,
+                        "last_tvl": float(ex_act_last_tvl),
+                        "data_quality": "exact_partial",
+                        "data_quality_reason": f"Exact active-window now ({src_lbl})",
+                        "status": status,
+                    }
+                )
         else:
             row = {
                 "pool_id": base_pool_id,
@@ -18114,6 +18180,8 @@ def _merge_for_web(
                     "tvl": tvl,
                     "strict_compare_estimated_fees": (est_fees if has_strict_compare else (v.get("strict_compare_estimated_fees") or [])),
                     "strict_compare_estimated_tvl": (est_tvl if has_strict_compare else (v.get("strict_compare_estimated_tvl") or [])),
+                    "strict_compare_estimated_active_fees": (est_active_fees if has_strict_compare else (v.get("strict_compare_estimated_active_fees") or [])),
+                    "strict_compare_estimated_active_tvl": (est_active_tvl if has_strict_compare else (v.get("strict_compare_estimated_active_tvl") or [])),
                     "strict_compare_exact_fees": (ex_fees if has_strict_compare else (v.get("strict_compare_exact_fees") or [])),
                     "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
                     "strict_compare_exact_active_tvl": (ex_active_tvl if has_strict_compare else (v.get("strict_compare_exact_active_tvl") or [])),
@@ -32874,15 +32942,19 @@ HTML_PAGE = """
         if (!visibilityMap[poolId]) continue;
         const estFees = Array.isArray(s.strict_compare_estimated_fees) ? s.strict_compare_estimated_fees : [];
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
+        const estActiveFees = Array.isArray(s.strict_compare_estimated_active_fees) ? s.strict_compare_estimated_active_fees : [];
+        const estActiveTvl = Array.isArray(s.strict_compare_estimated_active_tvl) ? s.strict_compare_estimated_active_tvl : [];
         const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
         const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
         const exActiveTvl = Array.isArray(s.strict_compare_exact_active_tvl) ? s.strict_compare_exact_active_tvl : [];
-        const useStrictCompare = strictMode && (estFees.length || estTvl.length || exFees.length || exTvl.length || exActiveTvl.length);
+        const useStrictCompare = strictMode && (estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length || exFees.length || exTvl.length || exActiveTvl.length);
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
           ...((s.tvl || []).map(p => Number(p[0] || 0))),
           ...(estFees.map(p => Number(p?.[0] || 0))),
           ...(estTvl.map(p => Number(p?.[0] || 0))),
+          ...(estActiveFees.map(p => Number(p?.[0] || 0))),
+          ...(estActiveTvl.map(p => Number(p?.[0] || 0))),
           ...(exFees.map(p => Number(p?.[0] || 0))),
           ...(exTvl.map(p => Number(p?.[0] || 0))),
           ...(exActiveTvl.map(p => Number(p?.[0] || 0))),
@@ -32909,9 +32981,13 @@ HTML_PAGE = """
         };
         if (useStrictCompare) {
           const estFeesSrc = estFees.length ? estFees : (Array.isArray(s.fees) ? s.fees : []);
+          const estFeesActSrc = estActiveFees.length ? estActiveFees : [];
           const estTvlSrc = estTvl.length ? estTvl : (Array.isArray(s.tvl) ? s.tvl : []);
+          const estTvlActSrc = estActiveTvl.length ? estActiveTvl : [];
           const estFeeX = estFeesSrc.map(p => new Date(p[0] * 1000));
           const estFeeY = estFeesSrc.map(p => p[1]);
+          const estActFeeX = estFeesActSrc.map(p => new Date(p[0] * 1000));
+          const estActFeeY = estFeesActSrc.map(p => p[1]);
           const exFeeX = exFees.map(p => new Date(p[0] * 1000));
           const exFeeYExact = exFees.map(p => {
             const v = Number(p?.[1] || 0);
@@ -32919,17 +32995,27 @@ HTML_PAGE = """
           });
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
+          const estActTvlX = estTvlActSrc.map(p => new Date(p[0] * 1000));
+          const estActTvlY = estTvlActSrc.map(p => p[1] / 1000.0);
           const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
           const exTvlYExact = sanitizeExactTvlK(exTvl, estTvlSrc, Number(s.pool_tvl_now_usd || 0));
           const exActX = exActiveTvl.map(p => new Date(p[0] * 1000));
-          const exActY = sanitizeExactTvlK(exActiveTvl, estTvlSrc, Number(s.pool_tvl_now_usd || 0));
+          const exActY = sanitizeExactTvlK(exActiveTvl, estTvlSrc.length ? estTvlSrc : estTvlActSrc, Number(s.pool_tvl_now_usd || 0));
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
+          const estActHover = estActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active-window"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           if (estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
               line: {color: "#64748b", width: 3.0, dash: "dot"}
+            });
+          }
+          if (estActFeeX.length) {
+            feeTraces.push({
+              x: estActFeeX, y: estActFeeY, mode: "lines", name: `${s.label} (estimated active-window)`, customdata: estActHover,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
+              line: {color: "#94a3b8", width: 2.4, dash: "dash"}
             });
           }
           if (exFeeX.length) {
@@ -32941,13 +33027,25 @@ HTML_PAGE = """
             });
           }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
+          const estActHoverTvl = estActTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active-window"]);
           const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           const exActHoverTvl = exActX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active-window"]);
           if (estTvlX.length) {
+            const estSingle = estTvlX.length === 1;
             tvlTraces.push({
-              x: estTvlX, y: estTvlY, mode: "lines", name: `${s.label} (estimated)`, customdata: estHoverTvl,
+              x: estTvlX, y: estTvlY, mode: (estSingle ? "markers" : "lines"), name: `${s.label} (estimated)`, customdata: estHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: "#64748b", width: 3.0, dash: "dot"}
+              line: {color: "#64748b", width: 3.0, dash: "dot"},
+              marker: (estSingle ? {size: 8, color: "#64748b", symbol: "circle"} : undefined)
+            });
+          }
+          if (estActTvlX.length) {
+            const estActSingle = estActTvlX.length === 1;
+            tvlTraces.push({
+              x: estActTvlX, y: estActTvlY, mode: (estActSingle ? "markers" : "lines"), name: `${s.label} (estimated active-window)`, customdata: estActHoverTvl,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
+              line: {color: "#94a3b8", width: 2.4, dash: "dash"},
+              marker: (estActSingle ? {size: 8, color: "#94a3b8", symbol: "square"} : undefined)
             });
           }
           if (exTvlX.length) {
@@ -33106,7 +33204,7 @@ HTML_PAGE = """
       const table = document.getElementById("resultTable");
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
-        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["data_quality", "Data quality"], ["data_quality_reason", "Quality reason"]
+        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["data_quality_reason", "Quality reason"]
       ];
 
       let html = "<tr>";
@@ -33145,12 +33243,8 @@ HTML_PAGE = """
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
-        const dqRaw = String(r.data_quality || "estimated");
-        const dq = (String(r.status || "ok") === "ok") ? dqRaw : "нет данных";
         const dqReason = String(r.data_quality_reason || "");
-        const dqReasonShort = formatQualityReasonShort(dqReason, dq);
-        const dqTitle = (dqReason || dqRaw) ? ` title="${escAttr(dqReason || dqRaw)}"` : "";
-        html += `<td${dqTitle}>${escAttr(dq)}</td>`;
+        const dqReasonShort = formatQualityReasonShort(dqReason, String(r.data_quality || ""));
         html += `<td style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(dqReason || "-")}">${escAttr(dqReasonShort || "-")}</td>`;
         html += "</tr>";
       }
@@ -33182,7 +33276,7 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "data_quality", "data_quality_reason"];
+      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "data_quality_reason"];
       const lines = [headers.join(",")];
       for (const r of rows) {
         const vals = headers.map(h => {

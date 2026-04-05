@@ -318,6 +318,8 @@ def save_chart_data_json(pool_chart_data: dict[str, dict], path: str) -> None:
             "strict_debug": v.get("strict_debug") or {},
             "strict_compare_estimated_tvl": v.get("strict_compare_estimated_tvl") or [],
             "strict_compare_estimated_fees": v.get("strict_compare_estimated_fees") or [],
+            "strict_compare_estimated_active_tvl": v.get("strict_compare_estimated_active_tvl") or [],
+            "strict_compare_estimated_active_fees": v.get("strict_compare_estimated_active_fees") or [],
             "strict_compare_exact_tvl": v.get("strict_compare_exact_tvl") or [],
             "strict_compare_exact_active_tvl": v.get("strict_compare_exact_active_tvl") or [],
             "strict_compare_exact_fees": v.get("strict_compare_exact_fees") or [],

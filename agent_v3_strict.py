@@ -375,6 +375,8 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "") -> d
         "data_quality_reason": str(reason or "strict_required:unknown"),
         "strict_compare_estimated_tvl": [],
         "strict_compare_estimated_fees": [],
+        "strict_compare_estimated_active_tvl": [],
+        "strict_compare_estimated_active_fees": [],
         "strict_compare_exact_tvl": [],
         "strict_compare_exact_active_tvl": [],
         "strict_compare_exact_fees": [],
@@ -1759,6 +1761,14 @@ def main() -> None:
     estimated_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_tvl_base)
     estimated_tvl = _append_now_tvl_anchor(estimated_tvl_base, float(pool_tvl_now_usd))
     estimated_fees = _append_now_fee_anchor(estimated_fees_base)
+    tvl_active_now = float((tvl_now_debug or {}).get("tvl_active_window_usd") or 0.0)
+    estimated_active_tvl: list[tuple[int, float]] = []
+    estimated_active_fees: list[tuple[int, float]] = []
+    if tvl_active_now > 0.0:
+        estimated_active_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
+        estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl_base)
+        estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
+        estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
@@ -2015,6 +2025,8 @@ def main() -> None:
         "strict_debug": {"v3_tvl_now": (tvl_now_debug or {})},
         "strict_compare_estimated_tvl": estimated_tvl,
         "strict_compare_estimated_fees": estimated_fees,
+        "strict_compare_estimated_active_tvl": estimated_active_tvl,
+        "strict_compare_estimated_active_fees": estimated_active_fees,
         "strict_compare_exact_tvl": strict_exact_tvl,
         "strict_compare_exact_active_tvl": (
             [

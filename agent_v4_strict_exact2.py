@@ -126,6 +126,8 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "", stri
         "strict_debug": dict(strict_debug or {}),
         "strict_compare_estimated_tvl": [],
         "strict_compare_estimated_fees": [],
+        "strict_compare_estimated_active_tvl": [],
+        "strict_compare_estimated_active_fees": [],
         "strict_compare_exact_tvl": [],
         "strict_compare_exact_fees": [],
     }
@@ -833,12 +835,20 @@ def main() -> None:
 
     estimated_tvl: list[tuple[int, float]] = []
     estimated_fees: list[tuple[int, float]] = []
+    estimated_active_tvl: list[tuple[int, float]] = []
+    estimated_active_fees: list[tuple[int, float]] = []
+    tvl_active_now = float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0)
     if raw_tvl_positive_days > 0:
         estimated_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
         estimated_fees = _rebuild_fees_cumulative(fees_usd, estimated_tvl)
+        if tvl_active_now > 0.0:
+            estimated_active_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
+            estimated_active_fees = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl)
     else:
         # No historical day-shape: still expose a single estimate marker at TVL NOW.
         estimated_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
+        if tvl_active_now > 0.0:
+            estimated_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
     exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
     exact_active_tvl = _one_point_marker_tvl(fees_usd, float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0))
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
@@ -866,6 +876,8 @@ def main() -> None:
         "strict_debug": strict_dbg,
         "strict_compare_estimated_tvl": estimated_tvl,
         "strict_compare_estimated_fees": estimated_fees,
+        "strict_compare_estimated_active_tvl": estimated_active_tvl,
+        "strict_compare_estimated_active_fees": estimated_active_fees,
         "strict_compare_exact_tvl": exact_tvl,
         "strict_compare_exact_active_tvl": exact_active_tvl,
         "strict_compare_exact_fees": [],
