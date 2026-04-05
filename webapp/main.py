@@ -18653,6 +18653,53 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
         return str(payload)
 
 
+def _strict_detect_target_versions(target_pool_id: str, include_chains: list[str]) -> list[str]:
+    pid = str(target_pool_id or "").strip().lower()
+    if not pid:
+        return []
+    chains = [c for c in (include_chains or []) if c in (set(UNISWAP_V3_SUBGRAPHS) | set(UNISWAP_V4_SUBGRAPHS))]
+    if not chains:
+        chains = sorted(set(UNISWAP_V3_SUBGRAPHS.keys()) | set(UNISWAP_V4_SUBGRAPHS.keys()))
+    is_addr40 = bool(pid.startswith("0x") and len(pid) == 42)
+    is_id64 = bool(pid.startswith("0x") and len(pid) == 66)
+    q = """
+    query PoolById($id: String!) {
+      pool(id: $id) { id }
+    }
+    """
+    found_v3 = False
+    found_v4 = False
+    for chain in chains:
+        if (not found_v3) and is_addr40 and chain in UNISWAP_V3_SUBGRAPHS:
+            try:
+                ep3 = get_graph_endpoint(chain, version="v3")
+                if ep3:
+                    d3 = graphql_query(ep3, q, {"id": pid}, retries=1)
+                    p3 = ((d3 or {}).get("data") or {}).get("pool")
+                    if isinstance(p3, dict) and str(p3.get("id") or "").strip():
+                        found_v3 = True
+            except Exception:
+                pass
+        if (not found_v4) and (is_addr40 or is_id64) and chain in UNISWAP_V4_SUBGRAPHS:
+            try:
+                ep4 = get_graph_endpoint(chain, version="v4")
+                if ep4:
+                    d4 = graphql_query(ep4, q, {"id": pid}, retries=1)
+                    p4 = ((d4 or {}).get("data") or {}).get("pool")
+                    if isinstance(p4, dict) and str(p4.get("id") or "").strip():
+                        found_v4 = True
+            except Exception:
+                pass
+        if found_v3 and found_v4:
+            break
+    out: list[str] = []
+    if found_v3:
+        out.append("v3")
+    if found_v4:
+        out.append("v4")
+    return out
+
+
 def _run_result_cache_get(key: str) -> dict[str, Any] | None:
     now = time.time()
     with JOB_LOCK:
@@ -30275,6 +30322,15 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
             raise HTTPException(status_code=400, detail="strict exact mode requires target_pool_id")
         req.ignore_cache = True
         req.mode_fast_legacy = False
+        detected_versions = _strict_detect_target_versions(req.target_pool_id, req.include_chains)
+        if detected_versions:
+            req.include_versions = list(detected_versions)
+        else:
+            pid = str(req.target_pool_id or "").strip().lower()
+            if pid.startswith("0x") and len(pid) == 66:
+                req.include_versions = ["v4"]
+            elif pid.startswith("0x") and len(pid) == 42:
+                req.include_versions = ["v3", "v4"]
     else:
         req.target_pool_id = ""
     if (not req.mode_strict_exact) and (not req.mode_fast_legacy):
@@ -31044,6 +31100,44 @@ HTML_PAGE = """
       align-items: end;
       justify-content: start;
     }
+    .mode-filter-line {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 8px;
+      align-items: end;
+      margin-bottom: 8px;
+    }
+    .mode-filter-line:last-child { margin-bottom: 0; }
+    .mode-check {
+      display: flex;
+      align-items: center;
+      height: 34px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      background: #f8fbff;
+      padding: 0 10px;
+      white-space: nowrap;
+    }
+    .mode-check label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #334155;
+      margin: 0;
+    }
+    .mode-check input[type="checkbox"] {
+      margin: 0;
+      transform: translateY(-1px);
+      accent-color: #2563eb;
+    }
+    .estimated-grid {
+      grid-template-columns: repeat(5, minmax(90px, 1fr));
+    }
+    .exact-grid {
+      grid-template-columns: 140px minmax(360px, 1fr);
+    }
     .inline-grid .filter-item input,
     .inline-grid .filter-item select {
       width: 100%;
@@ -31107,11 +31201,15 @@ HTML_PAGE = """
     }
     @media (max-width: 1500px) {
       .inline-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .estimated-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .exact-grid { grid-template-columns: 120px minmax(0, 1fr); }
     }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
       .row label { padding-top: 0; }
       .inline-grid { grid-template-columns: 1fr 1fr; }
+      .mode-filter-line { grid-template-columns: 1fr; }
+      .estimated-grid, .exact-grid { grid-template-columns: 1fr; }
       .summary-strip { gap: 6px; }
       .summary-box { min-width: 150px; }
       .search-link-btn { font-size: 15px; }
@@ -31319,40 +31417,49 @@ HTML_PAGE = """
           <div class="row" id="runFiltersRow">
             <label>Filters</label>
             <div>
-              <div class="inline-grid">
-                <div class="filter-item" id="filterMinTvlItem">
-                  <div class="hint">Min TVL<br/>(USD)</div>
-                  <input id="minTvl" value="1000" type="number" min="0" max="10000000" step="1"/>
+              <div class="mode-filter-line" id="estimatedModeLine">
+                <div class="mode-check mode-item">
+                  <label><input id="modeFastLegacy" type="checkbox" checked onchange="syncRunModes('fast')"/> Estimated</label>
                 </div>
-                <div class="filter-item" id="filterDaysItem">
-                  <div class="hint">History<br/>days</div>
-                  <input id="days" value="30" type="number" min="1" max="3650" step="1"/>
-                </div>
-                <div class="filter-item" id="filterFeeRangeItem">
-                  <div class="hint">Exclude fee range<br/>X% (min-max)</div>
-                  <input id="feeRangePct" value="0-2" type="text" placeholder="0-2 or 0/2"/>
-                </div>
-                <div class="filter-item" id="filterMinApyItem">
-                  <div class="hint">Min APY<br/>%</div>
-                  <input id="minApyPct" value="0" type="number" step="0.1" min="0" max="100000"/>
-                </div>
-                <div class="filter-item proto-item" id="filterProtocolItem">
-                  <div class="hint">Protocol<br/>version</div>
-                  <div class="proto-checks">
-                    <label><input id="protoV3" type="checkbox" checked onchange="updateChainsNote()"/> V3</label>
-                    <label><input id="protoV4" type="checkbox" checked onchange="updateChainsNote()"/> V4</label>
+                <div class="inline-grid estimated-grid">
+                  <div class="filter-item" id="filterMinTvlItem">
+                    <div class="hint">Min TVL<br/>(USD)</div>
+                    <input id="minTvl" value="1000" type="number" min="0" max="10000000" step="1"/>
+                  </div>
+                  <div class="filter-item" id="filterDaysEstimatedItem">
+                    <div class="hint">History<br/>days</div>
+                    <input id="daysEstimated" value="30" type="number" min="1" max="3650" step="1" oninput="syncDaysFromEstimated()"/>
+                  </div>
+                  <div class="filter-item" id="filterFeeRangeItem">
+                    <div class="hint">Exclude fee range<br/>X% (min-max)</div>
+                    <input id="feeRangePct" value="0-2" type="text" placeholder="0-2 or 0/2"/>
+                  </div>
+                  <div class="filter-item" id="filterMinApyItem">
+                    <div class="hint">Min APY<br/>%</div>
+                    <input id="minApyPct" value="0" type="number" step="0.1" min="0" max="100000"/>
+                  </div>
+                  <div class="filter-item proto-item" id="filterProtocolItem">
+                    <div class="hint">Protocol<br/>version</div>
+                    <div class="proto-checks">
+                      <label><input id="protoV3" type="checkbox" checked onchange="updateChainsNote()"/> V3</label>
+                      <label><input id="protoV4" type="checkbox" checked onchange="updateChainsNote()"/> V4</label>
+                    </div>
                   </div>
                 </div>
-                <div class="filter-item mode-item">
-                  <div class="hint">Calculation<br/>mode</div>
-                  <div class="proto-checks">
-                    <label><input id="modeFastLegacy" type="checkbox" checked onchange="syncRunModes('fast')"/> Estimated</label>
-                    <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Exact</label>
-                  </div>
+              </div>
+              <div class="mode-filter-line" id="exactModeLine">
+                <div class="mode-check mode-item">
+                  <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Exact</label>
                 </div>
-                <div class="filter-item contract-item" id="filterContractItem">
-                  <div class="hint">Contract address</div>
-                  <input id="targetPoolId" type="text" placeholder="0x1234...abcd (optional)" onfocus="expandTargetPoolInput()" onblur="shrinkTargetPoolInput()"/>
+                <div class="inline-grid exact-grid">
+                  <div class="filter-item" id="filterDaysItem">
+                    <div class="hint">History<br/>days</div>
+                    <input id="days" value="30" type="number" min="1" max="3650" step="1" oninput="syncDaysFromExact()"/>
+                  </div>
+                  <div class="filter-item contract-item" id="filterContractItem">
+                    <div class="hint">Contract address</div>
+                    <input id="targetPoolId" type="text" placeholder="0x... (40 hex address or 64 hex pool id)"/>
+                  </div>
                 </div>
               </div>
             </div>
@@ -31431,7 +31538,7 @@ HTML_PAGE = """
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
     const FIELD_IDS = [
       "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
-      "minTvl", "days", "feeRangePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache",
+      "minTvl", "daysEstimated", "days", "feeRangePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache",
       "modeFastLegacy", "modeStrictExact", "targetPoolId"
     ];
     let availableChains = [];
@@ -31481,7 +31588,24 @@ HTML_PAGE = """
     }
 
     function setDays(v) {
-      document.getElementById("days").value = v;
+      const exactEl = document.getElementById("days");
+      const estEl = document.getElementById("daysEstimated");
+      if (exactEl) exactEl.value = v;
+      if (estEl) estEl.value = v;
+      saveFormState();
+    }
+
+    function syncDaysFromEstimated() {
+      const src = document.getElementById("daysEstimated");
+      const dst = document.getElementById("days");
+      if (src && dst) dst.value = src.value;
+      saveFormState();
+    }
+
+    function syncDaysFromExact() {
+      const src = document.getElementById("days");
+      const dst = document.getElementById("daysEstimated");
+      if (src && dst) dst.value = src.value;
       saveFormState();
     }
 
@@ -31494,12 +31618,17 @@ HTML_PAGE = """
 
     function applyRunModeUiState() {
       const strict = !!document.getElementById("modeStrictExact")?.checked;
+      const fast = !!document.getElementById("modeFastLegacy")?.checked;
       const pairsRow = document.getElementById("runPairsRow");
       const chainsRow = document.getElementById("runChainsRow");
       const filtersRow = document.getElementById("runFiltersRow");
+      const estimatedLine = document.getElementById("estimatedModeLine");
+      const exactLine = document.getElementById("exactModeLine");
       if (pairsRow) pairsRow.classList.toggle("mode-disabled", strict);
       if (chainsRow) chainsRow.classList.remove("mode-disabled");
       if (filtersRow) filtersRow.classList.remove("mode-disabled");
+      if (estimatedLine) estimatedLine.classList.toggle("mode-disabled", !fast);
+      if (exactLine) exactLine.classList.toggle("mode-disabled", !strict);
 
       const pairIds = ["stableBucketMode", "stableBucketManual", "tokenBucketMode", "tokenBucketManual"];
       for (const id of pairIds) {
@@ -31518,14 +31647,16 @@ HTML_PAGE = """
       chainInputs.forEach((el) => { el.disabled = false; });
 
       setDisabledWithDim(document.getElementById("minTvl"), strict);
+      setDisabledWithDim(document.getElementById("daysEstimated"), strict);
       setDisabledWithDim(document.getElementById("feeRangePct"), strict);
       setDisabledWithDim(document.getElementById("minApyPct"), strict);
+      setDisabledWithDim(document.getElementById("days"), !strict);
       const protoV3 = document.getElementById("protoV3");
       const protoV4 = document.getElementById("protoV4");
-      if (protoV3) protoV3.disabled = false;
-      if (protoV4) protoV4.disabled = false;
+      if (protoV3) protoV3.disabled = strict;
+      if (protoV4) protoV4.disabled = strict;
       const protoItem = document.getElementById("filterProtocolItem");
-      if (protoItem) protoItem.classList.remove("mode-disabled");
+      if (protoItem) protoItem.classList.toggle("mode-disabled", strict);
 
       // Contract field is used only in Exact mode.
       setDisabledWithDim(document.getElementById("targetPoolId"), !strict);
@@ -31595,7 +31726,7 @@ HTML_PAGE = """
         el.value = "";
         return;
       }
-      el.value = shortAddress4x4(targetPoolFullValue);
+      el.value = targetPoolFullValue;
     }
 
     function getTargetPoolAddressForSubmit() {
@@ -31603,43 +31734,16 @@ HTML_PAGE = """
       if (!strictEnabled) return "";
       const el = document.getElementById("targetPoolId");
       const current = normalizeTargetPoolAddress(el?.value || "");
-      if (isHexPoolAddress(current)) {
-        targetPoolFullValue = current;
-      }
-      return normalizeTargetPoolAddress(targetPoolFullValue);
+      if (isHexPoolAddress(current)) return current;
+      return "";
     }
 
     function expandTargetPoolInput() {
-      const el = document.getElementById("targetPoolId");
-      if (!el) return;
-      const full = normalizeTargetPoolAddress(targetPoolFullValue);
-      if (full) {
-        el.value = full;
-        return;
-      }
-      const current = normalizeTargetPoolAddress(el.value || "");
-      if (isHexPoolAddress(current)) {
-        targetPoolFullValue = current;
-        el.value = current;
-      }
+      return;
     }
 
     function shrinkTargetPoolInput() {
-      const el = document.getElementById("targetPoolId");
-      if (!el) return;
-      const typed = normalizeTargetPoolAddress(el.value || "");
-      if (!typed) {
-        targetPoolFullValue = "";
-        el.value = "";
-        saveFormState();
-        return;
-      }
-      if (isHexPoolAddress(typed)) {
-        targetPoolFullValue = typed;
-      }
-      const full = normalizeTargetPoolAddress(targetPoolFullValue);
-      el.value = full ? shortAddress4x4(full) : typed;
-      saveFormState();
+      return;
     }
 
     function normalizePairToken(v) {
@@ -32231,6 +32335,13 @@ HTML_PAGE = """
             const box = document.getElementById("chain_" + c);
             if (box) box.checked = true;
           }
+        }
+        // Keep dual days inputs synchronized.
+        const dExact = document.getElementById("days");
+        const dEst = document.getElementById("daysEstimated");
+        if (dExact && dEst) {
+          if (String(dExact.value || "").trim()) dEst.value = dExact.value;
+          else if (String(dEst.value || "").trim()) dExact.value = dEst.value;
         }
         syncRunModes("");
         updatePairBuilderUi();
@@ -33190,15 +33301,14 @@ HTML_PAGE = """
           payload.target_pool_id = "";
         }
         if (payload.mode_strict_exact) {
-          payload.include_versions = ["v3"];
           payload.ignore_cache = true;
           if (!payload.target_pool_id) {
             setStatus("Strict exact requires a contract address.", "fail");
             return;
           }
         }
-        if (payload.target_pool_id && !/^0x[a-f0-9]{40}$/.test(payload.target_pool_id)) {
-          setStatus("Contract address must be a valid 0x address.", "fail");
+        if (payload.target_pool_id && !/^0x([a-f0-9]{40}|[a-f0-9]{64})$/.test(payload.target_pool_id)) {
+          setStatus("Contract address must be a valid 0x address or pool id.", "fail");
           return;
         }
         if (!payload.include_versions.length) {
