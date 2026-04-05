@@ -19238,8 +19238,13 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     env_v4["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(v4_budget))
                     strict_timeout_target_v4 = int(max(75, int(v4_budget) + 75))
                     env_v4["AGENT_TIMEOUT_SEC"] = str(max(75, min(base_timeout, strict_timeout_target_v4, 300)))
-                    logs.append(f"[strict][v4] budget={int(v4_budget)}s timeout={env_v4['AGENT_TIMEOUT_SEC']}s")
-                    strict_agents.append(("agent_v4_strict_exact.py", env_v4, "v4"))
+                    v4_variant = str(os.environ.get("STRICT_V4_VARIANT", "exact2") or "exact2").strip().lower()
+                    v4_script = "agent_v4_strict_exact2.py" if v4_variant in {"exact2", "2", "v4_2", "v4_exact2"} else "agent_v4_strict_exact.py"
+                    logs.append(
+                        f"[strict][v4] variant={v4_variant} script={v4_script} "
+                        f"budget={int(v4_budget)}s timeout={env_v4['AGENT_TIMEOUT_SEC']}s"
+                    )
+                    strict_agents.append((v4_script, env_v4, "v4"))
 
                 strict_dbg_list: list[dict[str, Any]] = []
                 for idx_agent, (script_name, env_cur, tag) in enumerate(strict_agents, start=1):
