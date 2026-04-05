@@ -31333,12 +31333,14 @@ HTML_PAGE = """
       content: "";
       position: absolute;
       left: 0;
-      top: -4px;
-      bottom: -4px;
+      top: 50%;
+      transform: translateY(-50%);
+      height: 112px;
       width: 94px;
       border: 1px solid #d1dbe9;
       border-radius: 12px;
-      background: rgba(248, 251, 255, 0.55);
+      background: linear-gradient(180deg, rgba(248, 251, 255, 0.9) 0%, rgba(242, 247, 255, 0.9) 100%);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
       pointer-events: none;
     }
     .mode-filter-wrap .mode-filter-line {
@@ -31348,15 +31350,18 @@ HTML_PAGE = """
       grid-column: 1;
       position: relative;
       z-index: 1;
+      justify-self: stretch;
+      background: #f4f8ff;
+      border-color: #b9c9df;
     }
     .mode-filter-wrap .inline-grid {
       grid-column: 2;
     }
     #estimatedModeLine .mode-check {
-      transform: translateY(-4px);
+      transform: translateY(-6px);
     }
     #exactModeLine .mode-check {
-      transform: translateY(4px);
+      transform: translateY(6px);
     }
     .mode-check {
       display: flex;
@@ -31440,7 +31445,7 @@ HTML_PAGE = """
     }
     .contract-input-note {
       white-space: nowrap;
-      font-size: 11px;
+      font-size: 12px;
       color: #64748b;
       line-height: 1.2;
       margin: 0;
@@ -33156,6 +33161,22 @@ HTML_PAGE = """
             return vK;
           });
         };
+        const extendTrailingWithLastValid = (arr) => {
+          const out = Array.isArray(arr) ? arr.slice() : [];
+          if (!out.length) return out;
+          let lastValid = null;
+          for (let i = 0; i < out.length; i++) {
+            const v = Number(out[i]);
+            if (Number.isFinite(v) && v > 0) lastValid = v;
+          }
+          if (!(lastValid > 0)) return out;
+          for (let i = out.length - 1; i >= 0; i--) {
+            const v = Number(out[i]);
+            if (Number.isFinite(v) && v > 0) break;
+            out[i] = lastValid;
+          }
+          return out;
+        };
         if (useStrictCompare) {
           const estFeesSrc = estFees.length ? estFees : (Array.isArray(s.fees) ? s.fees : []);
           const estFeesActSrc = estActiveFees.length ? estActiveFees : [];
@@ -33180,7 +33201,9 @@ HTML_PAGE = """
           const estActTvlX = estTvlActSrc.map(p => new Date(p[0] * 1000));
           const estActTvlY = estTvlActSrc.map(p => p[1] / 1000.0);
           const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
-          const exTvlYExact = sanitizeExactTvlK(exTvl, estTvlSrc, Number(s.pool_tvl_now_usd || 0));
+          const exTvlYExact = extendTrailingWithLastValid(
+            sanitizeExactTvlK(exTvl, estTvlSrc, Number(s.pool_tvl_now_usd || 0))
+          );
           const exActX = exActiveTvl.map(p => new Date(p[0] * 1000));
           const exActY = sanitizeExactTvlK(exActiveTvl, estTvlSrc.length ? estTvlSrc : estTvlActSrc, Number(s.pool_tvl_now_usd || 0));
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
