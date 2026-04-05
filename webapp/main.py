@@ -18083,7 +18083,8 @@ def _merge_for_web(
                     "pool_id": base_pool_id,
                     "chain": base_chain,
                     "version": base_version,
-                        "pair": f"{base_pair} (estimated full)",
+                        "pair": f"{base_pair} (estimated)",
+                    "anchor_type": "Full",
                     "fee_pct": base_fee_pct,
                     "final_income": est_income,
                     "apy_pct": float(est_apy),
@@ -18103,7 +18104,8 @@ def _merge_for_web(
                         "pool_id": base_pool_id,
                         "chain": base_chain,
                         "version": base_version,
-                        "pair": f"{base_pair} (estimated active)",
+                        "pair": f"{base_pair} (estimated)",
+                        "anchor_type": "Active",
                         "fee_pct": base_fee_pct,
                         "final_income": est_act_income,
                         "apy_pct": float(est_act_apy),
@@ -18132,7 +18134,8 @@ def _merge_for_web(
                     "pool_id": base_pool_id,
                     "chain": base_chain,
                     "version": base_version,
-                    "pair": f"{base_pair} (exact full)",
+                    "pair": f"{base_pair} (exact)",
+                    "anchor_type": "Full",
                     "fee_pct": base_fee_pct,
                     "final_income": exact_income,
                     "apy_pct": float(exact_apy),
@@ -18151,7 +18154,8 @@ def _merge_for_web(
                         "pool_id": base_pool_id,
                         "chain": base_chain,
                         "version": base_version,
-                        "pair": f"{base_pair} (exact active)",
+                        "pair": f"{base_pair} (exact)",
+                        "anchor_type": "Active",
                         "fee_pct": base_fee_pct,
                         "final_income": ex_act_income,
                         "apy_pct": float(ex_act_apy),
@@ -18167,6 +18171,7 @@ def _merge_for_web(
                 "chain": base_chain,
                 "version": base_version,
                 "pair": base_pair,
+                "anchor_type": "",
                 "fee_pct": base_fee_pct,
                 "final_income": final_income,
                 "apy_pct": float(apy_pct),
@@ -31283,18 +31288,18 @@ HTML_PAGE = """
       display: grid;
       grid-template-columns: 94px 1fr;
       gap: 6px;
-      align-items: end;
+      align-items: stretch;
       margin-bottom: 6px;
     }
     .mode-filter-line:last-child { margin-bottom: 0; }
     .mode-check {
       display: flex;
       align-items: center;
-      height: 30px;
+      height: 34px;
       border: 1px solid #cbd5e1;
       border-radius: 8px;
       background: #f8fbff;
-      padding: 0 8px;
+      padding: 0 10px;
       white-space: nowrap;
     }
     .mode-check label {
@@ -31308,7 +31313,7 @@ HTML_PAGE = """
     }
     .mode-check input[type="checkbox"] {
       margin: 0;
-      transform: translateY(-1px);
+      transform: none;
       accent-color: #2563eb;
     }
     .estimated-grid {
@@ -31316,23 +31321,24 @@ HTML_PAGE = """
       gap: 4px;
     }
     .exact-grid {
-      grid-template-columns: 92px minmax(300px, 1fr);
+      grid-template-columns: 92px minmax(360px, 560px);
       gap: 4px;
     }
     .estimated-grid .filter-item .hint,
     .exact-grid .filter-item .hint {
-      min-height: 20px;
-      font-size: 10px;
-      margin-bottom: 2px !important;
-      line-height: 1.05;
+      min-height: 28px;
+      font-size: 11px;
+      margin-bottom: 4px !important;
+      line-height: 1.15;
+      white-space: nowrap;
     }
     .estimated-grid .filter-item input,
     .estimated-grid .filter-item select,
     .exact-grid .filter-item input,
     .exact-grid .filter-item select {
-      height: 30px;
-      padding: 4px 6px;
-      font-size: 12px;
+      height: 34px;
+      padding: 6px 7px;
+      font-size: 13px;
     }
     .inline-grid .filter-item input,
     .inline-grid .filter-item select {
@@ -31344,10 +31350,10 @@ HTML_PAGE = """
       font-size: 13px;
     }
     .filter-item .hint {
-      margin-bottom: 3px !important;
-      min-height: 24px;
+      margin-bottom: 4px !important;
+      min-height: 28px;
       display: flex;
-      align-items: flex-end;
+      align-items: flex-start;
       line-height: 1.15;
       white-space: normal;
       font-size: 11px;
@@ -31356,6 +31362,22 @@ HTML_PAGE = """
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       font-size: 12px;
       letter-spacing: 0.01em;
+    }
+    .filter-item.contract-item {
+      max-width: 560px;
+    }
+    .contract-input-row {
+      display: grid;
+      grid-template-columns: minmax(280px, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .contract-input-note {
+      white-space: nowrap;
+      font-size: 11px;
+      color: #64748b;
+      line-height: 1.2;
+      margin: 0;
     }
     .mode-disabled {
       opacity: 0.45;
@@ -31619,23 +31641,23 @@ HTML_PAGE = """
                 </div>
                 <div class="inline-grid estimated-grid">
                   <div class="filter-item" id="filterMinTvlItem">
-                    <div class="hint">Min TVL<br/>(USD)</div>
+                    <div class="hint">Min TVL (USD)</div>
                     <input id="minTvl" value="1000" type="number" min="0" max="10000000" step="1"/>
                   </div>
                   <div class="filter-item" id="filterDaysEstimatedItem">
-                    <div class="hint">History<br/>days</div>
+                    <div class="hint">History days</div>
                     <input id="daysEstimated" value="30" type="number" min="1" max="3650" step="1" oninput="syncDaysFromEstimated()"/>
                   </div>
                   <div class="filter-item" id="filterFeeRangeItem">
-                    <div class="hint">Exclude fee range<br/>X% (min-max)</div>
+                    <div class="hint">Fee range % (min-max)</div>
                     <input id="feeRangePct" value="0-2" type="text" placeholder="0-2 or 0/2"/>
                   </div>
                   <div class="filter-item" id="filterMinApyItem">
-                    <div class="hint">Min APY<br/>%</div>
+                    <div class="hint">Min APY %</div>
                     <input id="minApyPct" value="0" type="number" step="0.1" min="0" max="100000"/>
                   </div>
                   <div class="filter-item proto-item" id="filterProtocolItem">
-                    <div class="hint">Protocol<br/>version</div>
+                    <div class="hint">Protocol version</div>
                     <div class="proto-checks">
                       <label><input id="protoV3" type="checkbox" checked onchange="updateChainsNote()"/> V3</label>
                       <label><input id="protoV4" type="checkbox" checked onchange="updateChainsNote()"/> V4</label>
@@ -31649,12 +31671,15 @@ HTML_PAGE = """
                 </div>
                 <div class="inline-grid exact-grid">
                   <div class="filter-item" id="filterDaysItem">
-                    <div class="hint">History<br/>days</div>
+                    <div class="hint">History days</div>
                     <input id="days" value="30" type="number" min="1" max="3650" step="1" oninput="syncDaysFromExact()"/>
                   </div>
                   <div class="filter-item contract-item" id="filterContractItem">
                     <div class="hint">Contract address</div>
-                    <input id="targetPoolId" type="text" placeholder="0x... (40 hex address or 64 hex pool id)"/>
+                    <div class="contract-input-row">
+                      <input id="targetPoolId" type="text" placeholder="0x... (40 hex address or 64 hex pool id)"/>
+                      <span class="contract-input-note">Detailed scan for one contract: ~1-2 min.</span>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -31718,6 +31743,14 @@ HTML_PAGE = """
       chain: (r) => r.chain || "",
       version: (r) => r.version || "",
       pair: (r) => r.pair || "",
+      anchor_type: (r) => String(r.anchor_type || "").toLowerCase(),
+      status_code: (r) => {
+        const dq = String(r.data_quality || "").trim().toLowerCase();
+        const reason = String(r.data_quality_reason || "").trim();
+        if (reason.startsWith("strict_required:")) return reason;
+        if (dq === "strict_unavailable") return (reason || "strict_unavailable");
+        return "ok";
+      },
       fee_pct: (r) => Number(r.fee_pct || 0),
       final_income: (r) => Number(r.final_income || 0),
       apy_pct: (r) => Number(r.apy_pct || 0),
@@ -33284,9 +33317,25 @@ HTML_PAGE = """
 
     function renderTable(rows) {
       const table = document.getElementById("resultTable");
+      const statusCodeForRow = (r) => {
+        const dq = String(r?.data_quality || "").trim().toLowerCase();
+        const reason = String(r?.data_quality_reason || "").trim();
+        if (reason.startsWith("strict_required:")) return reason;
+        if (dq === "strict_unavailable") return (reason || "strict_unavailable");
+        const hasRawDiag = (
+          reason.startsWith("exact:")
+          || reason.startsWith("exact2")
+          || reason.includes("source_conflict")
+          || reason.includes("one_leg")
+          || reason.includes("timeout")
+          || reason.includes("partial")
+        );
+        if (hasRawDiag) return `ok | ${reason}`;
+        return "ok";
+      };
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
-        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["data_quality_reason", "Quality reason"]
+        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["anchor_type", "Anchor"], ["status_code", "Status"]
       ];
 
       let html = "<tr>";
@@ -33299,10 +33348,11 @@ HTML_PAGE = """
       for (const r of rows) {
         const cls = r.status === "ok" ? "ok-row" : "error-row";
         const pairLbl = String(r.pair || "").toLowerCase();
-        const isEstFull = pairLbl.includes("(estimated full)");
-        const isEstActive = pairLbl.includes("(estimated active)");
-        const isExFull = pairLbl.includes("(exact full)");
-        const isExActive = pairLbl.includes("(exact active)");
+        const anchorType = String(r.anchor_type || "").trim().toLowerCase();
+        const isEstFull = isEstimatedRow && anchorType === "full";
+        const isEstActive = isEstimatedRow && anchorType === "active";
+        const isExFull = isExactRow && anchorType === "full";
+        const isExActive = isExactRow && anchorType === "active";
         const isEstimatedRow = isEstFull || isEstActive;
         const isExactRow = isExFull || isExActive;
         let color = colorMap[r.pool_id] || "#94a3b8";
@@ -33342,9 +33392,11 @@ HTML_PAGE = """
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
+        const anchor = anchorType ? (anchorType.charAt(0).toUpperCase() + anchorType.slice(1)) : "-";
+        html += `<td>${anchor}</td>`;
         const dqReason = String(r.data_quality_reason || "");
-        const dqReasonShort = formatQualityReasonShort(dqReason, String(r.data_quality || ""));
-        html += `<td style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(dqReason || "-")}">${escAttr(dqReasonShort || "-")}</td>`;
+        const statusCode = statusCodeForRow(r);
+        html += `<td style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(dqReason || statusCode || "-")}">${escAttr(statusCode || "-")}</td>`;
         html += "</tr>";
       }
       table.innerHTML = html;
@@ -33375,11 +33427,36 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "data_quality_reason"];
+      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "anchor_type", "status_code", "data_quality_reason"];
       const lines = [headers.join(",")];
       for (const r of rows) {
         const vals = headers.map(h => {
-          const rawVal = (h === "visibility") ? (!!visibilityMap[r.pool_id]) : r[h];
+          let rawVal;
+          if (h === "visibility") {
+            rawVal = !!visibilityMap[r.pool_id];
+          } else if (h === "anchor_type") {
+            rawVal = String(r.anchor_type || "");
+          } else if (h === "status_code") {
+            const reason = String(r.data_quality_reason || "").trim();
+            const dq = String(r.data_quality || "").trim().toLowerCase();
+            if (reason.startsWith("strict_required:")) {
+              rawVal = reason;
+            } else if (dq === "strict_unavailable") {
+              rawVal = reason || "strict_unavailable";
+            } else {
+              const hasRawDiag = (
+                reason.startsWith("exact:")
+                || reason.startsWith("exact2")
+                || reason.includes("source_conflict")
+                || reason.includes("one_leg")
+                || reason.includes("timeout")
+                || reason.includes("partial")
+              );
+              rawVal = hasRawDiag ? (`ok | ${reason}`) : "ok";
+            }
+          } else {
+            rawVal = r[h];
+          }
           const val = rawVal == null ? "" : String(rawVal);
           return `"${val.replace(/"/g, '""')}"`;
         });
