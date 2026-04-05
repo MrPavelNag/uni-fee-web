@@ -17935,6 +17935,19 @@ def _merge_for_web(
     days_safe = max(1, int(days or 1))
     alloc_safe = float(lp_allocation_usd or 0.0)
 
+    def _last_positive_value(series: list | None) -> float:
+        arr = series or []
+        for item in reversed(arr):
+            try:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                v = float(item[1] or 0.0)
+                if v > 0.0:
+                    return float(v)
+            except Exception:
+                continue
+        return 0.0
+
     def _align_series_end(series: list, end_ts: int) -> list:
         arr = [x for x in (series or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
         if not arr:
@@ -18019,7 +18032,9 @@ def _merge_for_web(
 
             est_income = float(est_fees[-1][1]) if est_fees else 0.0
             est_apy = (est_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-            est_last_tvl = float(est_tvl[-1][1]) if est_tvl else pool_tvl_now_usd
+            est_last_tvl = _last_positive_value(est_tvl) if est_tvl else float(pool_tvl_now_usd)
+            if est_last_tvl <= 0.0:
+                est_last_tvl = float(pool_tvl_now_usd)
             rows.append(
                 {
                     "pool_id": base_pool_id,
@@ -18040,7 +18055,7 @@ def _merge_for_web(
 
             exact_income = float(ex_fees[-1][1]) if ex_fees else 0.0
             exact_apy = (exact_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-            exact_last_tvl = float(ex_tvl[-1][1]) if ex_tvl else 0.0
+            exact_last_tvl = _last_positive_value(ex_tvl) if ex_tvl else 0.0
             exact_ok = bool(ex_tvl and not str(exact2_reason).startswith("strict_required:"))
             exact_dq = str(v.get("data_quality") or "").strip().lower()
             if not exact_ok:
@@ -18421,10 +18436,13 @@ def _build_run_job_env(
     env["TARGET_POOL_ID"] = (target_pool_id if run_mode == "strict_exact" else "")
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
-    # Allow exact engines on all supported v3 chains.
-    # This avoids false strict_required:...:chain_not_enabled when target pool is found
-    # on a fallback chain outside current UI chain selection.
-    env["V3_EXACT_TVL_CHAINS"] = ",".join(sorted(UNISWAP_V3_SUBGRAPHS.keys()))
+    # Respect Include chains selection for strict exact mode.
+    # If user did not select chains (all), keep full set.
+    env["V3_EXACT_TVL_CHAINS"] = (
+        ",".join(include_chains)
+        if include_chains
+        else ",".join(sorted(UNISWAP_V3_SUBGRAPHS.keys()))
+    )
     env["DISABLE_PDF_OUTPUT"] = "1"
     env["GRAPHQL_RETRIES"] = os.environ.get("WEB_GRAPHQL_RETRIES", "1")
     env["GRAPHQL_CONNECT_TIMEOUT_SEC"] = os.environ.get(
@@ -31410,7 +31428,7 @@ HTML_PAGE = """
     let scanLastBackendAt = 0;
     let pairListsHintBySymbol = {};
     let pairListsIconUrls = {};
-    let pairListsExpanded = true;
+    let pairListsExpanded = false;
     let targetPoolFullValue = "";
     const homeSectionState = { feeHistory: false, poolsTable: false };
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
@@ -31455,7 +31473,7 @@ HTML_PAGE = """
       const chainsRow = document.getElementById("runChainsRow");
       const filtersRow = document.getElementById("runFiltersRow");
       if (pairsRow) pairsRow.classList.toggle("mode-disabled", strict);
-      if (chainsRow) chainsRow.classList.toggle("mode-disabled", strict);
+      if (chainsRow) chainsRow.classList.remove("mode-disabled");
       if (filtersRow) filtersRow.classList.remove("mode-disabled");
 
       const pairIds = ["stableBucketMode", "stableBucketManual", "tokenBucketMode", "tokenBucketManual"];
@@ -31465,11 +31483,14 @@ HTML_PAGE = """
       }
       const pairDetailsBtn = document.getElementById("pairListsDetailsBtn");
       if (pairDetailsBtn) pairDetailsBtn.disabled = strict;
+      if (strict) pairListsExpanded = false;
+      if (pairDetailsBtn) pairDetailsBtn.textContent = pairListsExpanded ? "Hide details" : "Details";
+      renderPairListsPanel();
 
       const allChainsEl = document.getElementById("allChains");
-      if (allChainsEl) allChainsEl.disabled = strict;
+      if (allChainsEl) allChainsEl.disabled = false;
       const chainInputs = document.querySelectorAll("#chainChecks input[type='checkbox']");
-      chainInputs.forEach((el) => { el.disabled = strict; });
+      chainInputs.forEach((el) => { el.disabled = false; });
 
       setDisabledWithDim(document.getElementById("minTvl"), strict);
       setDisabledWithDim(document.getElementById("feeRangePct"), strict);
@@ -32843,8 +32864,16 @@ HTML_PAGE = """
 
       for (const r of rows) {
         const cls = r.status === "ok" ? "ok-row" : "error-row";
-        const color = colorMap[r.pool_id] || "#94a3b8";
-        const dash = dashMap[r.pool_id] || "solid";
+        const pairLbl = String(r.pair || "").toLowerCase();
+        const isEstimatedRow = pairLbl.includes("(estimated)");
+        const isExactRow = pairLbl.includes("(exact)");
+        const color = isEstimatedRow
+          ? "#64748b"
+          : (isExactRow ? "#1d4ed8" : (colorMap[r.pool_id] || "#94a3b8"));
+        const dash = isEstimatedRow
+          ? "dot"
+          : (isExactRow ? "solid" : (dashMap[r.pool_id] || "solid"));
+        const swatchWidth = isEstimatedRow ? 3.0 : (isExactRow ? 1.8 : 3.0);
         const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
         const visible = !!visibilityMap[r.pool_id];
         const hasSeries = !!seriesByPool[r.pool_id];
@@ -32852,7 +32881,7 @@ HTML_PAGE = """
         const poolIdDisplay = shortStartEnd4(r.pool_id || "");
         const poolIdRaw = String(r.pool_id || "");
         html += `<tr class="${cls}">`;
-        html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};"></span></td>`;
+        html += `<td><span class="line-swatch" style="border-top-color:${color};border-top-style:${cssDash};border-top-width:${swatchWidth}px;"></span></td>`;
         html += `<td><input type="checkbox" data-pool-id="${r.pool_id}" ${visible ? "checked" : ""} ${disabled} onchange="togglePoolVisibility(this)"/></td>`;
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
