@@ -33286,6 +33286,11 @@ HTML_PAGE = """
           }
           return false;
         };
+        const tvlMarkersOnly = (xArr, yArr) => {
+          const n = Array.isArray(xArr) ? xArr.length : 0;
+          if (n <= 3) return true; // avoid fake straight trends from too few points
+          return isSparseFlatTvl(yArr);
+        };
         if (useStrictCompare) {
           const estFeesSrc = estFees.length ? estFees : (Array.isArray(s.fees) ? s.fees : []);
           const estFeesActSrc = estActiveFees.length ? estActiveFees : [];
@@ -33413,26 +33418,8 @@ HTML_PAGE = """
           const exActHoverTvl = exActX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
           const exSanityHoverTvl = exSanityTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact full sanity"]);
           const exActSanityHoverTvl = exActSanityTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active sanity"]);
-          if (showEstFull && estTvlX.length) {
-            const estSingle = estTvlX.length === 1 || isSparseFlatTvl(estTvlY);
-            tvlTraces.push({
-              x: estTvlX, y: estTvlY, mode: (estSingle ? "markers" : "lines"), name: `${s.label} (estimated full)`, customdata: estHoverTvl,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: COLOR_FULL_EST, width: 3.0, dash: "dot"},
-              ...(estSingle ? {marker: {size: 8, color: COLOR_FULL_EST, symbol: "circle"}} : {})
-            });
-          }
-          if (showEstActive && estActTvlX.length) {
-            const estActSingle = estActTvlX.length === 1 || isSparseFlatTvl(estActTvlY);
-            tvlTraces.push({
-              x: estActTvlX, y: estActTvlY, mode: (estActSingle ? "markers" : "lines"), name: `${s.label} (estimated active)`, customdata: estActHoverTvl,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: COLOR_ACTIVE_EST, width: 2.4, dash: "dash"},
-              ...(estActSingle ? {marker: {size: 8, color: COLOR_ACTIVE_EST, symbol: "square"}} : {})
-            });
-          }
           if (showExFull && exTvlX.length) {
-            const exFlat = isSparseFlatTvl(exTvlYExact);
+            const exFlat = tvlMarkersOnly(exTvlX, exTvlYExact);
             tvlTraces.push({
               x: exTvlX, y: exTvlYExact, mode: (exFlat ? "markers" : "lines+markers"), name: `${s.label} (exact full)`, customdata: exHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
@@ -33441,12 +33428,30 @@ HTML_PAGE = """
             });
           }
           if (showExActive && exActX.length) {
-            const exActFlat = isSparseFlatTvl(exActY);
+            const exActFlat = tvlMarkersOnly(exActX, exActY);
             tvlTraces.push({
               x: exActX, y: exActY, mode: (exActFlat ? "markers" : "lines+markers"), name: `${s.label} (exact active)`, customdata: exActHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: COLOR_ACTIVE, width: 1.8, dash: "solid"},
               marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
+            });
+          }
+          if (showEstFull && estTvlX.length) {
+            const estSingle = tvlMarkersOnly(estTvlX, estTvlY);
+            tvlTraces.push({
+              x: estTvlX, y: estTvlY, mode: (estSingle ? "markers" : "lines"), name: `${s.label} (estimated full)`, customdata: estHoverTvl,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
+              line: {color: COLOR_FULL_EST, width: 3.0, dash: "dot"},
+              ...(estSingle ? {marker: {size: 8, color: COLOR_FULL_EST, symbol: "circle"}} : {})
+            });
+          }
+          if (showEstActive && estActTvlX.length) {
+            const estActSingle = tvlMarkersOnly(estActTvlX, estActTvlY);
+            tvlTraces.push({
+              x: estActTvlX, y: estActTvlY, mode: (estActSingle ? "markers" : "lines"), name: `${s.label} (estimated active)`, customdata: estActHoverTvl,
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
+              line: {color: COLOR_ACTIVE_EST, width: 2.4, dash: "dash"},
+              ...(estActSingle ? {marker: {size: 8, color: COLOR_ACTIVE_EST, symbol: "square"}} : {})
             });
           }
           // TVL sanity traces are intentionally not drawn:
