@@ -18089,8 +18089,6 @@ def _merge_for_web(
             ex_tvl = v.get("strict_compare_exact_tvl") or []
             ex_active_tvl = v.get("strict_compare_exact_active_tvl") or []
             ex_active_fees = v.get("strict_compare_exact_active_fees") or []
-            ex_sanity_fees = v.get("strict_compare_exact_sanity_fees") or []
-            ex_active_sanity_fees = v.get("strict_compare_exact_active_sanity_fees") or []
             if (not ex_active_fees) and est_active_fees:
                 ex_active_fees = list(est_active_fees)
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
@@ -18109,8 +18107,6 @@ def _merge_for_web(
                 + [int(x[0]) for x in (est_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
-                + [int(x[0]) for x in (ex_sanity_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
-                + [int(x[0]) for x in (ex_active_sanity_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(now_ts)]
             )
             est_tvl = _align_series_end(est_tvl, tvl_end_ts)
@@ -18121,8 +18117,6 @@ def _merge_for_web(
             est_active_fees = _align_series_end(est_active_fees, fees_end_ts)
             ex_fees = _align_series_end(ex_fees, fees_end_ts)
             ex_active_fees = _align_series_end(ex_active_fees, fees_end_ts)
-            ex_sanity_fees = _align_series_end(ex_sanity_fees, fees_end_ts)
-            ex_active_sanity_fees = _align_series_end(ex_active_sanity_fees, fees_end_ts)
 
             src_lbl = _short_source_label(str(v.get("tvl_price_source") or ""))
             est_income = float(est_fees[-1][1]) if est_fees else 0.0
@@ -18213,63 +18207,6 @@ def _merge_for_web(
                     data_quality_reason=f"Exact active now ({src_lbl})",
                     status=status,
                 )
-            if ex_sanity_fees:
-                ex_sanity_income = float(ex_sanity_fees[-1][1]) if ex_sanity_fees else 0.0
-                ex_sanity_apy = (ex_sanity_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-                sanity_dbg = ((v.get("strict_debug") or {}).get("sanity_swap_debug") or {})
-                sanity_err = str((sanity_dbg.get("error") or "")).strip()
-                sanity_ok = bool(ex_sanity_income > 0.0)
-                sanity_quality = ("exact_partial" if (exact_quality != "strict_unavailable" and sanity_ok) else "strict_unavailable")
-                sanity_reason = (
-                    f"Exact full sanity-check (on-chain swap logs; {src_lbl})"
-                    if sanity_ok
-                    else f"strict_required:v4_exact2:onchain_swap_logs:{sanity_err or 'no_data'}"
-                )
-                sanity_status = (status if sanity_ok else "strict_unavailable")
-                _append_compare_row(
-                    pool_id=base_pool_id,
-                    chain=base_chain,
-                    version=base_version,
-                    base_pair=base_pair,
-                    branch="exact sanity",
-                    anchor_type="Full",
-                    fee_pct=base_fee_pct,
-                    income=ex_sanity_income,
-                    apy=ex_sanity_apy,
-                    last_tvl=exact_last_tvl,
-                    data_quality=sanity_quality,
-                    data_quality_reason=sanity_reason,
-                    status=sanity_status,
-                )
-            if ex_active_sanity_fees and ex_active_tvl:
-                ex_act_sanity_income = float(ex_active_sanity_fees[-1][1]) if ex_active_sanity_fees else 0.0
-                ex_act_sanity_apy = (ex_act_sanity_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-                ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
-                sanity_dbg = ((v.get("strict_debug") or {}).get("sanity_swap_debug") or {})
-                sanity_err = str((sanity_dbg.get("error") or "")).strip()
-                sanity_ok = bool(ex_act_sanity_income > 0.0)
-                sanity_quality = ("exact_partial" if (exact_quality != "strict_unavailable" and sanity_ok) else "strict_unavailable")
-                sanity_reason = (
-                    f"Exact active sanity-check (on-chain swap logs; {src_lbl})"
-                    if sanity_ok
-                    else f"strict_required:v4_exact2:onchain_swap_logs:{sanity_err or 'no_data'}"
-                )
-                sanity_status = (status if sanity_ok else "strict_unavailable")
-                _append_compare_row(
-                    pool_id=base_pool_id,
-                    chain=base_chain,
-                    version=base_version,
-                    base_pair=base_pair,
-                    branch="exact sanity",
-                    anchor_type="Active",
-                    fee_pct=base_fee_pct,
-                    income=ex_act_sanity_income,
-                    apy=ex_act_sanity_apy,
-                    last_tvl=ex_act_last_tvl,
-                    data_quality=sanity_quality,
-                    data_quality_reason=sanity_reason,
-                    status=sanity_status,
-                )
         else:
             anchor_type = _infer_anchor_type_for_normal_row(v, dq_reason)
             row = {
@@ -18307,8 +18244,6 @@ def _merge_for_web(
                     "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
                     "strict_compare_exact_active_tvl": (ex_active_tvl if has_strict_compare else (v.get("strict_compare_exact_active_tvl") or [])),
                     "strict_compare_exact_active_fees": (ex_active_fees if has_strict_compare else (v.get("strict_compare_exact_active_fees") or [])),
-                    "strict_compare_exact_sanity_fees": (ex_sanity_fees if has_strict_compare else (v.get("strict_compare_exact_sanity_fees") or [])),
-                    "strict_compare_exact_active_sanity_fees": (ex_active_sanity_fees if has_strict_compare else (v.get("strict_compare_exact_active_sanity_fees") or [])),
                     "strict_compare_exact2_reason": exact2_reason,
                     "pool_tvl_now_usd": pool_tvl_now_usd,
                 }
@@ -33184,7 +33119,6 @@ HTML_PAGE = """
 
     function rowBranchFromLabel(pairLabel) {
       const p = String(pairLabel || "").toLowerCase();
-      if (p.includes("(exact sanity)")) return "exact_sanity";
       if (p.includes("(estimated)")) return "estimated";
       if (p.includes("(exact)")) return "exact";
       return "all";
@@ -33220,23 +33154,18 @@ HTML_PAGE = """
         const showEstActive = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "active")];
         const showExFull = !!visibilityMap[makeVisibilityKey(poolId, "exact", "full")];
         const showExActive = !!visibilityMap[makeVisibilityKey(poolId, "exact", "active")];
-        const showExSanityFull = !!visibilityMap[makeVisibilityKey(poolId, "exact_sanity", "full")];
-        const showExSanityActive = !!visibilityMap[makeVisibilityKey(poolId, "exact_sanity", "active")];
-        if (!(showAll || showEstFull || showEstActive || showExFull || showExActive || showExSanityFull || showExSanityActive)) continue;
+        if (!(showAll || showEstFull || showEstActive || showExFull || showExActive)) continue;
         const estFees = Array.isArray(s.strict_compare_estimated_fees) ? s.strict_compare_estimated_fees : [];
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
         const estActiveFees = Array.isArray(s.strict_compare_estimated_active_fees) ? s.strict_compare_estimated_active_fees : [];
         const estActiveTvl = Array.isArray(s.strict_compare_estimated_active_tvl) ? s.strict_compare_estimated_active_tvl : [];
         const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
         const exActiveFees = Array.isArray(s.strict_compare_exact_active_fees) ? s.strict_compare_exact_active_fees : [];
-        const exSanityFees = Array.isArray(s.strict_compare_exact_sanity_fees) ? s.strict_compare_exact_sanity_fees : [];
-        const exActiveSanityFees = Array.isArray(s.strict_compare_exact_active_sanity_fees) ? s.strict_compare_exact_active_sanity_fees : [];
         const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
         const exActiveTvl = Array.isArray(s.strict_compare_exact_active_tvl) ? s.strict_compare_exact_active_tvl : [];
         const useStrictCompare = strictMode && (
           estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length ||
-          exFees.length || exActiveFees.length || exTvl.length || exActiveTvl.length ||
-          exSanityFees.length || exActiveSanityFees.length
+          exFees.length || exActiveFees.length || exTvl.length || exActiveTvl.length
         );
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
@@ -33247,8 +33176,6 @@ HTML_PAGE = """
           ...(estActiveTvl.map(p => Number(p?.[0] || 0))),
           ...(exFees.map(p => Number(p?.[0] || 0))),
           ...(exActiveFees.map(p => Number(p?.[0] || 0))),
-          ...(exSanityFees.map(p => Number(p?.[0] || 0))),
-          ...(exActiveSanityFees.map(p => Number(p?.[0] || 0))),
           ...(exTvl.map(p => Number(p?.[0] || 0))),
           ...(exActiveTvl.map(p => Number(p?.[0] || 0))),
           0
@@ -33324,16 +33251,6 @@ HTML_PAGE = """
             const v = Number(p?.[1] || 0);
             return v > 0 ? v : null;
           });
-          const exSanityFeeX = exSanityFees.map(p => new Date(p[0] * 1000));
-          const exSanityFeeY = exSanityFees.map(p => {
-            const v = Number(p?.[1] || 0);
-            return v > 0 ? v : null;
-          });
-          const exActSanityFeeX = exActiveSanityFees.map(p => new Date(p[0] * 1000));
-          const exActSanityFeeY = exActiveSanityFees.map(p => {
-            const v = Number(p?.[1] || 0);
-            return v > 0 ? v : null;
-          });
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
           const estActTvlX = estTvlActSrc.map(p => new Date(p[0] * 1000));
@@ -33344,42 +33261,14 @@ HTML_PAGE = """
           );
           const exActX = exActiveTvl.map(p => new Date(p[0] * 1000));
           const exActY = sanitizeExactTvlK(exActiveTvl, estTvlSrc.length ? estTvlSrc : estTvlActSrc, Number(s.pool_tvl_now_usd || 0));
-          const lastPositiveK = (arr, idx = 1, scale = 1.0) => {
-            const src = Array.isArray(arr) ? arr : [];
-            for (let j = src.length - 1; j >= 0; j--) {
-              const row = src[j];
-              const v = Number(Array.isArray(row) ? row[idx] : NaN);
-              if (Number.isFinite(v) && v > 0) return v / scale;
-            }
-            return 0;
-          };
-          const fullAnchorK = (() => {
-            const fromExact = lastPositiveK(exTvl, 1, 1000.0);
-            if (fromExact > 0) return fromExact;
-            const nowUsd = Number(s.pool_tvl_now_usd || 0);
-            return nowUsd > 0 ? (nowUsd / 1000.0) : 0;
-          })();
-          const activeAnchorK = (() => {
-            const fromExactActive = lastPositiveK(exActiveTvl, 1, 1000.0);
-            if (fromExactActive > 0) return fromExactActive;
-            return 0;
-          })();
-          const exSanityTvlX = exSanityFeeX.slice();
-          const exSanityTvlY = exSanityTvlX.map(() => (fullAnchorK > 0 ? fullAnchorK : null));
-          const exActSanityTvlX = exActSanityFeeX.slice();
-          const exActSanityTvlY = exActSanityTvlX.map(() => (activeAnchorK > 0 ? activeAnchorK : null));
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const estActHover = estActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           const exActHover = exActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
-          const exSanityHover = exSanityFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact full sanity"]);
-          const exActSanityHover = exActSanityFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active sanity"]);
           const COLOR_FULL = "#1d4ed8";          // blue
           const COLOR_ACTIVE = "#166534";        // darker green
           const COLOR_FULL_EST = "#60a5fa";      // light blue
           const COLOR_ACTIVE_EST = "#15803d";    // darker green (estimated active)
-          const COLOR_FULL_SANITY = "#2563eb";   // blue (sanity)
-          const COLOR_ACTIVE_SANITY = "#15803d"; // green (sanity)
           if (showEstFull && estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated full)`, customdata: estHover,
@@ -33410,28 +33299,10 @@ HTML_PAGE = """
               marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
             });
           }
-          if (showExSanityFull && exSanityFeeX.length) {
-            feeTraces.push({
-              x: exSanityFeeX, y: exSanityFeeY, mode: "lines+markers", name: `${s.label} (exact full sanity-check)`, customdata: exSanityHover,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: COLOR_FULL_SANITY, width: 1.6, dash: "dashdot"},
-              marker: {size: 5, color: COLOR_FULL_SANITY, symbol: "circle-open"}
-            });
-          }
-          if (showExSanityActive && exActSanityFeeX.length) {
-            feeTraces.push({
-              x: exActSanityFeeX, y: exActSanityFeeY, mode: "lines+markers", name: `${s.label} (exact active sanity-check)`, customdata: exActSanityHover,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: COLOR_ACTIVE_SANITY, width: 1.6, dash: "dashdot"},
-              marker: {size: 6, color: COLOR_ACTIVE_SANITY, symbol: "diamond-open"}
-            });
-          }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const estActHoverTvl = estActTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
           const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           const exActHoverTvl = exActX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
-          const exSanityHoverTvl = exSanityTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact full sanity"]);
-          const exActSanityHoverTvl = exActSanityTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active sanity"]);
           if (showExFull && exTvlX.length) {
             const exFlat = tvlMarkersOnly(exTvlX, exTvlYExact);
             tvlTraces.push({
@@ -33468,9 +33339,6 @@ HTML_PAGE = """
               ...(estActSingle ? {marker: {size: 8, color: COLOR_ACTIVE_EST, symbol: "square"}} : {})
             });
           }
-          // TVL sanity traces are intentionally not drawn:
-          // they use the same full/active anchors as exact TVL and visually overlap.
-          // Keep sanity-check comparison on the Fees chart where sources differ.
         } else {
           const feeX = (s.fees || []).map(p => new Date(p[0] * 1000));
           const feeY = (s.fees || []).map(p => p[1]);
@@ -33633,8 +33501,6 @@ HTML_PAGE = """
         const isEstActive = pairLbl.includes("(estimated)") && anchorType === "active";
         const isExFull = pairLbl.includes("(exact)") && anchorType === "full";
         const isExActive = pairLbl.includes("(exact)") && anchorType === "active";
-        const isExSanityFull = pairLbl.includes("(exact sanity)") && anchorType === "full";
-        const isExSanityActive = pairLbl.includes("(exact sanity)") && anchorType === "active";
         let color = colorMap[r.pool_id] || "#94a3b8";
         let dash = dashMap[r.pool_id] || "solid";
         let swatchWidth = 3.0;
@@ -33654,14 +33520,6 @@ HTML_PAGE = """
           color = "#166534";
           dash = "solid";
           swatchWidth = 1.8;
-        } else if (isExSanityFull) {
-          color = "#2563eb";
-          dash = "dashdot";
-          swatchWidth = 1.6;
-        } else if (isExSanityActive) {
-          color = "#15803d";
-          dash = "dashdot";
-          swatchWidth = 1.6;
         }
         const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
         const rowKey = rowVisibilityKey(r);
