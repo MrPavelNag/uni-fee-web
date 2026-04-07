@@ -87,6 +87,18 @@ def save_pdf(pools: list[dict], path: str) -> None:
 
 # v4 may use native ETH (0x0) instead of WETH
 NATIVE_ETH = "0x0000000000000000000000000000000000000000"
+_UNISWAP_INTERFACE_GRAPHQL = "https://interface.gateway.uniswap.org/v1/graphql"
+_UNISWAP_CHAIN_ENUM_BY_KEY: dict[str, str] = {
+    "ethereum": "ETHEREUM",
+    "arbitrum": "ARBITRUM",
+    "base": "BASE",
+    "polygon": "POLYGON",
+    "optimism": "OPTIMISM",
+    "avalanche": "AVALANCHE",
+    "unichain": "UNICHAIN",
+    "bsc": "BNB",
+    "celo": "CELO",
+}
 
 
 def _native_eth_query_chains() -> set[str]:
@@ -152,6 +164,59 @@ def _pool_tvl_usd(pool: dict) -> float:
         return float(pool.get("effectiveTvlUSD") or pool.get("pool_tvl_now_usd") or pool.get("totalValueLockedUSD") or 0)
     except Exception:
         return 0.0
+
+
+def _is_v4_pool_id(v: str) -> bool:
+    s = str(v or "").strip().lower()
+    return s.startswith("0x") and len(s) == 66 and all(c in "0123456789abcdef" for c in s[2:])
+
+
+def _uniswap_interface_v4_pool_metrics(chain: str, pool_id: str, timeout_sec: float = 8.0) -> tuple[dict[str, float], str]:
+    chain_enum = _UNISWAP_CHAIN_ENUM_BY_KEY.get(str(chain or "").strip().lower(), "")
+    pid = str(pool_id or "").strip().lower()
+    if not chain_enum:
+        return {}, "chain_not_supported_by_interface_api"
+    if not _is_v4_pool_id(pid):
+        return {}, "pool_id_must_be_64hex"
+    q = """
+    query V4Pool($chain: Chain!, $poolId: String!) {
+      v4Pool(chain: $chain, poolId: $poolId) {
+        feeTier
+        totalLiquidity { value }
+        volume24h: cumulativeVolume(duration: DAY) { value }
+      }
+    }
+    """
+    body = {"query": q, "variables": {"chain": chain_enum, "poolId": pid}, "operationName": "V4Pool"}
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "https://app.uniswap.org",
+        "referer": "https://app.uniswap.org/",
+        "user-agent": "Mozilla/5.0",
+    }
+    try:
+        r = requests.post(_UNISWAP_INTERFACE_GRAPHQL, json=body, headers=headers, timeout=max(3.0, float(timeout_sec)))
+        if int(r.status_code) != 200:
+            return {}, f"http_{int(r.status_code)}"
+        payload = r.json() if r.content else {}
+        errs = payload.get("errors") or []
+        if errs:
+            msg = str((errs[0] or {}).get("message") or "graphql_error").strip() or "graphql_error"
+            return {}, f"graphql:{msg}"
+        p = ((payload.get("data") or {}).get("v4Pool") or {})
+        if not isinstance(p, dict) or not p:
+            return {}, "empty_v4Pool"
+        out = {
+            "fee_tier": float(p.get("feeTier") or 0.0),
+            "total_liquidity_usd": float(((p.get("totalLiquidity") or {}).get("value") or 0.0)),
+            "volume24h_usd": float(((p.get("volume24h") or {}).get("value") or 0.0)),
+        }
+        if out["total_liquidity_usd"] <= 0.0:
+            return {}, "total_liquidity_non_positive"
+        return out, ""
+    except Exception as e:
+        return {}, f"request_error:{type(e).__name__}"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -573,9 +638,24 @@ def main() -> None:
         if not endpoint:
             return idx, None, None, f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: skipped (no endpoint)"
         series = compute_fee_series(pool, endpoint)
-        # Hard rule: TVL "now" must always come from reserves * external prices.
-        # Never trust prefilled pool TVL fields for current-point valuation.
-        pool_tvl_now_usd, price_source, price_err = resolve_pool_tvl_now_external(pool, chain, write_back=True)
+        # Primary source for v4 estimate full TVL NOW: Uniswap Interface v4Pool.totalLiquidity.
+        # Fallback: on-chain reserves * external prices.
+        pool_tvl_now_usd = 0.0
+        price_source = ""
+        price_err = ""
+        uni_metrics, uni_err = _uniswap_interface_v4_pool_metrics(chain, pool_id, timeout_sec=8.0)
+        uni_tvl = float(uni_metrics.get("total_liquidity_usd") or 0.0)
+        if uni_tvl > 0.0:
+            pool_tvl_now_usd = float(uni_tvl)
+            vol24h = float(uni_metrics.get("volume24h_usd") or 0.0)
+            price_source = f"v4_interface:totalLiquidity:volume24h={vol24h:.2f}"
+            pool["effectiveTvlUSD"] = float(pool_tvl_now_usd)
+            pool["pool_tvl_now_usd"] = float(pool_tvl_now_usd)
+            pool["tvl_price_source"] = str(price_source)
+        else:
+            pool_tvl_now_usd, price_source, price_err = resolve_pool_tvl_now_external(pool, chain, write_back=True)
+            if not price_err and uni_err:
+                price_err = f"uniswap_interface_unavailable:{uni_err}"
         if float(pool_tvl_now_usd) <= 0:
             msg = (
                 f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: "
