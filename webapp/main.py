@@ -33481,9 +33481,13 @@ HTML_PAGE = """
 
     function renderTable(rows) {
       const table = document.getElementById("resultTable");
+      const strictMode = String(currentRequest?.run_mode || "").toLowerCase() === "strict_exact";
+      const showAnchor = strictMode;
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
-        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"], ["anchor_type", "Anchor"], ["status_code", "Status"]
+        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"],
+        ...(showAnchor ? [["anchor_type", "Anchor"]] : []),
+        ["status_code", "Status"]
       ];
 
       let html = "<tr>";
@@ -33539,8 +33543,10 @@ HTML_PAGE = """
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
         html += `<td>$${formatUsd(r.last_tvl)}</td>`;
-        const anchor = anchorType ? (anchorType.charAt(0).toUpperCase() + anchorType.slice(1)) : "-";
-        html += `<td>${anchor}</td>`;
+        if (showAnchor) {
+          const anchor = anchorType ? (anchorType.charAt(0).toUpperCase() + anchorType.slice(1)) : "-";
+          html += `<td>${anchor}</td>`;
+        }
         const dqReason = String(r.data_quality_reason || "");
         const statusCode = statusCodeForRow(r);
         html += `<td style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(dqReason || statusCode || "-")}">${escAttr(statusCode || "-")}</td>`;
@@ -33574,7 +33580,12 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const headers = ["visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl", "anchor_type", "status_code"];
+      const strictMode = String(currentRequest?.run_mode || "").toLowerCase() === "strict_exact";
+      const headers = [
+        "visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl",
+        ...(strictMode ? ["anchor_type"] : []),
+        "status_code"
+      ];
       const lines = [headers.join(",")];
       for (const r of rows) {
         const vals = headers.map(h => {
