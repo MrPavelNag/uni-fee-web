@@ -17983,6 +17983,35 @@ def _merge_for_web(
             price = "Dexscreener"
         return f"{onchain} + {price}"
 
+    def _calc_path_human(v: dict, *, branch: str = "", anchor_type: str = "", has_strict_compare: bool = False) -> str:
+        ver = str(v.get("version") or "").strip().lower()
+        src = str(v.get("tvl_price_source") or "").strip()
+        src_l = src.lower()
+        br = str(branch or "").strip().lower()
+        anc = str(anchor_type or "").strip().lower()
+        strict_dbg = (v.get("strict_debug") or {}) if isinstance(v, dict) else {}
+        if has_strict_compare:
+            if br == "estimated":
+                anchor_lbl = "active" if anc == "active" else "full"
+                return f"Strict compare: estimated {anchor_lbl} | TVL shape=poolDayData + NOW anchor | fees=subgraph feesUSD"
+            if br == "exact":
+                hist_dbg = (strict_dbg.get("onchain_history_debug") or {})
+                hist_pts = int(hist_dbg.get("snapshots_done") or 0)
+                hist_part = ("history=on-chain block snapshots" if hist_pts > 0 else "history=NOW anchor")
+                full_src = ("full TVL NOW=Uniswap Interface" if ("full_src=uniswap_interface" in src_l or "uniswap_interface_v4pool_totalliquidity" in src_l) else "full TVL NOW=on-chain quantities")
+                if anc == "active":
+                    return f"Strict compare: exact active | active TVL=StateView/PoolManager | {hist_part} | fees=subgraph feesUSD"
+                return f"Strict compare: exact full | {full_src} | {hist_part} | fees=subgraph feesUSD"
+            return "Strict compare: mixed path"
+        # Fast legacy / estimate mode
+        if ver == "v4":
+            if "v4_interface:totalliquidity" in src_l:
+                return "Fast legacy: TVL NOW=Uniswap Interface | TVL history shape=poolDayData | fees=subgraph feesUSD"
+            return "Fast legacy: TVL NOW=on-chain reserves + oracle prices | TVL history shape=poolDayData | fees=subgraph feesUSD"
+        if ver == "v3":
+            return "Fast legacy: TVL NOW=on-chain reserves + oracle prices | TVL history shape=poolDayData | fees=subgraph feesUSD"
+        return "Fast legacy: standard pipeline"
+
     def _append_compare_row(
         *,
         pool_id: str,
@@ -17998,6 +18027,7 @@ def _merge_for_web(
         data_quality: str,
         data_quality_reason: str,
         status: str,
+        calc_path_human: str = "",
     ) -> None:
         rows.append(
             {
@@ -18013,6 +18043,7 @@ def _merge_for_web(
                 "data_quality": str(data_quality or ""),
                 "data_quality_reason": str(data_quality_reason or ""),
                 "status": str(status or ""),
+                "calc_path_human": str(calc_path_human or ""),
             }
         )
 
@@ -18138,6 +18169,7 @@ def _merge_for_web(
                 data_quality="estimated",
                 data_quality_reason=f"Estimate full anchor ({src_lbl})",
                 status=status,
+                calc_path_human=_calc_path_human(v, branch="estimated", anchor_type="Full", has_strict_compare=True),
             )
 
             if est_active_tvl:
@@ -18158,6 +18190,7 @@ def _merge_for_web(
                     data_quality="estimated",
                     data_quality_reason=f"Estimate active anchor ({src_lbl})",
                     status=status,
+                    calc_path_human=_calc_path_human(v, branch="estimated", anchor_type="Active", has_strict_compare=True),
                 )
 
             exact_income = float(ex_fees[-1][1]) if ex_fees else 0.0
@@ -18187,6 +18220,7 @@ def _merge_for_web(
                 data_quality=exact_quality,
                 data_quality_reason=f"Exact full now ({src_lbl})",
                 status=status,
+                calc_path_human=_calc_path_human(v, branch="exact", anchor_type="Full", has_strict_compare=True),
             )
             if ex_active_tvl:
                 ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
@@ -18206,6 +18240,7 @@ def _merge_for_web(
                     data_quality=("exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"),
                     data_quality_reason=f"Exact active now ({src_lbl})",
                     status=status,
+                    calc_path_human=_calc_path_human(v, branch="exact", anchor_type="Active", has_strict_compare=True),
                 )
         else:
             anchor_type = _infer_anchor_type_for_normal_row(v, dq_reason)
@@ -18222,6 +18257,7 @@ def _merge_for_web(
                 "data_quality": dq,
                 "data_quality_reason": dq_reason,
                 "status": status,
+                "calc_path_human": _calc_path_human(v, has_strict_compare=False),
             }
             rows.append(row)
         if fees or tvl or has_strict_compare:
@@ -33133,6 +33169,9 @@ HTML_PAGE = """
 
     function rowVisibilityKey(r) {
       const branch = rowBranchFromLabel(r?.pair || "");
+      if (branch === "all") {
+        return makeVisibilityKey(r?.pool_id || "", "all", "all");
+      }
       const anchor = String(r?.anchor_type || "").trim().toLowerCase() || "all";
       return makeVisibilityKey(r?.pool_id || "", branch, anchor);
     }
@@ -33548,8 +33587,10 @@ HTML_PAGE = """
           html += `<td>${anchor}</td>`;
         }
         const dqReason = String(r.data_quality_reason || "");
+        const calcPath = String(r.calc_path_human || "").trim();
         const statusCode = statusCodeForRow(r);
-        html += `<td style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(dqReason || statusCode || "-")}">${escAttr(statusCode || "-")}</td>`;
+        const statusTitle = [dqReason || statusCode || "-", calcPath ? `Path: ${calcPath}` : ""].filter(Boolean).join("\\n");
+        html += `<td style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(statusTitle)}">${escAttr(statusCode || "-")}</td>`;
         html += "</tr>";
       }
       table.innerHTML = html;

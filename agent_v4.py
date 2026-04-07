@@ -662,6 +662,12 @@ def main() -> None:
                 f"skipped (external TVL unavailable: {price_err or 'unknown'})"
             )
             return idx, None, None, msg
+        if float(pool_tvl_now_usd) < float(min_tvl):
+            msg = (
+                f"  [{idx+1}/{len(pools)}] {chain} {pair_label}: "
+                f"skipped (TVL NOW ${pool_tvl_now_usd:,.0f} < min ${float(min_tvl):,.0f})"
+            )
+            return idx, None, None, msg
         # Build TVL and profitability strictly from external TVL (no subgraph TVL dependency).
         series["fees"] = []
         series["tvl"] = []
