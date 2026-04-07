@@ -18028,6 +18028,9 @@ def _merge_for_web(
         data_quality_reason: str,
         status: str,
         calc_path_human: str = "",
+        risk_level: str = "none",
+        risk_reason: str = "",
+        risk_flags: list[str] | None = None,
     ) -> None:
         rows.append(
             {
@@ -18044,8 +18047,66 @@ def _merge_for_web(
                 "data_quality_reason": str(data_quality_reason or ""),
                 "status": str(status or ""),
                 "calc_path_human": str(calc_path_human or ""),
+                "risk_level": str(risk_level or "none"),
+                "risk_reason": str(risk_reason or ""),
+                "risk_flags": list(risk_flags or []),
             }
         )
+
+    def _risk_assessment(
+        *,
+        apy_pct: float,
+        last_tvl: float,
+        dq_reason: str,
+        tvl_price_source: str,
+        fees_series: list | None,
+    ) -> tuple[str, str, list[str]]:
+        flags: list[str] = []
+        reasons: list[str] = []
+        apy = float(apy_pct or 0.0)
+        tvl_now = float(last_tvl or 0.0)
+        reason_blob = str(dq_reason or "").strip().lower()
+        src_blob = str(tvl_price_source or "").strip().lower()
+        if apy <= 100.0:
+            return "none", "", []
+        flags.append("apr_gt_100")
+        reasons.append("APR > 100%")
+        if tvl_now > 0 and tvl_now < 50_000:
+            flags.append("tiny_tvl_now")
+            reasons.append(f"low TVL (${tvl_now:,.0f})")
+        if alloc_safe > 0 and tvl_now > 0 and alloc_safe > tvl_now:
+            flags.append("lp_allocation_gt_tvl")
+            reasons.append("LP allocation > pool TVL")
+        if ("raw_zero=" in reason_blob) or ("strict_required:v4_exact2" in reason_blob and "no_day_data" in reason_blob):
+            flags.append("tvl_shape_missing_or_broken")
+            reasons.append("TVL day-shape missing/broken")
+        if "volume24h=0" in src_blob:
+            flags.append("volume24h_zero")
+            reasons.append("24h volume is zero")
+        # Fees concentration check from cumulative series: one day dominates.
+        cumul = []
+        for p in (fees_series or []):
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                try:
+                    cumul.append(float(p[1] or 0.0))
+                except Exception:
+                    continue
+        if len(cumul) >= 3:
+            inc: list[float] = []
+            prev = 0.0
+            for v in cumul:
+                d = float(v) - float(prev)
+                if d > 0:
+                    inc.append(d)
+                prev = float(v)
+            tot = float(sum(inc))
+            mx = float(max(inc)) if inc else 0.0
+            if tot > 0 and (mx / tot) >= 0.70:
+                flags.append("fees_spike_concentration")
+                reasons.append("single-day fees spike dominates")
+        if not flags:
+            return "none", "", []
+        return "suspicious", "; ".join(reasons), flags
 
     def _infer_anchor_type_for_normal_row(v: dict, dq_reason: str) -> str:
         explicit = str(v.get("anchor_type") or "").strip().lower()
@@ -18109,6 +18170,7 @@ def _merge_for_web(
         base_version = v.get("version", "")
         base_pair = v.get("pair", "")
         base_fee_pct = float(v.get("fee_pct") or 0)
+        tvl_src_raw = str(v.get("tvl_price_source") or "")
         exact2_reason = str(dq_reason or "")
         if has_strict_compare:
             now_ts = int(time.time())
@@ -18155,6 +18217,13 @@ def _merge_for_web(
             est_last_tvl = _last_positive_value(est_tvl) if est_tvl else float(pool_tvl_now_usd)
             if est_last_tvl <= 0.0:
                 est_last_tvl = float(pool_tvl_now_usd)
+            est_risk_level, est_risk_reason, est_risk_flags = _risk_assessment(
+                apy_pct=est_apy,
+                last_tvl=est_last_tvl,
+                dq_reason=f"Estimate full anchor ({src_lbl})",
+                tvl_price_source=tvl_src_raw,
+                fees_series=est_fees,
+            )
             _append_compare_row(
                 pool_id=base_pool_id,
                 chain=base_chain,
@@ -18170,12 +18239,22 @@ def _merge_for_web(
                 data_quality_reason=f"Estimate full anchor ({src_lbl})",
                 status=status,
                 calc_path_human=_calc_path_human(v, branch="estimated", anchor_type="Full", has_strict_compare=True),
+                risk_level=est_risk_level,
+                risk_reason=est_risk_reason,
+                risk_flags=est_risk_flags,
             )
 
             if est_active_tvl:
                 est_act_income = float(est_active_fees[-1][1]) if est_active_fees else 0.0
                 est_act_apy = (est_act_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
                 est_act_last_tvl = _last_positive_value(est_active_tvl) if est_active_tvl else 0.0
+                est_act_risk_level, est_act_risk_reason, est_act_risk_flags = _risk_assessment(
+                    apy_pct=est_act_apy,
+                    last_tvl=est_act_last_tvl,
+                    dq_reason=f"Estimate active anchor ({src_lbl})",
+                    tvl_price_source=tvl_src_raw,
+                    fees_series=est_active_fees,
+                )
                 _append_compare_row(
                     pool_id=base_pool_id,
                     chain=base_chain,
@@ -18191,6 +18270,9 @@ def _merge_for_web(
                     data_quality_reason=f"Estimate active anchor ({src_lbl})",
                     status=status,
                     calc_path_human=_calc_path_human(v, branch="estimated", anchor_type="Active", has_strict_compare=True),
+                    risk_level=est_act_risk_level,
+                    risk_reason=est_act_risk_reason,
+                    risk_flags=est_act_risk_flags,
                 )
 
             exact_income = float(ex_fees[-1][1]) if ex_fees else 0.0
@@ -18206,6 +18288,13 @@ def _merge_for_web(
                 exact_quality = "exact_partial"
             else:
                 exact_quality = "exact"
+            ex_risk_level, ex_risk_reason, ex_risk_flags = _risk_assessment(
+                apy_pct=exact_apy,
+                last_tvl=exact_last_tvl,
+                dq_reason=f"Exact full now ({src_lbl})",
+                tvl_price_source=tvl_src_raw,
+                fees_series=ex_fees,
+            )
             _append_compare_row(
                 pool_id=base_pool_id,
                 chain=base_chain,
@@ -18221,11 +18310,21 @@ def _merge_for_web(
                 data_quality_reason=f"Exact full now ({src_lbl})",
                 status=status,
                 calc_path_human=_calc_path_human(v, branch="exact", anchor_type="Full", has_strict_compare=True),
+                risk_level=ex_risk_level,
+                risk_reason=ex_risk_reason,
+                risk_flags=ex_risk_flags,
             )
             if ex_active_tvl:
                 ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
                 ex_act_income = float(ex_active_fees[-1][1]) if ex_active_fees else 0.0
                 ex_act_apy = (ex_act_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+                ex_act_risk_level, ex_act_risk_reason, ex_act_risk_flags = _risk_assessment(
+                    apy_pct=ex_act_apy,
+                    last_tvl=ex_act_last_tvl,
+                    dq_reason=f"Exact active now ({src_lbl})",
+                    tvl_price_source=tvl_src_raw,
+                    fees_series=ex_active_fees,
+                )
                 _append_compare_row(
                     pool_id=base_pool_id,
                     chain=base_chain,
@@ -18241,9 +18340,19 @@ def _merge_for_web(
                     data_quality_reason=f"Exact active now ({src_lbl})",
                     status=status,
                     calc_path_human=_calc_path_human(v, branch="exact", anchor_type="Active", has_strict_compare=True),
+                    risk_level=ex_act_risk_level,
+                    risk_reason=ex_act_risk_reason,
+                    risk_flags=ex_act_risk_flags,
                 )
         else:
             anchor_type = _infer_anchor_type_for_normal_row(v, dq_reason)
+            row_risk_level, row_risk_reason, row_risk_flags = _risk_assessment(
+                apy_pct=float(apy_pct),
+                last_tvl=pool_tvl_now_usd,
+                dq_reason=dq_reason,
+                tvl_price_source=tvl_src_raw,
+                fees_series=fees,
+            )
             row = {
                 "pool_id": base_pool_id,
                 "chain": base_chain,
@@ -18258,6 +18367,9 @@ def _merge_for_web(
                 "data_quality_reason": dq_reason,
                 "status": status,
                 "calc_path_human": _calc_path_human(v, has_strict_compare=False),
+                "risk_level": row_risk_level,
+                "risk_reason": row_risk_reason,
+                "risk_flags": row_risk_flags,
             }
             rows.append(row)
         if fees or tvl or has_strict_compare:
@@ -33588,9 +33700,20 @@ HTML_PAGE = """
         }
         const dqReason = String(r.data_quality_reason || "");
         const calcPath = String(r.calc_path_human || "").trim();
+        const riskLevel = String(r.risk_level || "none").toLowerCase();
+        const riskReason = String(r.risk_reason || "").trim();
+        const riskFlags = Array.isArray(r.risk_flags) ? r.risk_flags.join(", ") : "";
         const statusCode = statusCodeForRow(r);
-        const statusTitle = [dqReason || statusCode || "-", calcPath ? `Path: ${calcPath}` : ""].filter(Boolean).join("\\n");
-        html += `<td style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(statusTitle)}">${escAttr(statusCode || "-")}</td>`;
+        const statusTitle = [
+          dqReason || statusCode || "-",
+          calcPath ? `Path: ${calcPath}` : "",
+          (riskLevel === "suspicious") ? `Risk: ${riskReason || "APR anomaly"}` : "",
+          (riskLevel === "suspicious" && riskFlags) ? `Flags: ${riskFlags}` : ""
+        ].filter(Boolean).join("\\n");
+        const riskBadge = (riskLevel === "suspicious")
+          ? `<span style="display:inline-block;margin-left:6px;padding:1px 6px;border-radius:10px;background:#fef3c7;color:#92400e;font-size:11px;font-weight:600;vertical-align:middle;">suspicious</span>`
+          : "";
+        html += `<td style="max-width:320px;white-space:normal;word-break:break-word;line-height:1.2;" title="${escAttr(statusTitle)}">${escAttr(statusCode || "-")}${riskBadge}</td>`;
         html += "</tr>";
       }
       table.innerHTML = html;
@@ -33625,7 +33748,7 @@ HTML_PAGE = """
       const headers = [
         "visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl",
         ...(strictMode ? ["anchor_type"] : []),
-        "status_code"
+        "status_code", "risk_level", "risk_reason", "risk_flags"
       ];
       const lines = [headers.join(",")];
       for (const r of rows) {
@@ -33637,6 +33760,8 @@ HTML_PAGE = """
             rawVal = String(r.anchor_type || "");
           } else if (h === "status_code") {
             rawVal = statusCodeForRow(r);
+          } else if (h === "risk_flags") {
+            rawVal = Array.isArray(r.risk_flags) ? r.risk_flags.join("|") : "";
           } else {
             rawVal = r[h];
           }
