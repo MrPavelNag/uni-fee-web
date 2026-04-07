@@ -18015,6 +18015,19 @@ def _merge_for_web(
                 "status": str(status or ""),
             }
         )
+
+    def _infer_anchor_type_for_normal_row(v: dict, dq_reason: str) -> str:
+        explicit = str(v.get("anchor_type") or "").strip().lower()
+        if explicit in {"full", "active"}:
+            return "Full" if explicit == "full" else "Active"
+        src = str(v.get("tvl_price_source") or "").strip().lower()
+        reason = str(dq_reason or "").strip().lower()
+        blob = f"{src} {reason}"
+        # Prefer explicit active hints from data source/reason.
+        if ("active_window" in blob) or ("active anchor" in blob) or ("exact active" in blob):
+            return "Active"
+        # Default non-strict anchor semantics are full-pool TVL.
+        return "Full"
     for pool_id, v in all_items:
         fees = v.get("fees") or []
         tvl = v.get("tvl") or []
@@ -18258,12 +18271,13 @@ def _merge_for_web(
                     status=sanity_status,
                 )
         else:
+            anchor_type = _infer_anchor_type_for_normal_row(v, dq_reason)
             row = {
                 "pool_id": base_pool_id,
                 "chain": base_chain,
                 "version": base_version,
                 "pair": base_pair,
-                "anchor_type": "",
+                "anchor_type": anchor_type,
                 "fee_pct": base_fee_pct,
                 "final_income": final_income,
                 "apy_pct": float(apy_pct),
