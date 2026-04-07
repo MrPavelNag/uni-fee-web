@@ -22,6 +22,7 @@ import time
 from decimal import Decimal, getcontext
 from typing import Any
 
+import requests
 from config import DEFAULT_TOKEN_PAIRS, FEE_DAYS, LP_ALLOCATION_USD, UNISWAP_V4_SUBGRAPHS
 from agent_common import build_exact_day_window, pairs_to_filename_suffix, save_chart_data_json
 from agent_v3 import CHAIN_ID_BY_KEY, _erc20_decimals, _rpc_json
@@ -85,6 +86,19 @@ _V4_GET_TICK_LIQ_SELECTOR = "0xcaedab54"  # getTickLiquidity(bytes32,int24)
 _V4_TOPIC_INITIALIZE = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
 _V4_TOPIC_MODIFY_LIQ = "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec"
 
+_UNISWAP_INTERFACE_GRAPHQL = "https://interface.gateway.uniswap.org/v1/graphql"
+_UNISWAP_CHAIN_ENUM_BY_KEY: dict[str, str] = {
+    "ethereum": "ETHEREUM",
+    "arbitrum": "ARBITRUM",
+    "base": "BASE",
+    "polygon": "POLYGON",
+    "optimism": "OPTIMISM",
+    "avalanche": "AVALANCHE",
+    "unichain": "UNICHAIN",
+    "bsc": "BNB",
+    "celo": "CELO",
+}
+
 
 def _keccak256_hex(data: bytes) -> str:
     try:
@@ -110,6 +124,55 @@ def _v4_swap_topic_candidates() -> list[str]:
         if t0 and t0 not in out:
             out.append(t0.lower())
     return out
+
+
+def _uniswap_interface_v4_pool_metrics(chain: str, pool_id: str, *, timeout_sec: float = 8.0) -> tuple[dict[str, float], str]:
+    chain_enum = _UNISWAP_CHAIN_ENUM_BY_KEY.get(str(chain or "").strip().lower(), "")
+    pid = str(pool_id or "").strip().lower()
+    if not chain_enum:
+        return {}, "chain_not_supported_by_interface_api"
+    if not _is_hex(pid, 64):
+        return {}, "pool_id_must_be_64hex"
+    q = """
+    query V4Pool($chain: Chain!, $poolId: String!) {
+      v4Pool(chain: $chain, poolId: $poolId) {
+        feeTier
+        totalLiquidity { value }
+        volume24h: cumulativeVolume(duration: DAY) { value }
+      }
+    }
+    """
+    body = {"query": q, "variables": {"chain": chain_enum, "poolId": pid}, "operationName": "V4Pool"}
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        # Uniswap interface gateway is stricter than plain subgraph endpoints.
+        "origin": "https://app.uniswap.org",
+        "referer": "https://app.uniswap.org/",
+        "user-agent": "Mozilla/5.0",
+    }
+    try:
+        r = requests.post(_UNISWAP_INTERFACE_GRAPHQL, json=body, headers=headers, timeout=max(3.0, float(timeout_sec)))
+        if int(r.status_code) != 200:
+            return {}, f"http_{int(r.status_code)}"
+        payload = r.json() if r.content else {}
+        errs = payload.get("errors") or []
+        if errs:
+            msg = str((errs[0] or {}).get("message") or "graphql_error").strip() or "graphql_error"
+            return {}, f"graphql:{msg}"
+        p = ((payload.get("data") or {}).get("v4Pool") or {})
+        if not isinstance(p, dict) or not p:
+            return {}, "empty_v4Pool"
+        out = {
+            "fee_tier": float(p.get("feeTier") or 0.0),
+            "total_liquidity_usd": float(((p.get("totalLiquidity") or {}).get("value") or 0.0)),
+            "volume24h_usd": float(((p.get("volume24h") or {}).get("value") or 0.0)),
+        }
+        if out["total_liquidity_usd"] <= 0.0:
+            return {}, "total_liquidity_non_positive"
+        return out, ""
+    except Exception as e:
+        return {}, f"request_error:{type(e).__name__}"
 
 
 def _is_hex(v: str, n_hex: int) -> bool:
@@ -842,6 +905,17 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     dbg["decimals0"] = int(d0)
     dbg["decimals1"] = int(d1)
 
+    interface_metrics, interface_err = _uniswap_interface_v4_pool_metrics(ck, pool_id, timeout_sec=8.0)
+    interface_full_tvl = float(interface_metrics.get("total_liquidity_usd") or 0.0)
+    dbg["uniswap_interface_source"] = "interface.gateway.uniswap.org/v1/graphql"
+    dbg["uniswap_interface_ok"] = bool(interface_full_tvl > 0.0)
+    if interface_full_tvl > 0.0:
+        dbg["uniswap_interface_full_tvl_usd"] = float(interface_full_tvl)
+        dbg["uniswap_interface_volume24h_usd"] = float(interface_metrics.get("volume24h_usd") or 0.0)
+        dbg["uniswap_interface_fee_tier"] = float(interface_metrics.get("fee_tier") or 0.0)
+    else:
+        dbg["uniswap_interface_error"] = str(interface_err or "unavailable")
+
     qty_src_or_err = ""
     full_available = False
     try:
@@ -876,7 +950,7 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     dbg["quantity_source"] = str(qty_src_or_err or "")
     dbg["amount0_raw"] = float(a0_raw or 0.0)
     dbg["amount1_raw"] = float(a1_raw or 0.0)
-    if a0_raw <= 0.0 and a1_raw <= 0.0:
+    if a0_raw <= 0.0 and a1_raw <= 0.0 and interface_full_tvl <= 0.0:
         dbg["error"] = str(qty_src_or_err or "quantities_unavailable")
         dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
         return 0.0, "", str(qty_src_or_err or "strict_required:v4_exact2:quantities_unavailable"), dbg
@@ -903,15 +977,25 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
         if p1 <= 0 and p0 > 0 and ratio01 > 0:
             p1 = p0 / ratio01
     if p0 <= 0 and p1 <= 0:
-        dbg["error"] = "price_unavailable"
+        if interface_full_tvl <= 0.0:
+            dbg["error"] = "price_unavailable"
+            dbg["price_errors"] = [str(x) for x in errs if str(x).strip()]
+            dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
+            return 0.0, "", (";".join(str(x) for x in errs if str(x).strip()) or "strict_required:v4_exact2:price_unavailable"), dbg
+        # Full TVL from Uniswap interface is available; keep active window as unknown (0).
+        p0 = 0.0
+        p1 = 0.0
         dbg["price_errors"] = [str(x) for x in errs if str(x).strip()]
-        dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
-        return 0.0, "", (";".join(str(x) for x in errs if str(x).strip()) or "strict_required:v4_exact2:price_unavailable"), dbg
+        dbg["price_unavailable_active_disabled"] = True
 
     tvl = max(0.0, a0 * max(0.0, p0)) + max(0.0, a1 * max(0.0, p1))
     tvl_full = max(0.0, float(a0_full) * max(0.0, p0)) + max(0.0, float(a1_full) * max(0.0, p1))
     tvl_active = max(0.0, float(a0_active_raw / (10 ** d0)) * max(0.0, p0)) + max(0.0, float(a1_active_raw / (10 ** d1)) * max(0.0, p1))
-    dbg["tvl_full_pool_usd"] = float(tvl_full)
+    if interface_full_tvl > 0.0:
+        tvl = float(interface_full_tvl)
+        qty_src_or_err = "uniswap_interface_v4Pool_totalLiquidity"
+    dbg["tvl_full_pool_usd_from_quantities"] = float(tvl_full)
+    dbg["tvl_full_pool_usd"] = float(interface_full_tvl if interface_full_tvl > 0.0 else tvl_full)
     dbg["tvl_active_window_usd"] = float(tvl_active)
     if tvl <= 0:
         dbg["error"] = "computed_tvl_zero"
@@ -924,6 +1008,7 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
         psrc = f"{s0}+{s1}"
     src = (
         f"v4_exact2:one_point_qty={qty_src_or_err}:alt={dbg.get('quantity_source_secondary')}"
+        f":full_src={'uniswap_interface' if interface_full_tvl > 0.0 else 'quantized'}"
         f":state={state_src_or_err}:liq={int(pool_liquidity)}:tick={int(current_tick)}:price={psrc}"
     )
     dbg["price_source"] = str(psrc or "")
