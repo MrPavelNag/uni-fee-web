@@ -33524,7 +33524,7 @@ HTML_PAGE = """
         showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
-        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
+        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, rangemode: "tozero"}
       }, {displaylogo: false, responsive: true}).then(() => {
         installChartTitleHint("feesChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
       });
@@ -33536,7 +33536,7 @@ HTML_PAGE = """
         showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
-        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false}
+        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, rangemode: "tozero"}
       }, {displaylogo: false, responsive: true}).then(() => {
         installChartTitleHint("tvlChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
       });
