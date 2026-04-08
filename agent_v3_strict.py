@@ -968,6 +968,33 @@ def _normalize_exact_series_to_fees(
     return [(int(ts), float(by_ts.get(int(ts), 0.0))) for ts, _ in (fees_usd or [])]
 
 
+def _expand_sparse_tvl_to_fee_days(
+    fees_usd: list[tuple[int, float]],
+    sparse_series: list[tuple[int, float]],
+    *,
+    fallback_value: float = 0.0,
+) -> list[tuple[int, float]]:
+    days = [int(ts) for ts, _ in (fees_usd or [])]
+    if not days:
+        return []
+    sparse = sorted(
+        [(int(ts), float(v or 0.0)) for ts, v in (sparse_series or []) if int(ts) > 0 and float(v or 0.0) > 0.0],
+        key=lambda x: int(x[0]),
+    )
+    if not sparse:
+        fv = float(max(0.0, float(fallback_value or 0.0)))
+        return [(int(ts), fv) for ts in days]
+    out: list[tuple[int, float]] = []
+    j = 0
+    last_v = float(sparse[0][1])
+    for ts in days:
+        while j < len(sparse) and int(sparse[j][0]) <= int(ts):
+            last_v = float(sparse[j][1])
+            j += 1
+        out.append((int(ts), float(max(0.0, last_v))))
+    return out
+
+
 def _blend_exact_with_estimated(
     exact_series: list[tuple[int, float]],
     estimated_series: list[tuple[int, float]],
@@ -2299,9 +2326,15 @@ def main() -> None:
         )
         if onchain_active_sparse:
             exact_active_tvl = _append_now_tvl_anchor(list(onchain_active_sparse), float(tvl_active_now))
-            if estimated_active_fees:
-                exact_active_fees = _sparse_series_every_n_days(estimated_active_fees, active_step_days)
-                exact_active_fees = _append_now_fee_anchor(exact_active_fees)
+            # Build exact active fees from exact active TVL (independent from estimated active branch).
+            active_tvl_for_fees = _expand_sparse_tvl_to_fee_days(
+                fees_usd,
+                list(onchain_active_sparse),
+                fallback_value=float(tvl_active_now),
+            )
+            exact_active_fees_base = _rebuild_fees_cumulative(fees_usd, active_tvl_for_fees)
+            exact_active_fees = _sparse_series_every_n_days(exact_active_fees_base, active_step_days)
+            exact_active_fees = _append_now_fee_anchor(exact_active_fees)
             if isinstance(tvl_now_debug, dict):
                 tvl_now_debug["active_history_source"] = str(onchain_active_reason)
         elif isinstance(tvl_now_debug, dict):
