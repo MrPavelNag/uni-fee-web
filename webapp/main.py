@@ -18324,14 +18324,24 @@ def _merge_for_web(
                 risk_reason=ex_risk_reason,
                 risk_flags=ex_risk_flags,
             )
-            if ex_active_tvl:
-                ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
-                ex_act_income = float(ex_active_fees[-1][1]) if ex_active_fees else 0.0
-                ex_act_apy = (ex_act_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+            if est_active_tvl or ex_active_tvl:
+                active_dbg = ((v.get("strict_debug") or {}).get("v3_tvl_now") or {}) if isinstance(v, dict) else {}
+                if ex_active_tvl:
+                    ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
+                    ex_act_income = float(ex_active_fees[-1][1]) if ex_active_fees else 0.0
+                    ex_act_apy = (ex_act_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
+                    ex_act_quality = "exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"
+                    ex_act_reason = f"Exact active now ({src_lbl})"
+                else:
+                    ex_act_last_tvl = float(active_dbg.get("tvl_active_window_usd") or 0.0)
+                    ex_act_income = 0.0
+                    ex_act_apy = 0.0
+                    ex_act_quality = "strict_unavailable"
+                    ex_act_reason = f"Exact active unavailable ({src_lbl})"
                 ex_act_risk_level, ex_act_risk_reason, ex_act_risk_flags = _risk_assessment(
                     apy_pct=ex_act_apy,
                     last_tvl=ex_act_last_tvl,
-                    dq_reason=f"Exact active now ({src_lbl})",
+                    dq_reason=ex_act_reason,
                     tvl_price_source=tvl_src_raw,
                     fees_series=ex_active_fees,
                 )
@@ -18346,8 +18356,8 @@ def _merge_for_web(
                     income=ex_act_income,
                     apy=ex_act_apy,
                     last_tvl=ex_act_last_tvl,
-                    data_quality=("exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"),
-                    data_quality_reason=f"Exact active now ({src_lbl})",
+                    data_quality=ex_act_quality,
+                    data_quality_reason=ex_act_reason,
                     status=status,
                     calc_path_human=_calc_path_human(v, branch="exact", anchor_type="Active", has_strict_compare=True),
                     risk_level=ex_act_risk_level,
@@ -32037,6 +32047,7 @@ HTML_PAGE = """
     let scanProgressPct = 0;
     let scanProgressTargetPct = 0;
     let scanLastBackendAt = 0;
+    let strictStageStartedAt = 0;
     let pairListsHintBySymbol = {};
     let pairListsIconUrls = {};
     let pairListsExpanded = false;
@@ -32671,6 +32682,7 @@ HTML_PAGE = """
       scanProgressPct = 0;
       scanProgressTargetPct = 0;
       scanLastBackendAt = 0;
+      strictStageStartedAt = 0;
     }
 
     function startScanTicker() {
@@ -32692,11 +32704,25 @@ HTML_PAGE = """
         const elapsed = Math.max(0, Math.floor((Date.now() - scanStartedAt) / 1000));
         const backendTargetRaw = Math.max(0, Math.min(100, Number(scanProgressTargetPct || 0)));
         // Realistic UI: follow backend progress and never run far ahead by timer.
-        const target = (backendTargetRaw >= 100) ? 100 : Math.min(99, backendTargetRaw);
+        const stageTxt = String(scanStageLabel || "").toLowerCase();
+        const strictStage = (stageTxt.includes("strict exact") || stageTxt.includes("running strict"));
+        let stageLimitedTarget = backendTargetRaw;
+        if (strictStage && backendTargetRaw <= 78) {
+          if (!(strictStageStartedAt > 0)) strictStageStartedAt = Date.now();
+          const strictElapsedSec = Math.max(0, (Date.now() - strictStageStartedAt) / 1000);
+          // Slow down the climb during strict stage for more realistic progress around 75%.
+          const realisticCap = Math.min(78, 22 + strictElapsedSec * 1.05);
+          stageLimitedTarget = Math.min(stageLimitedTarget, realisticCap);
+        } else if (!strictStage) {
+          strictStageStartedAt = 0;
+        }
+        const target = (stageLimitedTarget >= 100) ? 100 : Math.min(99, stageLimitedTarget);
         const current = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
         if (target > current) {
           const diff = target - current;
-          const step = Math.max(1, Math.min(6, Math.ceil(diff / 4)));
+          const step = strictStage
+            ? Math.max(1, Math.min(3, Math.ceil(diff / 8)))
+            : Math.max(1, Math.min(6, Math.ceil(diff / 4)));
           scanProgressPct = Math.min(target, current + step);
         } else if (target < current) {
           // Backend can move backward on stage transitions; ease down slightly.
@@ -32726,6 +32752,12 @@ HTML_PAGE = """
     function updateProgress(progress, stageLabel) {
       scanStageLabel = String(stageLabel || "running");
       scanProgressTargetPct = Math.max(0, Math.min(100, Number(progress || 0)));
+      const s = String(scanStageLabel || "").toLowerCase();
+      if (s.includes("strict exact") || s.includes("running strict")) {
+        if (!(strictStageStartedAt > 0)) strictStageStartedAt = Date.now();
+      } else {
+        strictStageStartedAt = 0;
+      }
       scanLastBackendAt = Date.now();
     }
 

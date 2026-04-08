@@ -613,6 +613,252 @@ def _v3_active_tvl_onchain_sparse_snapshots(
     return [(int(ts), float(v)) for ts, v in out], reason
 
 
+def _v3_active_positions_amounts_from_subgraph_at_block(
+    endpoint: str,
+    pool_id: str,
+    current_tick: int,
+    sqrt_price_x96: int,
+    block_number: int,
+) -> tuple[float, float, str, dict[str, Any]]:
+    ep = str(endpoint or "").strip()
+    pid = str(pool_id or "").strip().lower()
+    bn = int(block_number or 0)
+    if not ep:
+        return 0.0, 0.0, "active_positions_hist_no_endpoint", {"active_positions_count": 0}
+    if not pid or bn <= 0:
+        return 0.0, 0.0, "active_positions_hist_invalid_inputs", {"active_positions_count": 0}
+    if int(sqrt_price_x96) <= 0:
+        return 0.0, 0.0, "active_positions_hist_invalid_price", {"active_positions_count": 0}
+
+    q_filtered = """
+    query ActivePositionsAtBlock($pool: String!, $tick: BigInt!, $last: String!, $block: Int!) {
+      positions(
+        block: { number: $block }
+        first: 1000
+        orderBy: id
+        orderDirection: asc
+        where: {
+          pool: $pool
+          liquidity_gt: "0"
+          id_gt: $last
+          tickLower_: { tickIdx_lte: $tick }
+          tickUpper_: { tickIdx_gt: $tick }
+        }
+      ) {
+        id
+        liquidity
+        tickLower { tickIdx }
+        tickUpper { tickIdx }
+      }
+    }
+    """
+    q_unfiltered = """
+    query ActivePositionsUnfilteredAtBlock($pool: String!, $last: String!, $block: Int!) {
+      positions(
+        block: { number: $block }
+        first: 1000
+        orderBy: id
+        orderDirection: asc
+        where: {
+          pool: $pool
+          liquidity_gt: "0"
+          id_gt: $last
+        }
+      ) {
+        id
+        liquidity
+        tickLower { tickIdx }
+        tickUpper { tickIdx }
+      }
+    }
+    """
+
+    sqrt_p = Decimal(int(sqrt_price_x96))
+    sqrt_cache: dict[int, Decimal] = {}
+
+    def _sqrt_tick(t: int) -> Decimal:
+        x = int(t)
+        v = sqrt_cache.get(x)
+        if v is not None:
+            return v
+        v = _sqrt_ratio_x96_at_tick(x)
+        sqrt_cache[x] = v
+        return v
+
+    max_pages = int(max(1, int(os.environ.get("STRICT_V3_ACTIVE_HIST_POS_MAX_PAGES", "12") or 12)))
+    max_rows = int(max(1000, int(os.environ.get("STRICT_V3_ACTIVE_HIST_POS_MAX_ROWS", "12000") or 12000)))
+
+    def _scan(query_text: str, *, use_tick_filter: bool) -> tuple[Decimal, Decimal, int, int, int, str]:
+        total0 = Decimal(0)
+        total1 = Decimal(0)
+        scanned = 0
+        visited = 0
+        last_id = ""
+        pages = 0
+        err = ""
+        while pages < max_pages and visited < max_rows:
+            vars_payload: dict[str, Any] = {"pool": pid, "last": str(last_id), "block": int(bn)}
+            if use_tick_filter:
+                vars_payload["tick"] = str(int(current_tick))
+            try:
+                data = graphql_query(ep, query_text, vars_payload, retries=1)
+            except Exception as e:
+                err = f"active_positions_hist_query_failed:{e}"
+                break
+            rows = ((data or {}).get("data") or {}).get("positions") or []
+            if not isinstance(rows, list) or not rows:
+                break
+            pages += 1
+            for r in rows:
+                try:
+                    liq = int(str((r or {}).get("liquidity") or "0"))
+                    lo = int(str((((r or {}).get("tickLower") or {}).get("tickIdx") or "0")))
+                    hi = int(str((((r or {}).get("tickUpper") or {}).get("tickIdx") or "0")))
+                except Exception:
+                    continue
+                visited += 1
+                if liq <= 0 or hi <= lo:
+                    continue
+                if not (lo <= int(current_tick) < hi):
+                    continue
+                sqrt_lo = _sqrt_tick(lo)
+                sqrt_hi = _sqrt_tick(hi)
+                if not (sqrt_lo <= sqrt_p < sqrt_hi):
+                    continue
+                a0, _ = _amounts_from_liquidity_segment(Decimal(liq), sqrt_p, sqrt_hi)
+                _, a1 = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_p)
+                if a0 <= 0 and a1 <= 0:
+                    continue
+                total0 += a0
+                total1 += a1
+                scanned += 1
+                if visited >= max_rows:
+                    break
+            last_id = str((rows[-1] or {}).get("id") or last_id)
+            if len(rows) < 1000:
+                break
+        return total0, total1, scanned, pages, visited, err
+
+    total0, total1, scanned, pages, visited, err = _scan(q_filtered, use_tick_filter=True)
+    source_base = "active_positions_hist_subgraph_filtered"
+    if err:
+        source_base = "active_positions_hist_filtered_error"
+    if scanned <= 0:
+        f_total0, f_total1, f_scanned, f_pages, f_visited, f_err = _scan(q_unfiltered, use_tick_filter=False)
+        if f_scanned > 0 or (not err and not f_err):
+            total0, total1, scanned, pages, visited = f_total0, f_total1, f_scanned, f_pages, f_visited
+            source_base = "active_positions_hist_subgraph_local_filter"
+            err = f_err
+        elif f_err and not err:
+            err = f_err
+            source_base = "active_positions_hist_local_filter_error"
+    src = source_base
+    if scanned >= max_rows or visited >= max_rows:
+        src = f"{source_base}_partial_row_cap"
+    elif pages >= max_pages:
+        src = f"{source_base}_partial_page_cap"
+    if err:
+        src = f"{src}:{err}"
+    return float(total0), float(total1), src, {
+        "active_positions_count": int(scanned),
+        "active_positions_pages": int(pages),
+        "active_positions_rows_visited": int(visited),
+    }
+
+
+def _v3_active_tvl_subgraph_sparse_snapshots(
+    *,
+    chain: str,
+    endpoint: str,
+    pool: dict[str, Any],
+    fees_usd: list[tuple[int, float]],
+    day_start_ts: int,
+    day_end_ts: int,
+    step_days: int,
+    budget_sec: float,
+) -> tuple[list[tuple[int, float]], str]:
+    ck = str(chain or "").strip().lower()
+    ep = str(endpoint or "").strip()
+    chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    pool_id = str(pool.get("id") or "").strip().lower()
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    if chain_id <= 0 or not (_is_eth_address(pool_id) and token0 and token1 and ep):
+        return [], "active_subgraph_sparse:invalid_inputs"
+    if not fees_usd:
+        return [], "active_subgraph_sparse:no_fee_days"
+    t0 = time.monotonic()
+    deadline = t0 + max(8.0, float(budget_sec))
+    sparse = _sparse_series_every_n_days([(int(ts), 1.0) for ts, _ in fees_usd], max(1, int(step_days)))
+    targets = [int(ts) for ts, _ in sparse if int(ts) > 0]
+    if fees_usd and (not targets or int(targets[-1]) != int(fees_usd[-1][0])):
+        targets.append(int(fees_usd[-1][0]))
+    targets = sorted({int(x) for x in targets if int(x) > 0})
+    if not targets:
+        return [], "active_subgraph_sparse:no_targets"
+
+    day_blocks: dict[int, int] = {}
+    for ts in targets:
+        if time.monotonic() >= deadline:
+            return [], "active_subgraph_sparse:budget_timeout:block_resolution"
+        day_ts = int((int(ts) // 86400) * 86400)
+        if day_ts in day_blocks:
+            continue
+        try:
+            day_blocks[day_ts] = int(_llama_block_for_day(ck, day_ts + 86399))
+        except Exception:
+            day_blocks[day_ts] = 0
+    if not any(int(x) > 0 for x in day_blocks.values()):
+        return [], "active_subgraph_sparse:no_day_blocks"
+
+    dec0 = int(_token_decimals_from_pool(pool, "token0") or _erc20_decimals(chain_id, token0))
+    dec1 = int(_token_decimals_from_pool(pool, "token1") or _erc20_decimals(chain_id, token1))
+    day_price: dict[int, tuple[float, float]] = {}
+    out: list[tuple[int, float]] = []
+    points_done = 0
+    for ts in targets:
+        if time.monotonic() >= deadline:
+            break
+        day_ts = int((int(ts) // 86400) * 86400)
+        b = int(day_blocks.get(day_ts, 0))
+        if b <= 0:
+            continue
+        pp = day_price.get(day_ts)
+        if pp is None:
+            p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
+            p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
+            day_price[day_ts] = (float(max(0.0, p0)), float(max(0.0, p1)))
+            pp = day_price[day_ts]
+        p0, p1 = pp
+        sqrt_p_x96, tick_now, _liq_now, _spacing, st_err = _v3_pool_state_at_block(chain_id, pool_id, hex(int(b)))
+        if int(sqrt_p_x96) <= 0 or st_err:
+            continue
+        act0_raw, act1_raw, _src, _dbg = _v3_active_positions_amounts_from_subgraph_at_block(
+            endpoint=ep,
+            pool_id=pool_id,
+            current_tick=int(tick_now),
+            sqrt_price_x96=int(sqrt_p_x96),
+            block_number=int(b),
+        )
+        amt0 = float(act0_raw) / float(10 ** max(0, int(dec0)))
+        amt1 = float(act1_raw) / float(10 ** max(0, int(dec1)))
+        if amt0 <= 0.0 and amt1 <= 0.0:
+            continue
+        tvl = max(0.0, amt0 * max(0.0, float(p0))) + max(0.0, amt1 * max(0.0, float(p1)))
+        if tvl <= 0.0:
+            continue
+        out.append((int(ts), float(tvl)))
+        points_done += 1
+    if not out:
+        return [], "active_subgraph_sparse:no_points"
+    out = sorted({int(ts): float(v) for ts, v in out}.items(), key=lambda x: int(x[0]))
+    reason = (
+        f"active_subgraph_sparse:ok:points={int(points_done)}/{len(targets)}:"
+        f"elapsed={max(0.0, time.monotonic() - t0):.1f}"
+    )
+    return [(int(ts), float(v)) for ts, v in out], reason
+
+
 def _symbol_decimals_hint(symbol: str) -> int:
     s = str(symbol or "").strip().upper()
     hints = {
@@ -2320,21 +2566,46 @@ def main() -> None:
             step_days=int(active_step_days),
             budget_sec=float(active_hist_budget),
         )
-        if onchain_active_sparse:
-            exact_active_tvl = _append_now_tvl_anchor(list(onchain_active_sparse), float(tvl_active_now))
+        active_sparse = list(onchain_active_sparse or [])
+        active_source_reason = str(onchain_active_reason or "active_onchain_sparse:unavailable")
+        if not active_sparse:
+            try:
+                active_subgraph_budget = max(
+                    10.0,
+                    min(40.0, float(active_hist_budget) * 0.6),
+                )
+            except Exception:
+                active_subgraph_budget = 14.0
+            subgraph_active_sparse, subgraph_active_reason = _v3_active_tvl_subgraph_sparse_snapshots(
+                chain=str(found_chain),
+                endpoint=str(found_endpoint or ""),
+                pool=pool,
+                fees_usd=fees_usd,
+                day_start_ts=int((int(fees_usd[0][0]) // 86400) * 86400),
+                day_end_ts=int((int(fees_usd[-1][0]) // 86400) * 86400),
+                step_days=int(active_step_days),
+                budget_sec=float(active_subgraph_budget),
+            )
+            if subgraph_active_sparse:
+                active_sparse = list(subgraph_active_sparse)
+                active_source_reason = f"{active_source_reason}|fallback:{str(subgraph_active_reason)}"
+            else:
+                active_source_reason = f"{active_source_reason}|fallback:{str(subgraph_active_reason or 'active_subgraph_sparse:unavailable')}"
+        if active_sparse:
+            exact_active_tvl = _append_now_tvl_anchor(list(active_sparse), float(tvl_active_now))
             # Build exact active fees from exact active TVL (independent from estimated active branch).
             active_tvl_for_fees = _expand_sparse_tvl_to_fee_days(
                 fees_usd,
-                list(onchain_active_sparse),
+                list(active_sparse),
                 fallback_value=float(tvl_active_now),
             )
             exact_active_fees_base = _rebuild_fees_cumulative(fees_usd, active_tvl_for_fees)
             exact_active_fees = _sparse_series_every_n_days(exact_active_fees_base, active_step_days)
             exact_active_fees = _append_now_fee_anchor(exact_active_fees)
             if isinstance(tvl_now_debug, dict):
-                tvl_now_debug["active_history_source"] = str(onchain_active_reason)
+                tvl_now_debug["active_history_source"] = str(active_source_reason)
         elif isinstance(tvl_now_debug, dict):
-            tvl_now_debug["active_history_source"] = str(onchain_active_reason or "active_onchain_sparse:unavailable")
+            tvl_now_debug["active_history_source"] = str(active_source_reason)
             # Optional legacy fallback (off by default): mirror estimated active branch.
             use_est_fallback = str(os.environ.get("STRICT_V3_ACTIVE_ONCHAIN_FALLBACK_ESTIMATE", "0")).strip().lower() in {"1", "true", "yes", "on"}
             if use_est_fallback and estimated_active_tvl:
