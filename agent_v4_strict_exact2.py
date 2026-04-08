@@ -25,7 +25,7 @@ from typing import Any
 import requests
 from config import DEFAULT_TOKEN_PAIRS, FEE_DAYS, LP_ALLOCATION_USD, UNISWAP_V4_SUBGRAPHS
 from agent_common import build_exact_day_window, pairs_to_filename_suffix, save_chart_data_json
-from agent_v3 import CHAIN_ID_BY_KEY, _erc20_decimals, _rpc_json
+from agent_v3 import CHAIN_ID_BY_KEY, _erc20_decimals, _llama_block_for_day, _rpc_json
 from agent_v4 import get_endpoint, query_pool_day_data
 from price_oracle import get_token_prices_usd
 from uniswap_client import graphql_query
@@ -745,28 +745,35 @@ def _v4_onchain_historical_tvl_snapshots(
     dbg["targets"] = int(len(targets))
     dbg["counters"]["targets_total"] = int(len(targets))
 
-    # Prepare full-pool tick universe (on-chain). If timeout/error: fallback to active*ratio.
+    # Prepare full-pool tick universe (on-chain). If disabled/timeout/error: fallback to active*ratio.
     t0 = time.monotonic()
     total_budget = max(12.0, float(budget_sec))
-    ticks_budget = max(4.0, float(total_budget) * 0.45)
+    try:
+        full_scan_enable = str(os.environ.get("STRICT_V4_ONCHAIN_HISTORY_FULL_SCAN_ENABLE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        full_scan_enable = False
+    ticks_budget = max(3.0, float(total_budget) * (0.40 if full_scan_enable else 0.15))
     ticks_deadline_ts = t0 + ticks_budget
     snapshot_deadline_ts = t0 + total_budget
     ticks: list[int] = []
     ticks_status = ""
     t_ticks0 = time.monotonic()
-    init_meta, init_err = _pool_init_meta(chain_id, pm, pool_id, int(latest_block))
-    if init_meta and int(init_meta.get("block") or 0) > 0:
-        from_block = int(init_meta.get("block") or 0)
-        ticks, ticks_status = _fetch_modified_ticks(
-            chain_id,
-            pm,
-            pool_id,
-            from_block,
-            int(latest_block),
-            deadline_ts=ticks_deadline_ts,
-        )
+    if full_scan_enable:
+        init_meta, init_err = _pool_init_meta(chain_id, pm, pool_id, int(latest_block))
+        if init_meta and int(init_meta.get("block") or 0) > 0:
+            from_block = int(init_meta.get("block") or 0)
+            ticks, ticks_status = _fetch_modified_ticks(
+                chain_id,
+                pm,
+                pool_id,
+                from_block,
+                int(latest_block),
+                deadline_ts=ticks_deadline_ts,
+            )
+        else:
+            ticks_status = str(init_err or "init_meta_unavailable")
     else:
-        ticks_status = str(init_err or "init_meta_unavailable")
+        ticks_status = "disabled"
     dbg["stage_ms"]["ticks_prepare"] = int(round(max(0.0, time.monotonic() - t_ticks0) * 1000.0))
     dbg["ticks_status"] = str(ticks_status or "ok")
     dbg["ticks_count"] = int(len(ticks or []))
@@ -778,11 +785,30 @@ def _v4_onchain_historical_tvl_snapshots(
     now_act = float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0)
     full_to_active_ratio = (now_full / now_act) if (now_full > 0 and now_act > 0) else 0.0
 
+    # Resolve target days to blocks once (prefer DefiLlama mapping, fallback to RPC binary search).
+    target_days = sorted({int((int(ts) // 86400) * 86400) for ts in targets if int(ts) > 0})
+    day_to_block: dict[int, int] = {}
+    t_blocks0 = time.monotonic()
+    for day_ts in target_days:
+        if time.monotonic() >= snapshot_deadline_ts:
+            break
+        b = 0
+        try:
+            b = int(_llama_block_for_day(ck, int(day_ts) + 86399))
+        except Exception:
+            b = 0
+        if b <= 0:
+            # Fallback: slower RPC binary search only for days missing in llama.
+            b = int(_first_block_at_or_after_ts(chain_id, int(day_ts), int(latest_block)))
+        day_to_block[int(day_ts)] = int(max(0, b))
+    dbg["stage_ms"]["block_resolve"] = int(round(max(0.0, time.monotonic() - t_blocks0) * 1000.0))
+
     for ts in targets:
         if time.monotonic() >= snapshot_deadline_ts:
             dbg["timeout"] = True
             break
-        b = _first_block_at_or_after_ts(chain_id, int(ts), int(latest_block))
+        day_ts = int((int(ts) // 86400) * 86400)
+        b = int(day_to_block.get(day_ts, 0))
         if b <= 0:
             dbg["counters"]["block_resolve_fail"] = int(dbg["counters"]["block_resolve_fail"]) + 1
             if len(dbg["samples"]["block_resolve_fail_ts"]) < 6:
