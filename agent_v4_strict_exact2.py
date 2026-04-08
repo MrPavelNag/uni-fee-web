@@ -1101,21 +1101,17 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     tvl_full = max(0.0, float(a0_full) * max(0.0, p0)) + max(0.0, float(a1_full) * max(0.0, p1))
     act0 = float(a0_active_raw / (10 ** d0)) if d0 > 0 else 0.0
     act1 = float(a1_active_raw / (10 ** d1)) if d1 > 0 else 0.0
-    # Root-cause fix: active is a subset of full pool balances.
-    # Keep both branches in one quantity domain to avoid source-mixing inversions.
+    # Do not cap active by subgraph full-token balances here:
+    # in V4 they can be stale/incomplete and suppress active TVL incorrectly.
     act0_raw_pre_cap = float(max(0.0, act0))
     act1_raw_pre_cap = float(max(0.0, act1))
-    if full_available:
-        act0 = float(min(max(0.0, act0), max(0.0, float(a0_full))))
-        act1 = float(min(max(0.0, act1), max(0.0, float(a1_full))))
     tvl_active = max(0.0, float(act0) * max(0.0, p0)) + max(0.0, float(act1) * max(0.0, p1))
-    # Prefer quantized full TVL for strict compare consistency.
-    # Use Interface TVL only as fallback when quantized full is unavailable.
-    if float(tvl_full) > 0.0:
-        tvl = float(tvl_full)
-    elif interface_full_tvl > 0.0:
+    # Keep interface full TVL as primary when available (historically more stable on V4).
+    if interface_full_tvl > 0.0:
         tvl = float(interface_full_tvl)
-        qty_src_or_err = "uniswap_interface_v4Pool_totalLiquidity_fallback"
+        qty_src_or_err = "uniswap_interface_v4Pool_totalLiquidity"
+    elif float(tvl_full) > 0.0:
+        tvl = float(tvl_full)
     dbg["amount0_active_window_raw_uncapped"] = float(act0_raw_pre_cap)
     dbg["amount1_active_window_raw_uncapped"] = float(act1_raw_pre_cap)
     dbg["tvl_full_pool_usd_from_quantities"] = float(tvl_full)
@@ -1677,45 +1673,32 @@ def main() -> None:
         onchain_hist_active_tvl = list(hist_active or [])
         strict_dbg["onchain_history_debug"] = dict(hist_dbg or {})
 
-    if raw_tvl_positive_days > 0:
-        estimated_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
-        estimated_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_tvl_base)
-        estimated_tvl = _append_now_tvl_anchor(estimated_tvl_base, float(pool_tvl_now_usd))
-        estimated_fees = _append_now_fee_anchor(estimated_fees_base)
+    # Match V3 principle:
+    # estimated(active/full) always use _build_estimated_tvl with NOW anchor.
+    # If raw_tvl has no positive days, _build_estimated_tvl naturally becomes flat NOW-series.
+    estimated_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
+    estimated_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_tvl_base)
+    estimated_tvl = _append_now_tvl_anchor(estimated_tvl_base, float(pool_tvl_now_usd))
+    estimated_fees = _append_now_fee_anchor(estimated_fees_base)
 
-        # Align V4 exact compare behavior with V3 exact compare:
-        # exact series = sparse points over exact-now anchored shape + explicit NOW anchor.
-        exact_tvl = _sparse_series_every_n_days(estimated_tvl_base, exact_step_days)
-        exact_tvl = _append_now_tvl_anchor(exact_tvl, float(pool_tvl_now_usd))
-        exact_fees = _sparse_series_every_n_days(estimated_fees_base, exact_step_days)
-        exact_fees = _append_now_fee_anchor(exact_fees)
+    # Align V4 exact compare behavior with V3 exact compare:
+    # exact series = sparse points over exact-now anchored shape + explicit NOW anchor.
+    exact_tvl = _sparse_series_every_n_days(estimated_tvl_base, exact_step_days)
+    exact_tvl = _append_now_tvl_anchor(exact_tvl, float(pool_tvl_now_usd))
+    exact_fees = _sparse_series_every_n_days(estimated_fees_base, exact_step_days)
+    exact_fees = _append_now_fee_anchor(exact_fees)
 
-        if tvl_active_now > 0.0:
-            estimated_active_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
-            estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl_base)
-            estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
-            estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
-        if onchain_hist_full_tvl:
-            exact_tvl = _append_now_tvl_anchor(list(onchain_hist_full_tvl), float(pool_tvl_now_usd))
-    else:
-        # No historical day-shape from subgraph:
-        # - keep TVL visualization as one-point marker (do not invent TVL shape),
-        # - but still compute cumulative fees from feesUSD on a flat NOW anchor.
-        estimated_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
-        exact_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
-        est_flat_tvl_for_fees = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in (fees_usd or [])]
-        estimated_fees_base = _rebuild_fees_cumulative(fees_usd, est_flat_tvl_for_fees)
-        estimated_fees = _append_now_fee_anchor(estimated_fees_base)
-        exact_fees = _sparse_series_every_n_days(estimated_fees_base, exact_step_days)
-        exact_fees = _append_now_fee_anchor(exact_fees)
-        if tvl_active_now > 0.0:
-            estimated_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
-            est_active_flat_tvl_for_fees = [(int(ts), float(tvl_active_now)) for ts, _ in (fees_usd or [])]
-            estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, est_active_flat_tvl_for_fees)
-            estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
-        if onchain_hist_full_tvl:
-            exact_tvl = _append_now_tvl_anchor(list(onchain_hist_full_tvl), float(pool_tvl_now_usd))
-            # Mirror exact history into estimated view only when subgraph shape is missing.
+    if tvl_active_now > 0.0:
+        estimated_active_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
+        estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl_base)
+        estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
+        estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
+
+    if onchain_hist_full_tvl:
+        exact_tvl = _append_now_tvl_anchor(list(onchain_hist_full_tvl), float(pool_tvl_now_usd))
+        # Keep previous behavior only when daily raw shape is missing:
+        # mirror exact history into estimated full curve.
+        if raw_tvl_positive_days <= 0:
             estimated_tvl = list(exact_tvl)
     if (not exact_tvl) and fees_usd:
         exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
