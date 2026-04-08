@@ -18005,6 +18005,8 @@ def _merge_for_web(
                         ah_src = str(v3_dbg.get("active_history_source") or "").strip().lower()
                         if ah_src.startswith("active_onchain_sparse:ok"):
                             ah_part = "exact active history=on-chain snapshots"
+                        elif "fallback:active_subgraph_sparse:ok" in ah_src:
+                            ah_part = "exact active history=subgraph block snapshots (fallback)"
                         elif ah_src:
                             ah_part = "exact active history=fallback"
                         else:
@@ -18192,8 +18194,6 @@ def _merge_for_web(
             ex_tvl = v.get("strict_compare_exact_tvl") or []
             ex_active_tvl = v.get("strict_compare_exact_active_tvl") or []
             ex_active_fees = v.get("strict_compare_exact_active_fees") or []
-            if (not ex_active_fees) and est_active_fees:
-                ex_active_fees = list(est_active_fees)
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
 
             tvl_end_ts = max(
@@ -19537,8 +19537,10 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     env_v4 = dict(env)
                     env_v4["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(v4_budget))
                     env_v4["WEB_V4_EXACT_POOL_BUDGET_SEC"] = str(int(v4_budget))
-                    strict_timeout_target_v4 = int(max(90, int(v4_budget) + 45))
-                    env_v4["AGENT_TIMEOUT_SEC"] = str(max(90, min(300, max(base_timeout, strict_timeout_target_v4))))
+                    # v4 strict runs two heavy phases sequentially (TVL-now + on-chain history),
+                    # so keep a larger timeout envelope than v3 strict.
+                    strict_timeout_target_v4 = int(max(150, int(v4_budget) * 2 + 75))
+                    env_v4["AGENT_TIMEOUT_SEC"] = str(max(150, min(600, max(base_timeout, strict_timeout_target_v4))))
                     v4_variant = "exact2"
                     v4_script = "agent_v4_strict_exact2.py"
                     logs.append(
@@ -31927,7 +31929,7 @@ HTML_PAGE = """
                     <div class="hint">Contract address</div>
                     <div class="contract-input-row">
                       <input id="targetPoolId" type="text" placeholder="0x... (40 hex address or 64 hex pool id)"/>
-                      <span class="contract-input-note">Detailed scan for one contract: ~1-2 min.</span>
+                      <span class="contract-input-note">Detailed scan for one contract: ~2-3 min.</span>
                     </div>
                   </div>
                 </div>
@@ -32691,15 +32693,6 @@ HTML_PAGE = """
       scanLastBackendAt = Date.now();
       const selected = getSelectedChains();
       const chainSummary = selected.length ? `${selected.length} chain(s)` : "all chains";
-      const parsePairScanProgress = (label) => {
-        const txt = String(label || "");
-        const m = txt.match(/Running pair scans\s*\((\d+)\s*\/\s*(\d+)\)/i);
-        if (!m) return null;
-        const done = Math.max(0, Number(m[1] || 0));
-        const total = Math.max(0, Number(m[2] || 0));
-        if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return null;
-        return {done, total};
-      };
       const tick = () => {
         const elapsed = Math.max(0, Math.floor((Date.now() - scanStartedAt) / 1000));
         const backendTargetRaw = Math.max(0, Math.min(100, Number(scanProgressTargetPct || 0)));

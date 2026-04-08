@@ -1501,9 +1501,19 @@ def main() -> None:
     except Exception:
         onchain_hist_enable = True
     try:
-        onchain_hist_budget = max(10.0, float(os.environ.get("STRICT_V4_ONCHAIN_HISTORY_BUDGET_SEC", str(max(20.0, float(budget_sec) * 0.75)))))
+        # Keep history phase bounded: strict v4 already spends budget on TVL-now resolution.
+        # Default to half of pool budget to avoid hitting subprocess timeout envelope.
+        onchain_hist_budget = max(
+            10.0,
+            float(
+                os.environ.get(
+                    "STRICT_V4_ONCHAIN_HISTORY_BUDGET_SEC",
+                    str(max(15.0, float(budget_sec) * 0.50)),
+                )
+            ),
+        )
     except Exception:
-        onchain_hist_budget = max(20.0, float(budget_sec) * 0.75)
+        onchain_hist_budget = max(15.0, float(budget_sec) * 0.50)
 
     estimated_tvl: list[tuple[int, float]] = []
     estimated_fees: list[tuple[int, float]] = []
