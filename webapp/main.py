@@ -18314,8 +18314,9 @@ def _merge_for_web(
             est_active_tvl = v.get("strict_compare_estimated_active_tvl") or []
             ex_fees = v.get("strict_compare_exact_fees") or []
             ex_tvl = v.get("strict_compare_exact_tvl") or []
-            ex_active_tvl = v.get("strict_compare_exact_active_tvl") or []
-            ex_active_fees = v.get("strict_compare_exact_active_fees") or []
+            # Product decision: exact active branch is removed.
+            ex_active_tvl = []
+            ex_active_fees = []
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
 
             tvl_end_ts = max(
@@ -18323,7 +18324,6 @@ def _merge_for_web(
                 + [int(x[0]) for x in (est_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (est_active_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
-                + [int(x[0]) for x in (ex_active_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(now_ts)]
             )
             fees_end_ts = max(
@@ -18331,17 +18331,14 @@ def _merge_for_web(
                 + [int(x[0]) for x in (est_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (est_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (ex_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
-                + [int(x[0]) for x in (ex_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(now_ts)]
             )
             est_tvl = _align_series_end(est_tvl, tvl_end_ts)
             est_active_tvl = _align_series_end(est_active_tvl, tvl_end_ts)
             ex_tvl = _align_series_end(ex_tvl, tvl_end_ts)
-            ex_active_tvl = _align_series_end(ex_active_tvl, tvl_end_ts)
             est_fees = _align_series_end(est_fees, fees_end_ts)
             est_active_fees = _align_series_end(est_active_fees, fees_end_ts)
             ex_fees = _align_series_end(ex_fees, fees_end_ts)
-            ex_active_fees = _align_series_end(ex_active_fees, fees_end_ts)
 
             src_lbl = _short_source_label(str(v.get("tvl_price_source") or ""))
             est_income = float(est_fees[-1][1]) if est_fees else 0.0
@@ -18446,46 +18443,6 @@ def _merge_for_web(
                 risk_reason=ex_risk_reason,
                 risk_flags=ex_risk_flags,
             )
-            if est_active_tvl or ex_active_tvl:
-                active_dbg = ((v.get("strict_debug") or {}).get("v3_tvl_now") or {}) if isinstance(v, dict) else {}
-                if ex_active_tvl:
-                    ex_act_last_tvl = _last_positive_value(ex_active_tvl) if ex_active_tvl else 0.0
-                    ex_act_income = float(ex_active_fees[-1][1]) if ex_active_fees else 0.0
-                    ex_act_apy = (ex_act_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-                    ex_act_quality = "exact_partial" if exact_quality != "strict_unavailable" else "strict_unavailable"
-                    ex_act_reason = f"Exact active now ({src_lbl})"
-                else:
-                    ex_act_last_tvl = float(active_dbg.get("tvl_active_window_usd") or 0.0)
-                    ex_act_income = 0.0
-                    ex_act_apy = 0.0
-                    ex_act_quality = "strict_unavailable"
-                    ex_act_reason = f"Exact active unavailable ({src_lbl})"
-                ex_act_risk_level, ex_act_risk_reason, ex_act_risk_flags = _risk_assessment(
-                    apy_pct=ex_act_apy,
-                    last_tvl=ex_act_last_tvl,
-                    dq_reason=ex_act_reason,
-                    tvl_price_source=tvl_src_raw,
-                    fees_series=ex_active_fees,
-                )
-                _append_compare_row(
-                    pool_id=base_pool_id,
-                    chain=base_chain,
-                    version=base_version,
-                    base_pair=base_pair,
-                    branch="exact",
-                    anchor_type="Active",
-                    fee_pct=base_fee_pct,
-                    income=ex_act_income,
-                    apy=ex_act_apy,
-                    last_tvl=ex_act_last_tvl,
-                    data_quality=ex_act_quality,
-                    data_quality_reason=ex_act_reason,
-                    status=status,
-                    calc_path_human=_calc_path_human(v, branch="exact", anchor_type="Active", has_strict_compare=True),
-                    risk_level=ex_act_risk_level,
-                    risk_reason=ex_act_risk_reason,
-                    risk_flags=ex_act_risk_flags,
-                )
         else:
             anchor_type = _infer_anchor_type_for_normal_row(v, dq_reason)
             row_risk_level, row_risk_reason, row_risk_flags = _risk_assessment(
@@ -33477,19 +33434,16 @@ HTML_PAGE = """
         const showEstFull = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "full")];
         const showEstActive = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "active")];
         const showExFull = !!visibilityMap[makeVisibilityKey(poolId, "exact", "full")];
-        const showExActive = !!visibilityMap[makeVisibilityKey(poolId, "exact", "active")];
-        if (!(showAll || showEstFull || showEstActive || showExFull || showExActive)) continue;
+        if (!(showAll || showEstFull || showEstActive || showExFull)) continue;
         const estFees = Array.isArray(s.strict_compare_estimated_fees) ? s.strict_compare_estimated_fees : [];
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
         const estActiveFees = Array.isArray(s.strict_compare_estimated_active_fees) ? s.strict_compare_estimated_active_fees : [];
         const estActiveTvl = Array.isArray(s.strict_compare_estimated_active_tvl) ? s.strict_compare_estimated_active_tvl : [];
         const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
-        const exActiveFees = Array.isArray(s.strict_compare_exact_active_fees) ? s.strict_compare_exact_active_fees : [];
         const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
-        const exActiveTvl = Array.isArray(s.strict_compare_exact_active_tvl) ? s.strict_compare_exact_active_tvl : [];
         const useStrictCompare = strictMode && (
           estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length ||
-          exFees.length || exActiveFees.length || exTvl.length || exActiveTvl.length
+          exFees.length || exTvl.length
         );
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
@@ -33499,9 +33453,7 @@ HTML_PAGE = """
           ...(estActiveFees.map(p => Number(p?.[0] || 0))),
           ...(estActiveTvl.map(p => Number(p?.[0] || 0))),
           ...(exFees.map(p => Number(p?.[0] || 0))),
-          ...(exActiveFees.map(p => Number(p?.[0] || 0))),
           ...(exTvl.map(p => Number(p?.[0] || 0))),
-          ...(exActiveTvl.map(p => Number(p?.[0] || 0))),
           0
         );
         if (localMax > maxTs) maxTs = localMax;
@@ -33570,11 +33522,6 @@ HTML_PAGE = """
             const v = Number(p?.[1] || 0);
             return v > 0 ? v : null;
           });
-          const exActFeeX = exActiveFees.map(p => new Date(p[0] * 1000));
-          const exActFeeYExact = exActiveFees.map(p => {
-            const v = Number(p?.[1] || 0);
-            return v > 0 ? v : null;
-          });
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
           const estActTvlX = estTvlActSrc.map(p => new Date(p[0] * 1000));
@@ -33583,14 +33530,10 @@ HTML_PAGE = """
           const exTvlYExact = extendTrailingWithLastValid(
             sanitizeExactTvlK(exTvl, estTvlSrc, Number(s.pool_tvl_now_usd || 0))
           );
-          const exActX = exActiveTvl.map(p => new Date(p[0] * 1000));
-          const exActY = sanitizeExactTvlK(exActiveTvl, estTvlSrc.length ? estTvlSrc : estTvlActSrc, Number(s.pool_tvl_now_usd || 0));
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const estActHover = estActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
           const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
-          const exActHover = exActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
           const COLOR_FULL = "#1d4ed8";          // blue
-          const COLOR_ACTIVE = "#166534";        // darker green
           const COLOR_FULL_EST = "#60a5fa";      // light blue
           const COLOR_ACTIVE_EST = "#15803d";    // darker green (estimated active)
           if (showEstFull && estFeeX.length) {
@@ -33615,18 +33558,9 @@ HTML_PAGE = """
               marker: {size: 5, color: COLOR_FULL}
             });
           }
-          if (showExActive && exActFeeX.length) {
-            feeTraces.push({
-              x: exActFeeX, y: exActFeeYExact, mode: "lines+markers", name: `${s.label} (exact active)`, customdata: exActHover,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: COLOR_ACTIVE, width: 1.8, dash: "solid"},
-              marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
-            });
-          }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const estActHoverTvl = estActTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
           const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
-          const exActHoverTvl = exActX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact active"]);
           if (showExFull && exTvlX.length) {
             const exFlat = tvlMarkersOnly(exTvlX, exTvlYExact);
             tvlTraces.push({
@@ -33634,15 +33568,6 @@ HTML_PAGE = """
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
               line: {color: COLOR_FULL, width: 1.8, dash: "solid"},
               marker: {size: 5, color: COLOR_FULL}
-            });
-          }
-          if (showExActive && exActX.length) {
-            const exActFlat = tvlMarkersOnly(exActX, exActY);
-            tvlTraces.push({
-              x: exActX, y: exActY, mode: (exActFlat ? "markers" : "lines+markers"), name: `${s.label} (exact active)`, customdata: exActHoverTvl,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: COLOR_ACTIVE, width: 1.8, dash: "solid"},
-              marker: {size: 6, color: COLOR_ACTIVE, symbol: "diamond"}
             });
           }
           if (showEstFull && estTvlX.length) {

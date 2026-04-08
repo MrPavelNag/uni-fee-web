@@ -1280,11 +1280,17 @@ def _rebuild_fees_cumulative(fees_usd: list[tuple[int, float]], tvl_series: list
 def _normalize_exact_series_to_fees(
     fees_usd: list[tuple[int, float]],
     exact_series: list[tuple[int, float]],
+    *,
+    fallback_value: float = 0.0,
 ) -> list[tuple[int, float]]:
-    by_ts: dict[int, float] = {}
-    for ts, v in (exact_series or []):
-        by_ts[int(ts)] = float(v or 0.0)
-    return [(int(ts), float(by_ts.get(int(ts), 0.0))) for ts, _ in (fees_usd or [])]
+    # exact_series can be sparse (one point per N days). For fee replay we need a
+    # daily shape; carry the latest known exact TVL forward instead of zero-filling
+    # missing days, otherwise cumulative exact fees are artificially suppressed.
+    return _expand_sparse_tvl_to_fee_days(
+        fees_usd,
+        exact_series,
+        fallback_value=float(fallback_value or 0.0),
+    )
 
 
 def _expand_sparse_tvl_to_fee_days(
@@ -2355,96 +2361,12 @@ def main() -> None:
         estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl_base)
         estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
         estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
-        try:
-            active_step_days = max(5, int(os.environ.get("STRICT_V3_ACTIVE_WINDOW_STEP_DAYS", "5")))
-        except Exception:
-            active_step_days = 5
-        if int(len(fees_usd or [])) > 180:
-            active_step_days = max(active_step_days, 10)
-        try:
-            active_max_points = max(6, int(os.environ.get("STRICT_V3_ACTIVE_MAX_POINTS", "36")))
-        except Exception:
-            active_max_points = 36
-        if int(len(fees_usd or [])) > 0:
-            min_step_from_cap = int(math.ceil(float(len(fees_usd)) / float(max(1, active_max_points))))
-            active_step_days = max(int(active_step_days), int(min_step_from_cap))
-        # exact_active must be independent from estimated_active.
-        # Do NOT prefill exact from estimated: this can create identical rows.
+        # exact-active branch is intentionally disabled by product decision:
+        # keep only estimated active for strict compare.
         exact_active_tvl = []
         exact_active_fees = []
-        # Prefer independent on-chain active snapshots (in-range liquidity at day blocks).
-        try:
-            active_hist_budget = max(
-                8.0,
-                float(os.environ.get("STRICT_V3_ACTIVE_ONCHAIN_HISTORY_BUDGET_SEC", str(max(12.0, float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")) * 0.25)))),
-            )
-        except Exception:
-            active_hist_budget = 20.0
-        onchain_active_sparse, onchain_active_reason = _v3_active_tvl_onchain_sparse_snapshots(
-            chain=str(found_chain),
-            pool=pool,
-            fees_usd=fees_usd,
-            day_start_ts=int((int(fees_usd[0][0]) // 86400) * 86400),
-            day_end_ts=int((int(fees_usd[-1][0]) // 86400) * 86400),
-            step_days=int(active_step_days),
-            budget_sec=float(active_hist_budget),
-        )
-        active_sparse = list(onchain_active_sparse or [])
-        active_source_reason = str(onchain_active_reason or "active_onchain_sparse:unavailable")
-        if not active_sparse:
-            try:
-                active_subgraph_budget = max(
-                    10.0,
-                    min(40.0, float(active_hist_budget) * 0.6),
-                )
-            except Exception:
-                active_subgraph_budget = 14.0
-            subgraph_active_sparse, subgraph_active_reason = _v3_active_tvl_subgraph_sparse_snapshots(
-                chain=str(found_chain),
-                endpoint=str(found_endpoint or ""),
-                pool=pool,
-                fees_usd=fees_usd,
-                day_start_ts=int((int(fees_usd[0][0]) // 86400) * 86400),
-                day_end_ts=int((int(fees_usd[-1][0]) // 86400) * 86400),
-                step_days=int(active_step_days),
-                budget_sec=float(active_subgraph_budget),
-            )
-            if subgraph_active_sparse:
-                active_sparse = list(subgraph_active_sparse)
-                active_source_reason = f"{active_source_reason}|fallback:{str(subgraph_active_reason)}"
-            else:
-                active_source_reason = f"{active_source_reason}|fallback:{str(subgraph_active_reason or 'active_subgraph_sparse:unavailable')}"
-        if active_sparse:
-            exact_active_tvl = _append_now_tvl_anchor(list(active_sparse), float(tvl_active_now))
-            # Build exact active fees from exact active TVL (independent from estimated active branch).
-            active_tvl_for_fees = _expand_sparse_tvl_to_fee_days(
-                fees_usd,
-                list(active_sparse),
-                fallback_value=float(tvl_active_now),
-            )
-            exact_active_fees_base = _rebuild_fees_cumulative(fees_usd, active_tvl_for_fees)
-            exact_active_fees = _sparse_series_every_n_days(exact_active_fees_base, active_step_days)
-            exact_active_fees = _append_now_fee_anchor(exact_active_fees)
-            if isinstance(tvl_now_debug, dict):
-                tvl_now_debug["active_history_source"] = str(active_source_reason)
-        elif isinstance(tvl_now_debug, dict):
-            tvl_now_debug["active_history_source"] = str(active_source_reason)
-            # Optional legacy fallback (off by default): mirror estimated active branch.
-            use_est_fallback = str(os.environ.get("STRICT_V3_ACTIVE_ONCHAIN_FALLBACK_ESTIMATE", "0")).strip().lower() in {"1", "true", "yes", "on"}
-            if use_est_fallback and estimated_active_tvl:
-                exact_active_tvl = _sparse_series_every_n_days(estimated_active_tvl, active_step_days)
-                exact_active_tvl = _append_now_tvl_anchor(exact_active_tvl, float(tvl_active_now))
-                if estimated_active_fees:
-                    exact_active_fees = _sparse_series_every_n_days(estimated_active_fees, active_step_days)
-                    exact_active_fees = _append_now_fee_anchor(exact_active_fees)
-                tvl_now_debug["active_history_source"] = f"{str(tvl_now_debug.get('active_history_source') or '')}:fallback_estimated"
-            elif fees_usd and float(tvl_active_now) > 0.0:
-                # Keep exact-active row present even when historical reconstruction failed.
-                # This avoids hard "unavailable" regression while still not cloning estimated history.
-                exact_active_tvl = [(int(fees_usd[-1][0]), float(max(0.0, tvl_active_now)))]
-                exact_active_tvl = _append_now_tvl_anchor(exact_active_tvl, float(tvl_active_now))
-                exact_active_fees = _append_now_fee_anchor([(int(fees_usd[-1][0]), 0.0)])
-                tvl_now_debug["active_history_source"] = f"{str(tvl_now_debug.get('active_history_source') or '')}:fallback_now_point"
+        if isinstance(tvl_now_debug, dict):
+            tvl_now_debug["active_history_source"] = "disabled_exact_active_removed"
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
@@ -2463,7 +2385,11 @@ def main() -> None:
     except Exception:
         partial_min_cov = 0.50
 
-    exact_base = _normalize_exact_series_to_fees(fees_usd, list(exact_series or []))
+    exact_base = _normalize_exact_series_to_fees(
+        fees_usd,
+        list(exact_series or []),
+        fallback_value=float(pool_tvl_now_usd),
+    )
     structural_cov = float(exact_cov)
     one_leg_conflict = bool(str(exact_reason).startswith("exact2_partial:one_leg_quantity_collapse"))
     scale_ratio = _series_scale_ratio(exact_base, estimated_tvl_base)

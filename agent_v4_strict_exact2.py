@@ -1597,15 +1597,8 @@ def main() -> None:
             estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl_base)
             estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
             estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
-
-            exact_active_tvl = _sparse_series_every_n_days(estimated_active_tvl_base, exact_step_days)
-            exact_active_tvl = _append_now_tvl_anchor(exact_active_tvl, float(tvl_active_now))
-            exact_active_fees = _sparse_series_every_n_days(estimated_active_fees_base, exact_step_days)
-            exact_active_fees = _append_now_fee_anchor(exact_active_fees)
         if onchain_hist_full_tvl:
             exact_tvl = _append_now_tvl_anchor(list(onchain_hist_full_tvl), float(pool_tvl_now_usd))
-        if onchain_hist_active_tvl and tvl_active_now > 0.0:
-            exact_active_tvl = _append_now_tvl_anchor(list(onchain_hist_active_tvl), float(tvl_active_now))
     else:
         # No historical day-shape from subgraph:
         # - keep TVL visualization as one-point marker (do not invent TVL shape),
@@ -1619,23 +1612,18 @@ def main() -> None:
         exact_fees = _append_now_fee_anchor(exact_fees)
         if tvl_active_now > 0.0:
             estimated_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
-            exact_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
             est_active_flat_tvl_for_fees = [(int(ts), float(tvl_active_now)) for ts, _ in (fees_usd or [])]
             estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, est_active_flat_tvl_for_fees)
             estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
-            exact_active_fees = _sparse_series_every_n_days(estimated_active_fees_base, exact_step_days)
-            exact_active_fees = _append_now_fee_anchor(exact_active_fees)
         if onchain_hist_full_tvl:
             exact_tvl = _append_now_tvl_anchor(list(onchain_hist_full_tvl), float(pool_tvl_now_usd))
             # Mirror exact history into estimated view only when subgraph shape is missing.
             estimated_tvl = list(exact_tvl)
-        if onchain_hist_active_tvl and tvl_active_now > 0.0:
-            exact_active_tvl = _append_now_tvl_anchor(list(onchain_hist_active_tvl), float(tvl_active_now))
-            estimated_active_tvl = list(exact_active_tvl)
     if (not exact_tvl) and fees_usd:
         exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
-    if (not exact_active_tvl) and fees_usd and tvl_active_now > 0.0:
-        exact_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
+    # Product decision: keep only estimated active branch in strict compare.
+    exact_active_tvl = []
+    exact_active_fees = []
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
     reason = (
         f"exact_v4_2_onchain_quantities:one_point_now:cov={exact_cov:.2f}"
