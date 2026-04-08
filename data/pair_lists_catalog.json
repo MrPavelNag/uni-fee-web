@@ -1,6 +1,6 @@
 {
   "schema_version": 19,
-  "updated_at": "2026-04-07T06:54:30Z",
+  "updated_at": "2026-04-08T13:33:52Z",
   "source": "manual_only_catalog+manual_fiat_override+manual_algo_override+manual_coins_override+manual_meme_override",
   "stablecoins": [
     "usdt",
@@ -218,7 +218,6 @@
     "brlm",
     "vgbp",
     "kesm",
-    "euroe",
     "phpm",
     "audm",
     "cadm",
