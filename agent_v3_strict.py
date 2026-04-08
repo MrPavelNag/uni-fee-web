@@ -11,6 +11,7 @@ Strict single-pool v3 agent.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import os
@@ -2205,62 +2206,80 @@ def _build_exact2_tvl_series_v3_sparse_points(
     except Exception:
         ratio01 = 0.0
 
+    n = len(fees_usd)
+    if n <= 0:
+        return [], "exact2_sparse_points:no_days", 0.0
+
+    if int(points) <= 0:
+        picked_idx = list(range(n))
+    else:
+        p = max(2, min(int(points), n))
+        if p == 1:
+            pick_positions = [0]
+        else:
+            pick_positions = sorted({int(round(i * (n - 1) / (p - 1))) for i in range(p)})
+        picked_idx = [pos for pos in pick_positions if 0 <= pos < n]
+        picked_idx = sorted(set(picked_idx))
+    if not picked_idx:
+        return [(int(ts), 0.0) for ts, _ in fees_usd], "exact2_sparse_points:no_picked_idx", 0.0
+
+    # Resolve day->block only for selected sparse points (instead of all history days).
+    needed_days = sorted({int((int(fees_usd[i][0]) // 86400) * 86400) for i in picked_idx})
     day_blocks: dict[int, int] = {}
-    for ts, _ in fees_usd:
-        d = int((int(ts) // 86400) * 86400)
-        if d in day_blocks:
-            continue
+    for d in needed_days:
         try:
             day_blocks[d] = int(_llama_block_for_day(ck, d + 86399))
         except Exception:
             day_blocks[d] = 0
-
-    n = len(fees_usd)
-    if n <= 0:
-        return [], "exact2_sparse_points:no_days", 0.0
-    valid_idx = [i for i, (ts, _f) in enumerate(fees_usd) if int(day_blocks.get(int((int(ts) // 86400) * 86400), 0)) > 0]
-    if not valid_idx:
+    picked_idx = [i for i in picked_idx if int(day_blocks.get(int((int(fees_usd[i][0]) // 86400) * 86400), 0)) > 0]
+    if not picked_idx:
         return [(int(ts), 0.0) for ts, _ in fees_usd], "exact2_sparse_points:no_day_blocks", 0.0
-
-    if int(points) <= 0:
-        picked_idx = list(valid_idx)
-    else:
-        p = max(2, min(int(points), len(valid_idx)))
-        if p == 1:
-            pick_positions = [0]
-        else:
-            pick_positions = sorted({int(round(i * (len(valid_idx) - 1) / (p - 1))) for i in range(p)})
-        picked_idx = [valid_idx[pos] for pos in pick_positions if 0 <= pos < len(valid_idx)]
-        picked_idx = sorted(set(picked_idx))
 
     deadline = time.monotonic() + max(8.0, float(budget_sec))
     out = [(int(ts), 0.0) for ts, _ in fees_usd]
     ok_points = 0
-    for i in picked_idx:
+    def _calc_point(i: int) -> tuple[int, float]:
         if time.monotonic() >= deadline:
-            break
+            return i, 0.0
         ts = int(fees_usd[i][0])
         day_ts = int((ts // 86400) * 86400)
         b = int(day_blocks.get(day_ts, 0))
         if b <= 0:
-            continue
+            return i, 0.0
         try:
-            bal0 = int(_balance_of_raw(chain_id, token0, pool_id, b, timeout_sec=6.0))
-            bal1 = int(_balance_of_raw(chain_id, token1, pool_id, b, timeout_sec=6.0))
+            # Keep point-level RPC timeout bounded by remaining budget.
+            left = max(0.8, min(6.0, deadline - time.monotonic()))
+            bal0 = int(_balance_of_raw(chain_id, token0, pool_id, b, timeout_sec=float(left)))
+            bal1 = int(_balance_of_raw(chain_id, token1, pool_id, b, timeout_sec=float(left)))
         except Exception:
-            continue
+            return i, 0.0
         amt0 = float(bal0) / float(10 ** max(0, dec0))
         amt1 = float(bal1) / float(10 ** max(0, dec1))
-        p0 = float(_historical_price_usd(ck, token0, ts, int(day_start_ts), int(day_end_ts)))
-        p1 = float(_historical_price_usd(ck, token1, ts, int(day_start_ts), int(day_end_ts)))
+        p0 = float(_historical_price_usd(ck, token0, day_ts, int(day_start_ts), int(day_end_ts)))
+        p1 = float(_historical_price_usd(ck, token1, day_ts, int(day_start_ts), int(day_end_ts)))
         if p0 <= 0 and p1 > 0 and ratio01 > 0:
             p0 = p1 * ratio01
         if p1 <= 0 and p0 > 0 and ratio01 > 0:
             p1 = p0 / ratio01
         tvl = max(0.0, amt0 * max(0.0, p0)) + max(0.0, amt1 * max(0.0, p1))
-        if tvl > 0.0:
-            out[i] = (ts, float(tvl))
-            ok_points += 1
+        return i, float(tvl if tvl > 0.0 else 0.0)
+
+    try:
+        workers = max(2, min(8, int(os.environ.get("STRICT_EXACT2_POINT_WORKERS", "4") or 4)))
+    except Exception:
+        workers = 4
+    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+        futs = {ex.submit(_calc_point, int(i)): int(i) for i in picked_idx}
+        for fut in as_completed(futs):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                idx, tvl = fut.result()
+            except Exception:
+                continue
+            if float(tvl) > 0.0:
+                out[int(idx)] = (int(fees_usd[int(idx)][0]), float(tvl))
+                ok_points += 1
 
     cov = float(ok_points / max(1, n))
     mode = "all_days" if int(points) <= 0 else f"points={len(picked_idx)}"
