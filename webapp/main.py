@@ -16913,6 +16913,12 @@ _MANUAL_FIAT_STABLE_DEFAULT_RWA = (
     "buidl", "usyc", "usdy", "usdtb", "usd0",
     "frxusd", "mnee", "cgusd",
 )
+_MANUAL_FIAT_NONUSD_DEFAULT_TOP = (
+    "eurc", "eurs", "eurt", "xsgd", "eurcv",
+    "euri", "aeur", "eure", "euroe", "gyen",
+    "jpyc", "xchf", "tgbp", "gbpt", "brz",
+    "brla", "idrt", "idrx", "audd", "audf",
+)
 _MANUAL_ALGO_STABLE_DEFAULT_MAIN = (
     "usds", "usde", "dai", "gho", "crvusd", "frax", "frxusd", "mim", "dola",
 )
@@ -16945,6 +16951,28 @@ _MANUAL_FIAT_STABLE_HINTS: dict[str, dict[str, str]] = {
     "frxusd": {"desc": "Frax fully collateralized USD stable", "liquidity": "mid-tier DeFi liquidity"},
     "mnee": {"desc": "Niche fiat-backed stable", "liquidity": "~$100M"},
     "cgusd": {"desc": "Cygnus Finance Global USD", "liquidity": "~$75M"},
+}
+_MANUAL_FIAT_NONUSD_HINTS: dict[str, dict[str, str]] = {
+    "eurc": {"desc": "Euro stable (Circle), main non-USD leader", "liquidity": "high"},
+    "eurs": {"desc": "Euro stable (STASIS)", "liquidity": "mid"},
+    "eurt": {"desc": "Euro stable (Tether)", "liquidity": "low-mid"},
+    "xsgd": {"desc": "Singapore Dollar stable", "liquidity": "niche"},
+    "eurcv": {"desc": "SocGen EUR institutional stable", "liquidity": "growing"},
+    "euri": {"desc": "Banking Circle EUR stable", "liquidity": "niche"},
+    "aeur": {"desc": "Anchored Euro stable", "liquidity": "low"},
+    "eure": {"desc": "Monerium EURe", "liquidity": "low"},
+    "euroe": {"desc": "EUROe euro-backed stable", "liquidity": "niche"},
+    "gyen": {"desc": "Japanese Yen stable", "liquidity": "very low"},
+    "jpyc": {"desc": "Japanese Yen stable", "liquidity": "very low"},
+    "xchf": {"desc": "Swiss Franc stable", "liquidity": "very low"},
+    "tgbp": {"desc": "British Pound stable", "liquidity": "very low"},
+    "gbpt": {"desc": "British Pound stable", "liquidity": "very low"},
+    "brz": {"desc": "Brazilian Real stable", "liquidity": "low"},
+    "brla": {"desc": "Brazilian Real stable", "liquidity": "low"},
+    "idrt": {"desc": "Indonesian Rupiah stable", "liquidity": "very low"},
+    "idrx": {"desc": "Indonesian Rupiah stable", "liquidity": "very low"},
+    "audd": {"desc": "Australian Dollar stable", "liquidity": "very low"},
+    "audf": {"desc": "Australian Dollar stable", "liquidity": "very low"},
 }
 _MANUAL_ALGO_STABLE_HINTS: dict[str, dict[str, str]] = {
     "usds": {"desc": "Sky (ex-Maker) decentralized stable, yield-oriented", "liquidity": "~$11.7B"},
@@ -17074,6 +17102,11 @@ def _default_manual_pair_lists_overrides() -> dict[str, Any]:
     commodity_top_env = os.environ.get("COMMODITY_MANUAL_LIST", "")
     commodity_top = _normalize_symbol_list(commodity_top_env.split(",")) if commodity_top_env.strip() else list(_COMMODITY_MANUAL_LIST)
     commodity_date = str(os.environ.get("COMMODITY_MANUAL_DATE", "")).strip() or datetime.now(timezone.utc).date().isoformat()
+    nonusd_enabled = str(os.environ.get("MANUAL_FIAT_NONUSD_ENABLE", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    nonusd_strict = str(os.environ.get("MANUAL_FIAT_NONUSD_STRICT", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    nonusd_top_env = os.environ.get("MANUAL_FIAT_NONUSD_TOP", "")
+    nonusd_top = _normalize_symbol_list(nonusd_top_env.split(",")) if nonusd_top_env.strip() else list(_MANUAL_FIAT_NONUSD_DEFAULT_TOP)
+    nonusd_date = str(os.environ.get("MANUAL_FIAT_NONUSD_DATE", "")).strip() or datetime.now(timezone.utc).date().isoformat()
     return {
         "fiat_stable": {
             "enabled": bool(enabled),
@@ -17107,6 +17140,12 @@ def _default_manual_pair_lists_overrides() -> dict[str, Any]:
             "selection_date": commodity_date,
             "top": _normalize_symbol_list(commodity_top),
         },
+        "fiat_nonusd": {
+            "enabled": bool(nonusd_enabled),
+            "strict": bool(nonusd_strict),
+            "selection_date": nonusd_date,
+            "top": _normalize_symbol_list(nonusd_top),
+        },
     }
 
 
@@ -17130,11 +17169,13 @@ def _load_manual_pair_lists_overrides() -> dict[str, Any]:
     meme_raw = raw.get("memes") if isinstance(raw.get("memes"), dict) else {}
     coins_raw = raw.get("coins") if isinstance(raw.get("coins"), dict) else {}
     commodity_raw = raw.get("commodity") if isinstance(raw.get("commodity"), dict) else {}
+    nonusd_raw = raw.get("fiat_nonusd") if isinstance(raw.get("fiat_nonusd"), dict) else {}
     fiat_base = base["fiat_stable"]
     algo_base = base["algo_stable"]
     meme_base = base["memes"]
     coins_base = base["coins"]
     commodity_base = base["commodity"]
+    nonusd_base = base["fiat_nonusd"]
     cfg = {
         "enabled": bool(fiat_raw.get("enabled", fiat_base.get("enabled", True))),
         "strict": bool(fiat_raw.get("strict", fiat_base.get("strict", True))),
@@ -17167,7 +17208,13 @@ def _load_manual_pair_lists_overrides() -> dict[str, Any]:
         "selection_date": str(commodity_raw.get("selection_date") or commodity_base.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
         "top": _normalize_symbol_list(commodity_raw.get("top") if isinstance(commodity_raw.get("top"), list) else commodity_base.get("top", [])),
     }
-    out = {"fiat_stable": cfg, "algo_stable": algo_cfg, "memes": meme_cfg, "coins": coins_cfg, "commodity": commodity_cfg}
+    nonusd_cfg = {
+        "enabled": bool(nonusd_raw.get("enabled", nonusd_base.get("enabled", True))),
+        "strict": bool(nonusd_raw.get("strict", nonusd_base.get("strict", True))),
+        "selection_date": str(nonusd_raw.get("selection_date") or nonusd_base.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+        "top": _normalize_symbol_list(nonusd_raw.get("top") if isinstance(nonusd_raw.get("top"), list) else nonusd_base.get("top", [])),
+    }
+    out = {"fiat_stable": cfg, "algo_stable": algo_cfg, "memes": meme_cfg, "coins": coins_cfg, "commodity": commodity_cfg, "fiat_nonusd": nonusd_cfg}
     PAIR_LISTS_MANUAL_OVERRIDES_RUNTIME = out
     return out
 
@@ -17181,11 +17228,13 @@ def _save_manual_pair_lists_overrides(payload: dict[str, Any]) -> dict[str, Any]
     meme_src = src.get("memes") if isinstance(src.get("memes"), dict) else {}
     coins_src = src.get("coins") if isinstance(src.get("coins"), dict) else {}
     commodity_src = src.get("commodity") if isinstance(src.get("commodity"), dict) else {}
+    nonusd_src = src.get("fiat_nonusd") if isinstance(src.get("fiat_nonusd"), dict) else {}
     fiat_cur = cur.get("fiat_stable") if isinstance(cur.get("fiat_stable"), dict) else {}
     algo_cur = cur.get("algo_stable") if isinstance(cur.get("algo_stable"), dict) else {}
     meme_cur = cur.get("memes") if isinstance(cur.get("memes"), dict) else {}
     coins_cur = cur.get("coins") if isinstance(cur.get("coins"), dict) else {}
     commodity_cur = cur.get("commodity") if isinstance(cur.get("commodity"), dict) else {}
+    nonusd_cur = cur.get("fiat_nonusd") if isinstance(cur.get("fiat_nonusd"), dict) else {}
     merged = {
         "fiat_stable": {
             "enabled": bool(fiat_src.get("enabled", fiat_cur.get("enabled", True))),
@@ -17218,6 +17267,12 @@ def _save_manual_pair_lists_overrides(payload: dict[str, Any]) -> dict[str, Any]
             "strict": bool(commodity_src.get("strict", commodity_cur.get("strict", True))),
             "selection_date": str(commodity_src.get("selection_date") or commodity_cur.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
             "top": _normalize_symbol_list(commodity_src.get("top") if isinstance(commodity_src.get("top"), list) else commodity_cur.get("top", [])),
+        },
+        "fiat_nonusd": {
+            "enabled": bool(nonusd_src.get("enabled", nonusd_cur.get("enabled", True))),
+            "strict": bool(nonusd_src.get("strict", nonusd_cur.get("strict", True))),
+            "selection_date": str(nonusd_src.get("selection_date") or nonusd_cur.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+            "top": _normalize_symbol_list(nonusd_src.get("top") if isinstance(nonusd_src.get("top"), list) else nonusd_cur.get("top", [])),
         },
     }
     PAIR_LISTS_MANUAL_OVERRIDES_RUNTIME = merged
@@ -17255,6 +17310,21 @@ def _manual_algo_hints_lines(items: list[str]) -> list[str]:
             out.append(f"{s.upper()} - {desc}")
         elif liq:
             out.append(f"{s.upper()} - liquidity: {liq}")
+    return out
+
+
+def _manual_fiat_nonusd_hints_lines(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for s in _normalize_symbol_list(items):
+        info = _MANUAL_FIAT_NONUSD_HINTS.get(s, {})
+        desc = str(info.get("desc") or "").strip()
+        liq = str(info.get("liquidity") or "").strip()
+        line = f"{s.upper()} - {desc}" if desc else s.upper()
+        if liq:
+            line = f"{line}; liq: {liq}"
+        if len(line) > 120:
+            line = line[:117].rstrip() + "..."
+        out.append(line)
     return out
 
 
@@ -17334,6 +17404,7 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         meme_cfg = manual_cfg.get("memes") if isinstance(manual_cfg.get("memes"), dict) else {}
         coins_cfg = manual_cfg.get("coins") if isinstance(manual_cfg.get("coins"), dict) else {}
         commodity_cfg = manual_cfg.get("commodity") if isinstance(manual_cfg.get("commodity"), dict) else {}
+        nonusd_cfg = manual_cfg.get("fiat_nonusd") if isinstance(manual_cfg.get("fiat_nonusd"), dict) else {}
         fiat_all = _merge_ranked_symbol_lists(
             _normalize_symbol_list(fiat_cfg.get("core") if isinstance(fiat_cfg.get("core"), list) else []),
             _normalize_symbol_list(fiat_cfg.get("rwa") if isinstance(fiat_cfg.get("rwa"), list) else []),
@@ -17345,6 +17416,7 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         meme_all = _normalize_symbol_list(meme_cfg.get("top") if isinstance(meme_cfg.get("top"), list) else [])
         coins_all = _normalize_symbol_list(coins_cfg.get("top") if isinstance(coins_cfg.get("top"), list) else [])
         commodity_all = _normalize_symbol_list(commodity_cfg.get("top") if isinstance(commodity_cfg.get("top"), list) else [])
+        nonusd_all = _normalize_symbol_list(nonusd_cfg.get("top") if isinstance(nonusd_cfg.get("top"), list) else [])
         return {
             "schema_version": int(PAIR_LISTS_SCHEMA_VERSION),
             "updated_at": _iso_now(),
@@ -17398,8 +17470,16 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
                     "top": commodity_all,
                     "count": len(commodity_all),
                 },
+                "fiat_nonusd": {
+                    "enabled": bool(nonusd_cfg.get("enabled", True)),
+                    "strict": bool(nonusd_cfg.get("strict", True)),
+                    "selection_date": str(nonusd_cfg.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+                    "top": nonusd_all,
+                    "count": len(nonusd_all),
+                },
             },
             "fiat_stable_hints": _manual_fiat_hints_lines(fiat_all),
+            "fiat_nonusd_hints": _manual_fiat_nonusd_hints_lines(nonusd_all),
             "algo_stable_hints": _manual_algo_hints_lines(algo_all),
             "coin_hints": _manual_coins_hints_lines(coins_all),
             "commodity_hints": _manual_commodity_hints_lines(commodity_all),
@@ -17448,11 +17528,13 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         meme_manual_raw = manual_cfg_raw.get("memes") if isinstance(manual_cfg_raw.get("memes"), dict) else {}
         coins_manual_raw = manual_cfg_raw.get("coins") if isinstance(manual_cfg_raw.get("coins"), dict) else {}
         commodity_manual_raw = manual_cfg_raw.get("commodity") if isinstance(manual_cfg_raw.get("commodity"), dict) else {}
+        nonusd_manual_raw = manual_cfg_raw.get("fiat_nonusd") if isinstance(manual_cfg_raw.get("fiat_nonusd"), dict) else {}
         base_manual = base.get("manual_overrides", {}).get("fiat_stable", {})
         base_algo = base.get("manual_overrides", {}).get("algo_stable", {})
         base_meme = base.get("manual_overrides", {}).get("memes", {})
         base_coins = base.get("manual_overrides", {}).get("coins", {})
         base_commodity = base.get("manual_overrides", {}).get("commodity", {})
+        base_nonusd = base.get("manual_overrides", {}).get("fiat_nonusd", {})
         fiat_manual = {
             "enabled": bool(fiat_manual_raw.get("enabled", base_manual.get("enabled", True))),
             "strict": bool(fiat_manual_raw.get("strict", base_manual.get("strict", True))),
@@ -17490,7 +17572,21 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
             "top": _clean_sym_list(as_list(commodity_manual_raw.get("top")) or as_list(base_commodity.get("top"))),
         }
         commodity_manual["count"] = len(commodity_manual.get("top", []))
-        out["manual_overrides"] = {"fiat_stable": fiat_manual, "algo_stable": algo_manual, "memes": meme_manual, "coins": coins_manual, "commodity": commodity_manual}
+        nonusd_manual = {
+            "enabled": bool(nonusd_manual_raw.get("enabled", base_nonusd.get("enabled", True))),
+            "strict": bool(nonusd_manual_raw.get("strict", base_nonusd.get("strict", True))),
+            "selection_date": str(nonusd_manual_raw.get("selection_date") or base_nonusd.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+            "top": _clean_sym_list(as_list(nonusd_manual_raw.get("top")) or as_list(base_nonusd.get("top"))),
+        }
+        nonusd_manual["count"] = len(nonusd_manual.get("top", []))
+        out["manual_overrides"] = {
+            "fiat_stable": fiat_manual,
+            "algo_stable": algo_manual,
+            "memes": meme_manual,
+            "coins": coins_manual,
+            "commodity": commodity_manual,
+            "fiat_nonusd": nonusd_manual,
+        }
         raw_hints = raw.get("fiat_stable_hints")
         if isinstance(raw_hints, list) and raw_hints:
             out["fiat_stable_hints"] = [str(x)[:220] for x in raw_hints if str(x or "").strip()]
@@ -17511,6 +17607,11 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
             out["commodity_hints"] = [str(x)[:220] for x in raw_commodity_hints if str(x or "").strip()]
         else:
             out["commodity_hints"] = _manual_commodity_hints_lines(commodity_manual.get("top", []))
+        raw_nonusd_hints = raw.get("fiat_nonusd_hints")
+        if isinstance(raw_nonusd_hints, list) and raw_nonusd_hints:
+            out["fiat_nonusd_hints"] = [str(x)[:120] for x in raw_nonusd_hints if str(x or "").strip()]
+        else:
+            out["fiat_nonusd_hints"] = _manual_fiat_nonusd_hints_lines(nonusd_manual.get("top", []))
         raw_meme_hints = raw.get("meme_hints")
         if isinstance(raw_meme_hints, list) and raw_meme_hints:
             out["meme_hints"] = [str(x)[:220] for x in raw_meme_hints if str(x or "").strip()]
@@ -17539,6 +17640,7 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
     out["source"] = "manual_only_catalog"
     manual_cfg = _load_manual_pair_lists_overrides()
     fiat_manual = manual_cfg.get("fiat_stable") if isinstance(manual_cfg.get("fiat_stable"), dict) else {}
+    nonusd_manual = manual_cfg.get("fiat_nonusd") if isinstance(manual_cfg.get("fiat_nonusd"), dict) else {}
     fiat_manual_core = _normalize_symbol_list(fiat_manual.get("core") if isinstance(fiat_manual.get("core"), list) else [])
     fiat_manual_rwa = _normalize_symbol_list(fiat_manual.get("rwa") if isinstance(fiat_manual.get("rwa"), list) else [])
     fiat_manual_all = _merge_ranked_symbol_lists(fiat_manual_core, fiat_manual_rwa)
@@ -17564,6 +17666,24 @@ def _load_pair_lists_catalog(refresh: bool = False) -> dict[str, Any]:
         },
     }
     out["fiat_stable_hints"] = _manual_fiat_hints_lines(fiat_manual_all)
+    nonusd_manual_top = _normalize_symbol_list(nonusd_manual.get("top") if isinstance(nonusd_manual.get("top"), list) else [])
+    if bool(nonusd_manual.get("enabled", True)) and nonusd_manual_top:
+        out["fiat_nonusd_stables"] = _apply_manual_list(
+            list(out.get("fiat_nonusd_stables") or []),
+            nonusd_manual_top,
+            strict=bool(nonusd_manual.get("strict", True)),
+        )[:200]
+        src_cur = str(out.get("source") or "")
+        if "manual_nonusd_override" not in src_cur:
+            out["source"] = f"{src_cur}+manual_nonusd_override".strip("+")
+    out["manual_overrides"]["fiat_nonusd"] = {
+        "enabled": bool(nonusd_manual.get("enabled", True)),
+        "strict": bool(nonusd_manual.get("strict", True)),
+        "selection_date": str(nonusd_manual.get("selection_date") or datetime.now(timezone.utc).date().isoformat()),
+        "top": nonusd_manual_top,
+        "count": len(nonusd_manual_top),
+    }
+    out["fiat_nonusd_hints"] = _manual_fiat_nonusd_hints_lines(out.get("fiat_nonusd_stables", []))
     algo_manual = manual_cfg.get("algo_stable") if isinstance(manual_cfg.get("algo_stable"), dict) else {}
     algo_manual_main = _normalize_symbol_list(algo_manual.get("main") if isinstance(algo_manual.get("main"), list) else [])
     algo_manual_niche = _normalize_symbol_list(algo_manual.get("niche") if isinstance(algo_manual.get("niche"), list) else [])
@@ -19806,6 +19926,7 @@ class AdminWalletUpdate(BaseModel):
 class AdminPairListsManualUpdate(BaseModel):
     fiat_core: list[str] = Field(default_factory=list)
     fiat_rwa: list[str] = Field(default_factory=list)
+    fiat_nonusd_top: list[str] = Field(default_factory=list)
     commodity_top: list[str] = Field(default_factory=list)
     coins_top: list[str] = Field(default_factory=list)
     memes_top: list[str] = Field(default_factory=list)
@@ -25724,10 +25845,11 @@ def _render_admin_page() -> str:
       </section>
       <section class="card">
         <h3>Pair Lists Manual Override</h3>
-        <p class="hint">Manual pair-lists controls (fiat-backed stables, commodities, coins, memes). Saved in admin state and applied on next catalog refresh.</p>
+        <p class="hint">Manual pair-lists controls (fiat-backed stables, non-USD fiat stables, commodities, coins, memes). Saved in admin state and applied on next catalog refresh.</p>
         <div class="row"><label>Previous edit date</label><input id="manualPrevEditDate" type="text" readonly /></div>
         <div class="row"><label>Fiat core (CSV)</label><textarea id="manualFiatCore" placeholder="usdt,usdc,usd1,pyusd,fdusd,rlusd,usdg,tusd,gusd,husd"></textarea></div>
         <div class="row"><label>Fiat RWA/yield (CSV)</label><textarea id="manualFiatRwa" placeholder="buidl,usyc,usdy,usdtb,usd0,frxusd,mnee,cgusd"></textarea></div>
+        <div class="row"><label>Fiat non-USD Top (CSV)</label><textarea id="manualFiatNonUsdTop" placeholder="eurc,eurs,eurt,xsgd,eurcv,euri,aeur,eure,euroe,gyen,jpyc,xchf,tgbp,gbpt,brz,brla,idrt,idrx,audd,audf"></textarea></div>
         <div class="row"><label>Commodities Top (CSV)</label><textarea id="manualCommodityTop" placeholder="xaut,paxg,kau,kag,cgo"></textarea></div>
         <div class="row"><label>Coins Top (CSV)</label><textarea id="manualCoinsTop" placeholder="eth,wbtc,steth,wsteth,weeth,bnb,link,uni,aave,arb,op,avax,xrp,ada,bch,xlm,hype,leo,okb,wbt"></textarea></div>
         <div class="row"><label>Memes Top (CSV)</label><textarea id="manualMemesTop" placeholder="doge,shib,pepe,floki,brett,mog,trump,pump,spx,turbo,toshi"></textarea></div>
@@ -26297,16 +26419,19 @@ def _render_admin_page() -> str:
     }}
     function renderManualPairListsSettings(cfg) {{
       const fiat = cfg && cfg.fiat_stable ? cfg.fiat_stable : {{}};
+      const nonusd = cfg && cfg.fiat_nonusd ? cfg.fiat_nonusd : {{}};
       const commodity = cfg && cfg.commodity ? cfg.commodity : {{}};
       const coins = cfg && cfg.coins ? cfg.coins : {{}};
       const memes = cfg && cfg.memes ? cfg.memes : {{}};
       const core = Array.isArray(fiat.core) ? fiat.core : [];
       const rwa = Array.isArray(fiat.rwa) ? fiat.rwa : [];
+      const nonusdTop = Array.isArray(nonusd.top) ? nonusd.top : [];
       const commodityTop = Array.isArray(commodity.top) ? commodity.top : [];
       const coinsTop = Array.isArray(coins.top) ? coins.top : [];
       const memesTop = Array.isArray(memes.top) ? memes.top : [];
       const dates = [
         String(fiat.selection_date || "").trim(),
+        String(nonusd.selection_date || "").trim(),
         String(commodity.selection_date || "").trim(),
         String(coins.selection_date || "").trim(),
         String(memes.selection_date || "").trim(),
@@ -26315,12 +26440,14 @@ def _render_admin_page() -> str:
       const elPrevDate = document.getElementById("manualPrevEditDate");
       const elCore = document.getElementById("manualFiatCore");
       const elRwa = document.getElementById("manualFiatRwa");
+      const elNonUsdTop = document.getElementById("manualFiatNonUsdTop");
       const elCommodityTop = document.getElementById("manualCommodityTop");
       const elCoinsTop = document.getElementById("manualCoinsTop");
       const elMemesTop = document.getElementById("manualMemesTop");
       if (elPrevDate) elPrevDate.value = prevDate || "-";
       if (elCore) elCore.value = core.join(",");
       if (elRwa) elRwa.value = rwa.join(",");
+      if (elNonUsdTop) elNonUsdTop.value = nonusdTop.join(",");
       if (elCommodityTop) elCommodityTop.value = commodityTop.join(",");
       if (elCoinsTop) elCoinsTop.value = coinsTop.join(",");
       if (elMemesTop) elMemesTop.value = memesTop.join(",");
@@ -26335,10 +26462,11 @@ def _render_admin_page() -> str:
       try {{
         const fiat_core = csvToSymbols(document.getElementById("manualFiatCore")?.value || "");
         const fiat_rwa = csvToSymbols(document.getElementById("manualFiatRwa")?.value || "");
+        const fiat_nonusd_top = csvToSymbols(document.getElementById("manualFiatNonUsdTop")?.value || "");
         const commodity_top = csvToSymbols(document.getElementById("manualCommodityTop")?.value || "");
         const coins_top = csvToSymbols(document.getElementById("manualCoinsTop")?.value || "");
         const memes_top = csvToSymbols(document.getElementById("manualMemesTop")?.value || "");
-        const data = await postJson("/api/admin/pair-lists-manual", {{fiat_core, fiat_rwa, commodity_top, coins_top, memes_top}});
+        const data = await postJson("/api/admin/pair-lists-manual", {{fiat_core, fiat_rwa, fiat_nonusd_top, commodity_top, coins_top, memes_top}});
         setAdminStatus(data.info || "Manual pair-lists override saved", false);
         await loadAdmin();
       }} catch (e) {{
@@ -27072,6 +27200,7 @@ def admin_pair_lists_manual_update(req: AdminPairListsManualUpdate, request: Req
     _require_admin(request, response)
     current = _load_manual_pair_lists_overrides()
     cur_fiat = current.get("fiat_stable") if isinstance(current.get("fiat_stable"), dict) else {}
+    cur_nonusd = current.get("fiat_nonusd") if isinstance(current.get("fiat_nonusd"), dict) else {}
     cur_commodity = current.get("commodity") if isinstance(current.get("commodity"), dict) else {}
     cur_coins = current.get("coins") if isinstance(current.get("coins"), dict) else {}
     cur_memes = current.get("memes") if isinstance(current.get("memes"), dict) else {}
@@ -27083,6 +27212,12 @@ def admin_pair_lists_manual_update(req: AdminPairListsManualUpdate, request: Req
             "selection_date": sel_date,
             "core": _normalize_symbol_list(req.fiat_core or []),
             "rwa": _normalize_symbol_list(req.fiat_rwa or []),
+        },
+        "fiat_nonusd": {
+            "enabled": bool(cur_nonusd.get("enabled", True)),
+            "strict": bool(cur_nonusd.get("strict", True)),
+            "selection_date": sel_date,
+            "top": _normalize_symbol_list(req.fiat_nonusd_top or []),
         },
         "commodity": {
             "enabled": bool(cur_commodity.get("enabled", True)),
@@ -30593,6 +30728,7 @@ def meta() -> dict[str, Any]:
             "memes": pair_lists_catalog.get("memes", []),
             "manual_overrides": pair_lists_catalog.get("manual_overrides", {}),
             "fiat_stable_hints": pair_lists_catalog.get("fiat_stable_hints", []),
+            "fiat_nonusd_hints": pair_lists_catalog.get("fiat_nonusd_hints", []),
             "algo_stable_hints": pair_lists_catalog.get("algo_stable_hints", []),
             "coin_hints": pair_lists_catalog.get("coin_hints", []),
             "commodity_hints": pair_lists_catalog.get("commodity_hints", []),
@@ -33231,6 +33367,7 @@ HTML_PAGE = """
       panel.innerHTML = `
         <div class="pair-lists-grid">
           ${renderPairListSection("Fiat-backed Stablecoins", pairPresetCatalog.stablecoins)}
+          ${renderPairListSection("Non-USD Fiat Stables", pairPresetCatalog.fiatNonUsdStablecoins)}
           ${renderPairListSection("Algo/Crypto-backed Stablecoins", pairPresetCatalog.stableAlgoCrypto)}
           ${renderPairListSection("Coins", pairPresetCatalog.coins)}
           ${renderPairListSection("Commodity Stables", pairPresetCatalog.commodityStablecoins)}
@@ -33856,6 +33993,7 @@ HTML_PAGE = """
         const manualCoinsEnabled = !!manualCoins.enabled;
         const manualFiatHints = Array.isArray(meta?.pair_lists?.fiat_stable_hints) ? meta.pair_lists.fiat_stable_hints : [];
         const manualAlgoHints = Array.isArray(meta?.pair_lists?.algo_stable_hints) ? meta.pair_lists.algo_stable_hints : [];
+        const manualNonUsdHints = Array.isArray(meta?.pair_lists?.fiat_nonusd_hints) ? meta.pair_lists.fiat_nonusd_hints : [];
         const manualCoinHints = Array.isArray(meta?.pair_lists?.coin_hints) ? meta.pair_lists.coin_hints : [];
         const manualCommodityHints = Array.isArray(meta?.pair_lists?.commodity_hints) ? meta.pair_lists.commodity_hints : [];
         const manualMemeHints = Array.isArray(meta?.pair_lists?.meme_hints) ? meta.pair_lists.meme_hints : [];
@@ -33864,6 +34002,7 @@ HTML_PAGE = """
           {},
           collectHintMap(manualFiatHints),
           collectHintMap(manualAlgoHints),
+          collectHintMap(manualNonUsdHints),
           collectHintMap(manualCoinHints),
           collectHintMap(manualCommodityHints),
           collectHintMap(manualMemeHints),
@@ -33884,7 +34023,7 @@ HTML_PAGE = """
           const fiatShown = manualFiatEnabled ? stCount : 0;
           const algoShown = manualAlgoEnabled ? stAlgoCount : 0;
           const coinsShown = manualCoinsEnabled ? coinCount : 0;
-          plBadge.textContent = `pair lists (manual): fiat-stable ${fiatShown}, algo/crypto-stable ${algoShown}, coins ${coinsShown}, commodity ${cmCount}, memes ${memeCount}`;
+          plBadge.textContent = `pair lists (manual): fiat-stable ${fiatShown}, fiat-nonusd ${fxCount}, algo/crypto-stable ${algoShown}, coins ${coinsShown}, commodity ${cmCount}, memes ${memeCount}`;
         }
         for (const selId of ["stableBucketMode", "tokenBucketMode"]) {
           const sel = document.getElementById(selId);
