@@ -1198,6 +1198,12 @@ def _resolve_pool_tvl_now_onchain(pool: dict, chain: str, endpoint: str = "") ->
         _act_dbg = dict(og_dbg or {})
     act0 = float(act0_raw) / float(10 ** max(0, dec0))
     act1 = float(act1_raw) / float(10 ** max(0, dec1))
+    # Root-cause fix: active liquidity amounts are a subset of full pool balances.
+    # Some upstream active-position sources can overcount; clamp by token balances.
+    act0_pre_cap = float(act0)
+    act1_pre_cap = float(act1)
+    act0 = float(min(max(0.0, act0), max(0.0, amt0)))
+    act1 = float(min(max(0.0, act1), max(0.0, amt1)))
 
     prices, sources, errs = get_token_prices_usd(ck, [token0, token1])
     p0 = float(prices.get(token0) or 0.0)
@@ -1225,6 +1231,8 @@ def _resolve_pool_tvl_now_onchain(pool: dict, chain: str, endpoint: str = "") ->
         "decimals1": int(dec1),
         "amount0_full_pool": float(amt0),
         "amount1_full_pool": float(amt1),
+        "amount0_active_window_raw": float(max(0.0, act0_pre_cap)),
+        "amount1_active_window_raw": float(max(0.0, act1_pre_cap)),
         "amount0_active_window": float(max(0.0, act0)),
         "amount1_active_window": float(max(0.0, act1)),
         "tvl_full_pool_usd": float(tvl_full),

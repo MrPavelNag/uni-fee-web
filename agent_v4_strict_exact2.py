@@ -1016,10 +1016,25 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
 
     tvl = max(0.0, a0 * max(0.0, p0)) + max(0.0, a1 * max(0.0, p1))
     tvl_full = max(0.0, float(a0_full) * max(0.0, p0)) + max(0.0, float(a1_full) * max(0.0, p1))
-    tvl_active = max(0.0, float(a0_active_raw / (10 ** d0)) * max(0.0, p0)) + max(0.0, float(a1_active_raw / (10 ** d1)) * max(0.0, p1))
-    if interface_full_tvl > 0.0:
+    act0 = float(a0_active_raw / (10 ** d0)) if d0 > 0 else 0.0
+    act1 = float(a1_active_raw / (10 ** d1)) if d1 > 0 else 0.0
+    # Root-cause fix: active is a subset of full pool balances.
+    # Keep both branches in one quantity domain to avoid source-mixing inversions.
+    act0_raw_pre_cap = float(max(0.0, act0))
+    act1_raw_pre_cap = float(max(0.0, act1))
+    if full_available:
+        act0 = float(min(max(0.0, act0), max(0.0, float(a0_full))))
+        act1 = float(min(max(0.0, act1), max(0.0, float(a1_full))))
+    tvl_active = max(0.0, float(act0) * max(0.0, p0)) + max(0.0, float(act1) * max(0.0, p1))
+    # Prefer quantized full TVL for strict compare consistency.
+    # Use Interface TVL only as fallback when quantized full is unavailable.
+    if float(tvl_full) > 0.0:
+        tvl = float(tvl_full)
+    elif interface_full_tvl > 0.0:
         tvl = float(interface_full_tvl)
-        qty_src_or_err = "uniswap_interface_v4Pool_totalLiquidity"
+        qty_src_or_err = "uniswap_interface_v4Pool_totalLiquidity_fallback"
+    dbg["amount0_active_window_raw_uncapped"] = float(act0_raw_pre_cap)
+    dbg["amount1_active_window_raw_uncapped"] = float(act1_raw_pre_cap)
     dbg["tvl_full_pool_usd_from_quantities"] = float(tvl_full)
     dbg["tvl_full_pool_usd"] = float(interface_full_tvl if interface_full_tvl > 0.0 else tvl_full)
     dbg["tvl_active_window_usd"] = float(tvl_active)
