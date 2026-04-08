@@ -18007,6 +18007,8 @@ def _merge_for_web(
                             ah_part = "exact active history=on-chain snapshots"
                         elif "fallback:active_subgraph_sparse:ok" in ah_src:
                             ah_part = "exact active history=subgraph block snapshots (fallback)"
+                        elif "fallback_now_point" in ah_src:
+                            ah_part = "exact active history=NOW point fallback"
                         elif ah_src:
                             ah_part = "exact active history=fallback"
                         else:

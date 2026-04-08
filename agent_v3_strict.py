@@ -2415,6 +2415,13 @@ def main() -> None:
                     exact_active_fees = _sparse_series_every_n_days(estimated_active_fees, active_step_days)
                     exact_active_fees = _append_now_fee_anchor(exact_active_fees)
                 tvl_now_debug["active_history_source"] = f"{str(tvl_now_debug.get('active_history_source') or '')}:fallback_estimated"
+            elif fees_usd and float(tvl_active_now) > 0.0:
+                # Keep exact-active row present even when historical reconstruction failed.
+                # This avoids hard "unavailable" regression while still not cloning estimated history.
+                exact_active_tvl = [(int(fees_usd[-1][0]), float(max(0.0, tvl_active_now)))]
+                exact_active_tvl = _append_now_tvl_anchor(exact_active_tvl, float(tvl_active_now))
+                exact_active_fees = _append_now_fee_anchor([(int(fees_usd[-1][0]), 0.0)])
+                tvl_now_debug["active_history_source"] = f"{str(tvl_now_debug.get('active_history_source') or '')}:fallback_now_point"
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
