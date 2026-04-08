@@ -152,7 +152,7 @@ def _v3_active_positions_amounts_from_subgraph(
           pool: $pool
           liquidity_gt: "0"
           id_gt: $last
-          tickLower_: { tickIdx_lt: $tick }
+          tickLower_: { tickIdx_lte: $tick }
           tickUpper_: { tickIdx_gt: $tick }
         }
       ) {
@@ -229,16 +229,16 @@ def _v3_active_positions_amounts_from_subgraph(
                 visited += 1
                 if liq <= 0 or hi <= lo:
                     continue
-                # Strict in-range criterion: both token sides must be non-zero.
-                if not (lo < int(current_tick) < hi):
+                # In-range liquidity criterion (v3 canonical): tickLower <= currentTick < tickUpper.
+                if not (lo <= int(current_tick) < hi):
                     continue
                 sqrt_lo = _sqrt_tick(lo)
                 sqrt_hi = _sqrt_tick(hi)
-                if not (sqrt_lo < sqrt_p < sqrt_hi):
+                if not (sqrt_lo <= sqrt_p < sqrt_hi):
                     continue
                 a0, _ = _amounts_from_liquidity_segment(Decimal(liq), sqrt_p, sqrt_hi)
                 _, a1 = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_p)
-                if a0 <= 0 or a1 <= 0:
+                if a0 <= 0 and a1 <= 0:
                     continue
                 total0 += a0
                 total1 += a1
@@ -359,15 +359,15 @@ def _v3_active_positions_amounts_onchain_logs(
         liq = int(liq_raw)
         if liq <= 0:
             continue
-        if not (int(lo) < int(current_tick) < int(hi)):
+        if not (int(lo) <= int(current_tick) < int(hi)):
             continue
         sqrt_lo = _sqrt_ratio_x96_at_tick(int(lo))
         sqrt_hi = _sqrt_ratio_x96_at_tick(int(hi))
-        if not (sqrt_lo < sqrt_p < sqrt_hi):
+        if not (sqrt_lo <= sqrt_p < sqrt_hi):
             continue
         a0, _ = _amounts_from_liquidity_segment(Decimal(liq), sqrt_p, sqrt_hi)
         _, a1 = _amounts_from_liquidity_segment(Decimal(liq), sqrt_lo, sqrt_p)
-        if a0 <= 0 or a1 <= 0:
+        if a0 <= 0 and a1 <= 0:
             continue
         total0 += a0
         total1 += a1
