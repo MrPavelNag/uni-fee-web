@@ -22,10 +22,9 @@ import time
 from decimal import Decimal, getcontext
 from typing import Any
 
-import requests
 from config import DEFAULT_TOKEN_PAIRS, FEE_DAYS, LP_ALLOCATION_USD, UNISWAP_V4_SUBGRAPHS
 from agent_common import build_exact_day_window, pairs_to_filename_suffix, save_chart_data_json
-from agent_v3 import CHAIN_ID_BY_KEY, _erc20_decimals, _llama_block_for_day, _rpc_json
+from agent_v3 import CHAIN_ID_BY_KEY, _erc20_decimals, _rpc_json
 from agent_v4 import get_endpoint, query_pool_day_data
 from price_oracle import get_token_prices_usd
 from uniswap_client import graphql_query
@@ -86,94 +85,6 @@ _V4_GET_TICK_LIQ_SELECTOR = "0xcaedab54"  # getTickLiquidity(bytes32,int24)
 _V4_TOPIC_INITIALIZE = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
 _V4_TOPIC_MODIFY_LIQ = "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec"
 
-_UNISWAP_INTERFACE_GRAPHQL = "https://interface.gateway.uniswap.org/v1/graphql"
-_UNISWAP_CHAIN_ENUM_BY_KEY: dict[str, str] = {
-    "ethereum": "ETHEREUM",
-    "arbitrum": "ARBITRUM",
-    "base": "BASE",
-    "polygon": "POLYGON",
-    "optimism": "OPTIMISM",
-    "avalanche": "AVALANCHE",
-    "unichain": "UNICHAIN",
-    "bsc": "BNB",
-    "celo": "CELO",
-}
-
-
-def _keccak256_hex(data: bytes) -> str:
-    try:
-        from eth_hash.auto import keccak as _keccak  # type: ignore
-
-        h = _keccak(data)
-        return "0x" + bytes(h).hex()
-    except Exception:
-        return ""
-
-
-def _v4_swap_topic_candidates() -> list[str]:
-    # Candidate signatures used across v4 indexers/ABIs.
-    sigs = [
-        b"Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)",
-        b"Swap(bytes32,address,int128,int128,uint160,uint128,int24)",
-        b"Swap(bytes32,address,address,int128,int128,uint160,uint128,int24)",
-        b"Swap(bytes32,address,address,int256,int256,uint160,uint128,int24)",
-    ]
-    out: list[str] = []
-    for sig in sigs:
-        t0 = _keccak256_hex(sig)
-        if t0 and t0 not in out:
-            out.append(t0.lower())
-    return out
-
-
-def _uniswap_interface_v4_pool_metrics(chain: str, pool_id: str, *, timeout_sec: float = 8.0) -> tuple[dict[str, float], str]:
-    chain_enum = _UNISWAP_CHAIN_ENUM_BY_KEY.get(str(chain or "").strip().lower(), "")
-    pid = str(pool_id or "").strip().lower()
-    if not chain_enum:
-        return {}, "chain_not_supported_by_interface_api"
-    if not _is_hex(pid, 64):
-        return {}, "pool_id_must_be_64hex"
-    q = """
-    query V4Pool($chain: Chain!, $poolId: String!) {
-      v4Pool(chain: $chain, poolId: $poolId) {
-        feeTier
-        totalLiquidity { value }
-        volume24h: cumulativeVolume(duration: DAY) { value }
-      }
-    }
-    """
-    body = {"query": q, "variables": {"chain": chain_enum, "poolId": pid}, "operationName": "V4Pool"}
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        # Uniswap interface gateway is stricter than plain subgraph endpoints.
-        "origin": "https://app.uniswap.org",
-        "referer": "https://app.uniswap.org/",
-        "user-agent": "Mozilla/5.0",
-    }
-    try:
-        r = requests.post(_UNISWAP_INTERFACE_GRAPHQL, json=body, headers=headers, timeout=max(3.0, float(timeout_sec)))
-        if int(r.status_code) != 200:
-            return {}, f"http_{int(r.status_code)}"
-        payload = r.json() if r.content else {}
-        errs = payload.get("errors") or []
-        if errs:
-            msg = str((errs[0] or {}).get("message") or "graphql_error").strip() or "graphql_error"
-            return {}, f"graphql:{msg}"
-        p = ((payload.get("data") or {}).get("v4Pool") or {})
-        if not isinstance(p, dict) or not p:
-            return {}, "empty_v4Pool"
-        out = {
-            "fee_tier": float(p.get("feeTier") or 0.0),
-            "total_liquidity_usd": float(((p.get("totalLiquidity") or {}).get("value") or 0.0)),
-            "volume24h_usd": float(((p.get("volume24h") or {}).get("value") or 0.0)),
-        }
-        if out["total_liquidity_usd"] <= 0.0:
-            return {}, "total_liquidity_non_positive"
-        return out, ""
-    except Exception as e:
-        return {}, f"request_error:{type(e).__name__}"
-
 
 def _is_hex(v: str, n_hex: int) -> bool:
     s = str(v or "").strip().lower()
@@ -218,8 +129,6 @@ def _strict_unavailable_payload(pool_id: str, reason: str, chain: str = "", stri
         "strict_compare_estimated_active_tvl": [],
         "strict_compare_estimated_active_fees": [],
         "strict_compare_exact_tvl": [],
-        "strict_compare_exact_active_tvl": [],
-        "strict_compare_exact_active_fees": [],
         "strict_compare_exact_fees": [],
     }
 
@@ -296,18 +205,6 @@ def _decode_int24_from_word(word: str) -> int:
     return int(x)
 
 
-def _parse_int_any(v: Any, default: int = 0) -> int:
-    s = str(v or "").strip().lower()
-    if not s:
-        return int(default)
-    try:
-        if s.startswith("0x"):
-            return int(s, 16)
-        return int(s, 10)
-    except Exception:
-        return int(default)
-
-
 def _decode_address_from_topic(topic_word: str) -> str:
     w = str(topic_word or "").strip().lower()
     if w.startswith("0x"):
@@ -324,8 +221,8 @@ def _encode_int24_word(v: int) -> str:
     return ("f" * 58) + format(x, "06x") if (x & 0x800000) else ("0" * 58) + format(x, "06x")
 
 
-def _rpc_eth_call(chain_id: int, to: str, data: str, *, timeout_sec: float = 8.0, block_tag: str = "latest") -> str:
-    payload = [{"to": str(to or "").strip().lower(), "data": str(data or "")}, str(block_tag or "latest")]
+def _rpc_eth_call(chain_id: int, to: str, data: str, *, timeout_sec: float = 8.0) -> str:
+    payload = [{"to": str(to or "").strip().lower(), "data": str(data or "")}, "latest"]
     res = _rpc_json(int(chain_id), "eth_call", payload, timeout_sec=float(timeout_sec)) or {}
     return str(res.get("result") or "")
 
@@ -336,38 +233,6 @@ def _rpc_latest_block(chain_id: int, timeout_sec: float = 8.0) -> int:
         return int(str(res.get("result") or "0x0"), 16)
     except Exception:
         return 0
-
-
-def _rpc_block_timestamp(chain_id: int, block_number: int, timeout_sec: float = 8.0) -> int:
-    try:
-        out = _rpc_json(int(chain_id), "eth_getBlockByNumber", [hex(max(0, int(block_number))), False], timeout_sec=float(timeout_sec)) or {}
-        ts_hex = str((out.get("result") or {}).get("timestamp") or "0x0")
-        return int(ts_hex, 16) if str(ts_hex).startswith("0x") else int(str(ts_hex) or "0")
-    except Exception:
-        return 0
-
-
-def _first_block_at_or_after_ts(chain_id: int, target_ts: int, latest_block: int) -> int:
-    cid = int(chain_id)
-    t = int(target_ts)
-    hi0 = int(latest_block)
-    if cid <= 0 or t <= 0 or hi0 <= 0:
-        return 0
-    lo, hi = 0, hi0
-    ans = hi0
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        ts_mid = _rpc_block_timestamp(cid, mid, timeout_sec=8.0)
-        if ts_mid <= 0:
-            # retry toward newer side
-            lo = mid + 1
-            continue
-        if ts_mid >= t:
-            ans = mid
-            hi = mid - 1
-        else:
-            lo = mid + 1
-    return int(ans)
 
 
 def _rpc_get_logs(
@@ -481,15 +346,15 @@ def _pool_init_meta(chain_id: int, pool_manager: str, pool_id: str, latest_block
     return cand[0], ""
 
 
-def _read_v4_slot0_liquidity(chain_id: int, chain: str, pool_id: str, *, block_tag: str = "latest") -> tuple[int, int, int, str]:
+def _read_v4_slot0_liquidity(chain_id: int, chain: str, pool_id: str) -> tuple[int, int, int, str]:
     pid = str(pool_id or "").strip().lower()
     pm, sv = _onchain_addresses_for_chain(chain)
     targets = [t for t in [sv, pm] if t]
     last_err = ""
     for target in targets:
         try:
-            slot_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_SLOT0_SELECTOR + pid[2:], timeout_sec=8.0, block_tag=block_tag)
-            liq_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_LIQUIDITY_SELECTOR + pid[2:], timeout_sec=8.0, block_tag=block_tag)
+            slot_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_SLOT0_SELECTOR + pid[2:], timeout_sec=8.0)
+            liq_hex = _rpc_eth_call(int(chain_id), target, _V4_GET_LIQUIDITY_SELECTOR + pid[2:], timeout_sec=8.0)
             slot_words = _hex_words(slot_hex)
             liq_words = _hex_words(liq_hex)
             if len(slot_words) < 2 or not liq_words:
@@ -552,7 +417,7 @@ def _fetch_modified_ticks(
     return sorted(ticks), ""
 
 
-def _read_tick_liquidity_net(chain_id: int, chain: str, pool_id: str, tick: int, *, block_tag: str = "latest") -> tuple[int, int, str]:
+def _read_tick_liquidity_net(chain_id: int, chain: str, pool_id: str, tick: int) -> tuple[int, int, str]:
     pid = str(pool_id or "").strip().lower()
     pm, sv = _onchain_addresses_for_chain(chain)
     targets = [t for t in [sv, pm] if t]
@@ -560,7 +425,7 @@ def _read_tick_liquidity_net(chain_id: int, chain: str, pool_id: str, tick: int,
     last_err = ""
     for target in targets:
         try:
-            out = _rpc_eth_call(int(chain_id), target, calldata, timeout_sec=8.0, block_tag=block_tag)
+            out = _rpc_eth_call(int(chain_id), target, calldata, timeout_sec=8.0)
             words = _hex_words(out)
             if len(words) < 2:
                 last_err = "empty_tick_liquidity"
@@ -615,80 +480,6 @@ def _active_window_amounts(
     return float(max(Decimal(0), a0)), float(max(Decimal(0), a1)), "pure_onchain_active_window"
 
 
-def _active_window_amounts_from_initialized_band(
-    *,
-    chain_id: int,
-    chain: str,
-    pool_id: str,
-    liquidity: int,
-    current_tick: int,
-    tick_spacing: int,
-    sqrt_price_x96: int,
-    block_tag: str = "latest",
-) -> tuple[float, float, str]:
-    """Estimate active amounts in the real initialized band around current tick.
-
-    Root-cause fix for underestimated V4 active TVL:
-    using [floorTick, floorTick+tickSpacing] is often too narrow. We search nearest
-    initialized ticks around current price and use that band with current liquidity.
-    """
-    if int(liquidity) <= 0 or int(tick_spacing) <= 0 or int(sqrt_price_x96) <= 0:
-        return _active_window_amounts(liquidity, current_tick, tick_spacing, sqrt_price_x96)
-    s = int(tick_spacing)
-    t = int(current_tick)
-    base = int(math.floor(float(t) / float(s)) * s)
-    try:
-        max_steps = max(4, min(120, int(os.environ.get("STRICT_V4_ACTIVE_BAND_MAX_STEPS", "28") or 28)))
-    except Exception:
-        max_steps = 28
-
-    def _is_initialized_tick(tick: int) -> tuple[bool, str]:
-        gross, net, src = _read_tick_liquidity_net(
-            int(chain_id),
-            str(chain),
-            str(pool_id),
-            int(tick),
-            block_tag=str(block_tag or "latest"),
-        )
-        return bool(int(gross) > 0 or int(net) != 0), str(src or "")
-
-    src_tag = ""
-    lower_tick: int | None = None
-    upper_tick: int | None = None
-    for k in range(0, int(max_steps) + 1):
-        cand = int(base - k * s)
-        ok, src = _is_initialized_tick(int(cand))
-        src_tag = src_tag or src
-        if ok:
-            lower_tick = int(cand)
-            break
-    for k in range(0, int(max_steps) + 1):
-        cand = int(base + (k + 1) * s)
-        ok, src = _is_initialized_tick(int(cand))
-        src_tag = src_tag or src
-        if ok:
-            upper_tick = int(cand)
-            break
-
-    if lower_tick is None or upper_tick is None or int(upper_tick) <= int(lower_tick):
-        a0, a1, src0 = _active_window_amounts(liquidity, current_tick, tick_spacing, sqrt_price_x96)
-        return a0, a1, f"{src0}:fallback_no_initialized_band"
-
-    sqrt_lo = _sqrt_ratio_x96_at_tick(int(lower_tick))
-    sqrt_hi = _sqrt_ratio_x96_at_tick(int(upper_tick))
-    sqrt_p = Decimal(int(sqrt_price_x96))
-    if not (sqrt_lo < sqrt_p < sqrt_hi):
-        sqrt_p = min(max(sqrt_p, sqrt_lo + Decimal(1)), sqrt_hi - Decimal(1))
-    liq = Decimal(int(liquidity))
-    a0, _ = _amounts_from_liquidity_segment(liq, sqrt_p, sqrt_hi)
-    _, a1 = _amounts_from_liquidity_segment(liq, sqrt_lo, sqrt_p)
-    src = (
-        f"pure_onchain_active_initialized_band:{src_tag or 'state'}:"
-        f"lo={int(lower_tick)}:hi={int(upper_tick)}"
-    )
-    return float(max(Decimal(0), a0)), float(max(Decimal(0), a1)), src
-
-
 def _compute_pool_token_amounts_onchain(
     chain_id: int,
     chain: str,
@@ -699,7 +490,6 @@ def _compute_pool_token_amounts_onchain(
     ticks: list[int],
     *,
     deadline_ts: float | None = None,
-    block_tag: str = "latest",
 ) -> tuple[float, float, str]:
     if int(tick_spacing) <= 0:
         return 0.0, 0.0, "strict_required:v4_exact2:invalid_tick_spacing"
@@ -713,7 +503,7 @@ def _compute_pool_token_amounts_onchain(
     for t in ticks:
         if deadline_ts is not None and time.monotonic() >= float(deadline_ts):
             return 0.0, 0.0, "strict_required:v4_exact2:tick_scan_timeout"
-        _gross, net, src = _read_tick_liquidity_net(chain_id, chain, pool_id, int(t), block_tag=block_tag)
+        _gross, net, src = _read_tick_liquidity_net(chain_id, chain, pool_id, int(t))
         src_tag = src_tag or str(src)
         if int(net) != 0:
             tick_to_net[int(t)] = int(net)
@@ -757,178 +547,6 @@ def _compute_pool_token_amounts_onchain(
 
     src = f"pure_onchain_ticks:{src_tag or 'state'}:ticks={len(sorted_ticks)}"
     return float(max(Decimal(0), amount0_raw)), float(max(Decimal(0), amount1_raw)), src
-
-
-def _v4_onchain_historical_tvl_snapshots(
-    *,
-    pool: dict[str, Any],
-    chain: str,
-    chain_id: int,
-    day_ts: list[int],
-    latest_block: int,
-    fee_pct: float,
-    budget_sec: float,
-    step_days: int,
-    strict_dbg: dict[str, Any],
-) -> tuple[list[tuple[int, float]], list[tuple[int, float]], dict[str, Any]]:
-    t_fn0 = time.monotonic()
-    dbg: dict[str, Any] = {
-        "source": "onchain_historical_snapshots",
-        "stage_ms": {},
-        "counters": {
-            "targets_total": 0,
-            "targets_done": 0,
-            "block_resolve_fail": 0,
-            "slot0_fail": 0,
-            "active_points": 0,
-            "full_points": 0,
-            "full_fallback_points": 0,
-        },
-        "samples": {"block_resolve_fail_ts": [], "slot0_fail_ts": []},
-    }
-    if not day_ts:
-        return [], [], dbg
-    ck = str(chain or "").strip().lower()
-    pool_id = str(pool.get("id") or "").strip().lower()
-    pm, _sv = _onchain_addresses_for_chain(ck)
-    if not pm:
-        dbg["error"] = "pool_manager_not_configured"
-        return [], [], dbg
-    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
-    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
-    d0 = int(_erc20_decimals(chain_id, token0)) if token0 else 18
-    d1 = int(_erc20_decimals(chain_id, token1)) if token1 else 18
-    d0 = d0 if 0 < d0 <= 36 else 18
-    d1 = d1 if 0 < d1 <= 36 else 18
-    t_price0 = time.monotonic()
-    prices, _srcs, _errs = get_token_prices_usd(ck, [token0, token1])
-    dbg["stage_ms"]["prices_lookup"] = int(round(max(0.0, time.monotonic() - t_price0) * 1000.0))
-    p0 = float(prices.get(token0) or 0.0)
-    p1 = float(prices.get(token1) or 0.0)
-    if p0 <= 0 and p1 <= 0:
-        dbg["error"] = "prices_unavailable"
-        return [], [], dbg
-
-    # Build sparse target timestamps based on requested step (1 point / N days).
-    base = sorted({int(x) for x in day_ts if int(x) > 0})
-    sparse = _sparse_series_every_n_days([(int(ts), 1.0) for ts in base], int(step_days))
-    targets = [int(ts) for ts, _ in sparse]
-    if base and (not targets or targets[-1] != base[-1]):
-        targets.append(int(base[-1]))
-    targets = sorted({int(x) for x in targets if int(x) > 0})
-    dbg["targets"] = int(len(targets))
-    dbg["counters"]["targets_total"] = int(len(targets))
-
-    # Prepare full-pool tick universe (on-chain). If disabled/timeout/error: fallback to active*ratio.
-    t0 = time.monotonic()
-    total_budget = max(12.0, float(budget_sec))
-    try:
-        full_scan_enable = str(os.environ.get("STRICT_V4_ONCHAIN_HISTORY_FULL_SCAN_ENABLE", "0")).strip().lower() in {"1", "true", "yes", "on"}
-    except Exception:
-        full_scan_enable = False
-    ticks_budget = max(3.0, float(total_budget) * (0.40 if full_scan_enable else 0.15))
-    ticks_deadline_ts = t0 + ticks_budget
-    snapshot_deadline_ts = t0 + total_budget
-    ticks: list[int] = []
-    ticks_status = ""
-    t_ticks0 = time.monotonic()
-    if full_scan_enable:
-        init_meta, init_err = _pool_init_meta(chain_id, pm, pool_id, int(latest_block))
-        if init_meta and int(init_meta.get("block") or 0) > 0:
-            from_block = int(init_meta.get("block") or 0)
-            ticks, ticks_status = _fetch_modified_ticks(
-                chain_id,
-                pm,
-                pool_id,
-                from_block,
-                int(latest_block),
-                deadline_ts=ticks_deadline_ts,
-            )
-        else:
-            ticks_status = str(init_err or "init_meta_unavailable")
-    else:
-        ticks_status = "disabled"
-    dbg["stage_ms"]["ticks_prepare"] = int(round(max(0.0, time.monotonic() - t_ticks0) * 1000.0))
-    dbg["ticks_status"] = str(ticks_status or "ok")
-    dbg["ticks_count"] = int(len(ticks or []))
-
-    full_out: list[tuple[int, float]] = []
-    active_out: list[tuple[int, float]] = []
-    # fallback ratio from NOW anchors (if tick scan unavailable on historical block)
-    now_full = float((strict_dbg or {}).get("tvl_full_pool_usd") or 0.0)
-    now_act = float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0)
-    full_to_active_ratio = (now_full / now_act) if (now_full > 0 and now_act > 0) else 0.0
-
-    # Resolve target days to blocks once (prefer DefiLlama mapping, fallback to RPC binary search).
-    target_days = sorted({int((int(ts) // 86400) * 86400) for ts in targets if int(ts) > 0})
-    day_to_block: dict[int, int] = {}
-    t_blocks0 = time.monotonic()
-    for day_ts in target_days:
-        if time.monotonic() >= snapshot_deadline_ts:
-            break
-        b = 0
-        try:
-            b = int(_llama_block_for_day(ck, int(day_ts) + 86399))
-        except Exception:
-            b = 0
-        if b <= 0:
-            # Fallback: slower RPC binary search only for days missing in llama.
-            b = int(_first_block_at_or_after_ts(chain_id, int(day_ts), int(latest_block)))
-        day_to_block[int(day_ts)] = int(max(0, b))
-    dbg["stage_ms"]["block_resolve"] = int(round(max(0.0, time.monotonic() - t_blocks0) * 1000.0))
-
-    for ts in targets:
-        if time.monotonic() >= snapshot_deadline_ts:
-            dbg["timeout"] = True
-            break
-        day_ts = int((int(ts) // 86400) * 86400)
-        b = int(day_to_block.get(day_ts, 0))
-        if b <= 0:
-            dbg["counters"]["block_resolve_fail"] = int(dbg["counters"]["block_resolve_fail"]) + 1
-            if len(dbg["samples"]["block_resolve_fail_ts"]) < 6:
-                dbg["samples"]["block_resolve_fail_ts"].append(int(ts))
-            continue
-        block_tag = hex(int(b))
-        sqrt_price_x96, current_tick, pool_liquidity, _src = _read_v4_slot0_liquidity(chain_id, ck, pool_id, block_tag=block_tag)
-        if sqrt_price_x96 <= 0:
-            dbg["counters"]["slot0_fail"] = int(dbg["counters"]["slot0_fail"]) + 1
-            if len(dbg["samples"]["slot0_fail_ts"]) < 6:
-                dbg["samples"]["slot0_fail_ts"].append(int(ts))
-            continue
-        # active TVL (on-chain)
-        a0_act_raw, a1_act_raw, _act_src = _active_window_amounts(pool_liquidity, current_tick, int(pool.get("tickSpacing") or 10), sqrt_price_x96)
-        a0_act = float(a0_act_raw / (10**d0))
-        a1_act = float(a1_act_raw / (10**d1))
-        tvl_act = max(0.0, a0_act * max(0.0, p0)) + max(0.0, a1_act * max(0.0, p1))
-        active_out.append((int(ts), float(tvl_act)))
-        dbg["counters"]["active_points"] = int(dbg["counters"]["active_points"]) + 1
-
-        tvl_full = 0.0
-        if ticks:
-            a0_full_raw, a1_full_raw, _full_src = _compute_pool_token_amounts_onchain(
-                chain_id,
-                ck,
-                pool_id,
-                int(pool.get("tickSpacing") or 10),
-                int(current_tick),
-                int(sqrt_price_x96),
-                ticks,
-                deadline_ts=snapshot_deadline_ts,
-                block_tag=block_tag,
-            )
-            a0_full = float(a0_full_raw / (10**d0))
-            a1_full = float(a1_full_raw / (10**d1))
-            tvl_full = max(0.0, a0_full * max(0.0, p0)) + max(0.0, a1_full * max(0.0, p1))
-        if tvl_full <= 0.0 and tvl_act > 0.0 and full_to_active_ratio > 0.0:
-            tvl_full = float(tvl_act * full_to_active_ratio)
-            dbg["counters"]["full_fallback_points"] = int(dbg["counters"]["full_fallback_points"]) + 1
-        full_out.append((int(ts), float(max(0.0, tvl_full))))
-        dbg["counters"]["full_points"] = int(dbg["counters"]["full_points"]) + 1
-        dbg["counters"]["targets_done"] = int(dbg["counters"]["targets_done"]) + 1
-
-    dbg["snapshots_done"] = int(min(len(full_out), len(active_out)))
-    dbg["elapsed_ms"] = int(round(max(0.0, time.monotonic() - t_fn0) * 1000.0))
-    return full_out, active_out, dbg
 
 
 def _resolve_pool_tvl_now_onchain_v4_exact2(
@@ -1005,17 +623,6 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     dbg["decimals0"] = int(d0)
     dbg["decimals1"] = int(d1)
 
-    interface_metrics, interface_err = _uniswap_interface_v4_pool_metrics(ck, pool_id, timeout_sec=8.0)
-    interface_full_tvl = float(interface_metrics.get("total_liquidity_usd") or 0.0)
-    dbg["uniswap_interface_source"] = "interface.gateway.uniswap.org/v1/graphql"
-    dbg["uniswap_interface_ok"] = bool(interface_full_tvl > 0.0)
-    if interface_full_tvl > 0.0:
-        dbg["uniswap_interface_full_tvl_usd"] = float(interface_full_tvl)
-        dbg["uniswap_interface_volume24h_usd"] = float(interface_metrics.get("volume24h_usd") or 0.0)
-        dbg["uniswap_interface_fee_tier"] = float(interface_metrics.get("fee_tier") or 0.0)
-    else:
-        dbg["uniswap_interface_error"] = str(interface_err or "unavailable")
-
     qty_src_or_err = ""
     full_available = False
     try:
@@ -1028,16 +635,7 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     a0_full_raw = float(a0_full * (10 ** d0))
     a1_full_raw = float(a1_full * (10 ** d1))
 
-    a0_active_raw, a1_active_raw, active_src = _active_window_amounts_from_initialized_band(
-        chain_id=int(chain_id),
-        chain=str(ck),
-        pool_id=str(pool_id),
-        liquidity=int(pool_liquidity),
-        current_tick=int(current_tick),
-        tick_spacing=int(tick_spacing),
-        sqrt_price_x96=int(sqrt_price_x96),
-        block_tag="latest",
-    )
+    a0_active_raw, a1_active_raw, active_src = _active_window_amounts(pool_liquidity, current_tick, tick_spacing, sqrt_price_x96)
     dbg["quantity_mode_full_available"] = bool(full_available)
     dbg["quantity_mode_active_available"] = bool((a0_active_raw > 0.0) or (a1_active_raw > 0.0))
     dbg["amount0_full_pool"] = float(a0_full)
@@ -1059,7 +657,7 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     dbg["quantity_source"] = str(qty_src_or_err or "")
     dbg["amount0_raw"] = float(a0_raw or 0.0)
     dbg["amount1_raw"] = float(a1_raw or 0.0)
-    if a0_raw <= 0.0 and a1_raw <= 0.0 and interface_full_tvl <= 0.0:
+    if a0_raw <= 0.0 and a1_raw <= 0.0:
         dbg["error"] = str(qty_src_or_err or "quantities_unavailable")
         dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
         return 0.0, "", str(qty_src_or_err or "strict_required:v4_exact2:quantities_unavailable"), dbg
@@ -1086,36 +684,15 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
         if p1 <= 0 and p0 > 0 and ratio01 > 0:
             p1 = p0 / ratio01
     if p0 <= 0 and p1 <= 0:
-        if interface_full_tvl <= 0.0:
-            dbg["error"] = "price_unavailable"
-            dbg["price_errors"] = [str(x) for x in errs if str(x).strip()]
-            dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
-            return 0.0, "", (";".join(str(x) for x in errs if str(x).strip()) or "strict_required:v4_exact2:price_unavailable"), dbg
-        # Full TVL from Uniswap interface is available; keep active window as unknown (0).
-        p0 = 0.0
-        p1 = 0.0
+        dbg["error"] = "price_unavailable"
         dbg["price_errors"] = [str(x) for x in errs if str(x).strip()]
-        dbg["price_unavailable_active_disabled"] = True
+        dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
+        return 0.0, "", (";".join(str(x) for x in errs if str(x).strip()) or "strict_required:v4_exact2:price_unavailable"), dbg
 
     tvl = max(0.0, a0 * max(0.0, p0)) + max(0.0, a1 * max(0.0, p1))
     tvl_full = max(0.0, float(a0_full) * max(0.0, p0)) + max(0.0, float(a1_full) * max(0.0, p1))
-    act0 = float(a0_active_raw / (10 ** d0)) if d0 > 0 else 0.0
-    act1 = float(a1_active_raw / (10 ** d1)) if d1 > 0 else 0.0
-    # Do not cap active by subgraph full-token balances here:
-    # in V4 they can be stale/incomplete and suppress active TVL incorrectly.
-    act0_raw_pre_cap = float(max(0.0, act0))
-    act1_raw_pre_cap = float(max(0.0, act1))
-    tvl_active = max(0.0, float(act0) * max(0.0, p0)) + max(0.0, float(act1) * max(0.0, p1))
-    # Keep interface full TVL as primary when available (historically more stable on V4).
-    if interface_full_tvl > 0.0:
-        tvl = float(interface_full_tvl)
-        qty_src_or_err = "uniswap_interface_v4Pool_totalLiquidity"
-    elif float(tvl_full) > 0.0:
-        tvl = float(tvl_full)
-    dbg["amount0_active_window_raw_uncapped"] = float(act0_raw_pre_cap)
-    dbg["amount1_active_window_raw_uncapped"] = float(act1_raw_pre_cap)
-    dbg["tvl_full_pool_usd_from_quantities"] = float(tvl_full)
-    dbg["tvl_full_pool_usd"] = float(interface_full_tvl if interface_full_tvl > 0.0 else tvl_full)
+    tvl_active = max(0.0, float(a0_active_raw / (10 ** d0)) * max(0.0, p0)) + max(0.0, float(a1_active_raw / (10 ** d1)) * max(0.0, p1))
+    dbg["tvl_full_pool_usd"] = float(tvl_full)
     dbg["tvl_active_window_usd"] = float(tvl_active)
     if tvl <= 0:
         dbg["error"] = "computed_tvl_zero"
@@ -1128,303 +705,12 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
         psrc = f"{s0}+{s1}"
     src = (
         f"v4_exact2:one_point_qty={qty_src_or_err}:alt={dbg.get('quantity_source_secondary')}"
-        f":full_src={'uniswap_interface' if interface_full_tvl > 0.0 else 'quantized'}"
         f":state={state_src_or_err}:liq={int(pool_liquidity)}:tick={int(current_tick)}:price={psrc}"
     )
     dbg["price_source"] = str(psrc or "")
     dbg["tvl_now_usd"] = float(tvl)
     dbg["elapsed_sec"] = round(max(0.0, time.monotonic() - t_start), 3)
     return float(tvl), src, "", dbg
-
-
-def _guess_v4_swap_topic(
-    chain_id: int,
-    pool_manager: str,
-    pool_id: str,
-    latest_block: int,
-    *,
-    max_back_blocks: int | None = None,
-) -> tuple[str, str]:
-    pid = str(pool_id or "").strip().lower()
-    hi = int(latest_block)
-    step = 48_000
-    if max_back_blocks is not None and int(max_back_blocks) > 0:
-        max_back = int(max_back_blocks)
-    else:
-        try:
-            max_back = max(48_000, int(os.environ.get("STRICT_V4_SWAP_TOPIC_SCAN_BLOCKS", "180000")))
-        except Exception:
-            max_back = 180_000
-    scanned = 0
-    # 1) Try known signature candidates first.
-    for t0 in _v4_swap_topic_candidates():
-        cur_hi = int(hi)
-        scanned = 0
-        while cur_hi >= 0 and scanned <= max_back:
-            cur_lo = max(0, cur_hi - step + 1)
-            try:
-                rows = _rpc_get_logs(chain_id, pool_manager, cur_lo, cur_hi, [str(t0), pid], timeout_sec=10.0)
-            except Exception:
-                rows = []
-            if rows:
-                return str(t0), "candidate_topic1_poolid"
-            scanned += (cur_hi - cur_lo + 1)
-            cur_hi = cur_lo - 1
-
-    # 2) Fallback: infer by most frequent unknown topic0 with swap-like payload.
-    rows: list[dict[str, Any]] = []
-    cur_hi = int(hi)
-    scanned = 0
-    while cur_hi >= 0 and scanned <= max_back and not rows:
-        cur_lo = max(0, cur_hi - step + 1)
-        try:
-            rows = _rpc_get_logs(chain_id, pool_manager, cur_lo, cur_hi, [None, pid], timeout_sec=12.0)
-        except Exception:
-            rows = []
-        scanned += (cur_hi - cur_lo + 1)
-        cur_hi = cur_lo - 1
-    counts: dict[str, int] = {}
-    for lg in rows:
-        topics = [str(x or "").strip().lower() for x in (lg.get("topics") or [])]
-        if not topics:
-            continue
-        t0 = topics[0]
-        if t0 in {_V4_TOPIC_INITIALIZE, _V4_TOPIC_MODIFY_LIQ}:
-            continue
-        words = _hex_words(str(lg.get("data") or ""))
-        if len(words) < 2:
-            continue
-        a0 = _decode_int_word(words[0], bits=256)
-        a1 = _decode_int_word(words[1], bits=256)
-        if a0 == 0 or a1 == 0:
-            continue
-        if a0 * a1 >= 0:
-            continue
-        counts[t0] = int(counts.get(t0, 0)) + 1
-    if not counts:
-        counts_data0: dict[str, int] = {}
-        pid_word = str(pid[2:]).zfill(64)
-        for lg in rows:
-            topics = [str(x or "").strip().lower() for x in (lg.get("topics") or [])]
-            if not topics:
-                continue
-            t0 = topics[0]
-            if t0 in {_V4_TOPIC_INITIALIZE, _V4_TOPIC_MODIFY_LIQ}:
-                continue
-            words = _hex_words(str(lg.get("data") or ""))
-            if len(words) < 3:
-                continue
-            if str(words[0]).lower() != pid_word:
-                continue
-            a0 = _decode_int_word(words[1], bits=256)
-            a1 = _decode_int_word(words[2], bits=256)
-            if a0 == 0 or a1 == 0 or (a0 * a1) >= 0:
-                continue
-            counts_data0[t0] = int(counts_data0.get(t0, 0)) + 1
-        if counts_data0:
-            t0_best = max(counts_data0.items(), key=lambda kv: int(kv[1]))[0]
-            return str(t0_best), "inferred_data0_poolid"
-        return "", "not_found"
-    t0_best = max(counts.items(), key=lambda kv: int(kv[1]))[0]
-    return str(t0_best), "inferred_topic1_poolid"
-
-
-def _v4_onchain_swap_fee_daily(
-    *,
-    chain: str,
-    chain_id: int,
-    pool: dict[str, Any],
-    pool_id: str,
-    fee_pct: float,
-    latest_block: int,
-    day_count: int,
-    budget_sec: float,
-) -> tuple[dict[int, float], dict[str, Any]]:
-    t_fn0 = time.monotonic()
-    out_dbg: dict[str, Any] = {
-        "source": "onchain_swap_logs",
-        "stage_ms": {},
-        "counters": {
-            "windows_scanned": 0,
-            "rpc_log_rows": 0,
-            "rpc_errors": 0,
-            "block_ts_rpc_calls": 0,
-            "block_ts_cache_hits": 0,
-            "block_ts_fallback_approx": 0,
-            "decoded_rows": 0,
-            "reject_poolid_data_mismatch": 0,
-            "reject_sign_or_zero": 0,
-            "reject_usd_zero": 0,
-            "reject_gross_zero": 0,
-            "reject_fee_zero": 0,
-        },
-    }
-    pm, _sv = _onchain_addresses_for_chain(chain)
-    if not pm:
-        out_dbg["error"] = "pool_manager_not_configured"
-        return {}, out_dbg
-    t_topic0 = time.monotonic()
-    # Conservative per-chain block time for day-range approximation.
-    block_time_sec = {
-        "ethereum": 12.0,
-        "arbitrum": 0.25,
-        "base": 2.0,
-        "optimism": 2.0,
-        "polygon": 2.0,
-        "bsc": 3.0,
-        "avalanche": 2.0,
-        "celo": 5.0,
-        "unichain": 1.0,
-    }.get(str(chain or "").strip().lower(), 3.0)
-    lookback_blocks = int(max(20_000, (max(1, int(day_count)) * 86400.0 / max(0.2, float(block_time_sec))) * 1.25))
-    try:
-        env_scan = max(48_000, int(os.environ.get("STRICT_V4_SWAP_TOPIC_SCAN_BLOCKS", "180000")))
-    except Exception:
-        env_scan = 180_000
-    topic_scan_blocks = min(1_500_000, max(int(env_scan), int(lookback_blocks) + 48_000))
-    out_dbg["topic_scan_blocks"] = int(topic_scan_blocks)
-    cand = _v4_swap_topic_candidates()
-    topic0 = str(cand[0] if cand else "").strip().lower()
-    topic_src = "known_signature"
-    try:
-        discovery_enabled = str(os.environ.get("STRICT_V4_SWAP_TOPIC_DISCOVERY", "0")).strip().lower() in {"1", "true", "yes", "on"}
-    except Exception:
-        discovery_enabled = False
-    if discovery_enabled or (not topic0):
-        topic0, topic_src = _guess_v4_swap_topic(
-            int(chain_id),
-            pm,
-            str(pool_id),
-            int(latest_block),
-            max_back_blocks=int(topic_scan_blocks),
-        )
-    out_dbg["stage_ms"]["topic_discovery"] = int(round(max(0.0, time.monotonic() - t_topic0) * 1000.0))
-    out_dbg["swap_topic_source"] = str(topic_src)
-    out_dbg["swap_topic0"] = str(topic0 or "")
-    if not topic0:
-        out_dbg["error"] = "swap_topic_not_found"
-        return {}, out_dbg
-
-    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
-    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
-    d0 = int(_erc20_decimals(chain_id, token0)) if token0 else 18
-    d1 = int(_erc20_decimals(chain_id, token1)) if token1 else 18
-    d0 = d0 if 0 < d0 <= 36 else 18
-    d1 = d1 if 0 < d1 <= 36 else 18
-    t_price0 = time.monotonic()
-    prices, _sources, _errs = get_token_prices_usd(str(chain), [token0, token1])
-    out_dbg["stage_ms"]["prices_lookup"] = int(round(max(0.0, time.monotonic() - t_price0) * 1000.0))
-    p0 = float(prices.get(token0) or 0.0)
-    p1 = float(prices.get(token1) or 0.0)
-    out_dbg["token0_price_usd"] = float(p0)
-    out_dbg["token1_price_usd"] = float(p1)
-    if p0 <= 0.0 and p1 <= 0.0:
-        out_dbg["error"] = "token_prices_unavailable"
-        return {}, out_dbg
-
-    from_block = max(0, int(latest_block) - lookback_blocks)
-    to_block = int(latest_block)
-    out_dbg["from_block"] = int(from_block)
-    out_dbg["to_block"] = int(to_block)
-
-    deadline_ts = time.monotonic() + max(8.0, float(budget_sec))
-    rows: list[dict[str, Any]] = []
-    base_step = 12_000
-    step_cur = int(base_step)
-    min_step = 750
-    cur_hi = int(to_block)
-    while cur_hi >= int(from_block):
-        if time.monotonic() >= deadline_ts:
-            out_dbg["timeout"] = True
-            break
-        lo = max(int(from_block), int(cur_hi) - max(1, int(step_cur)) + 1)
-        out_dbg["counters"]["windows_scanned"] = int(out_dbg["counters"]["windows_scanned"]) + 1
-        try:
-            if str(topic_src).endswith("data0_poolid"):
-                part = _rpc_get_logs(int(chain_id), pm, lo, cur_hi, [str(topic0)], timeout_sec=20.0)
-            else:
-                part = _rpc_get_logs(int(chain_id), pm, lo, cur_hi, [str(topic0), str(pool_id).strip().lower()], timeout_sec=20.0)
-        except Exception as e:
-            out_dbg["counters"]["rpc_errors"] = int(out_dbg["counters"]["rpc_errors"]) + 1
-            out_dbg["last_rpc_error"] = str(e)[:220]
-            # Retry same block window with smaller range on provider errors/timeouts.
-            if int(step_cur) > int(min_step):
-                step_cur = max(int(min_step), int(step_cur // 2))
-                continue
-            # Window already small: skip this chunk and proceed.
-            part = []
-        if part:
-            rows.extend(part)
-            out_dbg["counters"]["rpc_log_rows"] = int(out_dbg["counters"]["rpc_log_rows"]) + int(len(part))
-            # Recover to larger windows gradually after successful responses.
-            if int(step_cur) < int(base_step):
-                step_cur = min(int(base_step), int(step_cur * 2))
-        cur_hi = lo - 1
-    out_dbg["swap_logs"] = int(len(rows))
-    if not rows:
-        return {}, out_dbg
-
-    now_ts = int(time.time())
-    latest_b = int(latest_block)
-    day_fees: dict[int, float] = {}
-    used = 0
-    pid_word = str(str(pool_id).strip().lower()[2:]).zfill(64)
-    ts_cache: dict[int, int] = {}
-    for lg in rows:
-        bno = _parse_int_any(lg.get("blockNumber"), default=0)
-        words = _hex_words(str(lg.get("data") or ""))
-        if len(words) < 2:
-            continue
-        if str(topic_src).endswith("data0_poolid"):
-            if len(words) < 3:
-                continue
-            if str(words[0]).lower() != pid_word:
-                out_dbg["counters"]["reject_poolid_data_mismatch"] = int(out_dbg["counters"]["reject_poolid_data_mismatch"]) + 1
-                continue
-            a0_raw = int(_decode_int_word(words[1], bits=256))
-            a1_raw = int(_decode_int_word(words[2], bits=256))
-        else:
-            a0_raw = int(_decode_int_word(words[0], bits=256))
-            a1_raw = int(_decode_int_word(words[1], bits=256))
-        if a0_raw == 0 or a1_raw == 0 or (a0_raw * a1_raw) >= 0:
-            out_dbg["counters"]["reject_sign_or_zero"] = int(out_dbg["counters"]["reject_sign_or_zero"]) + 1
-            continue
-        out_dbg["counters"]["decoded_rows"] = int(out_dbg["counters"]["decoded_rows"]) + 1
-        a0 = abs(float(a0_raw)) / float(10**d0)
-        a1 = abs(float(a1_raw)) / float(10**d1)
-        usd0 = a0 * max(0.0, float(p0))
-        usd1 = a1 * max(0.0, float(p1))
-        if usd0 <= 0.0 and usd1 <= 0.0:
-            out_dbg["counters"]["reject_usd_zero"] = int(out_dbg["counters"]["reject_usd_zero"]) + 1
-            continue
-        # Conservative notional: use smaller side value to reduce decode outliers.
-        gross_usd = min(x for x in [usd0, usd1] if x > 0.0)
-        if gross_usd <= 0.0:
-            out_dbg["counters"]["reject_gross_zero"] = int(out_dbg["counters"]["reject_gross_zero"]) + 1
-            continue
-        fee_usd = float(gross_usd) * max(0.0, float(fee_pct))
-        if fee_usd <= 0.0:
-            out_dbg["counters"]["reject_fee_zero"] = int(out_dbg["counters"]["reject_fee_zero"]) + 1
-            continue
-        if int(bno) in ts_cache:
-            ts = int(ts_cache[int(bno)])
-            out_dbg["counters"]["block_ts_cache_hits"] = int(out_dbg["counters"]["block_ts_cache_hits"]) + 1
-        else:
-            ts = 0
-            if time.monotonic() < (deadline_ts - 1.0):
-                ts = int(_rpc_block_timestamp(int(chain_id), int(bno), timeout_sec=8.0))
-                out_dbg["counters"]["block_ts_rpc_calls"] = int(out_dbg["counters"]["block_ts_rpc_calls"]) + 1
-            if ts <= 0:
-                ts = int(now_ts - max(0, latest_b - max(0, int(bno))) * float(block_time_sec))
-                out_dbg["counters"]["block_ts_fallback_approx"] = int(out_dbg["counters"]["block_ts_fallback_approx"]) + 1
-            ts_cache[int(bno)] = int(ts)
-        day_ts = (int(ts) // 86400) * 86400
-        day_fees[day_ts] = float(day_fees.get(day_ts, 0.0) + fee_usd)
-        used += 1
-    out_dbg["swap_logs_used"] = int(used)
-    out_dbg["day_points"] = int(len(day_fees))
-    out_dbg["elapsed_ms"] = int(round(max(0.0, time.monotonic() - t_fn0) * 1000.0))
-    return day_fees, out_dbg
 
 
 def _build_estimated_tvl(fees_usd: list[tuple[int, float]], raw_tvl: list[tuple[int, float]], tvl_now: float) -> list[tuple[int, float]]:
@@ -1457,73 +743,6 @@ def _rebuild_fees_cumulative(fees_usd: list[tuple[int, float]], tvl_series: list
         if float(fee_day) > 0.0 and tvl_day > 0.0:
             cumul += float(fee_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day))
         out.append((int(ts), float(cumul)))
-    return out
-
-
-def _append_now_tvl_anchor(tvl_series: list[tuple[int, float]], now_tvl_usd: float) -> list[tuple[int, float]]:
-    out = list(tvl_series or [])
-    now_ts = int(time.time())
-    now_tvl = float(max(0.0, now_tvl_usd))
-    if out and int(out[-1][0]) >= now_ts - 3600:
-        out[-1] = (int(out[-1][0]), now_tvl)
-    else:
-        out.append((now_ts, now_tvl))
-    return out
-
-
-def _append_now_fee_anchor(fee_series: list[tuple[int, float]]) -> list[tuple[int, float]]:
-    out = list(fee_series or [])
-    now_ts = int(time.time())
-    last_val = float(out[-1][1]) if out else 0.0
-    if out and int(out[-1][0]) >= now_ts - 3600:
-        out[-1] = (int(out[-1][0]), last_val)
-    else:
-        out.append((now_ts, last_val))
-    return out
-
-
-def _sparse_series_every_n_days(series: list[tuple[int, float]], step_days: int = 5) -> list[tuple[int, float]]:
-    arr: list[tuple[int, float]] = []
-    seen_ts: set[int] = set()
-    for ts, v in sorted((series or []), key=lambda x: int(x[0])):
-        t = int(ts)
-        if t in seen_ts:
-            continue
-        seen_ts.add(t)
-        arr.append((t, float(v)))
-    if not arr:
-        return []
-    step_sec = max(86400, int(max(1, int(step_days)) * 86400))
-    first_ts = int(arr[0][0])
-    last_ts = int(arr[-1][0])
-    targets: list[int] = []
-    cur = int((first_ts // 86400) * 86400)
-    end = int((last_ts // 86400) * 86400)
-    while cur <= end:
-        targets.append(int(cur))
-        cur += step_sec
-    if not targets or targets[-1] != int(last_ts):
-        targets.append(int(last_ts))
-
-    out: list[tuple[int, float]] = []
-    used_idx: set[int] = set()
-    for target in targets:
-        best_i = -1
-        best_d = 10**30
-        for i, (ts, _v) in enumerate(arr):
-            if i in used_idx:
-                continue
-            d = abs(int(ts) - int(target))
-            if d < best_d:
-                best_d = d
-                best_i = i
-        if best_i < 0:
-            continue
-        used_idx.add(best_i)
-        out.append((int(arr[best_i][0]), float(arr[best_i][1])))
-    out = sorted(out, key=lambda x: int(x[0]))
-    if out and int(out[-1][0]) != int(last_ts):
-        out.append((int(last_ts), float(arr[-1][1])))
     return out
 
 
@@ -1570,7 +789,6 @@ def main() -> None:
     day_rows = query_pool_day_data(endpoint, str(pool.get("id") or ""), start_ts, end_ts)
     fees_usd: list[tuple[int, float]] = []
     raw_tvl: list[tuple[int, float]] = []
-    fee_pct = int(pool.get("feeTier") or 0) / 10000.0
     for r in day_rows:
         d = int(r.get("date") or 0)
         ts = int(d if d > 1e9 else d * 86400)
@@ -1614,97 +832,25 @@ def main() -> None:
     strict_dbg["raw_tvl_positive_days"] = int(raw_tvl_positive_days)
     strict_dbg["raw_tvl_zero_days"] = int(raw_tvl_zero_days)
     strict_dbg["budget_sec"] = float(budget_sec)
-    strict_dbg["debug_profile"] = "v4_exact2_extended_debug"
-    chain_id = int(CHAIN_ID_BY_KEY.get(str(found_chain or "").strip().lower(), 0) or 0)
-    try:
-        onchain_hist_enable = str(os.environ.get("STRICT_V4_ONCHAIN_HISTORY_ENABLE", "1")).strip().lower() in {"1", "true", "yes", "on"}
-    except Exception:
-        onchain_hist_enable = True
-    try:
-        # Keep history phase bounded: strict v4 already spends budget on TVL-now resolution.
-        # Default to half of pool budget to avoid hitting subprocess timeout envelope.
-        onchain_hist_budget = max(
-            10.0,
-            float(
-                os.environ.get(
-                    "STRICT_V4_ONCHAIN_HISTORY_BUDGET_SEC",
-                    str(max(15.0, float(budget_sec) * 0.50)),
-                )
-            ),
-        )
-    except Exception:
-        onchain_hist_budget = max(15.0, float(budget_sec) * 0.50)
 
     estimated_tvl: list[tuple[int, float]] = []
     estimated_fees: list[tuple[int, float]] = []
     estimated_active_tvl: list[tuple[int, float]] = []
     estimated_active_fees: list[tuple[int, float]] = []
-    exact_tvl: list[tuple[int, float]] = []
-    exact_fees: list[tuple[int, float]] = []
-    exact_active_tvl: list[tuple[int, float]] = []
-    exact_active_fees: list[tuple[int, float]] = []
     tvl_active_now = float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0)
-
-    try:
-        exact_step_days = max(1, int(os.environ.get("STRICT_V4_EXACT_STEP_DAYS", "5")))
-    except Exception:
-        exact_step_days = 5
-    strict_dbg["debug_config"] = {
-        "exact_step_days": int(exact_step_days),
-        "onchain_history_enable": bool(onchain_hist_enable),
-        "onchain_history_budget_sec": float(onchain_hist_budget),
-        "swap_topic_scan_blocks": int(os.environ.get("STRICT_V4_SWAP_TOPIC_SCAN_BLOCKS", "180000") or 180000),
-    }
-    onchain_hist_full_tvl: list[tuple[int, float]] = []
-    onchain_hist_active_tvl: list[tuple[int, float]] = []
-    if onchain_hist_enable and int(chain_id) > 0:
-        hist_full, hist_active, hist_dbg = _v4_onchain_historical_tvl_snapshots(
-            pool=pool,
-            chain=str(found_chain),
-            chain_id=int(chain_id),
-            day_ts=[int(ts) for ts, _ in (fees_usd or [])],
-            latest_block=int((strict_dbg or {}).get("latest_block") or 0),
-            fee_pct=float(fee_pct),
-            budget_sec=float(onchain_hist_budget),
-            step_days=int(exact_step_days),
-            strict_dbg=strict_dbg,
-        )
-        onchain_hist_full_tvl = list(hist_full or [])
-        onchain_hist_active_tvl = list(hist_active or [])
-        strict_dbg["onchain_history_debug"] = dict(hist_dbg or {})
-
-    # Match V3 principle:
-    # estimated(active/full) always use _build_estimated_tvl with NOW anchor.
-    # If raw_tvl has no positive days, _build_estimated_tvl naturally becomes flat NOW-series.
-    estimated_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
-    estimated_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_tvl_base)
-    estimated_tvl = _append_now_tvl_anchor(estimated_tvl_base, float(pool_tvl_now_usd))
-    estimated_fees = _append_now_fee_anchor(estimated_fees_base)
-
-    # Align V4 exact compare behavior with V3 exact compare:
-    # exact series = sparse points over exact-now anchored shape + explicit NOW anchor.
-    exact_tvl = _sparse_series_every_n_days(estimated_tvl_base, exact_step_days)
-    exact_tvl = _append_now_tvl_anchor(exact_tvl, float(pool_tvl_now_usd))
-    exact_fees = _sparse_series_every_n_days(estimated_fees_base, exact_step_days)
-    exact_fees = _append_now_fee_anchor(exact_fees)
-
-    if tvl_active_now > 0.0:
-        estimated_active_tvl_base = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
-        estimated_active_fees_base = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl_base)
-        estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
-        estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
-
-    if onchain_hist_full_tvl:
-        exact_tvl = _append_now_tvl_anchor(list(onchain_hist_full_tvl), float(pool_tvl_now_usd))
-        # Keep previous behavior only when daily raw shape is missing:
-        # mirror exact history into estimated full curve.
-        if raw_tvl_positive_days <= 0:
-            estimated_tvl = list(exact_tvl)
-    if (not exact_tvl) and fees_usd:
-        exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
-    # Product decision: keep only estimated active branch in strict compare.
-    exact_active_tvl = []
-    exact_active_fees = []
+    if raw_tvl_positive_days > 0:
+        estimated_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(pool_tvl_now_usd))
+        estimated_fees = _rebuild_fees_cumulative(fees_usd, estimated_tvl)
+        if tvl_active_now > 0.0:
+            estimated_active_tvl = _build_estimated_tvl(fees_usd, raw_tvl, float(tvl_active_now))
+            estimated_active_fees = _rebuild_fees_cumulative(fees_usd, estimated_active_tvl)
+    else:
+        # No historical day-shape: still expose a single estimate marker at TVL NOW.
+        estimated_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
+        if tvl_active_now > 0.0:
+            estimated_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
+    exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
+    exact_active_tvl = _one_point_marker_tvl(fees_usd, float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0))
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
     reason = (
         f"exact_v4_2_onchain_quantities:one_point_now:cov={exact_cov:.2f}"
@@ -1734,8 +880,7 @@ def main() -> None:
         "strict_compare_estimated_active_fees": estimated_active_fees,
         "strict_compare_exact_tvl": exact_tvl,
         "strict_compare_exact_active_tvl": exact_active_tvl,
-        "strict_compare_exact_active_fees": exact_active_fees,
-        "strict_compare_exact_fees": exact_fees,
+        "strict_compare_exact_fees": [],
         "strict_estimated_shape_missing": bool(raw_tvl_positive_days <= 0),
     }
     save_chart_data_json({str(pool.get("id") or ""): payload}, out_path)
