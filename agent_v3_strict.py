@@ -426,6 +426,29 @@ def _v3_pool_state_now(chain_id: int, pool_id: str) -> tuple[int, int, int, int,
     return _v3_pool_state_at_block(chain_id, pool_id, "latest")
 
 
+def _nearby_day_candidates(target_day_ts: int, available_days: list[int], max_offset_days: int) -> list[int]:
+    day = int((int(target_day_ts) // 86400) * 86400)
+    days = sorted({int(d) for d in (available_days or []) if int(d) > 0})
+    if not days:
+        return [int(day)]
+    day_set = set(days)
+    out: list[int] = []
+    if day in day_set:
+        out.append(int(day))
+    max_off = max(0, int(max_offset_days))
+    for off in range(1, max_off + 1):
+        d_prev = int(day - off * 86400)
+        d_next = int(day + off * 86400)
+        if d_prev in day_set:
+            out.append(d_prev)
+        if d_next in day_set:
+            out.append(d_next)
+    if out:
+        return out
+    nearest = min(days, key=lambda d: abs(int(d) - int(day)))
+    return [int(nearest)]
+
+
 def _v3_active_tvl_onchain_sparse_snapshots(
     *,
     chain: str,
@@ -453,6 +476,7 @@ def _v3_active_tvl_onchain_sparse_snapshots(
     if fees_usd and (not targets or int(targets[-1]) != int(fees_usd[-1][0])):
         targets.append(int(fees_usd[-1][0]))
     targets = sorted({int(x) for x in targets if int(x) > 0})
+    fee_days = sorted({int((int(ts) // 86400) * 86400) for ts, _ in fees_usd if int(ts) > 0})
     if not targets:
         return [], "active_onchain_sparse:no_targets"
     latest_block = _latest_block_number(chain_id)
@@ -552,63 +576,88 @@ def _v3_active_tvl_onchain_sparse_snapshots(
     day_price: dict[int, tuple[float, float]] = {}
     out: list[tuple[int, float]] = []
     points_done = 0
+    points_nearby = 0
+    try:
+        nearby_days = max(1, int(os.environ.get("STRICT_V3_ACTIVE_NEARBY_DAYS", str(max(2, int(step_days) // 2)))))
+    except Exception:
+        nearby_days = max(2, int(step_days) // 2)
     for ts in targets:
         if time.monotonic() >= deadline:
             break
-        day_ts = int((int(ts) // 86400) * 86400)
-        b = int(day_blocks.get(day_ts, 0))
-        if b <= 0:
-            continue
-        # Price per day (cheap cache).
-        pp = day_price.get(day_ts)
-        if pp is None:
-            p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
-            p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
-            day_price[day_ts] = (float(max(0.0, p0)), float(max(0.0, p1)))
-            pp = day_price[day_ts]
-        p0, p1 = pp
-        sqrt_p_x96, tick_now, _liq_now, _spacing, st_err = _v3_pool_state_at_block(chain_id, pool_id, hex(int(b)))
-        if int(sqrt_p_x96) <= 0 or st_err:
-            continue
-        sqrt_p = Decimal(int(sqrt_p_x96))
-        total0_raw = Decimal(0)
-        total1_raw = Decimal(0)
-        for (lo, hi), latest_liq in range_latest_net.items():
+        target_day_ts = int((int(ts) // 86400) * 86400)
+        cand_days = _nearby_day_candidates(target_day_ts, fee_days, nearby_days)
+        picked = False
+        for cand_day_ts in cand_days:
             if time.monotonic() >= deadline:
                 break
-            liq = int(latest_liq)
-            if liq <= 0:
+            b = int(day_blocks.get(cand_day_ts, 0))
+            if b <= 0:
+                try:
+                    day_blocks[cand_day_ts] = int(_llama_block_for_day(ck, int(cand_day_ts) + 86399))
+                except Exception:
+                    day_blocks[cand_day_ts] = 0
+                b = int(day_blocks.get(cand_day_ts, 0))
+            if b <= 0:
                 continue
-            # Remove future deltas to reconstruct liquidity at block b.
-            for bn, dv in (range_deltas.get((lo, hi), {}) or {}).items():
-                if int(bn) > int(b):
-                    liq -= int(dv)
-            if liq <= 0:
+            # Price per day (cheap cache).
+            pp = day_price.get(cand_day_ts)
+            if pp is None:
+                p0 = float(_historical_price_usd(ck, token0, int(cand_day_ts), int(day_start_ts), int(day_end_ts)))
+                p1 = float(_historical_price_usd(ck, token1, int(cand_day_ts), int(day_start_ts), int(day_end_ts)))
+                day_price[cand_day_ts] = (float(max(0.0, p0)), float(max(0.0, p1)))
+                pp = day_price[cand_day_ts]
+            p0, p1 = pp
+            sqrt_p_x96, tick_now, _liq_now, _spacing, st_err = _v3_pool_state_at_block(chain_id, pool_id, hex(int(b)))
+            if int(sqrt_p_x96) <= 0 or st_err:
                 continue
-            if not (int(lo) <= int(tick_now) < int(hi)):
+            sqrt_p = Decimal(int(sqrt_p_x96))
+            total0_raw = Decimal(0)
+            total1_raw = Decimal(0)
+            for (lo, hi), latest_liq in range_latest_net.items():
+                if time.monotonic() >= deadline:
+                    break
+                liq = int(latest_liq)
+                if liq <= 0:
+                    continue
+                # Remove future deltas to reconstruct liquidity at block b.
+                for bn, dv in (range_deltas.get((lo, hi), {}) or {}).items():
+                    if int(bn) > int(b):
+                        liq -= int(dv)
+                if liq <= 0:
+                    continue
+                if not (int(lo) <= int(tick_now) < int(hi)):
+                    continue
+                sqrt_lo = _sqrt_tick(int(lo))
+                sqrt_hi = _sqrt_tick(int(hi))
+                if not (sqrt_lo <= sqrt_p < sqrt_hi):
+                    continue
+                a0, _ = _amounts_from_liquidity_segment(Decimal(int(liq)), sqrt_p, sqrt_hi)
+                _, a1 = _amounts_from_liquidity_segment(Decimal(int(liq)), sqrt_lo, sqrt_p)
+                if a0 <= 0 and a1 <= 0:
+                    continue
+                total0_raw += max(Decimal(0), a0)
+                total1_raw += max(Decimal(0), a1)
+            amt0 = float(total0_raw) / float(10 ** max(0, int(dec0)))
+            amt1 = float(total1_raw) / float(10 ** max(0, int(dec1)))
+            tvl = max(0.0, amt0 * max(0.0, float(p0))) + max(0.0, amt1 * max(0.0, float(p1)))
+            if tvl <= 0.0:
                 continue
-            sqrt_lo = _sqrt_tick(int(lo))
-            sqrt_hi = _sqrt_tick(int(hi))
-            if not (sqrt_lo <= sqrt_p < sqrt_hi):
-                continue
-            a0, _ = _amounts_from_liquidity_segment(Decimal(int(liq)), sqrt_p, sqrt_hi)
-            _, a1 = _amounts_from_liquidity_segment(Decimal(int(liq)), sqrt_lo, sqrt_p)
-            if a0 <= 0 and a1 <= 0:
-                continue
-            total0_raw += max(Decimal(0), a0)
-            total1_raw += max(Decimal(0), a1)
-        amt0 = float(total0_raw) / float(10 ** max(0, int(dec0)))
-        amt1 = float(total1_raw) / float(10 ** max(0, int(dec1)))
-        tvl = max(0.0, amt0 * max(0.0, float(p0))) + max(0.0, amt1 * max(0.0, float(p1)))
-        out.append((int(ts), float(max(0.0, tvl))))
-        points_done += 1
+            out.append((int(ts), float(max(0.0, tvl))))
+            points_done += 1
+            if int(cand_day_ts) != int(target_day_ts):
+                points_nearby += 1
+            picked = True
+            break
+        if not picked:
+            continue
     if not out:
         return [], f"active_onchain_sparse:no_points:logs={int(scanned_logs)}"
     # Ensure latest day anchor exists if available in targets.
     out = sorted({int(ts): float(v) for ts, v in out}.items(), key=lambda x: int(x[0]))
     reason = (
         f"active_onchain_sparse:ok:points={int(points_done)}/{len(targets)}:"
-        f"ranges={len(range_latest_net)}:logs={int(scanned_logs)}:elapsed={max(0.0, time.monotonic() - t0):.1f}"
+        f"nearby={int(points_nearby)}:ranges={len(range_latest_net)}:logs={int(scanned_logs)}:"
+        f"elapsed={max(0.0, time.monotonic() - t0):.1f}"
     )
     return [(int(ts), float(v)) for ts, v in out], reason
 
@@ -794,6 +843,7 @@ def _v3_active_tvl_subgraph_sparse_snapshots(
     if fees_usd and (not targets or int(targets[-1]) != int(fees_usd[-1][0])):
         targets.append(int(fees_usd[-1][0]))
     targets = sorted({int(x) for x in targets if int(x) > 0})
+    fee_days = sorted({int((int(ts) // 86400) * 86400) for ts, _ in fees_usd if int(ts) > 0})
     if not targets:
         return [], "active_subgraph_sparse:no_targets"
 
@@ -816,45 +866,67 @@ def _v3_active_tvl_subgraph_sparse_snapshots(
     day_price: dict[int, tuple[float, float]] = {}
     out: list[tuple[int, float]] = []
     points_done = 0
+    points_nearby = 0
+    try:
+        nearby_days = max(1, int(os.environ.get("STRICT_V3_ACTIVE_NEARBY_DAYS", str(max(2, int(step_days) // 2)))))
+    except Exception:
+        nearby_days = max(2, int(step_days) // 2)
     for ts in targets:
         if time.monotonic() >= deadline:
             break
-        day_ts = int((int(ts) // 86400) * 86400)
-        b = int(day_blocks.get(day_ts, 0))
-        if b <= 0:
+        target_day_ts = int((int(ts) // 86400) * 86400)
+        cand_days = _nearby_day_candidates(target_day_ts, fee_days, nearby_days)
+        picked = False
+        for cand_day_ts in cand_days:
+            if time.monotonic() >= deadline:
+                break
+            b = int(day_blocks.get(cand_day_ts, 0))
+            if b <= 0:
+                try:
+                    day_blocks[cand_day_ts] = int(_llama_block_for_day(ck, int(cand_day_ts) + 86399))
+                except Exception:
+                    day_blocks[cand_day_ts] = 0
+                b = int(day_blocks.get(cand_day_ts, 0))
+            if b <= 0:
+                continue
+            pp = day_price.get(cand_day_ts)
+            if pp is None:
+                p0 = float(_historical_price_usd(ck, token0, int(cand_day_ts), int(day_start_ts), int(day_end_ts)))
+                p1 = float(_historical_price_usd(ck, token1, int(cand_day_ts), int(day_start_ts), int(day_end_ts)))
+                day_price[cand_day_ts] = (float(max(0.0, p0)), float(max(0.0, p1)))
+                pp = day_price[cand_day_ts]
+            p0, p1 = pp
+            sqrt_p_x96, tick_now, _liq_now, _spacing, st_err = _v3_pool_state_at_block(chain_id, pool_id, hex(int(b)))
+            if int(sqrt_p_x96) <= 0 or st_err:
+                continue
+            act0_raw, act1_raw, _src, _dbg = _v3_active_positions_amounts_from_subgraph_at_block(
+                endpoint=ep,
+                pool_id=pool_id,
+                current_tick=int(tick_now),
+                sqrt_price_x96=int(sqrt_p_x96),
+                block_number=int(b),
+            )
+            amt0 = float(act0_raw) / float(10 ** max(0, int(dec0)))
+            amt1 = float(act1_raw) / float(10 ** max(0, int(dec1)))
+            if amt0 <= 0.0 and amt1 <= 0.0:
+                continue
+            tvl = max(0.0, amt0 * max(0.0, float(p0))) + max(0.0, amt1 * max(0.0, float(p1)))
+            if tvl <= 0.0:
+                continue
+            out.append((int(ts), float(tvl)))
+            points_done += 1
+            if int(cand_day_ts) != int(target_day_ts):
+                points_nearby += 1
+            picked = True
+            break
+        if not picked:
             continue
-        pp = day_price.get(day_ts)
-        if pp is None:
-            p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
-            p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
-            day_price[day_ts] = (float(max(0.0, p0)), float(max(0.0, p1)))
-            pp = day_price[day_ts]
-        p0, p1 = pp
-        sqrt_p_x96, tick_now, _liq_now, _spacing, st_err = _v3_pool_state_at_block(chain_id, pool_id, hex(int(b)))
-        if int(sqrt_p_x96) <= 0 or st_err:
-            continue
-        act0_raw, act1_raw, _src, _dbg = _v3_active_positions_amounts_from_subgraph_at_block(
-            endpoint=ep,
-            pool_id=pool_id,
-            current_tick=int(tick_now),
-            sqrt_price_x96=int(sqrt_p_x96),
-            block_number=int(b),
-        )
-        amt0 = float(act0_raw) / float(10 ** max(0, int(dec0)))
-        amt1 = float(act1_raw) / float(10 ** max(0, int(dec1)))
-        if amt0 <= 0.0 and amt1 <= 0.0:
-            continue
-        tvl = max(0.0, amt0 * max(0.0, float(p0))) + max(0.0, amt1 * max(0.0, float(p1)))
-        if tvl <= 0.0:
-            continue
-        out.append((int(ts), float(tvl)))
-        points_done += 1
     if not out:
         return [], "active_subgraph_sparse:no_points"
     out = sorted({int(ts): float(v) for ts, v in out}.items(), key=lambda x: int(x[0]))
     reason = (
         f"active_subgraph_sparse:ok:points={int(points_done)}/{len(targets)}:"
-        f"elapsed={max(0.0, time.monotonic() - t0):.1f}"
+        f"nearby={int(points_nearby)}:elapsed={max(0.0, time.monotonic() - t0):.1f}"
     )
     return [(int(ts), float(v)) for ts, v in out], reason
 
