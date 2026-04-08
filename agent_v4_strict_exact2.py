@@ -850,6 +850,11 @@ def main() -> None:
         if tvl_active_now > 0.0:
             estimated_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
     exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
+    # Compatibility with current webapp strict-compare table:
+    # exact full income/APY are read from strict_compare_exact_fees.
+    # v0.2.1 emitted empty exact fees, which now renders as $0 / 0%.
+    # Keep v0.2.1 exact full TVL semantics, but expose fees curve for row metrics.
+    exact_fees = list(estimated_fees or [])
     exact_active_tvl = _one_point_marker_tvl(fees_usd, float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0))
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
     reason = (
@@ -880,7 +885,7 @@ def main() -> None:
         "strict_compare_estimated_active_fees": estimated_active_fees,
         "strict_compare_exact_tvl": exact_tvl,
         "strict_compare_exact_active_tvl": exact_active_tvl,
-        "strict_compare_exact_fees": [],
+        "strict_compare_exact_fees": exact_fees,
         "strict_estimated_shape_missing": bool(raw_tvl_positive_days <= 0),
     }
     save_chart_data_json({str(pool.get("id") or ""): payload}, out_path)
