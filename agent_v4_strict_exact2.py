@@ -847,8 +847,13 @@ def main() -> None:
     else:
         # No historical day-shape: still expose a single estimate marker at TVL NOW.
         estimated_tvl = _one_point_marker_tvl(fees_usd, float(pool_tvl_now_usd))
+        # Keep fee/APY metrics meaningful even in marker mode.
+        est_flat_tvl_for_fees = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in (fees_usd or [])]
+        estimated_fees = _rebuild_fees_cumulative(fees_usd, est_flat_tvl_for_fees)
         if tvl_active_now > 0.0:
             estimated_active_tvl = _one_point_marker_tvl(fees_usd, float(tvl_active_now))
+            est_active_flat_tvl_for_fees = [(int(ts), float(tvl_active_now)) for ts, _ in (fees_usd or [])]
+            estimated_active_fees = _rebuild_fees_cumulative(fees_usd, est_active_flat_tvl_for_fees)
     exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
     # Compatibility with current webapp strict-compare table:
     # exact full income/APY are read from strict_compare_exact_fees.
