@@ -18000,6 +18000,16 @@ def _merge_for_web(
                 hist_part = ("history=on-chain block snapshots" if hist_pts > 0 else "history=NOW anchor")
                 full_src = ("full TVL NOW=Uniswap Interface" if ("full_src=uniswap_interface" in src_l or "uniswap_interface_v4pool_totalliquidity" in src_l) else "full TVL NOW=on-chain quantities")
                 if anc == "active":
+                    if ver == "v3":
+                        v3_dbg = (strict_dbg.get("v3_tvl_now") or {}) if isinstance(strict_dbg, dict) else {}
+                        ah_src = str(v3_dbg.get("active_history_source") or "").strip().lower()
+                        if ah_src.startswith("active_onchain_sparse:ok"):
+                            ah_part = "exact active history=on-chain snapshots"
+                        elif ah_src:
+                            ah_part = "exact active history=fallback"
+                        else:
+                            ah_part = "exact active history=not_reported"
+                        return f"Strict compare: exact active | active TVL=in-range liquidity | {ah_part} | fees=subgraph feesUSD"
                     return f"Strict compare: exact active | active TVL=StateView/PoolManager | {hist_part} | fees=subgraph feesUSD"
                 return f"Strict compare: exact full | {full_src} | {hist_part} | fees=subgraph feesUSD"
             return "Strict compare: mixed path"

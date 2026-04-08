@@ -383,7 +383,7 @@ def _v3_active_positions_amounts_onchain_logs(
     }
 
 
-def _v3_pool_state_now(chain_id: int, pool_id: str) -> tuple[int, int, int, int, str]:
+def _v3_pool_state_at_block(chain_id: int, pool_id: str, block_tag: str = "latest") -> tuple[int, int, int, int, str]:
     p = str(pool_id or "").strip().lower()
     if not _is_eth_address(p):
         return 0, 0, 0, 0, "invalid_pool_id"
@@ -391,19 +391,19 @@ def _v3_pool_state_now(chain_id: int, pool_id: str) -> tuple[int, int, int, int,
         slot0 = _rpc_json(
             int(chain_id),
             "eth_call",
-            [{"to": p, "data": "0x3850c7bd"}, "latest"],
+            [{"to": p, "data": "0x3850c7bd"}, str(block_tag or "latest")],
             timeout_sec=8.0,
         )
         liq = _rpc_json(
             int(chain_id),
             "eth_call",
-            [{"to": p, "data": "0x1a686502"}, "latest"],
+            [{"to": p, "data": "0x1a686502"}, str(block_tag or "latest")],
             timeout_sec=8.0,
         )
         spacing = _rpc_json(
             int(chain_id),
             "eth_call",
-            [{"to": p, "data": "0xd0c93a7c"}, "latest"],
+            [{"to": p, "data": "0xd0c93a7c"}, str(block_tag or "latest")],
             timeout_sec=8.0,
         )
     except Exception as e:
@@ -420,6 +420,197 @@ def _v3_pool_state_now(chain_id: int, pool_id: str) -> tuple[int, int, int, int,
     if tick_spacing <= 0:
         tick_spacing = 10
     return sqrt_price_x96, tick, liquidity, tick_spacing, ""
+
+
+def _v3_pool_state_now(chain_id: int, pool_id: str) -> tuple[int, int, int, int, str]:
+    return _v3_pool_state_at_block(chain_id, pool_id, "latest")
+
+
+def _v3_active_tvl_onchain_sparse_snapshots(
+    *,
+    chain: str,
+    pool: dict[str, Any],
+    fees_usd: list[tuple[int, float]],
+    day_start_ts: int,
+    day_end_ts: int,
+    step_days: int,
+    budget_sec: float,
+) -> tuple[list[tuple[int, float]], str]:
+    ck = str(chain or "").strip().lower()
+    chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    pool_id = str(pool.get("id") or "").strip().lower()
+    token0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+    token1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+    if chain_id <= 0 or not (_is_eth_address(pool_id) and token0 and token1):
+        return [], "active_onchain_sparse:invalid_inputs"
+    if not fees_usd:
+        return [], "active_onchain_sparse:no_fee_days"
+    t0 = time.monotonic()
+    deadline = t0 + max(8.0, float(budget_sec))
+    # Sparse day targets (same cadence as exact TVL).
+    sparse = _sparse_series_every_n_days([(int(ts), 1.0) for ts, _ in fees_usd], max(1, int(step_days)))
+    targets = [int(ts) for ts, _ in sparse if int(ts) > 0]
+    if fees_usd and (not targets or int(targets[-1]) != int(fees_usd[-1][0])):
+        targets.append(int(fees_usd[-1][0]))
+    targets = sorted({int(x) for x in targets if int(x) > 0})
+    if not targets:
+        return [], "active_onchain_sparse:no_targets"
+    latest_block = _latest_block_number(chain_id)
+    from_block = int(pool.get("createdAtBlockNumber") or 0)
+    if from_block <= 0:
+        from_block = max(1, int(latest_block) - 3_500_000)
+
+    day_blocks: dict[int, int] = {}
+    for ts in targets:
+        if time.monotonic() >= deadline:
+            return [], "active_onchain_sparse:budget_timeout:block_resolution"
+        day_ts = int((int(ts) // 86400) * 86400)
+        if day_ts in day_blocks:
+            continue
+        try:
+            day_blocks[day_ts] = int(_llama_block_for_day(ck, day_ts + 86399))
+        except Exception:
+            day_blocks[day_ts] = 0
+    boundary_blocks = sorted({int(b) for b in day_blocks.values() if int(b) > 0}, reverse=True)
+    if not boundary_blocks:
+        return [], "active_onchain_sparse:no_day_blocks"
+
+    # Build per-range liquidity deltas from Mint/Burn logs once.
+    range_deltas: dict[tuple[int, int], dict[int, int]] = {}
+    range_latest_net: dict[tuple[int, int], int] = {}
+    scanned_logs = 0
+
+    def _on_log(log: dict) -> None:
+        nonlocal scanned_logs
+        scanned_logs += 1
+        topics = log.get("topics") or []
+        if not isinstance(topics, list) or len(topics) < 4:
+            return
+        t0x = str(topics[0] or "").strip().lower()
+        if t0x not in {V3_MINT_TOPIC, V3_BURN_TOPIC}:
+            return
+        try:
+            lo = int(_decode_int24_from_word(str(topics[2] or "")))
+            hi = int(_decode_int24_from_word(str(topics[3] or "")))
+            bn = int(_safe_hex_to_int(log.get("blockNumber")))
+        except Exception:
+            return
+        if hi <= lo or bn <= 0:
+            return
+        words = _hex_words(str(log.get("data") or ""))
+        amt = 0
+        if t0x == V3_MINT_TOPIC:
+            amt = int(_decode_uint_word(words[1])) if len(words) >= 2 else 0
+            sign = 1
+        else:
+            amt = int(_decode_uint_word(words[0])) if len(words) >= 1 else 0
+            sign = -1
+        if amt <= 0:
+            return
+        k = (int(lo), int(hi))
+        rd = range_deltas.setdefault(k, {})
+        rd[bn] = int(rd.get(bn, 0)) + int(sign) * int(amt)
+        range_latest_net[k] = int(range_latest_net.get(k, 0)) + int(sign) * int(amt)
+
+    try:
+        _fetch_logs_adaptive(
+            int(chain_id),
+            str(pool_id).strip().lower(),
+            [V3_MINT_TOPIC],
+            int(from_block),
+            int(latest_block),
+            deadline_ts=deadline,
+            on_log=_on_log,
+        )
+        _fetch_logs_adaptive(
+            int(chain_id),
+            str(pool_id).strip().lower(),
+            [V3_BURN_TOPIC],
+            int(from_block),
+            int(latest_block),
+            deadline_ts=deadline,
+            on_log=_on_log,
+        )
+    except Exception as e:
+        return [], f"active_onchain_sparse:logs_failed:{e}"
+    if not range_latest_net:
+        return [], "active_onchain_sparse:no_active_ranges"
+
+    dec0 = int(_token_decimals_from_pool(pool, "token0") or _erc20_decimals(chain_id, token0))
+    dec1 = int(_token_decimals_from_pool(pool, "token1") or _erc20_decimals(chain_id, token1))
+    sqrt_cache: dict[int, Decimal] = {}
+
+    def _sqrt_tick(t: int) -> Decimal:
+        x = int(t)
+        v = sqrt_cache.get(x)
+        if v is None:
+            v = _sqrt_ratio_x96_at_tick(x)
+            sqrt_cache[x] = v
+        return v
+
+    # Historical prices cache by day_ts.
+    day_price: dict[int, tuple[float, float]] = {}
+    out: list[tuple[int, float]] = []
+    points_done = 0
+    for ts in targets:
+        if time.monotonic() >= deadline:
+            break
+        day_ts = int((int(ts) // 86400) * 86400)
+        b = int(day_blocks.get(day_ts, 0))
+        if b <= 0:
+            continue
+        # Price per day (cheap cache).
+        pp = day_price.get(day_ts)
+        if pp is None:
+            p0 = float(_historical_price_usd(ck, token0, int(ts), int(day_start_ts), int(day_end_ts)))
+            p1 = float(_historical_price_usd(ck, token1, int(ts), int(day_start_ts), int(day_end_ts)))
+            day_price[day_ts] = (float(max(0.0, p0)), float(max(0.0, p1)))
+            pp = day_price[day_ts]
+        p0, p1 = pp
+        sqrt_p_x96, tick_now, _liq_now, _spacing, st_err = _v3_pool_state_at_block(chain_id, pool_id, hex(int(b)))
+        if int(sqrt_p_x96) <= 0 or st_err:
+            continue
+        sqrt_p = Decimal(int(sqrt_p_x96))
+        total0_raw = Decimal(0)
+        total1_raw = Decimal(0)
+        for (lo, hi), latest_liq in range_latest_net.items():
+            if time.monotonic() >= deadline:
+                break
+            liq = int(latest_liq)
+            if liq <= 0:
+                continue
+            # Remove future deltas to reconstruct liquidity at block b.
+            for bn, dv in (range_deltas.get((lo, hi), {}) or {}).items():
+                if int(bn) > int(b):
+                    liq -= int(dv)
+            if liq <= 0:
+                continue
+            if not (int(lo) <= int(tick_now) < int(hi)):
+                continue
+            sqrt_lo = _sqrt_tick(int(lo))
+            sqrt_hi = _sqrt_tick(int(hi))
+            if not (sqrt_lo <= sqrt_p < sqrt_hi):
+                continue
+            a0, _ = _amounts_from_liquidity_segment(Decimal(int(liq)), sqrt_p, sqrt_hi)
+            _, a1 = _amounts_from_liquidity_segment(Decimal(int(liq)), sqrt_lo, sqrt_p)
+            if a0 <= 0 and a1 <= 0:
+                continue
+            total0_raw += max(Decimal(0), a0)
+            total1_raw += max(Decimal(0), a1)
+        amt0 = float(total0_raw) / float(10 ** max(0, int(dec0)))
+        amt1 = float(total1_raw) / float(10 ** max(0, int(dec1)))
+        tvl = max(0.0, amt0 * max(0.0, float(p0))) + max(0.0, amt1 * max(0.0, float(p1)))
+        out.append((int(ts), float(max(0.0, tvl))))
+        points_done += 1
+    if not out:
+        return [], f"active_onchain_sparse:no_points:logs={int(scanned_logs)}"
+    # Ensure latest day anchor exists if available in targets.
+    out = sorted({int(ts): float(v) for ts, v in out}.items(), key=lambda x: int(x[0]))
+    reason = (
+        f"active_onchain_sparse:ok:points={int(points_done)}/{len(targets)}:"
+        f"ranges={len(range_latest_net)}:logs={int(scanned_logs)}:elapsed={max(0.0, time.monotonic() - t0):.1f}"
+    )
+    return [(int(ts), float(v)) for ts, v in out], reason
 
 
 def _symbol_decimals_hint(symbol: str) -> int:
@@ -2089,6 +2280,32 @@ def main() -> None:
             exact_active_tvl[-1] = (int(exact_active_tvl[-1][0]), float(max(0.0, tvl_active_now)))
         if exact_active_fees and estimated_active_fees:
             exact_active_fees[-1] = (int(exact_active_fees[-1][0]), float(max(0.0, estimated_active_fees[-1][1])))
+        # Prefer independent on-chain active snapshots (in-range liquidity at day blocks).
+        try:
+            active_hist_budget = max(
+                8.0,
+                float(os.environ.get("STRICT_V3_ACTIVE_ONCHAIN_HISTORY_BUDGET_SEC", str(max(12.0, float(os.environ.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "180")) * 0.25)))),
+            )
+        except Exception:
+            active_hist_budget = 20.0
+        onchain_active_sparse, onchain_active_reason = _v3_active_tvl_onchain_sparse_snapshots(
+            chain=str(found_chain),
+            pool=pool,
+            fees_usd=fees_usd,
+            day_start_ts=int((int(fees_usd[0][0]) // 86400) * 86400),
+            day_end_ts=int((int(fees_usd[-1][0]) // 86400) * 86400),
+            step_days=int(active_step_days),
+            budget_sec=float(active_hist_budget),
+        )
+        if onchain_active_sparse:
+            exact_active_tvl = _append_now_tvl_anchor(list(onchain_active_sparse), float(tvl_active_now))
+            if estimated_active_fees:
+                exact_active_fees = _sparse_series_every_n_days(estimated_active_fees, active_step_days)
+                exact_active_fees = _append_now_fee_anchor(exact_active_fees)
+            if isinstance(tvl_now_debug, dict):
+                tvl_now_debug["active_history_source"] = str(onchain_active_reason)
+        elif isinstance(tvl_now_debug, dict):
+            tvl_now_debug["active_history_source"] = str(onchain_active_reason or "active_onchain_sparse:unavailable")
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
