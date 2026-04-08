@@ -615,6 +615,80 @@ def _active_window_amounts(
     return float(max(Decimal(0), a0)), float(max(Decimal(0), a1)), "pure_onchain_active_window"
 
 
+def _active_window_amounts_from_initialized_band(
+    *,
+    chain_id: int,
+    chain: str,
+    pool_id: str,
+    liquidity: int,
+    current_tick: int,
+    tick_spacing: int,
+    sqrt_price_x96: int,
+    block_tag: str = "latest",
+) -> tuple[float, float, str]:
+    """Estimate active amounts in the real initialized band around current tick.
+
+    Root-cause fix for underestimated V4 active TVL:
+    using [floorTick, floorTick+tickSpacing] is often too narrow. We search nearest
+    initialized ticks around current price and use that band with current liquidity.
+    """
+    if int(liquidity) <= 0 or int(tick_spacing) <= 0 or int(sqrt_price_x96) <= 0:
+        return _active_window_amounts(liquidity, current_tick, tick_spacing, sqrt_price_x96)
+    s = int(tick_spacing)
+    t = int(current_tick)
+    base = int(math.floor(float(t) / float(s)) * s)
+    try:
+        max_steps = max(4, min(120, int(os.environ.get("STRICT_V4_ACTIVE_BAND_MAX_STEPS", "28") or 28)))
+    except Exception:
+        max_steps = 28
+
+    def _is_initialized_tick(tick: int) -> tuple[bool, str]:
+        gross, net, src = _read_tick_liquidity_net(
+            int(chain_id),
+            str(chain),
+            str(pool_id),
+            int(tick),
+            block_tag=str(block_tag or "latest"),
+        )
+        return bool(int(gross) > 0 or int(net) != 0), str(src or "")
+
+    src_tag = ""
+    lower_tick: int | None = None
+    upper_tick: int | None = None
+    for k in range(0, int(max_steps) + 1):
+        cand = int(base - k * s)
+        ok, src = _is_initialized_tick(int(cand))
+        src_tag = src_tag or src
+        if ok:
+            lower_tick = int(cand)
+            break
+    for k in range(0, int(max_steps) + 1):
+        cand = int(base + (k + 1) * s)
+        ok, src = _is_initialized_tick(int(cand))
+        src_tag = src_tag or src
+        if ok:
+            upper_tick = int(cand)
+            break
+
+    if lower_tick is None or upper_tick is None or int(upper_tick) <= int(lower_tick):
+        a0, a1, src0 = _active_window_amounts(liquidity, current_tick, tick_spacing, sqrt_price_x96)
+        return a0, a1, f"{src0}:fallback_no_initialized_band"
+
+    sqrt_lo = _sqrt_ratio_x96_at_tick(int(lower_tick))
+    sqrt_hi = _sqrt_ratio_x96_at_tick(int(upper_tick))
+    sqrt_p = Decimal(int(sqrt_price_x96))
+    if not (sqrt_lo < sqrt_p < sqrt_hi):
+        sqrt_p = min(max(sqrt_p, sqrt_lo + Decimal(1)), sqrt_hi - Decimal(1))
+    liq = Decimal(int(liquidity))
+    a0, _ = _amounts_from_liquidity_segment(liq, sqrt_p, sqrt_hi)
+    _, a1 = _amounts_from_liquidity_segment(liq, sqrt_lo, sqrt_p)
+    src = (
+        f"pure_onchain_active_initialized_band:{src_tag or 'state'}:"
+        f"lo={int(lower_tick)}:hi={int(upper_tick)}"
+    )
+    return float(max(Decimal(0), a0)), float(max(Decimal(0), a1)), src
+
+
 def _compute_pool_token_amounts_onchain(
     chain_id: int,
     chain: str,
@@ -954,7 +1028,16 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     a0_full_raw = float(a0_full * (10 ** d0))
     a1_full_raw = float(a1_full * (10 ** d1))
 
-    a0_active_raw, a1_active_raw, active_src = _active_window_amounts(pool_liquidity, current_tick, tick_spacing, sqrt_price_x96)
+    a0_active_raw, a1_active_raw, active_src = _active_window_amounts_from_initialized_band(
+        chain_id=int(chain_id),
+        chain=str(ck),
+        pool_id=str(pool_id),
+        liquidity=int(pool_liquidity),
+        current_tick=int(current_tick),
+        tick_spacing=int(tick_spacing),
+        sqrt_price_x96=int(sqrt_price_x96),
+        block_tag="latest",
+    )
     dbg["quantity_mode_full_available"] = bool(full_available)
     dbg["quantity_mode_active_available"] = bool((a0_active_raw > 0.0) or (a1_active_raw > 0.0))
     dbg["amount0_full_pool"] = float(a0_full)
