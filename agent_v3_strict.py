@@ -2126,13 +2126,26 @@ def _build_exact2_tvl_series_v3_ledger(
             hit_cov = float(sum(1 for _ts, v in hit_series if float(v) > 0.0) / max(1, len(hit_series)))
             return hit_series, "exact2_cache:ok", hit_cov
 
-    # Sparse exact-point mode (default): build a small set of fully reliable points
-    # via balanceOf at historical day blocks through Alchemy RPC.
+    # Sparse exact-point mode: never fetch exact for every day by default.
+    # Keep cadence around 5 days, and relax to 10 days on long windows.
     try:
-        # 0 => all available days (on-chain points for each day).
-        sparse_points = int(os.environ.get("STRICT_EXACT2_SPARSE_POINTS", "0"))
+        sparse_points = int(os.environ.get("STRICT_EXACT2_SPARSE_POINTS", "").strip() or "0")
     except Exception:
         sparse_points = 0
+    if sparse_points <= 0:
+        n_days = int(len(fees_usd or []))
+        try:
+            sparse_step_days = max(5, int(os.environ.get("STRICT_EXACT2_SPARSE_STEP_DAYS", "5")))
+        except Exception:
+            sparse_step_days = 5
+        if n_days > 180:
+            sparse_step_days = max(sparse_step_days, 10)
+        auto_points = max(2, int(math.ceil(float(max(1, n_days)) / float(max(1, sparse_step_days)))))
+        try:
+            max_points = max(8, int(os.environ.get("STRICT_EXACT2_SPARSE_MAX_POINTS", "48")))
+        except Exception:
+            max_points = 48
+        sparse_points = min(int(max_points), int(auto_points))
     return _build_exact2_tvl_series_v3_sparse_points(
             chain=chain,
             pool=pool,
@@ -2342,9 +2355,18 @@ def main() -> None:
         estimated_active_tvl = _append_now_tvl_anchor(estimated_active_tvl_base, float(tvl_active_now))
         estimated_active_fees = _append_now_fee_anchor(estimated_active_fees_base)
         try:
-            active_step_days = max(1, int(os.environ.get("STRICT_V3_ACTIVE_WINDOW_STEP_DAYS", "5")))
+            active_step_days = max(5, int(os.environ.get("STRICT_V3_ACTIVE_WINDOW_STEP_DAYS", "5")))
         except Exception:
             active_step_days = 5
+        if int(len(fees_usd or [])) > 180:
+            active_step_days = max(active_step_days, 10)
+        try:
+            active_max_points = max(6, int(os.environ.get("STRICT_V3_ACTIVE_MAX_POINTS", "36")))
+        except Exception:
+            active_max_points = 36
+        if int(len(fees_usd or [])) > 0:
+            min_step_from_cap = int(math.ceil(float(len(fees_usd)) / float(max(1, active_max_points))))
+            active_step_days = max(int(active_step_days), int(min_step_from_cap))
         # exact_active must be independent from estimated_active.
         # Do NOT prefill exact from estimated: this can create identical rows.
         exact_active_tvl = []
