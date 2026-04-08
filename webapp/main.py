@@ -18317,6 +18317,16 @@ def _merge_for_web(
             # Product decision: exact active branch is removed.
             ex_active_tvl = []
             ex_active_fees = []
+            # Compatibility guard for v4 strict payload variants:
+            # if exact full TVL is present but exact fees are absent, reuse estimated fees
+            # to avoid false $0/0% exact row in compare table.
+            if (
+                str(base_version or "").strip().lower() == "v4"
+                and (not ex_fees)
+                and bool(ex_tvl)
+                and bool(est_fees)
+            ):
+                ex_fees = list(est_fees)
             exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
 
             tvl_end_ts = max(
