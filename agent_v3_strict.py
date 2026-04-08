@@ -2299,14 +2299,10 @@ def main() -> None:
             active_step_days = max(1, int(os.environ.get("STRICT_V3_ACTIVE_WINDOW_STEP_DAYS", "5")))
         except Exception:
             active_step_days = 5
-        # Exact active-window is intentionally sparse for performance:
-        # one point every N days + TVL NOW; if target day missing pick nearest day.
-        exact_active_tvl = _sparse_series_every_n_days(estimated_active_tvl, active_step_days)
-        exact_active_fees = _sparse_series_every_n_days(estimated_active_fees, active_step_days)
-        if exact_active_tvl:
-            exact_active_tvl[-1] = (int(exact_active_tvl[-1][0]), float(max(0.0, tvl_active_now)))
-        if exact_active_fees and estimated_active_fees:
-            exact_active_fees[-1] = (int(exact_active_fees[-1][0]), float(max(0.0, estimated_active_fees[-1][1])))
+        # exact_active must be independent from estimated_active.
+        # Do NOT prefill exact from estimated: this can create identical rows.
+        exact_active_tvl = []
+        exact_active_fees = []
         # Prefer independent on-chain active snapshots (in-range liquidity at day blocks).
         try:
             active_hist_budget = max(
@@ -2339,6 +2335,15 @@ def main() -> None:
                 tvl_now_debug["active_history_source"] = str(onchain_active_reason)
         elif isinstance(tvl_now_debug, dict):
             tvl_now_debug["active_history_source"] = str(onchain_active_reason or "active_onchain_sparse:unavailable")
+            # Optional legacy fallback (off by default): mirror estimated active branch.
+            use_est_fallback = str(os.environ.get("STRICT_V3_ACTIVE_ONCHAIN_FALLBACK_ESTIMATE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+            if use_est_fallback and estimated_active_tvl:
+                exact_active_tvl = _sparse_series_every_n_days(estimated_active_tvl, active_step_days)
+                exact_active_tvl = _append_now_tvl_anchor(exact_active_tvl, float(tvl_active_now))
+                if estimated_active_fees:
+                    exact_active_fees = _sparse_series_every_n_days(estimated_active_fees, active_step_days)
+                    exact_active_fees = _append_now_fee_anchor(exact_active_fees)
+                tvl_now_debug["active_history_source"] = f"{str(tvl_now_debug.get('active_history_source') or '')}:fallback_estimated"
 
     day_start_ts = int((int(fees_usd[0][0]) // 86400) * 86400)
     day_end_ts = int((int(fees_usd[-1][0]) // 86400) * 86400)
