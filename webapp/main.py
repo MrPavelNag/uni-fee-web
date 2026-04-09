@@ -30581,22 +30581,18 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
     job_id = str(uuid.uuid4())
     with JOB_LOCK:
         _prune_run_jobs_locked()
-        active_for_session = 0
+        active_candidates: list[tuple[float, str]] = []
         for _jid, _j in JOBS.items():
             if str((_j or {}).get("session_id") or "") != str(session_id):
                 continue
             _status = str((_j or {}).get("status") or "")
             if _status in {"queued", "running"}:
-                active_for_session += 1
-        if active_for_session >= int(RUN_MAX_ACTIVE_PER_SESSION):
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Too many active scans in this session "
-                    f"({active_for_session}/{int(RUN_MAX_ACTIVE_PER_SESSION)}). "
-                    "Wait for completion and retry."
-                ),
-            )
+                active_candidates.append((float((_j or {}).get("created_at") or 0.0), str(_jid)))
+        # Always reuse currently active scan in this session to avoid
+        # launching parallel heavy jobs that degrade performance.
+        if active_candidates:
+            active_candidates.sort(key=lambda x: x[0], reverse=True)
+            return {"job_id": str(active_candidates[0][1]), "reused_active_job": "1"}
         JOBS[job_id] = {
             "id": job_id,
             "status": "queued",
@@ -31734,6 +31730,7 @@ HTML_PAGE = """
     let sortDesc = true;
     const FORM_STORAGE_KEY = "uni_fee_form_v4";
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
+    const ACTIVE_POOL_JOB_KEY = "uni_fee_active_pool_job_v1";
     const FIELD_IDS = [
       "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
       "minTvl", "daysEstimated", "feeRangePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache"
@@ -31772,6 +31769,22 @@ HTML_PAGE = """
 
     function splitCSV(v) {
       return (v || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
+    }
+
+    function setActivePoolJobId(jobId) {
+      const id = String(jobId || "").trim();
+      try {
+        if (!id) localStorage.removeItem(ACTIVE_POOL_JOB_KEY);
+        else localStorage.setItem(ACTIVE_POOL_JOB_KEY, id);
+      } catch (_) {}
+    }
+
+    function getActivePoolJobId() {
+      try {
+        return String(localStorage.getItem(ACTIVE_POOL_JOB_KEY) || "").trim();
+      } catch (_) {
+        return "";
+      }
     }
 
     function formatUsd(v) {
@@ -33573,6 +33586,11 @@ HTML_PAGE = """
           setStatus("Error: backend returned empty job id", "fail");
           return;
         }
+        const reusedActive = String(data?.reused_active_job || "") === "1";
+        setActivePoolJobId(String(data.job_id || ""));
+        if (reusedActive) {
+          setStatus("Resuming existing active scan...", "running");
+        }
         pollJob(data.job_id);
       } catch (e) {
         stopActivePoll();
@@ -33585,6 +33603,7 @@ HTML_PAGE = """
     async function pollJob(jobId) {
       stopActivePoll();
       activeJobId = String(jobId || "");
+      setActivePoolJobId(activeJobId);
       const tick = async () => {
         try {
           if (!activeJobId || activeJobId !== String(jobId || "")) return;
@@ -33634,6 +33653,7 @@ HTML_PAGE = """
             } else {
               setStatus(`Completed in ${elapsedSec}s`, "ok");
             }
+            setActivePoolJobId("");
             renderResult(job.result);
           } else if (job.status === "failed") {
             stopActivePoll();
@@ -33641,6 +33661,7 @@ HTML_PAGE = """
             hasScanRun = true;
             setBusy(false);
             setStatus("Failed: " + (job.error || "unknown"), "fail");
+            setActivePoolJobId("");
             renderPoolRunDebug(job.result || null);
           } else {
             scanStageLabel = String(job.stage_label || job.status || "running");
@@ -33652,6 +33673,7 @@ HTML_PAGE = """
           setBusy(false);
           const msg = String(e?.message || "job polling error");
           setStatus("Failed: " + msg, "fail");
+          setActivePoolJobId("");
         }
       };
       await tick();
@@ -33757,6 +33779,13 @@ HTML_PAGE = """
         } else {
           setStatus("Restored last result", "ok");
         }
+      }
+      const activeJob = getActivePoolJobId();
+      if (activeJob) {
+        setStatus("Resuming active scan...", "running");
+        setBusy(true);
+        startScanTicker();
+        pollJob(activeJob);
       }
     });
   </script>
