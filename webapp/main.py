@@ -30656,6 +30656,26 @@ def recent_runs(request: Request, response: Response) -> dict[str, Any]:
     return {"items": items}
 
 
+@app.get("/api/scans/active")
+def active_scans(request: Request, response: Response) -> dict[str, Any]:
+    session_id = _ensure_session_cookie(request, response)
+    with JOB_LOCK:
+        _prune_run_jobs_locked()
+        total = 0
+        in_session = 0
+        for rec in JOBS.values():
+            st = str((rec or {}).get("status") or "")
+            if st in {"queued", "running"}:
+                total += 1
+                if str((rec or {}).get("session_id") or "") == str(session_id):
+                    in_session += 1
+    return {
+        "active_total": int(total),
+        "active_in_session": int(in_session),
+        "session_limit": int(RUN_MAX_ACTIVE_PER_SESSION),
+    }
+
+
 @app.post("/api/runs/reset")
 def reset_runs(request: Request, response: Response) -> dict[str, Any]:
     session_id = _ensure_session_cookie(request, response)
@@ -31529,6 +31549,7 @@ HTML_PAGE = """
             <div>
               <div class="pair-mode-line">
                 <span class="meta-badge" id="pairListsMeta">pair lists: -</span>
+                <span class="meta-badge" id="activeScansMeta">active scans: -</span>
                 <button type="button" class="pair-details-btn" id="pairListsDetailsBtn" onclick="openPairListsDetails()">Hide details</button>
               </div>
               <div class="top-line">
@@ -31747,6 +31768,7 @@ HTML_PAGE = """
     let scanTicker = null;
     let activePollTimer = null;
     let activeJobId = "";
+    let activeScansTimer = null;
     let scanStartedAt = 0;
     let scanStageLabel = "waiting";
     let scanProgressPct = 0;
@@ -31769,6 +31791,34 @@ HTML_PAGE = """
 
     function splitCSV(v) {
       return (v || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
+    }
+
+    function renderActiveScansMeta(data) {
+      const el = document.getElementById("activeScansMeta");
+      if (!el) return;
+      const total = Number(data?.active_total || 0);
+      const own = Number(data?.active_in_session || 0);
+      const lim = Number(data?.session_limit || 0);
+      const limTxt = (Number.isFinite(lim) && lim > 0) ? `${own}/${lim}` : `${own}`;
+      el.textContent = `active scans: ${total} (you: ${limTxt})`;
+    }
+
+    async function refreshActiveScansMeta() {
+      try {
+        const r = await fetch("/api/scans/active", {cache: "no-store"});
+        if (!r.ok) return;
+        const data = await r.json().catch(() => ({}));
+        renderActiveScansMeta(data || {});
+      } catch (_) {}
+    }
+
+    function startActiveScansMetaTimer() {
+      if (activeScansTimer) {
+        clearInterval(activeScansTimer);
+        activeScansTimer = null;
+      }
+      refreshActiveScansMeta();
+      activeScansTimer = setInterval(refreshActiveScansMeta, 5000);
     }
 
     function setActivePoolJobId(jobId) {
@@ -32325,17 +32375,22 @@ HTML_PAGE = """
       const tick = () => {
         const elapsed = Math.max(0, Math.floor((Date.now() - scanStartedAt) / 1000));
         const backendTargetRaw = Math.max(0, Math.min(100, Number(scanProgressTargetPct || 0)));
+        const isQueueWait = /waiting\s+for\s+scan\s+slot/i.test(String(scanStageLabel || ""));
         // Follow backend progress and avoid jumping ahead too fast.
-        const stageLimitedTarget = backendTargetRaw;
+        let stageLimitedTarget = backendTargetRaw;
+        if (isQueueWait) {
+          // While waiting for a scan slot, backend progress can stay flat for a long time.
+          // Add a conservative local ramp so users can see that waiting is still progressing.
+          const queueCap = 22;
+          const queueRamp = Math.min(queueCap, 8 + Math.floor(elapsed / 6));
+          stageLimitedTarget = Math.max(stageLimitedTarget, queueRamp);
+        }
         const target = (stageLimitedTarget >= 100) ? 100 : Math.min(99, stageLimitedTarget);
         const current = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
         if (target > current) {
           const diff = target - current;
           const step = Math.max(1, Math.min(6, Math.ceil(diff / 4)));
           scanProgressPct = Math.min(target, current + step);
-        } else if (target < current) {
-          // Backend can move backward on stage transitions; ease down slightly.
-          scanProgressPct = Math.max(target, current - 2);
         }
         const pct = Math.max(0, Math.min(100, Number(scanProgressPct || 0)));
         const staleSec = scanLastBackendAt > 0 ? Math.max(0, Math.floor((Date.now() - scanLastBackendAt) / 1000)) : 0;
@@ -33493,6 +33548,17 @@ HTML_PAGE = """
         stopActivePoll();
         renderPoolRunDebug(null);
         const pairCheck = validateBucketPairs();
+        const pairCount = Array.isArray(pairCheck?.pairs) ? pairCheck.pairs.length : 0;
+        if (pairCount > 50) {
+          const proceed = window.confirm(
+            `This scan includes ${pairCount} pairs and may take a long time. ` +
+            `Consider narrowing the scope before continuing.`
+          );
+          if (!proceed) {
+            setStatus("Scan cancelled: narrowed scope recommended.", "fail");
+            return;
+          }
+        }
         const minTvlRaw = String(document.getElementById("minTvl").value ?? "").trim();
         const daysRaw = String(document.getElementById("daysEstimated").value ?? "").trim();
         const feeRangeRaw = String(document.getElementById("feeRangePct").value ?? "").trim();
@@ -33591,6 +33657,7 @@ HTML_PAGE = """
         if (reusedActive) {
           setStatus("Resuming existing active scan...", "running");
         }
+        refreshActiveScansMeta();
         pollJob(data.job_id);
       } catch (e) {
         stopActivePoll();
@@ -33654,6 +33721,7 @@ HTML_PAGE = """
               setStatus(`Completed in ${elapsedSec}s`, "ok");
             }
             setActivePoolJobId("");
+            refreshActiveScansMeta();
             renderResult(job.result);
           } else if (job.status === "failed") {
             stopActivePoll();
@@ -33662,6 +33730,7 @@ HTML_PAGE = """
             setBusy(false);
             setStatus("Failed: " + (job.error || "unknown"), "fail");
             setActivePoolJobId("");
+            refreshActiveScansMeta();
             renderPoolRunDebug(job.result || null);
           } else {
             scanStageLabel = String(job.stage_label || job.status || "running");
@@ -33674,6 +33743,7 @@ HTML_PAGE = """
           const msg = String(e?.message || "job polling error");
           setStatus("Failed: " + msg, "fail");
           setActivePoolJobId("");
+          refreshActiveScansMeta();
         }
       };
       await tick();
@@ -33766,6 +33836,7 @@ HTML_PAGE = """
     renderEmptyCharts();
     loadAuthState();
     refreshIntentMenu();
+    startActiveScansMetaTimer();
     loadMeta().then(() => {
       const cached = loadResultState();
       if (cached) {
