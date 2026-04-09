@@ -18114,28 +18114,6 @@ def _merge_for_web(
             if br == "estimated":
                 anchor_lbl = "active" if anc == "active" else "full"
                 return f"Strict compare: estimated {anchor_lbl} | TVL shape=poolDayData + NOW anchor | fees=subgraph feesUSD"
-            if br == "exact":
-                hist_dbg = (strict_dbg.get("onchain_history_debug") or {})
-                hist_pts = int(hist_dbg.get("snapshots_done") or 0)
-                hist_part = ("history=on-chain block snapshots" if hist_pts > 0 else "history=NOW anchor")
-                full_src = ("full TVL NOW=Uniswap Interface" if ("full_src=uniswap_interface" in src_l or "uniswap_interface_v4pool_totalliquidity" in src_l) else "full TVL NOW=on-chain quantities")
-                if anc == "active":
-                    if ver == "v3":
-                        v3_dbg = (strict_dbg.get("v3_tvl_now") or {}) if isinstance(strict_dbg, dict) else {}
-                        ah_src = str(v3_dbg.get("active_history_source") or "").strip().lower()
-                        if ah_src.startswith("active_onchain_sparse:ok"):
-                            ah_part = "exact active history=on-chain snapshots"
-                        elif "fallback:active_subgraph_sparse:ok" in ah_src:
-                            ah_part = "exact active history=subgraph block snapshots (fallback)"
-                        elif "fallback_now_point" in ah_src:
-                            ah_part = "exact active history=NOW point fallback"
-                        elif ah_src:
-                            ah_part = "exact active history=fallback"
-                        else:
-                            ah_part = "exact active history=not_reported"
-                        return f"Strict compare: exact active | active TVL=in-range liquidity | {ah_part} | fees=subgraph feesUSD"
-                    return f"Strict compare: exact active | active TVL=StateView/PoolManager | {hist_part} | fees=subgraph feesUSD"
-                return f"Strict compare: exact full | {full_src} | {hist_part} | fees=subgraph feesUSD"
             return "Strict compare: mixed path"
         # Fast legacy / estimate mode
         if ver == "v4":
@@ -18250,7 +18228,7 @@ def _merge_for_web(
         reason = str(dq_reason or "").strip().lower()
         blob = f"{src} {reason}"
         # Prefer explicit active hints from data source/reason.
-        if ("active_window" in blob) or ("active anchor" in blob) or ("exact active" in blob):
+        if ("active_window" in blob) or ("active anchor" in blob):
             return "Active"
         # Default non-strict anchor semantics are full-pool TVL.
         return "Full"
@@ -18265,9 +18243,6 @@ def _merge_for_web(
             or (v.get("strict_compare_estimated_tvl") or [])
             or (v.get("strict_compare_estimated_active_fees") or [])
             or (v.get("strict_compare_estimated_active_tvl") or [])
-            or (v.get("strict_compare_exact_fees") or [])
-            or (v.get("strict_compare_exact_tvl") or [])
-            or (v.get("strict_compare_exact_active_tvl") or [])
         )
         final_income = _final_income(v)
         apy_pct = (final_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
@@ -18305,50 +18280,31 @@ def _merge_for_web(
         base_pair = v.get("pair", "")
         base_fee_pct = float(v.get("fee_pct") or 0)
         tvl_src_raw = str(v.get("tvl_price_source") or "")
-        exact2_reason = str(dq_reason or "")
+        strict_compare_reason = str(dq_reason or "")
         if has_strict_compare:
             now_ts = int(time.time())
             est_fees = v.get("strict_compare_estimated_fees") or []
             est_tvl = v.get("strict_compare_estimated_tvl") or []
             est_active_fees = v.get("strict_compare_estimated_active_fees") or []
             est_active_tvl = v.get("strict_compare_estimated_active_tvl") or []
-            ex_fees = v.get("strict_compare_exact_fees") or []
-            ex_tvl = v.get("strict_compare_exact_tvl") or []
-            # Product decision: exact active branch is removed.
-            ex_active_tvl = []
-            ex_active_fees = []
-            # Compatibility guard for v4 strict payload variants:
-            # if exact full TVL is present but exact fees are absent, reuse estimated fees
-            # to avoid false $0/0% exact row in compare table.
-            if (
-                str(base_version or "").strip().lower() == "v4"
-                and (not ex_fees)
-                and bool(ex_tvl)
-                and bool(est_fees)
-            ):
-                ex_fees = list(est_fees)
-            exact2_reason = str(v.get("strict_compare_exact2_reason") or dq_reason or "strict_compare:exact")
+            strict_compare_reason = str(v.get("strict_compare_reason") or dq_reason or "strict_compare")
 
             tvl_end_ts = max(
                 [0]
                 + [int(x[0]) for x in (est_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (est_active_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
-                + [int(x[0]) for x in (ex_tvl or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(now_ts)]
             )
             fees_end_ts = max(
                 [0]
                 + [int(x[0]) for x in (est_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(x[0]) for x in (est_active_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
-                + [int(x[0]) for x in (ex_fees or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
                 + [int(now_ts)]
             )
             est_tvl = _align_series_end(est_tvl, tvl_end_ts)
             est_active_tvl = _align_series_end(est_active_tvl, tvl_end_ts)
-            ex_tvl = _align_series_end(ex_tvl, tvl_end_ts)
             est_fees = _align_series_end(est_fees, fees_end_ts)
             est_active_fees = _align_series_end(est_active_fees, fees_end_ts)
-            ex_fees = _align_series_end(ex_fees, fees_end_ts)
 
             src_lbl = _short_source_label(str(v.get("tvl_price_source") or ""))
             est_income = float(est_fees[-1][1]) if est_fees else 0.0
@@ -18414,45 +18370,6 @@ def _merge_for_web(
                     risk_flags=est_act_risk_flags,
                 )
 
-            exact_income = float(ex_fees[-1][1]) if ex_fees else 0.0
-            exact_apy = (exact_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-            exact_last_tvl = _last_positive_value(ex_tvl) if ex_tvl else 0.0
-            exact_ok = bool(ex_tvl and not str(exact2_reason).startswith("strict_required:"))
-            exact_dq = str(v.get("data_quality") or "").strip().lower()
-            if not exact_ok:
-                exact_quality = "strict_unavailable"
-            elif exact_dq in {"exact_partial", "exact"}:
-                exact_quality = exact_dq
-            elif "partial_blend" in str(exact2_reason):
-                exact_quality = "exact_partial"
-            else:
-                exact_quality = "exact"
-            ex_risk_level, ex_risk_reason, ex_risk_flags = _risk_assessment(
-                apy_pct=exact_apy,
-                last_tvl=exact_last_tvl,
-                dq_reason=f"Exact full now ({src_lbl})",
-                tvl_price_source=tvl_src_raw,
-                fees_series=ex_fees,
-            )
-            _append_compare_row(
-                pool_id=base_pool_id,
-                chain=base_chain,
-                version=base_version,
-                base_pair=base_pair,
-                branch="exact",
-                anchor_type="Full",
-                fee_pct=base_fee_pct,
-                income=exact_income,
-                apy=exact_apy,
-                last_tvl=exact_last_tvl,
-                data_quality=exact_quality,
-                data_quality_reason=f"Exact full now ({src_lbl})",
-                status=status,
-                calc_path_human=_calc_path_human(v, branch="exact", anchor_type="Full", has_strict_compare=True),
-                risk_level=ex_risk_level,
-                risk_reason=ex_risk_reason,
-                risk_flags=ex_risk_flags,
-            )
         else:
             anchor_type = _infer_anchor_type_for_normal_row(v, dq_reason)
             row_risk_level, row_risk_reason, row_risk_flags = _risk_assessment(
@@ -18497,11 +18414,7 @@ def _merge_for_web(
                     "strict_compare_estimated_tvl": (est_tvl if has_strict_compare else (v.get("strict_compare_estimated_tvl") or [])),
                     "strict_compare_estimated_active_fees": (est_active_fees if has_strict_compare else (v.get("strict_compare_estimated_active_fees") or [])),
                     "strict_compare_estimated_active_tvl": (est_active_tvl if has_strict_compare else (v.get("strict_compare_estimated_active_tvl") or [])),
-                    "strict_compare_exact_fees": (ex_fees if has_strict_compare else (v.get("strict_compare_exact_fees") or [])),
-                    "strict_compare_exact_tvl": (ex_tvl if has_strict_compare else (v.get("strict_compare_exact_tvl") or [])),
-                    "strict_compare_exact_active_tvl": (ex_active_tvl if has_strict_compare else (v.get("strict_compare_exact_active_tvl") or [])),
-                    "strict_compare_exact_active_fees": (ex_active_fees if has_strict_compare else (v.get("strict_compare_exact_active_fees") or [])),
-                    "strict_compare_exact2_reason": exact2_reason,
+                    "strict_compare_reason": strict_compare_reason,
                     "pool_tvl_now_usd": pool_tvl_now_usd,
                 }
             )
@@ -18601,7 +18514,7 @@ def _run_output_dir(job_id: str) -> Path:
 
 
 def _agent_data_path(script_name: str, pair_suffix: str) -> Path:
-    if str(script_name) in {"agent_v3.py", "agent_v3_strict_exact2.py"}:
+    if str(script_name) == "agent_v3.py":
         return DATA_DIR / f"pools_v3_{pair_suffix}.json"
     return DATA_DIR / f"pools_v4_{pair_suffix}.json"
 
@@ -18733,13 +18646,8 @@ def _build_run_job_env(
     run_v4: bool,
 ) -> dict[str, str]:
     env = os.environ.copy()
-    mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
-    mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
-    if mode_strict_exact:
-        mode_fast_legacy = False
-    if (not mode_strict_exact) and (not mode_fast_legacy):
-        mode_fast_legacy = True
-    run_mode = "strict_exact" if mode_strict_exact else "fast_legacy"
+    mode_fast_legacy = True
+    run_mode = "fast_legacy"
     # Per-chain RPC routing (no shared/global RPC across chains).
     # Priority for each chain:
     # 1) chain-specific env (ALCHEMY_RPC_URL_<CHAIN>/RPC_URL_<CHAIN>/WEB3_RPC_URL_<CHAIN>)
@@ -18781,7 +18689,7 @@ def _build_run_job_env(
         if not str(env.get(key, "") or "").strip():
             env[key] = str(rpc_url)
 
-    strict_mode = (run_mode == "strict_exact")
+    strict_mode = False
     strict_allow_public_fallback = str(env.get("STRICT_RPC_ALLOW_PUBLIC_FALLBACK", "0") or "").strip().lower() in {
         "1", "true", "yes", "on"
     }
@@ -18814,7 +18722,6 @@ def _build_run_job_env(
 
     for _ck, _cid in chain_id_by_key.items():
         _prepend_rpc(_ck, _cid)
-    target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
     exact_days_default = str(max(1, min(int(req.days), 7 if speed_mode == "fast" else 14)))
     # Agents resolve symbols via the same top-N cache as site catalog.
     try:
@@ -18822,10 +18729,8 @@ def _build_run_job_env(
     except Exception:
         env["MAJOR_TOKENS_CACHE_PATH"] = str(MAJOR_TOKENS_CACHE_PATH)
     env["TOKEN_PAIRS"] = token_pairs
-    env["TARGET_POOL_ID"] = (target_pool_id if run_mode == "strict_exact" else "")
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
-    # Respect Include chains selection for strict exact mode.
     # If user did not select chains (all), keep full set.
     env["V3_EXACT_TVL_CHAINS"] = (
         ",".join(include_chains)
@@ -18893,32 +18798,12 @@ def _build_run_job_env(
         "WEB_V3_BASE_FALLBACK_READ_TIMEOUT_SEC_FAST" if speed_mode == "fast" else "WEB_V3_BASE_FALLBACK_READ_TIMEOUT_SEC_NORMAL",
         "4" if speed_mode == "fast" else "6",
     )
-    env["V3_EXACT_TVL_ENABLE"] = os.environ.get(
-        "WEB_V3_EXACT_TVL_ENABLE_FAST" if speed_mode == "fast" else "WEB_V3_EXACT_TVL_ENABLE_NORMAL",
-        "0" if speed_mode == "fast" else "1",
-    )
-    env["V3_EXACT_TVL_DAYS_MAX"] = os.environ.get(
-        "WEB_V3_EXACT_TVL_DAYS_MAX_FAST" if speed_mode == "fast" else "WEB_V3_EXACT_TVL_DAYS_MAX_NORMAL",
-        exact_days_default,
-    )
-    env["V3_EXACT_TVL_MAX_POOLS"] = os.environ.get(
-        "WEB_V3_EXACT_TVL_MAX_POOLS_FAST" if speed_mode == "fast" else "WEB_V3_EXACT_TVL_MAX_POOLS_NORMAL",
-        "1" if speed_mode == "fast" else "2",
-    )
-    env["V3_EXACT_TVL_POOL_BUDGET_SEC"] = os.environ.get(
-        "WEB_V3_EXACT_TVL_POOL_BUDGET_SEC_FAST" if speed_mode == "fast" else "WEB_V3_EXACT_TVL_POOL_BUDGET_SEC_NORMAL",
-        "12" if speed_mode == "fast" else "20",
-    )
+    env["V3_EXACT_TVL_DAYS_MAX"] = exact_days_default
+    env["V3_EXACT_TVL_MAX_POOLS"] = "0"
+    env["V3_EXACT_TVL_POOL_BUDGET_SEC"] = "0"
     env["RUN_MODE"] = run_mode
-    if run_mode == "strict_exact":
-        env["V3_EXACT_TVL_ENABLE"] = os.environ.get("WEB_V3_EXACT_STRICT_ENABLE", "1")
-        env["V3_EXACT_TVL_STRICT_MODE"] = os.environ.get("WEB_V3_EXACT_STRICT_MODE", "1")
-        env["V3_EXACT_TVL_DAYS_MAX"] = os.environ.get("WEB_V3_EXACT_STRICT_DAYS_MAX", str(max(1, int(req.days))))
-        env["V3_EXACT_TVL_MAX_POOLS"] = os.environ.get("WEB_V3_EXACT_STRICT_MAX_POOLS", "1")
-        env["V3_EXACT_TVL_POOL_BUDGET_SEC"] = os.environ.get("WEB_V3_EXACT_STRICT_POOL_BUDGET_SEC", "180")
-    else:
-        env["V3_EXACT_TVL_ENABLE"] = os.environ.get("WEB_V3_FAST_LEGACY_EXACT_ENABLE", "0")
-        env["V3_EXACT_TVL_STRICT_MODE"] = "0"
+    env["V3_EXACT_TVL_ENABLE"] = "0"
+    env["V3_EXACT_TVL_STRICT_MODE"] = "0"
     # v4 endpoint config uses this list at import-time.
     # When UI sends "all chains", include_chains is empty; in that case force all known v4 chains.
     if run_v4:
@@ -19018,10 +18903,7 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
     chains = sorted(str(x).strip().lower() for x in (req.include_chains or []) if str(x).strip())
     versions = sorted(str(x).strip().lower() for x in (req.include_versions or []) if str(x).strip())
     suffixes = sorted(str(x).strip().lower() for x in (req.exclude_suffixes or []) if str(x).strip())
-    run_mode = ("strict_exact" if bool(getattr(req, "mode_strict_exact", False)) else "fast_legacy")
-    target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
-    if run_mode != "strict_exact":
-        target_pool_id = ""
+    run_mode = "fast_legacy"
     payload = {
         "pairs": pairs,
         "chains": chains,
@@ -19030,7 +18912,6 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
         "min_tvl": float(req.min_tvl or 0.0),
         "speed_mode": str(req.speed_mode or "normal").strip().lower(),
         "run_mode": run_mode,
-        "target_pool_id": target_pool_id,
         "min_fee_pct": float(req.min_fee_pct or 0.0),
         "max_fee_pct": float(req.max_fee_pct or 0.0),
         "min_apy_pct": float(req.min_apy_pct or 0.0),
@@ -19040,53 +18921,6 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
     except Exception:
         return str(payload)
-
-
-def _strict_detect_target_versions(target_pool_id: str, include_chains: list[str]) -> list[str]:
-    pid = str(target_pool_id or "").strip().lower()
-    if not pid:
-        return []
-    chains = [c for c in (include_chains or []) if c in (set(UNISWAP_V3_SUBGRAPHS) | set(UNISWAP_V4_SUBGRAPHS))]
-    if not chains:
-        chains = sorted(set(UNISWAP_V3_SUBGRAPHS.keys()) | set(UNISWAP_V4_SUBGRAPHS.keys()))
-    is_addr40 = bool(pid.startswith("0x") and len(pid) == 42)
-    is_id64 = bool(pid.startswith("0x") and len(pid) == 66)
-    q = """
-    query PoolById($id: String!) {
-      pool(id: $id) { id }
-    }
-    """
-    found_v3 = False
-    found_v4 = False
-    for chain in chains:
-        if (not found_v3) and is_addr40 and chain in UNISWAP_V3_SUBGRAPHS:
-            try:
-                ep3 = get_graph_endpoint(chain, version="v3")
-                if ep3:
-                    d3 = graphql_query(ep3, q, {"id": pid}, retries=1)
-                    p3 = ((d3 or {}).get("data") or {}).get("pool")
-                    if isinstance(p3, dict) and str(p3.get("id") or "").strip():
-                        found_v3 = True
-            except Exception:
-                pass
-        if (not found_v4) and (is_addr40 or is_id64) and chain in UNISWAP_V4_SUBGRAPHS:
-            try:
-                ep4 = get_graph_endpoint(chain, version="v4")
-                if ep4:
-                    d4 = graphql_query(ep4, q, {"id": pid}, retries=1)
-                    p4 = ((d4 or {}).get("data") or {}).get("pool")
-                    if isinstance(p4, dict) and str(p4.get("id") or "").strip():
-                        found_v4 = True
-            except Exception:
-                pass
-        if found_v3 and found_v4:
-            break
-    out: list[str] = []
-    if found_v3:
-        out.append("v3")
-    if found_v4:
-        out.append("v4")
-    return out
 
 
 def _run_result_cache_get(key: str) -> dict[str, Any] | None:
@@ -19502,14 +19336,8 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     speed_mode = str(req.speed_mode or "normal").strip().lower()
     if speed_mode not in {"normal", "fast"}:
         speed_mode = "normal"
-    mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
-    mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
-    if mode_strict_exact:
-        mode_fast_legacy = False
-    if (not mode_strict_exact) and (not mode_fast_legacy):
-        mode_fast_legacy = True
-    run_mode = "strict_exact" if mode_strict_exact else "fast_legacy"
-    target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
+    mode_fast_legacy = True
+    run_mode = "fast_legacy"
 
     with JOB_LOCK:
         job = JOBS[job_id]
@@ -19602,132 +19430,57 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             return
         try:
             t_agents_total0 = time.perf_counter()
-            if run_mode == "strict_exact":
-                pair_suffix = pairs_to_filename_suffix(token_pairs)
-                _set_stage("strict", "Running strict exact agent(s) (single pool)", 22)
-                base_timeout = int(env.get("AGENT_TIMEOUT_SEC", "480") or 480)
-                strict_agents: list[tuple[str, dict[str, str], str]] = []
-                if run_v3:
-                    try:
-                        exact2_budget = max(15.0, float(os.environ.get("WEB_V3_EXACT2_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "60"))))
-                    except Exception:
-                        exact2_budget = 60.0
-                    env_v3 = dict(env)
-                    env_v3["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(exact2_budget))
-                    strict_timeout_target = int(max(75, int(exact2_budget) + 75))
-                    env_v3["AGENT_TIMEOUT_SEC"] = str(max(75, min(300, max(base_timeout, strict_timeout_target))))
-                    logs.append(f"[strict][v3] budget={int(exact2_budget)}s timeout={env_v3['AGENT_TIMEOUT_SEC']}s")
-                    strict_agents.append(("agent_v3_strict_exact2.py", env_v3, "v3"))
-                if run_v4:
-                    try:
-                        v4_budget = max(15.0, float(os.environ.get("WEB_V4_EXACT_POOL_BUDGET_SEC", env.get("V3_EXACT_TVL_POOL_BUDGET_SEC", "45"))))
-                    except Exception:
-                        v4_budget = 45.0
-                    env_v4 = dict(env)
-                    env_v4["V3_EXACT_TVL_POOL_BUDGET_SEC"] = str(int(v4_budget))
-                    env_v4["WEB_V4_EXACT_POOL_BUDGET_SEC"] = str(int(v4_budget))
-                    # v4 strict is optimized to stay close to pool budget.
-                    strict_timeout_target_v4 = int(max(120, int(v4_budget) + 90))
-                    env_v4["AGENT_TIMEOUT_SEC"] = str(max(120, min(360, max(base_timeout, strict_timeout_target_v4))))
-                    v4_variant = "exact2"
-                    v4_script = "agent_v4_strict_exact2.py"
-                    logs.append(
-                        f"[strict][v4] variant={v4_variant} script={v4_script} "
-                        f"budget={int(v4_budget)}s timeout={env_v4['AGENT_TIMEOUT_SEC']}s"
-                    )
-                    strict_agents.append((v4_script, env_v4, "v4"))
-
-                strict_dbg_list: list[dict[str, Any]] = []
-                for idx_agent, (script_name, env_cur, tag) in enumerate(strict_agents, start=1):
-                    _set_stage("strict", f"Running strict exact {tag} ({idx_agent}/{len(strict_agents)})", int(20 + (55 * idx_agent / max(1, len(strict_agents)))))
-                    strict_data, strict_dbg = _run_agent_and_load_timed(
-                        script_name=script_name,
-                        env=env_cur,
+            total_pairs = max(1, len(pairs))
+            pair_workers = _pair_worker_count(speed_mode, total_pairs)
+            _set_stage(
+                "pairs",
+                f"Running pair scans ({total_pairs} pair(s), workers={pair_workers})",
+                12,
+            )
+            pair_results: list[tuple[dict[str, dict], dict[str, Any], list[str]]] = []
+            if pair_workers <= 1 or total_pairs <= 1:
+                for idx, pair_tokens in enumerate(pairs, start=1):
+                    pair_results.append(
+                        _run_single_pair_scan(
+                            pair_index=idx,
+                            total_pairs=total_pairs,
+                            pair_tokens=pair_tokens,
+                            base_env=env,
                             min_tvl=req.min_tvl,
-                            logs=logs,
-                            pair_suffix=pair_suffix,
+                            run_v3=run_v3,
+                            run_v4=run_v4,
                         )
-                    for _pid, _row in (strict_data or {}).items():
-                        if not isinstance(_row, dict):
-                            continue
-                        prev = merged_raw.get(_pid)
-                        if isinstance(prev, dict):
-                            prev_q = str(prev.get("data_quality") or "").strip().lower()
-                            cur_q = str(_row.get("data_quality") or "").strip().lower()
-                            # Do not replace a valid/partial row with strict_unavailable from another strict engine.
-                            if prev_q in {"exact", "exact_partial", "estimated"} and cur_q == "strict_unavailable":
-                                continue
-                        merged_raw[_pid] = _row
-                    for _pid, _v2 in (strict_data or {}).items():
-                        base2 = merged_raw.get(_pid)
-                        if isinstance(base2, dict):
-                            base2["strict_compare_exact2_reason"] = str(_v2.get("data_quality_reason") or "")
-                    strict_dbg_list.append(strict_dbg)
-
-                timing_debug["pairs"].append(
-                    {
-                        "pair": token_pairs,
-                        "index": 1,
-                        "agents": strict_dbg_list,
-                        "merged_before": 0,
-                        "merged_after": int(len(merged_raw)),
-                        "merged_added": int(len(merged_raw)),
-                        "total_ms": int(sum(int((x or {}).get("total_ms") or 0) for x in strict_dbg_list)),
-                    }
-                )
-                _set_stage("strict", "Strict exact agent(s) completed", 78)
+                    )
+                    _set_stage("pairs", f"Running pair scans ({idx}/{total_pairs})", int(10 + (65 * idx / total_pairs)))
             else:
-                total_pairs = max(1, len(pairs))
-                pair_workers = _pair_worker_count(speed_mode, total_pairs)
-                _set_stage(
-                    "pairs",
-                    f"Running pair scans ({total_pairs} pair(s), workers={pair_workers})",
-                    12,
-                )
-                pair_results: list[tuple[dict[str, dict], dict[str, Any], list[str]]] = []
-                if pair_workers <= 1 or total_pairs <= 1:
-                    for idx, pair_tokens in enumerate(pairs, start=1):
-                        pair_results.append(
-                            _run_single_pair_scan(
-                                pair_index=idx,
-                                total_pairs=total_pairs,
-                                pair_tokens=pair_tokens,
-                                base_env=env,
-                                min_tvl=req.min_tvl,
-                                run_v3=run_v3,
-                                run_v4=run_v4,
-                            )
-                        )
-                        _set_stage("pairs", f"Running pair scans ({idx}/{total_pairs})", int(10 + (65 * idx / total_pairs)))
-                else:
-                    with ThreadPoolExecutor(max_workers=pair_workers) as pair_ex:
-                        future_to_idx = {
-                            pair_ex.submit(
-                                _run_single_pair_scan,
-                                pair_index=idx,
-                                total_pairs=total_pairs,
-                                pair_tokens=pair_tokens,
-                                base_env=env,
-                                min_tvl=req.min_tvl,
-                                run_v3=run_v3,
-                                run_v4=run_v4,
-                            ): idx
-                            for idx, pair_tokens in enumerate(pairs, start=1)
-                        }
-                        done_n = 0
-                        for fut in as_completed(list(future_to_idx.keys())):
-                            pair_results.append(fut.result())
-                            done_n += 1
-                            _set_stage("pairs", f"Running pair scans ({done_n}/{total_pairs})", int(10 + (65 * done_n / total_pairs)))
+                with ThreadPoolExecutor(max_workers=pair_workers) as pair_ex:
+                    future_to_idx = {
+                        pair_ex.submit(
+                            _run_single_pair_scan,
+                            pair_index=idx,
+                            total_pairs=total_pairs,
+                            pair_tokens=pair_tokens,
+                            base_env=env,
+                            min_tvl=req.min_tvl,
+                            run_v3=run_v3,
+                            run_v4=run_v4,
+                        ): idx
+                        for idx, pair_tokens in enumerate(pairs, start=1)
+                    }
+                    done_n = 0
+                    for fut in as_completed(list(future_to_idx.keys())):
+                        pair_results.append(fut.result())
+                        done_n += 1
+                        _set_stage("pairs", f"Running pair scans ({done_n}/{total_pairs})", int(10 + (65 * done_n / total_pairs)))
 
-                pair_results.sort(key=lambda x: int((x[1] or {}).get("index") or 0))
-                for merged_piece, pair_dbg, pair_logs in pair_results:
-                    pair_dbg["merged_before"] = int(len(merged_raw))
-                    merged_raw.update(merged_piece or {})
-                    pair_dbg["merged_after"] = int(len(merged_raw))
-                    pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
-                    timing_debug["pairs"].append(pair_dbg)
-                    logs.extend(pair_logs or [])
+            pair_results.sort(key=lambda x: int((x[1] or {}).get("index") or 0))
+            for merged_piece, pair_dbg, pair_logs in pair_results:
+                pair_dbg["merged_before"] = int(len(merged_raw))
+                merged_raw.update(merged_piece or {})
+                pair_dbg["merged_after"] = int(len(merged_raw))
+                pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
+                timing_debug["pairs"].append(pair_dbg)
+                logs.extend(pair_logs or [])
 
             timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
         finally:
@@ -19736,7 +19489,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
         # Keep only pools that really match requested pairs.
         # Protects against occasional cross-token resolution artifacts (e.g. POL instead of ETH).
         t_filter0 = time.perf_counter()
-        if requested_pair_keys and run_mode != "strict_exact":
+        if requested_pair_keys:
             merged_raw = {
                 k: v
                 for k, v in merged_raw.items()
@@ -19784,7 +19537,6 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 "include_versions": include_versions,
                 "speed_mode": speed_mode,
                 "run_mode": run_mode,
-                "target_pool_id": target_pool_id,
                 "min_fee_pct": req.min_fee_pct,
                 "max_fee_pct": req.max_fee_pct,
                 "min_apy_pct": req.min_apy_pct,
@@ -19792,7 +19544,6 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 "lp_allocation_usd": float(env.get("LP_ALLOCATION_USD", "1000")),
                 "ignore_cache": bool(getattr(req, "ignore_cache", False)),
                 "mode_fast_legacy": mode_fast_legacy,
-                "mode_strict_exact": mode_strict_exact,
             },
             **result,
             "debug_timing": timing_debug,
@@ -19860,8 +19611,6 @@ class PoolsRunRequest(BaseModel):
     include_versions: list[str] = Field(default_factory=lambda: ["v3", "v4"])
     speed_mode: str = "normal"
     mode_fast_legacy: bool = True
-    mode_strict_exact: bool = False
-    target_pool_id: str = ""
     min_tvl: float = 1000.0
     days: int = 30
     min_fee_pct: float = 0.0
@@ -22169,52 +21918,8 @@ def _render_positions_page() -> str:
         if (raw.includes("coingecko+defillama")) return "Estimated: CoinGecko/DefiLlama";
         return "Estimated mode";
       }
-      if (raw.startsWith("exact:ok") || raw.startsWith("exact2.0:ok")) return "Exact complete";
-      if (raw.startsWith("exact2_cache:ok")) return "Exact from cache";
-      if (raw.startsWith("exact:partial_blend:") || raw.startsWith("exact2.0:partial_blend:")) {
-        const parts = [];
-        if (covPct) parts.push(`exact ${covPct}`);
-        if (filledDays) parts.push(`filled ${filledDays}`);
-        return `Exact + estimate fill${parts.length ? ` (${parts.join(", ")})` : ""}`;
-      }
-      if (raw.includes("source_conflict_scale")) return "Exact rejected: scale conflict vs estimated";
-      if (raw.includes("source_conflict_clone")) return "Exact rejected: duplicates estimated values";
-      if (raw.includes("source_conflict_anchor_jump")) return "Exact rejected: sharp jump near current TVL";
-      if (raw.includes("source_conflict_level_shift")) return "Exact rejected: level shift vs current TVL";
-      if (raw.includes("one_leg_quantity_collapse")) return "Partial exact: one token balance missing";
-      if (raw.includes("exact2_budget_timeout:block_resolution")) return `Exact timeout: day block resolution${dbgTail}`;
-      if (raw.includes("exact2_budget_timeout:pricing")) return `Exact timeout: historical pricing${dbgTail}`;
-      if (raw.includes("exact2_partial:block_missing")) return "Partial exact: missing day blocks";
-      if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
-      if (raw.includes("exact2_partial:transfer_logs_timeout")) return `Partial exact: transfer log timeout${dbgTail}`;
-      if (raw.includes("strict_required:v4:target_pool_id_must_be_pool_id_64hex")) return "V4 exact: use pool id (0x + 64 hex), not contract address";
-      if (raw.includes("strict_required:v4_exact2:")) {
-        const tail = raw.split("strict_required:v4_exact2:")[1] || "unknown";
-        return `V4 exact2 unavailable: ${tail.replace(/[:_]+/g, " ").replace(/\\s+/g, " ").trim()}`;
-      }
-      if (raw.startsWith("exact_v4_2_onchain_quantities:")) {
-        const mode = raw.includes("pure_onchain_active_window")
-          ? "active"
-          : (raw.includes("pure_onchain_ticks") ? "tick-scan" : "onchain");
-        const days = (raw.match(/(?:^|:)days=(\\d+)/i) || [])[1];
-        const pos = (raw.match(/(?:^|:)raw_pos=(\\d+)/i) || [])[1];
-        const zero = (raw.match(/(?:^|:)raw_zero=(\\d+)/i) || [])[1];
-        const cov = (raw.match(/(?:^|:)cov=([0-9]*\\.?[0-9]+)/i) || [])[1];
-        const src = (raw.match(/(?:^|:)src=([^\\s]+)/i) || [])[1] || "";
-        const psrc = friendlyPriceSource(src);
-        const onchain = friendlyOnchainSource(src);
-        const covTxt = cov ? `${Math.round(Number(cov) * 100)}%` : "";
-        const parts = [];
-        if (covTxt) parts.push(`cov ${covTxt}`);
-        if (days) parts.push(`days ${days}`);
-        if (pos || zero) parts.push(`raw ${pos || 0}/${zero || 0}`);
-        return `V4 exact2: ${onchain} + ${psrc} (${mode}${parts.length ? `; ${parts.join(", ")}` : ""})`;
-      }
       if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found in selected chains";
-      if (raw.includes("missing_target_pool_id")) return "Target pool is required";
-      if (dq === "exact") return "Exact";
-      if (dq === "exact_partial") return "Exact partial";
-      if (dq === "strict_unavailable") return `Strict exact unavailable${dbgTail}`;
+      if (dq === "strict_unavailable") return `Unavailable${dbgTail}`;
       return raw.replace(/[:_]+/g, " ").replace(/\s+/g, " ").trim();
     }
     function getTrustedSpamKeys() {
@@ -30808,34 +30513,8 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
     if req.min_apy_pct < 0 or req.min_apy_pct > 100000:
         raise HTTPException(status_code=400, detail="min_apy_pct must be in range 0..100000")
-    req.target_pool_id = str(getattr(req, "target_pool_id", "") or "").strip().lower()
-    if req.target_pool_id:
-        is_hex_addr = req.target_pool_id.startswith("0x") and len(req.target_pool_id) == 42
-        is_hex_pool_id = req.target_pool_id.startswith("0x") and len(req.target_pool_id) == 66
-        if not (is_hex_addr or is_hex_pool_id):
-            raise HTTPException(status_code=400, detail="target_pool_id must be a valid 0x address (40 hex) or pool id (64 hex)")
     req.mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
-    req.mode_strict_exact = bool(getattr(req, "mode_strict_exact", False))
-    if req.mode_strict_exact:
-        if not req.target_pool_id:
-            raise HTTPException(status_code=400, detail="strict exact mode requires target_pool_id")
-        req.ignore_cache = True
-        req.mode_fast_legacy = False
-        detected_versions = _strict_detect_target_versions(req.target_pool_id, req.include_chains)
-        if detected_versions:
-            req.include_versions = list(detected_versions)
-        else:
-            pid = str(req.target_pool_id or "").strip().lower()
-            if pid.startswith("0x") and len(pid) == 66:
-                req.include_versions = ["v4"]
-            elif pid.startswith("0x") and len(pid) == 42:
-                # Address-like target pool ids map naturally to v3 pool contracts.
-                # v4 exact expects a pool id hash (bytes32, 0x + 64 hex).
-                req.include_versions = ["v3"]
-    else:
-        req.target_pool_id = ""
-    if (not req.mode_strict_exact) and (not req.mode_fast_legacy):
-        req.mode_fast_legacy = True
+    req.mode_fast_legacy = True
     req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
     req.include_versions = list(dict.fromkeys(req.include_versions))
     if not req.include_versions:
@@ -31632,9 +31311,6 @@ HTML_PAGE = """
     #estimatedModeLine .mode-check {
       margin-top: 0;
     }
-    #exactModeLine .mode-check {
-      margin-top: 0;
-    }
     .mode-filter-wrap .inline-grid {
       grid-column: 2;
       margin-left: 8px;
@@ -31667,12 +31343,8 @@ HTML_PAGE = """
       grid-template-columns: 92px 86px 112px 86px 110px;
       gap: 4px;
     }
-    .exact-grid {
-      grid-template-columns: 86px minmax(420px, 680px);
-      gap: 4px;
-    }
     .estimated-grid .filter-item .hint,
-    .exact-grid .filter-item .hint {
+    .inline-grid .filter-item .hint {
       min-height: 16px;
       font-size: 11px;
       margin-bottom: 2px !important;
@@ -31680,9 +31352,7 @@ HTML_PAGE = """
       white-space: nowrap;
     }
     .estimated-grid .filter-item input,
-    .estimated-grid .filter-item select,
-    .exact-grid .filter-item input,
-    .exact-grid .filter-item select {
+    .estimated-grid .filter-item select {
       height: 34px;
       padding: 6px 7px;
       font-size: 13px;
@@ -31704,29 +31374,6 @@ HTML_PAGE = """
       line-height: 1.15;
       white-space: normal;
       font-size: 11px;
-    }
-    .filter-item.contract-item input {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size: 12px;
-      letter-spacing: 0.01em;
-    }
-    .filter-item.contract-item {
-      max-width: 700px;
-    }
-    .contract-input-row {
-      display: grid;
-      grid-template-columns: minmax(280px, 1fr) auto;
-      gap: 8px;
-      align-items: center;
-    }
-    .contract-input-note {
-      white-space: nowrap;
-      font-size: 12px;
-      color: #64748b;
-      line-height: 1.2;
-      margin: 0;
-      text-align: right;
-      justify-self: end;
     }
     .mode-disabled {
       opacity: 0.45;
@@ -31769,7 +31416,6 @@ HTML_PAGE = """
     @media (max-width: 1500px) {
       .inline-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .estimated-grid { grid-template-columns: repeat(5, minmax(76px, 1fr)); }
-      .exact-grid { grid-template-columns: 86px minmax(220px, 1fr); }
     }
     @media (max-width: 980px) {
       .row { grid-template-columns: 1fr; }
@@ -31780,9 +31426,8 @@ HTML_PAGE = """
       .mode-filter-wrap::before { display: none; }
       .mode-filter-wrap .mode-check,
       .mode-filter-wrap .inline-grid { grid-column: 1; }
-      #estimatedModeLine .mode-check,
-      #exactModeLine .mode-check { transform: none; }
-      .estimated-grid, .exact-grid { grid-template-columns: 1fr; }
+      #estimatedModeLine .mode-check { transform: none; }
+      .estimated-grid { grid-template-columns: 1fr; }
       .summary-strip { gap: 6px; }
       .summary-box { min-width: 150px; }
       .search-link-btn { font-size: 15px; }
@@ -32020,24 +31665,6 @@ HTML_PAGE = """
                 </div>
               </div>
             </div>
-              <div class="mode-filter-line" id="exactModeLine">
-                <div class="mode-check mode-item">
-                  <label><input id="modeStrictExact" type="checkbox" onchange="syncRunModes('strict')"/> Exact</label>
-                </div>
-                <div class="inline-grid exact-grid">
-                  <div class="filter-item" id="filterDaysItem">
-                    <div class="hint">History days</div>
-                    <input id="days" value="30" type="number" min="1" max="3650" step="1" oninput="syncDaysFromExact()"/>
-                  </div>
-                  <div class="filter-item contract-item" id="filterContractItem">
-                    <div class="hint">Contract address</div>
-                    <div class="contract-input-row">
-                      <input id="targetPoolId" type="text" placeholder="0x... (40 hex address or 64 hex pool id)"/>
-                      <span class="contract-input-note">Detailed scan for one contract: ~2-3 min.</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
             </div>
           </div>
         </div>
@@ -32133,8 +31760,8 @@ HTML_PAGE = """
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
     const FIELD_IDS = [
       "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
-      "minTvl", "daysEstimated", "days", "feeRangePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache",
-      "modeFastLegacy", "modeStrictExact", "targetPoolId"
+      "minTvl", "daysEstimated", "feeRangePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache",
+      "modeFastLegacy"
     ];
     let availableChains = [];
     let colorMap = {};
@@ -32153,11 +31780,9 @@ HTML_PAGE = """
     let scanProgressPct = 0;
     let scanProgressTargetPct = 0;
     let scanLastBackendAt = 0;
-    let strictStageStartedAt = 0;
     let pairListsHintBySymbol = {};
     let pairListsIconUrls = {};
     let pairListsExpanded = false;
-    let targetPoolFullValue = "";
     const homeSectionState = { feeHistory: false, poolsTable: false };
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
 
@@ -32179,29 +31804,17 @@ HTML_PAGE = """
     }
 
     function getDaysValue() {
-      const v = Number(document.getElementById("days")?.value || 30);
+      const v = Number(document.getElementById("daysEstimated")?.value || 30);
       return Number.isFinite(v) && v > 0 ? v : 30;
     }
 
     function setDays(v) {
-      const exactEl = document.getElementById("days");
       const estEl = document.getElementById("daysEstimated");
-      if (exactEl) exactEl.value = v;
       if (estEl) estEl.value = v;
       saveFormState();
     }
 
     function syncDaysFromEstimated() {
-      const src = document.getElementById("daysEstimated");
-      const dst = document.getElementById("days");
-      if (src && dst) dst.value = src.value;
-      saveFormState();
-    }
-
-    function syncDaysFromExact() {
-      const src = document.getElementById("days");
-      const dst = document.getElementById("daysEstimated");
-      if (src && dst) dst.value = src.value;
       saveFormState();
     }
 
@@ -32213,27 +31826,22 @@ HTML_PAGE = """
     }
 
     function applyRunModeUiState() {
-      const strict = !!document.getElementById("modeStrictExact")?.checked;
-      const fast = !!document.getElementById("modeFastLegacy")?.checked;
       const pairsRow = document.getElementById("runPairsRow");
       const chainsRow = document.getElementById("runChainsRow");
       const filtersRow = document.getElementById("runFiltersRow");
       const estimatedLine = document.getElementById("estimatedModeLine");
-      const exactLine = document.getElementById("exactModeLine");
-      if (pairsRow) pairsRow.classList.toggle("mode-disabled", strict);
+      if (pairsRow) pairsRow.classList.remove("mode-disabled");
       if (chainsRow) chainsRow.classList.remove("mode-disabled");
       if (filtersRow) filtersRow.classList.remove("mode-disabled");
       if (estimatedLine) estimatedLine.classList.remove("mode-disabled");
-      if (exactLine) exactLine.classList.toggle("mode-disabled", !strict);
 
       const pairIds = ["stableBucketMode", "stableBucketManual", "tokenBucketMode", "tokenBucketManual"];
       for (const id of pairIds) {
         const el = document.getElementById(id);
-        if (el) el.disabled = strict;
+        if (el) el.disabled = false;
       }
       const pairDetailsBtn = document.getElementById("pairListsDetailsBtn");
-      if (pairDetailsBtn) pairDetailsBtn.disabled = strict;
-      if (strict) pairListsExpanded = false;
+      if (pairDetailsBtn) pairDetailsBtn.disabled = false;
       if (pairDetailsBtn) pairDetailsBtn.textContent = pairListsExpanded ? "Hide details" : "Details";
       renderPairListsPanel();
 
@@ -32242,52 +31850,32 @@ HTML_PAGE = """
       const chainInputs = document.querySelectorAll("#chainChecks input[type='checkbox']");
       chainInputs.forEach((el) => { el.disabled = false; });
 
-      setDisabledWithDim(document.getElementById("minTvl"), strict);
-      setDisabledWithDim(document.getElementById("daysEstimated"), strict);
-      setDisabledWithDim(document.getElementById("feeRangePct"), strict);
-      setDisabledWithDim(document.getElementById("minApyPct"), strict);
-      setDisabledWithDim(document.getElementById("days"), !strict);
+      setDisabledWithDim(document.getElementById("minTvl"), false);
+      setDisabledWithDim(document.getElementById("daysEstimated"), false);
+      setDisabledWithDim(document.getElementById("feeRangePct"), false);
+      setDisabledWithDim(document.getElementById("minApyPct"), false);
       const protoV3 = document.getElementById("protoV3");
       const protoV4 = document.getElementById("protoV4");
-      if (protoV3) protoV3.disabled = strict;
-      if (protoV4) protoV4.disabled = strict;
+      if (protoV3) protoV3.disabled = false;
+      if (protoV4) protoV4.disabled = false;
       const protoItem = document.getElementById("filterProtocolItem");
-      if (protoItem) protoItem.classList.toggle("mode-disabled", strict);
+      if (protoItem) protoItem.classList.remove("mode-disabled");
 
-      // Contract field is used only in Exact mode.
-      setDisabledWithDim(document.getElementById("targetPoolId"), !strict);
-      const contractItem = document.getElementById("filterContractItem");
-      if (contractItem) contractItem.classList.toggle("mode-disabled", !strict);
-
-      // In strict mode always bypass result cache to avoid stale rows.
       const ignoreCache = document.getElementById("runIgnoreCache");
       const ignoreCacheLabel = ignoreCache ? ignoreCache.closest(".run-ignore-cache") : null;
       if (ignoreCache) {
-        if (strict) {
-          ignoreCache.checked = true;
-          ignoreCache.disabled = true;
-        } else {
-          ignoreCache.disabled = false;
-        }
+        ignoreCache.disabled = false;
       }
-      if (ignoreCacheLabel) ignoreCacheLabel.classList.toggle("mode-disabled", strict);
+      if (ignoreCacheLabel) ignoreCacheLabel.classList.remove("mode-disabled");
     }
 
     function syncRunModes(source) {
       const fast = document.getElementById("modeFastLegacy");
-      const strict = document.getElementById("modeStrictExact");
       const protoV3 = document.getElementById("protoV3");
       const protoV4 = document.getElementById("protoV4");
-      if (!fast || !strict) return;
-      const src = String(source || "").toLowerCase();
-      if (src === "strict" && strict.checked) fast.checked = false;
-      if (src === "fast" && fast.checked) strict.checked = false;
-      if (!fast.checked && !strict.checked) {
-        fast.checked = true;
-      }
-      if (strict.checked) {
-        try { updateChainsNote(); } catch (_) {}
-      }
+      if (!fast) return;
+      if (!fast.checked) fast.checked = true;
+      try { updateChainsNote(); } catch (_) {}
       applyRunModeUiState();
       saveFormState();
     }
@@ -32300,47 +31888,8 @@ HTML_PAGE = """
         .replace(/>/g, "&gt;");
     }
 
-    function normalizeTargetPoolAddress(v) {
-      return String(v || "").trim().toLowerCase();
-    }
-
-    function isHexPoolAddress(v) {
-      return /^0x([a-f0-9]{40}|[a-f0-9]{64})$/.test(String(v || ""));
-    }
-
-    function shortAddress4x4(v) {
-      const s = normalizeTargetPoolAddress(v);
-      if (!isHexPoolAddress(s)) return s;
-      return `${s.slice(0, 6)}...${s.slice(-4)}`;
-    }
-
-    function setTargetPoolAddress(raw) {
-      targetPoolFullValue = normalizeTargetPoolAddress(raw);
-      const el = document.getElementById("targetPoolId");
-      if (!el) return;
-      if (!targetPoolFullValue) {
-        el.value = "";
-        return;
-      }
-      el.value = targetPoolFullValue;
-    }
-
-    function getTargetPoolAddressForSubmit() {
-      const strictEnabled = !!document.getElementById("modeStrictExact")?.checked;
-      if (!strictEnabled) return "";
-      const el = document.getElementById("targetPoolId");
-      const current = normalizeTargetPoolAddress(el?.value || "");
-      if (isHexPoolAddress(current)) return current;
-      return "";
-    }
-
-    function expandTargetPoolInput() {
-      return;
-    }
-
-    function shrinkTargetPoolInput() {
-      return;
-    }
+    function expandTargetPoolInput() { return; }
+    function shrinkTargetPoolInput() { return; }
 
     function normalizePairToken(v) {
       const s = String(v || "").trim().toLowerCase();
@@ -32788,7 +32337,6 @@ HTML_PAGE = """
       scanProgressPct = 0;
       scanProgressTargetPct = 0;
       scanLastBackendAt = 0;
-      strictStageStartedAt = 0;
     }
 
     function startScanTicker() {
@@ -32800,26 +32348,13 @@ HTML_PAGE = """
       const tick = () => {
         const elapsed = Math.max(0, Math.floor((Date.now() - scanStartedAt) / 1000));
         const backendTargetRaw = Math.max(0, Math.min(100, Number(scanProgressTargetPct || 0)));
-        // Realistic UI: follow backend progress and never run far ahead by timer.
-        const stageTxt = String(scanStageLabel || "").toLowerCase();
-        const strictStage = (stageTxt.includes("strict exact") || stageTxt.includes("running strict"));
-        let stageLimitedTarget = backendTargetRaw;
-        if (strictStage && backendTargetRaw <= 78) {
-          if (!(strictStageStartedAt > 0)) strictStageStartedAt = Date.now();
-          const strictElapsedSec = Math.max(0, (Date.now() - strictStageStartedAt) / 1000);
-          // Slow down the climb during strict stage for more realistic progress around 75%.
-          const realisticCap = Math.min(78, 22 + strictElapsedSec * 1.05);
-          stageLimitedTarget = Math.min(stageLimitedTarget, realisticCap);
-        } else if (!strictStage) {
-          strictStageStartedAt = 0;
-        }
+        // Follow backend progress and avoid jumping ahead too fast.
+        const stageLimitedTarget = backendTargetRaw;
         const target = (stageLimitedTarget >= 100) ? 100 : Math.min(99, stageLimitedTarget);
         const current = Math.max(0, Math.min(99, Number(scanProgressPct || 0)));
         if (target > current) {
           const diff = target - current;
-          const step = strictStage
-            ? Math.max(1, Math.min(3, Math.ceil(diff / 8)))
-            : Math.max(1, Math.min(6, Math.ceil(diff / 4)));
+          const step = Math.max(1, Math.min(6, Math.ceil(diff / 4)));
           scanProgressPct = Math.min(target, current + step);
         } else if (target < current) {
           // Backend can move backward on stage transitions; ease down slightly.
@@ -32849,12 +32384,6 @@ HTML_PAGE = """
     function updateProgress(progress, stageLabel) {
       scanStageLabel = String(stageLabel || "running");
       scanProgressTargetPct = Math.max(0, Math.min(100, Number(progress || 0)));
-      const s = String(scanStageLabel || "").toLowerCase();
-      if (s.includes("strict exact") || s.includes("running strict")) {
-        if (!(strictStageStartedAt > 0)) strictStageStartedAt = Date.now();
-      } else {
-        strictStageStartedAt = 0;
-      }
       scanLastBackendAt = Date.now();
     }
 
@@ -32874,8 +32403,6 @@ HTML_PAGE = """
         if (!el) continue;
         if (el.type === "checkbox") {
           state[id] = !!el.checked;
-        } else if (id === "targetPoolId") {
-          state[id] = getTargetPoolAddressForSubmit();
         } else {
           state[id] = el.value;
         }
@@ -32932,8 +32459,6 @@ HTML_PAGE = """
           if (!el || state[id] == null) continue;
           if (el.type === "checkbox") {
             el.checked = !!state[id];
-          } else if (id === "targetPoolId") {
-            setTargetPoolAddress(state[id]);
           } else if (typeof state[id] === "string") {
             el.value = state[id];
           }
@@ -32943,13 +32468,6 @@ HTML_PAGE = """
             const box = document.getElementById("chain_" + c);
             if (box) box.checked = true;
           }
-        }
-        // Keep dual days inputs synchronized.
-        const dExact = document.getElementById("days");
-        const dEst = document.getElementById("daysEstimated");
-        if (dExact && dEst) {
-          if (String(dExact.value || "").trim()) dEst.value = dExact.value;
-          else if (String(dEst.value || "").trim()) dExact.value = dEst.value;
         }
         syncRunModes("");
         updatePairBuilderUi();
@@ -33408,7 +32926,6 @@ HTML_PAGE = """
     function rowBranchFromLabel(pairLabel) {
       const p = String(pairLabel || "").toLowerCase();
       if (p.includes("(estimated)")) return "estimated";
-      if (p.includes("(exact)")) return "exact";
       return "all";
     }
 
@@ -33433,7 +32950,7 @@ HTML_PAGE = """
       const dashes = ["dash", "dot", "dashdot", "longdash", "longdashdot"];
       const feeTraces = [];
       const tvlTraces = [];
-      const strictMode = String(currentRequest?.run_mode || "").toLowerCase() === "strict_exact";
+      const strictMode = false;
       let maxTs = 0;
 
       const pools = Object.keys(seriesByPool);
@@ -33443,17 +32960,13 @@ HTML_PAGE = """
         const showAll = !!visibilityMap[makeVisibilityKey(poolId, "all", "all")];
         const showEstFull = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "full")];
         const showEstActive = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "active")];
-        const showExFull = !!visibilityMap[makeVisibilityKey(poolId, "exact", "full")];
-        if (!(showAll || showEstFull || showEstActive || showExFull)) continue;
+        if (!(showAll || showEstFull || showEstActive)) continue;
         const estFees = Array.isArray(s.strict_compare_estimated_fees) ? s.strict_compare_estimated_fees : [];
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
         const estActiveFees = Array.isArray(s.strict_compare_estimated_active_fees) ? s.strict_compare_estimated_active_fees : [];
         const estActiveTvl = Array.isArray(s.strict_compare_estimated_active_tvl) ? s.strict_compare_estimated_active_tvl : [];
-        const exFees = Array.isArray(s.strict_compare_exact_fees) ? s.strict_compare_exact_fees : [];
-        const exTvl = Array.isArray(s.strict_compare_exact_tvl) ? s.strict_compare_exact_tvl : [];
         const useStrictCompare = strictMode && (
-          estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length ||
-          exFees.length || exTvl.length
+          estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length
         );
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
@@ -33462,29 +32975,11 @@ HTML_PAGE = """
           ...(estTvl.map(p => Number(p?.[0] || 0))),
           ...(estActiveFees.map(p => Number(p?.[0] || 0))),
           ...(estActiveTvl.map(p => Number(p?.[0] || 0))),
-          ...(exFees.map(p => Number(p?.[0] || 0))),
-          ...(exTvl.map(p => Number(p?.[0] || 0))),
           0
         );
         if (localMax > maxTs) maxTs = localMax;
         const c = colorMap[poolId] || palette[i % palette.length];
         const d = dashMap[poolId] || (i < palette.length ? "solid" : dashes[(i - palette.length) % dashes.length]);
-        const sanitizeExactTvlK = (exactPts, estimatedPts, poolNowUsd) => {
-          const estByTs = new Map((Array.isArray(estimatedPts) ? estimatedPts : []).map((p) => [Number(p?.[0] || 0), Number(p?.[1] || 0)]));
-          const nowK = Math.max(0, Number(poolNowUsd || 0) / 1000.0);
-          return (Array.isArray(exactPts) ? exactPts : []).map((p) => {
-            const ts = Number(p?.[0] || 0);
-            const vUsd = Number(p?.[1] || 0);
-            if (!(vUsd > 0)) return null;
-            const vK = vUsd / 1000.0;
-            const estUsd = Number(estByTs.get(ts) || 0);
-            const estK = estUsd > 0 ? (estUsd / 1000.0) : 0.0;
-            // Guard chart scale from clearly broken strict outliers.
-            const upper = Math.max(0.0, (estK > 0 ? estK * 4.0 : 0.0), (nowK > 0 ? nowK * 4.0 : 0.0));
-            if (upper > 0 && vK > upper) return null;
-            return vK;
-          });
-        };
         const extendTrailingWithLastValid = (arr) => {
           const out = Array.isArray(arr) ? arr.slice() : [];
           if (!out.length) return out;
@@ -33527,22 +33022,12 @@ HTML_PAGE = """
           const estFeeY = estFeesSrc.map(p => p[1]);
           const estActFeeX = estFeesActSrc.map(p => new Date(p[0] * 1000));
           const estActFeeY = estFeesActSrc.map(p => p[1]);
-          const exFeeX = exFees.map(p => new Date(p[0] * 1000));
-          const exFeeYExact = exFees.map(p => {
-            const v = Number(p?.[1] || 0);
-            return v > 0 ? v : null;
-          });
           const estTvlX = estTvlSrc.map(p => new Date(p[0] * 1000));
           const estTvlY = estTvlSrc.map(p => p[1] / 1000.0);
           const estActTvlX = estTvlActSrc.map(p => new Date(p[0] * 1000));
           const estActTvlY = estTvlActSrc.map(p => p[1] / 1000.0);
-          const exTvlX = exTvl.map(p => new Date(p[0] * 1000));
-          const exTvlYExact = extendTrailingWithLastValid(
-            sanitizeExactTvlK(exTvl, estTvlSrc, Number(s.pool_tvl_now_usd || 0))
-          );
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const estActHover = estActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
-          const exHover = exFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
           const COLOR_FULL = "#1d4ed8";          // blue
           const COLOR_FULL_EST = "#60a5fa";      // light blue
           const COLOR_ACTIVE_EST = "#15803d";    // darker green (estimated active)
@@ -33560,26 +33045,8 @@ HTML_PAGE = """
               line: {color: COLOR_ACTIVE_EST, width: 2.4, dash: "dash"}
             });
           }
-          if (showExFull && exFeeX.length) {
-            feeTraces.push({
-              x: exFeeX, y: exFeeYExact, mode: "lines+markers", name: `${s.label} (exact full)`, customdata: exHover,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: COLOR_FULL, width: 1.8, dash: "solid"},
-              marker: {size: 5, color: COLOR_FULL}
-            });
-          }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const estActHoverTvl = estActTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
-          const exHoverTvl = exTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "exact"]);
-          if (showExFull && exTvlX.length) {
-            const exFlat = tvlMarkersOnly(exTvlX, exTvlYExact);
-            tvlTraces.push({
-              x: exTvlX, y: exTvlYExact, mode: (exFlat ? "markers" : "lines+markers"), name: `${s.label} (exact full)`, customdata: exHoverTvl,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: COLOR_FULL, width: 1.8, dash: "solid"},
-              marker: {size: 5, color: COLOR_FULL}
-            });
-          }
           if (showEstFull && estTvlX.length) {
             const estSingle = tvlMarkersOnly(estTvlX, estTvlY);
             tvlTraces.push({
@@ -33690,57 +33157,14 @@ HTML_PAGE = """
         if (raw.includes("coingecko+defillama")) return "Estimated: CoinGecko/DefiLlama";
         return "Estimated mode";
       }
-      if (raw.startsWith("exact:ok") || raw.startsWith("exact2.0:ok")) return "Exact complete";
-      if (raw.startsWith("exact2_cache:ok")) return "Exact from cache";
-      if (raw.startsWith("exact:partial_blend:") || raw.startsWith("exact2.0:partial_blend:")) {
-        const parts = [];
-        if (covPct) parts.push(`exact ${covPct}`);
-        if (filledDays) parts.push(`filled ${filledDays}`);
-        return `Exact + estimate fill${parts.length ? ` (${parts.join(", ")})` : ""}`;
-      }
-      if (raw.includes("source_conflict_scale")) return "Exact rejected: scale conflict vs estimated";
-      if (raw.includes("source_conflict_anchor_jump")) return "Exact rejected: sharp jump near current TVL";
-      if (raw.includes("source_conflict_level_shift")) return "Exact rejected: level shift vs current TVL";
-      if (raw.includes("one_leg_quantity_collapse")) return "Partial exact: one token balance missing";
-      if (raw.includes("exact2_budget_timeout:block_resolution")) return `Exact timeout: day block resolution${dbgTail}`;
-      if (raw.includes("exact2_budget_timeout:pricing")) return `Exact timeout: historical pricing${dbgTail}`;
-      if (raw.includes("exact2_partial:block_missing")) return "Partial exact: missing day blocks";
-      if (raw.includes("exact2_partial:insufficient_prices")) return "Partial exact: missing historical prices";
-      if (raw.includes("exact2_partial:transfer_logs_timeout")) return `Partial exact: transfer log timeout${dbgTail}`;
-      if (raw.includes("strict_required:v4:target_pool_id_must_be_pool_id_64hex")) return "V4 exact: use pool id (0x + 64 hex), not contract address";
-      if (raw.includes("strict_required:v4_exact2:")) {
-        const tail = raw.split("strict_required:v4_exact2:")[1] || "unknown";
-        return `V4 exact2 unavailable: ${tail.replace(/[:_]+/g, " ").replace(/\\s+/g, " ").trim()}`;
-      }
-      if (raw.startsWith("exact_v4_2_onchain_quantities:")) {
-        const mode = raw.includes("pure_onchain_active_window")
-          ? "active"
-          : (raw.includes("pure_onchain_ticks") ? "tick-scan" : "onchain");
-        const days = (raw.match(/(?:^|:)days=(\\d+)/i) || [])[1];
-        const pos = (raw.match(/(?:^|:)raw_pos=(\\d+)/i) || [])[1];
-        const zero = (raw.match(/(?:^|:)raw_zero=(\\d+)/i) || [])[1];
-        const cov = (raw.match(/(?:^|:)cov=([0-9]*\\.?[0-9]+)/i) || [])[1];
-        const src = (raw.match(/(?:^|:)src=([^\\s]+)/i) || [])[1] || "";
-        const psrc = friendlyPriceSource(src);
-        const onchain = friendlyOnchainSource(src);
-        const covTxt = cov ? `${Math.round(Number(cov) * 100)}%` : "";
-        const parts = [];
-        if (covTxt) parts.push(`cov ${covTxt}`);
-        if (days) parts.push(`days ${days}`);
-        if (pos || zero) parts.push(`raw ${pos || 0}/${zero || 0}`);
-        return `V4 exact2: ${onchain} + ${psrc} (${mode}${parts.length ? `; ${parts.join(", ")}` : ""})`;
-      }
       if (raw.includes("pool_not_found_on_selected_chains")) return "Pool not found in selected chains";
-      if (raw.includes("missing_target_pool_id")) return "Target pool is required";
-      if (dq === "exact") return "Exact";
-      if (dq === "exact_partial") return "Exact partial";
-      if (dq === "strict_unavailable") return `Strict exact unavailable${dbgTail}`;
+      if (dq === "strict_unavailable") return `Unavailable${dbgTail}`;
       return raw.replace(/[:_]+/g, " ").replace(/\s+/g, " ").trim();
     }
 
     function renderTable(rows) {
       const table = document.getElementById("resultTable");
-      const strictMode = String(currentRequest?.run_mode || "").toLowerCase() === "strict_exact";
+      const strictMode = false;
       const showAnchor = strictMode;
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
@@ -33762,8 +33186,6 @@ HTML_PAGE = """
         const anchorType = String(r.anchor_type || "").trim().toLowerCase();
         const isEstFull = pairLbl.includes("(estimated)") && anchorType === "full";
         const isEstActive = pairLbl.includes("(estimated)") && anchorType === "active";
-        const isExFull = pairLbl.includes("(exact)") && anchorType === "full";
-        const isExActive = pairLbl.includes("(exact)") && anchorType === "active";
         let color = colorMap[r.pool_id] || "#94a3b8";
         let dash = dashMap[r.pool_id] || "solid";
         let swatchWidth = 3.0;
@@ -33775,14 +33197,6 @@ HTML_PAGE = """
           color = "#15803d";
           dash = "dash";
           swatchWidth = 2.4;
-        } else if (isExFull) {
-          color = "#1d4ed8";
-          dash = "solid";
-          swatchWidth = 1.8;
-        } else if (isExActive) {
-          color = "#166534";
-          dash = "solid";
-          swatchWidth = 1.8;
         }
         const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
         const rowKey = rowVisibilityKey(r);
@@ -33852,7 +33266,7 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const strictMode = String(currentRequest?.run_mode || "").toLowerCase() === "strict_exact";
+      const strictMode = false;
       const headers = [
         "visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl",
         ...(strictMode ? ["anchor_type"] : []),
@@ -34071,10 +33485,9 @@ HTML_PAGE = """
         renderPoolRunDebug(null);
         const pairCheck = validateBucketPairs();
         const minTvlRaw = String(document.getElementById("minTvl").value ?? "").trim();
-        const daysRaw = String(document.getElementById("days").value ?? "").trim();
+        const daysRaw = String(document.getElementById("daysEstimated").value ?? "").trim();
         const feeRangeRaw = String(document.getElementById("feeRangePct").value ?? "").trim();
         const minApyRaw = String(document.getElementById("minApyPct").value ?? "").trim();
-        const targetPoolRaw = getTargetPoolAddressForSubmit();
         syncRunModes("");
         if (!minTvlRaw || !daysRaw || !feeRangeRaw || !minApyRaw) {
           setStatus("Fill all filter fields before running analysis.", "fail");
@@ -34102,23 +33515,7 @@ HTML_PAGE = """
           min_apy_pct: Number(minApyRaw),
           ignore_cache: !!document.getElementById("runIgnoreCache")?.checked,
           mode_fast_legacy: !!document.getElementById("modeFastLegacy")?.checked,
-          mode_strict_exact: !!document.getElementById("modeStrictExact")?.checked,
-          target_pool_id: targetPoolRaw,
         };
-        if (!payload.mode_strict_exact) {
-          payload.target_pool_id = "";
-        }
-        if (payload.mode_strict_exact) {
-          payload.ignore_cache = true;
-          if (!payload.target_pool_id) {
-            setStatus("Strict exact requires a contract address.", "fail");
-            return;
-          }
-        }
-        if (payload.target_pool_id && !/^0x([a-f0-9]{40}|[a-f0-9]{64})$/.test(payload.target_pool_id)) {
-          setStatus("Contract address must be a valid 0x address or pool id.", "fail");
-          return;
-        }
         if (!payload.include_versions.length) {
           setStatus("Select at least one protocol (V3/V4).", "fail");
           return;

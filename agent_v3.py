@@ -132,20 +132,13 @@ def _is_eth_address(v: str) -> bool:
     return s.startswith("0x") and len(s) == 42
 
 
-def _target_pool_id() -> str:
-    raw = str(os.environ.get("TARGET_POOL_ID", "") or "").strip().lower()
-    if _is_eth_address(raw):
-        return raw
-    return ""
-
-
-V3_EXACT_TVL_ENABLE = _env_flag("V3_EXACT_TVL_ENABLE", True)
+V3_EXACT_TVL_ENABLE = _env_flag("V3_EXACT_TVL_ENABLE", False)
 V3_EXACT_TVL_CHAINS = {
     c.strip().lower()
     for c in str(os.environ.get("V3_EXACT_TVL_CHAINS", "ethereum")).split(",")
     if c.strip()
 }
-V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 5))
+V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 0))
 # By default exact-days cap follows the same history window as agent day-data (FEE_DAYS),
 # i.e. the value selected in UI "History days".
 V3_EXACT_TVL_DAYS_MAX = max(1, _env_int("V3_EXACT_TVL_DAYS_MAX", int(FEE_DAYS)))
@@ -1451,11 +1444,7 @@ def main() -> None:
     print("Discovering v3 pools...")
     fresh = "TOKEN_PAIRS" in os.environ
     pools = discover_pools_v3(token_pairs, args.min_tvl, fresh_token_lookup=fresh)
-    target_pool = _target_pool_id()
-    strict_target_run = bool(target_pool and V3_EXACT_TVL_STRICT_MODE)
-    if target_pool:
-        pools = [p for p in pools if str((p or {}).get("id") or "").strip().lower() == target_pool]
-        print(f"Target pool filter enabled: {target_pool} | matched {len(pools)}")
+    strict_target_run = False
     max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 40))
     max_total = max(0, _env_int("MAX_POOLS_TOTAL", 300))
     pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)
@@ -1678,11 +1667,8 @@ def main() -> None:
             "data_quality": tvl_quality,
             "data_quality_reason": tvl_quality_reason,
         }
-        if strict_target_run:
-            payload["strict_compare_estimated_tvl"] = estimated_tvl_compare
-            payload["strict_compare_estimated_fees"] = estimated_fees_compare
-            payload["strict_compare_exact_tvl"] = exact_tvl_compare
-            payload["strict_compare_exact_fees"] = exact_fees_compare
+        payload["strict_compare_estimated_tvl"] = estimated_tvl_compare
+        payload["strict_compare_estimated_fees"] = estimated_fees_compare
         msg = f"  [{idx+1}/{len(pools)}] {chain} {pair}: {len(data.get('fees') or [])} days"
         if V3_EXACT_TVL_DEBUG:
             msg += f" | quality={tvl_quality} reason={tvl_quality_reason}"
