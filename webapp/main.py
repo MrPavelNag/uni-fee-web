@@ -18246,7 +18246,7 @@ def _merge_for_web(
         )
         final_income = _final_income(v)
         apy_pct = (final_income / alloc_safe) * (365.0 / days_safe) * 100.0 if alloc_safe > 0 else 0.0
-        if has_strict_compare or strict_diagnostic:
+        if strict_diagnostic:
             status = "ok"
         else:
             if float(apy_pct) < float(min_apy_pct or 0.0):
@@ -21883,6 +21883,10 @@ def _render_positions_page() -> str:
       if (!v) return "";
       if (v.length <= 8) return v;
       return `${v.slice(0, 4)}...${v.slice(-4)}`;
+    }
+
+    function cleanPairLabel(pair) {
+      return String(pair || "").replace(/\s*\(estimated\)\s*/ig, "").trim();
     }
 
     function formatQualityReasonShort(rawReason, qualityTag) {
@@ -31282,19 +31286,15 @@ HTML_PAGE = """
     }
     .mode-filter-line {
       display: grid;
-      grid-template-columns: 112px 1fr;
+      grid-template-columns: 1fr;
       gap: 10px;
       align-items: stretch;
       margin-bottom: 6px;
     }
     .mode-filter-line:last-child { margin-bottom: 0; }
     .mode-filter-wrap {
-      display: grid;
-      grid-template-columns: 112px 1fr;
-      column-gap: 14px;
-      row-gap: 8px;
-      align-items: center;
-      padding-left: 18px;
+      display: block;
+      padding-left: 0;
     }
     .mode-filter-wrap::before {
       display: none;
@@ -31302,42 +31302,9 @@ HTML_PAGE = """
     .mode-filter-wrap .mode-filter-line {
       display: contents;
     }
-    .mode-filter-wrap .mode-check {
-      grid-column: 1;
-      justify-self: start;
-      align-self: start;
-      margin-top: 0;
-    }
-    #estimatedModeLine .mode-check {
-      margin-top: 0;
-    }
     .mode-filter-wrap .inline-grid {
-      grid-column: 2;
-      margin-left: 8px;
-    }
-    .mode-check {
-      display: flex;
-      align-items: center;
-      height: auto;
-      border: none;
-      border-radius: 0;
-      background: transparent;
-      padding: 0;
-      white-space: nowrap;
-    }
-    .mode-check label {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      font-size: 11px;
-      font-weight: 700;
-      color: #334155;
-      margin: 0;
-    }
-    .mode-check input[type="checkbox"] {
-      margin: 0;
-      transform: none;
-      accent-color: #2563eb;
+      grid-column: 1;
+      margin-left: 0;
     }
     .estimated-grid {
       grid-template-columns: 92px 86px 112px 86px 110px;
@@ -31424,9 +31391,7 @@ HTML_PAGE = """
       .mode-filter-line { grid-template-columns: 1fr; }
       .mode-filter-wrap { grid-template-columns: 1fr; row-gap: 8px; }
       .mode-filter-wrap::before { display: none; }
-      .mode-filter-wrap .mode-check,
       .mode-filter-wrap .inline-grid { grid-column: 1; }
-      #estimatedModeLine .mode-check { transform: none; }
       .estimated-grid { grid-template-columns: 1fr; }
       .summary-strip { gap: 6px; }
       .summary-box { min-width: 150px; }
@@ -31636,9 +31601,6 @@ HTML_PAGE = """
             <label>Filters</label>
             <div class="mode-filter-wrap">
               <div class="mode-filter-line" id="estimatedModeLine">
-                <div class="mode-check mode-item">
-                  <label><input id="modeFastLegacy" type="checkbox" checked onchange="syncRunModes('fast')"/> Estimated</label>
-                </div>
                 <div class="inline-grid estimated-grid">
                   <div class="filter-item" id="filterMinTvlItem">
                     <div class="hint">Min TVL (USD)</div>
@@ -31760,8 +31722,7 @@ HTML_PAGE = """
     const RESULT_STORAGE_KEY = "uni_fee_result_v1";
     const FIELD_IDS = [
       "stableBucketMode", "tokenBucketMode", "stableBucketManual", "tokenBucketManual",
-      "minTvl", "daysEstimated", "feeRangePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache",
-      "modeFastLegacy"
+      "minTvl", "daysEstimated", "feeRangePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache"
     ];
     let availableChains = [];
     let colorMap = {};
@@ -31867,17 +31828,6 @@ HTML_PAGE = """
         ignoreCache.disabled = false;
       }
       if (ignoreCacheLabel) ignoreCacheLabel.classList.remove("mode-disabled");
-    }
-
-    function syncRunModes(source) {
-      const fast = document.getElementById("modeFastLegacy");
-      const protoV3 = document.getElementById("protoV3");
-      const protoV4 = document.getElementById("protoV4");
-      if (!fast) return;
-      if (!fast.checked) fast.checked = true;
-      try { updateChainsNote(); } catch (_) {}
-      applyRunModeUiState();
-      saveFormState();
     }
 
     function escAttr(v) {
@@ -32469,7 +32419,7 @@ HTML_PAGE = """
             if (box) box.checked = true;
           }
         }
-        syncRunModes("");
+        applyRunModeUiState();
         updatePairBuilderUi();
       } catch (e) {
         console.warn("load form state failed", e);
@@ -32950,7 +32900,6 @@ HTML_PAGE = """
       const dashes = ["dash", "dot", "dashdot", "longdash", "longdashdot"];
       const feeTraces = [];
       const tvlTraces = [];
-      const strictMode = false;
       let maxTs = 0;
 
       const pools = Object.keys(seriesByPool);
@@ -32960,14 +32909,16 @@ HTML_PAGE = """
         const showAll = !!visibilityMap[makeVisibilityKey(poolId, "all", "all")];
         const showEstFull = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "full")];
         const showEstActive = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "active")];
-        if (!(showAll || showEstFull || showEstActive)) continue;
         const estFees = Array.isArray(s.strict_compare_estimated_fees) ? s.strict_compare_estimated_fees : [];
         const estTvl = Array.isArray(s.strict_compare_estimated_tvl) ? s.strict_compare_estimated_tvl : [];
         const estActiveFees = Array.isArray(s.strict_compare_estimated_active_fees) ? s.strict_compare_estimated_active_fees : [];
         const estActiveTvl = Array.isArray(s.strict_compare_estimated_active_tvl) ? s.strict_compare_estimated_active_tvl : [];
-        const useStrictCompare = strictMode && (
-          estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length
-        );
+        const useStrictCompare = !!(estFees.length || estTvl.length || estActiveFees.length || estActiveTvl.length);
+        if (useStrictCompare) {
+          if (!(showEstFull || showEstActive)) continue;
+        } else if (!showAll) {
+          continue;
+        }
         const localMax = Math.max(
           ...((s.fees || []).map(p => Number(p[0] || 0))),
           ...((s.tvl || []).map(p => Number(p[0] || 0))),
@@ -33164,8 +33115,7 @@ HTML_PAGE = """
 
     function renderTable(rows) {
       const table = document.getElementById("resultTable");
-      const strictMode = false;
-      const showAnchor = strictMode;
+      const showAnchor = false;
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
         ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"],
@@ -33210,7 +33160,7 @@ HTML_PAGE = """
         html += `<td><input type="checkbox" data-pool-id="${r.pool_id}" data-row-key="${escAttr(rowKey)}" ${visible ? "checked" : ""} ${disabled} onchange="togglePoolVisibility(this)"/></td>`;
         html += `<td>${r.chain}</td>`;
         html += `<td>${r.version}</td>`;
-        html += `<td>${r.pair}</td>`;
+        html += `<td>${cleanPairLabel(r.pair)}</td>`;
         html += `<td class="mono">${escAttr(poolIdDisplay)}<button class='copy-btn' style="border:none;background:transparent;box-shadow:none;outline:none;padding:0 0 0 4px;color:#2563eb" type='button' data-copy="${escAttr(poolIdRaw)}" onclick="copyText(this.dataset.copy || '')" title='Copy pool id'>⧉</button></td>`;
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
         html += `<td>$${formatUsd(r.final_income)}</td>`;
@@ -33266,10 +33216,8 @@ HTML_PAGE = """
         setStatus("No rows to export yet.", "fail");
         return;
       }
-      const strictMode = false;
       const headers = [
         "visibility", "chain", "version", "pair", "pool_id", "fee_pct", "final_income", "apy_pct", "last_tvl",
-        ...(strictMode ? ["anchor_type"] : []),
         "status_code", "risk_level", "risk_reason", "risk_flags"
       ];
       const lines = [headers.join(",")];
@@ -33278,14 +33226,12 @@ HTML_PAGE = """
           let rawVal;
           if (h === "visibility") {
             rawVal = !!visibilityMap[rowVisibilityKey(r)];
-          } else if (h === "anchor_type") {
-            rawVal = String(r.anchor_type || "");
           } else if (h === "status_code") {
             rawVal = statusCodeForRow(r);
           } else if (h === "risk_flags") {
             rawVal = Array.isArray(r.risk_flags) ? r.risk_flags.join("|") : "";
           } else {
-            rawVal = r[h];
+            rawVal = (h === "pair") ? cleanPairLabel(r[h]) : r[h];
           }
           const val = rawVal == null ? "" : String(rawVal);
           return `"${val.replace(/"/g, '""')}"`;
@@ -33488,7 +33434,7 @@ HTML_PAGE = """
         const daysRaw = String(document.getElementById("daysEstimated").value ?? "").trim();
         const feeRangeRaw = String(document.getElementById("feeRangePct").value ?? "").trim();
         const minApyRaw = String(document.getElementById("minApyPct").value ?? "").trim();
-        syncRunModes("");
+        applyRunModeUiState();
         if (!minTvlRaw || !daysRaw || !feeRangeRaw || !minApyRaw) {
           setStatus("Fill all filter fields before running analysis.", "fail");
           return;
@@ -33514,7 +33460,7 @@ HTML_PAGE = """
           min_fee_pct: minFeeNum,
           min_apy_pct: Number(minApyRaw),
           ignore_cache: !!document.getElementById("runIgnoreCache")?.checked,
-          mode_fast_legacy: !!document.getElementById("modeFastLegacy")?.checked,
+          mode_fast_legacy: true,
         };
         if (!payload.include_versions.length) {
           setStatus("Select at least one protocol (V3/V4).", "fail");
