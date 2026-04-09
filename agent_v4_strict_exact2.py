@@ -861,7 +861,13 @@ def _v4_onchain_historical_tvl_snapshots(
 
     # Resolve target days to blocks once (prefer DefiLlama mapping, fallback to RPC binary search).
     target_days = sorted({int((int(ts) // 86400) * 86400) for ts in targets if int(ts) > 0})
+    all_days = sorted({int((int(ts) // 86400) * 86400) for ts in day_ts if int(ts) > 0})
     day_to_block: dict[int, int] = {}
+    points_nearby = 0
+    try:
+        nearby_days = max(1, int(os.environ.get("STRICT_V4_EXACT_NEARBY_DAYS", str(max(2, int(step_days) // 2)))))
+    except Exception:
+        nearby_days = max(2, int(step_days) // 2)
     t_blocks0 = time.monotonic()
     for day_ts in target_days:
         if time.monotonic() >= snapshot_deadline_ts:
@@ -883,6 +889,24 @@ def _v4_onchain_historical_tvl_snapshots(
             break
         day_ts = int((int(ts) // 86400) * 86400)
         b = int(day_to_block.get(day_ts, 0))
+        chosen_day_ts = int(day_ts)
+        if b <= 0:
+            for cand_day_ts in _nearby_day_candidates(day_ts, all_days, int(nearby_days)):
+                cand_b = int(day_to_block.get(int(cand_day_ts), 0))
+                if cand_b <= 0:
+                    try:
+                        cand_b = int(_llama_block_for_day(ck, int(cand_day_ts) + 86399))
+                    except Exception:
+                        cand_b = 0
+                    if cand_b <= 0:
+                        cand_b = int(_first_block_at_or_after_ts(chain_id, int(cand_day_ts), int(latest_block)))
+                    day_to_block[int(cand_day_ts)] = int(max(0, cand_b))
+                if cand_b > 0:
+                    b = int(cand_b)
+                    chosen_day_ts = int(cand_day_ts)
+                    if int(chosen_day_ts) != int(day_ts):
+                        points_nearby += 1
+                    break
         if b <= 0:
             dbg["counters"]["block_resolve_fail"] = int(dbg["counters"]["block_resolve_fail"]) + 1
             if len(dbg["samples"]["block_resolve_fail_ts"]) < 6:
@@ -927,6 +951,8 @@ def _v4_onchain_historical_tvl_snapshots(
         dbg["counters"]["targets_done"] = int(dbg["counters"]["targets_done"]) + 1
 
     dbg["snapshots_done"] = int(min(len(full_out), len(active_out)))
+    dbg["nearby_days"] = int(nearby_days)
+    dbg["points_nearby"] = int(points_nearby)
     dbg["elapsed_ms"] = int(round(max(0.0, time.monotonic() - t_fn0) * 1000.0))
     return full_out, active_out, dbg
 
@@ -1592,7 +1618,7 @@ def main() -> None:
     start_ts, end_ts = build_exact_day_window(int(FEE_DAYS))
     day_rows = query_pool_day_data(endpoint, str(pool.get("id") or ""), start_ts, end_ts)
     fees_usd: list[tuple[int, float]] = []
-    raw_tvl: list[tuple[int, float]] = []
+    raw_tvl_signed: list[tuple[int, float]] = []
     fee_pct = int(pool.get("feeTier") or 0) / 10000.0
     for r in day_rows:
         d = int(r.get("date") or 0)
@@ -1600,7 +1626,7 @@ def main() -> None:
         if ts <= 0:
             continue
         fees_usd.append((ts, max(0.0, float(r.get("feesUSD") or 0.0))))
-        raw_tvl.append((ts, max(0.0, float(r.get("tvlUSD") or 0.0))))
+        raw_tvl_signed.append((ts, float(r.get("tvlUSD") or 0.0)))
     if not fees_usd:
         save_chart_data_json(
             {str(pool.get("id") or target_pool): _strict_unavailable_payload(str(pool.get("id") or target_pool), "strict_required:v4_exact2:no_day_data", found_chain)},
@@ -1629,6 +1655,19 @@ def main() -> None:
         )
         return
 
+    raw_pos = int(sum(1 for _ts, v in raw_tvl_signed if float(v or 0.0) > 0.0))
+    raw_neg = int(sum(1 for _ts, v in raw_tvl_signed if float(v or 0.0) < 0.0))
+    raw_zero = int(max(0, len(raw_tvl_signed) - raw_pos - raw_neg))
+    use_abs_for_negative = bool(raw_neg > 0 and (raw_pos == 0 or raw_neg >= max(10, raw_pos * 2)))
+    raw_tvl: list[tuple[int, float]] = []
+    for ts, rv in raw_tvl_signed:
+        v = float(rv or 0.0)
+        if v > 0.0:
+            raw_tvl.append((int(ts), float(v)))
+        elif v < 0.0 and use_abs_for_negative:
+            raw_tvl.append((int(ts), float(abs(v))))
+        else:
+            raw_tvl.append((int(ts), 0.0))
     raw_tvl_positive_days = int(sum(1 for _ts, v in raw_tvl if float(v or 0.0) > 0.0))
     raw_tvl_zero_days = int(max(0, len(raw_tvl) - raw_tvl_positive_days))
     strict_dbg = dict(strict_dbg or {})
@@ -1636,6 +1675,10 @@ def main() -> None:
     strict_dbg["fees_days"] = int(len(fees_usd))
     strict_dbg["raw_tvl_positive_days"] = int(raw_tvl_positive_days)
     strict_dbg["raw_tvl_zero_days"] = int(raw_tvl_zero_days)
+    strict_dbg["raw_tvl_signed_positive_days"] = int(raw_pos)
+    strict_dbg["raw_tvl_signed_negative_days"] = int(raw_neg)
+    strict_dbg["raw_tvl_signed_zero_days"] = int(raw_zero)
+    strict_dbg["raw_tvl_negative_abs_mode"] = bool(use_abs_for_negative)
     strict_dbg["budget_sec"] = float(budget_sec)
     strict_dbg["debug_profile"] = "v4_exact2_extended_debug"
     chain_id = int(CHAIN_ID_BY_KEY.get(str(found_chain or "").strip().lower(), 0) or 0)
