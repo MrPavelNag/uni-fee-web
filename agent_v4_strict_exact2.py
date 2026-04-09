@@ -866,14 +866,14 @@ def main() -> None:
     start_ts, end_ts = build_exact_day_window(int(FEE_DAYS))
     day_rows = query_pool_day_data(endpoint, str(pool.get("id") or ""), start_ts, end_ts)
     fees_usd: list[tuple[int, float]] = []
-    raw_tvl: list[tuple[int, float]] = []
+    raw_tvl_signed: list[tuple[int, float]] = []
     for r in day_rows:
         d = int(r.get("date") or 0)
         ts = int(d if d > 1e9 else d * 86400)
         if ts <= 0:
             continue
         fees_usd.append((ts, max(0.0, float(r.get("feesUSD") or 0.0))))
-        raw_tvl.append((ts, max(0.0, float(r.get("tvlUSD") or 0.0))))
+        raw_tvl_signed.append((ts, float(r.get("tvlUSD") or 0.0)))
     if not fees_usd:
         save_chart_data_json(
             {str(pool.get("id") or target_pool): _strict_unavailable_payload(str(pool.get("id") or target_pool), "strict_required:v4_exact2:no_day_data", found_chain)},
@@ -902,6 +902,26 @@ def main() -> None:
         )
         return
 
+    # Root-cause fix for half-flat estimated full on some V4 pools:
+    # poolDayData.tvlUSD may be emitted as negative values by indexer/backends.
+    # Using max(0, tvlUSD) collapses long ranges to zero and makes estimated TVL flat at NOW anchor.
+    raw_pos = int(sum(1 for _ts, v in raw_tvl_signed if float(v or 0.0) > 0.0))
+    raw_neg = int(sum(1 for _ts, v in raw_tvl_signed if float(v or 0.0) < 0.0))
+    raw_zero = int(max(0, len(raw_tvl_signed) - raw_pos - raw_neg))
+    use_abs_for_negative = False
+    if raw_neg > 0:
+        # If all/non-trivial tail is negative, preserve magnitude as shape signal.
+        if raw_pos == 0 or raw_neg >= max(10, raw_pos * 2):
+            use_abs_for_negative = True
+    raw_tvl: list[tuple[int, float]] = []
+    for ts, rv in raw_tvl_signed:
+        v = float(rv or 0.0)
+        if v > 0.0:
+            raw_tvl.append((int(ts), float(v)))
+        elif v < 0.0 and use_abs_for_negative:
+            raw_tvl.append((int(ts), float(abs(v))))
+        else:
+            raw_tvl.append((int(ts), 0.0))
     raw_tvl_positive_days = int(sum(1 for _ts, v in raw_tvl if float(v or 0.0) > 0.0))
     raw_tvl_zero_days = int(max(0, len(raw_tvl) - raw_tvl_positive_days))
     strict_dbg = dict(strict_dbg or {})
@@ -909,6 +929,10 @@ def main() -> None:
     strict_dbg["fees_days"] = int(len(fees_usd))
     strict_dbg["raw_tvl_positive_days"] = int(raw_tvl_positive_days)
     strict_dbg["raw_tvl_zero_days"] = int(raw_tvl_zero_days)
+    strict_dbg["raw_tvl_signed_positive_days"] = int(raw_pos)
+    strict_dbg["raw_tvl_signed_negative_days"] = int(raw_neg)
+    strict_dbg["raw_tvl_signed_zero_days"] = int(raw_zero)
+    strict_dbg["raw_tvl_negative_abs_mode"] = bool(use_abs_for_negative)
     strict_dbg["budget_sec"] = float(budget_sec)
 
     estimated_tvl: list[tuple[int, float]] = []
