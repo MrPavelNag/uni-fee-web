@@ -204,7 +204,10 @@ RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 
 RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "120")))
 RUN_JOB_RESULT_TTL_SEC = max(60, int(os.environ.get("RUN_JOB_RESULT_TTL_SEC", str(20 * 60))))
 RUN_MAX_CONCURRENT = max(1, min(6, int(os.environ.get("RUN_MAX_CONCURRENT", "1"))))
-RUN_SLOT_WAIT_TIMEOUT_SEC = min(600, max(10, int(os.environ.get("RUN_SLOT_WAIT_TIMEOUT_SEC", "180"))))
+# Queue wait timeout for run-slot semaphore.
+# Keep it noticeably higher than typical single scan duration to avoid
+# premature queue failures under load.
+RUN_SLOT_WAIT_TIMEOUT_SEC = max(600, min(7200, int(os.environ.get("RUN_SLOT_WAIT_TIMEOUT_SEC", "900"))))
 RUN_MAX_ACTIVE_PER_SESSION = max(1, min(6, int(os.environ.get("RUN_MAX_ACTIVE_PER_SESSION", "2"))))
 RUN_SLOTS_SEMAPHORE = threading.BoundedSemaphore(RUN_MAX_CONCURRENT)
 RUNTIME_PRUNE_INTERVAL_SEC = max(15, int(os.environ.get("RUNTIME_PRUNE_INTERVAL_SEC", "60")))
@@ -19354,8 +19357,9 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
 
     with JOB_LOCK:
         job = JOBS[job_id]
-        job["status"] = "running"
-        job["started_at"] = time.time()
+        # Mark as queued until semaphore slot is actually acquired.
+        # This avoids treating queue-waiting jobs as actively scanning.
+        job["status"] = "queued"
         job["stage"] = "prepare"
         job["stage_label"] = f"Preparing parameters ({speed_mode}, {run_mode})"
         job["progress"] = 5
@@ -19441,6 +19445,16 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 error=msg,
             )
             return
+        with JOB_LOCK:
+            j = JOBS.get(job_id)
+            if j:
+                j["status"] = "running"
+                if float(j.get("started_at") or 0.0) <= 0:
+                    j["started_at"] = time.time()
+                j["stage"] = "queue"
+                j["stage_label"] = "Scan slot acquired"
+                j["progress"] = max(10, int(j.get("progress") or 0))
+                _job_snapshot_save(j)
         try:
             t_agents_total0 = time.perf_counter()
             total_pairs = max(1, len(pairs))
@@ -32380,9 +32394,13 @@ HTML_PAGE = """
         let stageLimitedTarget = backendTargetRaw;
         if (isQueueWait) {
           // While waiting for a scan slot, backend progress can stay flat for a long time.
-          // Add a conservative local ramp so users can see that waiting is still progressing.
-          const queueCap = 22;
-          const queueRamp = Math.min(queueCap, 8 + Math.floor(elapsed / 6));
+          // Ramp according to queue timeout to keep movement realistic and visible.
+          const label = String(scanStageLabel || "");
+          const m = label.match(/timeout\s*=\s*(\d+)\s*s/i);
+          const timeoutSec = Number(m?.[1] || 0);
+          const denom = (Number.isFinite(timeoutSec) && timeoutSec > 0) ? timeoutSec : 240;
+          const queueFrac = Math.max(0, Math.min(1, elapsed / denom));
+          const queueRamp = 8 + (queueFrac * 30); // 8%..38% while waiting in queue.
           stageLimitedTarget = Math.max(stageLimitedTarget, queueRamp);
         }
         const target = (stageLimitedTarget >= 100) ? 100 : Math.min(99, stageLimitedTarget);
