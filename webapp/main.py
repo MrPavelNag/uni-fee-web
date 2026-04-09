@@ -31855,6 +31855,31 @@ HTML_PAGE = """
       return new Intl.NumberFormat("en-US", {maximumFractionDigits: 0}).format(Number(v || 0));
     }
 
+    function formatUsdCompact(v) {
+      const n = Number(v || 0);
+      if (!Number.isFinite(n)) return "0";
+      const abs = Math.abs(n);
+      if (abs >= 1e18) return n.toExponential(2);
+      const units = [
+        [1e15, "Q"],
+        [1e12, "T"],
+        [1e9, "B"],
+        [1e6, "M"],
+        [1e3, "K"],
+      ];
+      for (const [base, suffix] of units) {
+        if (abs >= base) {
+          const scaled = n / base;
+          const digits = Math.abs(scaled) >= 100 ? 0 : (Math.abs(scaled) >= 10 ? 1 : 2);
+          const txt = Number(scaled).toFixed(digits).replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+          return `${txt}${suffix}`;
+        }
+      }
+      if (abs >= 100) return Math.round(n).toString();
+      if (abs >= 10) return n.toFixed(1).replace(/\.0+$/, "");
+      return n.toFixed(2).replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+    }
+
     function getDaysValue() {
       const v = Number(document.getElementById("daysEstimated")?.value || 30);
       return Number.isFinite(v) && v > 0 ? v : 30;
@@ -32979,8 +33004,12 @@ HTML_PAGE = """
       return "all";
     }
 
+    function normalizePoolId(poolId) {
+      return String(poolId || "").trim().toLowerCase();
+    }
+
     function makeVisibilityKey(poolId, branch, anchorType) {
-      const pid = String(poolId || "");
+      const pid = normalizePoolId(poolId);
       const b = String(branch || "all").toLowerCase();
       const a = String(anchorType || "all").toLowerCase();
       return `${pid}::${b}::${a}`;
@@ -33282,7 +33311,7 @@ HTML_PAGE = """
         const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
         const rowKey = rowVisibilityKey(r);
         const visible = !!visibilityMap[rowKey];
-        const hasSeries = !!seriesByPool[r.pool_id];
+        const hasSeries = !!seriesByPool[normalizePoolId(r.pool_id)];
         const disabled = hasSeries ? "" : "disabled";
         const poolIdDisplay = shortStartEnd4(r.pool_id || "");
         const poolIdRaw = String(r.pool_id || "");
@@ -33296,7 +33325,9 @@ HTML_PAGE = """
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
         html += `<td>$${formatUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
-        html += `<td>$${formatUsd(r.last_tvl)}</td>`;
+        const tvlFull = `$${formatUsd(r.last_tvl)}`;
+        const tvlCompact = `$${formatUsdCompact(r.last_tvl)}`;
+        html += `<td title="${escAttr(tvlFull)}">${escAttr(tvlCompact)}</td>`;
         if (showAnchor) {
           const anchor = anchorType ? (anchorType.charAt(0).toUpperCase() + anchorType.slice(1)) : "-";
           html += `<td>${anchor}</td>`;
@@ -33689,12 +33720,39 @@ HTML_PAGE = """
       stopActivePoll();
       activeJobId = String(jobId || "");
       setActivePoolJobId(activeJobId);
+      let transientFailCount = 0;
+      let firstTransientFailAtMs = 0;
+      const MAX_TRANSIENT_OUTAGE_SEC = 180;
+      const markTransientFailure = (hint) => {
+        transientFailCount += 1;
+        if (!firstTransientFailAtMs) firstTransientFailAtMs = Date.now();
+        const outageSec = Math.max(0, Math.floor((Date.now() - firstTransientFailAtMs) / 1000));
+        const offline = (typeof navigator !== "undefined" && navigator && navigator.onLine === false);
+        const state = offline ? "offline" : "reconnecting";
+        setStatus(
+          `Scanning pools... ${state} (${transientFailCount})` +
+          `${hint ? ` | ${hint}` : ""}` +
+          ` · outage ${outageSec}s`,
+          "running"
+        );
+        return outageSec;
+      };
+      const resetTransientFailure = () => {
+        transientFailCount = 0;
+        firstTransientFailAtMs = 0;
+      };
       const tick = async () => {
         try {
           if (!activeJobId || activeJobId !== String(jobId || "")) return;
           const {resp: r, parsed} = await apiFetchJson("/api/jobs/" + jobId);
           const job = parsed.data || {};
           if (!r.ok) {
+            const statusCode = Number(r.status || 0);
+            const retryableHttp = (statusCode === 0 || statusCode === 408 || statusCode === 425 || statusCode === 429 || statusCode >= 500);
+            if (retryableHttp) {
+              const outageSec = markTransientFailure(`HTTP ${statusCode || "?"}`);
+              if (outageSec <= MAX_TRANSIENT_OUTAGE_SEC) return;
+            }
             stopActivePoll();
             stopScanTicker();
             hasScanRun = true;
@@ -33705,6 +33763,7 @@ HTML_PAGE = """
             setStatus("Failed: " + (det || (isHtml ? `server returned HTML instead of JSON (HTTP ${r.status})` : `job status request failed (HTTP ${r.status})`)), "fail");
             return;
           }
+          resetTransientFailure();
           updateProgress(job.progress, job.stage_label || job.stage);
           if (job.status === "done") {
             const elapsedSec = scanElapsedSecFromJob(job);
@@ -33754,13 +33813,15 @@ HTML_PAGE = """
             scanStageLabel = String(job.stage_label || job.status || "running");
           }
         } catch (e) {
+          const msg = String(e?.message || "job polling error");
+          const outageSec = markTransientFailure(msg);
+          if (outageSec <= MAX_TRANSIENT_OUTAGE_SEC) return;
           stopActivePoll();
           stopScanTicker();
           hasScanRun = true;
           setBusy(false);
-          const msg = String(e?.message || "job polling error");
           setStatus("Failed: " + msg, "fail");
-          setActivePoolJobId("");
+          // Keep active job id for resume-after-refresh when possible.
           refreshActiveScansMeta();
         }
       };
@@ -33791,8 +33852,10 @@ HTML_PAGE = """
       seriesByPool = {};
       for (let i = 0; i < (result.series || []).length; i++) {
         const s = result.series[i];
-        seriesByPool[s.pool_id] = s;
-        const allKey = makeVisibilityKey(s.pool_id, "all", "all");
+        const pid = normalizePoolId(s.pool_id);
+        if (!pid) continue;
+        seriesByPool[pid] = s;
+        const allKey = makeVisibilityKey(pid, "all", "all");
         if (visibilityMap[allKey] === undefined) visibilityMap[allKey] = (s.status === "ok");
       }
       for (const r of (result.rows || [])) {
