@@ -18565,7 +18565,7 @@ def _run_agent_and_load_timed(
 
 def _pair_worker_count(speed_mode: str, total_pairs: int) -> int:
     key = "WEB_MAX_PAIR_WORKERS_FAST" if str(speed_mode) == "fast" else "WEB_MAX_PAIR_WORKERS_NORMAL"
-    default_val = "3" if str(speed_mode) == "fast" else "2"
+    default_val = "4" if str(speed_mode) == "fast" else "3"
     try:
         cfg = int(os.environ.get(key, default_val))
     except Exception:
@@ -19637,7 +19637,7 @@ class PoolsRunRequest(BaseModel):
     pairs: list[str] = Field(default_factory=list, description="Up to 4 pairs: tokenA,tokenB")
     include_chains: list[str] = Field(default_factory=list)
     include_versions: list[str] = Field(default_factory=lambda: ["v3", "v4"])
-    speed_mode: str = "normal"
+    speed_mode: str = "fast"
     mode_fast_legacy: bool = True
     min_tvl: float = 1000.0
     days: int = 30
@@ -33632,6 +33632,7 @@ HTML_PAGE = """
           pairs: pairCheck.pairs,
           include_chains: getSelectedChains(),
           include_versions: getSelectedProtocols(),
+          speed_mode: "fast",
           min_tvl: Number(minTvlRaw),
           days: Number(daysRaw),
           max_fee_pct: maxFeeNum,
