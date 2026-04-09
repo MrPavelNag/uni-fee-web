@@ -31725,8 +31725,7 @@ HTML_PAGE = """
       "minTvl", "daysEstimated", "feeRangePct", "minApyPct", "protoV3", "protoV4", "allChains", "runIgnoreCache"
     ];
     let availableChains = [];
-    let colorMap = {};
-    let dashMap = {};
+    let rowLineStyleMap = {};
     let visibilityMap = {};
     let seriesByPool = {};
     let currentRequest = {};
@@ -32886,6 +32885,25 @@ HTML_PAGE = """
       return `${pid}::${b}::${a}`;
     }
 
+    function lineStyleForKey(rowKey) {
+      const k = String(rowKey || "");
+      const got = rowLineStyleMap[k];
+      if (got && got.color) return got;
+      const darkPalette = ["#1f2937", "#1e3a8a", "#155e75", "#14532d", "#7f1d1d", "#4c1d95", "#0c4a6e", "#3f6212", "#312e81", "#831843"];
+      const dashOrder = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"];
+      const used = Object.keys(rowLineStyleMap || {}).length;
+      const color = darkPalette[used % darkPalette.length];
+      const dashIdx = Math.floor(used / darkPalette.length);
+      const dash = dashOrder[Math.min(dashOrder.length - 1, Math.max(0, dashIdx))];
+      const style = {
+        color,
+        dash,
+        width: (dash === "solid") ? 2.8 : 2.3,
+      };
+      rowLineStyleMap[k] = style;
+      return style;
+    }
+
     function rowVisibilityKey(r) {
       const branch = rowBranchFromLabel(r?.pair || "");
       if (branch === "all") {
@@ -32896,15 +32914,12 @@ HTML_PAGE = """
     }
 
     function redrawCharts() {
-      const palette = ["#1e3a8a", "#155e75", "#14532d", "#7e22ce", "#7f1d1d", "#1d4ed8", "#0e7490", "#166534", "#6d28d9", "#be123c"];
-      const dashes = ["dash", "dot", "dashdot", "longdash", "longdashdot"];
       const feeTraces = [];
       const tvlTraces = [];
       let maxTs = 0;
 
       const pools = Object.keys(seriesByPool);
-      for (let i = 0; i < pools.length; i++) {
-        const poolId = pools[i];
+      for (const poolId of pools) {
         const s = seriesByPool[poolId];
         const showAll = !!visibilityMap[makeVisibilityKey(poolId, "all", "all")];
         const showEstFull = !!visibilityMap[makeVisibilityKey(poolId, "estimated", "full")];
@@ -32929,8 +32944,6 @@ HTML_PAGE = """
           0
         );
         if (localMax > maxTs) maxTs = localMax;
-        const c = colorMap[poolId] || palette[i % palette.length];
-        const d = dashMap[poolId] || (i < palette.length ? "solid" : dashes[(i - palette.length) % dashes.length]);
         const extendTrailingWithLastValid = (arr) => {
           const out = Array.isArray(arr) ? arr.slice() : [];
           if (!out.length) return out;
@@ -32969,6 +32982,10 @@ HTML_PAGE = """
           const estFeesActSrc = estActiveFees.length ? estActiveFees : [];
           const estTvlSrc = estTvl.length ? estTvl : (Array.isArray(s.tvl) ? s.tvl : []);
           const estTvlActSrc = estActiveTvl.length ? estActiveTvl : [];
+          const fullKey = makeVisibilityKey(poolId, "estimated", "full");
+          const activeKey = makeVisibilityKey(poolId, "estimated", "active");
+          const fullStyle = lineStyleForKey(fullKey);
+          const activeStyle = lineStyleForKey(activeKey);
           const estFeeX = estFeesSrc.map(p => new Date(p[0] * 1000));
           const estFeeY = estFeesSrc.map(p => p[1]);
           const estActFeeX = estFeesActSrc.map(p => new Date(p[0] * 1000));
@@ -32979,21 +32996,18 @@ HTML_PAGE = """
           const estActTvlY = estTvlActSrc.map(p => p[1] / 1000.0);
           const estHover = estFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
           const estActHover = estActFeeX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated active"]);
-          const COLOR_FULL = "#1d4ed8";          // blue
-          const COLOR_FULL_EST = "#60a5fa";      // light blue
-          const COLOR_ACTIVE_EST = "#15803d";    // darker green (estimated active)
           if (showEstFull && estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated full)`, customdata: estHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: COLOR_FULL_EST, width: 3.0, dash: "dot"}
+              line: {color: fullStyle.color, width: fullStyle.width, dash: fullStyle.dash}
             });
           }
           if (showEstActive && estActFeeX.length) {
             feeTraces.push({
               x: estActFeeX, y: estActFeeY, mode: "lines", name: `${s.label} (estimated active)`, customdata: estActHover,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-              line: {color: COLOR_ACTIVE_EST, width: 2.4, dash: "dash"}
+              line: {color: activeStyle.color, width: activeStyle.width, dash: activeStyle.dash}
             });
           }
           const estHoverTvl = estTvlX.map(() => [s.chain || "", s.version || "", Number(s.fee_pct || 0).toFixed(2), s.pair || "", "estimated"]);
@@ -33003,8 +33017,8 @@ HTML_PAGE = """
             tvlTraces.push({
               x: estTvlX, y: estTvlY, mode: (estSingle ? "markers" : "lines"), name: `${s.label} (estimated full)`, customdata: estHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: COLOR_FULL_EST, width: 3.0, dash: "dot"},
-              ...(estSingle ? {marker: {size: 8, color: COLOR_FULL_EST, symbol: "circle"}} : {})
+              line: {color: fullStyle.color, width: fullStyle.width, dash: fullStyle.dash},
+              ...(estSingle ? {marker: {size: 8, color: fullStyle.color, symbol: "circle"}} : {})
             });
           }
           if (showEstActive && estActTvlX.length) {
@@ -33012,11 +33026,13 @@ HTML_PAGE = """
             tvlTraces.push({
               x: estActTvlX, y: estActTvlY, mode: (estActSingle ? "markers" : "lines"), name: `${s.label} (estimated active)`, customdata: estActHoverTvl,
               hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-              line: {color: COLOR_ACTIVE_EST, width: 2.4, dash: "dash"},
-              ...(estActSingle ? {marker: {size: 8, color: COLOR_ACTIVE_EST, symbol: "square"}} : {})
+              line: {color: activeStyle.color, width: activeStyle.width, dash: activeStyle.dash},
+              ...(estActSingle ? {marker: {size: 8, color: activeStyle.color, symbol: "square"}} : {})
             });
           }
         } else {
+          const allKey = makeVisibilityKey(poolId, "all", "all");
+          const allStyle = lineStyleForKey(allKey);
           const feeX = (s.fees || []).map(p => new Date(p[0] * 1000));
           const feeY = (s.fees || []).map(p => p[1]);
           const tvlX = (s.tvl || []).map(p => new Date(p[0] * 1000));
@@ -33026,12 +33042,12 @@ HTML_PAGE = """
         feeTraces.push({
           x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
             hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
-          line: {color: c, width: 2, dash: d}
+          line: {color: allStyle.color, width: allStyle.width, dash: allStyle.dash}
         });
         tvlTraces.push({
           x: tvlX, y: tvlY, mode: "lines", name: s.label, customdata: hoverData,
             hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<br>TVL: %{y:,.2f}k USD<extra></extra>",
-          line: {color: c, width: 2, dash: d}
+          line: {color: allStyle.color, width: allStyle.width, dash: allStyle.dash}
         });
         }
       }
@@ -33136,22 +33152,10 @@ HTML_PAGE = """
 
       for (const r of rows) {
         const cls = r.status === "ok" ? "ok-row" : "error-row";
-        const pairLbl = String(r.pair || "").toLowerCase();
-        const anchorType = String(r.anchor_type || "").trim().toLowerCase();
-        const isEstFull = pairLbl.includes("(estimated)") && anchorType === "full";
-        const isEstActive = pairLbl.includes("(estimated)") && anchorType === "active";
-        let color = colorMap[r.pool_id] || "#94a3b8";
-        let dash = dashMap[r.pool_id] || "solid";
-        let swatchWidth = 3.0;
-        if (isEstFull) {
-          color = "#60a5fa";
-          dash = "dot";
-          swatchWidth = 3.0;
-        } else if (isEstActive) {
-          color = "#15803d";
-          dash = "dash";
-          swatchWidth = 2.4;
-        }
+        const style = lineStyleForKey(rowVisibilityKey(r));
+        const color = style.color || "#94a3b8";
+        const dash = style.dash || "solid";
+        const swatchWidth = Number(style.width || 2.4);
         const cssDash = (dash === "solid") ? "solid" : (dash === "dot" ? "dotted" : "dashed");
         const rowKey = rowVisibilityKey(r);
         const visible = !!visibilityMap[rowKey];
@@ -33612,18 +33616,11 @@ HTML_PAGE = """
       if (mErr) mErr.textContent = result.error_pools;
 
       currentRequest = result?.request || {};
-      colorMap = {};
-      dashMap = {};
+      rowLineStyleMap = {};
       visibilityMap = {};
       seriesByPool = {};
-      const palette = ["#1e3a8a", "#155e75", "#14532d", "#7e22ce", "#7f1d1d", "#1d4ed8", "#0e7490", "#166534", "#6d28d9", "#be123c"];
-      const dashes = ["dash", "dot", "dashdot", "longdash", "longdashdot"];
       for (let i = 0; i < (result.series || []).length; i++) {
         const s = result.series[i];
-        const c = palette[i % palette.length];
-        const d = i < palette.length ? "solid" : dashes[(i - palette.length) % dashes.length];
-        colorMap[s.pool_id] = c;
-        dashMap[s.pool_id] = d;
         seriesByPool[s.pool_id] = s;
         const allKey = makeVisibilityKey(s.pool_id, "all", "all");
         if (visibilityMap[allKey] === undefined) visibilityMap[allKey] = (s.status === "ok");
@@ -33631,6 +33628,12 @@ HTML_PAGE = """
       for (const r of (result.rows || [])) {
         const key = rowVisibilityKey(r);
         if (visibilityMap[key] === undefined) visibilityMap[key] = (r.status === "ok");
+      }
+      for (const r of (result.rows || [])) {
+        lineStyleForKey(rowVisibilityKey(r));
+      }
+      for (const s of (result.series || [])) {
+        lineStyleForKey(makeVisibilityKey(s.pool_id, "all", "all"));
       }
 
       const daysForApy = Number(result?.request?.days || getDaysValue());
