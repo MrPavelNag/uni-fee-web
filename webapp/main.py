@@ -33075,6 +33075,10 @@ HTML_PAGE = """
       return `${v.slice(0, 4)}...${v.slice(-4)}`;
     }
 
+    function cleanPairLabel(pair) {
+      return String(pair || "").replace(/\s*\(estimated\)\s*/ig, "").trim();
+    }
+
     function formatQualityReasonShort(rawReason, qualityTag) {
       const raw = String(rawReason || "").trim();
       if (!raw) return "-";
