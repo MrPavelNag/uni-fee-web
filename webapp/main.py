@@ -18109,12 +18109,11 @@ def _merge_for_web(
         src_l = src.lower()
         br = str(branch or "").strip().lower()
         anc = str(anchor_type or "").strip().lower()
-        strict_dbg = (v.get("strict_debug") or {}) if isinstance(v, dict) else {}
         if has_strict_compare:
             if br == "estimated":
                 anchor_lbl = "active" if anc == "active" else "full"
-                return f"Strict compare: estimated {anchor_lbl} | TVL shape=poolDayData + NOW anchor | fees=subgraph feesUSD"
-            return "Strict compare: mixed path"
+                return f"Estimated {anchor_lbl} | TVL shape=poolDayData + NOW anchor | fees=subgraph feesUSD"
+            return "Estimated path"
         # Fast legacy / estimate mode
         if ver == "v4":
             if "v4_interface:totalliquidity" in src_l:
@@ -18287,7 +18286,7 @@ def _merge_for_web(
             est_tvl = v.get("strict_compare_estimated_tvl") or []
             est_active_fees = v.get("strict_compare_estimated_active_fees") or []
             est_active_tvl = v.get("strict_compare_estimated_active_tvl") or []
-            strict_compare_reason = str(v.get("strict_compare_reason") or dq_reason or "strict_compare")
+            strict_compare_reason = str(v.get("strict_compare_reason") or dq_reason or "estimated_compare")
 
             tvl_end_ts = max(
                 [0]
@@ -33179,7 +33178,12 @@ HTML_PAGE = """
           html += `<td>${anchor}</td>`;
         }
         const dqReason = String(r.data_quality_reason || "");
-        const calcPath = String(r.calc_path_human || "").trim();
+        const calcPathRaw = String(r.calc_path_human || "").trim();
+        const calcPath = calcPathRaw
+          .replace(/^\s*strict\s+compare\s*:\s*/i, "Estimated ")
+          .replace(/\bstrict\s+compare\b/ig, "estimated")
+          .replace(/\bstrict\s+exact\b/ig, "estimated")
+          .trim();
         const riskLevel = String(r.risk_level || "none").toLowerCase();
         const riskReason = String(r.risk_reason || "").trim();
         const riskFlags = Array.isArray(r.risk_flags) ? r.risk_flags.join(", ") : "";
