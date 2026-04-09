@@ -480,6 +480,66 @@ def _active_window_amounts(
     return float(max(Decimal(0), a0)), float(max(Decimal(0), a1)), "pure_onchain_active_window"
 
 
+def _active_amounts_nearest_initialized_band(
+    *,
+    chain_id: int,
+    chain: str,
+    pool_id: str,
+    liquidity: int,
+    current_tick: int,
+    tick_spacing: int,
+    sqrt_price_x96: int,
+    max_steps: int,
+) -> tuple[float, float, str, dict[str, Any]]:
+    """Compute active amounts in nearest initialized tick band around current price."""
+    meta: dict[str, Any] = {"band_lo": None, "band_hi": None, "band_width": 0, "scan_calls": 0}
+    if int(liquidity) <= 0 or int(tick_spacing) <= 0 or int(sqrt_price_x96) <= 0:
+        a0, a1, src = _active_window_amounts(liquidity, current_tick, tick_spacing, sqrt_price_x96)
+        return a0, a1, f"{src}:fallback_invalid_inputs", meta
+
+    s = int(tick_spacing)
+    base = int(math.floor(float(current_tick) / float(s)) * s)
+    lo_tick: int | None = None
+    hi_tick: int | None = None
+    src_tag = ""
+
+    for k in range(0, max(1, int(max_steps)) + 1):
+        if lo_tick is None:
+            t_lo = int(base - k * s)
+            gross, net, src = _read_tick_liquidity_net(int(chain_id), str(chain), str(pool_id), int(t_lo))
+            meta["scan_calls"] = int(meta.get("scan_calls") or 0) + 1
+            src_tag = src_tag or str(src or "")
+            if int(gross) > 0 or int(net) != 0:
+                lo_tick = int(t_lo)
+        if hi_tick is None:
+            t_hi = int(base + (k + 1) * s)
+            gross, net, src = _read_tick_liquidity_net(int(chain_id), str(chain), str(pool_id), int(t_hi))
+            meta["scan_calls"] = int(meta.get("scan_calls") or 0) + 1
+            src_tag = src_tag or str(src or "")
+            if int(gross) > 0 or int(net) != 0:
+                hi_tick = int(t_hi)
+        if lo_tick is not None and hi_tick is not None:
+            break
+
+    if lo_tick is None or hi_tick is None or int(hi_tick) <= int(lo_tick):
+        a0, a1, src = _active_window_amounts(liquidity, current_tick, tick_spacing, sqrt_price_x96)
+        return a0, a1, f"{src}:fallback_no_initialized_band", meta
+
+    sqrt_lo = _sqrt_ratio_x96_at_tick(int(lo_tick))
+    sqrt_hi = _sqrt_ratio_x96_at_tick(int(hi_tick))
+    sqrt_p = Decimal(int(sqrt_price_x96))
+    liq = Decimal(int(liquidity))
+    if not (sqrt_lo < sqrt_p < sqrt_hi):
+        sqrt_p = min(max(sqrt_p, sqrt_lo + Decimal(1)), sqrt_hi - Decimal(1))
+    a0, _ = _amounts_from_liquidity_segment(liq, sqrt_p, sqrt_hi)
+    _, a1 = _amounts_from_liquidity_segment(liq, sqrt_lo, sqrt_p)
+    meta["band_lo"] = int(lo_tick)
+    meta["band_hi"] = int(hi_tick)
+    meta["band_width"] = int(hi_tick - lo_tick)
+    src = f"pure_onchain_active_initialized_band:{src_tag or 'state'}"
+    return float(max(Decimal(0), a0)), float(max(Decimal(0), a1)), src, meta
+
+
 def _compute_pool_token_amounts_onchain(
     chain_id: int,
     chain: str,
@@ -635,13 +695,31 @@ def _resolve_pool_tvl_now_onchain_v4_exact2(
     a0_full_raw = float(a0_full * (10 ** d0))
     a1_full_raw = float(a1_full * (10 ** d1))
 
-    a0_active_raw, a1_active_raw, active_src = _active_window_amounts(pool_liquidity, current_tick, tick_spacing, sqrt_price_x96)
+    try:
+        active_band_max_steps = max(8, min(1000, int(os.environ.get("STRICT_V4_ACTIVE_BAND_MAX_STEPS", "120") or 120)))
+    except Exception:
+        active_band_max_steps = 120
+    a0_active_raw, a1_active_raw, active_src, active_meta = _active_amounts_nearest_initialized_band(
+        chain_id=int(chain_id),
+        chain=str(ck),
+        pool_id=str(pool_id),
+        liquidity=int(pool_liquidity),
+        current_tick=int(current_tick),
+        tick_spacing=int(tick_spacing),
+        sqrt_price_x96=int(sqrt_price_x96),
+        max_steps=int(active_band_max_steps),
+    )
     dbg["quantity_mode_full_available"] = bool(full_available)
     dbg["quantity_mode_active_available"] = bool((a0_active_raw > 0.0) or (a1_active_raw > 0.0))
     dbg["amount0_full_pool"] = float(a0_full)
     dbg["amount1_full_pool"] = float(a1_full)
     dbg["amount0_active_window"] = float(a0_active_raw / (10 ** d0)) if d0 > 0 else 0.0
     dbg["amount1_active_window"] = float(a1_active_raw / (10 ** d1)) if d1 > 0 else 0.0
+    dbg["active_band_max_steps"] = int(active_band_max_steps)
+    dbg["active_band_lo"] = active_meta.get("band_lo")
+    dbg["active_band_hi"] = active_meta.get("band_hi")
+    dbg["active_band_width"] = int(active_meta.get("band_width") or 0)
+    dbg["active_band_scan_calls"] = int(active_meta.get("scan_calls") or 0)
 
     if full_available:
         a0_raw = float(a0_full_raw)
@@ -855,10 +933,11 @@ def main() -> None:
             est_active_flat_tvl_for_fees = [(int(ts), float(tvl_active_now)) for ts, _ in (fees_usd or [])]
             estimated_active_fees = _rebuild_fees_cumulative(fees_usd, est_active_flat_tvl_for_fees)
     exact_tvl = _one_point_exact_tvl(fees_usd, float(pool_tvl_now_usd))
-    # Compatibility with current webapp strict-compare table:
-    # exact full income/APY are read from strict_compare_exact_fees.
-    # v0.2.1 emitted empty exact fees, which now renders as $0 / 0%.
-    # Keep v0.2.1 exact full TVL semantics, but expose fees curve for row metrics.
+    # Compatibility guard: never emit empty exact fees in strict compare.
+    # The table computes exact full income/APY from strict_compare_exact_fees.
+    if not estimated_fees and fees_usd and float(pool_tvl_now_usd) > 0.0:
+        est_flat_tvl_for_fees = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in (fees_usd or [])]
+        estimated_fees = _rebuild_fees_cumulative(fees_usd, est_flat_tvl_for_fees)
     exact_fees = list(estimated_fees or [])
     exact_active_tvl = _one_point_marker_tvl(fees_usd, float((strict_dbg or {}).get("tvl_active_window_usd") or 0.0))
     exact_cov = float(sum(1 for _ts, v in exact_tvl if float(v) > 0.0) / max(1, len(exact_tvl)))
