@@ -1738,6 +1738,24 @@ def main() -> None:
         onchain_hist_full_tvl = list(hist_full or [])
         onchain_hist_active_tvl = list(hist_active or [])
         strict_dbg["onchain_history_debug"] = dict(hist_dbg or {})
+        # Reliability gate for exact full history:
+        # when full history is produced entirely via active*ratio fallback
+        # (ticks disabled / no full-token reconstruction), values are unstable
+        # and can diverge sharply from the actual pool TVL level.
+        try:
+            hist_counters = dict((hist_dbg or {}).get("counters") or {})
+            full_points = int(hist_counters.get("full_points") or 0)
+            full_fallback_points = int(hist_counters.get("full_fallback_points") or 0)
+            ticks_status = str((hist_dbg or {}).get("ticks_status") or "").strip().lower()
+            fallback_only = bool(full_points > 0 and full_fallback_points >= full_points)
+            no_tick_universe = bool(ticks_status in {"disabled", "timeout", "init_meta_unavailable", ""})
+            if fallback_only and no_tick_universe:
+                onchain_hist_full_tvl = []
+                strict_dbg["onchain_history_full_reliability"] = "fallback_only_disabled"
+            else:
+                strict_dbg["onchain_history_full_reliability"] = "ok"
+        except Exception:
+            strict_dbg["onchain_history_full_reliability"] = "unknown"
 
     # Match V3 principle:
     # estimated(active/full) always use _build_estimated_tvl with NOW anchor.
