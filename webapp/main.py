@@ -18010,6 +18010,7 @@ def _merge_for_web(
     min_fee_pct: float,
     max_fee_pct: float,
     min_apy_pct: float,
+    min_tvl: float,
     days: int,
     lp_allocation_usd: float,
     exclude_suffixes: list[str],
@@ -18051,6 +18052,8 @@ def _merge_for_web(
     rows = []
     chart_series = []
     filtered_out = 0
+    filtered_by_apy = 0
+    filtered_by_min_tvl = 0
     default_visible = 0
     days_safe = max(1, int(days or 1))
     alloc_safe = float(lp_allocation_usd or 0.0)
@@ -18250,6 +18253,7 @@ def _merge_for_web(
         else:
             if float(apy_pct) < float(min_apy_pct or 0.0):
                 filtered_out += 1
+                filtered_by_apy += 1
                 continue
         if excluded_by_suffix(v, pool_id):
             status = "filtered_suffix"
@@ -18263,6 +18267,10 @@ def _merge_for_web(
             pool_tvl_now_usd = float(v.get("pool_tvl_now_usd") or 0.0)
         except (TypeError, ValueError):
             pool_tvl_now_usd = 0.0
+        if float(pool_tvl_now_usd) < float(min_tvl or 0.0):
+            filtered_out += 1
+            filtered_by_min_tvl += 1
+            continue
         if not dq_reason:
             ver = str(v.get("version") or "").strip().lower()
             if dq == "exact":
@@ -18425,6 +18433,12 @@ def _merge_for_web(
         "total": len(merged),
         "chart_pools": default_visible,
         "error_pools": filtered_out,
+        "result_flags": {
+            "empty_due_to_min_apy": bool((len(rows) == 0) and (filtered_by_apy > 0)),
+            "empty_due_to_min_tvl": bool((len(rows) == 0) and (filtered_by_min_tvl > 0)),
+            "filtered_by_apy_count": int(filtered_by_apy),
+            "filtered_by_min_tvl_count": int(filtered_by_min_tvl),
+        },
         "rows": rows,
         "series": chart_series,
     }
@@ -19504,6 +19518,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             min_fee_pct=req.min_fee_pct,
             max_fee_pct=req.max_fee_pct,
             min_apy_pct=req.min_apy_pct,
+            min_tvl=req.min_tvl,
             days=req.days,
             lp_allocation_usd=float(env.get("LP_ALLOCATION_USD", "1000") or 1000.0),
             exclude_suffixes=req.exclude_suffixes,
@@ -31728,6 +31743,7 @@ HTML_PAGE = """
     let visibilityMap = {};
     let seriesByPool = {};
     let currentRequest = {};
+    let currentResultFlags = {};
     let pairPresetCatalog = {stablecoins: [], stableAlgoCrypto: [], coins: [], commodityStablecoins: [], fiatNonUsdStablecoins: [], memes: []};
     let authState = {authenticated: false};
     let hasScanRun = false;
@@ -33057,6 +33073,26 @@ HTML_PAGE = """
       const pairHintText = getChartPairsHintText();
       const endDate = maxTs > 0 ? new Date(maxTs * 1000) : new Date();
       const startDate = new Date(endDate.getTime() - days * 24 * 3600 * 1000);
+      const emptyDueToMinApy = !!currentResultFlags?.empty_due_to_min_apy;
+      const emptyDueToMinTvl = !!currentResultFlags?.empty_due_to_min_tvl;
+      const minApyValue = Number(currentRequest?.min_apy_pct || 0);
+      const minTvlValue = Number(currentRequest?.min_tvl || 0);
+      const warningText = emptyDueToMinApy
+        ? `No pools passed Min APY filter (${Number.isFinite(minApyValue) ? minApyValue.toFixed(1) : "0.0"}%)`
+        : (emptyDueToMinTvl
+            ? `No pools passed Min TVL filter ($${formatUsd(Number.isFinite(minTvlValue) ? minTvlValue : 0)})`
+            : "");
+      const warningAnnotations = (warningText && feeTraces.length === 0 && tvlTraces.length === 0)
+        ? [{
+            text: warningText,
+            x: 0.5,
+            y: 0.5,
+            xref: "paper",
+            yref: "paper",
+            showarrow: false,
+            font: {color: "#b91c1c", size: 13},
+          }]
+        : [];
       Plotly.newPlot("feesChart", feeTraces, {
         title: {text: `Cumulative Fees (LP allocation: $${formatUsd(alloc)})${scopeSuffix}`, font: {size: 14}},
         paper_bgcolor: "#ffffff",
@@ -33065,7 +33101,8 @@ HTML_PAGE = """
         showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
-        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, rangemode: "tozero"}
+        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, rangemode: "tozero"},
+        annotations: warningAnnotations,
       }, {displaylogo: false, responsive: true}).then(() => {
         installChartTitleHint("feesChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
       });
@@ -33077,7 +33114,8 @@ HTML_PAGE = """
         showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
-        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, rangemode: "tozero"}
+        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, rangemode: "tozero"},
+        annotations: warningAnnotations,
       }, {displaylogo: false, responsive: true}).then(() => {
         installChartTitleHint("tvlChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
       });
@@ -33572,10 +33610,27 @@ HTML_PAGE = """
             setBusy(false);
             const fromCache = !!job?.result?.result_flags?.from_cache || String(job?.stage_label || "").toLowerCase().includes("cache");
             const incomplete = !!job?.result?.result_flags?.incomplete_discovery;
+            const emptyDueToMinApy = !!job?.result?.result_flags?.empty_due_to_min_apy;
+            const emptyDueToMinTvl = !!job?.result?.result_flags?.empty_due_to_min_tvl;
+            const rowsCount = Array.isArray(job?.result?.rows) ? job.result.rows.length : 0;
+            const chartPools = Number(job?.result?.chart_pools || 0);
+            const totalPools = Number(job?.result?.total || 0);
+            const minApy = Number(job?.result?.request?.min_apy_pct || 0);
+            const minTvl = Number(job?.result?.request?.min_tvl || 0);
             if (fromCache) {
               setStatus("Completed (cache)", "ok");
             } else if (incomplete) {
               setStatus(`Completed in ${elapsedSec}s (warning: incomplete discovery)`, "fail");
+            } else if (emptyDueToMinApy) {
+              setStatus(`Completed in ${elapsedSec}s: no pools passed Min APY ${Number.isFinite(minApy) ? minApy.toFixed(1) : "0.0"}%`, "fail");
+            } else if (emptyDueToMinTvl) {
+              setStatus(`Completed in ${elapsedSec}s: no pools passed Min TVL $${formatUsd(Number.isFinite(minTvl) ? minTvl : 0)}`, "fail");
+            } else if (rowsCount === 0) {
+              const noDiscovery = totalPools <= 0 && chartPools <= 0;
+              const hint = noDiscovery
+                ? "no pools found for selected pairs/chains"
+                : `all pools filtered out (min APY ${Number.isFinite(minApy) ? minApy.toFixed(1) : "0.0"}%, min TVL $${formatUsd(Number.isFinite(minTvl) ? minTvl : 0)})`;
+              setStatus(`Completed in ${elapsedSec}s: empty result (${hint})`, "fail");
             } else {
               setStatus(`Completed in ${elapsedSec}s`, "ok");
             }
@@ -33620,6 +33675,7 @@ HTML_PAGE = """
       if (mErr) mErr.textContent = result.error_pools;
 
       currentRequest = result?.request || {};
+      currentResultFlags = (result && typeof result.result_flags === "object" && result.result_flags) ? result.result_flags : {};
       rowLineStyleMap = {};
       visibilityMap = {};
       seriesByPool = {};
