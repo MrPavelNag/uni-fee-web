@@ -16334,6 +16334,173 @@ def _scan_aave_merit_rewards(addresses: list[str], chain_ids: list[int]) -> tupl
     return rows, errors
 
 
+def _stable_catalog_for_lending_scan() -> tuple[dict[str, list[str]], dict[str, str], set[str]]:
+    catalog = _load_pair_lists_catalog(refresh=False)
+    fiat_backed = [str(x or "").strip().lower() for x in (catalog.get("stablecoins_full") or catalog.get("stablecoins") or []) if str(x or "").strip()]
+    non_usd = [str(x or "").strip().lower() for x in (catalog.get("fiat_nonusd_stables") or []) if str(x or "").strip()]
+    algo_crypto = [
+        str(x or "").strip().lower()
+        for x in (catalog.get("stable_algo_crypto_full") or catalog.get("stable_algo_crypto") or [])
+        if str(x or "").strip()
+    ]
+    categories = {
+        "fiat_backed": list(dict.fromkeys(fiat_backed)),
+        "fiat_nonusd": list(dict.fromkeys(non_usd)),
+        "algo_crypto": list(dict.fromkeys(algo_crypto)),
+    }
+    symbol_to_bucket: dict[str, str] = {}
+    for bucket in ("fiat_backed", "fiat_nonusd", "algo_crypto"):
+        for sym in categories.get(bucket, []):
+            symbol_to_bucket.setdefault(str(sym), bucket)
+    symbols = set(symbol_to_bucket.keys())
+    return categories, symbol_to_bucket, symbols
+
+
+def _pct_from_percent_value(raw: Any) -> float:
+    v = _safe_float(raw)
+    if v <= 0:
+        return 0.0
+    # Aave PercentValue.value may be normalized (1.0 = 100%).
+    return float(v * 100.0) if v <= 1.5 else float(v)
+
+
+def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    categories, symbol_to_bucket, stable_symbols = _stable_catalog_for_lending_scan()
+    if not stable_symbols:
+        return [], {"stable_catalog": categories, "chains": [], "markets": 0}, ["Stablecoin catalog is empty."]
+
+    chain_ids = sorted(int(x) for x in AAVE_CHAIN_ID_TO_NAME.keys())
+    query = """
+    query AaveStableMarkets($ids: [ChainId!]!) {
+      markets(request: { chainIds: $ids }) {
+        address
+        name
+        chain { chainId name }
+        reserves {
+          underlyingToken { symbol address decimals }
+          supplyInfo { apy { value } canBeCollateral }
+          borrowInfo { apy { value } }
+          isFrozen
+          isPaused
+          incentives {
+            __typename
+            ... on MeritSupplyIncentive {
+              extraSupplyApr { value }
+            }
+            ... on AaveSupplyIncentive {
+              extraSupplyApr { value }
+              rewardTokenSymbol
+            }
+            ... on MeritBorrowIncentive {
+              borrowAprDiscount { value }
+            }
+            ... on AaveBorrowIncentive {
+              borrowAprDiscount { value }
+              rewardTokenSymbol
+            }
+            ... on MeritBorrowAndSupplyIncentiveCondition {
+              extraApr { value }
+              supplyToken { symbol }
+              borrowToken { symbol }
+            }
+          }
+        }
+      }
+    }
+    """
+    try:
+        data = graphql_query(AAVE_V3_GRAPHQL_ENDPOINT, query, {"ids": chain_ids}, retries=1)
+    except Exception as e:
+        return [], {"stable_catalog": categories, "chains": [], "markets": 0}, [f"AAVE markets scan failed: {e}"]
+
+    markets = (data.get("data") or {}).get("markets") or []
+    rows: list[dict[str, Any]] = []
+    seen_chains: set[int] = set()
+    for market in markets:
+        chain = (market.get("chain") or {})
+        chain_id = int(chain.get("chainId") or 0)
+        chain_name = str(chain.get("name") or AAVE_CHAIN_ID_TO_NAME.get(chain_id, chain_id))
+        if chain_id > 0:
+            seen_chains.add(chain_id)
+        market_name = str(market.get("name") or "")
+        for reserve in (market.get("reserves") or []):
+            token = (reserve.get("underlyingToken") or {})
+            symbol = str(token.get("symbol") or "").strip().lower()
+            if not symbol or symbol not in stable_symbols:
+                continue
+            supply_apy_pct = _pct_from_percent_value((((reserve.get("supplyInfo") or {}).get("apy") or {}).get("value")))
+            borrow_apy_pct = _pct_from_percent_value((((reserve.get("borrowInfo") or {}).get("apy") or {}).get("value")))
+            supply_bonus_pct = 0.0
+            borrow_discount_pct = 0.0
+            conditional_bonus_pct = 0.0
+            reward_tokens: set[str] = set()
+            bonus_labels: list[str] = []
+            for inc in (reserve.get("incentives") or []):
+                t = str(inc.get("__typename") or "")
+                if t in {"MeritSupplyIncentive", "AaveSupplyIncentive"}:
+                    val = _pct_from_percent_value((((inc.get("extraSupplyApr") or {}).get("value"))))
+                    if val > 0:
+                        supply_bonus_pct += float(val)
+                        bonus_labels.append(f"{t}: +{val:.2f}% supply")
+                    rt = str(inc.get("rewardTokenSymbol") or "").strip().upper()
+                    if rt:
+                        reward_tokens.add(rt)
+                elif t in {"MeritBorrowIncentive", "AaveBorrowIncentive"}:
+                    val = _pct_from_percent_value((((inc.get("borrowAprDiscount") or {}).get("value"))))
+                    if val > 0:
+                        borrow_discount_pct += float(val)
+                        bonus_labels.append(f"{t}: -{val:.2f}% borrow")
+                    rt = str(inc.get("rewardTokenSymbol") or "").strip().upper()
+                    if rt:
+                        reward_tokens.add(rt)
+                elif t == "MeritBorrowAndSupplyIncentiveCondition":
+                    val = _pct_from_percent_value((((inc.get("extraApr") or {}).get("value"))))
+                    sup = str(((inc.get("supplyToken") or {}).get("symbol") or "")).strip().upper()
+                    bor = str(((inc.get("borrowToken") or {}).get("symbol") or "")).strip().upper()
+                    if val > 0:
+                        conditional_bonus_pct += float(val)
+                        cond = f"{sup}/{bor}" if (sup or bor) else "conditional"
+                        bonus_labels.append(f"{t} ({cond}): +{val:.2f}%")
+            supply_total_pct = float(supply_apy_pct + supply_bonus_pct + conditional_bonus_pct)
+            borrow_effective_pct = float(max(0.0, borrow_apy_pct - borrow_discount_pct))
+            rows.append(
+                {
+                    "chain": chain_name,
+                    "chain_id": int(chain_id),
+                    "market": market_name,
+                    "asset": symbol.upper(),
+                    "bucket": str(symbol_to_bucket.get(symbol) or "other"),
+                    "supply_apy_pct": float(supply_apy_pct),
+                    "supply_bonus_apr_pct": float(supply_bonus_pct),
+                    "conditional_bonus_apr_pct": float(conditional_bonus_pct),
+                    "supply_total_apr_pct": float(supply_total_pct),
+                    "borrow_apy_pct": float(borrow_apy_pct),
+                    "borrow_discount_apr_pct": float(borrow_discount_pct),
+                    "borrow_effective_apr_pct": float(borrow_effective_pct),
+                    "can_be_collateral": bool((reserve.get("supplyInfo") or {}).get("canBeCollateral")),
+                    "paused": bool(reserve.get("isPaused")),
+                    "frozen": bool(reserve.get("isFrozen")),
+                    "reward_tokens": sorted(reward_tokens),
+                    "bonus_programs": bonus_labels,
+                }
+            )
+
+    rows.sort(
+        key=lambda r: (
+            str(r.get("asset") or ""),
+            -float(r.get("supply_total_apr_pct") or 0.0),
+            str(r.get("chain") or ""),
+            str(r.get("market") or ""),
+        )
+    )
+    meta = {
+        "stable_catalog": categories,
+        "chains": sorted(int(x) for x in seen_chains),
+        "markets": int(len(markets)),
+    }
+    return rows, meta, []
+
+
 def _parse_pairs_str(raw: str) -> list[tuple[str, str]]:
     def _norm_sym(s: str) -> str:
         v = str(s or "").strip().lower()
@@ -18664,8 +18831,6 @@ def _build_run_job_env(
     run_v4: bool,
 ) -> dict[str, str]:
     env = os.environ.copy()
-    mode_fast_legacy = True
-    run_mode = "fast_legacy"
     # Per-chain RPC routing (no shared/global RPC across chains).
     # Priority for each chain:
     # 1) chain-specific env (ALCHEMY_RPC_URL_<CHAIN>/RPC_URL_<CHAIN>/WEB3_RPC_URL_<CHAIN>)
@@ -18707,11 +18872,6 @@ def _build_run_job_env(
         if not str(env.get(key, "") or "").strip():
             env[key] = str(rpc_url)
 
-    strict_mode = False
-    strict_allow_public_fallback = str(env.get("STRICT_RPC_ALLOW_PUBLIC_FALLBACK", "0") or "").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
-
     def _prepend_rpc(chain_key: str, chain_id: int) -> None:
         ck = str(chain_key or "").strip().lower()
         cu = ck.upper()
@@ -18726,9 +18886,6 @@ def _build_run_job_env(
         if not chain_rpc:
             return
         key = f"V3_RPC_URLS_{cid}"
-        if strict_mode and ("g.alchemy.com" in str(chain_rpc).lower()) and not strict_allow_public_fallback:
-            env[key] = str(chain_rpc)
-            return
         existing = [x.strip() for x in str(env.get(key, "") or "").split(",") if x.strip()]
         merged: list[str] = []
         seen: set[str] = set()
@@ -18819,7 +18976,6 @@ def _build_run_job_env(
     env["V3_EXACT_TVL_DAYS_MAX"] = exact_days_default
     env["V3_EXACT_TVL_MAX_POOLS"] = "0"
     env["V3_EXACT_TVL_POOL_BUDGET_SEC"] = "0"
-    env["RUN_MODE"] = run_mode
     env["V3_EXACT_TVL_ENABLE"] = "0"
     env["V3_EXACT_TVL_STRICT_MODE"] = "0"
     # v4 endpoint config uses this list at import-time.
@@ -18928,7 +19084,7 @@ def _pool_run_cache_key(req: "PoolsRunRequest") -> str:
         "versions": versions,
         "days": int(req.days or 0),
         "min_tvl": float(req.min_tvl or 0.0),
-        "speed_mode": str(req.speed_mode or "normal").strip().lower(),
+        "speed_mode": str(req.speed_mode or "fast").strip().lower(),
         "run_mode": run_mode,
         "min_fee_pct": float(req.min_fee_pct or 0.0),
         "max_fee_pct": float(req.max_fee_pct or 0.0),
@@ -19376,7 +19532,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
     }
 
     t_prepare0 = time.perf_counter()
-    speed_mode = str(req.speed_mode or "normal").strip().lower()
+    speed_mode = str(req.speed_mode or "fast").strip().lower()
     if speed_mode not in {"normal", "fast"}:
         speed_mode = "normal"
     mode_fast_legacy = True
@@ -25138,17 +25294,20 @@ def _render_stables_page() -> str:
     }
     .positions-form h3, .result-card h3 { margin:0; font-size:17px; color:#1f3a8a; }
     .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; min-width:0; }
-    .address-columns { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
-    .stables-address-columns { grid-template-columns:repeat(3, minmax(0, 1fr)); }
-    .addr-box { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
-    .addr-input-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
-    .addr-input-row input { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; }
-    .btn-plus { width:26px; min-width:26px; height:26px; border:none; border-radius:0; padding:0; font-size:22px; line-height:1; display:inline-flex; align-items:center; justify-content:center; background:transparent; color:#2563eb; font-weight:800; box-shadow:none; }
-    .btn-plus:hover { color:#1d4ed8; background:transparent; }
     .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; min-height:26px; }
     .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
-    .chip .x { border:none; background:transparent; color:#1d4ed8; cursor:pointer; font-weight:700; padding:0; line-height:1; }
     .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
+    .stable-groups { display:grid; grid-template-columns:repeat(1, minmax(0, 1fr)); gap:10px; }
+    .stable-group { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; }
+    .stable-group h4 { margin:0 0 6px; font-size:14px; color:#1e3a8a; }
+    .stable-meta { margin-top:6px; color:#475569; font-size:12px; }
+    .stable-table-controls { display:grid; grid-template-columns:repeat(6, minmax(120px, 1fr)); gap:8px; margin:8px 0 10px; }
+    .stable-table-controls .ctrl { display:flex; flex-direction:column; gap:4px; }
+    .stable-table-controls label { font-size:11px; color:#64748b; }
+    .stable-table-controls input, .stable-table-controls select { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:6px 8px; font-size:12px; }
+    .stable-table-controls .check { flex-direction:row; align-items:center; gap:6px; padding-top:18px; }
+    .stable-table-controls .check input { width:auto; }
+    .stable-table-summary { margin:0 0 8px; font-size:12px; color:#475569; }
     .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:17px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
@@ -25169,14 +25328,13 @@ def _render_stables_page() -> str:
       max-width:100%;
       min-width:0;
     }
-    table { width:100%; border-collapse:collapse; font-size:12px; min-width:900px; }
+    table { width:100%; border-collapse:collapse; font-size:12px; min-width:1250px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     @media (max-width: 1100px) {
-      .address-columns { grid-template-columns:1fr; }
       .positions-form, .result-card { padding: 12px; }
       .section-head { flex-wrap: wrap; align-items: center; }
       .section-head h3 { font-size: 16px; }
@@ -25185,14 +25343,11 @@ def _render_stables_page() -> str:
     @media (max-width: 720px) {
       .positions-grid { gap: 10px; }
       .positions-form, .result-card { padding: 10px; border-radius: 12px; }
-      .addr-box { padding: 8px; }
-      .addr-input-row { gap: 6px; }
-      .addr-input-row input { font-size: 12px; padding: 7px; }
-      .btn-plus { width: 24px; min-width: 24px; height: 24px; font-size: 20px; }
       .chip { font-size: 11px; padding: 3px 7px; }
       .pos-status { font-size: 12px; min-width: 0; max-width: 100%; flex: 1 1 140px; }
       .table-wrap { border-radius: 8px; }
-      table { min-width: 740px; font-size: 11px; }
+      .stable-table-controls { grid-template-columns:repeat(2, minmax(120px, 1fr)); }
+      table { min-width: 980px; font-size: 11px; }
       th, td { padding: 6px; }
       .mono { font-size: 10px; }
       .errors-box, .info-box { font-size: 11px; padding: 7px; }
@@ -25201,34 +25356,13 @@ def _render_stables_page() -> str:
     extra_html = """
     <div class="positions-grid">
       <section class="positions-form">
-        <div class="section-head"><h3>Lending Stablecoin</h3></div>
-        <div class="address-columns stables-address-columns">
-          <div class="addr-box">
-            <div class="addr-input-row">
-              <input id="evmInput" placeholder="0x..." />
-              <button class="btn btn-plus" type="button" onclick="addAddress('evm')" aria-label="Add EVM address">+</button>
-            </div>
-            <div class="chips" id="evmChips"></div>
-          </div>
-          <div class="addr-box">
-            <div class="addr-input-row">
-              <input id="solanaInput" placeholder="Solana address" />
-              <button class="btn btn-plus" type="button" onclick="addAddress('solana')" aria-label="Add Solana address">+</button>
-            </div>
-            <div class="chips" id="solanaChips"></div>
-          </div>
-          <div class="addr-box">
-            <div class="addr-input-row">
-              <input id="tronInput" placeholder="TRON address" />
-              <button class="btn btn-plus" type="button" onclick="addAddress('tron')" aria-label="Add TRON address">+</button>
-            </div>
-            <div class="chips" id="tronChips"></div>
-          </div>
-        </div>
+        <div class="section-head"><h3>Stablecoin universe (from Pools lists)</h3></div>
+        <div id="stableUniverseMeta" class="stable-meta">Loading stablecoin lists...</div>
+        <div id="stableUniverseGroups" class="stable-groups"></div>
       </section>
       <section class="result-card">
         <div class="section-head">
-          <h3 id="stableCombinedTitle">Lending positions and unclaimed rewards</h3>
+          <h3 id="stableCombinedTitle">AAVE lending rates and bonus programs</h3>
           <div class="section-actions">
             <div id="stableProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="stableStatus">Ready</span>
@@ -25237,10 +25371,55 @@ def _render_stables_page() -> str:
           </div>
         </div>
         <div id="stableCombinedBody" class="section-body">
-          <div id="stableLendingHeading" style="margin-bottom:8px;font-weight:700;color:#1e3a8a;display:none">Lending positions</div>
+          <div id="stableLendingHeading" style="margin-bottom:8px;font-weight:700;color:#1e3a8a;display:none">Combined AAVE stablecoin table (base + bonus APR)</div>
+          <div class="stable-table-controls">
+            <div class="ctrl">
+              <label>Sort by</label>
+              <select id="stableSortBy" onchange="onStableTableControlChange()">
+                <option value="supply_total_apr_pct" selected>Supply Total APR</option>
+                <option value="supply_apy_pct">Supply APY</option>
+                <option value="supply_bonus_apr_pct">Supply Bonus APR</option>
+                <option value="borrow_effective_apr_pct">Borrow Effective APR</option>
+                <option value="borrow_apy_pct">Borrow APY</option>
+                <option value="asset">Asset</option>
+                <option value="chain">Chain</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label>Order</label>
+              <select id="stableSortDir" onchange="onStableTableControlChange()">
+                <option value="desc" selected>Desc</option>
+                <option value="asc">Asc</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label>Top N</label>
+              <select id="stableTopN" onchange="onStableTableControlChange()">
+                <option value="25">25</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="0">All</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label>Min Supply Total APR %</label>
+              <input id="stableMinTotalApr" type="number" step="0.01" min="0" value="0" oninput="onStableTableControlChange()" />
+            </div>
+            <div class="ctrl">
+              <label>Search asset/chain</label>
+              <input id="stableSearch" type="text" placeholder="e.g. USDC or base" oninput="onStableTableControlChange()" />
+            </div>
+            <div class="ctrl check">
+              <input id="stableOnlyBonuses" type="checkbox" onchange="onStableTableControlChange()" />
+              <label for="stableOnlyBonuses">Only with bonuses</label>
+            </div>
+            <div class="ctrl check">
+              <input id="stableOnlyActive" type="checkbox" checked onchange="onStableTableControlChange()" />
+              <label for="stableOnlyActive">Only active</label>
+            </div>
+          </div>
+          <div id="stableTableSummary" class="stable-table-summary">Rows: 0</div>
           <div class="table-wrap"><table id="stableLendingTable"></table></div>
-          <div id="stableRewardsHeading" style="margin:12px 0 8px;font-weight:700;color:#1e3a8a;display:none">Unclaimed lending rewards</div>
-          <div class="table-wrap"><table id="stableRewardsTable"></table></div>
           <div id="stableErrors"></div>
         </div>
       </section>
@@ -25248,66 +25427,77 @@ def _render_stables_page() -> str:
     """
     extra_script = """
     function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
-    const stableState = { evm: [], solana: [], tron: [] };
-    const STABLE_STORAGE_KEY = "stables_form_v1";
-    function validAddress(kind, value) {
-      const v = String(value || "").trim();
-      if (!v) return false;
-      if (kind === "evm") return /^0x[a-fA-F0-9]{40}$/.test(v);
-      if (kind === "solana") return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
-      if (kind === "tron") return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(v);
-      return false;
-    }
-    function inputId(kind) {
-      if (kind === "evm") return "evmInput";
-      if (kind === "solana") return "solanaInput";
-      return "tronInput";
-    }
-    function chipsId(kind) {
-      if (kind === "evm") return "evmChips";
-      if (kind === "solana") return "solanaChips";
-      return "tronChips";
-    }
-    function saveStableState() { localStorage.setItem(STABLE_STORAGE_KEY, JSON.stringify(stableState)); }
-    function loadStableState() {
-      try {
-        const raw = localStorage.getItem(STABLE_STORAGE_KEY);
-        if (!raw) return;
-        const parsed = JSON.parse(raw);
-        for (const k of ["evm", "solana", "tron"]) {
-          if (Array.isArray(parsed[k])) stableState[k] = parsed[k].map((x) => String(x || "").trim()).filter(Boolean);
-        }
-      } catch (_) {}
-    }
-    function renderChips(kind) {
-      const wrap = document.getElementById(chipsId(kind));
-      if (!wrap) return;
-      const rows = stableState[kind] || [];
-      if (!rows.length) { wrap.innerHTML = "<span class='chip muted'>No addresses</span>"; return; }
-      wrap.innerHTML = rows.map((addr, i) => `<span class='chip'><span class='mono'>${esc(addr)}</span><button class='x' type='button' onclick=\"removeAddress('${kind}', ${i})\">×</button></span>`).join("");
-    }
-    function renderAllChips() { renderChips("evm"); renderChips("solana"); renderChips("tron"); }
-    function addAddress(kind) {
-      const el = document.getElementById(inputId(kind));
-      const addrRaw = String(el?.value || "").trim();
-      if (!validAddress(kind, addrRaw)) { setStableStatus(`Invalid ${kind.toUpperCase()} address format.`, true); return; }
-      const addr = addrRaw;
-      const dup = (stableState[kind] || []).some((x) => kind === "evm" ? String(x).toLowerCase() === addr.toLowerCase() : String(x) === addr);
-      if (dup) { setStableStatus("Address already added.", true); return; }
-      stableState[kind].push(addr);
-      if (el) el.value = "";
-      saveStableState();
-      renderChips(kind);
-      setStableStatus("Address added.", false);
-    }
-    function removeAddress(kind, idx) {
-      if (!Array.isArray(stableState[kind])) return;
-      stableState[kind].splice(Number(idx) || 0, 1);
-      saveStableState();
-      renderChips(kind);
-    }
     const stableSectionState = {combined: false};
-    const stableCache = {lending: [], rewards: []};
+    const stableCache = {lending: [], catalog: null};
+    const stableTableState = {
+      sortBy: "supply_total_apr_pct",
+      sortDir: "desc",
+      topN: 50,
+      minTotalApr: 0,
+      search: "",
+      onlyBonuses: false,
+      onlyActive: true,
+    };
+    function fmtPct(v) {
+      const n = Number(v || 0);
+      return `${n.toFixed(2)}%`;
+    }
+    function bucketLabel(bucket) {
+      const b = String(bucket || "").toLowerCase();
+      if (b === "fiat_backed") return "Fiat-backed";
+      if (b === "fiat_nonusd") return "Non-USD fiat";
+      if (b === "algo_crypto") return "Algo/Crypto-backed";
+      return b || "-";
+    }
+    function readStableTableControls() {
+      const sortBy = String(document.getElementById("stableSortBy")?.value || stableTableState.sortBy);
+      const sortDir = String(document.getElementById("stableSortDir")?.value || stableTableState.sortDir);
+      const topNRaw = Number(document.getElementById("stableTopN")?.value || stableTableState.topN || 0);
+      const minTotalAprRaw = Number(document.getElementById("stableMinTotalApr")?.value || stableTableState.minTotalApr || 0);
+      const search = String(document.getElementById("stableSearch")?.value || "").trim().toLowerCase();
+      const onlyBonuses = !!document.getElementById("stableOnlyBonuses")?.checked;
+      const onlyActive = !!document.getElementById("stableOnlyActive")?.checked;
+      stableTableState.sortBy = sortBy;
+      stableTableState.sortDir = (sortDir === "asc") ? "asc" : "desc";
+      stableTableState.topN = Number.isFinite(topNRaw) ? Math.max(0, Math.floor(topNRaw)) : 50;
+      stableTableState.minTotalApr = Number.isFinite(minTotalAprRaw) ? Math.max(0, minTotalAprRaw) : 0;
+      stableTableState.search = search;
+      stableTableState.onlyBonuses = onlyBonuses;
+      stableTableState.onlyActive = onlyActive;
+    }
+    function applyLendingView(rows) {
+      const list = Array.isArray(rows) ? rows.slice() : [];
+      const out = list.filter((r) => {
+        const total = Number(r?.supply_total_apr_pct || 0);
+        if (total < Number(stableTableState.minTotalApr || 0)) return false;
+        if (stableTableState.onlyBonuses) {
+          const bonus = Number(r?.supply_bonus_apr_pct || 0) + Number(r?.conditional_bonus_apr_pct || 0) + Number(r?.borrow_discount_apr_pct || 0);
+          if (!(bonus > 0)) return false;
+        }
+        if (stableTableState.onlyActive && (r?.paused || r?.frozen)) return false;
+        if (stableTableState.search) {
+          const blob = `${String(r?.asset || "")} ${String(r?.chain || "")} ${String(r?.market || "")}`.toLowerCase();
+          if (!blob.includes(stableTableState.search)) return false;
+        }
+        return true;
+      });
+      const sortBy = String(stableTableState.sortBy || "supply_total_apr_pct");
+      const dir = (stableTableState.sortDir === "asc") ? 1 : -1;
+      out.sort((a, b) => {
+        const av = a?.[sortBy];
+        const bv = b?.[sortBy];
+        const an = Number(av);
+        const bn = Number(bv);
+        if (Number.isFinite(an) && Number.isFinite(bn)) return (an - bn) * dir;
+        return String(av || "").localeCompare(String(bv || "")) * dir;
+      });
+      const topN = Number(stableTableState.topN || 0);
+      return (topN > 0) ? out.slice(0, topN) : out;
+    }
+    function onStableTableControlChange() {
+      readStableTableControls();
+      renderLending(stableCache.lending || []);
+    }
     function setStableStatus(text, isErr) {
       const el = document.getElementById("stableStatus");
       if (!el) return;
@@ -25324,107 +25514,127 @@ def _render_stables_page() -> str:
       const btn = document.getElementById("toggleStableCombinedBtn");
       const title = document.getElementById("stableCombinedTitle");
       const hL = document.getElementById("stableLendingHeading");
-      const hR = document.getElementById("stableRewardsHeading");
       if (!body || !btn) return;
       stableSectionState.combined = !!collapsed;
       body.classList.toggle("collapsed", !!collapsed);
       btn.textContent = collapsed ? "▸" : "▾";
       if (title) title.style.visibility = collapsed ? "visible" : "hidden";
       if (hL) hL.style.display = collapsed ? "none" : "block";
-      if (hR) hR.style.display = collapsed ? "none" : "block";
     }
     function toggleStableSection() {
       const next = !stableSectionState.combined;
       setStableSectionCollapsed(next);
-      if (!next) {
-        renderLending(stableCache.lending || []);
-        renderRewards(stableCache.rewards || []);
-      }
+      if (!next) renderLending(stableCache.lending || []);
+    }
+    function renderCatalog(catalog) {
+      stableCache.catalog = catalog || {};
+      const groups = [
+        {key: "fiat_backed", label: "Fiat-backed Stablecoins"},
+        {key: "fiat_nonusd", label: "Non-USD Fiat Stables"},
+        {key: "algo_crypto", label: "Algo/Crypto-backed Stablecoins"},
+      ];
+      const wrap = document.getElementById("stableUniverseGroups");
+      const meta = document.getElementById("stableUniverseMeta");
+      if (!wrap || !meta) return;
+      let total = 0;
+      wrap.innerHTML = groups.map((g) => {
+        const arr = Array.isArray(catalog?.[g.key]) ? catalog[g.key] : [];
+        total += arr.length;
+        const chips = arr.length
+          ? arr.map((x) => `<span class='chip'>${esc(String(x || "").toUpperCase())}</span>`).join("")
+          : "<span class='chip muted'>No symbols</span>";
+        return `<div class='stable-group'><h4>${esc(g.label)} (${arr.length})</h4><div class='chips'>${chips}</div></div>`;
+      }).join("");
+      meta.textContent = `Using ${total} stable symbols from Pools catalog.`;
     }
     function renderLending(rows) {
+      readStableTableControls();
+      const sourceRows = Array.isArray(rows) ? rows : [];
+      const viewRows = applyLendingView(sourceRows);
       const table = document.getElementById("stableLendingTable");
-      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Type</th><th>Market</th><th>Asset</th><th>Amount</th><th>USD</th><th>APY</th><th>Collateral</th></tr>";
-      for (const r of (rows || [])) {
+      const summary = document.getElementById("stableTableSummary");
+      if (summary) summary.textContent = `Rows: ${viewRows.length} (from ${sourceRows.length})`;
+      let html = "<tr><th>Bucket</th><th>Chain</th><th>Market</th><th>Asset</th><th>Supply APY</th><th>Supply Bonus APR</th><th>Conditional Bonus APR</th><th>Supply Total APR</th><th>Borrow APY</th><th>Borrow Discount APR</th><th>Borrow Effective APR</th><th>Reward Tokens</th><th>Bonus programs</th><th>Status</th></tr>";
+      for (const r of viewRows) {
+        const rewards = Array.isArray(r.reward_tokens) ? r.reward_tokens.join(", ") : "";
+        const bonus = Array.isArray(r.bonus_programs) ? r.bonus_programs.join(" | ") : "";
+        const statusParts = [];
+        if (r.paused) statusParts.push("paused");
+        if (r.frozen) statusParts.push("frozen");
+        if (!r.paused && !r.frozen) statusParts.push("active");
         html += "<tr>";
-        html += `<td class='mono'>${esc(r.address || "")}</td>`;
+        html += `<td>${esc(bucketLabel(r.bucket))}</td>`;
         html += `<td>${esc(r.chain || "")}</td>`;
-        html += `<td>${esc(r.protocol || "")}</td>`;
-        html += `<td>${esc(r.kind || "")}</td>`;
         html += `<td>${esc(r.market || "")}</td>`;
         html += `<td>${esc(r.asset || "")}</td>`;
-        html += `<td>${Number(r.amount || 0).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>`;
-        html += `<td>${Number(r.usd || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}</td>`;
-        html += `<td>${Number(r.apy || 0).toFixed(4)}</td>`;
-        html += `<td>${r.is_collateral ? "yes" : ""}</td>`;
+        html += `<td>${fmtPct(r.supply_apy_pct)}</td>`;
+        html += `<td>${fmtPct(r.supply_bonus_apr_pct)}</td>`;
+        html += `<td>${fmtPct(r.conditional_bonus_apr_pct)}</td>`;
+        html += `<td><b>${fmtPct(r.supply_total_apr_pct)}</b></td>`;
+        html += `<td>${fmtPct(r.borrow_apy_pct)}</td>`;
+        html += `<td>${fmtPct(r.borrow_discount_apr_pct)}</td>`;
+        html += `<td><b>${fmtPct(r.borrow_effective_apr_pct)}</b></td>`;
+        html += `<td>${esc(rewards || "-")}</td>`;
+        html += `<td title="${esc(bonus)}">${esc(bonus || "-")}</td>`;
+        html += `<td>${esc(statusParts.join(", "))}</td>`;
         html += "</tr>";
       }
-      if (!(rows || []).length) html += "<tr><td colspan='10'>No lending positions found.</td></tr>";
+      if (!viewRows.length) html += "<tr><td colspan='14'>No rows match current filters.</td></tr>";
       table.innerHTML = html;
     }
-    function renderRewards(rows) {
-      const table = document.getElementById("stableRewardsTable");
-      let html = "<tr><th>Address</th><th>Chain</th><th>Protocol</th><th>Asset</th><th>Amount</th><th>USD</th></tr>";
-      for (const r of (rows || [])) {
-        html += "<tr>";
-        html += `<td class='mono'>${esc(r.address || "")}</td>`;
-        html += `<td>${esc(r.chain || "")}</td>`;
-        html += `<td>${esc(r.protocol || "")}</td>`;
-        html += `<td>${esc(r.asset || "")}</td>`;
-        html += `<td>${Number(r.amount || 0).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>`;
-        html += `<td>${Number(r.usd || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}</td>`;
-        html += "</tr>";
+    async function loadStableUniverse() {
+      try {
+        const r = await fetch("/api/meta");
+        const meta = await r.json().catch(() => ({}));
+        const pl = (meta && meta.pair_lists) ? meta.pair_lists : {};
+        renderCatalog({
+          fiat_backed: (pl.stablecoins_full || pl.stablecoins || []).map((x) => String(x || "").toLowerCase()),
+          fiat_nonusd: (pl.fiat_nonusd_stables || []).map((x) => String(x || "").toLowerCase()),
+          algo_crypto: (pl.stable_algo_crypto_full || pl.stable_algo_crypto || []).map((x) => String(x || "").toLowerCase()),
+        });
+      } catch (_) {
+        renderCatalog({fiat_backed: [], fiat_nonusd: [], algo_crypto: []});
       }
-      if (!(rows || []).length) html += "<tr><td colspan='6'>No unclaimed rewards found.</td></tr>";
-      table.innerHTML = html;
     }
     async function scanStable() {
-      if (!stableState.evm.length && !stableState.solana.length && !stableState.tron.length) {
-        setStableStatus("Add at least one address first.", true);
-        return;
-      }
       setStableSectionCollapsed(false);
       try {
         setStableBusy(true);
-        setStableStatus("Scanning latest lending and rewards...", false);
-        const res = await fetch("/api/positions/scan", {
+        setStableStatus("Scanning AAVE markets for stablecoins across all chains...", false);
+        const res = await fetch("/api/stables/aave/scan", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
-          body: JSON.stringify({
-            evm_addresses: stableState.evm,
-            solana_addresses: stableState.solana,
-            tron_addresses: stableState.tron,
-            include_pools: false,
-            include_lending: true,
-            include_rewards: true,
-          }),
+          body: "{}",
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || "Scan failed");
-        stableCache.lending = data.lending_positions || [];
-        stableCache.rewards = data.reward_positions || [];
+        stableCache.lending = data.rows || [];
+        renderCatalog(data.stable_catalog || stableCache.catalog || {});
         renderLending(stableCache.lending);
-        renderRewards(stableCache.rewards);
         const errWrap = document.getElementById("stableErrors");
         const errs = data.errors || [];
-        const infos = data.infos || [];
+        const infos = [];
+        const chains = Array.isArray(data.chains) ? data.chains.length : 0;
+        const markets = Number(data.markets || 0);
+        const elapsed = Number((data.summary || {}).elapsed_sec || 0);
+        infos.push(`AAVE chains scanned: ${chains}, markets: ${markets}, rows: ${(data.rows || []).length}, elapsed: ${elapsed.toFixed(2)}s`);
         const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
         const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
         if (errWrap) errWrap.innerHTML = errHtml + infoHtml;
-        setStableStatus(`Done. Lending: ${(data.lending_positions || []).length}, Rewards: ${(data.reward_positions || []).length}`, false);
+        setStableStatus(`Done. Rows: ${(data.rows || []).length}`, false);
       } catch (e) {
         setStableStatus("Scan failed: " + (e?.message || "unknown"), true);
       } finally {
         setStableBusy(false);
       }
     }
-    loadStableState();
-    renderAllChips();
+    loadStableUniverse();
     setStableSectionCollapsed(false);
     setStableStatus("Ready", false);
     """
     return _render_placeholder_page(
         "Lending Stablecoin",
-        "Scan lending positions and unclaimed rewards.",
+        "Scan AAVE lending opportunities and bonus programs for stablecoins.",
         "/stables",
         extra_css=extra_css,
         extra_html=extra_html,
@@ -27842,6 +28052,25 @@ def scan_positions(req: PositionsScanRequest, request: Request, response: Respon
         sid=sid,
         include_creation_dates=bool(POSITIONS_DIRECT_INCLUDE_CREATION_DATES),
     )
+
+
+@app.post("/api/stables/aave/scan")
+def scan_stables_aave(request: Request, response: Response) -> dict[str, Any]:
+    _ensure_session_cookie(request, response)
+    t0 = time.monotonic()
+    rows, meta, errors = _scan_aave_stable_lending_rows()
+    elapsed = round(max(0.0, time.monotonic() - t0), 3)
+    return {
+        "rows": rows,
+        "errors": list(errors or []),
+        "stable_catalog": (meta.get("stable_catalog") if isinstance(meta, dict) else {}) or {},
+        "chains": (meta.get("chains") if isinstance(meta, dict) else []) or [],
+        "markets": int((meta.get("markets") if isinstance(meta, dict) else 0) or 0),
+        "summary": {
+            "rows": int(len(rows)),
+            "elapsed_sec": float(elapsed),
+        },
+    }
 
 
 @app.post("/api/positions/row/enrich")
@@ -30575,7 +30804,6 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
         raise HTTPException(status_code=400, detail="min_fee_pct must be lower than max_fee_pct")
     if req.min_apy_pct < 0 or req.min_apy_pct > 100000:
         raise HTTPException(status_code=400, detail="min_apy_pct must be in range 0..100000")
-    req.mode_fast_legacy = bool(getattr(req, "mode_fast_legacy", True))
     req.mode_fast_legacy = True
     req.include_versions = [v for v in req.include_versions if v in {"v3", "v4"}]
     req.include_versions = list(dict.fromkeys(req.include_versions))
