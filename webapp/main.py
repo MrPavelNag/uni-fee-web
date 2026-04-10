@@ -257,6 +257,8 @@ WALLETCONNECT_PROJECT_ID = (
     or os.environ.get("NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID", "").strip()
 )
 AAVE_V3_GRAPHQL_ENDPOINT = os.environ.get("AAVE_V3_GRAPHQL_ENDPOINT", "https://api.v3.aave.com/graphql").strip()
+MERKL_API_ENDPOINT = os.environ.get("MERKL_API_ENDPOINT", "https://api.merkl.xyz/v4").strip()
+MERKL_API_KEY = os.environ.get("MERKL_API_KEY", "").strip()
 CHAIN_ID_TO_KEY: dict[int, str] = {
     1: "ethereum",
     10: "optimism",
@@ -16364,12 +16366,94 @@ def _pct_from_percent_value(raw: Any) -> float:
     return float(v * 100.0) if v <= 1.5 else float(v)
 
 
+def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any]], str]:
+    if not str(MERKL_API_KEY or "").strip():
+        return {}, "Merkl API key is not configured."
+    base = str(MERKL_API_ENDPOINT or "https://api.merkl.xyz/v4").rstrip("/")
+    url = f"{base}/opportunities?mainProtocolId=aave"
+    headers = {
+        "User-Agent": APP_USER_AGENT,
+        "Accept": "application/json",
+        "X-API-Key": str(MERKL_API_KEY),
+    }
+    req = UrlRequest(url, headers=headers)
+    payload: Any = {}
+    with urlopen(req, timeout=18) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    items = payload if isinstance(payload, list) else (
+        (payload.get("items") if isinstance(payload, dict) else None)
+        or (payload.get("data") if isinstance(payload, dict) else None)
+        or (payload.get("opportunities") if isinstance(payload, dict) else None)
+        or []
+    )
+    out: dict[tuple[int, str], dict[str, Any]] = {}
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+        apr = _safe_float(it.get("apr"))
+        if apr <= 0:
+            continue
+        chain_id = int(
+            _safe_float(
+                it.get("chainId")
+                or ((it.get("chain") or {}).get("chainId") if isinstance(it.get("chain"), dict) else 0)
+                or ((it.get("distributionChain") or {}).get("chainId") if isinstance(it.get("distributionChain"), dict) else 0)
+            )
+        )
+        if chain_id <= 0:
+            continue
+        explorer_addr = str(
+            it.get("explorerAddress")
+            or it.get("address")
+            or ((it.get("tokens") or {}).get("address") if isinstance(it.get("tokens"), dict) else "")
+            or ""
+        ).strip().lower()
+        if not _is_eth_address(explorer_addr):
+            continue
+        reward_sym = str(
+            it.get("rewardTokenSymbol")
+            or ((it.get("rewardToken") or {}).get("symbol") if isinstance(it.get("rewardToken"), dict) else "")
+            or ((it.get("token") or {}).get("symbol") if isinstance(it.get("token"), dict) else "")
+            or "MERKL"
+        ).strip().upper()
+        label = str(
+            it.get("name")
+            or it.get("campaignName")
+            or it.get("identifier")
+            or f"Merkl {reward_sym}"
+        ).strip()
+        key = (int(chain_id), str(explorer_addr))
+        rec = out.setdefault(key, {"apr": 0.0, "labels": [], "tokens": set()})
+        rec["apr"] = float(rec.get("apr") or 0.0) + float(apr)
+        if label:
+            labels = rec.get("labels") if isinstance(rec.get("labels"), list) else []
+            if label not in labels:
+                labels.append(label)
+            rec["labels"] = labels
+        if reward_sym:
+            toks = rec.get("tokens") if isinstance(rec.get("tokens"), set) else set(rec.get("tokens") or [])
+            toks.add(reward_sym)
+            rec["tokens"] = toks
+    for rec in out.values():
+        rec["tokens"] = sorted(list(rec.get("tokens") or []))
+    return out, ""
+
+
 def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
     categories, symbol_to_bucket, stable_symbols = _stable_catalog_for_lending_scan()
     if not stable_symbols:
         return [], {"stable_catalog": categories, "chains": [], "markets": 0}, ["Stablecoin catalog is empty."]
 
     chain_ids = sorted(int(x) for x in AAVE_CHAIN_ID_TO_NAME.keys())
+    merkl_idx: dict[tuple[int, str], dict[str, Any]] = {}
+    warnings: list[str] = []
+    try:
+        merkl_idx, merkl_warn = _fetch_merkl_aave_bonus_index()
+        if merkl_warn:
+            warnings.append(merkl_warn)
+    except Exception as e:
+        warnings.append(f"Merkl bonus fetch failed: {e}")
+
     query = """
     query AaveStableMarkets($ids: [ChainId!]!) {
       markets(request: { chainIds: $ids }) {
@@ -16378,6 +16462,8 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
         chain { chainId name }
         reserves {
           underlyingToken { symbol address decimals }
+          aToken { address symbol }
+          vToken { address symbol }
           supplyInfo { apy { value } canBeCollateral }
           borrowInfo { apy { value } }
           isFrozen
@@ -16484,6 +16570,39 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     "bonus_programs": bonus_labels,
                 }
             )
+            row = rows[-1]
+            underlying_addr = str((token.get("address") or "")).strip().lower()
+            atoken_addr = str(((reserve.get("aToken") or {}).get("address") or "")).strip().lower()
+            vtoken_addr = str(((reserve.get("vToken") or {}).get("address") or "")).strip().lower()
+            merkl_apr = 0.0
+            merkl_tokens: list[str] = []
+            merkl_labels: list[str] = []
+            for addr in [underlying_addr, atoken_addr, vtoken_addr]:
+                if not _is_eth_address(addr):
+                    continue
+                rec = merkl_idx.get((int(chain_id), addr))
+                if not isinstance(rec, dict):
+                    continue
+                merkl_apr += float(rec.get("apr") or 0.0)
+                for t in (rec.get("tokens") or []):
+                    ts = str(t or "").strip().upper()
+                    if ts and ts not in merkl_tokens:
+                        merkl_tokens.append(ts)
+                for lb in (rec.get("labels") or []):
+                    lbl = str(lb or "").strip()
+                    if lbl and lbl not in merkl_labels:
+                        merkl_labels.append(lbl)
+            if merkl_apr > 0:
+                row["merkl_bonus_apr_pct"] = float(merkl_apr)
+                row["supply_total_apr_pct"] = float(row.get("supply_total_apr_pct") or 0.0) + float(merkl_apr)
+                for t in merkl_tokens:
+                    if t and t not in reward_tokens:
+                        reward_tokens.add(t)
+                bonus_labels.extend([f"Merkl: +{float(merkl_apr):.2f}%"] + [f"Merkl campaign: {x}" for x in merkl_labels[:3]])
+            else:
+                row["merkl_bonus_apr_pct"] = 0.0
+            row["reward_tokens"] = sorted(reward_tokens)
+            row["bonus_programs"] = bonus_labels
 
     rows.sort(
         key=lambda r: (
@@ -16497,6 +16616,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
         "stable_catalog": categories,
         "chains": sorted(int(x) for x in seen_chains),
         "markets": int(len(markets)),
+        "warnings": warnings,
     }
     return rows, meta, []
 
@@ -25301,13 +25421,16 @@ def _render_stables_page() -> str:
     .stable-group { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; }
     .stable-group h4 { margin:0 0 6px; font-size:14px; color:#1e3a8a; }
     .stable-meta { margin-top:6px; color:#475569; font-size:12px; }
-    .stable-table-controls { display:grid; grid-template-columns:repeat(6, minmax(120px, 1fr)); gap:8px; margin:8px 0 10px; }
+    .stable-universe-body.collapsed { display:none; }
+    .stable-table-controls { display:grid; grid-template-columns:repeat(4, minmax(120px, 1fr)); gap:8px; margin:8px 0 10px; }
     .stable-table-controls .ctrl { display:flex; flex-direction:column; gap:4px; }
     .stable-table-controls label { font-size:11px; color:#64748b; }
     .stable-table-controls input, .stable-table-controls select { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:6px 8px; font-size:12px; }
     .stable-table-controls .check { flex-direction:row; align-items:center; gap:6px; padding-top:18px; }
     .stable-table-controls .check input { width:auto; }
     .stable-table-summary { margin:0 0 8px; font-size:12px; color:#475569; }
+    .stable-block { margin-bottom:12px; }
+    .stable-block-title { margin:8px 0 6px; font-size:13px; color:#1e3a8a; font-weight:700; }
     .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:17px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
@@ -25331,6 +25454,8 @@ def _render_stables_page() -> str:
     table { width:100%; border-collapse:collapse; font-size:12px; min-width:1250px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
+    th.sortable { cursor:pointer; user-select:none; }
+    th.sortable:hover { background:#dbeafe; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
@@ -25356,9 +25481,14 @@ def _render_stables_page() -> str:
     extra_html = """
     <div class="positions-grid">
       <section class="positions-form">
-        <div class="section-head"><h3>Stablecoin universe (from Pools lists)</h3></div>
-        <div id="stableUniverseMeta" class="stable-meta">Loading stablecoin lists...</div>
-        <div id="stableUniverseGroups" class="stable-groups"></div>
+        <div class="section-head">
+          <h3>Stablecoin universe (from Pools lists)</h3>
+          <button class="collapse-btn" id="stableUniverseDetailsBtn" type="button" onclick="toggleStableUniverseDetails()" title="Collapse/expand">Details</button>
+        </div>
+        <div id="stableUniverseBody" class="stable-universe-body collapsed">
+          <div id="stableUniverseMeta" class="stable-meta">Loading stablecoin lists...</div>
+          <div id="stableUniverseGroups" class="stable-groups"></div>
+        </div>
       </section>
       <section class="result-card">
         <div class="section-head">
@@ -25373,25 +25503,6 @@ def _render_stables_page() -> str:
         <div id="stableCombinedBody" class="section-body">
           <div id="stableLendingHeading" style="margin-bottom:8px;font-weight:700;color:#1e3a8a;display:none">Combined AAVE stablecoin table (base + bonus APR)</div>
           <div class="stable-table-controls">
-            <div class="ctrl">
-              <label>Sort by</label>
-              <select id="stableSortBy" onchange="onStableTableControlChange()">
-                <option value="supply_total_apr_pct" selected>Supply Total APR</option>
-                <option value="supply_apy_pct">Supply APY</option>
-                <option value="supply_bonus_apr_pct">Supply Bonus APR</option>
-                <option value="borrow_effective_apr_pct">Borrow Effective APR</option>
-                <option value="borrow_apy_pct">Borrow APY</option>
-                <option value="asset">Asset</option>
-                <option value="chain">Chain</option>
-              </select>
-            </div>
-            <div class="ctrl">
-              <label>Order</label>
-              <select id="stableSortDir" onchange="onStableTableControlChange()">
-                <option value="desc" selected>Desc</option>
-                <option value="asc">Asc</option>
-              </select>
-            </div>
             <div class="ctrl">
               <label>Top N</label>
               <select id="stableTopN" onchange="onStableTableControlChange()">
@@ -25419,7 +25530,7 @@ def _render_stables_page() -> str:
             </div>
           </div>
           <div id="stableTableSummary" class="stable-table-summary">Rows: 0</div>
-          <div class="table-wrap"><table id="stableLendingTable"></table></div>
+          <div id="stableLendingBlocks"></div>
           <div id="stableErrors"></div>
         </div>
       </section>
@@ -25428,6 +25539,7 @@ def _render_stables_page() -> str:
     extra_script = """
     function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
     const stableSectionState = {combined: false};
+    const stableUniverseState = {expanded: false};
     const stableCache = {lending: [], catalog: null};
     const stableTableState = {
       sortBy: "supply_total_apr_pct",
@@ -25449,21 +25561,35 @@ def _render_stables_page() -> str:
       if (b === "algo_crypto") return "Algo/Crypto-backed";
       return b || "-";
     }
+    function toggleStableUniverseDetails() {
+      stableUniverseState.expanded = !stableUniverseState.expanded;
+      const body = document.getElementById("stableUniverseBody");
+      const btn = document.getElementById("stableUniverseDetailsBtn");
+      if (body) body.classList.toggle("collapsed", !stableUniverseState.expanded);
+      if (btn) btn.textContent = stableUniverseState.expanded ? "Hide details" : "Details";
+    }
     function readStableTableControls() {
-      const sortBy = String(document.getElementById("stableSortBy")?.value || stableTableState.sortBy);
-      const sortDir = String(document.getElementById("stableSortDir")?.value || stableTableState.sortDir);
       const topNRaw = Number(document.getElementById("stableTopN")?.value || stableTableState.topN || 0);
       const minTotalAprRaw = Number(document.getElementById("stableMinTotalApr")?.value || stableTableState.minTotalApr || 0);
       const search = String(document.getElementById("stableSearch")?.value || "").trim().toLowerCase();
       const onlyBonuses = !!document.getElementById("stableOnlyBonuses")?.checked;
       const onlyActive = !!document.getElementById("stableOnlyActive")?.checked;
-      stableTableState.sortBy = sortBy;
-      stableTableState.sortDir = (sortDir === "asc") ? "asc" : "desc";
       stableTableState.topN = Number.isFinite(topNRaw) ? Math.max(0, Math.floor(topNRaw)) : 50;
       stableTableState.minTotalApr = Number.isFinite(minTotalAprRaw) ? Math.max(0, minTotalAprRaw) : 0;
       stableTableState.search = search;
       stableTableState.onlyBonuses = onlyBonuses;
       stableTableState.onlyActive = onlyActive;
+    }
+    function onStableHeaderSort(key) {
+      const k = String(key || "").trim();
+      if (!k) return;
+      if (stableTableState.sortBy === k) {
+        stableTableState.sortDir = (stableTableState.sortDir === "desc") ? "asc" : "desc";
+      } else {
+        stableTableState.sortBy = k;
+        stableTableState.sortDir = (k === "asset" || k === "chain" || k === "market" || k === "bucket") ? "asc" : "desc";
+      }
+      renderLending(stableCache.lending || []);
     }
     function applyLendingView(rows) {
       const list = Array.isArray(rows) ? rows.slice() : [];
@@ -25471,7 +25597,7 @@ def _render_stables_page() -> str:
         const total = Number(r?.supply_total_apr_pct || 0);
         if (total < Number(stableTableState.minTotalApr || 0)) return false;
         if (stableTableState.onlyBonuses) {
-          const bonus = Number(r?.supply_bonus_apr_pct || 0) + Number(r?.conditional_bonus_apr_pct || 0) + Number(r?.borrow_discount_apr_pct || 0);
+          const bonus = Number(r?.supply_bonus_apr_pct || 0) + Number(r?.conditional_bonus_apr_pct || 0) + Number(r?.borrow_discount_apr_pct || 0) + Number(r?.merkl_bonus_apr_pct || 0);
           if (!(bonus > 0)) return false;
         }
         if (stableTableState.onlyActive && (r?.paused || r?.frozen)) return false;
@@ -25551,36 +25677,64 @@ def _render_stables_page() -> str:
       readStableTableControls();
       const sourceRows = Array.isArray(rows) ? rows : [];
       const viewRows = applyLendingView(sourceRows);
-      const table = document.getElementById("stableLendingTable");
+      const blocks = document.getElementById("stableLendingBlocks");
       const summary = document.getElementById("stableTableSummary");
       if (summary) summary.textContent = `Rows: ${viewRows.length} (from ${sourceRows.length})`;
-      let html = "<tr><th>Bucket</th><th>Chain</th><th>Market</th><th>Asset</th><th>Supply APY</th><th>Supply Bonus APR</th><th>Conditional Bonus APR</th><th>Supply Total APR</th><th>Borrow APY</th><th>Borrow Discount APR</th><th>Borrow Effective APR</th><th>Reward Tokens</th><th>Bonus programs</th><th>Status</th></tr>";
-      for (const r of viewRows) {
-        const rewards = Array.isArray(r.reward_tokens) ? r.reward_tokens.join(", ") : "";
-        const bonus = Array.isArray(r.bonus_programs) ? r.bonus_programs.join(" | ") : "";
-        const statusParts = [];
-        if (r.paused) statusParts.push("paused");
-        if (r.frozen) statusParts.push("frozen");
-        if (!r.paused && !r.frozen) statusParts.push("active");
+      if (!blocks) return;
+      const sortMark = (k) => (stableTableState.sortBy === k ? (stableTableState.sortDir === "desc" ? " ↓" : " ↑") : "");
+      const groups = [
+        {key: "fiat_backed", title: "Fiat-backed stables"},
+        {key: "fiat_nonusd", title: "Non-USD fiat stables"},
+        {key: "algo_crypto", title: "Algo/Crypto-backed stables"},
+      ];
+      const renderGroupTable = (title, rowsGroup) => {
+        let html = `<div class="stable-block"><div class="stable-block-title">${esc(title)} (${rowsGroup.length})</div><div class="table-wrap"><table>`;
         html += "<tr>";
-        html += `<td>${esc(bucketLabel(r.bucket))}</td>`;
-        html += `<td>${esc(r.chain || "")}</td>`;
-        html += `<td>${esc(r.market || "")}</td>`;
-        html += `<td>${esc(r.asset || "")}</td>`;
-        html += `<td>${fmtPct(r.supply_apy_pct)}</td>`;
-        html += `<td>${fmtPct(r.supply_bonus_apr_pct)}</td>`;
-        html += `<td>${fmtPct(r.conditional_bonus_apr_pct)}</td>`;
-        html += `<td><b>${fmtPct(r.supply_total_apr_pct)}</b></td>`;
-        html += `<td>${fmtPct(r.borrow_apy_pct)}</td>`;
-        html += `<td>${fmtPct(r.borrow_discount_apr_pct)}</td>`;
-        html += `<td><b>${fmtPct(r.borrow_effective_apr_pct)}</b></td>`;
-        html += `<td>${esc(rewards || "-")}</td>`;
-        html += `<td title="${esc(bonus)}">${esc(bonus || "-")}</td>`;
-        html += `<td>${esc(statusParts.join(", "))}</td>`;
-        html += "</tr>";
+        html += `<th class="sortable" onclick="onStableHeaderSort('chain')">Chain${sortMark("chain")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('market')">Market${sortMark("market")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('asset')">Asset${sortMark("asset")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('supply_apy_pct')">Supply APY${sortMark("supply_apy_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('supply_bonus_apr_pct')">Supply Bonus APR${sortMark("supply_bonus_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('conditional_bonus_apr_pct')">Conditional Bonus APR${sortMark("conditional_bonus_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('merkl_bonus_apr_pct')">Merkl Bonus APR${sortMark("merkl_bonus_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('supply_total_apr_pct')">Supply Total APR${sortMark("supply_total_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('borrow_apy_pct')">Borrow APY${sortMark("borrow_apy_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('borrow_discount_apr_pct')">Borrow Discount APR${sortMark("borrow_discount_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('borrow_effective_apr_pct')">Borrow Effective APR${sortMark("borrow_effective_apr_pct")}</th>`;
+        html += "<th>Reward Tokens</th><th>Bonus programs</th><th>Status</th></tr>";
+        for (const r of rowsGroup) {
+          const rewards = Array.isArray(r.reward_tokens) ? r.reward_tokens.join(", ") : "";
+          const bonus = Array.isArray(r.bonus_programs) ? r.bonus_programs.join(" | ") : "";
+          const statusParts = [];
+          if (r.paused) statusParts.push("paused");
+          if (r.frozen) statusParts.push("frozen");
+          if (!r.paused && !r.frozen) statusParts.push("active");
+          html += "<tr>";
+          html += `<td>${esc(r.chain || "")}</td>`;
+          html += `<td>${esc(r.market || "")}</td>`;
+          html += `<td>${esc(r.asset || "")}</td>`;
+          html += `<td>${fmtPct(r.supply_apy_pct)}</td>`;
+          html += `<td>${fmtPct(r.supply_bonus_apr_pct)}</td>`;
+          html += `<td>${fmtPct(r.conditional_bonus_apr_pct)}</td>`;
+          html += `<td>${fmtPct(r.merkl_bonus_apr_pct)}</td>`;
+          html += `<td><b>${fmtPct(r.supply_total_apr_pct)}</b></td>`;
+          html += `<td>${fmtPct(r.borrow_apy_pct)}</td>`;
+          html += `<td>${fmtPct(r.borrow_discount_apr_pct)}</td>`;
+          html += `<td><b>${fmtPct(r.borrow_effective_apr_pct)}</b></td>`;
+          html += `<td>${esc(rewards || "-")}</td>`;
+          html += `<td title="${esc(bonus)}">${esc(bonus || "-")}</td>`;
+          html += `<td>${esc(statusParts.join(", "))}</td>`;
+          html += "</tr>";
+        }
+        if (!rowsGroup.length) html += "<tr><td colspan='14'>No rows in this block.</td></tr>";
+        html += "</table></div></div>";
+        return html;
+      };
+      if (!viewRows.length) {
+        blocks.innerHTML = "<div class='table-wrap'><table><tr><td>No rows match current filters.</td></tr></table></div>";
+        return;
       }
-      if (!viewRows.length) html += "<tr><td colspan='14'>No rows match current filters.</td></tr>";
-      table.innerHTML = html;
+      blocks.innerHTML = groups.map((g) => renderGroupTable(g.title, viewRows.filter((r) => String(r?.bucket || "") === g.key))).join("");
     }
     async function loadStableUniverse() {
       try {
@@ -25613,11 +25767,13 @@ def _render_stables_page() -> str:
         renderLending(stableCache.lending);
         const errWrap = document.getElementById("stableErrors");
         const errs = data.errors || [];
+        const warns = data.warnings || [];
         const infos = [];
         const chains = Array.isArray(data.chains) ? data.chains.length : 0;
         const markets = Number(data.markets || 0);
         const elapsed = Number((data.summary || {}).elapsed_sec || 0);
         infos.push(`AAVE chains scanned: ${chains}, markets: ${markets}, rows: ${(data.rows || []).length}, elapsed: ${elapsed.toFixed(2)}s`);
+        for (const w of warns) infos.push(String(w || ""));
         const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
         const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
         if (errWrap) errWrap.innerHTML = errHtml + infoHtml;
@@ -28060,9 +28216,11 @@ def scan_stables_aave(request: Request, response: Response) -> dict[str, Any]:
     t0 = time.monotonic()
     rows, meta, errors = _scan_aave_stable_lending_rows()
     elapsed = round(max(0.0, time.monotonic() - t0), 3)
+    warnings = (meta.get("warnings") if isinstance(meta, dict) else []) or []
     return {
         "rows": rows,
         "errors": list(errors or []),
+        "warnings": list(warnings),
         "stable_catalog": (meta.get("stable_catalog") if isinstance(meta, dict) else {}) or {},
         "chains": (meta.get("chains") if isinstance(meta, dict) else []) or [],
         "markets": int((meta.get("markets") if isinstance(meta, dict) else 0) or 0),
