@@ -199,10 +199,12 @@ RUN_HISTORY_LIMIT = 10
 RUN_HISTORY_SESSION_LIMIT = max(20, int(os.environ.get("RUN_HISTORY_SESSION_LIMIT", "300")))
 RUN_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 RUN_RESULT_CACHE_TTL_SEC = max(30, int(os.environ.get("RUN_RESULT_CACHE_TTL_SEC", str(15 * 60))))
-RUN_RESULT_CACHE_LIMIT = max(10, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "24")))
+RUN_RESULT_CACHE_LIMIT = max(8, int(os.environ.get("RUN_RESULT_CACHE_LIMIT", "12")))
 RUN_JOB_TTL_SEC = max(10 * 60, int(os.environ.get("RUN_JOB_TTL_SEC", str(4 * 60 * 60))))
-RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "120")))
+RUN_JOB_LIMIT = max(20, int(os.environ.get("RUN_JOB_LIMIT", "80")))
 RUN_JOB_RESULT_TTL_SEC = max(60, int(os.environ.get("RUN_JOB_RESULT_TTL_SEC", str(20 * 60))))
+# Safety TTL for jobs stuck in queued/running forever (e.g. abrupt worker loss).
+RUN_ACTIVE_STALE_SEC = max(5 * 60, int(os.environ.get("RUN_ACTIVE_STALE_SEC", str(3 * 60 * 60))))
 RUN_MAX_CONCURRENT = max(1, min(6, int(os.environ.get("RUN_MAX_CONCURRENT", "1"))))
 # Queue wait timeout for run-slot semaphore.
 # Keep it noticeably higher than typical single scan duration to avoid
@@ -19009,6 +19011,31 @@ def _job_snapshot_load(job_id: str) -> dict[str, Any] | None:
 
 def _prune_run_jobs_locked(now: float | None = None) -> None:
     ts_now = float(now or time.time())
+    # Convert stale active jobs to failed so they don't block counters forever.
+    stale_active = []
+    for jid, rec in list(JOBS.items()):
+        st = str((rec or {}).get("status") or "")
+        if st not in {"queued", "running"}:
+            continue
+        created_at = float((rec or {}).get("created_at") or 0.0)
+        started_at = float((rec or {}).get("started_at") or 0.0)
+        base_ts = started_at if started_at > 0 else created_at
+        if base_ts <= 0:
+            continue
+        if (ts_now - base_ts) > float(RUN_ACTIVE_STALE_SEC):
+            stale_active.append(str(jid))
+    for jid in stale_active:
+        rec = JOBS.get(str(jid))
+        if not isinstance(rec, dict):
+            continue
+        rec["status"] = "failed"
+        rec["stage"] = "failed"
+        rec["stage_label"] = "Interrupted (stale active job pruned)"
+        rec["progress"] = 100
+        rec["finished_at"] = ts_now
+        if not str(rec.get("error") or "").strip():
+            rec["error"] = "Scan state became stale and was auto-pruned. Please run scan again."
+        _job_snapshot_save(rec)
     stale_ids = [
         jid
         for jid, rec in JOBS.items()
@@ -19464,10 +19491,22 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                 f"Running pair scans ({total_pairs} pair(s), workers={pair_workers})",
                 12,
             )
-            pair_results: list[tuple[dict[str, dict], dict[str, Any], list[str]]] = []
+            def _merge_pair_result(res: tuple[dict[str, dict], dict[str, Any], list[str]]) -> None:
+                merged_piece, pair_dbg, pair_logs = res
+                pair_dbg["merged_before"] = int(len(merged_raw))
+                merged_raw.update(merged_piece or {})
+                pair_dbg["merged_after"] = int(len(merged_raw))
+                pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
+                timing_debug["pairs"].append(pair_dbg)
+                if pair_logs:
+                    logs.extend(pair_logs)
+                    # Avoid unbounded growth of in-memory logs on huge scans.
+                    if len(logs) > 400:
+                        del logs[:-200]
+
             if pair_workers <= 1 or total_pairs <= 1:
                 for idx, pair_tokens in enumerate(pairs, start=1):
-                    pair_results.append(
+                    _merge_pair_result(
                         _run_single_pair_scan(
                             pair_index=idx,
                             total_pairs=total_pairs,
@@ -19496,18 +19535,9 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
                     }
                     done_n = 0
                     for fut in as_completed(list(future_to_idx.keys())):
-                        pair_results.append(fut.result())
+                        _merge_pair_result(fut.result())
                         done_n += 1
                         _set_stage("pairs", f"Running pair scans ({done_n}/{total_pairs})", int(10 + (65 * done_n / total_pairs)))
-
-            pair_results.sort(key=lambda x: int((x[1] or {}).get("index") or 0))
-            for merged_piece, pair_dbg, pair_logs in pair_results:
-                pair_dbg["merged_before"] = int(len(merged_raw))
-                merged_raw.update(merged_piece or {})
-                pair_dbg["merged_after"] = int(len(merged_raw))
-                pair_dbg["merged_added"] = int(max(0, int(pair_dbg["merged_after"]) - int(pair_dbg["merged_before"])))
-                timing_debug["pairs"].append(pair_dbg)
-                logs.extend(pair_logs or [])
 
             timing_debug["stage_ms"]["agents_total"] = int(round(max(0.0, time.perf_counter() - t_agents_total0) * 1000.0))
         finally:
