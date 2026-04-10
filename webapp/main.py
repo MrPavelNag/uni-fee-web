@@ -16464,6 +16464,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
           underlyingToken { symbol address decimals }
           aToken { address symbol }
           vToken { address symbol }
+          size { usd }
           supplyInfo { apy { value } canBeCollateral }
           borrowInfo { apy { value } }
           isFrozen
@@ -16551,11 +16552,14 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
             borrow_effective_pct = float(max(0.0, borrow_apy_pct - borrow_discount_pct))
             rows.append(
                 {
+                    "protocol": "aave",
+                    "protocol_version": "aave_v3",
                     "chain": chain_name,
                     "chain_id": int(chain_id),
                     "market": market_name,
                     "asset": symbol.upper(),
                     "bucket": str(symbol_to_bucket.get(symbol) or "other"),
+                    "tvl_usd": float(_safe_float((reserve.get("size") or {}).get("usd"))),
                     "supply_apy_pct": float(supply_apy_pct),
                     "supply_bonus_apr_pct": float(supply_bonus_pct),
                     "conditional_bonus_apr_pct": float(conditional_bonus_pct),
@@ -25422,7 +25426,7 @@ def _render_stables_page() -> str:
     .stable-group h4 { margin:0 0 6px; font-size:14px; color:#1e3a8a; }
     .stable-meta { margin-top:6px; color:#475569; font-size:12px; }
     .stable-universe-body.collapsed { display:none; }
-    .stable-table-controls { display:grid; grid-template-columns:repeat(4, minmax(120px, 1fr)); gap:8px; margin:8px 0 10px; }
+    .stable-table-controls { display:grid; grid-template-columns:repeat(6, minmax(120px, 1fr)); gap:8px; margin:8px 0 10px; }
     .stable-table-controls .ctrl { display:flex; flex-direction:column; gap:4px; }
     .stable-table-controls label { font-size:11px; color:#64748b; }
     .stable-table-controls input, .stable-table-controls select { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:6px 8px; font-size:12px; }
@@ -25504,17 +25508,25 @@ def _render_stables_page() -> str:
           <div id="stableLendingHeading" style="margin-bottom:8px;font-weight:700;color:#1e3a8a;display:none">Combined AAVE stablecoin table (base + bonus APR)</div>
           <div class="stable-table-controls">
             <div class="ctrl">
-              <label>Top N</label>
-              <select id="stableTopN" onchange="onStableTableControlChange()">
-                <option value="25">25</option>
-                <option value="50" selected>50</option>
-                <option value="100">100</option>
-                <option value="0">All</option>
+              <label>Min APY %</label>
+              <input id="stableMinApy" type="number" step="0.01" min="0" value="0" oninput="onStableTableControlChange()" />
+            </div>
+            <div class="ctrl">
+              <label>Min TVL (USD)</label>
+              <input id="stableMinTvl" type="number" step="1" min="0" value="0" oninput="onStableTableControlChange()" />
+            </div>
+            <div class="ctrl">
+              <label>Protocol version</label>
+              <select id="stableProtocolVersion" onchange="onStableTableControlChange()">
+                <option value="all" selected>all</option>
+                <option value="aave_v3">aave_v3</option>
               </select>
             </div>
             <div class="ctrl">
-              <label>Min Supply Total APR %</label>
-              <input id="stableMinTotalApr" type="number" step="0.01" min="0" value="0" oninput="onStableTableControlChange()" />
+              <label>Chain</label>
+              <select id="stableChainFilter" onchange="onStableTableControlChange()">
+                <option value="all" selected>all</option>
+              </select>
             </div>
             <div class="ctrl">
               <label>Search asset/chain</label>
@@ -25538,18 +25550,89 @@ def _render_stables_page() -> str:
     """
     extra_script = """
     function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+    const STABLE_UI_STORAGE_KEY = "stables_ui_v2";
+    const STABLE_RESULT_STORAGE_KEY = "stables_result_v1";
+    const STABLE_RESULT_TTL_SEC = 1800;
     const stableSectionState = {combined: false};
     const stableUniverseState = {expanded: false};
     const stableCache = {lending: [], catalog: null};
     const stableTableState = {
       sortBy: "supply_total_apr_pct",
       sortDir: "desc",
-      topN: 50,
-      minTotalApr: 0,
+      minApy: 0,
+      minTvl: 0,
+      protocolVersion: "all",
+      chain: "all",
       search: "",
       onlyBonuses: false,
       onlyActive: true,
     };
+    function saveStableUiState() {
+      try {
+        localStorage.setItem(STABLE_UI_STORAGE_KEY, JSON.stringify({
+          table: {...stableTableState},
+          sectionCollapsed: !!stableSectionState.combined,
+          universeExpanded: !!stableUniverseState.expanded,
+        }));
+      } catch (_) {}
+    }
+    function loadStableUiState() {
+      try {
+        const raw = localStorage.getItem(STABLE_UI_STORAGE_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        const t = (parsed && parsed.table) ? parsed.table : {};
+        if (t && typeof t === "object") {
+          stableTableState.sortBy = String(t.sortBy || stableTableState.sortBy);
+          stableTableState.sortDir = String(t.sortDir || stableTableState.sortDir) === "asc" ? "asc" : "desc";
+          stableTableState.minApy = Math.max(0, Number(t.minApy || 0) || 0);
+          stableTableState.minTvl = Math.max(0, Number(t.minTvl || 0) || 0);
+          stableTableState.protocolVersion = String(t.protocolVersion || "all");
+          stableTableState.chain = String(t.chain || "all");
+          stableTableState.search = String(t.search || "");
+          stableTableState.onlyBonuses = !!t.onlyBonuses;
+          stableTableState.onlyActive = (t.onlyActive === undefined) ? true : !!t.onlyActive;
+        }
+        stableSectionState.combined = !!parsed?.sectionCollapsed;
+        stableUniverseState.expanded = !!parsed?.universeExpanded;
+      } catch (_) {}
+    }
+    function applyStableUiStateToControls() {
+      const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = String(v ?? ""); };
+      const setChk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+      setVal("stableMinApy", stableTableState.minApy);
+      setVal("stableMinTvl", stableTableState.minTvl);
+      setVal("stableSearch", stableTableState.search || "");
+      setChk("stableOnlyBonuses", stableTableState.onlyBonuses);
+      setChk("stableOnlyActive", stableTableState.onlyActive);
+      const ub = document.getElementById("stableUniverseBody");
+      const ubBtn = document.getElementById("stableUniverseDetailsBtn");
+      if (ub) ub.classList.toggle("collapsed", !stableUniverseState.expanded);
+      if (ubBtn) ubBtn.textContent = stableUniverseState.expanded ? "Hide details" : "Details";
+    }
+    function saveStableResultCache(payload) {
+      try {
+        localStorage.setItem(STABLE_RESULT_STORAGE_KEY, JSON.stringify({
+          ts: Math.floor(Date.now() / 1000),
+          data: payload || {},
+        }));
+      } catch (_) {}
+    }
+    function loadStableResultCache() {
+      try {
+        const raw = localStorage.getItem(STABLE_RESULT_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        const ts = Number(parsed?.ts || 0);
+        if (!Number.isFinite(ts) || ts <= 0) return null;
+        const age = Math.floor(Date.now() / 1000) - ts;
+        if (age > STABLE_RESULT_TTL_SEC) return null;
+        const data = parsed?.data;
+        return (data && typeof data === "object") ? data : null;
+      } catch (_) {
+        return null;
+      }
+    }
     function fmtPct(v) {
       const n = Number(v || 0);
       return `${n.toFixed(2)}%`;
@@ -25567,18 +25650,42 @@ def _render_stables_page() -> str:
       const btn = document.getElementById("stableUniverseDetailsBtn");
       if (body) body.classList.toggle("collapsed", !stableUniverseState.expanded);
       if (btn) btn.textContent = stableUniverseState.expanded ? "Hide details" : "Details";
+      saveStableUiState();
     }
     function readStableTableControls() {
-      const topNRaw = Number(document.getElementById("stableTopN")?.value || stableTableState.topN || 0);
-      const minTotalAprRaw = Number(document.getElementById("stableMinTotalApr")?.value || stableTableState.minTotalApr || 0);
+      const minApyRaw = Number(document.getElementById("stableMinApy")?.value || stableTableState.minApy || 0);
+      const minTvlRaw = Number(document.getElementById("stableMinTvl")?.value || stableTableState.minTvl || 0);
+      const protocolVersion = String(document.getElementById("stableProtocolVersion")?.value || stableTableState.protocolVersion || "all");
+      const chain = String(document.getElementById("stableChainFilter")?.value || stableTableState.chain || "all");
       const search = String(document.getElementById("stableSearch")?.value || "").trim().toLowerCase();
       const onlyBonuses = !!document.getElementById("stableOnlyBonuses")?.checked;
       const onlyActive = !!document.getElementById("stableOnlyActive")?.checked;
-      stableTableState.topN = Number.isFinite(topNRaw) ? Math.max(0, Math.floor(topNRaw)) : 50;
-      stableTableState.minTotalApr = Number.isFinite(minTotalAprRaw) ? Math.max(0, minTotalAprRaw) : 0;
+      stableTableState.minApy = Number.isFinite(minApyRaw) ? Math.max(0, minApyRaw) : 0;
+      stableTableState.minTvl = Number.isFinite(minTvlRaw) ? Math.max(0, minTvlRaw) : 0;
+      stableTableState.protocolVersion = protocolVersion || "all";
+      stableTableState.chain = chain || "all";
       stableTableState.search = search;
       stableTableState.onlyBonuses = onlyBonuses;
       stableTableState.onlyActive = onlyActive;
+    }
+    function refreshStableFilterOptions(rows) {
+      const list = Array.isArray(rows) ? rows : [];
+      const chainSel = document.getElementById("stableChainFilter");
+      if (chainSel) {
+        const prev = String(stableTableState.chain || "all");
+        const chains = Array.from(new Set(list.map((r) => String(r?.chain || "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b));
+        chainSel.innerHTML = `<option value="all">all</option>` + chains.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+        chainSel.value = chains.includes(prev) ? prev : "all";
+      }
+      const pvSel = document.getElementById("stableProtocolVersion");
+      if (pvSel) {
+        const prev = String(stableTableState.protocolVersion || "all");
+        const vals = Array.from(new Set(list.map((r) => String(r?.protocol_version || "").trim().toLowerCase()).filter(Boolean))).sort();
+        pvSel.innerHTML = `<option value="all">all</option>` + vals.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+        pvSel.value = vals.includes(prev) ? prev : "all";
+      }
+      readStableTableControls();
+      saveStableUiState();
     }
     function onStableHeaderSort(key) {
       const k = String(key || "").trim();
@@ -25587,15 +25694,20 @@ def _render_stables_page() -> str:
         stableTableState.sortDir = (stableTableState.sortDir === "desc") ? "asc" : "desc";
       } else {
         stableTableState.sortBy = k;
-        stableTableState.sortDir = (k === "asset" || k === "chain" || k === "market" || k === "bucket") ? "asc" : "desc";
+        stableTableState.sortDir = (k === "asset" || k === "chain" || k === "market" || k === "bucket" || k === "protocol_version") ? "asc" : "desc";
       }
+      saveStableUiState();
       renderLending(stableCache.lending || []);
     }
     function applyLendingView(rows) {
       const list = Array.isArray(rows) ? rows.slice() : [];
       const out = list.filter((r) => {
         const total = Number(r?.supply_total_apr_pct || 0);
-        if (total < Number(stableTableState.minTotalApr || 0)) return false;
+        if (total < Number(stableTableState.minApy || 0)) return false;
+        const tvl = Number(r?.tvl_usd || 0);
+        if (tvl < Number(stableTableState.minTvl || 0)) return false;
+        if (stableTableState.protocolVersion !== "all" && String(r?.protocol_version || "").toLowerCase() !== String(stableTableState.protocolVersion || "").toLowerCase()) return false;
+        if (stableTableState.chain !== "all" && String(r?.chain || "") !== String(stableTableState.chain || "")) return false;
         if (stableTableState.onlyBonuses) {
           const bonus = Number(r?.supply_bonus_apr_pct || 0) + Number(r?.conditional_bonus_apr_pct || 0) + Number(r?.borrow_discount_apr_pct || 0) + Number(r?.merkl_bonus_apr_pct || 0);
           if (!(bonus > 0)) return false;
@@ -25617,11 +25729,11 @@ def _render_stables_page() -> str:
         if (Number.isFinite(an) && Number.isFinite(bn)) return (an - bn) * dir;
         return String(av || "").localeCompare(String(bv || "")) * dir;
       });
-      const topN = Number(stableTableState.topN || 0);
-      return (topN > 0) ? out.slice(0, topN) : out;
+      return out;
     }
     function onStableTableControlChange() {
       readStableTableControls();
+      saveStableUiState();
       renderLending(stableCache.lending || []);
     }
     function setStableStatus(text, isErr) {
@@ -25646,6 +25758,7 @@ def _render_stables_page() -> str:
       btn.textContent = collapsed ? "▸" : "▾";
       if (title) title.style.visibility = collapsed ? "visible" : "hidden";
       if (hL) hL.style.display = collapsed ? "none" : "block";
+      saveStableUiState();
     }
     function toggleStableSection() {
       const next = !stableSectionState.combined;
@@ -25690,9 +25803,11 @@ def _render_stables_page() -> str:
       const renderGroupTable = (title, rowsGroup) => {
         let html = `<div class="stable-block"><div class="stable-block-title">${esc(title)} (${rowsGroup.length})</div><div class="table-wrap"><table>`;
         html += "<tr>";
-        html += `<th class="sortable" onclick="onStableHeaderSort('chain')">Chain${sortMark("chain")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('market')">Market${sortMark("market")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('asset')">Asset${sortMark("asset")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('chain')">Chain${sortMark("chain")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('protocol_version')">Protocol version${sortMark("protocol_version")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('market')">Market${sortMark("market")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('tvl_usd')">TVL USD${sortMark("tvl_usd")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('supply_apy_pct')">Supply APY${sortMark("supply_apy_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('supply_bonus_apr_pct')">Supply Bonus APR${sortMark("supply_bonus_apr_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('conditional_bonus_apr_pct')">Conditional Bonus APR${sortMark("conditional_bonus_apr_pct")}</th>`;
@@ -25710,9 +25825,11 @@ def _render_stables_page() -> str:
           if (r.frozen) statusParts.push("frozen");
           if (!r.paused && !r.frozen) statusParts.push("active");
           html += "<tr>";
-          html += `<td>${esc(r.chain || "")}</td>`;
-          html += `<td>${esc(r.market || "")}</td>`;
           html += `<td>${esc(r.asset || "")}</td>`;
+          html += `<td>${esc(r.chain || "")}</td>`;
+          html += `<td>${esc(r.protocol_version || r.protocol || "-")}</td>`;
+          html += `<td>${esc(r.market || "")}</td>`;
+          html += `<td>${Number(r.tvl_usd || 0).toLocaleString(undefined, {maximumFractionDigits: 0})}</td>`;
           html += `<td>${fmtPct(r.supply_apy_pct)}</td>`;
           html += `<td>${fmtPct(r.supply_bonus_apr_pct)}</td>`;
           html += `<td>${fmtPct(r.conditional_bonus_apr_pct)}</td>`;
@@ -25726,7 +25843,7 @@ def _render_stables_page() -> str:
           html += `<td>${esc(statusParts.join(", "))}</td>`;
           html += "</tr>";
         }
-        if (!rowsGroup.length) html += "<tr><td colspan='14'>No rows in this block.</td></tr>";
+        if (!rowsGroup.length) html += "<tr><td colspan='16'>No rows in this block.</td></tr>";
         html += "</table></div></div>";
         return html;
       };
@@ -25763,8 +25880,17 @@ def _render_stables_page() -> str:
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || "Scan failed");
         stableCache.lending = data.rows || [];
+        refreshStableFilterOptions(stableCache.lending);
         renderCatalog(data.stable_catalog || stableCache.catalog || {});
         renderLending(stableCache.lending);
+        saveStableResultCache({
+          rows: stableCache.lending || [],
+          stable_catalog: stableCache.catalog || {},
+          chains: data.chains || [],
+          markets: Number(data.markets || 0),
+          summary: data.summary || {},
+          warnings: data.warnings || [],
+        });
         const errWrap = document.getElementById("stableErrors");
         const errs = data.errors || [];
         const warns = data.warnings || [];
@@ -25784,9 +25910,20 @@ def _render_stables_page() -> str:
         setStableBusy(false);
       }
     }
+    loadStableUiState();
+    applyStableUiStateToControls();
     loadStableUniverse();
-    setStableSectionCollapsed(false);
-    setStableStatus("Ready", false);
+    setStableSectionCollapsed(!!stableSectionState.combined);
+    const cached = loadStableResultCache();
+    if (cached && Array.isArray(cached.rows) && cached.rows.length) {
+      stableCache.lending = cached.rows.slice();
+      renderCatalog(cached.stable_catalog || stableCache.catalog || {});
+      refreshStableFilterOptions(stableCache.lending);
+      renderLending(stableCache.lending);
+      setStableStatus(`Loaded cached table (${stableCache.lending.length} rows)`, false);
+    } else {
+      setStableStatus("Ready", false);
+    }
     """
     return _render_placeholder_page(
         "Lending Stablecoin",
