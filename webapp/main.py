@@ -16255,14 +16255,15 @@ def _scan_aave_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                 continue
             chain_obj = ((s.get("market") or {}).get("chain") or {})
             chain_id = int(chain_obj.get("chainId") or 0)
+            chain_str = str(chain_obj.get("name") or AAVE_CHAIN_ID_TO_NAME.get(chain_id, chain_id))
             rows.append(
                 {
                     "address": owner,
                     "protocol": "aave_v3",
-                    "chain": str(chain_obj.get("name") or AAVE_CHAIN_ID_TO_NAME.get(chain_id, chain_id)),
+                    "chain": chain_str,
                     "chain_id": chain_id,
                     "kind": "lending_supply",
-                    "market": str((s.get("market") or {}).get("name") or ""),
+                    "market": _market_name_without_chain(str((s.get("market") or {}).get("name") or ""), chain_str),
                     "asset": str((s.get("currency") or {}).get("symbol") or ""),
                     "amount": _safe_float(((s.get("balance") or {}).get("amount") or {}).get("value")),
                     "usd": usd,
@@ -16276,14 +16277,15 @@ def _scan_aave_positions(addresses: list[str], chain_ids: list[int]) -> tuple[li
                 continue
             chain_obj = ((b.get("market") or {}).get("chain") or {})
             chain_id = int(chain_obj.get("chainId") or 0)
+            chain_str = str(chain_obj.get("name") or AAVE_CHAIN_ID_TO_NAME.get(chain_id, chain_id))
             rows.append(
                 {
                     "address": owner,
                     "protocol": "aave_v3",
-                    "chain": str(chain_obj.get("name") or AAVE_CHAIN_ID_TO_NAME.get(chain_id, chain_id)),
+                    "chain": chain_str,
                     "chain_id": chain_id,
                     "kind": "lending_borrow",
-                    "market": str((b.get("market") or {}).get("name") or ""),
+                    "market": _market_name_without_chain(str((b.get("market") or {}).get("name") or ""), chain_str),
                     "asset": str((b.get("currency") or {}).get("symbol") or ""),
                     "amount": _safe_float(((b.get("debt") or {}).get("amount") or {}).get("value")),
                     "usd": usd,
@@ -16372,6 +16374,19 @@ def _pct_from_percent_value(raw: Any) -> float:
         return 0.0
     # Aave PercentValue.value may be normalized (1.0 = 100%).
     return float(v * 100.0) if v <= 1.5 else float(v)
+
+
+def _market_name_without_chain(market_name: str, chain_name: str) -> str:
+    """Strip the network name from an Aave market title when it duplicates the Chain column."""
+    m = str(market_name or "").strip()
+    c = str(chain_name or "").strip()
+    if not m or not c:
+        return m
+    out = re.sub(re.escape(c), "", m, flags=re.IGNORECASE)
+    out = re.sub(r"\s+", " ", out).strip()
+    out = re.sub(r"^[\s\-–—:|/,]+|[\s\-–—:|/,]+$", "", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out if out else m
 
 
 def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any]], str]:
@@ -16666,7 +16681,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
         chain_name = str(chain.get("name") or AAVE_CHAIN_ID_TO_NAME.get(chain_id, chain_id))
         if chain_id > 0:
             seen_chains.add(chain_id)
-        market_name = str(market.get("name") or "")
+        market_name = _market_name_without_chain(str(market.get("name") or ""), chain_name)
         for reserve in (market.get("reserves") or []):
             token = (reserve.get("underlyingToken") or {})
             symbol = str(token.get("symbol") or "").strip().lower()
@@ -26102,14 +26117,10 @@ def _render_stables_page() -> str:
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_apy_pct')">Borrow APY${sortMark("borrow_apy_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_discount_apr_pct')">Borrow Discount APR${sortMark("borrow_discount_apr_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_effective_apr_pct')">Borrow Effective APR${sortMark("borrow_effective_apr_pct")}</th>`;
-        html += "<th>Reward Tokens</th><th>Bonus programs</th><th>Status</th></tr>";
+        html += "<th>Reward Tokens</th><th>Bonus programs</th></tr>";
         for (const r of sortedRows) {
           const rewards = Array.isArray(r.reward_tokens) ? r.reward_tokens.join(", ") : "";
           const bonus = Array.isArray(r.bonus_programs) ? r.bonus_programs.join(" | ") : "";
-          const statusParts = [];
-          if (r.paused) statusParts.push("paused");
-          if (r.frozen) statusParts.push("frozen");
-          if (!r.paused && !r.frozen) statusParts.push("active");
           html += "<tr>";
           html += `<td>${esc(r.asset || "")}</td>`;
           html += `<td>${esc(r.chain || "")}</td>`;
@@ -26126,10 +26137,9 @@ def _render_stables_page() -> str:
           html += `<td><b>${fmtPct(r.borrow_effective_apr_pct)}</b></td>`;
           html += `<td>${esc(rewards || "-")}</td>`;
           html += `<td title="${esc(bonus)}">${esc(bonus || "-")}</td>`;
-          html += `<td>${esc(statusParts.join(", "))}</td>`;
           html += "</tr>";
         }
-        if (!sortedRows.length) html += "<tr><td colspan='16'>No rows in this block.</td></tr>";
+        if (!sortedRows.length) html += "<tr><td colspan='15'>No rows in this block.</td></tr>";
         html += "</table></div></div>";
         return html;
       };
