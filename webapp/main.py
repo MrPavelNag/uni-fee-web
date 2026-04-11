@@ -16376,6 +16376,30 @@ def _pct_from_percent_value(raw: Any) -> float:
     return float(v * 100.0) if v <= 1.5 else float(v)
 
 
+def _bonus_program_end_date_str(raw: Any) -> str:
+    """Bonus end instant as ``YYYY-MM-DD`` (UTC); empty if unknown."""
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    if "T" in s:
+        head = s.split("T", 1)[0].strip()
+        if len(head) >= 10 and head[4:5] == "-" and head[7:8] == "-":
+            return head[:10]
+        return ""
+    try:
+        ts = float(s)
+        if ts <= 0:
+            return ""
+        return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+    except Exception:
+        pass
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    return ""
+
+
 def _market_name_without_chain(market_name: str, chain_name: str) -> str:
     """Strip the network name from an Aave market title when it duplicates the Chain column."""
     m = str(market_name or "").strip()
@@ -16389,7 +16413,12 @@ def _market_name_without_chain(market_name: str, chain_name: str) -> str:
     return out if out else m
 
 
-def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any]], str]:
+def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any]], set[tuple[int, str]], str]:
+    """Return Merkl APR index, then a set of (chainId, addr) where Merkl lists an Aave opportunity with no APR.
+
+    Used to suppress Aave v4 ``MerklSupplyReward`` fallback: that GraphQL field can stay non-zero while the
+    Merkl REST API already reports ``apr: 0`` (e.g. ended campaigns), which inflated bonuses (e.g. USDG).
+    """
     base = str(MERKL_API_ENDPOINT or "https://api.merkl.xyz/v4").rstrip("/")
     headers = {
         "User-Agent": APP_USER_AGENT,
@@ -16411,7 +16440,7 @@ def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any
         except HTTPError as e:
             code = int(getattr(e, "code", 0) or 0)
             if code in (401, 403):
-                return {}, f"Merkl opportunities endpoint is not accessible ({code})."
+                return {}, set(), f"Merkl opportunities endpoint is not accessible ({code})."
             raise
         page_items = payload if isinstance(payload, list) else (
             (payload.get("items") if isinstance(payload, dict) else None)
@@ -16426,14 +16455,13 @@ def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any
         if len(chunk) < per_page:
             break
     if not items:
-        return {}, "Merkl API returned no AAVE opportunities."
+        return {}, set(), "Merkl API returned no AAVE opportunities."
     out: dict[tuple[int, str], dict[str, Any]] = {}
+    inactive_merkl_keys: set[tuple[int, str]] = set()
     for it in (items or []):
         if not isinstance(it, dict):
             continue
         apr = _safe_float(it.get("apr"))
-        if apr <= 0:
-            continue
         chain_id = int(
             _safe_float(
                 it.get("chainId")
@@ -16455,12 +16483,9 @@ def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any
             or ((it.get("token") or {}).get("symbol") if isinstance(it.get("token"), dict) else "")
             or "MERKL"
         ).strip().upper()
-        label = str(
-            it.get("name")
-            or it.get("campaignName")
-            or it.get("identifier")
-            or f"Merkl {reward_sym}"
-        ).strip()
+        end_raw = it.get("latestCampaignEnd") or it.get("earliestCampaignEnd")
+        end_d = _bonus_program_end_date_str(end_raw)
+        program_line = f"Merkl до {end_d}" if end_d else "Merkl до ?"
         token_addrs: list[str] = []
         for tk in (it.get("tokens") or []):
             if not isinstance(tk, dict):
@@ -16472,25 +16497,47 @@ def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any
         valid_addrs = [a for a in addrs if _is_eth_address(a)]
         if not valid_addrs:
             continue
+        if apr <= 0:
+            for addr in valid_addrs:
+                inactive_merkl_keys.add((int(chain_id), str(addr)))
+            continue
         per_addr_apr = float(apr) / float(len(valid_addrs))
         for addr in valid_addrs:
             key = (int(chain_id), str(addr))
-            rec = out.setdefault(key, {"apr": 0.0, "labels": [], "tokens": set()})
+            rec = out.setdefault(key, {"apr": 0.0, "programs": [], "tokens": set()})
             rec["apr"] = float(rec.get("apr") or 0.0) + per_addr_apr
-            if label:
-                labels = rec.get("labels") if isinstance(rec.get("labels"), list) else []
-                if label not in labels:
-                    labels.append(label)
-                rec["labels"] = labels
+            progs = rec.get("programs") if isinstance(rec.get("programs"), list) else []
+            if program_line and program_line not in progs:
+                progs.append(program_line)
+            rec["programs"] = progs
             if reward_sym:
                 toks = rec.get("tokens") if isinstance(rec.get("tokens"), set) else set(rec.get("tokens") or [])
                 toks.add(reward_sym)
                 rec["tokens"] = toks
+    inactive_merkl_keys -= set(out.keys())
     for rec in out.values():
         rec["tokens"] = sorted(list(rec.get("tokens") or []))
     if not out:
-        return {}, "Merkl opportunities were loaded but none matched AAVE reserve token addresses."
-    return out, ""
+        return {}, inactive_merkl_keys, "Merkl opportunities were loaded but none matched AAVE reserve token addresses."
+    return out, inactive_merkl_keys, ""
+
+
+def _merkl_inactive_covers_reserve(
+    chain_id: int,
+    underlying_addr: str,
+    atoken_addr: str,
+    vtoken_addr: str,
+    inactive: set[tuple[int, str]],
+) -> bool:
+    """True if Merkl REST lists a zero-APR Aave opportunity touching any of these reserve addresses."""
+    if not inactive:
+        return False
+    cid = int(chain_id)
+    for raw in (underlying_addr, atoken_addr, vtoken_addr):
+        a = str(raw or "").strip().lower()
+        if _is_eth_address(a) and (cid, a) in inactive:
+            return True
+    return False
 
 
 def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int, str], dict[str, Any]], str]:
@@ -16505,22 +16552,26 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
             __typename
             ... on MerklSupplyReward {
               id
+              endDate
               extraApy { value }
               payoutToken { info { symbol } }
             }
             ... on MerklBorrowReward {
               id
+              endDate
               discountApy { value }
               payoutToken { info { symbol } }
             }
             ... on SupplyPointsReward {
               id
               name
+              endDate
               program { name }
             }
             ... on BorrowPointsReward {
               id
               name
+              endDate
               program { name }
             }
           }
@@ -16562,7 +16613,11 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
                 val = _pct_from_percent_value((((rw.get("extraApy") or {}).get("value"))))
                 if val > 0:
                     supply_apr += float(val)
-                    labels.append(f"Aave v4 Merkl supply: +{val:.2f}%")
+                if val > 0:
+                    ed = _bonus_program_end_date_str(rw.get("endDate"))
+                    tag = f"Merkl до {ed}" if ed else "Merkl до ?"
+                    if tag not in labels:
+                        labels.append(tag)
                 tk = str((((rw.get("payoutToken") or {}).get("info") or {}).get("symbol") or "")).strip().upper()
                 if tk:
                     tokens.add(tk)
@@ -16570,15 +16625,19 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
                 val = _pct_from_percent_value((((rw.get("discountApy") or {}).get("value"))))
                 if val > 0:
                     borrow_discount += float(val)
-                    labels.append(f"Aave v4 Merkl borrow: -{val:.2f}%")
+                if val > 0:
+                    ed = _bonus_program_end_date_str(rw.get("endDate"))
+                    tag = f"Merkl borrow до {ed}" if ed else "Merkl borrow до ?"
+                    if tag not in labels:
+                        labels.append(tag)
                 tk = str((((rw.get("payoutToken") or {}).get("info") or {}).get("symbol") or "")).strip().upper()
                 if tk:
                     tokens.add(tk)
             elif t in {"SupplyPointsReward", "BorrowPointsReward"}:
-                rw_name = str(rw.get("name") or "").strip()
-                pg_name = str(((rw.get("program") or {}).get("name") or "")).strip()
-                label = rw_name or pg_name or t
-                labels.append(f"Aave v4 points: {label}")
+                ed = _bonus_program_end_date_str(rw.get("endDate"))
+                tag = f"Поинты до {ed}" if ed else "Поинты до ?"
+                if tag not in labels:
+                    labels.append(tag)
         if supply_apr <= 0 and borrow_discount <= 0 and not labels and not tokens:
             continue
         out[(int(chain_id), str(addr))] = {
@@ -16599,14 +16658,16 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
 
     chain_ids = sorted(int(x) for x in AAVE_CHAIN_ID_TO_NAME.keys())
     merkl_idx: dict[tuple[int, str], dict[str, Any]] = {}
+    merkl_inactive_keys: set[tuple[int, str]] = set()
     v4_idx: dict[tuple[int, str], dict[str, Any]] = {}
     warnings: list[str] = []
     try:
-        merkl_idx, merkl_warn = _fetch_merkl_aave_bonus_index()
+        merkl_idx, merkl_inactive_keys, merkl_warn = _fetch_merkl_aave_bonus_index()
         if merkl_warn:
             warnings.append(merkl_warn)
     except Exception as e:
         warnings.append(f"Merkl bonus fetch failed: {e}")
+        merkl_inactive_keys = set()
     try:
         v4_idx, v4_warn = _fetch_aave_v4_bonus_index(stable_symbols)
         if v4_warn:
@@ -16700,7 +16761,9 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     val = _pct_from_percent_value((((inc.get("extraSupplyApr") or {}).get("value"))))
                     if val > 0:
                         supply_bonus_pct += float(val)
-                        bonus_labels.append(f"{t}: +{val:.2f}% supply")
+                        tag = "Merit до ?" if t == "MeritSupplyIncentive" else "Aave до ?"
+                        if tag not in bonus_labels:
+                            bonus_labels.append(tag)
                     rt = str(inc.get("rewardTokenSymbol") or "").strip().upper()
                     if rt:
                         reward_tokens.add(rt)
@@ -16708,18 +16771,19 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     val = _pct_from_percent_value((((inc.get("borrowAprDiscount") or {}).get("value"))))
                     if val > 0:
                         borrow_discount_pct += float(val)
-                        bonus_labels.append(f"{t}: -{val:.2f}% borrow")
+                        tag = "Merit borrow до ?" if t == "MeritBorrowIncentive" else "Aave borrow до ?"
+                        if tag not in bonus_labels:
+                            bonus_labels.append(tag)
                     rt = str(inc.get("rewardTokenSymbol") or "").strip().upper()
                     if rt:
                         reward_tokens.add(rt)
                 elif t == "MeritBorrowAndSupplyIncentiveCondition":
                     val = _pct_from_percent_value((((inc.get("extraApr") or {}).get("value"))))
-                    sup = str(((inc.get("supplyToken") or {}).get("symbol") or "")).strip().upper()
-                    bor = str(((inc.get("borrowToken") or {}).get("symbol") or "")).strip().upper()
                     if val > 0:
                         conditional_bonus_pct += float(val)
-                        cond = f"{sup}/{bor}" if (sup or bor) else "conditional"
-                        bonus_labels.append(f"{t} ({cond}): +{val:.2f}%")
+                        tag = "Условно до ?"
+                        if tag not in bonus_labels:
+                            bonus_labels.append(tag)
             supply_total_pct = float(supply_apy_pct + supply_bonus_pct + conditional_bonus_pct)
             borrow_effective_pct = float(max(0.0, borrow_apy_pct - borrow_discount_pct))
             rows.append(
@@ -16752,7 +16816,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
             vtoken_addr = str(((reserve.get("vToken") or {}).get("address") or "")).strip().lower()
             merkl_apr = 0.0
             merkl_tokens: list[str] = []
-            merkl_labels: list[str] = []
+            merkl_program_lines: list[str] = []
             for addr in [underlying_addr, atoken_addr, vtoken_addr]:
                 if not _is_eth_address(addr):
                     continue
@@ -16764,17 +16828,17 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     ts = str(t or "").strip().upper()
                     if ts and ts not in merkl_tokens:
                         merkl_tokens.append(ts)
-                for lb in (rec.get("labels") or []):
-                    lbl = str(lb or "").strip()
-                    if lbl and lbl not in merkl_labels:
-                        merkl_labels.append(lbl)
+                for pl in rec.get("programs") or []:
+                    ps = str(pl or "").strip()
+                    if ps and ps not in merkl_program_lines:
+                        merkl_program_lines.append(ps)
             if merkl_apr > 0:
                 row["merkl_bonus_apr_pct"] = float(merkl_apr)
                 row["supply_total_apr_pct"] = float(row.get("supply_total_apr_pct") or 0.0) + float(merkl_apr)
                 for t in merkl_tokens:
                     if t and t not in reward_tokens:
                         reward_tokens.add(t)
-                bonus_labels.extend([f"Merkl: +{float(merkl_apr):.2f}%"] + [f"Merkl campaign: {x}" for x in merkl_labels[:3]])
+                bonus_labels.extend(merkl_program_lines)
             else:
                 row["merkl_bonus_apr_pct"] = 0.0
             v4_rec = v4_idx.get((int(chain_id), underlying_addr)) if _is_eth_address(underlying_addr) else None
@@ -16783,25 +16847,54 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                 v4_borrow_discount = float(v4_rec.get("borrow_discount") or 0.0)
                 v4_tokens = [str(x or "").strip().upper() for x in (v4_rec.get("tokens") or [])]
                 v4_labels = [str(x or "").strip() for x in (v4_rec.get("labels") or [])]
+                v4_stale = _merkl_inactive_covers_reserve(
+                    int(chain_id), underlying_addr, atoken_addr, vtoken_addr, merkl_inactive_keys
+                )
+                if v4_stale:
+                    v4_supply_apr = 0.0
+                    v4_borrow_discount = 0.0
+                    v4_tokens = []
+                    v4_labels = [lb for lb in v4_labels if str(lb).startswith("Поинты")]
                 for t in v4_tokens:
                     if t:
                         reward_tokens.add(t)
-                for lb in v4_labels[:4]:
+                for lb in v4_labels:
                     if lb and lb not in bonus_labels:
                         bonus_labels.append(lb)
                 # Avoid double counting when Merkl API already supplied direct APR.
-                if float(row.get("merkl_bonus_apr_pct") or 0.0) <= 0.0 and v4_supply_apr > 0:
+                # Skip v4 Merkl* numbers when Merkl REST reports apr<=0 for this market (stale v4 GraphQL).
+                if (
+                    float(row.get("merkl_bonus_apr_pct") or 0.0) <= 0.0
+                    and v4_supply_apr > 0
+                    and not v4_stale
+                ):
                     row["merkl_bonus_apr_pct"] = float(v4_supply_apr)
                     row["supply_total_apr_pct"] = float(row.get("supply_total_apr_pct") or 0.0) + float(v4_supply_apr)
-                    bonus_labels.append(f"Aave v4 rewards fallback: +{v4_supply_apr:.2f}% supply")
-                if float(row.get("borrow_discount_apr_pct") or 0.0) <= 0.0 and v4_borrow_discount > 0:
+                if (
+                    float(row.get("borrow_discount_apr_pct") or 0.0) <= 0.0
+                    and v4_borrow_discount > 0
+                    and not v4_stale
+                ):
                     row["borrow_discount_apr_pct"] = float(v4_borrow_discount)
                     row["borrow_effective_apr_pct"] = float(
                         max(0.0, float(row.get("borrow_apy_pct") or 0.0) - float(v4_borrow_discount))
                     )
-                    bonus_labels.append(f"Aave v4 rewards fallback: -{v4_borrow_discount:.2f}% borrow")
             row["reward_tokens"] = sorted(reward_tokens)
-            row["bonus_programs"] = bonus_labels
+            row["bonus_programs"] = list(dict.fromkeys(bonus_labels))
+
+    for row in rows:
+        sb = float(row.get("supply_bonus_apr_pct") or 0.0)
+        cb = float(row.get("conditional_bonus_apr_pct") or 0.0)
+        mb = float(row.get("merkl_bonus_apr_pct") or 0.0)
+        types: list[str] = []
+        if sb > 0:
+            types.append("Protocol")
+        if cb > 0:
+            types.append("Conditional")
+        if mb > 0:
+            types.append("Merkl")
+        row["supply_bonuses_apr_pct"] = float(sb + cb + mb)
+        row["supply_bonus_types"] = types
 
     rows.sort(
         key=lambda r: (
@@ -25601,57 +25694,145 @@ def _render_positions_page() -> str:
 
 def _render_stables_page() -> str:
     extra_css = """
-    .positions-grid { display:grid; gap:14px; margin-top:4px; min-width:0; width:100%; max-width:100%; }
-    .positions-form, .result-card {
+    /* Match ``Find the best fee on Uniswap`` (HTML_PAGE): .grid, .control-card, pair-lists panel */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
+      margin-top: 4px;
+      min-width: 0;
+      width: 100%;
+      max-width: 100%;
+    }
+    .card.control-card {
       background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%);
-      border: 1px solid #d4deee;
+      border: 1px solid #cfdcec;
       border-radius: 14px;
       padding: 14px;
-      box-shadow: 0 6px 20px rgba(15,23,42,0.06);
+      box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06);
       min-width: 0;
       max-width: 100%;
     }
-    .positions-form h3, .result-card h3 { margin:0; font-size:17px; color:#1f3a8a; }
-    .section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; min-width:0; }
-    .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; min-height:26px; }
-    .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #bfdbfe; border-radius:999px; padding:4px 8px; background:#eff6ff; color:#1f3a8a; font-size:12px; }
-    .chip.muted { border-style:dashed; color:#64748b; background:#f8fbff; }
-    .stable-groups { display:grid; grid-template-columns:repeat(1, minmax(0, 1fr)); gap:10px; }
-    .stable-group { border:1px solid #d7e1ef; border-radius:12px; background:#f8fbff; padding:10px; }
-    .stable-group h4 { margin:0 0 6px; font-size:14px; color:#1e3a8a; }
-    .stable-meta { margin-top:6px; color:#475569; font-size:12px; }
-    .stable-universe-body.collapsed { display:none; }
+    .card.control-card h3 { margin: 0; font-size: 17px; color: #1f3a8a; }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+      min-width: 0;
+    }
+    .section-head .pair-details-btn { flex: 0 0 auto; }
+    .pair-details-btn {
+      border: 1px solid #d1d5db;
+      background: #f8fafc;
+      color: #334155;
+      border-radius: 8px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .stable-universe-body.collapsed { display: none; }
+    #stableUniverseMeta {
+      margin: 0 0 10px;
+      font-size: 13px;
+      color: #64748b;
+    }
+    .pair-lists-panel {
+      margin-top: 0;
+      border: 1px solid #dbe3ef;
+      border-radius: 10px;
+      background: linear-gradient(180deg, #fbfdff 0%, #f3f7ff 100%);
+      padding: 10px;
+    }
+    .pair-lists-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .pair-lists-section {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .pair-lists-section h5 {
+      margin: 0 0 8px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #0f172a;
+    }
+    .chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 0;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      color: #1e3a8a;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: default;
+    }
+    .chip.muted {
+      border-style: dashed;
+      color: #64748b;
+      background: #f8fafc;
+      font-weight: 500;
+    }
     .stable-table-controls { display:grid; grid-template-columns:repeat(6, minmax(120px, 1fr)); gap:8px; margin:8px 0 10px; }
     .stable-table-controls .ctrl { display:flex; flex-direction:column; gap:4px; }
     .stable-table-controls label { font-size:11px; color:#64748b; }
     .stable-table-controls input, .stable-table-controls select { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:6px 8px; font-size:12px; }
     .stable-table-controls .check { flex-direction:row; align-items:center; gap:6px; padding-top:18px; }
     .stable-table-controls .check input { width:auto; }
-    .stable-table-summary { margin:0 0 8px; font-size:12px; color:#475569; }
-    .stable-block { margin-bottom:12px; }
-    .stable-block-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:8px 0 6px; }
-    .stable-block-title { margin:8px 0 6px; font-size:13px; color:#1e3a8a; font-weight:700; }
+    .stable-table-summary { margin:0 0 8px; font-size:12px; color:#64748b; }
+    .stable-block {
+      margin-bottom: 12px;
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .stable-block-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:0 0 8px; }
+    .stable-block-title { margin:0; font-size:13px; font-weight:700; color:#0f172a; }
     .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:17px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
-    .section-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; min-width:0; flex:1 1 auto; }
+    .section-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-left: auto;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
     .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
     .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
     .pos-progress .bar { width: 40%; height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); animation: posLoad 1s linear infinite; }
     @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
-    .pos-status { color:#475569; font-size:13px; min-width:0; flex:1 1 160px; max-width:min(520px,100%); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .pos-status { color:#64748b; font-size:13px; min-width:0; flex:1 1 160px; max-width:min(520px,100%); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .table-wrap {
-      overflow-x:auto;
+      overflow-x: auto;
       -webkit-overflow-scrolling: touch;
-      border:1px solid #dbe3ef;
-      border-radius:10px;
-      background:#f8fbff;
-      width:100%;
-      max-width:100%;
-      min-width:0;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      background: #fbfdff;
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
     }
-    table { width:100%; border-collapse:collapse; font-size:12px; min-width:1250px; }
+    table { width:100%; border-collapse:collapse; font-size:12px; min-width:1180px; }
     th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
     th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
     th.sortable { cursor:pointer; user-select:none; }
@@ -25661,37 +25842,39 @@ def _render_stables_page() -> str:
     .warnings-box { margin-top:10px; border:1px dashed #fdba74; background:#fff7ed; color:#9a3412; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     @media (max-width: 1100px) {
-      .positions-form, .result-card { padding: 12px; }
+      .card.control-card { padding: 12px; }
       .section-head { flex-wrap: wrap; align-items: center; }
-      .section-head h3 { font-size: 16px; }
+      .card.control-card h3 { font-size: 16px; }
       .search-link-btn { font-size: 15px; }
     }
     @media (max-width: 720px) {
-      .positions-grid { gap: 10px; }
-      .positions-form, .result-card { padding: 10px; border-radius: 12px; }
-      .chip { font-size: 11px; padding: 3px 7px; }
+      .grid { gap: 10px; }
+      .card.control-card { padding: 10px; border-radius: 12px; }
+      .chip { font-size: 11px; padding: 4px 8px; }
       .pos-status { font-size: 12px; min-width: 0; max-width: 100%; flex: 1 1 140px; }
       .table-wrap { border-radius: 8px; }
       .stable-table-controls { grid-template-columns:repeat(2, minmax(120px, 1fr)); }
-      table { min-width: 980px; font-size: 11px; }
+      table { min-width: 920px; font-size: 11px; }
       th, td { padding: 6px; }
       .mono { font-size: 10px; }
       .errors-box, .warnings-box, .info-box { font-size: 11px; padding: 7px; }
     }
     """
     extra_html = """
-    <div class="positions-grid">
-      <section class="positions-form">
+    <div class="grid">
+      <section class="card control-card">
         <div class="section-head">
           <h3>Stablecoin universe (from Pools lists)</h3>
-          <button class="collapse-btn" id="stableUniverseDetailsBtn" type="button" onclick="toggleStableUniverseDetails()" title="Collapse/expand">Details</button>
+          <button type="button" class="pair-details-btn" id="stableUniverseDetailsBtn" onclick="toggleStableUniverseDetails()" title="Show or hide lists">Details</button>
         </div>
         <div id="stableUniverseBody" class="stable-universe-body collapsed">
-          <div id="stableUniverseMeta" class="stable-meta">Loading stablecoin lists...</div>
-          <div id="stableUniverseGroups" class="stable-groups"></div>
+          <p id="stableUniverseMeta" class="hint">Loading stablecoin lists...</p>
+          <div class="pair-lists-panel">
+            <div id="stableUniverseGroups" class="pair-lists-grid"></div>
+          </div>
         </div>
       </section>
-      <section class="result-card">
+      <section class="card control-card">
         <div class="section-head">
           <h3 id="stableCombinedTitle">AAVE lending rates and bonus programs</h3>
           <div class="section-actions">
@@ -25741,8 +25924,8 @@ def _render_stables_page() -> str:
           </div>
           <div id="stableTableSummary" class="stable-table-summary">Rows: 0</div>
           <div style="margin:0 0 8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <button class="collapse-btn" id="stableCollapseAllBtn" type="button" onclick="collapseAllStableGroups()">Collapse all</button>
-            <button class="collapse-btn" id="stableExpandAllBtn" type="button" onclick="expandAllStableGroups()">Expand all</button>
+            <button type="button" class="pair-details-btn" id="stableCollapseAllBtn" onclick="collapseAllStableGroups()">Collapse all</button>
+            <button type="button" class="pair-details-btn" id="stableExpandAllBtn" onclick="expandAllStableGroups()">Expand all</button>
           </div>
           <div id="stableLendingBlocks"></div>
           <div id="stableErrors"></div>
@@ -25947,7 +26130,7 @@ def _render_stables_page() -> str:
         st.sortDir = (st.sortDir === "desc") ? "asc" : "desc";
       } else {
         st.sortBy = k;
-        st.sortDir = (k === "asset" || k === "chain" || k === "market" || k === "bucket" || k === "protocol_version") ? "asc" : "desc";
+        st.sortDir = (k === "asset" || k === "chain" || k === "bucket" || k === "protocol_version" || k === "supply_bonus_types" || k === "reward_tokens") ? "asc" : "desc";
       }
       saveStableUiState();
       renderLending(stableCache.lending || []);
@@ -26007,12 +26190,18 @@ def _render_stables_page() -> str:
         if (stableTableState.protocolVersion !== "all" && String(r?.protocol_version || "").toLowerCase() !== String(stableTableState.protocolVersion || "").toLowerCase()) return false;
         if (stableTableState.chain !== "all" && String(r?.chain || "") !== String(stableTableState.chain || "")) return false;
         if (stableTableState.onlyBonuses) {
-          const bonus = Number(r?.supply_bonus_apr_pct || 0) + Number(r?.conditional_bonus_apr_pct || 0) + Number(r?.borrow_discount_apr_pct || 0) + Number(r?.merkl_bonus_apr_pct || 0);
+          const supplyBonuses = Number(r?.supply_bonuses_apr_pct ?? NaN);
+          const bonus = (Number.isFinite(supplyBonuses) ? supplyBonuses : (
+            Number(r?.supply_bonus_apr_pct || 0) + Number(r?.conditional_bonus_apr_pct || 0) + Number(r?.merkl_bonus_apr_pct || 0)
+          )) + Number(r?.borrow_discount_apr_pct || 0);
           if (!(bonus > 0)) return false;
         }
         if (stableTableState.onlyActive && (r?.paused || r?.frozen)) return false;
         if (stableTableState.search) {
-          const blob = `${String(r?.asset || "")} ${String(r?.chain || "")} ${String(r?.market || "")}`.toLowerCase();
+          const typesStr = Array.isArray(r?.supply_bonus_types) ? r.supply_bonus_types.join(" ") : "";
+          const rewardsStr = Array.isArray(r?.reward_tokens) ? r.reward_tokens.join(" ") : "";
+          const bonusStr = Array.isArray(r?.bonus_programs) ? r.bonus_programs.join(" ") : "";
+          const blob = `${String(r?.asset || "")} ${String(r?.chain || "")} ${String(r?.market || "")} ${typesStr} ${rewardsStr} ${bonusStr}`.toLowerCase();
           if (!blob.includes(stableTableState.search)) return false;
         }
         return true;
@@ -26070,7 +26259,7 @@ def _render_stables_page() -> str:
         const chips = arr.length
           ? arr.map((x) => `<span class='chip'>${esc(String(x || "").toUpperCase())}</span>`).join("")
           : "<span class='chip muted'>No symbols</span>";
-        return `<div class='stable-group'><h4>${esc(g.label)} (${arr.length})</h4><div class='chips'>${chips}</div></div>`;
+        return `<div class='pair-lists-section'><h5>${esc(g.label)} (${arr.length})</h5><div class='chips'>${chips}</div></div>`;
       }).join("");
       meta.textContent = `Using ${total} stable symbols from Pools catalog.`;
     }
@@ -26089,8 +26278,16 @@ def _render_stables_page() -> str:
         const dir = (String(st.sortDir || "desc") === "asc") ? 1 : -1;
         const sortMark = (k) => (sortBy === k ? (dir > 0 ? " ↑" : " ↓") : "");
         const sortedRows = (rowsGroup || []).slice().sort((a, b) => {
-          const av = a?.[sortBy];
-          const bv = b?.[sortBy];
+          let av = a?.[sortBy];
+          let bv = b?.[sortBy];
+          if (sortBy === "supply_bonus_types") {
+            av = Array.isArray(a?.supply_bonus_types) ? a.supply_bonus_types.join(", ") : "";
+            bv = Array.isArray(b?.supply_bonus_types) ? b.supply_bonus_types.join(", ") : "";
+          }
+          if (sortBy === "reward_tokens") {
+            av = Array.isArray(a?.reward_tokens) ? a.reward_tokens.join(", ") : "";
+            bv = Array.isArray(b?.reward_tokens) ? b.reward_tokens.join(", ") : "";
+          }
           const an = Number(av);
           const bn = Number(bv);
           if (Number.isFinite(an) && Number.isFinite(bn)) return (an - bn) * dir;
@@ -26104,42 +26301,39 @@ def _render_stables_page() -> str:
         }
         html += `<div class="table-wrap"><table>`;
         html += "<tr>";
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','reward_tokens')">Reward Tokens${sortMark("reward_tokens")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','asset')">Asset${sortMark("asset")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','chain')">Chain${sortMark("chain")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','protocol_version')">Protocol version${sortMark("protocol_version")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','market')">Market${sortMark("market")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','tvl_usd')">TVL USD${sortMark("tvl_usd")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_apy_pct')">Supply APY${sortMark("supply_apy_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_bonus_apr_pct')">Supply Bonus APR${sortMark("supply_bonus_apr_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','conditional_bonus_apr_pct')">Conditional Bonus APR${sortMark("conditional_bonus_apr_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','merkl_bonus_apr_pct')">Merkl Bonus APR${sortMark("merkl_bonus_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_bonuses_apr_pct')">Supply bonuses APR${sortMark("supply_bonuses_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_bonus_types')">Bonus types${sortMark("supply_bonus_types")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_total_apr_pct')">Supply Total APR${sortMark("supply_total_apr_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_apy_pct')">Borrow APY${sortMark("borrow_apy_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_discount_apr_pct')">Borrow Discount APR${sortMark("borrow_discount_apr_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_effective_apr_pct')">Borrow Effective APR${sortMark("borrow_effective_apr_pct")}</th>`;
-        html += "<th>Reward Tokens</th><th>Bonus programs</th></tr>";
+        html += "<th>Bonus programs</th></tr>";
         for (const r of sortedRows) {
           const rewards = Array.isArray(r.reward_tokens) ? r.reward_tokens.join(", ") : "";
           const bonus = Array.isArray(r.bonus_programs) ? r.bonus_programs.join(" | ") : "";
           html += "<tr>";
+          html += `<td>${esc(rewards || "—")}</td>`;
           html += `<td>${esc(r.asset || "")}</td>`;
           html += `<td>${esc(r.chain || "")}</td>`;
           html += `<td>${esc(r.protocol_version || r.protocol || "-")}</td>`;
-          html += `<td>${esc(r.market || "")}</td>`;
           html += `<td>${Number(r.tvl_usd || 0).toLocaleString(undefined, {maximumFractionDigits: 0})}</td>`;
           html += `<td>${fmtPct(r.supply_apy_pct)}</td>`;
-          html += `<td>${fmtPct(r.supply_bonus_apr_pct)}</td>`;
-          html += `<td>${fmtPct(r.conditional_bonus_apr_pct)}</td>`;
-          html += `<td>${fmtPct(r.merkl_bonus_apr_pct)}</td>`;
+          html += `<td>${fmtPct(r.supply_bonuses_apr_pct)}</td>`;
+          html += `<td>${esc(Array.isArray(r.supply_bonus_types) && r.supply_bonus_types.length ? r.supply_bonus_types.join(", ") : "—")}</td>`;
           html += `<td><b>${fmtPct(r.supply_total_apr_pct)}</b></td>`;
           html += `<td>${fmtPct(r.borrow_apy_pct)}</td>`;
           html += `<td>${fmtPct(r.borrow_discount_apr_pct)}</td>`;
           html += `<td><b>${fmtPct(r.borrow_effective_apr_pct)}</b></td>`;
-          html += `<td>${esc(rewards || "-")}</td>`;
           html += `<td title="${esc(bonus)}">${esc(bonus || "-")}</td>`;
           html += "</tr>";
         }
-        if (!sortedRows.length) html += "<tr><td colspan='15'>No rows in this block.</td></tr>";
+        if (!sortedRows.length) html += "<tr><td colspan='13'>No rows in this block.</td></tr>";
         html += "</table></div></div>";
         return html;
       };
