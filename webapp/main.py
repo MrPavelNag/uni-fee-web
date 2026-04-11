@@ -28,7 +28,7 @@ from bisect import bisect_right
 from queue import Empty, Queue
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, wait
 from decimal import Decimal, getcontext
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.request import Request as UrlRequest, urlopen
@@ -16376,28 +16376,61 @@ def _pct_from_percent_value(raw: Any) -> float:
     return float(v * 100.0) if v <= 1.5 else float(v)
 
 
-def _bonus_program_end_date_str(raw: Any) -> str:
-    """Bonus end instant as ``YYYY-MM-DD`` (UTC); empty if unknown."""
+def _bonus_program_end_date_parse(raw: Any) -> date | None:
+    """Parse bonus end instant to a calendar date (UTC)."""
     if raw is None:
-        return ""
+        return None
     s = str(raw).strip()
     if not s:
-        return ""
+        return None
     if "T" in s:
         head = s.split("T", 1)[0].strip()
         if len(head) >= 10 and head[4:5] == "-" and head[7:8] == "-":
-            return head[:10]
-        return ""
+            try:
+                return date(int(head[0:4]), int(head[5:7]), int(head[8:10]))
+            except ValueError:
+                return None
+        return None
     try:
         ts = float(s)
         if ts <= 0:
-            return ""
-        return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc).date()
     except Exception:
         pass
     if len(s) >= 10 and s[4] == "-" and s[7] == "-":
-        return s[:10]
-    return ""
+        try:
+            return date(int(s[0:4]), int(s[5:7]), int(s[8:10]))
+        except ValueError:
+            return None
+    return None
+
+
+def _bonus_program_end_date_str(raw: Any) -> str:
+    """Bonus end for UI: ``16 Apr``; append year if not the current year (UTC). Empty if unknown."""
+    d = _bonus_program_end_date_parse(raw)
+    if d is None:
+        return ""
+    _mon_en = (
+        "",
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+    )
+    mon = _mon_en[d.month] if 1 <= d.month <= 12 else "?"
+    now_y = datetime.now(timezone.utc).date().year
+    if d.year == now_y:
+        return f"{d.day} {mon}"
+    return f"{d.day} {mon} {d.year}"
 
 
 def _market_name_without_chain(market_name: str, chain_name: str) -> str:
@@ -25703,12 +25736,25 @@ def _render_stables_page() -> str:
       --muted: #64748b;
       --text: #0f172a;
       --border: #d9e2f0;
+      --ok: #22c55e;
+      --warn: #eab308;
+      --danger: #ef4444;
       --accent: #2563eb;
       --accent-2: #06b6d4;
     }
     body {
+      margin: 0;
+      font-family: Inter, Arial, sans-serif;
       background: linear-gradient(180deg, #d9e3f5 0%, var(--bg) 100%);
       color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+    .subtitle {
+      color: var(--muted);
+    }
+    .hint {
+      color: var(--muted);
     }
     .grid {
       display: grid;
@@ -25737,8 +25783,6 @@ def _render_stables_page() -> str:
       min-width: 0;
       max-width: 100%;
     }
-    .card.control-card h3 { margin: 0; font-size: 17px; color: #1f3a8a; }
-    .stables-lending-section.card h3 { margin: 0; font-size: 17px; color: #1f3a8a; }
     .section-head {
       display: flex;
       align-items: center;
@@ -25747,7 +25791,21 @@ def _render_stables_page() -> str:
       margin-bottom: 10px;
       min-width: 0;
     }
+    .section-head h3 {
+      margin: 0;
+      font-size: 17px;
+      color: #1f3a8a;
+    }
     .section-head .pair-details-btn { flex: 0 0 auto; }
+    .section-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-left: auto;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
     .pair-details-btn {
       border: 1px solid #d1d5db;
       background: #f8fafc;
@@ -25785,14 +25843,13 @@ def _render_stables_page() -> str:
     .pair-lists-section h5 {
       margin: 0 0 5px 0;
       font-size: 13px;
-      font-weight: 700;
       color: #0f172a;
     }
     .chips {
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
-      margin-top: 0;
+      margin-top: 8px;
     }
     .chip {
       display: inline-flex;
@@ -25835,7 +25892,6 @@ def _render_stables_page() -> str:
     .stable-table-controls .check { flex-direction:row; align-items:center; gap:8px; padding-top:22px; }
     .stable-table-controls .check label { font-weight: 600; padding-top: 0; }
     .stable-table-controls .check input { width:auto; accent-color: #2563eb; }
-    .stable-rows-meta { font-weight:700; text-align:left !important; white-space:nowrap; }
     .stable-block {
       margin-bottom: 12px;
       background: #ffffff;
@@ -25844,35 +25900,29 @@ def _render_stables_page() -> str:
       padding: 10px 12px;
     }
     .stable-block-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:0 0 8px; }
-    .stable-block-title { margin:0; font-size:13px; font-weight:700; color:#0f172a; }
+    .stable-block-title { margin:0; font-size:13px; font-weight:700; color:#0f172a; flex:1; min-width:0; }
     .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:17px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
-    .stables-lending-section .section-actions {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      margin-left: auto;
-      justify-content: flex-end;
-      flex-wrap: wrap;
-      min-width: 0;
-    }
     .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
     .scan-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
     .scan-progress .bar { width: 40%; height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); animation: scanLoad 1s linear infinite; }
     @keyframes scanLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
-    .stables-lending-section .status {
+    .status {
       font-size: 17px;
       font-weight: 400;
       color: #111111;
-      min-width: 0;
-      flex: 1 1 auto;
+      display: inline-block;
+      width: auto;
       max-width: min(760px, 72vw);
+      text-align: left;
       white-space: normal;
       overflow: visible;
       text-overflow: clip;
       line-height: 1.3;
+      min-width: 0;
+      flex: 1 1 auto;
     }
     .table-wrap {
       overflow-x: auto;
@@ -25883,11 +25933,63 @@ def _render_stables_page() -> str:
       max-width: 100%;
       min-width: 0;
     }
-    .stables-lending-section table { width:100%; border-collapse:collapse; font-size:13px; min-width:900px; }
-    .stables-lending-section th, .stables-lending-section td { border-bottom:1px solid #e2e8f0; padding:8px; text-align:left; vertical-align:top; }
-    .stables-lending-section th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
-    th.sortable { cursor:pointer; user-select:none; white-space: nowrap; }
-    th.sortable:hover { background:#dbeafe; }
+    .stables-lending-section table.stable-lend-table {
+      width: 100%;
+      max-width: 100%;
+      table-layout: fixed;
+      border-collapse: collapse;
+      font-size: 11px;
+      min-width: 0;
+    }
+    .stables-lending-section .stable-lend-table th,
+    .stables-lending-section .stable-lend-table td {
+      border-bottom: 1px solid #e2e8f0;
+      padding: 4px 5px;
+      text-align: left;
+      vertical-align: top;
+      word-wrap: break-word;
+      overflow-wrap: anywhere;
+    }
+    .stables-lending-section .stable-lend-table th {
+      background: #eff6ff;
+      color: #1e3a8a;
+      position: sticky;
+      top: 0;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+    .stables-lending-section .stable-lend-table th.sortable {
+      cursor: pointer;
+      user-select: none;
+      white-space: normal;
+    }
+    .stables-lending-section .stable-lend-table th.sortable:hover { background: #dbeafe; }
+    /* Column widths (% of table) — keep table within card width */
+    .stables-lending-section .stable-lend-table col.sl-col-1 { width: 6%; }
+    .stables-lending-section .stable-lend-table col.sl-col-2 { width: 7%; }
+    .stables-lending-section .stable-lend-table col.sl-col-3 { width: 16%; }
+    .stables-lending-section .stable-lend-table col.sl-col-4 { width: 8%; }
+    .stables-lending-section .stable-lend-table col.sl-col-5 { width: 7%; }
+    .stables-lending-section .stable-lend-table col.sl-col-6 { width: 7%; }
+    .stables-lending-section .stable-lend-table col.sl-col-7 { width: 14%; }
+    .stables-lending-section .stable-lend-table col.sl-col-8 { width: 7%; }
+    .stables-lending-section .stable-lend-table col.sl-col-9 { width: 7%; }
+    .stables-lending-section .stable-lend-table col.sl-col-10 { width: 7%; }
+    .stables-lending-section .stable-lend-table col.sl-col-11 { width: 8%; }
+    .stables-lending-section .stable-lend-table th:nth-child(4),
+    .stables-lending-section .stable-lend-table td:nth-child(4),
+    .stables-lending-section .stable-lend-table th:nth-child(5),
+    .stables-lending-section .stable-lend-table td:nth-child(5),
+    .stables-lending-section .stable-lend-table th:nth-child(6),
+    .stables-lending-section .stable-lend-table td:nth-child(6),
+    .stables-lending-section .stable-lend-table th:nth-child(8),
+    .stables-lending-section .stable-lend-table td:nth-child(8),
+    .stables-lending-section .stable-lend-table th:nth-child(9),
+    .stables-lending-section .stable-lend-table td:nth-child(9),
+    .stables-lending-section .stable-lend-table th:nth-child(10),
+    .stables-lending-section .stable-lend-table td:nth-child(10),
+    .stables-lending-section .stable-lend-table th:nth-child(11),
+    .stables-lending-section .stable-lend-table td:nth-child(11) { text-align: right; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .warnings-box { margin-top:10px; border:1px dashed #fdba74; background:#fff7ed; color:#9a3412; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
@@ -25895,18 +25997,19 @@ def _render_stables_page() -> str:
     @media (max-width: 1100px) {
       .card.control-card, .stables-lending-section.card { padding: 12px; }
       .section-head { flex-wrap: wrap; align-items: center; }
-      .card.control-card h3, .stables-lending-section.card h3 { font-size: 16px; }
+      .section-head h3 { font-size: 16px; }
       .search-link-btn { font-size: 15px; }
     }
     @media (max-width: 720px) {
       .grid { gap: 10px; }
       .card.control-card, .stables-lending-section.card { padding: 10px; border-radius: 12px; }
       .chip { font-size: 11px; padding: 4px 8px; }
-      .stables-lending-section .status { font-size: 15px; max-width: 100%; }
+      .status { font-size: 15px; max-width: 100%; }
       .table-wrap { border-radius: 8px; }
       .stable-table-controls { grid-template-columns:repeat(2, minmax(120px, 1fr)); }
-      .stables-lending-section table { min-width: 780px; font-size: 11px; }
-      .stables-lending-section th, .stables-lending-section td { padding: 6px; }
+      .stables-lending-section table.stable-lend-table { font-size: 10px; }
+      .stables-lending-section .stable-lend-table th,
+      .stables-lending-section .stable-lend-table td { padding: 3px 4px; }
       .mono { font-size: 10px; }
       .errors-box, .warnings-box, .info-box { font-size: 11px; padding: 7px; }
     }
@@ -26264,6 +26367,16 @@ def _render_stables_page() -> str:
       }).join("");
       meta.textContent = `Using ${total} stable symbols from Pools catalog.`;
     }
+    function stableProtocolDisplay(r) {
+      const pv = String(r?.protocol_version || r?.protocol || "").trim() || "-";
+      const mk = String(r?.market || "").trim();
+      return mk ? (pv + " · " + mk) : pv;
+    }
+    function stableProtocolSortKey(r) {
+      const pv = String(r?.protocol_version || r?.protocol || "").trim().toLowerCase();
+      const mk = String(r?.market || "").trim().toLowerCase();
+      return pv + "\t" + mk;
+    }
     function renderLending(rows) {
       readStableTableControls();
       const sourceRows = Array.isArray(rows) ? rows : [];
@@ -26271,6 +26384,10 @@ def _render_stables_page() -> str:
       const blocks = document.getElementById("stableLendingBlocks");
       if (!blocks) return;
       const rowCountLine = `Rows: ${viewRows.length} (from ${sourceRows.length})`;
+      const stableLendColgroup = "<colgroup>"
+        + "<col class=\\"sl-col-1\\"/><col class=\\"sl-col-2\\"/><col class=\\"sl-col-3\\"/><col class=\\"sl-col-4\\"/>"
+        + "<col class=\\"sl-col-5\\"/><col class=\\"sl-col-6\\"/><col class=\\"sl-col-7\\"/><col class=\\"sl-col-8\\"/>"
+        + "<col class=\\"sl-col-9\\"/><col class=\\"sl-col-10\\"/><col class=\\"sl-col-11\\"/></colgroup>";
       const renderGroupTable = (groupKey, title, rowsGroup, isFirstGroup) => {
         const st = ensureStableGroupState(groupKey);
         const sortBy = String(st.sortBy || "supply_total_apr_pct");
@@ -26282,6 +26399,9 @@ def _render_stables_page() -> str:
           if (sortBy === "bonus_programs") {
             av = Array.isArray(a?.bonus_programs) ? a.bonus_programs.join(" | ") : "";
             bv = Array.isArray(b?.bonus_programs) ? b.bonus_programs.join(" | ") : "";
+          } else if (sortBy === "protocol_version") {
+            av = stableProtocolSortKey(a);
+            bv = stableProtocolSortKey(b);
           }
           const an = Number(av);
           const bn = Number(bv);
@@ -26289,22 +26409,19 @@ def _render_stables_page() -> str:
           return String(av || "").localeCompare(String(bv || "")) * dir;
         });
         const collapsed = !!stableGroupCollapseState[groupKey];
-        const headRowsMeta = (isFirstGroup && collapsed)
-          ? `<span class="stable-rows-meta" style="margin-left:auto;font-size:12px;font-weight:700;color:#1e3a8a">${esc(rowCountLine)}</span>`
-          : "";
-        let html = `<div class="stable-block"><div class="stable-block-head"><div class="stable-block-title">${esc(title)} (${sortedRows.length})</div>${headRowsMeta}<button class="collapse-btn" type="button" onclick="toggleStableGroup('${esc(groupKey)}')">${collapsed ? "▸" : "▾"}</button></div>`;
+        const titleLine = isFirstGroup
+          ? `${esc(title)} (${sortedRows.length}), ${esc(rowCountLine)}`
+          : `${esc(title)} (${sortedRows.length})`;
+        let html = `<div class="stable-block"><div class="stable-block-head"><div class="stable-block-title">${titleLine}</div><button class="collapse-btn" type="button" onclick="toggleStableGroup('${esc(groupKey)}')">${collapsed ? "▸" : "▾"}</button></div>`;
         if (collapsed) {
           html += "</div>";
           return html;
         }
-        html += `<div class="table-wrap"><table>`;
-        if (isFirstGroup) {
-          html += `<tr><th colspan="11" class="stable-rows-meta">${esc(rowCountLine)}</th></tr>`;
-        }
+        html += `<div class="table-wrap"><table class="stable-lend-table">${stableLendColgroup}`;
         html += "<tr>";
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','asset')">Asset${sortMark("asset")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','chain')">Chain${sortMark("chain")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','protocol_version')">Protocol version${sortMark("protocol_version")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','protocol_version')">Protocol${sortMark("protocol_version")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','tvl_usd')">TVL USD${sortMark("tvl_usd")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_apy_pct')">Supply APY${sortMark("supply_apy_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_bonuses_apr_pct')">Supply bonuses APR${sortMark("supply_bonuses_apr_pct")}</th>`;
@@ -26318,7 +26435,7 @@ def _render_stables_page() -> str:
           html += "<tr>";
           html += `<td>${esc(r.asset || "")}</td>`;
           html += `<td>${esc(r.chain || "")}</td>`;
-          html += `<td>${esc(r.protocol_version || r.protocol || "-")}</td>`;
+          html += `<td>${esc(stableProtocolDisplay(r))}</td>`;
           html += `<td>${Number(r.tvl_usd || 0).toLocaleString(undefined, {maximumFractionDigits: 0})}</td>`;
           html += `<td>${fmtPct(r.supply_apy_pct)}</td>`;
           html += `<td>${fmtPct(r.supply_bonuses_apr_pct)}</td>`;
@@ -26334,7 +26451,7 @@ def _render_stables_page() -> str:
         return html;
       };
       if (!viewRows.length) {
-        blocks.innerHTML = `<div class='table-wrap'><table><tr><th colspan='11' class='stable-rows-meta'>${esc(rowCountLine)}</th></tr><tr><td colspan='11'>No rows match current filters.</td></tr></table></div>`;
+        blocks.innerHTML = `<div class='table-wrap'><table class='stable-lend-table'>${stableLendColgroup}<tr><td colspan='11'>No rows match current filters.</td></tr></table></div>`;
         return;
       }
       blocks.innerHTML = STABLE_GROUPS.map((g, i) => renderGroupTable(g.key, g.title, viewRows.filter((r) => String(r?.bucket || "") === g.key), i === 0)).join("");
