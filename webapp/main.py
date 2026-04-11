@@ -16748,6 +16748,8 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
             symbol = str(token.get("symbol") or "").strip().lower()
             if not symbol or symbol not in stable_symbols:
                 continue
+            if bool(reserve.get("isPaused")) or bool(reserve.get("isFrozen")):
+                continue
             supply_apy_pct = _pct_from_percent_value((((reserve.get("supplyInfo") or {}).get("apy") or {}).get("value")))
             borrow_apy_pct = _pct_from_percent_value((((reserve.get("borrowInfo") or {}).get("apy") or {}).get("value")))
             supply_bonus_pct = 0.0
@@ -20570,7 +20572,7 @@ def _build_row_updates_from_snapshot(
 INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/", "Find the best fee on Uniswap"),
     ("/pancake", "Find the best pool on PancakeSwap"),
-    ("/stables", "Optimize my lending positions"),
+    ("/stables", "Find the best lending positions"),
     ("/positions", "Optimize my pool positions"),
     ("/help", "Send wishes or report issues"),
 ]
@@ -25694,7 +25696,20 @@ def _render_positions_page() -> str:
 
 def _render_stables_page() -> str:
     extra_css = """
-    /* Match ``Find the best fee on Uniswap`` (HTML_PAGE): .grid, .control-card, pair-lists panel */
+    /* Align with ``Find the best fee on Uniswap`` (HTML_PAGE) */
+    :root {
+      --bg: #e2eaf8;
+      --card: #f4f7fc;
+      --muted: #64748b;
+      --text: #0f172a;
+      --border: #d9e2f0;
+      --accent: #2563eb;
+      --accent-2: #06b6d4;
+    }
+    body {
+      background: linear-gradient(180deg, #d9e3f5 0%, var(--bg) 100%);
+      color: var(--text);
+    }
     .grid {
       display: grid;
       grid-template-columns: 1fr;
@@ -25713,7 +25728,17 @@ def _render_stables_page() -> str:
       min-width: 0;
       max-width: 100%;
     }
+    .stables-lending-section.card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06);
+      min-width: 0;
+      max-width: 100%;
+    }
     .card.control-card h3 { margin: 0; font-size: 17px; color: #1f3a8a; }
+    .stables-lending-section.card h3 { margin: 0; font-size: 17px; color: #1f3a8a; }
     .section-head {
       display: flex;
       align-items: center;
@@ -25737,10 +25762,10 @@ def _render_stables_page() -> str:
     #stableUniverseMeta {
       margin: 0 0 10px;
       font-size: 13px;
-      color: #64748b;
+      color: var(--muted);
     }
     .pair-lists-panel {
-      margin-top: 0;
+      margin-top: 10px;
       border: 1px solid #dbe3ef;
       border-radius: 10px;
       background: linear-gradient(180deg, #fbfdff 0%, #f3f7ff 100%);
@@ -25755,10 +25780,10 @@ def _render_stables_page() -> str:
       background: #ffffff;
       border: 1px solid #e2e8f0;
       border-radius: 10px;
-      padding: 10px 12px;
+      padding: 7px 8px;
     }
     .pair-lists-section h5 {
-      margin: 0 0 8px;
+      margin: 0 0 5px 0;
       font-size: 13px;
       font-weight: 700;
       color: #0f172a;
@@ -25774,8 +25799,8 @@ def _render_stables_page() -> str:
       align-items: center;
       border-radius: 999px;
       border: 1px solid #cbd5e1;
-      background: #ffffff;
-      color: #1e3a8a;
+      background: #f8fafc;
+      color: #334155;
       padding: 5px 10px;
       font-size: 12px;
       font-weight: 600;
@@ -25783,21 +25808,38 @@ def _render_stables_page() -> str:
     }
     .chip.muted {
       border-style: dashed;
-      color: #64748b;
+      color: var(--muted);
       background: #f8fafc;
       font-weight: 500;
     }
-    .stable-table-controls { display:grid; grid-template-columns:repeat(6, minmax(120px, 1fr)); gap:8px; margin:8px 0 10px; }
+    .stable-filters-panel {
+      margin: 8px 0 12px;
+      padding: 10px 12px;
+      background: #f8fbff;
+      border: 1px solid #d7e1ef;
+      border-radius: 12px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+    }
+    .stable-table-controls { display:grid; grid-template-columns:repeat(6, minmax(120px, 1fr)); gap:10px; }
     .stable-table-controls .ctrl { display:flex; flex-direction:column; gap:4px; }
-    .stable-table-controls label { font-size:11px; color:#64748b; }
-    .stable-table-controls input, .stable-table-controls select { width:100%; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:6px 8px; font-size:12px; }
-    .stable-table-controls .check { flex-direction:row; align-items:center; gap:6px; padding-top:18px; }
-    .stable-table-controls .check input { width:auto; }
-    .stable-table-summary { margin:0 0 8px; font-size:12px; color:#64748b; }
+    .stable-table-controls label { font-size:12px; font-weight:700; color:#1f2f4a; letter-spacing:0.2px; }
+    .stable-table-controls input, .stable-table-controls select {
+      width:100%;
+      background:#f8fbff;
+      border:1px solid #cbd5e1;
+      border-radius:8px;
+      padding:8px;
+      font-size:14px;
+      color: var(--text);
+    }
+    .stable-table-controls .check { flex-direction:row; align-items:center; gap:8px; padding-top:22px; }
+    .stable-table-controls .check label { font-weight: 600; padding-top: 0; }
+    .stable-table-controls .check input { width:auto; accent-color: #2563eb; }
+    .stable-rows-meta { font-weight:700; text-align:left !important; white-space:nowrap; }
     .stable-block {
       margin-bottom: 12px;
       background: #ffffff;
-      border: 1px solid #e2e8f0;
+      border: 1px solid #dbe3ef;
       border-radius: 10px;
       padding: 10px 12px;
     }
@@ -25806,56 +25848,65 @@ def _render_stables_page() -> str:
     .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:17px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
     .collapse-btn { border:none; background:transparent; color:#334155; font-size:14px; font-weight:800; cursor:pointer; padding:0 2px; min-width:16px; text-align:center; }
-    .section-actions {
+    .stables-lending-section .section-actions {
       display: flex;
-      align-items: center;
       gap: 10px;
+      align-items: center;
       margin-left: auto;
       justify-content: flex-end;
       flex-wrap: wrap;
       min-width: 0;
-      flex: 1 1 auto;
     }
     .section-body { display:block; min-width:0; }
     .section-body.collapsed { display:none; }
-    .pos-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
-    .pos-progress .bar { width: 40%; height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); animation: posLoad 1s linear infinite; }
-    @keyframes posLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
-    .pos-status { color:#64748b; font-size:13px; min-width:0; flex:1 1 160px; max-width:min(520px,100%); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .scan-progress { width: 140px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: none; }
+    .scan-progress .bar { width: 40%; height: 100%; background: linear-gradient(90deg, #93c5fd, #2563eb); animation: scanLoad 1s linear infinite; }
+    @keyframes scanLoad { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
+    .stables-lending-section .status {
+      font-size: 17px;
+      font-weight: 400;
+      color: #111111;
+      min-width: 0;
+      flex: 1 1 auto;
+      max-width: min(760px, 72vw);
+      white-space: normal;
+      overflow: visible;
+      text-overflow: clip;
+      line-height: 1.3;
+    }
     .table-wrap {
       overflow-x: auto;
       -webkit-overflow-scrolling: touch;
-      border: 1px solid #e2e8f0;
-      border-radius: 8px;
-      background: #fbfdff;
+      border: 1px solid #dbe3ef;
+      border-radius: 10px;
       width: 100%;
       max-width: 100%;
       min-width: 0;
     }
-    table { width:100%; border-collapse:collapse; font-size:12px; min-width:1180px; }
-    th, td { border-bottom:1px solid #e2e8f0; padding:5px 7px; text-align:left; vertical-align:top; }
-    th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
-    th.sortable { cursor:pointer; user-select:none; }
+    .stables-lending-section table { width:100%; border-collapse:collapse; font-size:13px; min-width:900px; }
+    .stables-lending-section th, .stables-lending-section td { border-bottom:1px solid #e2e8f0; padding:8px; text-align:left; vertical-align:top; }
+    .stables-lending-section th { background:#eff6ff; color:#1e3a8a; position:sticky; top:0; }
+    th.sortable { cursor:pointer; user-select:none; white-space: nowrap; }
     th.sortable:hover { background:#dbeafe; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .warnings-box { margin-top:10px; border:1px dashed #fdba74; background:#fff7ed; color:#9a3412; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     @media (max-width: 1100px) {
-      .card.control-card { padding: 12px; }
+      .card.control-card, .stables-lending-section.card { padding: 12px; }
       .section-head { flex-wrap: wrap; align-items: center; }
-      .card.control-card h3 { font-size: 16px; }
+      .card.control-card h3, .stables-lending-section.card h3 { font-size: 16px; }
       .search-link-btn { font-size: 15px; }
     }
     @media (max-width: 720px) {
       .grid { gap: 10px; }
-      .card.control-card { padding: 10px; border-radius: 12px; }
+      .card.control-card, .stables-lending-section.card { padding: 10px; border-radius: 12px; }
       .chip { font-size: 11px; padding: 4px 8px; }
-      .pos-status { font-size: 12px; min-width: 0; max-width: 100%; flex: 1 1 140px; }
+      .stables-lending-section .status { font-size: 15px; max-width: 100%; }
       .table-wrap { border-radius: 8px; }
       .stable-table-controls { grid-template-columns:repeat(2, minmax(120px, 1fr)); }
-      table { min-width: 920px; font-size: 11px; }
-      th, td { padding: 6px; }
+      .stables-lending-section table { min-width: 780px; font-size: 11px; }
+      .stables-lending-section th, .stables-lending-section td { padding: 6px; }
       .mono { font-size: 10px; }
       .errors-box, .warnings-box, .info-box { font-size: 11px; padding: 7px; }
     }
@@ -25874,19 +25925,19 @@ def _render_stables_page() -> str:
           </div>
         </div>
       </section>
-      <section class="card control-card">
+      <section class="card stables-lending-section">
         <div class="section-head">
           <h3 id="stableCombinedTitle">AAVE lending rates and bonus programs</h3>
           <div class="section-actions">
-            <div id="stableProgress" class="pos-progress"><div class="bar"></div></div>
-            <span class="pos-status" id="stableStatus">Ready</span>
-            <button class="search-link-btn" type="button" onclick="scanStable()">Search</button>
+            <div id="stableProgress" class="scan-progress"><div class="bar"></div></div>
+            <span class="status" id="stableStatus">Ready</span>
             <button class="search-link-btn" type="button" onclick="refreshStable()">Refresh</button>
             <button class="collapse-btn" id="toggleStableCombinedBtn" type="button" onclick="toggleStableSection()" title="Collapse/expand">▾</button>
           </div>
         </div>
         <div id="stableCombinedBody" class="section-body">
           <div id="stableLendingHeading" style="margin-bottom:8px;font-weight:700;color:#1e3a8a;display:none">Combined AAVE stablecoin table (base + bonus APR)</div>
+          <div class="stable-filters-panel">
           <div class="stable-table-controls">
             <div class="ctrl">
               <label>Min APY %</label>
@@ -25917,15 +25968,7 @@ def _render_stables_page() -> str:
               <input id="stableOnlyBonuses" type="checkbox" onchange="onStableTableControlChange()" />
               <label for="stableOnlyBonuses">Only with bonuses</label>
             </div>
-            <div class="ctrl check">
-              <input id="stableOnlyActive" type="checkbox" checked onchange="onStableTableControlChange()" />
-              <label for="stableOnlyActive">Only active</label>
-            </div>
           </div>
-          <div id="stableTableSummary" class="stable-table-summary">Rows: 0</div>
-          <div style="margin:0 0 8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <button type="button" class="pair-details-btn" id="stableCollapseAllBtn" onclick="collapseAllStableGroups()">Collapse all</button>
-            <button type="button" class="pair-details-btn" id="stableExpandAllBtn" onclick="expandAllStableGroups()">Expand all</button>
           </div>
           <div id="stableLendingBlocks"></div>
           <div id="stableErrors"></div>
@@ -25953,7 +25996,6 @@ def _render_stables_page() -> str:
       chain: "all",
       search: "",
       onlyBonuses: false,
-      onlyActive: true,
     };
     const stableGroupSortState = {};
     const stableGroupCollapseState = {};
@@ -25999,7 +26041,6 @@ def _render_stables_page() -> str:
           stableTableState.chain = String(t.chain || "all");
           stableTableState.search = String(t.search || "");
           stableTableState.onlyBonuses = !!t.onlyBonuses;
-          stableTableState.onlyActive = (t.onlyActive === undefined) ? true : !!t.onlyActive;
         }
         const gs = parsed?.groupSort;
         if (gs && typeof gs === "object") {
@@ -26033,7 +26074,6 @@ def _render_stables_page() -> str:
       setVal("stableMinTvl", stableTableState.minTvl);
       setVal("stableSearch", stableTableState.search || "");
       setChk("stableOnlyBonuses", stableTableState.onlyBonuses);
-      setChk("stableOnlyActive", stableTableState.onlyActive);
       const ub = document.getElementById("stableUniverseBody");
       const ubBtn = document.getElementById("stableUniverseDetailsBtn");
       if (ub) ub.classList.toggle("collapsed", !stableUniverseState.expanded);
@@ -26093,14 +26133,12 @@ def _render_stables_page() -> str:
       const chain = String(document.getElementById("stableChainFilter")?.value || stableTableState.chain || "all");
       const search = String(document.getElementById("stableSearch")?.value || "").trim().toLowerCase();
       const onlyBonuses = !!document.getElementById("stableOnlyBonuses")?.checked;
-      const onlyActive = !!document.getElementById("stableOnlyActive")?.checked;
       stableTableState.minApy = Number.isFinite(minApyRaw) ? Math.max(0, minApyRaw) : 0;
       stableTableState.minTvl = Number.isFinite(minTvlRaw) ? Math.max(0, minTvlRaw) : 0;
       stableTableState.protocolVersion = protocolVersion || "all";
       stableTableState.chain = chain || "all";
       stableTableState.search = search;
       stableTableState.onlyBonuses = onlyBonuses;
-      stableTableState.onlyActive = onlyActive;
     }
     function refreshStableFilterOptions(rows) {
       const list = Array.isArray(rows) ? rows : [];
@@ -26130,7 +26168,7 @@ def _render_stables_page() -> str:
         st.sortDir = (st.sortDir === "desc") ? "asc" : "desc";
       } else {
         st.sortBy = k;
-        st.sortDir = (k === "asset" || k === "chain" || k === "bucket" || k === "protocol_version" || k === "supply_bonus_types" || k === "reward_tokens") ? "asc" : "desc";
+        st.sortDir = (k === "asset" || k === "chain" || k === "bucket" || k === "protocol_version" || k === "bonus_programs") ? "asc" : "desc";
       }
       saveStableUiState();
       renderLending(stableCache.lending || []);
@@ -26140,43 +26178,6 @@ def _render_stables_page() -> str:
       if (!gk) return;
       ensureStableGroupState(gk);
       stableGroupCollapseState[gk] = !stableGroupCollapseState[gk];
-      saveStableUiState();
-      renderLending(stableCache.lending || []);
-    }
-    function areAllStableGroupsCollapsed() {
-      for (const g of STABLE_GROUPS) {
-        const gk = String(g.key || "");
-        if (!gk) continue;
-        ensureStableGroupState(gk);
-        if (!stableGroupCollapseState[gk]) return false;
-      }
-      return true;
-    }
-    function updateStableGroupBulkBtns() {
-      const collapseBtn = document.getElementById("stableCollapseAllBtn");
-      const expandBtn = document.getElementById("stableExpandAllBtn");
-      const allCollapsed = areAllStableGroupsCollapsed();
-      const anyExpanded = !allCollapsed;
-      if (collapseBtn) collapseBtn.disabled = !anyExpanded;
-      if (expandBtn) expandBtn.disabled = !!allCollapsed;
-    }
-    function collapseAllStableGroups() {
-      for (const g of STABLE_GROUPS) {
-        const gk = String(g.key || "");
-        if (!gk) continue;
-        ensureStableGroupState(gk);
-        stableGroupCollapseState[gk] = true;
-      }
-      saveStableUiState();
-      renderLending(stableCache.lending || []);
-    }
-    function expandAllStableGroups() {
-      for (const g of STABLE_GROUPS) {
-        const gk = String(g.key || "");
-        if (!gk) continue;
-        ensureStableGroupState(gk);
-        stableGroupCollapseState[gk] = false;
-      }
       saveStableUiState();
       renderLending(stableCache.lending || []);
     }
@@ -26196,7 +26197,7 @@ def _render_stables_page() -> str:
           )) + Number(r?.borrow_discount_apr_pct || 0);
           if (!(bonus > 0)) return false;
         }
-        if (stableTableState.onlyActive && (r?.paused || r?.frozen)) return false;
+        if (r?.paused || r?.frozen) return false;
         if (stableTableState.search) {
           const typesStr = Array.isArray(r?.supply_bonus_types) ? r.supply_bonus_types.join(" ") : "";
           const rewardsStr = Array.isArray(r?.reward_tokens) ? r.reward_tokens.join(" ") : "";
@@ -26217,7 +26218,7 @@ def _render_stables_page() -> str:
       const el = document.getElementById("stableStatus");
       if (!el) return;
       el.textContent = text || "";
-      el.style.color = isErr ? "#b91c1c" : "#475569";
+      el.style.color = isErr ? "#b91c1c" : "";
     }
     function setStableBusy(flag) {
       const el = document.getElementById("stableProgress");
@@ -26268,11 +26269,9 @@ def _render_stables_page() -> str:
       const sourceRows = Array.isArray(rows) ? rows : [];
       const viewRows = applyLendingView(sourceRows);
       const blocks = document.getElementById("stableLendingBlocks");
-      const summary = document.getElementById("stableTableSummary");
-      if (summary) summary.textContent = `Rows: ${viewRows.length} (from ${sourceRows.length})`;
-      updateStableGroupBulkBtns();
       if (!blocks) return;
-      const renderGroupTable = (groupKey, title, rowsGroup) => {
+      const rowCountLine = `Rows: ${viewRows.length} (from ${sourceRows.length})`;
+      const renderGroupTable = (groupKey, title, rowsGroup, isFirstGroup) => {
         const st = ensureStableGroupState(groupKey);
         const sortBy = String(st.sortBy || "supply_total_apr_pct");
         const dir = (String(st.sortDir || "desc") === "asc") ? 1 : -1;
@@ -26280,13 +26279,9 @@ def _render_stables_page() -> str:
         const sortedRows = (rowsGroup || []).slice().sort((a, b) => {
           let av = a?.[sortBy];
           let bv = b?.[sortBy];
-          if (sortBy === "supply_bonus_types") {
-            av = Array.isArray(a?.supply_bonus_types) ? a.supply_bonus_types.join(", ") : "";
-            bv = Array.isArray(b?.supply_bonus_types) ? b.supply_bonus_types.join(", ") : "";
-          }
-          if (sortBy === "reward_tokens") {
-            av = Array.isArray(a?.reward_tokens) ? a.reward_tokens.join(", ") : "";
-            bv = Array.isArray(b?.reward_tokens) ? b.reward_tokens.join(", ") : "";
+          if (sortBy === "bonus_programs") {
+            av = Array.isArray(a?.bonus_programs) ? a.bonus_programs.join(" | ") : "";
+            bv = Array.isArray(b?.bonus_programs) ? b.bonus_programs.join(" | ") : "";
           }
           const an = Number(av);
           const bn = Number(bv);
@@ -26294,54 +26289,55 @@ def _render_stables_page() -> str:
           return String(av || "").localeCompare(String(bv || "")) * dir;
         });
         const collapsed = !!stableGroupCollapseState[groupKey];
-        let html = `<div class="stable-block"><div class="stable-block-head"><div class="stable-block-title">${esc(title)} (${sortedRows.length})</div><button class="collapse-btn" type="button" onclick="toggleStableGroup('${esc(groupKey)}')">${collapsed ? "▸" : "▾"}</button></div>`;
+        const headRowsMeta = (isFirstGroup && collapsed)
+          ? `<span class="stable-rows-meta" style="margin-left:auto;font-size:12px;font-weight:700;color:#1e3a8a">${esc(rowCountLine)}</span>`
+          : "";
+        let html = `<div class="stable-block"><div class="stable-block-head"><div class="stable-block-title">${esc(title)} (${sortedRows.length})</div>${headRowsMeta}<button class="collapse-btn" type="button" onclick="toggleStableGroup('${esc(groupKey)}')">${collapsed ? "▸" : "▾"}</button></div>`;
         if (collapsed) {
           html += "</div>";
           return html;
         }
         html += `<div class="table-wrap"><table>`;
+        if (isFirstGroup) {
+          html += `<tr><th colspan="11" class="stable-rows-meta">${esc(rowCountLine)}</th></tr>`;
+        }
         html += "<tr>";
-        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','reward_tokens')">Reward Tokens${sortMark("reward_tokens")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','asset')">Asset${sortMark("asset")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','chain')">Chain${sortMark("chain")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','protocol_version')">Protocol version${sortMark("protocol_version")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','tvl_usd')">TVL USD${sortMark("tvl_usd")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_apy_pct')">Supply APY${sortMark("supply_apy_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_bonuses_apr_pct')">Supply bonuses APR${sortMark("supply_bonuses_apr_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_bonus_types')">Bonus types${sortMark("supply_bonus_types")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','bonus_programs')">Bonus programs${sortMark("bonus_programs")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_total_apr_pct')">Supply Total APR${sortMark("supply_total_apr_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_apy_pct')">Borrow APY${sortMark("borrow_apy_pct")}</th>`;
         html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_discount_apr_pct')">Borrow Discount APR${sortMark("borrow_discount_apr_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_effective_apr_pct')">Borrow Effective APR${sortMark("borrow_effective_apr_pct")}</th>`;
-        html += "<th>Bonus programs</th></tr>";
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_effective_apr_pct')">Borrow Effective APR${sortMark("borrow_effective_apr_pct")}</th></tr>`;
         for (const r of sortedRows) {
-          const rewards = Array.isArray(r.reward_tokens) ? r.reward_tokens.join(", ") : "";
           const bonus = Array.isArray(r.bonus_programs) ? r.bonus_programs.join(" | ") : "";
           html += "<tr>";
-          html += `<td>${esc(rewards || "—")}</td>`;
           html += `<td>${esc(r.asset || "")}</td>`;
           html += `<td>${esc(r.chain || "")}</td>`;
           html += `<td>${esc(r.protocol_version || r.protocol || "-")}</td>`;
           html += `<td>${Number(r.tvl_usd || 0).toLocaleString(undefined, {maximumFractionDigits: 0})}</td>`;
           html += `<td>${fmtPct(r.supply_apy_pct)}</td>`;
           html += `<td>${fmtPct(r.supply_bonuses_apr_pct)}</td>`;
-          html += `<td>${esc(Array.isArray(r.supply_bonus_types) && r.supply_bonus_types.length ? r.supply_bonus_types.join(", ") : "—")}</td>`;
+          html += `<td title="${esc(bonus)}">${esc(bonus || "—")}</td>`;
           html += `<td><b>${fmtPct(r.supply_total_apr_pct)}</b></td>`;
           html += `<td>${fmtPct(r.borrow_apy_pct)}</td>`;
           html += `<td>${fmtPct(r.borrow_discount_apr_pct)}</td>`;
           html += `<td><b>${fmtPct(r.borrow_effective_apr_pct)}</b></td>`;
-          html += `<td title="${esc(bonus)}">${esc(bonus || "-")}</td>`;
           html += "</tr>";
         }
-        if (!sortedRows.length) html += "<tr><td colspan='13'>No rows in this block.</td></tr>";
+        if (!sortedRows.length) html += "<tr><td colspan='11'>No rows in this block.</td></tr>";
         html += "</table></div></div>";
         return html;
       };
       if (!viewRows.length) {
-        blocks.innerHTML = "<div class='table-wrap'><table><tr><td>No rows match current filters.</td></tr></table></div>";
+        blocks.innerHTML = `<div class='table-wrap'><table><tr><th colspan='11' class='stable-rows-meta'>${esc(rowCountLine)}</th></tr><tr><td colspan='11'>No rows match current filters.</td></tr></table></div>`;
         return;
       }
-      blocks.innerHTML = STABLE_GROUPS.map((g) => renderGroupTable(g.key, g.title, viewRows.filter((r) => String(r?.bucket || "") === g.key))).join("");
+      blocks.innerHTML = STABLE_GROUPS.map((g, i) => renderGroupTable(g.key, g.title, viewRows.filter((r) => String(r?.bucket || "") === g.key), i === 0)).join("");
     }
     async function loadStableUniverse() {
       try {
@@ -26393,7 +26389,7 @@ def _render_stables_page() -> str:
         const warnHtml = warns.length ? `<div class='warnings-box'>${esc(warns.join("\\n"))}</div>` : "";
         const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
         if (errWrap) errWrap.innerHTML = errHtml + warnHtml + infoHtml;
-        setStableStatus(`Done. Rows: ${(data.rows || []).length}`, false);
+        setStableStatus("Ready", false);
       } catch (e) {
         setStableStatus("Scan failed: " + (e?.message || "unknown"), true);
       } finally {
@@ -32594,7 +32590,7 @@ HTML_PAGE = """
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
           <option value="/" selected>Find the best fee on Uniswap</option>
           <option value="/pancake">Find the best pool on PancakeSwap</option>
-          <option value="/stables">Optimize my lending positions</option>
+          <option value="/stables">Find the best lending positions</option>
           <option value="/positions">Optimize my pool positions</option>
           <option value="/help">Send wishes or report issues</option>
         </select>
