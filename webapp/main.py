@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.parse import urlparse
+from urllib.error import HTTPError
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
@@ -257,8 +258,15 @@ WALLETCONNECT_PROJECT_ID = (
     or os.environ.get("NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID", "").strip()
 )
 AAVE_V3_GRAPHQL_ENDPOINT = os.environ.get("AAVE_V3_GRAPHQL_ENDPOINT", "https://api.v3.aave.com/graphql").strip()
+AAVE_V4_GRAPHQL_ENDPOINT = os.environ.get("AAVE_V4_GRAPHQL_ENDPOINT", "https://api.v4.aave.com/graphql").strip()
 MERKL_API_ENDPOINT = os.environ.get("MERKL_API_ENDPOINT", "https://api.merkl.xyz/v4").strip()
-MERKL_API_KEY = os.environ.get("MERKL_API_KEY", "").strip()
+MERKL_API_KEY_ENV_CANDIDATES = (
+    "MERKL_API_KEY",
+    "MERKL_X_API_KEY",
+    "MERKL_APIKEY",
+    "X_API_KEY_MERKL",
+)
+MERKL_API_KEY = next((str(os.environ.get(k, "") or "").strip() for k in MERKL_API_KEY_ENV_CANDIDATES if str(os.environ.get(k, "") or "").strip()), "")
 CHAIN_ID_TO_KEY: dict[int, str] = {
     1: "ethereum",
     10: "optimism",
@@ -16367,25 +16375,43 @@ def _pct_from_percent_value(raw: Any) -> float:
 
 
 def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any]], str]:
-    if not str(MERKL_API_KEY or "").strip():
-        return {}, "Merkl API key is not configured."
     base = str(MERKL_API_ENDPOINT or "https://api.merkl.xyz/v4").rstrip("/")
-    url = f"{base}/opportunities?mainProtocolId=aave"
     headers = {
         "User-Agent": APP_USER_AGENT,
         "Accept": "application/json",
-        "X-API-Key": str(MERKL_API_KEY),
     }
-    req = UrlRequest(url, headers=headers)
-    payload: Any = {}
-    with urlopen(req, timeout=18) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    items = payload if isinstance(payload, list) else (
-        (payload.get("items") if isinstance(payload, dict) else None)
-        or (payload.get("data") if isinstance(payload, dict) else None)
-        or (payload.get("opportunities") if isinstance(payload, dict) else None)
-        or []
-    )
+    api_key = str(MERKL_API_KEY or "").strip()
+    if api_key:
+        headers["X-API-Key"] = api_key
+    items: list[dict[str, Any]] = []
+    per_page = 100
+    max_pages = 24
+    for page in range(max_pages):
+        url = f"{base}/opportunities?mainProtocolId=aave&items={per_page}&page={page}"
+        req = UrlRequest(url, headers=headers)
+        payload: Any = {}
+        try:
+            with urlopen(req, timeout=18) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            code = int(getattr(e, "code", 0) or 0)
+            if code in (401, 403):
+                return {}, f"Merkl opportunities endpoint is not accessible ({code})."
+            raise
+        page_items = payload if isinstance(payload, list) else (
+            (payload.get("items") if isinstance(payload, dict) else None)
+            or (payload.get("data") if isinstance(payload, dict) else None)
+            or (payload.get("opportunities") if isinstance(payload, dict) else None)
+            or []
+        )
+        chunk = [x for x in (page_items or []) if isinstance(x, dict)]
+        if not chunk:
+            break
+        items.extend(chunk)
+        if len(chunk) < per_page:
+            break
+    if not items:
+        return {}, "Merkl API returned no AAVE opportunities."
     out: dict[tuple[int, str], dict[str, Any]] = {}
     for it in (items or []):
         if not isinstance(it, dict):
@@ -16408,8 +16434,6 @@ def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any
             or ((it.get("tokens") or {}).get("address") if isinstance(it.get("tokens"), dict) else "")
             or ""
         ).strip().lower()
-        if not _is_eth_address(explorer_addr):
-            continue
         reward_sym = str(
             it.get("rewardTokenSymbol")
             or ((it.get("rewardToken") or {}).get("symbol") if isinstance(it.get("rewardToken"), dict) else "")
@@ -16422,20 +16446,134 @@ def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any
             or it.get("identifier")
             or f"Merkl {reward_sym}"
         ).strip()
-        key = (int(chain_id), str(explorer_addr))
-        rec = out.setdefault(key, {"apr": 0.0, "labels": [], "tokens": set()})
-        rec["apr"] = float(rec.get("apr") or 0.0) + float(apr)
-        if label:
-            labels = rec.get("labels") if isinstance(rec.get("labels"), list) else []
-            if label not in labels:
-                labels.append(label)
-            rec["labels"] = labels
-        if reward_sym:
-            toks = rec.get("tokens") if isinstance(rec.get("tokens"), set) else set(rec.get("tokens") or [])
-            toks.add(reward_sym)
-            rec["tokens"] = toks
+        token_addrs: list[str] = []
+        for tk in (it.get("tokens") or []):
+            if not isinstance(tk, dict):
+                continue
+            a = str(tk.get("address") or "").strip().lower()
+            if _is_eth_address(a):
+                token_addrs.append(a)
+        addrs = list(dict.fromkeys([explorer_addr, *token_addrs]))
+        valid_addrs = [a for a in addrs if _is_eth_address(a)]
+        if not valid_addrs:
+            continue
+        per_addr_apr = float(apr) / float(len(valid_addrs))
+        for addr in valid_addrs:
+            key = (int(chain_id), str(addr))
+            rec = out.setdefault(key, {"apr": 0.0, "labels": [], "tokens": set()})
+            rec["apr"] = float(rec.get("apr") or 0.0) + per_addr_apr
+            if label:
+                labels = rec.get("labels") if isinstance(rec.get("labels"), list) else []
+                if label not in labels:
+                    labels.append(label)
+                rec["labels"] = labels
+            if reward_sym:
+                toks = rec.get("tokens") if isinstance(rec.get("tokens"), set) else set(rec.get("tokens") or [])
+                toks.add(reward_sym)
+                rec["tokens"] = toks
     for rec in out.values():
         rec["tokens"] = sorted(list(rec.get("tokens") or []))
+    if not out:
+        return {}, "Merkl opportunities were loaded but none matched AAVE reserve token addresses."
+    return out, ""
+
+
+def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int, str], dict[str, Any]], str]:
+    # Public v4 endpoint currently supports Ethereum chainId=1 for reserve rewards.
+    query = """
+    query AaveV4StableRewards($query: ReservesRequestQuery!, $filter: ReservesRequestFilter) {
+      value: reserves(request: { query: $query, filter: $filter }) {
+        chain { chainId name }
+        asset { underlying { address info { symbol } } }
+        summary {
+          rewards {
+            __typename
+            ... on MerklSupplyReward {
+              id
+              extraApy { value }
+              payoutToken { info { symbol } }
+            }
+            ... on MerklBorrowReward {
+              id
+              discountApy { value }
+              payoutToken { info { symbol } }
+            }
+            ... on SupplyPointsReward {
+              id
+              name
+              program { name }
+            }
+            ... on BorrowPointsReward {
+              id
+              name
+              program { name }
+            }
+          }
+        }
+      }
+    }
+    """
+    variables = {
+        "query": {"chainTokenCategories": [{"chainId": 1, "categories": ["STABLECOIN"]}]},
+        "filter": "ALL",
+    }
+    data = graphql_query(AAVE_V4_GRAPHQL_ENDPOINT, query, variables, retries=1)
+    reserves = ((data.get("data") or {}).get("value") or []) if isinstance(data, dict) else []
+    out: dict[tuple[int, str], dict[str, Any]] = {}
+    for reserve in reserves:
+        if not isinstance(reserve, dict):
+            continue
+        chain = reserve.get("chain") or {}
+        chain_id = int(_safe_float((chain or {}).get("chainId")))
+        if chain_id <= 0:
+            continue
+        underlying = ((reserve.get("asset") or {}).get("underlying") or {})
+        addr = str((underlying.get("address") or "")).strip().lower()
+        if not _is_eth_address(addr):
+            continue
+        symbol = str(((underlying.get("info") or {}).get("symbol") or "")).strip().lower()
+        if symbol and stable_symbols and symbol not in stable_symbols:
+            continue
+        rewards = ((reserve.get("summary") or {}).get("rewards") or [])
+        supply_apr = 0.0
+        borrow_discount = 0.0
+        labels: list[str] = []
+        tokens: set[str] = set()
+        for rw in rewards:
+            if not isinstance(rw, dict):
+                continue
+            t = str(rw.get("__typename") or "").strip()
+            if t == "MerklSupplyReward":
+                val = _pct_from_percent_value((((rw.get("extraApy") or {}).get("value"))))
+                if val > 0:
+                    supply_apr += float(val)
+                    labels.append(f"Aave v4 Merkl supply: +{val:.2f}%")
+                tk = str((((rw.get("payoutToken") or {}).get("info") or {}).get("symbol") or "")).strip().upper()
+                if tk:
+                    tokens.add(tk)
+            elif t == "MerklBorrowReward":
+                val = _pct_from_percent_value((((rw.get("discountApy") or {}).get("value"))))
+                if val > 0:
+                    borrow_discount += float(val)
+                    labels.append(f"Aave v4 Merkl borrow: -{val:.2f}%")
+                tk = str((((rw.get("payoutToken") or {}).get("info") or {}).get("symbol") or "")).strip().upper()
+                if tk:
+                    tokens.add(tk)
+            elif t in {"SupplyPointsReward", "BorrowPointsReward"}:
+                rw_name = str(rw.get("name") or "").strip()
+                pg_name = str(((rw.get("program") or {}).get("name") or "")).strip()
+                label = rw_name or pg_name or t
+                labels.append(f"Aave v4 points: {label}")
+        if supply_apr <= 0 and borrow_discount <= 0 and not labels and not tokens:
+            continue
+        out[(int(chain_id), str(addr))] = {
+            "supply_apr": float(supply_apr),
+            "borrow_discount": float(borrow_discount),
+            "labels": labels,
+            "tokens": sorted(list(tokens)),
+        }
+    if not out:
+        return {}, "Aave v4 rewards fallback returned no matching stable bonuses."
     return out, ""
 
 
@@ -16446,6 +16584,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
 
     chain_ids = sorted(int(x) for x in AAVE_CHAIN_ID_TO_NAME.keys())
     merkl_idx: dict[tuple[int, str], dict[str, Any]] = {}
+    v4_idx: dict[tuple[int, str], dict[str, Any]] = {}
     warnings: list[str] = []
     try:
         merkl_idx, merkl_warn = _fetch_merkl_aave_bonus_index()
@@ -16453,6 +16592,24 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
             warnings.append(merkl_warn)
     except Exception as e:
         warnings.append(f"Merkl bonus fetch failed: {e}")
+    try:
+        v4_idx, v4_warn = _fetch_aave_v4_bonus_index(stable_symbols)
+        if v4_warn:
+            warnings.append(v4_warn)
+    except Exception as e:
+        warnings.append(f"Aave v4 rewards fallback failed: {e}")
+    if not merkl_idx and v4_idx:
+        warnings.append(
+            "Merkl bonuses missing or unmatched; using Aave v4 GraphQL rewards where applicable (Ethereum stables, partial coverage)."
+        )
+    elif not merkl_idx and not v4_idx:
+        key_set = bool(str(MERKL_API_KEY or "").strip())
+        auth_blocked = any("Merkl opportunities endpoint is not accessible" in str(w) for w in warnings)
+        fetch_failed = any("Merkl bonus fetch failed" in str(w) for w in warnings)
+        if auth_blocked or fetch_failed or not key_set:
+            warnings.append(
+                "Merkl API unavailable and v4 fallback returned no matching rewards. Set MERKL_API_KEY (or check network) for Merkl bonus coverage."
+            )
 
     query = """
     query AaveStableMarkets($ids: [ChainId!]!) {
@@ -16605,6 +16762,29 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                 bonus_labels.extend([f"Merkl: +{float(merkl_apr):.2f}%"] + [f"Merkl campaign: {x}" for x in merkl_labels[:3]])
             else:
                 row["merkl_bonus_apr_pct"] = 0.0
+            v4_rec = v4_idx.get((int(chain_id), underlying_addr)) if _is_eth_address(underlying_addr) else None
+            if isinstance(v4_rec, dict):
+                v4_supply_apr = float(v4_rec.get("supply_apr") or 0.0)
+                v4_borrow_discount = float(v4_rec.get("borrow_discount") or 0.0)
+                v4_tokens = [str(x or "").strip().upper() for x in (v4_rec.get("tokens") or [])]
+                v4_labels = [str(x or "").strip() for x in (v4_rec.get("labels") or [])]
+                for t in v4_tokens:
+                    if t:
+                        reward_tokens.add(t)
+                for lb in v4_labels[:4]:
+                    if lb and lb not in bonus_labels:
+                        bonus_labels.append(lb)
+                # Avoid double counting when Merkl API already supplied direct APR.
+                if float(row.get("merkl_bonus_apr_pct") or 0.0) <= 0.0 and v4_supply_apr > 0:
+                    row["merkl_bonus_apr_pct"] = float(v4_supply_apr)
+                    row["supply_total_apr_pct"] = float(row.get("supply_total_apr_pct") or 0.0) + float(v4_supply_apr)
+                    bonus_labels.append(f"Aave v4 rewards fallback: +{v4_supply_apr:.2f}% supply")
+                if float(row.get("borrow_discount_apr_pct") or 0.0) <= 0.0 and v4_borrow_discount > 0:
+                    row["borrow_discount_apr_pct"] = float(v4_borrow_discount)
+                    row["borrow_effective_apr_pct"] = float(
+                        max(0.0, float(row.get("borrow_apy_pct") or 0.0) - float(v4_borrow_discount))
+                    )
+                    bonus_labels.append(f"Aave v4 rewards fallback: -{v4_borrow_discount:.2f}% borrow")
             row["reward_tokens"] = sorted(reward_tokens)
             row["bonus_programs"] = bonus_labels
 
@@ -25434,6 +25614,7 @@ def _render_stables_page() -> str:
     .stable-table-controls .check input { width:auto; }
     .stable-table-summary { margin:0 0 8px; font-size:12px; color:#475569; }
     .stable-block { margin-bottom:12px; }
+    .stable-block-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:8px 0 6px; }
     .stable-block-title { margin:8px 0 6px; font-size:13px; color:#1e3a8a; font-weight:700; }
     .search-link-btn { border:none; background:transparent; color:#1d4ed8; font-size:17px; font-weight:800; line-height:1.25; cursor:pointer; padding:0; text-decoration:underline; text-underline-offset:2px; position:relative; z-index:2; pointer-events:auto; }
     .search-link-btn:hover { color:#1e40af; }
@@ -25462,6 +25643,7 @@ def _render_stables_page() -> str:
     th.sortable:hover { background:#dbeafe; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
     .errors-box { margin-top:10px; border:1px dashed #fca5a5; background:#fff1f2; color:#881337; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
+    .warnings-box { margin-top:10px; border:1px dashed #fdba74; background:#fff7ed; color:#9a3412; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     .info-box { margin-top:10px; border:1px dashed #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:8px; font-size:12px; white-space:pre-wrap; }
     @media (max-width: 1100px) {
       .positions-form, .result-card { padding: 12px; }
@@ -25479,7 +25661,7 @@ def _render_stables_page() -> str:
       table { min-width: 980px; font-size: 11px; }
       th, td { padding: 6px; }
       .mono { font-size: 10px; }
-      .errors-box, .info-box { font-size: 11px; padding: 7px; }
+      .errors-box, .warnings-box, .info-box { font-size: 11px; padding: 7px; }
     }
     """
     extra_html = """
@@ -25501,6 +25683,7 @@ def _render_stables_page() -> str:
             <div id="stableProgress" class="pos-progress"><div class="bar"></div></div>
             <span class="pos-status" id="stableStatus">Ready</span>
             <button class="search-link-btn" type="button" onclick="scanStable()">Search</button>
+            <button class="search-link-btn" type="button" onclick="refreshStable()">Refresh</button>
             <button class="collapse-btn" id="toggleStableCombinedBtn" type="button" onclick="toggleStableSection()" title="Collapse/expand">▾</button>
           </div>
         </div>
@@ -25542,6 +25725,10 @@ def _render_stables_page() -> str:
             </div>
           </div>
           <div id="stableTableSummary" class="stable-table-summary">Rows: 0</div>
+          <div style="margin:0 0 8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <button class="collapse-btn" id="stableCollapseAllBtn" type="button" onclick="collapseAllStableGroups()">Collapse all</button>
+            <button class="collapse-btn" id="stableExpandAllBtn" type="button" onclick="expandAllStableGroups()">Expand all</button>
+          </div>
           <div id="stableLendingBlocks"></div>
           <div id="stableErrors"></div>
         </div>
@@ -25551,14 +25738,17 @@ def _render_stables_page() -> str:
     extra_script = """
     function esc(v) { return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
     const STABLE_UI_STORAGE_KEY = "stables_ui_v2";
-    const STABLE_RESULT_STORAGE_KEY = "stables_result_v1";
+    const STABLE_RESULT_STORAGE_KEY = "stables_result_v2";
     const STABLE_RESULT_TTL_SEC = 1800;
+    const STABLE_GROUPS = [
+      {key: "fiat_backed", title: "Fiat-backed stables"},
+      {key: "fiat_nonusd", title: "Non-USD fiat stables"},
+      {key: "algo_crypto", title: "Algo/Crypto-backed stables"},
+    ];
     const stableSectionState = {combined: false};
     const stableUniverseState = {expanded: false};
     const stableCache = {lending: [], catalog: null};
     const stableTableState = {
-      sortBy: "supply_total_apr_pct",
-      sortDir: "desc",
       minApy: 0,
       minTvl: 0,
       protocolVersion: "all",
@@ -25567,10 +25757,32 @@ def _render_stables_page() -> str:
       onlyBonuses: false,
       onlyActive: true,
     };
+    const stableGroupSortState = {};
+    const stableGroupCollapseState = {};
+    function ensureStableGroupState(groupKey) {
+      const gk = String(groupKey || "").trim();
+      if (!gk) return {sortBy: "supply_total_apr_pct", sortDir: "desc"};
+      if (!stableGroupSortState[gk] || typeof stableGroupSortState[gk] !== "object") {
+        stableGroupSortState[gk] = {sortBy: "supply_total_apr_pct", sortDir: "desc"};
+      }
+      if (stableGroupCollapseState[gk] === undefined) stableGroupCollapseState[gk] = false;
+      return stableGroupSortState[gk];
+    }
     function saveStableUiState() {
       try {
+        const groupSort = {};
+        const groupCollapsed = {};
+        for (const g of STABLE_GROUPS) {
+          const gk = String(g.key || "");
+          if (!gk) continue;
+          const st = ensureStableGroupState(gk);
+          groupSort[gk] = {sortBy: String(st.sortBy || "supply_total_apr_pct"), sortDir: (String(st.sortDir || "desc") === "asc" ? "asc" : "desc")};
+          groupCollapsed[gk] = !!stableGroupCollapseState[gk];
+        }
         localStorage.setItem(STABLE_UI_STORAGE_KEY, JSON.stringify({
           table: {...stableTableState},
+          groupSort,
+          groupCollapsed,
           sectionCollapsed: !!stableSectionState.combined,
           universeExpanded: !!stableUniverseState.expanded,
         }));
@@ -25583,8 +25795,6 @@ def _render_stables_page() -> str:
         const parsed = JSON.parse(raw);
         const t = (parsed && parsed.table) ? parsed.table : {};
         if (t && typeof t === "object") {
-          stableTableState.sortBy = String(t.sortBy || stableTableState.sortBy);
-          stableTableState.sortDir = String(t.sortDir || stableTableState.sortDir) === "asc" ? "asc" : "desc";
           stableTableState.minApy = Math.max(0, Number(t.minApy || 0) || 0);
           stableTableState.minTvl = Math.max(0, Number(t.minTvl || 0) || 0);
           stableTableState.protocolVersion = String(t.protocolVersion || "all");
@@ -25592,6 +25802,27 @@ def _render_stables_page() -> str:
           stableTableState.search = String(t.search || "");
           stableTableState.onlyBonuses = !!t.onlyBonuses;
           stableTableState.onlyActive = (t.onlyActive === undefined) ? true : !!t.onlyActive;
+        }
+        const gs = parsed?.groupSort;
+        if (gs && typeof gs === "object") {
+          for (const g of STABLE_GROUPS) {
+            const gk = String(g.key || "");
+            if (!gk) continue;
+            const src = gs[gk];
+            const st = ensureStableGroupState(gk);
+            if (src && typeof src === "object") {
+              st.sortBy = String(src.sortBy || st.sortBy || "supply_total_apr_pct");
+              st.sortDir = (String(src.sortDir || st.sortDir || "desc") === "asc") ? "asc" : "desc";
+            }
+          }
+        }
+        const gc = parsed?.groupCollapsed;
+        if (gc && typeof gc === "object") {
+          for (const g of STABLE_GROUPS) {
+            const gk = String(g.key || "");
+            if (!gk) continue;
+            stableGroupCollapseState[gk] = !!gc[gk];
+          }
         }
         stableSectionState.combined = !!parsed?.sectionCollapsed;
         stableUniverseState.expanded = !!parsed?.universeExpanded;
@@ -25616,6 +25847,11 @@ def _render_stables_page() -> str:
           ts: Math.floor(Date.now() / 1000),
           data: payload || {},
         }));
+      } catch (_) {}
+    }
+    function clearStableResultCache() {
+      try {
+        localStorage.removeItem(STABLE_RESULT_STORAGE_KEY);
       } catch (_) {}
     }
     function loadStableResultCache() {
@@ -25687,14 +25923,61 @@ def _render_stables_page() -> str:
       readStableTableControls();
       saveStableUiState();
     }
-    function onStableHeaderSort(key) {
+    function onStableHeaderSort(groupKey, key) {
+      const gk = String(groupKey || "").trim();
       const k = String(key || "").trim();
       if (!k) return;
-      if (stableTableState.sortBy === k) {
-        stableTableState.sortDir = (stableTableState.sortDir === "desc") ? "asc" : "desc";
+      const st = ensureStableGroupState(gk);
+      if (st.sortBy === k) {
+        st.sortDir = (st.sortDir === "desc") ? "asc" : "desc";
       } else {
-        stableTableState.sortBy = k;
-        stableTableState.sortDir = (k === "asset" || k === "chain" || k === "market" || k === "bucket" || k === "protocol_version") ? "asc" : "desc";
+        st.sortBy = k;
+        st.sortDir = (k === "asset" || k === "chain" || k === "market" || k === "bucket" || k === "protocol_version") ? "asc" : "desc";
+      }
+      saveStableUiState();
+      renderLending(stableCache.lending || []);
+    }
+    function toggleStableGroup(groupKey) {
+      const gk = String(groupKey || "").trim();
+      if (!gk) return;
+      ensureStableGroupState(gk);
+      stableGroupCollapseState[gk] = !stableGroupCollapseState[gk];
+      saveStableUiState();
+      renderLending(stableCache.lending || []);
+    }
+    function areAllStableGroupsCollapsed() {
+      for (const g of STABLE_GROUPS) {
+        const gk = String(g.key || "");
+        if (!gk) continue;
+        ensureStableGroupState(gk);
+        if (!stableGroupCollapseState[gk]) return false;
+      }
+      return true;
+    }
+    function updateStableGroupBulkBtns() {
+      const collapseBtn = document.getElementById("stableCollapseAllBtn");
+      const expandBtn = document.getElementById("stableExpandAllBtn");
+      const allCollapsed = areAllStableGroupsCollapsed();
+      const anyExpanded = !allCollapsed;
+      if (collapseBtn) collapseBtn.disabled = !anyExpanded;
+      if (expandBtn) expandBtn.disabled = !!allCollapsed;
+    }
+    function collapseAllStableGroups() {
+      for (const g of STABLE_GROUPS) {
+        const gk = String(g.key || "");
+        if (!gk) continue;
+        ensureStableGroupState(gk);
+        stableGroupCollapseState[gk] = true;
+      }
+      saveStableUiState();
+      renderLending(stableCache.lending || []);
+    }
+    function expandAllStableGroups() {
+      for (const g of STABLE_GROUPS) {
+        const gk = String(g.key || "");
+        if (!gk) continue;
+        ensureStableGroupState(gk);
+        stableGroupCollapseState[gk] = false;
       }
       saveStableUiState();
       renderLending(stableCache.lending || []);
@@ -25718,16 +26001,6 @@ def _render_stables_page() -> str:
           if (!blob.includes(stableTableState.search)) return false;
         }
         return true;
-      });
-      const sortBy = String(stableTableState.sortBy || "supply_total_apr_pct");
-      const dir = (stableTableState.sortDir === "asc") ? 1 : -1;
-      out.sort((a, b) => {
-        const av = a?.[sortBy];
-        const bv = b?.[sortBy];
-        const an = Number(av);
-        const bn = Number(bv);
-        if (Number.isFinite(an) && Number.isFinite(bn)) return (an - bn) * dir;
-        return String(av || "").localeCompare(String(bv || "")) * dir;
       });
       return out;
     }
@@ -25793,31 +26066,44 @@ def _render_stables_page() -> str:
       const blocks = document.getElementById("stableLendingBlocks");
       const summary = document.getElementById("stableTableSummary");
       if (summary) summary.textContent = `Rows: ${viewRows.length} (from ${sourceRows.length})`;
+      updateStableGroupBulkBtns();
       if (!blocks) return;
-      const sortMark = (k) => (stableTableState.sortBy === k ? (stableTableState.sortDir === "desc" ? " ↓" : " ↑") : "");
-      const groups = [
-        {key: "fiat_backed", title: "Fiat-backed stables"},
-        {key: "fiat_nonusd", title: "Non-USD fiat stables"},
-        {key: "algo_crypto", title: "Algo/Crypto-backed stables"},
-      ];
-      const renderGroupTable = (title, rowsGroup) => {
-        let html = `<div class="stable-block"><div class="stable-block-title">${esc(title)} (${rowsGroup.length})</div><div class="table-wrap"><table>`;
+      const renderGroupTable = (groupKey, title, rowsGroup) => {
+        const st = ensureStableGroupState(groupKey);
+        const sortBy = String(st.sortBy || "supply_total_apr_pct");
+        const dir = (String(st.sortDir || "desc") === "asc") ? 1 : -1;
+        const sortMark = (k) => (sortBy === k ? (dir > 0 ? " ↑" : " ↓") : "");
+        const sortedRows = (rowsGroup || []).slice().sort((a, b) => {
+          const av = a?.[sortBy];
+          const bv = b?.[sortBy];
+          const an = Number(av);
+          const bn = Number(bv);
+          if (Number.isFinite(an) && Number.isFinite(bn)) return (an - bn) * dir;
+          return String(av || "").localeCompare(String(bv || "")) * dir;
+        });
+        const collapsed = !!stableGroupCollapseState[groupKey];
+        let html = `<div class="stable-block"><div class="stable-block-head"><div class="stable-block-title">${esc(title)} (${sortedRows.length})</div><button class="collapse-btn" type="button" onclick="toggleStableGroup('${esc(groupKey)}')">${collapsed ? "▸" : "▾"}</button></div>`;
+        if (collapsed) {
+          html += "</div>";
+          return html;
+        }
+        html += `<div class="table-wrap"><table>`;
         html += "<tr>";
-        html += `<th class="sortable" onclick="onStableHeaderSort('asset')">Asset${sortMark("asset")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('chain')">Chain${sortMark("chain")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('protocol_version')">Protocol version${sortMark("protocol_version")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('market')">Market${sortMark("market")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('tvl_usd')">TVL USD${sortMark("tvl_usd")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('supply_apy_pct')">Supply APY${sortMark("supply_apy_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('supply_bonus_apr_pct')">Supply Bonus APR${sortMark("supply_bonus_apr_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('conditional_bonus_apr_pct')">Conditional Bonus APR${sortMark("conditional_bonus_apr_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('merkl_bonus_apr_pct')">Merkl Bonus APR${sortMark("merkl_bonus_apr_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('supply_total_apr_pct')">Supply Total APR${sortMark("supply_total_apr_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('borrow_apy_pct')">Borrow APY${sortMark("borrow_apy_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('borrow_discount_apr_pct')">Borrow Discount APR${sortMark("borrow_discount_apr_pct")}</th>`;
-        html += `<th class="sortable" onclick="onStableHeaderSort('borrow_effective_apr_pct')">Borrow Effective APR${sortMark("borrow_effective_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','asset')">Asset${sortMark("asset")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','chain')">Chain${sortMark("chain")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','protocol_version')">Protocol version${sortMark("protocol_version")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','market')">Market${sortMark("market")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','tvl_usd')">TVL USD${sortMark("tvl_usd")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_apy_pct')">Supply APY${sortMark("supply_apy_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_bonus_apr_pct')">Supply Bonus APR${sortMark("supply_bonus_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','conditional_bonus_apr_pct')">Conditional Bonus APR${sortMark("conditional_bonus_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','merkl_bonus_apr_pct')">Merkl Bonus APR${sortMark("merkl_bonus_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','supply_total_apr_pct')">Supply Total APR${sortMark("supply_total_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_apy_pct')">Borrow APY${sortMark("borrow_apy_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_discount_apr_pct')">Borrow Discount APR${sortMark("borrow_discount_apr_pct")}</th>`;
+        html += `<th class="sortable" onclick="onStableHeaderSort('${esc(groupKey)}','borrow_effective_apr_pct')">Borrow Effective APR${sortMark("borrow_effective_apr_pct")}</th>`;
         html += "<th>Reward Tokens</th><th>Bonus programs</th><th>Status</th></tr>";
-        for (const r of rowsGroup) {
+        for (const r of sortedRows) {
           const rewards = Array.isArray(r.reward_tokens) ? r.reward_tokens.join(", ") : "";
           const bonus = Array.isArray(r.bonus_programs) ? r.bonus_programs.join(" | ") : "";
           const statusParts = [];
@@ -25843,7 +26129,7 @@ def _render_stables_page() -> str:
           html += `<td>${esc(statusParts.join(", "))}</td>`;
           html += "</tr>";
         }
-        if (!rowsGroup.length) html += "<tr><td colspan='16'>No rows in this block.</td></tr>";
+        if (!sortedRows.length) html += "<tr><td colspan='16'>No rows in this block.</td></tr>";
         html += "</table></div></div>";
         return html;
       };
@@ -25851,7 +26137,7 @@ def _render_stables_page() -> str:
         blocks.innerHTML = "<div class='table-wrap'><table><tr><td>No rows match current filters.</td></tr></table></div>";
         return;
       }
-      blocks.innerHTML = groups.map((g) => renderGroupTable(g.title, viewRows.filter((r) => String(r?.bucket || "") === g.key))).join("");
+      blocks.innerHTML = STABLE_GROUPS.map((g) => renderGroupTable(g.key, g.title, viewRows.filter((r) => String(r?.bucket || "") === g.key))).join("");
     }
     async function loadStableUniverse() {
       try {
@@ -25899,16 +26185,20 @@ def _render_stables_page() -> str:
         const markets = Number(data.markets || 0);
         const elapsed = Number((data.summary || {}).elapsed_sec || 0);
         infos.push(`AAVE chains scanned: ${chains}, markets: ${markets}, rows: ${(data.rows || []).length}, elapsed: ${elapsed.toFixed(2)}s`);
-        for (const w of warns) infos.push(String(w || ""));
         const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
+        const warnHtml = warns.length ? `<div class='warnings-box'>${esc(warns.join("\\n"))}</div>` : "";
         const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
-        if (errWrap) errWrap.innerHTML = errHtml + infoHtml;
+        if (errWrap) errWrap.innerHTML = errHtml + warnHtml + infoHtml;
         setStableStatus(`Done. Rows: ${(data.rows || []).length}`, false);
       } catch (e) {
         setStableStatus("Scan failed: " + (e?.message || "unknown"), true);
       } finally {
         setStableBusy(false);
       }
+    }
+    async function refreshStable() {
+      clearStableResultCache();
+      await scanStable();
     }
     loadStableUiState();
     applyStableUiStateToControls();
