@@ -218,7 +218,7 @@
     "fiat_stable": {
       "enabled": true,
       "strict": true,
-      "selection_date": "2026-04-10",
+      "selection_date": "2026-04-12",
       "core": [
         "usdt",
         "usdc",
@@ -246,7 +246,7 @@
     "fiat_nonusd": {
       "enabled": true,
       "strict": true,
-      "selection_date": "2026-04-10",
+      "selection_date": "2026-04-12",
       "top": [
         "eurc",
         "eurs",
@@ -274,7 +274,7 @@
     "algo_stable": {
       "enabled": true,
       "strict": true,
-      "selection_date": "2026-04-10",
+      "selection_date": "2026-04-12",
       "main": [
         "usds",
         "usde",
@@ -303,7 +303,7 @@
     "coins": {
       "enabled": true,
       "strict": true,
-      "selection_date": "2026-04-10",
+      "selection_date": "2026-04-12",
       "top": [
         "eth",
         "wbtc",
@@ -331,7 +331,7 @@
     "commodity": {
       "enabled": true,
       "strict": true,
-      "selection_date": "2026-04-10",
+      "selection_date": "2026-04-12",
       "top": [
         "xaut",
         "paxg",
@@ -344,7 +344,7 @@
     "memes": {
       "enabled": true,
       "strict": true,
-      "selection_date": "2026-04-10",
+      "selection_date": "2026-04-12",
       "top": [
         "doge",
         "shib",

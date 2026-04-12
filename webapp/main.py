@@ -300,6 +300,17 @@ AAVE_CHAIN_ID_TO_NAME: dict[int, str] = {
     534352: "scroll",
     57073: "ink",
 }
+# Fluid Lending (Instadapp): LendingResolver is deployed via CREATE2 at the same address on each chain.
+FLUID_LENDING_RESOLVER: str = "0x48D32f49aFeAEC7AE66ad7B9264f446fc11a1569"
+# FluidLiquidityResolver per chain (borrow APR via getOverallTokensData). Ethereum: post-upgrade resolver (DefiLlama fluid adapter).
+FLUID_LIQUIDITY_RESOLVER_BY_CHAIN_ID: dict[int, str] = {
+    1: "0xD7588F6c99605Ab274C211a0AFeC60947668A8Cb",
+    42161: "0x46859d33E662d4bF18eEED88f74C36256E606e44",
+    8453: "0x35A915336e2b3349FA94c133491b915eD3D3b0cd",
+    137: "0x98d900e25AAf345A4B23f454751EC5083443Fa83",
+    56: "0xca13A15de31235A37134B4717021C35A3CF25C60",
+    9745: "0x4b6Bb77196A7B6D0722059033a600BdCD6C12DB7",
+}
 _POSITION_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POOL_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
 _POSITION_LIQUIDITY_SCHEMA_SUPPORT_CACHE: dict[str, bool] = {}
@@ -927,6 +938,7 @@ DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
         "https://arb1.arbitrum.io/rpc",
         "https://arbitrum-one-rpc.publicnode.com",
     ],
+    9745: ["https://rpc.plasma.to"],
 }
 
 # Адреса крупных активов по сети (TOKEN_ADDRESSES / импорт каталога) — те же, что для «Find the best fee on Uniswap»
@@ -16377,7 +16389,7 @@ def _pct_from_percent_value(raw: Any) -> float:
 
 
 def _percent_value_ui_pct(obj: Any) -> float:
-    """Aave GraphQL ``PercentValue``: prefer ``formatted`` (2 decimals, same as app UI), else ``value`` via ``_pct_from_percent_value``."""
+    """Aave GraphQL percent types: ``formatted`` (PercentValue UI), else ``normalized`` (PercentNumber), else ``value``."""
     if isinstance(obj, dict):
         fmt = obj.get("formatted")
         if fmt is not None and str(fmt).strip() != "":
@@ -16385,6 +16397,8 @@ def _percent_value_ui_pct(obj: Any) -> float:
                 return float(str(fmt).strip())
             except ValueError:
                 pass
+        if obj.get("normalized") is not None:
+            return float(_pct_from_percent_value(obj.get("normalized")))
         return _pct_from_percent_value(obj.get("value"))
     return _pct_from_percent_value(obj)
 
@@ -16599,13 +16613,13 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
             ... on MerklSupplyReward {
               id
               endDate
-              extraApy { value formatted }
+              extraApy { value normalized }
               payoutToken { info { symbol } }
             }
             ... on MerklBorrowReward {
               id
               endDate
-              discountApy { value formatted }
+              discountApy { value normalized }
               payoutToken { info { symbol } }
             }
             ... on SupplyPointsReward {
@@ -16697,6 +16711,165 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
     return out, ""
 
 
+_FLUID_FTOKEN_DETAILS_ARRAY_ABI = (
+    "(address,bool,bool,string,string,uint256,address,uint256,uint256,uint256,uint256,uint256,uint256,int256,"
+    "(bool,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256))[]"
+)
+_FLUID_OVERALL_TOKENS_ARRAY_ABI = (
+    "(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,"
+    "uint256,uint256,(uint256,(address,uint256,uint256,uint256,uint256),"
+    "(address,uint256,uint256,uint256,uint256,uint256,uint256)))[]"
+)
+
+
+def _fluid_underlying_symbol_key(ftoken_symbol: str) -> str:
+    s = str(ftoken_symbol or "").strip()
+    if len(s) >= 2 and s[0] in "fF" and s[1].isalpha():
+        return s[1:].strip().lower()
+    return s.lower()
+
+
+def _fluid_borrow_rate_by_asset(
+    chain_id: int, asset_addrs: list[str]
+) -> dict[str, float]:
+    liq = str(FLUID_LIQUIDITY_RESOLVER_BY_CHAIN_ID.get(int(chain_id)) or "").strip().lower()
+    if not _is_eth_address(liq) or not asset_addrs:
+        return {}
+    try:
+        from eth_abi import decode as _abi_decode, encode as _abi_encode
+    except Exception:
+        return {}
+    sel = _evm_selector_4("getOverallTokensData(address[])")
+    if len(sel) != 4:
+        return {}
+    out: dict[str, float] = {}
+    chunk = 24
+    for i in range(0, len(asset_addrs), chunk):
+        batch = [a for a in asset_addrs[i : i + chunk] if _is_eth_address(a)]
+        if not batch:
+            continue
+        try:
+            body = _abi_encode(["address[]"], [batch])
+        except Exception:
+            continue
+        data_hex = "0x" + (sel + body).hex()
+        try:
+            ret_hex = _eth_call_hex(int(chain_id), liq, data_hex)
+            raw = bytes.fromhex(ret_hex[2:])
+            rows = _abi_decode([_FLUID_OVERALL_TOKENS_ARRAY_ABI], raw)[0]
+        except Exception:
+            continue
+        if not isinstance(rows, (list, tuple)) or len(rows) != len(batch):
+            continue
+        for addr, row in zip(batch, rows):
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            br = _safe_float(row[0])
+            if br > 0:
+                out[str(addr).strip().lower()] = float(br)
+    return out
+
+
+def _scan_fluid_stable_lending_rows(
+    stable_symbols: set[str], symbol_to_bucket: dict[str, str]
+) -> tuple[list[dict[str, Any]], list[str], set[int], int]:
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    seen_chains: set[int] = set()
+    ftokens_seen = 0
+    try:
+        from eth_abi import decode as _abi_decode
+    except Exception as e:
+        warnings.append(f"Fluid lending scan skipped (eth_abi unavailable): {e}")
+        return rows, warnings, seen_chains, 0
+    sel = _evm_selector_4("getFTokensEntireData()")
+    if len(sel) != 4:
+        warnings.append("Fluid lending scan skipped (selector error).")
+        return rows, warnings, seen_chains, 0
+    resolver = str(FLUID_LENDING_RESOLVER).strip().lower()
+    if not _is_eth_address(resolver):
+        return rows, warnings, seen_chains, 0
+    chain_ids = sorted(
+        int(cid)
+        for cid in FLUID_LIQUIDITY_RESOLVER_BY_CHAIN_ID.keys()
+        if int(cid) in AAVE_CHAIN_ID_TO_NAME and _rpc_urls_for_chain(int(cid))
+    )
+    for chain_id in chain_ids:
+        data_hex = "0x" + sel.hex()
+        try:
+            ret_hex = _eth_call_hex(int(chain_id), resolver, data_hex)
+            raw = bytes.fromhex(ret_hex[2:])
+            arr = _abi_decode([_FLUID_FTOKEN_DETAILS_ARRAY_ABI], raw)[0]
+        except Exception as e:
+            warnings.append(f"Fluid lending scan failed (chain_id={chain_id}): {e}")
+            continue
+        if not isinstance(arr, (list, tuple)) or not arr:
+            continue
+        seen_chains.add(int(chain_id))
+        ftokens_seen += int(len(arr))
+        chain_name = str(AAVE_CHAIN_ID_TO_NAME.get(int(chain_id), chain_id))
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        asset_addrs: list[str] = []
+        for tup in arr:
+            if not isinstance(tup, (list, tuple)) or len(tup) < 15:
+                continue
+            ftoken_addr = str(tup[0] or "").strip().lower()
+            f_sym = str(tup[4] or "")
+            decimals_raw = int(tup[5] or 0)
+            asset_addr = str(tup[6] or "").strip().lower()
+            total_assets = int(tup[7] or 0)
+            rewards_rate = int(tup[11] or 0)
+            supply_rate = int(tup[12] or 0)
+            u_key = _fluid_underlying_symbol_key(f_sym)
+            if not u_key or u_key not in stable_symbols:
+                continue
+            if not _is_eth_address(asset_addr):
+                continue
+            dec = int(decimals_raw) if 0 < int(decimals_raw) <= 36 else 18
+            scale = float(10**dec) if dec <= 36 else 0.0
+            tvl_usd = float(total_assets) / scale if scale > 0 else 0.0
+            supply_liq_pct = round(float(supply_rate) / 100.0, 4)
+            rewards_pct = round(float(rewards_rate) / 1e12, 4) if rewards_rate > 0 else 0.0
+            bonus_labels: list[str] = []
+            if rewards_pct > 0:
+                bonus_labels.append("Fluid rewards")
+            row = {
+                "protocol": "fluid",
+                "protocol_version": "fluid_lending",
+                "chain": chain_name,
+                "chain_id": int(chain_id),
+                "market": "Fluid lending",
+                "asset": u_key.upper(),
+                "bucket": str(symbol_to_bucket.get(u_key) or "other"),
+                "tvl_usd": float(tvl_usd),
+                "supply_apy_pct": float(supply_liq_pct),
+                "supply_bonus_apr_pct": float(rewards_pct),
+                "conditional_bonus_apr_pct": 0.0,
+                "supply_total_apr_pct": float(round(supply_liq_pct + rewards_pct, 4)),
+                "borrow_apy_pct": 0.0,
+                "borrow_discount_apr_pct": 0.0,
+                "borrow_effective_apr_pct": 0.0,
+                "merkl_bonus_apr_pct": 0.0,
+                "can_be_collateral": False,
+                "paused": False,
+                "frozen": False,
+                "reward_tokens": [],
+                "bonus_programs": list(bonus_labels),
+                "fluid_ftoken": ftoken_addr,
+                "fluid_underlying": asset_addr,
+            }
+            candidates.append((asset_addr, row))
+            asset_addrs.append(asset_addr)
+        borrow_map = _fluid_borrow_rate_by_asset(int(chain_id), list(dict.fromkeys(asset_addrs)))
+        for asset_addr, row in candidates:
+            br = float(borrow_map.get(str(asset_addr).strip().lower()) or 0.0)
+            borrow_pct = round(br / 100.0, 4) if br > 0 else 0.0
+            row["borrow_apy_pct"] = float(borrow_pct)
+            row["borrow_effective_apr_pct"] = float(borrow_pct)
+            rows.append(row)
+    return rows, warnings, seen_chains, int(ftokens_seen)
+
+
 def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
     categories, symbol_to_bucket, stable_symbols = _stable_catalog_for_lending_scan()
     if not stable_symbols:
@@ -16774,10 +16947,12 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
       }
     }
     """
+    scan_errors: list[str] = []
     try:
         data = graphql_query(AAVE_V3_GRAPHQL_ENDPOINT, query, {"ids": chain_ids}, retries=1)
     except Exception as e:
-        return [], {"stable_catalog": categories, "chains": [], "markets": 0}, [f"AAVE markets scan failed: {e}"]
+        data = {"data": {}}
+        scan_errors.append(f"AAVE markets scan failed: {e}")
 
     markets = (data.get("data") or {}).get("markets") or []
     rows: list[dict[str, Any]] = []
@@ -16931,13 +17106,20 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
             row["reward_tokens"] = sorted(reward_tokens)
             row["bonus_programs"] = list(dict.fromkeys(bonus_labels))
 
+    fluid_rows, fluid_warn, fluid_seen, fluid_n = _scan_fluid_stable_lending_rows(stable_symbols, symbol_to_bucket)
+    if fluid_warn:
+        warnings.extend(fluid_warn)
+    seen_chains.update(int(x) for x in fluid_seen)
+    rows.extend(fluid_rows)
+
     for row in rows:
         sb = float(row.get("supply_bonus_apr_pct") or 0.0)
         cb = float(row.get("conditional_bonus_apr_pct") or 0.0)
         mb = float(row.get("merkl_bonus_apr_pct") or 0.0)
         types: list[str] = []
+        proto = str(row.get("protocol") or "").strip().lower()
         if sb > 0:
-            types.append("Protocol")
+            types.append("Fluid rewards" if proto == "fluid" else "Protocol")
         if cb > 0:
             types.append("Conditional")
         if mb > 0:
@@ -16958,8 +17140,9 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
         "chains": sorted(int(x) for x in seen_chains),
         "markets": int(len(markets)),
         "warnings": warnings,
+        "fluid_ftokens_fetched": int(fluid_n),
     }
-    return rows, meta, []
+    return rows, meta, scan_errors
 
 
 def _parse_pairs_str(raw: str) -> list[tuple[str, str]]:
@@ -26488,7 +26671,7 @@ def _render_stables_page() -> str:
       setStableSectionCollapsed(false);
       try {
         setStableBusy(true);
-        setStableStatus("Scanning AAVE markets for stablecoins across all chains...", false);
+        setStableStatus("Scanning AAVE + Fluid lending (on-chain) for stablecoins...", false);
         const res = await fetch("/api/stables/aave/scan", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
@@ -26515,7 +26698,7 @@ def _render_stables_page() -> str:
         const chains = Array.isArray(data.chains) ? data.chains.length : 0;
         const markets = Number(data.markets || 0);
         const elapsed = Number((data.summary || {}).elapsed_sec || 0);
-        infos.push(`AAVE chains scanned: ${chains}, markets: ${markets}, rows: ${(data.rows || []).length}, elapsed: ${elapsed.toFixed(2)}s`);
+        infos.push(`Chains in result: ${chains}, AAVE markets: ${markets}, Fluid fTokens read: ${Number(data.fluid_ftokens_fetched || 0)}, rows: ${(data.rows || []).length}, elapsed: ${elapsed.toFixed(2)}s`);
         const errHtml = errs.length ? `<div class='errors-box'>${esc(errs.join("\\n"))}</div>` : "";
         const warnHtml = warns.length ? `<div class='warnings-box'>${esc(warns.join("\\n"))}</div>` : "";
         const infoHtml = infos.length ? `<div class='info-box'>${esc(infos.join("\\n"))}</div>` : "";
@@ -26548,7 +26731,7 @@ def _render_stables_page() -> str:
     """
     return _render_placeholder_page(
         "Lending Stablecoin",
-        "Scan AAVE lending opportunities and bonus programs for stablecoins.",
+        "Scan AAVE and Fluid lending opportunities and bonus programs for stablecoins.",
         "/stables",
         extra_css=extra_css,
         extra_html=extra_html,
@@ -28975,6 +29158,7 @@ def scan_stables_aave(request: Request, response: Response) -> dict[str, Any]:
     rows, meta, errors = _scan_aave_stable_lending_rows()
     elapsed = round(max(0.0, time.monotonic() - t0), 3)
     warnings = (meta.get("warnings") if isinstance(meta, dict) else []) or []
+    fluid_n = int((meta.get("fluid_ftokens_fetched") if isinstance(meta, dict) else 0) or 0)
     return {
         "rows": rows,
         "errors": list(errors or []),
@@ -28982,9 +29166,11 @@ def scan_stables_aave(request: Request, response: Response) -> dict[str, Any]:
         "stable_catalog": (meta.get("stable_catalog") if isinstance(meta, dict) else {}) or {},
         "chains": (meta.get("chains") if isinstance(meta, dict) else []) or [],
         "markets": int((meta.get("markets") if isinstance(meta, dict) else 0) or 0),
+        "fluid_ftokens_fetched": fluid_n,
         "summary": {
             "rows": int(len(rows)),
             "elapsed_sec": float(elapsed),
+            "fluid_ftokens_fetched": fluid_n,
         },
     }
 
