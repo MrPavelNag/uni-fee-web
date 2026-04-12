@@ -16518,7 +16518,7 @@ def _fetch_merkl_aave_bonus_index() -> tuple[dict[tuple[int, str], dict[str, Any
         ).strip().upper()
         end_raw = it.get("latestCampaignEnd") or it.get("earliestCampaignEnd")
         end_d = _bonus_program_end_date_str(end_raw)
-        program_line = f"Merkl до {end_d}" if end_d else "Merkl до ?"
+        program_line = f"Merkl until {end_d}" if end_d else "Merkl until unknown"
         token_addrs: list[str] = []
         for tk in (it.get("tokens") or []):
             if not isinstance(tk, dict):
@@ -16648,7 +16648,7 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
                     supply_apr += float(val)
                 if val > 0:
                     ed = _bonus_program_end_date_str(rw.get("endDate"))
-                    tag = f"Merkl до {ed}" if ed else "Merkl до ?"
+                    tag = f"Merkl until {ed}" if ed else "Merkl until unknown"
                     if tag not in labels:
                         labels.append(tag)
                 tk = str((((rw.get("payoutToken") or {}).get("info") or {}).get("symbol") or "")).strip().upper()
@@ -16660,7 +16660,7 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
                     borrow_discount += float(val)
                 if val > 0:
                     ed = _bonus_program_end_date_str(rw.get("endDate"))
-                    tag = f"Merkl borrow до {ed}" if ed else "Merkl borrow до ?"
+                    tag = f"Merkl borrow until {ed}" if ed else "Merkl borrow until unknown"
                     if tag not in labels:
                         labels.append(tag)
                 tk = str((((rw.get("payoutToken") or {}).get("info") or {}).get("symbol") or "")).strip().upper()
@@ -16668,7 +16668,7 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
                     tokens.add(tk)
             elif t in {"SupplyPointsReward", "BorrowPointsReward"}:
                 ed = _bonus_program_end_date_str(rw.get("endDate"))
-                tag = f"Поинты до {ed}" if ed else "Поинты до ?"
+                tag = f"Points until {ed}" if ed else "Points until unknown"
                 if tag not in labels:
                     labels.append(tag)
         if supply_apr <= 0 and borrow_discount <= 0 and not labels and not tokens:
@@ -16796,7 +16796,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     val = _pct_from_percent_value((((inc.get("extraSupplyApr") or {}).get("value"))))
                     if val > 0:
                         supply_bonus_pct += float(val)
-                        tag = "Merit до ?" if t == "MeritSupplyIncentive" else "Aave до ?"
+                        tag = "Merit until unknown" if t == "MeritSupplyIncentive" else "Aave until unknown"
                         if tag not in bonus_labels:
                             bonus_labels.append(tag)
                     rt = str(inc.get("rewardTokenSymbol") or "").strip().upper()
@@ -16806,7 +16806,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     val = _pct_from_percent_value((((inc.get("borrowAprDiscount") or {}).get("value"))))
                     if val > 0:
                         borrow_discount_pct += float(val)
-                        tag = "Merit borrow до ?" if t == "MeritBorrowIncentive" else "Aave borrow до ?"
+                        tag = "Merit borrow until unknown" if t == "MeritBorrowIncentive" else "Aave borrow until unknown"
                         if tag not in bonus_labels:
                             bonus_labels.append(tag)
                     rt = str(inc.get("rewardTokenSymbol") or "").strip().upper()
@@ -16816,7 +16816,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     val = _pct_from_percent_value((((inc.get("extraApr") or {}).get("value"))))
                     if val > 0:
                         conditional_bonus_pct += float(val)
-                        tag = "Условно до ?"
+                        tag = "Conditional until unknown"
                         if tag not in bonus_labels:
                             bonus_labels.append(tag)
             supply_total_pct = float(supply_apy_pct + supply_bonus_pct + conditional_bonus_pct)
@@ -16889,7 +16889,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     v4_supply_apr = 0.0
                     v4_borrow_discount = 0.0
                     v4_tokens = []
-                    v4_labels = [lb for lb in v4_labels if str(lb).startswith("Поинты")]
+                    v4_labels = [lb for lb in v4_labels if str(lb).startswith("Points")]
                 for t in v4_tokens:
                     if t:
                         reward_tokens.add(t)
@@ -25938,13 +25938,13 @@ def _render_stables_page() -> str:
       max-width: 100%;
       table-layout: fixed;
       border-collapse: collapse;
-      font-size: 11px;
+      font-size: 13px;
       min-width: 0;
     }
     .stables-lending-section .stable-lend-table th,
     .stables-lending-section .stable-lend-table td {
       border-bottom: 1px solid #e2e8f0;
-      padding: 4px 5px;
+      padding: 6px 7px;
       text-align: left;
       vertical-align: top;
       word-wrap: break-word;
@@ -26007,9 +26007,9 @@ def _render_stables_page() -> str:
       .status { font-size: 15px; max-width: 100%; }
       .table-wrap { border-radius: 8px; }
       .stable-table-controls { grid-template-columns:repeat(2, minmax(120px, 1fr)); }
-      .stables-lending-section table.stable-lend-table { font-size: 10px; }
+      .stables-lending-section table.stable-lend-table { font-size: 12px; }
       .stables-lending-section .stable-lend-table th,
-      .stables-lending-section .stable-lend-table td { padding: 3px 4px; }
+      .stables-lending-section .stable-lend-table td { padding: 5px 6px; }
       .mono { font-size: 10px; }
       .errors-box, .warnings-box, .info-box { font-size: 11px; padding: 7px; }
     }
