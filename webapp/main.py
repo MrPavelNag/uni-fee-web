@@ -16376,6 +16376,19 @@ def _pct_from_percent_value(raw: Any) -> float:
     return float(v * 100.0) if v <= 1.5 else float(v)
 
 
+def _percent_value_ui_pct(obj: Any) -> float:
+    """Aave GraphQL ``PercentValue``: prefer ``formatted`` (2 decimals, same as app UI), else ``value`` via ``_pct_from_percent_value``."""
+    if isinstance(obj, dict):
+        fmt = obj.get("formatted")
+        if fmt is not None and str(fmt).strip() != "":
+            try:
+                return float(str(fmt).strip())
+            except ValueError:
+                pass
+        return _pct_from_percent_value(obj.get("value"))
+    return _pct_from_percent_value(obj)
+
+
 def _bonus_program_end_date_parse(raw: Any) -> date | None:
     """Parse bonus end instant to a calendar date (UTC)."""
     if raw is None:
@@ -16586,13 +16599,13 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
             ... on MerklSupplyReward {
               id
               endDate
-              extraApy { value }
+              extraApy { value formatted }
               payoutToken { info { symbol } }
             }
             ... on MerklBorrowReward {
               id
               endDate
-              discountApy { value }
+              discountApy { value formatted }
               payoutToken { info { symbol } }
             }
             ... on SupplyPointsReward {
@@ -16643,7 +16656,7 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
                 continue
             t = str(rw.get("__typename") or "").strip()
             if t == "MerklSupplyReward":
-                val = _pct_from_percent_value((((rw.get("extraApy") or {}).get("value"))))
+                val = _percent_value_ui_pct(rw.get("extraApy"))
                 if val > 0:
                     supply_apr += float(val)
                 if val > 0:
@@ -16655,7 +16668,7 @@ def _fetch_aave_v4_bonus_index(stable_symbols: set[str]) -> tuple[dict[tuple[int
                 if tk:
                     tokens.add(tk)
             elif t == "MerklBorrowReward":
-                val = _pct_from_percent_value((((rw.get("discountApy") or {}).get("value"))))
+                val = _percent_value_ui_pct(rw.get("discountApy"))
                 if val > 0:
                     borrow_discount += float(val)
                 if val > 0:
@@ -16731,28 +16744,28 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
           aToken { address symbol }
           vToken { address symbol }
           size { usd }
-          supplyInfo { apy { value } canBeCollateral }
-          borrowInfo { apy { value } }
+          supplyInfo { apy { value formatted } canBeCollateral }
+          borrowInfo { apy { value formatted } }
           isFrozen
           isPaused
           incentives {
             __typename
             ... on MeritSupplyIncentive {
-              extraSupplyApr { value }
+              extraSupplyApr { value formatted }
             }
             ... on AaveSupplyIncentive {
-              extraSupplyApr { value }
+              extraSupplyApr { value formatted }
               rewardTokenSymbol
             }
             ... on MeritBorrowIncentive {
-              borrowAprDiscount { value }
+              borrowAprDiscount { value formatted }
             }
             ... on AaveBorrowIncentive {
-              borrowAprDiscount { value }
+              borrowAprDiscount { value formatted }
               rewardTokenSymbol
             }
             ... on MeritBorrowAndSupplyIncentiveCondition {
-              extraApr { value }
+              extraApr { value formatted }
               supplyToken { symbol }
               borrowToken { symbol }
             }
@@ -16783,8 +16796,8 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                 continue
             if bool(reserve.get("isPaused")) or bool(reserve.get("isFrozen")):
                 continue
-            supply_apy_pct = _pct_from_percent_value((((reserve.get("supplyInfo") or {}).get("apy") or {}).get("value")))
-            borrow_apy_pct = _pct_from_percent_value((((reserve.get("borrowInfo") or {}).get("apy") or {}).get("value")))
+            supply_apy_pct = _percent_value_ui_pct((reserve.get("supplyInfo") or {}).get("apy"))
+            borrow_apy_pct = _percent_value_ui_pct((reserve.get("borrowInfo") or {}).get("apy"))
             supply_bonus_pct = 0.0
             borrow_discount_pct = 0.0
             conditional_bonus_pct = 0.0
@@ -16793,7 +16806,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
             for inc in (reserve.get("incentives") or []):
                 t = str(inc.get("__typename") or "")
                 if t in {"MeritSupplyIncentive", "AaveSupplyIncentive"}:
-                    val = _pct_from_percent_value((((inc.get("extraSupplyApr") or {}).get("value"))))
+                    val = _percent_value_ui_pct(inc.get("extraSupplyApr"))
                     if val > 0:
                         supply_bonus_pct += float(val)
                         tag = "Merit until unknown" if t == "MeritSupplyIncentive" else "Aave until unknown"
@@ -16803,7 +16816,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     if rt:
                         reward_tokens.add(rt)
                 elif t in {"MeritBorrowIncentive", "AaveBorrowIncentive"}:
-                    val = _pct_from_percent_value((((inc.get("borrowAprDiscount") or {}).get("value"))))
+                    val = _percent_value_ui_pct(inc.get("borrowAprDiscount"))
                     if val > 0:
                         borrow_discount_pct += float(val)
                         tag = "Merit borrow until unknown" if t == "MeritBorrowIncentive" else "Aave borrow until unknown"
@@ -16813,7 +16826,7 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     if rt:
                         reward_tokens.add(rt)
                 elif t == "MeritBorrowAndSupplyIncentiveCondition":
-                    val = _pct_from_percent_value((((inc.get("extraApr") or {}).get("value"))))
+                    val = _percent_value_ui_pct(inc.get("extraApr"))
                     if val > 0:
                         conditional_bonus_pct += float(val)
                         tag = "Conditional until unknown"
@@ -16868,8 +16881,9 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
                     if ps and ps not in merkl_program_lines:
                         merkl_program_lines.append(ps)
             if merkl_apr > 0:
-                row["merkl_bonus_apr_pct"] = float(merkl_apr)
-                row["supply_total_apr_pct"] = float(row.get("supply_total_apr_pct") or 0.0) + float(merkl_apr)
+                merkl_apr = round(float(merkl_apr), 2)
+                row["merkl_bonus_apr_pct"] = merkl_apr
+                row["supply_total_apr_pct"] = float(row.get("supply_total_apr_pct") or 0.0) + merkl_apr
                 for t in merkl_tokens:
                     if t and t not in reward_tokens:
                         reward_tokens.add(t)
