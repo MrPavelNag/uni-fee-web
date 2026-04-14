@@ -24,7 +24,7 @@ from config import (
     UNISWAP_V3_SUBGRAPHS,
     UNISWAP_V4_SUBGRAPHS,
 )
-from agent_common import get_token_addresses, resolve_pool_tvl_now_external
+from agent_common import get_token_addresses, poolday_lp_fees_usd_exact, resolve_pool_tvl_now_external
 from uniswap_client import (
     get_graph_endpoint,
     query_pool_day_data,
@@ -207,8 +207,12 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
     day_data = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
     fees_usd_series = []
     raw_tvl_series = []
+    try:
+        fee_tier_ppm = int(pool.get("feeTier") or 0)
+    except (TypeError, ValueError):
+        fee_tier_ppm = 0
     for d in day_data:
-        fees = float(d.get("feesUSD") or 0)
+        fees = poolday_lp_fees_usd_exact(d, fee_tier_ppm)
         if fees <= 0:
             fees = 0.0
         ts = int(d["date"])

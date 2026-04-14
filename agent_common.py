@@ -93,6 +93,41 @@ def build_exact_day_window(days: int) -> tuple[int, int]:
     return int(start_day_start), int(end_day_start)
 
 
+def poolday_lp_fees_usd_exact(day_row: dict, fee_tier_ppm: int) -> float:
+    """
+    Daily LP swap fees (USD) implied by Uniswap v3 pool-day volume and static fee tier:
+    fees = volumeUSD * (feeTier / 1e6). If subgraph feesUSD matches within tolerance, return
+    feesUSD (same numeric identity, avoids double-rounding); if they diverge, volume×tier wins
+    (definitional for a constant-fee-tier pool given the reported notional).
+
+    fee_tier_ppm: subgraph feeTier (e.g. 3000 → 0.3%).
+    """
+    try:
+        vol = float(day_row.get("volumeUSD") or 0)
+    except (TypeError, ValueError):
+        vol = 0.0
+    try:
+        fees_rep = float(day_row.get("feesUSD") or 0)
+    except (TypeError, ValueError):
+        fees_rep = 0.0
+    try:
+        ft = int(fee_tier_ppm or 0)
+    except (TypeError, ValueError):
+        ft = 0
+    if ft <= 0:
+        return max(0.0, fees_rep)
+    tier_frac = float(ft) / 1_000_000.0
+    fees_from_vol = max(0.0, vol * tier_frac)
+    if vol <= 0:
+        return max(0.0, fees_rep)
+    if fees_rep <= 0:
+        return fees_from_vol
+    denom = max(fees_from_vol, 1e-12)
+    if abs(fees_rep - fees_from_vol) / denom <= float(os.environ.get("POOLDAY_FEES_EQ_TOL", "0.02")):
+        return fees_rep
+    return fees_from_vol
+
+
 def load_dynamic_tokens() -> dict:
     """Load chain->symbol->address from data/dynamic_tokens.json."""
     if os.path.isfile(DYNAMIC_TOKENS_PATH):

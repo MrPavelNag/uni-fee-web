@@ -34,6 +34,7 @@ from agent_common import (
     load_dynamic_tokens,
     pairs_to_filename_suffix,
     parse_token_pairs,
+    poolday_lp_fees_usd_exact,
     resolve_pool_tvl_now_external,
     save_chart_data_json,
     save_dynamic_token,
@@ -744,9 +745,10 @@ def _is_base_chain_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _quick_graphql_healthcheck(endpoint: str) -> bool:
+def _quick_graphql_healthcheck(endpoint: str) -> tuple[bool, str]:
+    """Return (ok, detail). Detail is empty on success or a short reason on failure."""
     if not endpoint:
-        return False
+        return False, "no_endpoint"
     try:
         timeout_sec = max(2.0, float(os.environ.get("V3_ENDPOINT_HEALTHCHECK_TIMEOUT_SEC", "4")))
     except Exception:
@@ -755,9 +757,18 @@ def _quick_graphql_healthcheck(endpoint: str) -> bool:
         r = requests.post(endpoint, json={"query": "query { __typename }"}, timeout=(3.0, timeout_sec))
         r.raise_for_status()
         data = r.json() if isinstance(r.json(), dict) else {}
-        return bool(isinstance(data, dict) and ("data" in data) and not data.get("errors"))
-    except Exception:
-        return False
+        if not isinstance(data, dict):
+            return False, "invalid_json"
+        errs = data.get("errors")
+        if errs:
+            first = errs[0] if isinstance(errs, list) and errs else errs
+            msg = str((first or {}).get("message", first) if isinstance(first, dict) else first)[:400]
+            return False, msg or "graphql_errors"
+        if "data" not in data:
+            return False, "no_data_field"
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:400]
 
 
 def _is_timeout_error(err: Exception) -> bool:
@@ -947,6 +958,9 @@ def _query_base_v3_pools_light(
         totalValueLockedUSD
         totalValueLockedToken0
         totalValueLockedToken1
+        volumeUSD
+        feesUSD
+        txCount
       }
       pools1: pools(
         first: 100,
@@ -962,6 +976,9 @@ def _query_base_v3_pools_light(
         totalValueLockedUSD
         totalValueLockedToken0
         totalValueLockedToken1
+        volumeUSD
+        feesUSD
+        txCount
       }
     }
     """ % (a, b, b, a)
@@ -1066,11 +1083,13 @@ def discover_pools_v3(
         if not endpoint:
             return out_chain
         check_enabled = str(os.environ.get("V3_ENDPOINT_HEALTHCHECK", "1")).strip().lower() in {"1", "true", "yes", "on"}
-        health_ok = True
         if check_enabled:
-            health_ok = _quick_graphql_healthcheck(endpoint)
+            health_ok, health_detail = _quick_graphql_healthcheck(endpoint)
+        else:
+            health_ok, health_detail = True, ""
         if check_enabled and not health_ok:
-            print(f"  [{chain}] v3: skip (endpoint healthcheck failed)")
+            detail = f": {health_detail}" if health_detail else ""
+            print(f"  [{chain}] v3: skip (endpoint healthcheck failed{detail})")
             return out_chain
 
         def _resolve_with_cache(sym: str) -> list[str]:
@@ -1235,9 +1254,15 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
         day_data = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
     fees_usd_series = []
     raw_tvl_series = []
+    try:
+        fee_tier_ppm = int(pool.get("feeTier") or 0)
+    except (TypeError, ValueError):
+        fee_tier_ppm = 0
     for d in day_data:
-        fees = float(d.get("feesUSD") or 0)
-        # feesUSD=0: do not estimate from volume; subgraph volume can be unreliable
+        if str(pool.get("_base_schema") or "") == "goldsky_v3_alt":
+            fees = float(d.get("feesUSD") or 0)
+        else:
+            fees = poolday_lp_fees_usd_exact(d, fee_tier_ppm)
         if fees <= 0:
             fees = 0.0
         ts = int(d["date"])

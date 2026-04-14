@@ -48,6 +48,60 @@ def _max_source_divergence() -> float:
         return 0.35
 
 
+def _stable_peg_enabled() -> bool:
+    v = str(os.environ.get("TOKEN_PRICE_DISABLE_STABLE_PEG", "0") or "").strip().lower()
+    return v not in {"1", "true", "yes", "on"}
+
+
+# Curated fiat-pegged symbols whose canonical addresses live in config.TOKEN_ADDRESSES.
+_FIAT_STABLE_CONFIG_KEYS = frozenset({"usdc", "usdt", "dai", "frax"})
+_STABLE_ADDR_BY_CHAIN: dict[str, frozenset[str]] = {}
+
+
+def _fiat_stable_addresses_for_chain(chain: str) -> frozenset[str]:
+    """Contract addresses we treat as ~$1 for TVL when oracles disagree or are missing."""
+    c = _norm_chain(chain)
+    cached = _STABLE_ADDR_BY_CHAIN.get(c)
+    if cached is not None:
+        return cached
+    from config import TOKEN_ADDRESSES
+
+    out: set[str] = set()
+    for sym, addr in (TOKEN_ADDRESSES.get(c) or {}).items():
+        if sym not in _FIAT_STABLE_CONFIG_KEYS:
+            continue
+        s = str(addr or "").strip().lower()
+        if not s.startswith("0x") or len(s) != 42:
+            continue
+        try:
+            if int(s, 16) == 0:
+                continue
+        except Exception:
+            continue
+        out.add(s)
+    fs = frozenset(out)
+    _STABLE_ADDR_BY_CHAIN[c] = fs
+    return fs
+
+
+def _resolve_fiat_stable_usd(cg: float, ll: float, max_div: float) -> tuple[float, str]:
+    """USD price for a known fiat stable: tolerate oracle disagreement; clamp single-source spikes."""
+    if cg > 0 and ll > 0:
+        rel = abs(cg - ll) / max(cg, ll)
+        if rel <= max_div:
+            return (cg + ll) / 2.0, "coingecko+defillama"
+        return 1.0, "stable_peg_divergence"
+    v = cg if cg > 0 else ll
+    if v > 0:
+        lo, hi = 0.92, 1.08
+        vc = min(max(v, lo), hi)
+        base = "coingecko" if cg > 0 else "defillama"
+        if abs(vc - v) > 1e-9:
+            return vc, f"{base}+stable_clamp"
+        return v, base
+    return 1.0, "stable_peg_default"
+
+
 def _norm_chain(chain: str) -> str:
     c = str(chain or "").strip().lower()
     if c == "arbitrum-one":
@@ -249,13 +303,23 @@ def get_token_prices_usd(chain: str, token_addresses: list[str]) -> tuple[dict[s
     ll_prices, _ll_sources = _fetch_defillama(chain, pending)
     unresolved: list[str] = []
     max_div = _max_source_divergence()
+    stable_addrs = _fiat_stable_addresses_for_chain(chain) if _stable_peg_enabled() else frozenset()
 
     for a in list(pending):
         cg = _safe_float(cg_prices.get(a))
         ll = _safe_float(ll_prices.get(a))
         chosen = 0.0
         src = ""
-        if cg > 0 and ll > 0:
+        if a in stable_addrs:
+            chosen, src = _resolve_fiat_stable_usd(cg, ll, max_div)
+            if cg > 0 and ll > 0:
+                rel = abs(cg - ll) / max(cg, ll)
+                if rel > max_div:
+                    errors.append(
+                        f"price_divergence_stable_peg chain={_norm_chain(chain)} token={a} "
+                        f"cg={cg:.10g} llama={ll:.10g} rel={rel:.3f} used_usd={chosen:.6g} src={src}"
+                    )
+        elif cg > 0 and ll > 0:
             rel = abs(cg - ll) / max(cg, ll)
             if rel <= max_div:
                 chosen = (cg + ll) / 2.0

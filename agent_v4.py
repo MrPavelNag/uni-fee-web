@@ -29,6 +29,7 @@ from agent_common import (
     get_token_addresses,
     load_dynamic_tokens,
     pairs_to_filename_suffix,
+    poolday_lp_fees_usd_exact,
     resolve_pool_tvl_now_external,
     save_chart_data_json,
     save_dynamic_token,
@@ -126,9 +127,10 @@ def _skip_base_v4_without_override() -> bool:
     return _env_flag("V4_SKIP_BASE_WITHOUT_OVERRIDE", True)
 
 
-def _quick_graphql_healthcheck(endpoint: str) -> bool:
+def _quick_graphql_healthcheck(endpoint: str) -> tuple[bool, str]:
+    """Return (ok, detail). Detail is empty on success or a short reason on failure."""
     if not endpoint:
-        return False
+        return False, "no_endpoint"
     try:
         timeout_sec = max(2.0, float(os.environ.get("BASE_V4_HEALTHCHECK_TIMEOUT_SEC", "4")))
     except Exception:
@@ -137,9 +139,18 @@ def _quick_graphql_healthcheck(endpoint: str) -> bool:
         r = requests.post(endpoint, json={"query": "query { __typename }"}, timeout=(3.0, timeout_sec))
         r.raise_for_status()
         data = r.json() if isinstance(r.json(), dict) else {}
-        return bool(isinstance(data, dict) and ("data" in data) and not data.get("errors"))
-    except Exception:
-        return False
+        if not isinstance(data, dict):
+            return False, "invalid_json"
+        errs = data.get("errors")
+        if errs:
+            first = errs[0] if isinstance(errs, list) and errs else errs
+            msg = str((first or {}).get("message", first) if isinstance(first, dict) else first)[:400]
+            return False, msg or "graphql_errors"
+        if "data" not in data:
+            return False, "no_data_field"
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:400]
 
 
 def _v4_endpoint_healthcheck_enabled() -> bool:
@@ -404,8 +415,12 @@ def compute_fee_series(pool: dict, endpoint: str) -> dict:
     rows = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
     fees_usd_series = []
     raw_tvl_series = []
+    try:
+        fee_tier_ppm = int(pool.get("feeTier") or 0)
+    except (TypeError, ValueError):
+        fee_tier_ppm = 0
     for r in rows:
-        fees = float(r.get("feesUSD") or 0)
+        fees = poolday_lp_fees_usd_exact(r, fee_tier_ppm)
         if fees <= 0:
             fees = 0.0
         # date may be Unix or day index; chart axis needs Unix timestamp
@@ -445,11 +460,13 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
             print(f"  [{chain}] skip: no endpoint")
             return
         healthcheck_enabled = _v4_endpoint_healthcheck_enabled()
-        health_ok = True
         if healthcheck_enabled:
-            health_ok = _quick_graphql_healthcheck(endpoint)
+            health_ok, health_detail = _quick_graphql_healthcheck(endpoint)
+        else:
+            health_ok, health_detail = True, ""
         if healthcheck_enabled and not health_ok:
-            print(f"  [{chain}] skip: endpoint healthcheck failed")
+            detail = f" ({health_detail})" if health_detail else ""
+            print(f"  [{chain}] skip: endpoint healthcheck failed{detail}")
             return
         chain_abort = False
         for base, quote in pairs:
@@ -545,10 +562,16 @@ def discover_pools(pairs: list[tuple[str, str]], min_tvl: float) -> list[dict]:
                 chains = [c for c in chains if c != "base"]
             else:
                 print("  [base] v4 isolated: override not set, fallback to default endpoint")
-        elif not _quick_graphql_healthcheck(base_override_ep):
-            print("  [base] v4 isolated: override healthcheck failed, fallback to default endpoint")
         else:
-            base_override_active = True
+            ov_ok, ov_why = _quick_graphql_healthcheck(base_override_ep)
+            if not ov_ok:
+                print(
+                    "  [base] v4 isolated: override healthcheck failed"
+                    + (f": {ov_why}" if ov_why else "")
+                    + ", fallback to default endpoint"
+                )
+            else:
+                base_override_active = True
 
     for chain in chains:
         if base_override_active and chain == "base":

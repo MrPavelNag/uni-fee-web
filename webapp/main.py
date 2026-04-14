@@ -20138,6 +20138,32 @@ def _extract_price_drop_stats(logs: list[str]) -> dict[str, Any]:
     return stats
 
 
+def _diagnose_subgraph_from_logs(logs: list[str]) -> str | None:
+    """
+    When pool scans return zero pools, agent stdout often contains Graph healthcheck skips
+    or GraphQL auth errors. Surface a short hint for the UI instead of a generic empty result.
+    """
+    blob = "\n".join(str(x) for x in (logs or [])).lower()
+    if not blob.strip():
+        return None
+    if "payment required" in blob and "api key" in blob:
+        return (
+            "The Graph rejected requests (payment required / quota). "
+            "Renew billing or replace THE_GRAPH_API_KEY; until then subgraph scans stay empty."
+        )
+    if "payment required" in blob:
+        return "The Graph returned payment required — check API key billing and quota."
+    if "auth error" in blob:
+        return "The Graph auth error — verify THE_GRAPH_API_KEY is valid and has access."
+    # Healthcheck failures with HTTP 200 + GraphQL errors still print our skip lines.
+    if "healthcheck failed" in blob and "skip (endpoint healthcheck" in blob:
+        return (
+            "Subgraph endpoints failed the health check (often the same as an expired or unpaid Graph API key). "
+            "See job logs for the exact message."
+        )
+    return None
+
+
 def _recent_failed_runs(limit: int = 50) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with JOB_LOCK:
@@ -20376,6 +20402,17 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             exclude_suffixes=req.exclude_suffixes,
             merged_override=merged_raw,
         )
+        try:
+            if int(result.get("total") or 0) <= 0:
+                sg_hint = _diagnose_subgraph_from_logs(logs)
+                if sg_hint:
+                    logs.append("[subgraph_diag] " + sg_hint)
+                    rf = dict(result.get("result_flags") or {})
+                    rf["empty_due_to_subgraph"] = True
+                    rf["subgraph_user_hint"] = sg_hint
+                    result["result_flags"] = rf
+        except Exception:
+            pass
         timing_debug["stage_ms"]["merge_for_web"] = int(round(max(0.0, time.perf_counter() - t_merge0) * 1000.0))
         timing_debug["stage_ms"]["merged_rows"] = int(len(result.get("rows") or []))
         timing_debug["stage_ms"]["merged_series"] = int(len(result.get("series") or []))
@@ -20413,7 +20450,7 @@ def _run_pool_job(job_id: str, req: "PoolsRunRequest", session_id: str) -> None:
             },
             **result,
             "debug_timing": timing_debug,
-            "logs": logs[-8:],
+            "logs": logs[-24:],
         })
         with JOB_LOCK:
             job["status"] = "done"
@@ -33223,6 +33260,13 @@ HTML_PAGE = """
       return new Intl.NumberFormat("en-US", {maximumFractionDigits: 0}).format(Number(v || 0));
     }
 
+    /** Table column for pool-scan fees: values are often single-digit dollars; show cents so APY lines up visually. */
+    function formatLpAllocFeesUsd(v) {
+      const n = Number(v || 0);
+      if (!Number.isFinite(n)) return "0";
+      return new Intl.NumberFormat("en-US", {minimumFractionDigits: 0, maximumFractionDigits: 2}).format(n);
+    }
+
     function formatUsdCompact(v) {
       const n = Number(v || 0);
       if (!Number.isFinite(n)) return "0";
@@ -34497,14 +34541,14 @@ HTML_PAGE = """
           if (showEstFull && estFeeX.length) {
             feeTraces.push({
               x: estFeeX, y: estFeeY, mode: "lines", name: `${s.label} (estimated full)`, customdata: estHover,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>LP allocation: $%{y:,.2f}<extra></extra>",
               line: {color: fullStyle.color, width: fullStyle.width, dash: fullStyle.dash}
             });
           }
           if (showEstActive && estActFeeX.length) {
             feeTraces.push({
               x: estActFeeX, y: estActFeeY, mode: "lines", name: `${s.label} (estimated active)`, customdata: estActHover,
-              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
+              hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]} | %{customdata[4]}<br>LP allocation: $%{y:,.2f}<extra></extra>",
               line: {color: activeStyle.color, width: activeStyle.width, dash: activeStyle.dash}
             });
           }
@@ -34539,7 +34583,7 @@ HTML_PAGE = """
           if (!showAll) continue;
         feeTraces.push({
           x: feeX, y: feeY, mode: "lines", name: s.label, customdata: hoverData,
-            hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<br>Cumulative: $%{y:,.2f}<extra></extra>",
+            hovertemplate: "%{x|%b %d}<br>%{customdata[0]} %{customdata[1]} | %{customdata[2]}% | %{customdata[3]}<br>LP allocation: $%{y:,.2f}<extra></extra>",
           line: {color: allStyle.color, width: allStyle.width, dash: allStyle.dash}
         });
         tvlTraces.push({
@@ -34584,7 +34628,7 @@ HTML_PAGE = """
         showlegend: false,
         margin: {t: 30, b: 42, l: 50, r: 14},
         xaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 18, tickformat: "%b %d", automargin: true, range: [startDate, endDate]},
-        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, rangemode: "tozero"},
+        yaxis: {showgrid: true, gridcolor: "#d9e2f0", nticks: 12, zeroline: false, rangemode: "tozero", title: "USD (LP allocation)"},
         annotations: warningAnnotations,
       }, {displaylogo: false, responsive: true}).then(() => {
         installChartTitleHint("feesChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
@@ -34656,9 +34700,15 @@ HTML_PAGE = """
     function renderTable(rows) {
       const table = document.getElementById("resultTable");
       const showAnchor = false;
+      const lpAllocHdr = Number(currentRequest?.lp_allocation_usd || 1000);
+      const feesColLabel =
+        Number.isFinite(lpAllocHdr) && lpAllocHdr > 0 ? `Fees ($${formatUsd(lpAllocHdr)})` : "Fees";
       const hdr = [
         ["color", ""], ["visibility", "Visibility"], ["chain", "Chain"], ["version", "Version"], ["pair", "Pair"], ["pool_id", "Pool ID"],
-        ["fee_pct", "Fee %"], ["final_income", "Cumul $"], ["apy_pct", "APY"], ["last_tvl", "TVL"],
+        ["fee_pct", "Fee %"],
+        ["final_income", feesColLabel, "Modeled cumulative fees for your LP allocation (see chart title), not total pool fees. APY is annualized from that same allocation."],
+        ["apy_pct", "APY", "Annualized return on that LP allocation over the selected history window."],
+        ["last_tvl", "TVL"],
         ...(showAnchor ? [["anchor_type", "Anchor"]] : []),
         ["status_code", "Status"]
       ];
@@ -34666,7 +34716,8 @@ HTML_PAGE = """
       let html = "<tr>";
       for (const h of hdr) {
         const marker = sortKey === h[0] ? (sortDesc ? " ▼" : " ▲") : "";
-        html += `<th onclick="sortBy('${h[0]}')">${h[1]}${marker}</th>`;
+        const tip = (h.length > 2 && h[2]) ? ` title="${escAttr(String(h[2]))}"` : "";
+        html += `<th${tip} onclick="sortBy('${h[0]}')">${h[1]}${marker}</th>`;
       }
       html += "</tr>";
 
@@ -34691,7 +34742,7 @@ HTML_PAGE = """
         html += `<td>${cleanPairLabel(r.pair)}</td>`;
         html += `<td class="mono">${escAttr(poolIdDisplay)}<button class='copy-btn' style="border:none;background:transparent;box-shadow:none;outline:none;padding:0 0 0 4px;color:#2563eb" type='button' data-copy="${escAttr(poolIdRaw)}" onclick="copyText(this.dataset.copy || '')" title='Copy pool id'>⧉</button></td>`;
         html += `<td>${Number(r.fee_pct).toFixed(2)}</td>`;
-        html += `<td>$${formatUsd(r.final_income)}</td>`;
+        html += `<td title="Same LP-allocation model as chart subtitle (not total pool fees).">$${formatLpAllocFeesUsd(r.final_income)}</td>`;
         html += `<td>${Number(r.apy_pct || 0).toFixed(1)}%</td>`;
         const tvlFull = `$${formatUsd(r.last_tvl)}`;
         const tvlCompact = `$${formatUsdCompact(r.last_tvl)}`;
@@ -35144,6 +35195,7 @@ HTML_PAGE = """
             const incomplete = !!job?.result?.result_flags?.incomplete_discovery;
             const emptyDueToMinApy = !!job?.result?.result_flags?.empty_due_to_min_apy;
             const emptyDueToMinTvl = !!job?.result?.result_flags?.empty_due_to_min_tvl;
+            const subgraphHint = String(job?.result?.result_flags?.subgraph_user_hint || "").trim();
             const rowsCount = Array.isArray(job?.result?.rows) ? job.result.rows.length : 0;
             const chartPools = Number(job?.result?.chart_pools || 0);
             const totalPools = Number(job?.result?.total || 0);
@@ -35157,6 +35209,8 @@ HTML_PAGE = """
               setStatus(`Completed in ${elapsedSec}s: no pools passed Min APY ${Number.isFinite(minApy) ? minApy.toFixed(1) : "0.0"}%`, "fail");
             } else if (emptyDueToMinTvl) {
               setStatus(`Completed in ${elapsedSec}s: no pools passed Min TVL $${formatUsd(Number.isFinite(minTvl) ? minTvl : 0)}`, "fail");
+            } else if (rowsCount === 0 && subgraphHint) {
+              setStatus(`Completed in ${elapsedSec}s: ${subgraphHint}`, "fail");
             } else if (rowsCount === 0) {
               const noDiscovery = totalPools <= 0 && chartPools <= 0;
               const hint = noDiscovery
@@ -35272,7 +35326,7 @@ HTML_PAGE = """
       };
       const scopeSuffix = getChartScopeSuffix();
       const pairHintText = getChartPairsHintText();
-      Plotly.newPlot("feesChart", baseline, {title: {text: `Cumulative Fees${scopeSuffix}`, font: {size: 14}}, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "Cumulative fee (USD)"}}, {displaylogo: false, responsive: true}).then(() => {
+      Plotly.newPlot("feesChart", baseline, {title: {text: `Cumulative Fees${scopeSuffix}`, font: {size: 14}}, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "USD (LP allocation)"}}, {displaylogo: false, responsive: true}).then(() => {
         installChartTitleHint("feesChart", pairHintText ? `Pairs: ${pairHintText}` : "Pairs: -");
       });
       Plotly.newPlot("tvlChart", baseline, {title: {text: `TVL dynamics (thousands USD)${scopeSuffix}`, font: {size: 14}}, ...emptyLayout, yaxis: {...emptyLayout.yaxis, title: "TVL (k USD)"}}, {displaylogo: false, responsive: true}).then(() => {
