@@ -19273,7 +19273,12 @@ def _requested_pair_key(a: str, b: str) -> tuple[str, str]:
 def _pair_label_key(pair_label: str) -> tuple[str, str] | None:
     if "/" not in (pair_label or ""):
         return None
-    a, b = pair_label.split("/", 1)
+    a_raw, b_raw = pair_label.split("/", 1)
+    # Subgraph symbols may use variants (USD₮0, USDC.e); align with request-side keys.
+    a = (_normalize_fee_symbol_hint(a_raw).strip().lower() or str(a_raw or "").strip().lower())
+    b = (_normalize_fee_symbol_hint(b_raw).strip().lower() or str(b_raw or "").strip().lower())
+    if not a or not b:
+        return None
     return _requested_pair_key(a, b)
 
 
@@ -19550,6 +19555,9 @@ def _build_run_job_env(
     env["TOKEN_PAIRS"] = token_pairs
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
+    # Agents disable Base discovery unless ENABLE_BASE_CHAIN=1; honor explicit UI / all-chains scans.
+    if (not include_chains) or ("base" in include_chains):
+        env["ENABLE_BASE_CHAIN"] = "1"
     # If user did not select chains (all), keep full set.
     env["V3_EXACT_TVL_CHAINS"] = (
         ",".join(include_chains)
