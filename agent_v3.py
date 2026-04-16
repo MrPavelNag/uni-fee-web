@@ -834,7 +834,8 @@ def _v3_swaps_fallback_max_pages() -> int:
 
 
 def _v3_onchain_swaps_fallback_enabled() -> bool:
-    raw = str(os.environ.get("V3_ONCHAIN_SWAPS_FALLBACK_ENABLE", "1")).strip().lower()
+    # Expensive path: disabled by default, opt-in only.
+    raw = str(os.environ.get("V3_ONCHAIN_SWAPS_FALLBACK_ENABLE", "0")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 

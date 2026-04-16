@@ -19599,6 +19599,8 @@ def _build_run_job_env(
         "1" if speed_mode == "fast" else "2",
     )
     env["V3_BASE_ONCHAIN_DISCOVERY"] = os.environ.get("WEB_V3_BASE_ONCHAIN_DISCOVERY", "1")
+    # Expensive diagnostic fallback; keep disabled in web runs unless explicitly enabled.
+    env["V3_ONCHAIN_SWAPS_FALLBACK_ENABLE"] = os.environ.get("WEB_V3_ONCHAIN_SWAPS_FALLBACK_ENABLE", "0")
     # If user did not select chains (all), keep full set.
     env["V3_EXACT_TVL_CHAINS"] = (
         ",".join(include_chains)
