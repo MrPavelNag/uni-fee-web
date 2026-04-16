@@ -16873,7 +16873,11 @@ def _scan_fluid_stable_lending_rows(
 def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
     categories, symbol_to_bucket, stable_symbols = _stable_catalog_for_lending_scan()
     if not stable_symbols:
-        return [], {"stable_catalog": categories, "chains": [], "markets": 0}, ["Stablecoin catalog is empty."]
+        return (
+            [],
+            {"stable_catalog": categories, "chains": [], "chain_filter_options": [], "markets": 0},
+            ["Stablecoin catalog is empty."],
+        )
 
     chain_ids = sorted(int(x) for x in AAVE_CHAIN_ID_TO_NAME.keys())
     merkl_idx: dict[tuple[int, str], dict[str, Any]] = {}
@@ -17135,9 +17139,21 @@ def _scan_aave_stable_lending_rows() -> tuple[list[dict[str, Any]], dict[str, An
             str(r.get("market") or ""),
         )
     )
+    chain_filter_options = sorted(
+        {
+            str(AAVE_CHAIN_ID_TO_NAME[int(cid)]).strip()
+            for cid in chain_ids
+            if int(cid) in AAVE_CHAIN_ID_TO_NAME and str(AAVE_CHAIN_ID_TO_NAME[int(cid)]).strip()
+        },
+        key=lambda s: str(s).lower(),
+    )
     meta = {
         "stable_catalog": categories,
-        "chains": sorted(int(x) for x in seen_chains),
+        # Always expose the full Aave scan scope so chain filters (e.g. Base / 8453) do not
+        # disappear when a chain has zero matching stable rows in this response.
+        "chains": sorted(int(x) for x in chain_ids),
+        "chains_with_data": sorted(int(x) for x in seen_chains),
+        "chain_filter_options": chain_filter_options,
         "markets": int(len(markets)),
         "warnings": warnings,
         "fluid_ftokens_fetched": int(fluid_n),
@@ -17270,11 +17286,23 @@ def _ensure_session_cookie(request: Request, response: Response) -> str:
 
 
 def _load_chain_catalog(refresh: bool = False) -> dict[str, Any]:
+    supported = _supported_chains()
+    supported_set = {str(x).strip().lower() for x in supported if str(x).strip()}
     if not refresh:
         cached = _read_json(CHAIN_CATALOG_PATH)
         if cached and isinstance(cached.get("items"), list):
+            from_cache = {str(x).strip().lower() for x in cached["items"] if str(x).strip()}
+            # Canonical list from config; refresh on-disk catalog when it is missing chains (e.g. Base).
+            merged = sorted(supported_set)
+            prev = sorted(from_cache & supported_set)
+            if merged != prev:
+                out = {"updated_at": _iso_now(), "count": len(merged), "items": merged}
+                _write_json(CHAIN_CATALOG_PATH, out)
+                return out
+            cached["items"] = merged
+            cached["count"] = len(merged)
             return cached
-    items = _supported_chains()
+    items = sorted(supported_set)
     out = {"updated_at": _iso_now(), "count": len(items), "items": items}
     _write_json(CHAIN_CATALOG_PATH, out)
     return out
@@ -19555,9 +19583,9 @@ def _build_run_job_env(
     env["TOKEN_PAIRS"] = token_pairs
     env["FEE_DAYS"] = str(req.days)
     env["INCLUDE_CHAINS"] = ",".join(include_chains)
-    # Agents disable Base discovery unless ENABLE_BASE_CHAIN=1; honor explicit UI / all-chains scans.
-    if (not include_chains) or ("base" in include_chains):
-        env["ENABLE_BASE_CHAIN"] = "1"
+    # Web pool jobs only: always allow Base in the agent when INCLUDE_CHAINS includes it (CLI agents
+    # still default-disable Base unless set). INCLUDE_CHAINS remains the real filter.
+    env["ENABLE_BASE_CHAIN"] = "1"
     # If user did not select chains (all), keep full set.
     env["V3_EXACT_TVL_CHAINS"] = (
         ",".join(include_chains)
@@ -26485,12 +26513,16 @@ def _render_stables_page() -> str:
       stableTableState.search = search;
       stableTableState.onlyBonuses = onlyBonuses;
     }
-    function refreshStableFilterOptions(rows) {
+    function refreshStableFilterOptions(rows, chainOptionsExtra) {
       const list = Array.isArray(rows) ? rows : [];
       const chainSel = document.getElementById("stableChainFilter");
       if (chainSel) {
         const prev = String(stableTableState.chain || "all");
-        const chains = Array.from(new Set(list.map((r) => String(r?.chain || "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b));
+        const fromRows = Array.from(new Set(list.map((r) => String(r?.chain || "").trim()).filter(Boolean)));
+        const extra = Array.isArray(chainOptionsExtra)
+          ? chainOptionsExtra.map((x) => String(x || "").trim()).filter(Boolean)
+          : [];
+        const chains = Array.from(new Set([...fromRows, ...extra])).sort((a, b) => a.localeCompare(b));
         chainSel.innerHTML = `<option value="all">all</option>` + chains.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
         chainSel.value = chains.includes(prev) ? prev : "all";
       }
@@ -26725,13 +26757,14 @@ def _render_stables_page() -> str:
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || "Scan failed");
         stableCache.lending = data.rows || [];
-        refreshStableFilterOptions(stableCache.lending);
+        refreshStableFilterOptions(stableCache.lending, data.chain_filter_options || []);
         renderCatalog(data.stable_catalog || stableCache.catalog || {});
         renderLending(stableCache.lending);
         saveStableResultCache({
           rows: stableCache.lending || [],
           stable_catalog: stableCache.catalog || {},
           chains: data.chains || [],
+          chain_filter_options: data.chain_filter_options || [],
           markets: Number(data.markets || 0),
           summary: data.summary || {},
           warnings: data.warnings || [],
@@ -26767,7 +26800,7 @@ def _render_stables_page() -> str:
     if (cached && Array.isArray(cached.rows) && cached.rows.length) {
       stableCache.lending = cached.rows.slice();
       renderCatalog(cached.stable_catalog || stableCache.catalog || {});
-      refreshStableFilterOptions(stableCache.lending);
+      refreshStableFilterOptions(stableCache.lending, cached.chain_filter_options || []);
       renderLending(stableCache.lending);
       setStableStatus(`Loaded cached table (${stableCache.lending.length} rows)`, false);
     } else {
@@ -29210,6 +29243,7 @@ def scan_stables_aave(request: Request, response: Response) -> dict[str, Any]:
         "warnings": list(warnings),
         "stable_catalog": (meta.get("stable_catalog") if isinstance(meta, dict) else {}) or {},
         "chains": (meta.get("chains") if isinstance(meta, dict) else []) or [],
+        "chain_filter_options": (meta.get("chain_filter_options") if isinstance(meta, dict) else []) or [],
         "markets": int((meta.get("markets") if isinstance(meta, dict) else 0) or 0),
         "fluid_ftokens_fetched": fluid_n,
         "summary": {
@@ -33950,9 +33984,17 @@ HTML_PAGE = """
             el.value = state[id];
           }
         }
+        const allChainsEl = document.getElementById("allChains");
+        const allChainsOn = !!(allChainsEl && allChainsEl.checked);
+        if (!allChainsOn && Array.isArray(availableChains) && availableChains.length) {
+          for (const c of availableChains) {
+            const box = document.getElementById(poolScanChainCheckId(c));
+            if (box) box.checked = false;
+          }
+        }
         if (Array.isArray(state.selectedChains)) {
           for (const c of state.selectedChains) {
-            const box = document.getElementById("chain_" + c);
+            const box = document.getElementById(poolScanChainCheckId(c));
             if (box) box.checked = true;
           }
         }
@@ -34362,13 +34404,18 @@ HTML_PAGE = """
       el.style.display = v4On ? "" : "none";
     }
 
+    function poolScanChainCheckId(c) {
+      const slug = String(c || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+      return "feechain__" + slug;
+    }
+
     function getSelectedChains() {
       const allEl = document.getElementById("allChains");
       if (!allEl) return [];
       if (allEl.checked) return [];
       const out = [];
       for (const c of availableChains) {
-        const el = document.getElementById("chain_" + c);
+        const el = document.getElementById(poolScanChainCheckId(c));
         if (el && el.checked) out.push(c);
       }
       return out;
@@ -34379,7 +34426,7 @@ HTML_PAGE = """
       if (!allEl) return;
       const all = allEl.checked;
       for (const c of availableChains) {
-        const el = document.getElementById("chain_" + c);
+        const el = document.getElementById(poolScanChainCheckId(c));
         if (el) el.checked = all;
       }
       saveFormState();
@@ -34388,7 +34435,7 @@ HTML_PAGE = """
     function onChainToggle() {
       let checkedCount = 0;
       for (const c of availableChains) {
-        const el = document.getElementById("chain_" + c);
+        const el = document.getElementById(poolScanChainCheckId(c));
         if (el && el.checked) checkedCount += 1;
       }
       const allEl = document.getElementById("allChains");
@@ -34975,7 +35022,8 @@ HTML_PAGE = """
             const raw = String(c);
             const lbl = raw.toLowerCase() === "base" ? "base*" : raw;
             const isCheckedByDefault = true;
-            return `<label class="check"><input type="checkbox" id="chain_${c}" ${isCheckedByDefault ? "checked" : ""} onchange="onChainToggle()"> ${lbl}</label>`;
+            const cid = poolScanChainCheckId(c);
+            return `<label class="check"><input type="checkbox" id="${cid}" ${isCheckedByDefault ? "checked" : ""} onchange="onChainToggle()"> ${lbl}</label>`;
           })
         ].join("");
         loadFormState();
