@@ -19598,6 +19598,7 @@ def _build_run_job_env(
         "WEB_V3_BASE_GOLDSKY_SCAN_PAGES_FAST" if speed_mode == "fast" else "WEB_V3_BASE_GOLDSKY_SCAN_PAGES_NORMAL",
         "1" if speed_mode == "fast" else "2",
     )
+    env["V3_BASE_ONCHAIN_DISCOVERY"] = os.environ.get("WEB_V3_BASE_ONCHAIN_DISCOVERY", "1")
     # If user did not select chains (all), keep full set.
     env["V3_EXACT_TVL_CHAINS"] = (
         ",".join(include_chains)

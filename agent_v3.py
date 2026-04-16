@@ -67,21 +67,16 @@ def _resolve_pool_tvl_now_onchain_v3(pool: dict, chain: str) -> tuple[float, str
     if not (pool_id and token0 and token1):
         return 0.0, "", "missing_pool_tokens"
     try:
-        latest_hex = str((_rpc_json(chain_id, "eth_blockNumber", [], timeout_sec=8.0) or {}).get("result") or "0x0")
-        latest_block = int(latest_hex, 16)
-    except Exception as e:
-        return 0.0, "", f"latest_block_failed:{e}"
-    if latest_block <= 0:
-        return 0.0, "", "latest_block_not_found"
-    try:
         d0 = int((((pool or {}).get("token0") or {}).get("decimals") or 0))
         d1 = int((((pool or {}).get("token1") or {}).get("decimals") or 0))
         if d0 <= 0 or d0 > 36:
             d0 = int(_erc20_decimals(chain_id, token0))
         if d1 <= 0 or d1 > 36:
             d1 = int(_erc20_decimals(chain_id, token1))
-        b0 = int(_balance_of_raw(chain_id, token0, pool_id, latest_block, timeout_sec=8.0))
-        b1 = int(_balance_of_raw(chain_id, token1, pool_id, latest_block, timeout_sec=8.0))
+        # Use "latest" tag directly to avoid cross-RPC block mismatch ("header not found")
+        # when providers are slightly out of sync.
+        b0 = int(_balance_of_raw_latest(chain_id, token0, pool_id, timeout_sec=8.0))
+        b1 = int(_balance_of_raw_latest(chain_id, token1, pool_id, timeout_sec=8.0))
     except Exception as e:
         return 0.0, "", f"onchain_balance_failed:{e}"
 
@@ -615,6 +610,12 @@ def _balance_of_raw(chain_id: int, token: str, owner: str, block_num: int, timeo
     return int(_decode_uint_hex(out))
 
 
+def _balance_of_raw_latest(chain_id: int, token: str, owner: str, timeout_sec: float = 8.0) -> int:
+    data = "0x70a08231" + str(owner).strip().lower().replace("0x", "").rjust(64, "0")
+    out = _rpc_eth_call_hex(int(chain_id), str(token), data, "latest", timeout_sec=float(timeout_sec))
+    return int(_decode_uint_hex(out))
+
+
 def _strict_block_deltas(window: int) -> list[int]:
     w = int(max(0, window))
     deltas = [0]
@@ -812,6 +813,164 @@ def _base_goldsky_use_filtered_query() -> bool:
     # Filtered query with inputTokens_contains is often slower on Goldsky and can timeout.
     raw = str(os.environ.get("V3_BASE_GOLDSKY_USE_FILTERED_QUERY", "0")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _base_v3_onchain_discovery_enabled() -> bool:
+    raw = str(os.environ.get("V3_BASE_ONCHAIN_DISCOVERY", "1")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _base_v3_factory_address() -> str:
+    # Uniswap v3 factory on Base.
+    return str(os.environ.get("V3_BASE_FACTORY", "0x33128a8fc17869897dce68ed026d694621f6fdfd") or "").strip().lower()
+
+
+def _base_v3_fee_tiers() -> list[int]:
+    raw = str(os.environ.get("V3_BASE_FEE_TIERS", "100,500,3000,10000") or "")
+    out: list[int] = []
+    seen: set[int] = set()
+    for part in raw.split(","):
+        s = str(part or "").strip()
+        if not s:
+            continue
+        try:
+            v = int(s)
+        except Exception:
+            continue
+        if v <= 0 or v > 1_000_000:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out or [100, 500, 3000, 10000]
+
+
+def _abi_word_addr(addr: str) -> str:
+    h = str(addr or "").strip().lower()
+    if not _is_eth_address(h):
+        return "0" * 64
+    return ("0" * 24) + h[2:]
+
+
+def _abi_word_uint(v: int) -> str:
+    try:
+        x = int(v)
+    except Exception:
+        x = 0
+    if x < 0:
+        x = 0
+    return f"{x:064x}"
+
+
+def _decode_addr_from_abi_word(data_hex: str) -> str:
+    s = str(data_hex or "").strip().lower()
+    if not s.startswith("0x"):
+        return ""
+    body = s[2:]
+    if len(body) < 64:
+        return ""
+    return "0x" + body[-40:]
+
+
+def _erc20_symbol_best_effort(chain_id: int, token: str, fallback: str = "?") -> str:
+    t = str(token or "").strip().lower()
+    if not _is_eth_address(t):
+        return str(fallback or "?")
+    try:
+        out = _rpc_eth_call_hex(int(chain_id), t, "0x95d89b41", "latest", timeout_sec=6.0)
+        raw = bytes.fromhex(out[2:]) if out.startswith("0x") else b""
+        if len(raw) >= 64:
+            try:
+                off = int.from_bytes(raw[:32], "big")
+                if 0 <= off <= (len(raw) - 32):
+                    ln = int.from_bytes(raw[off:off + 32], "big")
+                    start = off + 32
+                    end = start + ln
+                    if 0 <= ln <= 64 and end <= len(raw):
+                        s = raw[start:end].decode("utf-8", "ignore").strip()
+                        if s:
+                            return s[:24]
+            except Exception:
+                pass
+        if len(raw) >= 32:
+            s = raw[:32].rstrip(b"\x00").decode("utf-8", "ignore").strip()
+            if s:
+                return s[:24]
+    except Exception:
+        pass
+    return str(fallback or "?")
+
+
+def _base_v3_discover_onchain_factory_pools(
+    token_a: str,
+    token_b: str,
+    sym_by_addr: dict[str, str],
+    max_results: int,
+) -> list[dict]:
+    chain_id = 8453
+    a = str(token_a or "").strip().lower()
+    b = str(token_b or "").strip().lower()
+    if not (_is_eth_address(a) and _is_eth_address(b)) or a == b:
+        return []
+    factory = _base_v3_factory_address()
+    if not _is_eth_address(factory):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    selector_get_pool = "0x1698ee82"  # getPool(address,address,uint24)
+    selector_token0 = "0x0dfe1681"
+    selector_token1 = "0xd21220a7"
+    selector_fee = "0xddca3f43"
+    for fee in _base_v3_fee_tiers():
+        data = (
+            selector_get_pool
+            + _abi_word_addr(a)
+            + _abi_word_addr(b)
+            + _abi_word_uint(int(fee))
+        )
+        try:
+            ret = _rpc_eth_call_hex(chain_id, factory, data, "latest", timeout_sec=7.0)
+            pool = _decode_addr_from_abi_word(ret)
+            if not _is_eth_address(pool):
+                continue
+            if int(pool, 16) == 0:
+                continue
+            if pool in seen:
+                continue
+            seen.add(pool)
+            t0 = _decode_addr_from_abi_word(_rpc_eth_call_hex(chain_id, pool, selector_token0, "latest", timeout_sec=6.0))
+            t1 = _decode_addr_from_abi_word(_rpc_eth_call_hex(chain_id, pool, selector_token1, "latest", timeout_sec=6.0))
+            if not (_is_eth_address(t0) and _is_eth_address(t1)):
+                continue
+            fee_raw_hex = _rpc_eth_call_hex(chain_id, pool, selector_fee, "latest", timeout_sec=6.0)
+            fee_raw = int(_decode_uint_hex(fee_raw_hex))
+            d0 = int(_erc20_decimals(chain_id, t0))
+            d1 = int(_erc20_decimals(chain_id, t1))
+            b0 = int(_balance_of_raw_latest(chain_id, t0, pool, timeout_sec=8.0))
+            b1 = int(_balance_of_raw_latest(chain_id, t1, pool, timeout_sec=8.0))
+            t0_sym = str(sym_by_addr.get(t0) or _erc20_symbol_best_effort(chain_id, t0, "?"))
+            t1_sym = str(sym_by_addr.get(t1) or _erc20_symbol_best_effort(chain_id, t1, "?"))
+            out.append(
+                {
+                    "id": pool,
+                    "feeTier": int(fee_raw if fee_raw > 0 else int(fee)),
+                    "token0": {"id": t0, "symbol": t0_sym, "decimals": str(d0), "name": ""},
+                    "token1": {"id": t1, "symbol": t1_sym, "decimals": str(d1), "name": ""},
+                    "totalValueLockedUSD": "0",
+                    "totalValueLockedToken0": str(float(b0) / float(10 ** max(0, d0))),
+                    "totalValueLockedToken1": str(float(b1) / float(10 ** max(0, d1))),
+                    "volumeUSD": "0",
+                    "feesUSD": "0",
+                    "_base_schema": "goldsky_v3_alt",
+                    "_base_discovery": "onchain_factory",
+                }
+            )
+            if int(max_results or 0) > 0 and len(out) >= int(max_results):
+                break
+        except Exception:
+            continue
+    return out
 
 
 def _discover_base_v3_goldsky_pools(
@@ -1142,6 +1301,13 @@ def discover_pools_v3(
             use_base_goldsky = True
         if not endpoint:
             return out_chain
+        symbol_lookup_endpoints: list[str] = [str(endpoint or "").strip()]
+        if chain == "base" and use_base_goldsky:
+            # For symbol->address resolution, Goldsky can be sparse/slow for token lookup.
+            # Add The Graph Base endpoint as secondary resolver when available.
+            graph_ep = get_graph_endpoint("base", "v3")
+            if graph_ep and graph_ep not in symbol_lookup_endpoints:
+                symbol_lookup_endpoints.append(graph_ep)
         check_enabled = str(os.environ.get("V3_ENDPOINT_HEALTHCHECK", "1")).strip().lower() in {"1", "true", "yes", "on"}
         if check_enabled and _skip_healthcheck_for_endpoint(endpoint):
             check_enabled = False
@@ -1161,12 +1327,16 @@ def discover_pools_v3(
                     out.extend(get_token_addresses(c, sym, dynamic_tokens))
             out = list(dict.fromkeys(out))[:1]
             if not out:
-                addr = query_token_by_symbol(endpoint, sym)
-                if addr:
-                    with dyn_lock:
-                        save_dynamic_token(chain, sym, addr)
-                        dynamic_tokens.setdefault(chain, {})[sym.lower()] = addr
-                    out = [addr]
+                for ep in symbol_lookup_endpoints:
+                    if not ep:
+                        continue
+                    addr = query_token_by_symbol(ep, sym)
+                    if addr:
+                        with dyn_lock:
+                            save_dynamic_token(chain, sym, addr)
+                            dynamic_tokens.setdefault(chain, {})[sym.lower()] = addr
+                        out = [addr]
+                        break
             return out
 
         for base, quote in pairs:
@@ -1191,12 +1361,25 @@ def discover_pools_v3(
                 continue
             try:
                 if use_base_goldsky:
-                    pools = _discover_base_v3_goldsky_pools(
-                        endpoint,
-                        base_addrs[0],
-                        quote_addrs[0],
-                        max_results=int(discovery_cap),
-                    )
+                    sym_by_addr = {
+                        str(base_addrs[0]).strip().lower(): str(base or "").strip().upper(),
+                        str(quote_addrs[0]).strip().lower(): str(quote or "").strip().upper(),
+                    }
+                    pools = []
+                    if _base_v3_onchain_discovery_enabled():
+                        pools = _base_v3_discover_onchain_factory_pools(
+                            base_addrs[0],
+                            quote_addrs[0],
+                            sym_by_addr=sym_by_addr,
+                            max_results=int(discovery_cap),
+                        )
+                    if not pools:
+                        pools = _discover_base_v3_goldsky_pools(
+                            endpoint,
+                            base_addrs[0],
+                            quote_addrs[0],
+                            max_results=int(discovery_cap),
+                        )
                 else:
                     if chain == "base":
                         # For Base on The Graph route use lightweight query shape first.

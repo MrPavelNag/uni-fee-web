@@ -1,0 +1,190 @@
+{
+  "0x08c049f958e7d1f1b7ae44466b80d7773ca09c8e": {
+    "fees": [
+      [
+        1775865223,
+        0.0
+      ],
+      [
+        1775951695,
+        0.0
+      ],
+      [
+        1776036049,
+        0.0
+      ],
+      [
+        1776124377,
+        0.0
+      ],
+      [
+        1776210269,
+        0.0
+      ],
+      [
+        1776296129,
+        0.0
+      ]
+    ],
+    "tvl": [
+      [
+        1775865223,
+        40481.82303316283
+      ],
+      [
+        1775951695,
+        40735.448261967016
+      ],
+      [
+        1776036049,
+        29045.543936769507
+      ],
+      [
+        1776124377,
+        49434.56090250507
+      ],
+      [
+        1776210269,
+        37698.51873087412
+      ],
+      [
+        1776296129,
+        46147.8403278269
+      ]
+    ],
+    "pool_id": "0x08c049f958e7d1f1b7ae44466b80d7773ca09c8e",
+    "fee_pct": 0.3,
+    "raw_fee_tier": 3000,
+    "pool_tvl_now_usd": 46147.8403278269,
+    "pool_tvl_subgraph_usd": 0.0,
+    "tvl_multiplier": 1.0,
+    "tvl_price_source": "coingecko+defillama",
+    "pair": "USDC/LINK",
+    "chain": "base",
+    "version": "v3",
+    "data_quality": "estimated",
+    "data_quality_reason": "scaled_by_raw_tvl",
+    "strict_debug": {},
+    "strict_compare_estimated_tvl": [
+      [
+        1775865223,
+        40481.82303316283
+      ],
+      [
+        1775951695,
+        40735.448261967016
+      ],
+      [
+        1776036049,
+        29045.543936769507
+      ],
+      [
+        1776124377,
+        49434.56090250507
+      ],
+      [
+        1776210269,
+        37698.51873087412
+      ],
+      [
+        1776296129,
+        46147.8403278269
+      ]
+    ],
+    "strict_compare_estimated_fees": [
+      [
+        1775865223,
+        0.0
+      ],
+      [
+        1775951695,
+        0.0
+      ],
+      [
+        1776036049,
+        0.0
+      ],
+      [
+        1776124377,
+        0.0
+      ],
+      [
+        1776210269,
+        0.0
+      ],
+      [
+        1776296129,
+        0.0
+      ]
+    ],
+    "strict_compare_estimated_active_tvl": [],
+    "strict_compare_estimated_active_fees": [],
+    "strict_estimated_shape_missing": false
+  },
+  "0xda11f0ce51729422ee6d6cc561b7c8a3eb80d407": {
+    "fees": [],
+    "tvl": [],
+    "pool_id": "0xda11f0ce51729422ee6d6cc561b7c8a3eb80d407",
+    "fee_pct": 1.0,
+    "raw_fee_tier": 10000,
+    "pool_tvl_now_usd": 1.39988029969236e-05,
+    "pool_tvl_subgraph_usd": 0.0,
+    "tvl_multiplier": 1.0,
+    "tvl_price_source": "coingecko+defillama",
+    "pair": "USDC/LINK",
+    "chain": "base",
+    "version": "v3",
+    "data_quality": "estimated",
+    "data_quality_reason": "default_scaled",
+    "strict_debug": {},
+    "strict_compare_estimated_tvl": [],
+    "strict_compare_estimated_fees": [],
+    "strict_compare_estimated_active_tvl": [],
+    "strict_compare_estimated_active_fees": [],
+    "strict_estimated_shape_missing": false
+  },
+  "0xbeacc8ab83c4c32b4a11354a3412a2a12bd6c4b4": {
+    "fees": [],
+    "tvl": [],
+    "pool_id": "0xbeacc8ab83c4c32b4a11354a3412a2a12bd6c4b4",
+    "fee_pct": 0.01,
+    "raw_fee_tier": 100,
+    "pool_tvl_now_usd": 0.001245893466724966,
+    "pool_tvl_subgraph_usd": 0.0,
+    "tvl_multiplier": 1.0,
+    "tvl_price_source": "coingecko+defillama",
+    "pair": "USDC/LINK",
+    "chain": "base",
+    "version": "v3",
+    "data_quality": "estimated",
+    "data_quality_reason": "default_scaled",
+    "strict_debug": {},
+    "strict_compare_estimated_tvl": [],
+    "strict_compare_estimated_fees": [],
+    "strict_compare_estimated_active_tvl": [],
+    "strict_compare_estimated_active_fees": [],
+    "strict_estimated_shape_missing": false
+  },
+  "0x6c79527d387dd5c0579080374e65d3b4f711719b": {
+    "fees": [],
+    "tvl": [],
+    "pool_id": "0x6c79527d387dd5c0579080374e65d3b4f711719b",
+    "fee_pct": 0.05,
+    "raw_fee_tier": 500,
+    "pool_tvl_now_usd": 316.12472609770396,
+    "pool_tvl_subgraph_usd": 0.0,
+    "tvl_multiplier": 1.0,
+    "tvl_price_source": "coingecko+defillama",
+    "pair": "USDC/LINK",
+    "chain": "base",
+    "version": "v3",
+    "data_quality": "estimated",
+    "data_quality_reason": "default_scaled",
+    "strict_debug": {},
+    "strict_compare_estimated_tvl": [],
+    "strict_compare_estimated_fees": [],
+    "strict_compare_estimated_active_tvl": [],
+    "strict_compare_estimated_active_fees": [],
+    "strict_estimated_shape_missing": false
+  }
+}

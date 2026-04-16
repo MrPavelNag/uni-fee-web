@@ -54,6 +54,7 @@ TOKEN_ADDRESSES = {
         "fluid": "0x61e030a56d33e8260fdd81f03b162a79fe3449cd",
         "inst": "0x61e030a56d33e8260fdd81f03b162a79fe3449cd",
         "uni": "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+        "link": "0x88fb150bdc53a65fe94dea0c9ba0a6daf8c6e196",  # Chainlink on Base
         "wbtc": "0x0555e30da8f9830a4d47e02a04f16b17f5b95b8e",
         "eth": "0x4200000000000000000000000000000000000006",  # WETH
         "weth": "0x4200000000000000000000000000000000000006",
