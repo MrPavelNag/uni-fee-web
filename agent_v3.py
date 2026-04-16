@@ -1134,6 +1134,10 @@ def discover_pools_v3(
             and _base_v3_goldsky_endpoint()
         )
         endpoint = _base_v3_goldsky_endpoint() if use_base_goldsky else get_graph_endpoint(chain, "v3")
+        # If endpoint resolver returns Goldsky (e.g. missing/invalid Graph key),
+        # force Goldsky schema path even when isolated pipeline flag is off.
+        if chain == "base" and _is_goldsky_public_endpoint(endpoint):
+            use_base_goldsky = True
         if not endpoint:
             return out_chain
         check_enabled = str(os.environ.get("V3_ENDPOINT_HEALTHCHECK", "1")).strip().lower() in {"1", "true", "yes", "on"}
