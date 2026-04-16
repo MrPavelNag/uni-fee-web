@@ -19586,6 +19586,9 @@ def _build_run_job_env(
     # Web pool jobs only: always allow Base in the agent when INCLUDE_CHAINS includes it (CLI agents
     # still default-disable Base unless set). INCLUDE_CHAINS remains the real filter.
     env["ENABLE_BASE_CHAIN"] = "1"
+    # Stable path for web runs: use The Graph for Base v3 by default.
+    # Goldsky isolated route is opt-in via WEB_BASE_V3_ISOLATED_PIPELINE=1.
+    env["BASE_V3_ISOLATED_PIPELINE"] = os.environ.get("WEB_BASE_V3_ISOLATED_PIPELINE", "0")
     # If user did not select chains (all), keep full set.
     env["V3_EXACT_TVL_CHAINS"] = (
         ",".join(include_chains)

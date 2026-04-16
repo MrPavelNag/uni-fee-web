@@ -735,7 +735,9 @@ def _base_v3_goldsky_endpoint() -> str:
 
 
 def _is_base_v3_isolated_enabled() -> bool:
-    raw = str(os.environ.get("BASE_V3_ISOLATED_PIPELINE", "1")).strip().lower()
+    # Default to The Graph path for Base v3 when a valid key is present.
+    # Goldsky isolated route is opt-in only (BASE_V3_ISOLATED_PIPELINE=1).
+    raw = str(os.environ.get("BASE_V3_ISOLATED_PIPELINE", "0")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
