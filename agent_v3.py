@@ -833,6 +833,18 @@ def _v3_swaps_fallback_max_pages() -> int:
         return 20
 
 
+def _v3_onchain_swaps_fallback_enabled() -> bool:
+    raw = str(os.environ.get("V3_ONCHAIN_SWAPS_FALLBACK_ENABLE", "1")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _v3_onchain_swaps_chunk_blocks() -> int:
+    try:
+        return max(200, min(10000, int(os.environ.get("V3_ONCHAIN_SWAPS_CHUNK_BLOCKS", "8000"))))
+    except Exception:
+        return 8000
+
+
 def _base_v3_factory_address() -> str:
     # Uniswap v3 factory on Base.
     return str(os.environ.get("V3_BASE_FACTORY", "0x33128a8fc17869897dce68ed026d694621f6fdfd") or "").strip().lower()
@@ -1206,6 +1218,115 @@ def _query_pool_swaps_daily_fees_v3(
     if not by_day_usd:
         return []
     out = [(int(ts), float(v)) for ts, v in sorted(by_day_usd.items(), key=lambda x: int(x[0]))]
+    return out
+
+
+def _decode_int256_word(word_hex: str) -> int:
+    h = str(word_hex or "").strip().lower().replace("0x", "")
+    if len(h) < 64:
+        h = h.rjust(64, "0")
+    h = h[-64:]
+    v = int(h, 16)
+    if v >= (1 << 255):
+        v -= (1 << 256)
+    return int(v)
+
+
+def _query_pool_onchain_daily_fees_v3(
+    *,
+    chain: str,
+    pool_id: str,
+    token0: str,
+    token1: str,
+    dec0: int,
+    dec1: int,
+    start_ts: int,
+    end_ts: int,
+    fee_tier_ppm: int,
+) -> list[tuple[int, float]]:
+    """
+    Exact fallback from on-chain Swap events when subgraph day-data is zero/missing.
+    """
+    ck = str(chain or "").strip().lower()
+    chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    if chain_id <= 0:
+        return []
+    if not (_is_eth_address(pool_id) and _is_eth_address(token0) and _is_eth_address(token1)):
+        return []
+    try:
+        ft = int(fee_tier_ppm or 0)
+    except Exception:
+        ft = 0
+    if ft <= 0:
+        return []
+    fee_frac = float(ft) / 1_000_000.0
+    topic_swap = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+    out: list[tuple[int, float]] = []
+    chunk_blocks = _v3_onchain_swaps_chunk_blocks()
+    for day_ts in range(int(start_ts), int(end_ts) + 1, 86400):
+        try:
+            b0 = int(_llama_block_for_day(ck, int(day_ts)))
+            b1 = int(_llama_block_for_day(ck, int(day_ts + 86399)))
+        except Exception:
+            out.append((int(day_ts), 0.0))
+            continue
+        if b1 < b0:
+            b0, b1 = b1, b0
+        try:
+            p0 = float(_historical_price_usd(ck, token0, int(day_ts), int(start_ts), int(end_ts)))
+        except Exception:
+            p0 = 0.0
+        try:
+            p1 = float(_historical_price_usd(ck, token1, int(day_ts), int(start_ts), int(end_ts)))
+        except Exception:
+            p1 = 0.0
+        day_volume_usd = 0.0
+        cur = int(b0)
+        while cur <= int(b1):
+            hi = min(int(b1), int(cur + chunk_blocks - 1))
+            try:
+                logs = (_rpc_json(
+                    chain_id,
+                    "eth_getLogs",
+                    [{
+                        "address": str(pool_id).strip().lower(),
+                        "fromBlock": hex(int(cur)),
+                        "toBlock": hex(int(hi)),
+                        "topics": [topic_swap],
+                    }],
+                    timeout_sec=12.0,
+                ).get("result") or [])
+            except Exception as e:
+                msg = str(e).lower()
+                if ("range" in msg or "block range" in msg) and int(hi) > int(cur):
+                    # Provider block-range cap: halve and retry.
+                    mid = int((cur + hi) // 2)
+                    if mid <= cur:
+                        cur = hi + 1
+                    else:
+                        hi = mid
+                    continue
+                cur = hi + 1
+                continue
+            for lg in logs:
+                data_hex = str(lg.get("data") or "").strip().lower().replace("0x", "")
+                if len(data_hex) < 128:
+                    continue
+                try:
+                    a0_raw = abs(_decode_int256_word(data_hex[0:64]))
+                    a1_raw = abs(_decode_int256_word(data_hex[64:128]))
+                except Exception:
+                    continue
+                a0 = float(a0_raw) / float(10 ** max(0, int(dec0)))
+                a1 = float(a1_raw) / float(10 ** max(0, int(dec1)))
+                u0 = float(a0 * p0) if p0 > 0 else 0.0
+                u1 = float(a1 * p1) if p1 > 0 else 0.0
+                if u0 > 0 and u1 > 0:
+                    day_volume_usd += max(u0, u1)
+                else:
+                    day_volume_usd += max(u0, u1, 0.0)
+            cur = hi + 1
+        out.append((int(day_ts), max(0.0, float(day_volume_usd) * fee_frac)))
     return out
 
 
@@ -1621,6 +1742,30 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
                 fees_source = "swaps_fallback"
         except Exception:
             pass
+    # Last-resort exact path: recover fees from on-chain Swap logs by day.
+    fees_sum = sum(float(x[1] or 0.0) for x in fees_usd_series) if fees_usd_series else 0.0
+    if _v3_onchain_swaps_fallback_enabled() and (not fees_usd_series or fees_sum <= 0.0):
+        try:
+            t0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
+            t1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
+            d0 = int(((pool.get("token0") or {}).get("decimals") or 18))
+            d1 = int(((pool.get("token1") or {}).get("decimals") or 18))
+            onchain_daily_fees = _query_pool_onchain_daily_fees_v3(
+                chain=str(pool.get("chain") or ""),
+                pool_id=str(pool.get("id") or ""),
+                token0=t0,
+                token1=t1,
+                dec0=int(d0),
+                dec1=int(d1),
+                start_ts=int(start_ts),
+                end_ts=int(end_ts),
+                fee_tier_ppm=int(fee_tier_ppm),
+            )
+            if onchain_daily_fees and sum(float(v or 0.0) for _, v in onchain_daily_fees) > 0.0:
+                fees_usd_series = onchain_daily_fees
+                fees_source = "onchain_swaps_fallback"
+        except Exception:
+            pass
     return {"_fees_usd": fees_usd_series, "_raw_tvl_usd": raw_tvl_series, "_fees_source": fees_source}
 
 
@@ -1972,6 +2117,8 @@ def main() -> None:
                     tvl_quality_reason = "fees_from_swaps_fallback"
                 elif fees_source == "base_graph_daydata" and tvl_quality_reason == "default_scaled":
                     tvl_quality_reason = "fees_from_base_graph_daydata"
+                elif fees_source == "onchain_swaps_fallback" and tvl_quality_reason == "default_scaled":
+                    tvl_quality_reason = "fees_from_onchain_swaps"
         except Exception:
             pass
         data.pop("_fees_usd", None)
