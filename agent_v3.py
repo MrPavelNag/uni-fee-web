@@ -785,6 +785,33 @@ def _skip_healthcheck_for_endpoint(endpoint: str) -> bool:
     return False
 
 
+def _base_graphql_retries() -> int:
+    try:
+        return max(1, int(os.environ.get("V3_BASE_GRAPHQL_RETRIES", "3")))
+    except Exception:
+        return 3
+
+
+def _base_goldsky_page_size() -> int:
+    try:
+        return max(20, min(100, int(os.environ.get("V3_BASE_GOLDSKY_PAGE_SIZE", "40"))))
+    except Exception:
+        return 40
+
+
+def _base_goldsky_scan_pages() -> int:
+    try:
+        return max(1, min(200, int(os.environ.get("V3_BASE_GOLDSKY_SCAN_PAGES", "12"))))
+    except Exception:
+        return 12
+
+
+def _base_goldsky_use_filtered_query() -> bool:
+    # Filtered query with inputTokens_contains is often slower on Goldsky and can timeout.
+    raw = str(os.environ.get("V3_BASE_GOLDSKY_USE_FILTERED_QUERY", "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _discover_base_v3_goldsky_pools(
     endpoint: str,
     token_a: str,
@@ -796,10 +823,11 @@ def _discover_base_v3_goldsky_pools(
     token_b = str(token_b or "").strip().lower()
     if not token_a or not token_b or token_a == token_b:
         return []
+    page_size = _base_goldsky_page_size()
     q_filtered = """
     query BasePools($skip: Int!) {
       liquidityPools(
-        first: 100,
+        first: %d,
         skip: $skip,
         orderBy: totalValueLockedUSD,
         orderDirection: desc,
@@ -811,33 +839,45 @@ def _discover_base_v3_goldsky_pools(
         inputTokens { id symbol decimals }
       }
     }
-    """ % (token_a, token_b)
+    """ % (page_size, token_a, token_b)
     q_unfiltered = """
     query BasePools($skip: Int!) {
-      liquidityPools(first: 100, skip: $skip, orderBy: totalValueLockedUSD, orderDirection: desc) {
+      liquidityPools(first: %d, skip: $skip, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id
         totalValueLockedUSD
         inputTokenBalances
         inputTokens { id symbol decimals }
       }
     }
-    """
-    query_text = q_filtered
-    used_unfiltered = False
+    """ % (page_size,)
+    use_filtered = _base_goldsky_use_filtered_query()
+    query_text = q_filtered if use_filtered else q_unfiltered
+    used_unfiltered = not use_filtered
     out: list[dict] = []
     skip = 0
-    while True:
+    pages = 0
+    max_pages = _base_goldsky_scan_pages()
+    while pages < max_pages:
         try:
-            data = graphql_query(endpoint, query_text, {"skip": skip}, retries=1)
+            data = graphql_query(endpoint, query_text, {"skip": skip}, retries=_base_graphql_retries())
         except Exception as e:
-            if (not used_unfiltered) and "inputtokens_contains" in str(e).lower():
+            msg = str(e).lower()
+            if (not used_unfiltered) and (("inputtokens_contains" in msg) or ("timed out" in msg) or ("timeout" in msg)):
                 query_text = q_unfiltered
                 used_unfiltered = True
                 continue
+            # Do not drop already discovered pools because one later page timed out.
+            if out:
+                _warn_fallback_once(
+                    "base_v3_goldsky_paging_timeout_partial",
+                    "base v3 goldsky paging interrupted; returning partial discovery result",
+                )
+                break
             raise
         rows = data.get("data", {}).get("liquidityPools", []) or []
         if not rows:
             break
+        added_this_page = 0
         for r in rows:
             toks = r.get("inputTokens") or []
             if not isinstance(toks, list) or len(toks) < 2:
@@ -872,11 +912,16 @@ def _discover_base_v3_goldsky_pools(
             }
             if p["id"]:
                 out.append(p)
+                added_this_page += 1
                 if int(max_results or 0) > 0 and len(out) >= int(max_results):
                     return out[: int(max_results)]
-        if len(rows) < 100:
+        if out and added_this_page == 0:
+            # Rows are sorted by TVL desc; once matches stop appearing, deeper pages are unlikely useful.
             break
-        skip += 100
+        if len(rows) < int(page_size):
+            break
+        skip += int(page_size)
+        pages += 1
     return out
 
 
@@ -903,7 +948,7 @@ def _query_base_v3_goldsky_day_data(endpoint: str, pool_id: str, start_ts: int, 
             endpoint,
             q,
             {"pool": str(pool_id or "").strip().lower(), "start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
-            retries=1,
+            retries=_base_graphql_retries(),
         )
         rows = data.get("data", {}).get("liquidityPoolDailySnapshots", []) or []
         if not rows:
@@ -1019,7 +1064,7 @@ def _query_base_v3_pools_light(
     skip = 0
     try:
         while True:
-            data = graphql_query(endpoint, q, {"skip": int(skip)}, retries=1)
+            data = graphql_query(endpoint, q, {"skip": int(skip)}, retries=_base_graphql_retries())
             d = data.get("data", {}) or {}
             p0 = d.get("pools0", []) or []
             p1 = d.get("pools1", []) or []
@@ -1039,7 +1084,7 @@ def _query_base_v3_pools_light(
     max_scan_pages = max(1, _env_int("V3_BASE_LIGHT_SCAN_PAGES", 3))
     pages = 0
     while pages < max_scan_pages:
-        data = graphql_query(endpoint, q_unfiltered, {"skip": int(skip)}, retries=1)
+        data = graphql_query(endpoint, q_unfiltered, {"skip": int(skip)}, retries=_base_graphql_retries())
         rows = (data.get("data", {}) or {}).get("pools", []) or []
         if not rows:
             break
