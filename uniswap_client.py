@@ -15,6 +15,8 @@ _POOL_DAY_CACHE_LOCK = threading.Lock()
 _POOL_DAY_CACHE: dict[tuple[str, str, int, int], list[dict]] = {}
 _TOKEN_BY_SYMBOL_CACHE_LOCK = threading.Lock()
 _TOKEN_BY_SYMBOL_CACHE: dict[tuple[str, str], Optional[str]] = {}
+_ENDPOINT_RATE_LOCK = threading.Lock()
+_ENDPOINT_LAST_TS: dict[str, float] = {}
 
 
 def _page_delay_sec() -> float:
@@ -35,6 +37,40 @@ def _canonical_graph_chain(chain: str) -> str:
     if c == "arbitrum-one":
         return "arbitrum"
     return c
+
+
+def _is_goldsky_public_endpoint(endpoint: str) -> bool:
+    ep = str(endpoint or "").strip().lower()
+    return ("api.goldsky.com" in ep) and ("/api/public/" in ep)
+
+
+def _goldsky_min_interval_sec() -> float:
+    try:
+        return max(0.0, float(os.environ.get("GRAPHQL_GOLDSKY_MIN_INTERVAL_SEC", "0.35")))
+    except Exception:
+        return 0.35
+
+
+def _respect_endpoint_rate_limit(endpoint: str) -> None:
+    ep = str(endpoint or "").strip()
+    if not ep:
+        return
+    if not _is_goldsky_public_endpoint(ep):
+        return
+    min_gap = _goldsky_min_interval_sec()
+    if min_gap <= 0:
+        return
+    now = time.time()
+    wait = 0.0
+    with _ENDPOINT_RATE_LOCK:
+        last = float(_ENDPOINT_LAST_TS.get(ep, 0.0) or 0.0)
+        delta = now - last
+        if delta < min_gap:
+            wait = float(min_gap - delta)
+    if wait > 0:
+        time.sleep(wait)
+    with _ENDPOINT_RATE_LOCK:
+        _ENDPOINT_LAST_TS[ep] = time.time()
 
 
 def get_graph_endpoint(chain: str, version: str = "v3") -> Optional[str]:
@@ -81,6 +117,14 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
         except ValueError:
             retries = 4
     retries = max(1, retries)
+    ep_low = str(endpoint or "").strip().lower()
+    if ("api.goldsky.com" in ep_low) and ("/api/public/" in ep_low):
+        # Goldsky public endpoints can return transient 429 under shared quota.
+        # Ensure at least a few retry attempts even when caller requests retries=1.
+        try:
+            retries = max(retries, int(os.environ.get("GRAPHQL_GOLDSKY_429_RETRIES", "3")))
+        except Exception:
+            retries = max(retries, 3)
     try:
         connect_timeout = float(os.environ.get("GRAPHQL_CONNECT_TIMEOUT_SEC", "8"))
     except Exception:
@@ -93,7 +137,17 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
     read_timeout = max(5.0, read_timeout)
     for attempt in range(retries):
         try:
+            _respect_endpoint_rate_limit(endpoint)
             resp = requests.post(endpoint, json=payload, timeout=(connect_timeout, read_timeout))
+            if int(getattr(resp, "status_code", 0) or 0) == 429:
+                if attempt < retries - 1:
+                    ra = str(resp.headers.get("Retry-After", "") or "").strip()
+                    try:
+                        wait_s = max(1.0, float(ra))
+                    except Exception:
+                        wait_s = float(2 * (attempt + 1))
+                    time.sleep(wait_s)
+                    continue
             resp.raise_for_status()
             data = resp.json()
             if "errors" in data:

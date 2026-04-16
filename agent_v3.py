@@ -771,9 +771,18 @@ def _quick_graphql_healthcheck(endpoint: str) -> tuple[bool, str]:
         return False, str(e)[:400]
 
 
-def _is_timeout_error(err: Exception) -> bool:
-    msg = str(err or "").lower()
-    return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
+def _is_goldsky_public_endpoint(endpoint: str) -> bool:
+    ep = str(endpoint or "").strip().lower()
+    return ("api.goldsky.com" in ep) and ("/api/public/" in ep)
+
+
+def _skip_healthcheck_for_endpoint(endpoint: str) -> bool:
+    # Goldsky public endpoints are heavily rate-limited; extra healthcheck probes
+    # consume quota and can trigger 429 before the real discovery query.
+    if _is_goldsky_public_endpoint(endpoint):
+        raw = str(os.environ.get("V3_SKIP_HEALTHCHECK_GOLDSKY", "1")).strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+    return False
 
 
 def _discover_base_v3_goldsky_pools(
@@ -1083,6 +1092,8 @@ def discover_pools_v3(
         if not endpoint:
             return out_chain
         check_enabled = str(os.environ.get("V3_ENDPOINT_HEALTHCHECK", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        if check_enabled and _skip_healthcheck_for_endpoint(endpoint):
+            check_enabled = False
         if check_enabled:
             health_ok, health_detail = _quick_graphql_healthcheck(endpoint)
         else:
@@ -1129,46 +1140,12 @@ def discover_pools_v3(
                 continue
             try:
                 if use_base_goldsky:
-                    pools = []
-                    try:
-                        pools = _discover_base_v3_goldsky_pools(
-                            endpoint,
-                            base_addrs[0],
-                            quote_addrs[0],
-                            max_results=int(discovery_cap),
-                        )
-                    except Exception as ge:
-                        # Goldsky Base v3 can time out intermittently; fallback to The Graph endpoint when available.
-                        if _is_timeout_error(ge):
-                            graph_ep = get_graph_endpoint("base", "v3")
-                            if graph_ep and graph_ep != endpoint:
-                                try:
-                                    fb_read_timeout = max(3.0, float(os.environ.get("V3_BASE_FALLBACK_READ_TIMEOUT_SEC", "6")))
-                                except Exception:
-                                    fb_read_timeout = 6.0
-                                print("  [base] v3 fallback: goldsky timeout; trying thegraph endpoint")
-                                _warn_fallback_once(
-                                    "base_v3_goldsky_to_thegraph",
-                                    "base v3 discovery source fallback: goldsky timeout -> thegraph endpoint",
-                                )
-                                prev_read_timeout = os.environ.get("GRAPHQL_READ_TIMEOUT_SEC")
-                                try:
-                                    os.environ["GRAPHQL_READ_TIMEOUT_SEC"] = str(fb_read_timeout)
-                                    pools = _query_base_v3_pools_light(
-                                        graph_ep,
-                                        base_addrs[0],
-                                        quote_addrs[0],
-                                        max_results=int(discovery_cap),
-                                    )
-                                finally:
-                                    if prev_read_timeout is None:
-                                        os.environ.pop("GRAPHQL_READ_TIMEOUT_SEC", None)
-                                    else:
-                                        os.environ["GRAPHQL_READ_TIMEOUT_SEC"] = prev_read_timeout
-                            else:
-                                raise
-                        else:
-                            raise
+                    pools = _discover_base_v3_goldsky_pools(
+                        endpoint,
+                        base_addrs[0],
+                        quote_addrs[0],
+                        max_results=int(discovery_cap),
+                    )
                 else:
                     if chain == "base":
                         # For Base on The Graph route use lightweight query shape first.

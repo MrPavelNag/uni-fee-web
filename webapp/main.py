@@ -19634,6 +19634,11 @@ def _build_run_job_env(
         "WEB_V4_SKIP_CHAIN_AFTER_TIMEOUT",
         "1",
     )
+    # Keep Base v4 disabled by default unless explicit override endpoint is configured.
+    env["V4_SKIP_BASE_WITHOUT_OVERRIDE"] = os.environ.get(
+        "WEB_V4_SKIP_BASE_WITHOUT_OVERRIDE",
+        "1",
+    )
     # Fail-fast package: tighter endpoint checks and smaller Base fallback scan window.
     env["V3_ENDPOINT_HEALTHCHECK"] = os.environ.get("WEB_V3_ENDPOINT_HEALTHCHECK", "1")
     env["V4_ENDPOINT_HEALTHCHECK"] = os.environ.get("WEB_V4_ENDPOINT_HEALTHCHECK", "1")
