@@ -146,6 +146,11 @@ def graphql_query(endpoint: str, query: str, variables: Optional[dict] = None, r
         read_timeout = float(os.environ.get("GRAPHQL_READ_TIMEOUT_SEC", "15"))
     except Exception:
         read_timeout = 15.0
+    if _is_goldsky_public_endpoint(endpoint):
+        try:
+            read_timeout = max(read_timeout, float(os.environ.get("GRAPHQL_GOLDSKY_READ_TIMEOUT_SEC", "35")))
+        except Exception:
+            read_timeout = max(read_timeout, 35.0)
     connect_timeout = max(2.0, connect_timeout)
     read_timeout = max(5.0, read_timeout)
     for attempt in range(retries):

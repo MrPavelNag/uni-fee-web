@@ -19586,9 +19586,18 @@ def _build_run_job_env(
     # Web pool jobs only: always allow Base in the agent when INCLUDE_CHAINS includes it (CLI agents
     # still default-disable Base unless set). INCLUDE_CHAINS remains the real filter.
     env["ENABLE_BASE_CHAIN"] = "1"
-    # Stable path for web runs: use The Graph for Base v3 by default.
-    # Goldsky isolated route is opt-in via WEB_BASE_V3_ISOLATED_PIPELINE=1.
-    env["BASE_V3_ISOLATED_PIPELINE"] = os.environ.get("WEB_BASE_V3_ISOLATED_PIPELINE", "0")
+    # Base v3 web path: use isolated Goldsky route with low-load profile.
+    env["BASE_V3_ISOLATED_PIPELINE"] = os.environ.get("WEB_BASE_V3_ISOLATED_PIPELINE", "1")
+    env["V3_SKIP_HEALTHCHECK_GOLDSKY"] = os.environ.get("WEB_V3_SKIP_HEALTHCHECK_GOLDSKY", "1")
+    env["V3_BASE_GOLDSKY_USE_FILTERED_QUERY"] = os.environ.get("WEB_V3_BASE_GOLDSKY_USE_FILTERED_QUERY", "0")
+    env["V3_BASE_GOLDSKY_PAGE_SIZE"] = os.environ.get(
+        "WEB_V3_BASE_GOLDSKY_PAGE_SIZE_FAST" if speed_mode == "fast" else "WEB_V3_BASE_GOLDSKY_PAGE_SIZE_NORMAL",
+        "40" if speed_mode == "fast" else "60",
+    )
+    env["V3_BASE_GOLDSKY_SCAN_PAGES"] = os.environ.get(
+        "WEB_V3_BASE_GOLDSKY_SCAN_PAGES_FAST" if speed_mode == "fast" else "WEB_V3_BASE_GOLDSKY_SCAN_PAGES_NORMAL",
+        "1" if speed_mode == "fast" else "2",
+    )
     # If user did not select chains (all), keep full set.
     env["V3_EXACT_TVL_CHAINS"] = (
         ",".join(include_chains)
