@@ -1,0 +1,13 @@
+Agent 1: Uniswap v3 (base version)
+Token pairs: eth,usdc | Min TVL: $1 000
+Discovering v3 pools...
+  [arbitrum] v3: skip (endpoint healthcheck failed: auth error: malformed API key)
+  [polygon] v3: skip (endpoint healthcheck failed: auth error: malformed API key)
+  [optimism] v3: skip (endpoint healthcheck failed: auth error: malformed API key)
+  [unichain] v3: skip (endpoint healthcheck failed: auth error: malformed API key)
+  [ethereum] v3: skip (endpoint healthcheck failed: auth error: malformed API key)
+  [base] v3: skip (endpoint healthcheck failed: auth error: malformed API key)
+Found 0 v3 pools
+PDF output disabled (DISABLE_PDF_OUTPUT=1)
+Saved: data/pools_v3_eth_usdc.json
+Done. Output: data/pools_v3_eth_usdc.json

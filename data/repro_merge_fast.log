@@ -1,0 +1,4 @@
+Agent 3: merge v3 + v4
+Token pairs: eth,usdc → suffix: eth_usdc
+Merged: 0 v3 pools + 0 v4 pools = 0 total
+No data to plot. Run agent_v3.py and/or agent_v4.py first.

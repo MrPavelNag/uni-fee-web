@@ -1,0 +1,8 @@
+Agent 1: Uniswap v3 (base version)
+Token pairs: eth,usdc | Min TVL: $1 000
+Discovering v3 pools...
+  [base] v3 eth/usdc: GraphQL errors: [{'message': 'auth error: malformed API key'}]
+Found 0 v3 pools
+PDF output disabled (DISABLE_PDF_OUTPUT=1)
+Saved: data/pools_v3_eth_usdc.json
+Done. Output: data/pools_v3_eth_usdc.json

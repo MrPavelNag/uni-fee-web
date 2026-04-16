@@ -31976,8 +31976,13 @@ def run_pools(req: PoolsRunRequest, request: Request, response: Response) -> dic
     req.pairs = _clean_run_pairs(req.pairs, limit=RUN_PAIRS_LIMIT)
     if not req.pairs:
         raise HTTPException(status_code=400, detail="No valid pairs. Use token symbols like eth, usdc, wbtc, usdt (chars: a-z, 0-9, dot, underscore, dash).")
-    if not os.environ.get("THE_GRAPH_API_KEY"):
-        raise HTTPException(status_code=400, detail="Missing THE_GRAPH_API_KEY on server.")
+    graph_key = str(os.environ.get("THE_GRAPH_API_KEY") or "").strip()
+    bad_placeholder = (not graph_key) or ("paste" in graph_key.lower() and "key" in graph_key.lower())
+    if bad_placeholder:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid THE_GRAPH_API_KEY on server (placeholder or empty). Set a real key and restart backend.",
+        )
     if req.days < 1 or req.days > 3650:
         raise HTTPException(status_code=400, detail="days must be an integer between 1 and 3650")
     if req.min_tvl < 0 or req.min_tvl > 10_000_000:

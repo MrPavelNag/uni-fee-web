@@ -603,7 +603,9 @@ def main() -> None:
         v = os.environ.get("MIN_TVL")
         min_tvl = float(v) if v else MIN_TVL_USD
 
-    if not os.environ.get("THE_GRAPH_API_KEY") and not any(
+    graph_key = str(os.environ.get("THE_GRAPH_API_KEY") or "").strip()
+    key_is_placeholder = (not graph_key) or ("paste" in graph_key.lower() and "key" in graph_key.lower())
+    if key_is_placeholder and not any(
         k.startswith("V4_OVERRIDE_") for k in os.environ
     ):
         print("THE_GRAPH_API_KEY or V4_OVERRIDE_* (Ormi) is required")

@@ -39,6 +39,19 @@ def _canonical_graph_chain(chain: str) -> str:
     return c
 
 
+def _is_placeholder_graph_key(value: str) -> bool:
+    v = str(value or "").strip().lower()
+    if not v:
+        return True
+    placeholders = {
+        "paste_your_real_key_here",
+        "paste_your_key_here",
+        "your_key_here",
+        "changeme",
+    }
+    return v in placeholders or ("paste" in v and "key" in v)
+
+
 def _is_goldsky_public_endpoint(endpoint: str) -> bool:
     ep = str(endpoint or "").strip().lower()
     return ("api.goldsky.com" in ep) and ("/api/public/" in ep)
@@ -76,8 +89,8 @@ def _respect_endpoint_rate_limit(endpoint: str) -> None:
 def get_graph_endpoint(chain: str, version: str = "v3") -> Optional[str]:
     """Build GraphQL endpoint URL for a chain and protocol version (v3 or v4)."""
     chain = _canonical_graph_chain(chain)
-    api_key = os.environ.get("THE_GRAPH_API_KEY")
-    if not api_key:
+    api_key = str(os.environ.get("THE_GRAPH_API_KEY") or "").strip()
+    if _is_placeholder_graph_key(api_key):
         if version == "v4":
             return None
         # Fallback: Goldsky for Base v3 only if no API key (rate limited)

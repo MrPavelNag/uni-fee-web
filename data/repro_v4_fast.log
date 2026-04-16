@@ -1,0 +1,11 @@
+Uniswap v4 Agent
+Pairs: eth,usdc | Min TVL: $1000
+Discovering pools...
+  [ethereum] skip: endpoint healthcheck failed (auth error: malformed API key)
+  [arbitrum] skip: endpoint healthcheck failed (auth error: malformed API key)
+  [unichain] skip: endpoint healthcheck failed (auth error: malformed API key)
+  [polygon] skip: endpoint healthcheck failed (auth error: malformed API key)
+Found 0 v4 pools
+PDF output disabled (DISABLE_PDF_OUTPUT=1)
+Saved: data/pools_v4_eth_usdc.json
+Done: data/pools_v4_eth_usdc.json
