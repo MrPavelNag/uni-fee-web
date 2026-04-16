@@ -15,6 +15,7 @@ import os
 import threading
 import time
 import requests
+from collections import defaultdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -820,6 +821,18 @@ def _base_v3_onchain_discovery_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _v3_swaps_fallback_enabled() -> bool:
+    raw = str(os.environ.get("V3_SWAPS_FALLBACK_ENABLE", "1")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _v3_swaps_fallback_max_pages() -> int:
+    try:
+        return max(1, min(200, int(os.environ.get("V3_SWAPS_FALLBACK_MAX_PAGES", "20"))))
+    except Exception:
+        return 20
+
+
 def _base_v3_factory_address() -> str:
     # Uniswap v3 factory on Base.
     return str(os.environ.get("V3_BASE_FACTORY", "0x33128a8fc17869897dce68ed026d694621f6fdfd") or "").strip().lower()
@@ -1099,6 +1112,7 @@ def _query_base_v3_goldsky_day_data(endpoint: str, pool_id: str, start_ts: int, 
         timestamp
         totalValueLockedUSD
         dailySupplySideRevenueUSD
+        dailyVolumeUSD
       }
     }
     """
@@ -1121,11 +1135,77 @@ def _query_base_v3_goldsky_day_data(endpoint: str, pool_id: str, start_ts: int, 
                     "date": ts,
                     "tvlUSD": float(r.get("totalValueLockedUSD") or 0.0),
                     "feesUSD": float(r.get("dailySupplySideRevenueUSD") or 0.0),
+                    "volumeUSD": float(r.get("dailyVolumeUSD") or 0.0),
                 }
             )
         if len(rows) < 100:
             break
         skip += 100
+    return out
+
+
+def _query_pool_swaps_daily_fees_v3(
+    endpoint: str,
+    pool_id: str,
+    start_ts: int,
+    end_ts: int,
+    fee_tier_ppm: int,
+) -> list[tuple[int, float]]:
+    """
+    Fallback daily fees from swaps when poolDayData/snapshots are empty or zeroed.
+    """
+    try:
+        ft = int(fee_tier_ppm or 0)
+    except Exception:
+        ft = 0
+    if ft <= 0:
+        return []
+    fee_frac = float(ft) / 1_000_000.0
+    q = """
+    query PoolSwaps($pool: String!, $start: Int!, $end: Int!, $skip: Int!) {
+      swaps(
+        first: 1000,
+        skip: $skip,
+        orderBy: timestamp,
+        orderDirection: asc,
+        where: { pool: $pool, timestamp_gte: $start, timestamp_lte: $end }
+      ) {
+        timestamp
+        amountUSD
+      }
+    }
+    """
+    by_day_usd: dict[int, float] = defaultdict(float)
+    skip = 0
+    pages = 0
+    max_pages = _v3_swaps_fallback_max_pages()
+    while pages < max_pages:
+        data = graphql_query(
+            endpoint,
+            q,
+            {"pool": str(pool_id or "").strip().lower(), "start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
+            retries=1,
+        )
+        rows = (data.get("data") or {}).get("swaps") or []
+        if not rows:
+            break
+        for r in rows:
+            try:
+                ts = int(float(r.get("timestamp") or 0))
+                amt = abs(float(r.get("amountUSD") or 0.0))
+            except Exception:
+                continue
+            if ts <= 0 or amt <= 0:
+                continue
+            day_ts = int((ts // 86400) * 86400)
+            by_day_usd[day_ts] += float(amt) * fee_frac
+        if len(rows) < 1000:
+            break
+        skip += 1000
+        pages += 1
+    if not by_day_usd:
+        return []
+    out = [(int(ts), float(v)) for ts, v in sorted(by_day_usd.items(), key=lambda x: int(x[0]))]
     return out
 
 
@@ -1463,17 +1543,30 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
         day_data = _query_base_v3_goldsky_day_data(endpoint, pool["id"], start_ts, end_ts)
     else:
         day_data = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
+    def _clip_window(rows: list[dict]) -> list[dict]:
+        out_rows: list[dict] = []
+        for d in (rows or []):
+            try:
+                ts = int(d.get("date") or d.get("timestamp") or 0)
+            except Exception:
+                ts = 0
+            if ts <= 0:
+                continue
+            if int(start_ts) <= ts <= int(end_ts + 86399):
+                out_rows.append(dict(d))
+        out_rows.sort(key=lambda x: int(x.get("date") or x.get("timestamp") or 0))
+        return out_rows
+
+    day_data = _clip_window(day_data)
     fees_usd_series = []
+    fees_source = "day_data"
     raw_tvl_series = []
     try:
         fee_tier_ppm = int(pool.get("feeTier") or 0)
     except (TypeError, ValueError):
         fee_tier_ppm = 0
     for d in day_data:
-        if str(pool.get("_base_schema") or "") == "goldsky_v3_alt":
-            fees = float(d.get("feesUSD") or 0)
-        else:
-            fees = poolday_lp_fees_usd_exact(d, fee_tier_ppm)
+        fees = poolday_lp_fees_usd_exact(d, fee_tier_ppm)
         if fees <= 0:
             fees = 0.0
         ts = int(d["date"])
@@ -1483,7 +1576,52 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
         except Exception:
             raw_tvl = 0.0
         raw_tvl_series.append((ts, max(0.0, raw_tvl)))
-    return {"_fees_usd": fees_usd_series, "_raw_tvl_usd": raw_tvl_series}
+    # Base-specific root issue: Goldsky may return zeroed daily fee/volume for valid pools.
+    # If so, recover day data from The Graph endpoint when a real API key is available.
+    fees_sum = sum(float(x[1] or 0.0) for x in fees_usd_series) if fees_usd_series else 0.0
+    is_base_goldsky = (
+        str(pool.get("chain") or "").strip().lower() == "base"
+        and str(pool.get("_base_schema") or "").strip() == "goldsky_v3_alt"
+    )
+    if is_base_goldsky and (not fees_usd_series or fees_sum <= 0.0):
+        graph_ep = str(get_graph_endpoint("base", "v3") or "").strip()
+        if graph_ep and (not _is_goldsky_public_endpoint(graph_ep)):
+            try:
+                graph_days = _clip_window(query_pool_day_data(graph_ep, pool["id"], start_ts, end_ts))
+                graph_fees: list[tuple[int, float]] = []
+                graph_tvl: list[tuple[int, float]] = []
+                for d in graph_days:
+                    ts = int(d["date"])
+                    fees = max(0.0, float(poolday_lp_fees_usd_exact(d, fee_tier_ppm)))
+                    graph_fees.append((ts, fees))
+                    try:
+                        graph_tvl.append((ts, max(0.0, float(d.get("tvlUSD") or 0.0))))
+                    except Exception:
+                        graph_tvl.append((ts, 0.0))
+                if graph_fees and sum(v for _, v in graph_fees) > 0.0:
+                    fees_usd_series = graph_fees
+                    if graph_tvl and len(graph_tvl) == len(graph_fees):
+                        raw_tvl_series = graph_tvl
+                    fees_source = "base_graph_daydata"
+            except Exception:
+                pass
+    # If day snapshots have no usable fees, reconstruct from swaps.
+    fees_sum = sum(float(x[1] or 0.0) for x in fees_usd_series) if fees_usd_series else 0.0
+    if _v3_swaps_fallback_enabled() and (not fees_usd_series or fees_sum <= 0.0):
+        try:
+            swaps_daily_fees = _query_pool_swaps_daily_fees_v3(
+                endpoint=endpoint,
+                pool_id=str(pool.get("id") or ""),
+                start_ts=int(start_ts),
+                end_ts=int(end_ts + 86399),
+                fee_tier_ppm=int(fee_tier_ppm),
+            )
+            if swaps_daily_fees:
+                fees_usd_series = swaps_daily_fees
+                fees_source = "swaps_fallback"
+        except Exception:
+            pass
+    return {"_fees_usd": fees_usd_series, "_raw_tvl_usd": raw_tvl_series, "_fees_source": fees_source}
 
 
 def _build_exact_tvl_series_v3(
@@ -1730,6 +1868,7 @@ def main() -> None:
         try:
             fees_usd = data.get("_fees_usd") or []
             raw_tvl = data.get("_raw_tvl_usd") or []
+            fees_source = str(data.get("_fees_source") or "day_data")
             if fees_usd and pool_tvl_now_usd > 0:
                 tvl_series = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
                 if raw_tvl and len(raw_tvl) == len(fees_usd):
@@ -1829,10 +1968,15 @@ def main() -> None:
                         cumul += float(fees_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day))
                     fees_rebuilt.append((ts, cumul))
                 data["fees"] = fees_rebuilt
+                if fees_source == "swaps_fallback" and tvl_quality_reason == "default_scaled":
+                    tvl_quality_reason = "fees_from_swaps_fallback"
+                elif fees_source == "base_graph_daydata" and tvl_quality_reason == "default_scaled":
+                    tvl_quality_reason = "fees_from_base_graph_daydata"
         except Exception:
             pass
         data.pop("_fees_usd", None)
         data.pop("_raw_tvl_usd", None)
+        data.pop("_fees_source", None)
         try:
             raw_pool_tvl = float(pool.get("totalValueLockedUSD") or 0.0)
         except Exception:
