@@ -15,7 +15,6 @@ import os
 import threading
 import time
 import requests
-from collections import defaultdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -35,7 +34,6 @@ from agent_common import (
     load_dynamic_tokens,
     pairs_to_filename_suffix,
     parse_token_pairs,
-    poolday_lp_fees_usd_exact,
     resolve_pool_tvl_now_external,
     save_chart_data_json,
     save_dynamic_token,
@@ -68,16 +66,21 @@ def _resolve_pool_tvl_now_onchain_v3(pool: dict, chain: str) -> tuple[float, str
     if not (pool_id and token0 and token1):
         return 0.0, "", "missing_pool_tokens"
     try:
+        latest_hex = str((_rpc_json(chain_id, "eth_blockNumber", [], timeout_sec=8.0) or {}).get("result") or "0x0")
+        latest_block = int(latest_hex, 16)
+    except Exception as e:
+        return 0.0, "", f"latest_block_failed:{e}"
+    if latest_block <= 0:
+        return 0.0, "", "latest_block_not_found"
+    try:
         d0 = int((((pool or {}).get("token0") or {}).get("decimals") or 0))
         d1 = int((((pool or {}).get("token1") or {}).get("decimals") or 0))
         if d0 <= 0 or d0 > 36:
             d0 = int(_erc20_decimals(chain_id, token0))
         if d1 <= 0 or d1 > 36:
             d1 = int(_erc20_decimals(chain_id, token1))
-        # Use "latest" tag directly to avoid cross-RPC block mismatch ("header not found")
-        # when providers are slightly out of sync.
-        b0 = int(_balance_of_raw_latest(chain_id, token0, pool_id, timeout_sec=8.0))
-        b1 = int(_balance_of_raw_latest(chain_id, token1, pool_id, timeout_sec=8.0))
+        b0 = int(_balance_of_raw(chain_id, token0, pool_id, latest_block, timeout_sec=8.0))
+        b1 = int(_balance_of_raw(chain_id, token1, pool_id, latest_block, timeout_sec=8.0))
     except Exception as e:
         return 0.0, "", f"onchain_balance_failed:{e}"
 
@@ -129,13 +132,20 @@ def _is_eth_address(v: str) -> bool:
     return s.startswith("0x") and len(s) == 42
 
 
-V3_EXACT_TVL_ENABLE = _env_flag("V3_EXACT_TVL_ENABLE", False)
+def _target_pool_id() -> str:
+    raw = str(os.environ.get("TARGET_POOL_ID", "") or "").strip().lower()
+    if _is_eth_address(raw):
+        return raw
+    return ""
+
+
+V3_EXACT_TVL_ENABLE = _env_flag("V3_EXACT_TVL_ENABLE", True)
 V3_EXACT_TVL_CHAINS = {
     c.strip().lower()
     for c in str(os.environ.get("V3_EXACT_TVL_CHAINS", "ethereum")).split(",")
     if c.strip()
 }
-V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 0))
+V3_EXACT_TVL_MAX_POOLS = max(0, _env_int("V3_EXACT_TVL_MAX_POOLS", 5))
 # By default exact-days cap follows the same history window as agent day-data (FEE_DAYS),
 # i.e. the value selected in UI "History days".
 V3_EXACT_TVL_DAYS_MAX = max(1, _env_int("V3_EXACT_TVL_DAYS_MAX", int(FEE_DAYS)))
@@ -611,12 +621,6 @@ def _balance_of_raw(chain_id: int, token: str, owner: str, block_num: int, timeo
     return int(_decode_uint_hex(out))
 
 
-def _balance_of_raw_latest(chain_id: int, token: str, owner: str, timeout_sec: float = 8.0) -> int:
-    data = "0x70a08231" + str(owner).strip().lower().replace("0x", "").rjust(64, "0")
-    out = _rpc_eth_call_hex(int(chain_id), str(token), data, "latest", timeout_sec=float(timeout_sec))
-    return int(_decode_uint_hex(out))
-
-
 def _strict_block_deltas(window: int) -> list[int]:
     w = int(max(0, window))
     deltas = [0]
@@ -737,9 +741,7 @@ def _base_v3_goldsky_endpoint() -> str:
 
 
 def _is_base_v3_isolated_enabled() -> bool:
-    # Default to The Graph path for Base v3 when a valid key is present.
-    # Goldsky isolated route is opt-in only (BASE_V3_ISOLATED_PIPELINE=1).
-    raw = str(os.environ.get("BASE_V3_ISOLATED_PIPELINE", "0")).strip().lower()
+    raw = str(os.environ.get("BASE_V3_ISOLATED_PIPELINE", "1")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
@@ -749,10 +751,9 @@ def _is_base_chain_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _quick_graphql_healthcheck(endpoint: str) -> tuple[bool, str]:
-    """Return (ok, detail). Detail is empty on success or a short reason on failure."""
+def _quick_graphql_healthcheck(endpoint: str) -> bool:
     if not endpoint:
-        return False, "no_endpoint"
+        return False
     try:
         timeout_sec = max(2.0, float(os.environ.get("V3_ENDPOINT_HEALTHCHECK_TIMEOUT_SEC", "4")))
     except Exception:
@@ -761,242 +762,14 @@ def _quick_graphql_healthcheck(endpoint: str) -> tuple[bool, str]:
         r = requests.post(endpoint, json={"query": "query { __typename }"}, timeout=(3.0, timeout_sec))
         r.raise_for_status()
         data = r.json() if isinstance(r.json(), dict) else {}
-        if not isinstance(data, dict):
-            return False, "invalid_json"
-        errs = data.get("errors")
-        if errs:
-            first = errs[0] if isinstance(errs, list) and errs else errs
-            msg = str((first or {}).get("message", first) if isinstance(first, dict) else first)[:400]
-            return False, msg or "graphql_errors"
-        if "data" not in data:
-            return False, "no_data_field"
-        return True, ""
-    except Exception as e:
-        return False, str(e)[:400]
-
-
-def _is_goldsky_public_endpoint(endpoint: str) -> bool:
-    ep = str(endpoint or "").strip().lower()
-    return ("api.goldsky.com" in ep) and ("/api/public/" in ep)
-
-
-def _skip_healthcheck_for_endpoint(endpoint: str) -> bool:
-    # Goldsky public endpoints are heavily rate-limited; extra healthcheck probes
-    # consume quota and can trigger 429 before the real discovery query.
-    if _is_goldsky_public_endpoint(endpoint):
-        raw = str(os.environ.get("V3_SKIP_HEALTHCHECK_GOLDSKY", "1")).strip().lower()
-        return raw in {"1", "true", "yes", "on"}
-    return False
-
-
-def _base_graphql_retries() -> int:
-    try:
-        return max(1, int(os.environ.get("V3_BASE_GRAPHQL_RETRIES", "3")))
+        return bool(isinstance(data, dict) and ("data" in data) and not data.get("errors"))
     except Exception:
-        return 3
+        return False
 
 
-def _base_goldsky_page_size() -> int:
-    try:
-        return max(20, min(100, int(os.environ.get("V3_BASE_GOLDSKY_PAGE_SIZE", "40"))))
-    except Exception:
-        return 40
-
-
-def _base_goldsky_scan_pages() -> int:
-    try:
-        return max(1, min(200, int(os.environ.get("V3_BASE_GOLDSKY_SCAN_PAGES", "12"))))
-    except Exception:
-        return 12
-
-
-def _base_goldsky_use_filtered_query() -> bool:
-    # Filtered query with inputTokens_contains is often slower on Goldsky and can timeout.
-    raw = str(os.environ.get("V3_BASE_GOLDSKY_USE_FILTERED_QUERY", "0")).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _base_v3_onchain_discovery_enabled() -> bool:
-    raw = str(os.environ.get("V3_BASE_ONCHAIN_DISCOVERY", "1")).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _v3_swaps_fallback_enabled() -> bool:
-    raw = str(os.environ.get("V3_SWAPS_FALLBACK_ENABLE", "1")).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _v3_swaps_fallback_max_pages() -> int:
-    try:
-        return max(1, min(200, int(os.environ.get("V3_SWAPS_FALLBACK_MAX_PAGES", "20"))))
-    except Exception:
-        return 20
-
-
-def _v3_onchain_swaps_fallback_enabled() -> bool:
-    # Expensive path: disabled by default, opt-in only.
-    raw = str(os.environ.get("V3_ONCHAIN_SWAPS_FALLBACK_ENABLE", "0")).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _v3_onchain_swaps_chunk_blocks() -> int:
-    try:
-        return max(200, min(10000, int(os.environ.get("V3_ONCHAIN_SWAPS_CHUNK_BLOCKS", "8000"))))
-    except Exception:
-        return 8000
-
-
-def _base_v3_factory_address() -> str:
-    # Uniswap v3 factory on Base.
-    return str(os.environ.get("V3_BASE_FACTORY", "0x33128a8fc17869897dce68ed026d694621f6fdfd") or "").strip().lower()
-
-
-def _base_v3_fee_tiers() -> list[int]:
-    raw = str(os.environ.get("V3_BASE_FEE_TIERS", "100,500,3000,10000") or "")
-    out: list[int] = []
-    seen: set[int] = set()
-    for part in raw.split(","):
-        s = str(part or "").strip()
-        if not s:
-            continue
-        try:
-            v = int(s)
-        except Exception:
-            continue
-        if v <= 0 or v > 1_000_000:
-            continue
-        if v in seen:
-            continue
-        seen.add(v)
-        out.append(v)
-    return out or [100, 500, 3000, 10000]
-
-
-def _abi_word_addr(addr: str) -> str:
-    h = str(addr or "").strip().lower()
-    if not _is_eth_address(h):
-        return "0" * 64
-    return ("0" * 24) + h[2:]
-
-
-def _abi_word_uint(v: int) -> str:
-    try:
-        x = int(v)
-    except Exception:
-        x = 0
-    if x < 0:
-        x = 0
-    return f"{x:064x}"
-
-
-def _decode_addr_from_abi_word(data_hex: str) -> str:
-    s = str(data_hex or "").strip().lower()
-    if not s.startswith("0x"):
-        return ""
-    body = s[2:]
-    if len(body) < 64:
-        return ""
-    return "0x" + body[-40:]
-
-
-def _erc20_symbol_best_effort(chain_id: int, token: str, fallback: str = "?") -> str:
-    t = str(token or "").strip().lower()
-    if not _is_eth_address(t):
-        return str(fallback or "?")
-    try:
-        out = _rpc_eth_call_hex(int(chain_id), t, "0x95d89b41", "latest", timeout_sec=6.0)
-        raw = bytes.fromhex(out[2:]) if out.startswith("0x") else b""
-        if len(raw) >= 64:
-            try:
-                off = int.from_bytes(raw[:32], "big")
-                if 0 <= off <= (len(raw) - 32):
-                    ln = int.from_bytes(raw[off:off + 32], "big")
-                    start = off + 32
-                    end = start + ln
-                    if 0 <= ln <= 64 and end <= len(raw):
-                        s = raw[start:end].decode("utf-8", "ignore").strip()
-                        if s:
-                            return s[:24]
-            except Exception:
-                pass
-        if len(raw) >= 32:
-            s = raw[:32].rstrip(b"\x00").decode("utf-8", "ignore").strip()
-            if s:
-                return s[:24]
-    except Exception:
-        pass
-    return str(fallback or "?")
-
-
-def _base_v3_discover_onchain_factory_pools(
-    token_a: str,
-    token_b: str,
-    sym_by_addr: dict[str, str],
-    max_results: int,
-) -> list[dict]:
-    chain_id = 8453
-    a = str(token_a or "").strip().lower()
-    b = str(token_b or "").strip().lower()
-    if not (_is_eth_address(a) and _is_eth_address(b)) or a == b:
-        return []
-    factory = _base_v3_factory_address()
-    if not _is_eth_address(factory):
-        return []
-    out: list[dict] = []
-    seen: set[str] = set()
-    selector_get_pool = "0x1698ee82"  # getPool(address,address,uint24)
-    selector_token0 = "0x0dfe1681"
-    selector_token1 = "0xd21220a7"
-    selector_fee = "0xddca3f43"
-    for fee in _base_v3_fee_tiers():
-        data = (
-            selector_get_pool
-            + _abi_word_addr(a)
-            + _abi_word_addr(b)
-            + _abi_word_uint(int(fee))
-        )
-        try:
-            ret = _rpc_eth_call_hex(chain_id, factory, data, "latest", timeout_sec=7.0)
-            pool = _decode_addr_from_abi_word(ret)
-            if not _is_eth_address(pool):
-                continue
-            if int(pool, 16) == 0:
-                continue
-            if pool in seen:
-                continue
-            seen.add(pool)
-            t0 = _decode_addr_from_abi_word(_rpc_eth_call_hex(chain_id, pool, selector_token0, "latest", timeout_sec=6.0))
-            t1 = _decode_addr_from_abi_word(_rpc_eth_call_hex(chain_id, pool, selector_token1, "latest", timeout_sec=6.0))
-            if not (_is_eth_address(t0) and _is_eth_address(t1)):
-                continue
-            fee_raw_hex = _rpc_eth_call_hex(chain_id, pool, selector_fee, "latest", timeout_sec=6.0)
-            fee_raw = int(_decode_uint_hex(fee_raw_hex))
-            d0 = int(_erc20_decimals(chain_id, t0))
-            d1 = int(_erc20_decimals(chain_id, t1))
-            b0 = int(_balance_of_raw_latest(chain_id, t0, pool, timeout_sec=8.0))
-            b1 = int(_balance_of_raw_latest(chain_id, t1, pool, timeout_sec=8.0))
-            t0_sym = str(sym_by_addr.get(t0) or _erc20_symbol_best_effort(chain_id, t0, "?"))
-            t1_sym = str(sym_by_addr.get(t1) or _erc20_symbol_best_effort(chain_id, t1, "?"))
-            out.append(
-                {
-                    "id": pool,
-                    "feeTier": int(fee_raw if fee_raw > 0 else int(fee)),
-                    "token0": {"id": t0, "symbol": t0_sym, "decimals": str(d0), "name": ""},
-                    "token1": {"id": t1, "symbol": t1_sym, "decimals": str(d1), "name": ""},
-                    "totalValueLockedUSD": "0",
-                    "totalValueLockedToken0": str(float(b0) / float(10 ** max(0, d0))),
-                    "totalValueLockedToken1": str(float(b1) / float(10 ** max(0, d1))),
-                    "volumeUSD": "0",
-                    "feesUSD": "0",
-                    "_base_schema": "goldsky_v3_alt",
-                    "_base_discovery": "onchain_factory",
-                }
-            )
-            if int(max_results or 0) > 0 and len(out) >= int(max_results):
-                break
-        except Exception:
-            continue
-    return out
+def _is_timeout_error(err: Exception) -> bool:
+    msg = str(err or "").lower()
+    return ("read timed out" in msg) or ("timed out" in msg) or ("timeout" in msg)
 
 
 def _discover_base_v3_goldsky_pools(
@@ -1010,11 +783,10 @@ def _discover_base_v3_goldsky_pools(
     token_b = str(token_b or "").strip().lower()
     if not token_a or not token_b or token_a == token_b:
         return []
-    page_size = _base_goldsky_page_size()
     q_filtered = """
     query BasePools($skip: Int!) {
       liquidityPools(
-        first: %d,
+        first: 100,
         skip: $skip,
         orderBy: totalValueLockedUSD,
         orderDirection: desc,
@@ -1026,45 +798,33 @@ def _discover_base_v3_goldsky_pools(
         inputTokens { id symbol decimals }
       }
     }
-    """ % (page_size, token_a, token_b)
+    """ % (token_a, token_b)
     q_unfiltered = """
     query BasePools($skip: Int!) {
-      liquidityPools(first: %d, skip: $skip, orderBy: totalValueLockedUSD, orderDirection: desc) {
+      liquidityPools(first: 100, skip: $skip, orderBy: totalValueLockedUSD, orderDirection: desc) {
         id
         totalValueLockedUSD
         inputTokenBalances
         inputTokens { id symbol decimals }
       }
     }
-    """ % (page_size,)
-    use_filtered = _base_goldsky_use_filtered_query()
-    query_text = q_filtered if use_filtered else q_unfiltered
-    used_unfiltered = not use_filtered
+    """
+    query_text = q_filtered
+    used_unfiltered = False
     out: list[dict] = []
     skip = 0
-    pages = 0
-    max_pages = _base_goldsky_scan_pages()
-    while pages < max_pages:
+    while True:
         try:
-            data = graphql_query(endpoint, query_text, {"skip": skip}, retries=_base_graphql_retries())
+            data = graphql_query(endpoint, query_text, {"skip": skip}, retries=1)
         except Exception as e:
-            msg = str(e).lower()
-            if (not used_unfiltered) and (("inputtokens_contains" in msg) or ("timed out" in msg) or ("timeout" in msg)):
+            if (not used_unfiltered) and "inputtokens_contains" in str(e).lower():
                 query_text = q_unfiltered
                 used_unfiltered = True
                 continue
-            # Do not drop already discovered pools because one later page timed out.
-            if out:
-                _warn_fallback_once(
-                    "base_v3_goldsky_paging_timeout_partial",
-                    "base v3 goldsky paging interrupted; returning partial discovery result",
-                )
-                break
             raise
         rows = data.get("data", {}).get("liquidityPools", []) or []
         if not rows:
             break
-        added_this_page = 0
         for r in rows:
             toks = r.get("inputTokens") or []
             if not isinstance(toks, list) or len(toks) < 2:
@@ -1099,16 +859,11 @@ def _discover_base_v3_goldsky_pools(
             }
             if p["id"]:
                 out.append(p)
-                added_this_page += 1
                 if int(max_results or 0) > 0 and len(out) >= int(max_results):
                     return out[: int(max_results)]
-        if out and added_this_page == 0:
-            # Rows are sorted by TVL desc; once matches stop appearing, deeper pages are unlikely useful.
+        if len(rows) < 100:
             break
-        if len(rows) < int(page_size):
-            break
-        skip += int(page_size)
-        pages += 1
+        skip += 100
     return out
 
 
@@ -1125,7 +880,6 @@ def _query_base_v3_goldsky_day_data(endpoint: str, pool_id: str, start_ts: int, 
         timestamp
         totalValueLockedUSD
         dailySupplySideRevenueUSD
-        dailyVolumeUSD
       }
     }
     """
@@ -1136,7 +890,7 @@ def _query_base_v3_goldsky_day_data(endpoint: str, pool_id: str, start_ts: int, 
             endpoint,
             q,
             {"pool": str(pool_id or "").strip().lower(), "start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
-            retries=_base_graphql_retries(),
+            retries=1,
         )
         rows = data.get("data", {}).get("liquidityPoolDailySnapshots", []) or []
         if not rows:
@@ -1148,186 +902,11 @@ def _query_base_v3_goldsky_day_data(endpoint: str, pool_id: str, start_ts: int, 
                     "date": ts,
                     "tvlUSD": float(r.get("totalValueLockedUSD") or 0.0),
                     "feesUSD": float(r.get("dailySupplySideRevenueUSD") or 0.0),
-                    "volumeUSD": float(r.get("dailyVolumeUSD") or 0.0),
                 }
             )
         if len(rows) < 100:
             break
         skip += 100
-    return out
-
-
-def _query_pool_swaps_daily_fees_v3(
-    endpoint: str,
-    pool_id: str,
-    start_ts: int,
-    end_ts: int,
-    fee_tier_ppm: int,
-) -> list[tuple[int, float]]:
-    """
-    Fallback daily fees from swaps when poolDayData/snapshots are empty or zeroed.
-    """
-    try:
-        ft = int(fee_tier_ppm or 0)
-    except Exception:
-        ft = 0
-    if ft <= 0:
-        return []
-    fee_frac = float(ft) / 1_000_000.0
-    q = """
-    query PoolSwaps($pool: String!, $start: Int!, $end: Int!, $skip: Int!) {
-      swaps(
-        first: 1000,
-        skip: $skip,
-        orderBy: timestamp,
-        orderDirection: asc,
-        where: { pool: $pool, timestamp_gte: $start, timestamp_lte: $end }
-      ) {
-        timestamp
-        amountUSD
-      }
-    }
-    """
-    by_day_usd: dict[int, float] = defaultdict(float)
-    skip = 0
-    pages = 0
-    max_pages = _v3_swaps_fallback_max_pages()
-    while pages < max_pages:
-        data = graphql_query(
-            endpoint,
-            q,
-            {"pool": str(pool_id or "").strip().lower(), "start": int(start_ts), "end": int(end_ts), "skip": int(skip)},
-            retries=1,
-        )
-        rows = (data.get("data") or {}).get("swaps") or []
-        if not rows:
-            break
-        for r in rows:
-            try:
-                ts = int(float(r.get("timestamp") or 0))
-                amt = abs(float(r.get("amountUSD") or 0.0))
-            except Exception:
-                continue
-            if ts <= 0 or amt <= 0:
-                continue
-            day_ts = int((ts // 86400) * 86400)
-            by_day_usd[day_ts] += float(amt) * fee_frac
-        if len(rows) < 1000:
-            break
-        skip += 1000
-        pages += 1
-    if not by_day_usd:
-        return []
-    out = [(int(ts), float(v)) for ts, v in sorted(by_day_usd.items(), key=lambda x: int(x[0]))]
-    return out
-
-
-def _decode_int256_word(word_hex: str) -> int:
-    h = str(word_hex or "").strip().lower().replace("0x", "")
-    if len(h) < 64:
-        h = h.rjust(64, "0")
-    h = h[-64:]
-    v = int(h, 16)
-    if v >= (1 << 255):
-        v -= (1 << 256)
-    return int(v)
-
-
-def _query_pool_onchain_daily_fees_v3(
-    *,
-    chain: str,
-    pool_id: str,
-    token0: str,
-    token1: str,
-    dec0: int,
-    dec1: int,
-    start_ts: int,
-    end_ts: int,
-    fee_tier_ppm: int,
-) -> list[tuple[int, float]]:
-    """
-    Exact fallback from on-chain Swap events when subgraph day-data is zero/missing.
-    """
-    ck = str(chain or "").strip().lower()
-    chain_id = int(CHAIN_ID_BY_KEY.get(ck, 0) or 0)
-    if chain_id <= 0:
-        return []
-    if not (_is_eth_address(pool_id) and _is_eth_address(token0) and _is_eth_address(token1)):
-        return []
-    try:
-        ft = int(fee_tier_ppm or 0)
-    except Exception:
-        ft = 0
-    if ft <= 0:
-        return []
-    fee_frac = float(ft) / 1_000_000.0
-    topic_swap = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
-    out: list[tuple[int, float]] = []
-    chunk_blocks = _v3_onchain_swaps_chunk_blocks()
-    for day_ts in range(int(start_ts), int(end_ts) + 1, 86400):
-        try:
-            b0 = int(_llama_block_for_day(ck, int(day_ts)))
-            b1 = int(_llama_block_for_day(ck, int(day_ts + 86399)))
-        except Exception:
-            out.append((int(day_ts), 0.0))
-            continue
-        if b1 < b0:
-            b0, b1 = b1, b0
-        try:
-            p0 = float(_historical_price_usd(ck, token0, int(day_ts), int(start_ts), int(end_ts)))
-        except Exception:
-            p0 = 0.0
-        try:
-            p1 = float(_historical_price_usd(ck, token1, int(day_ts), int(start_ts), int(end_ts)))
-        except Exception:
-            p1 = 0.0
-        day_volume_usd = 0.0
-        cur = int(b0)
-        while cur <= int(b1):
-            hi = min(int(b1), int(cur + chunk_blocks - 1))
-            try:
-                logs = (_rpc_json(
-                    chain_id,
-                    "eth_getLogs",
-                    [{
-                        "address": str(pool_id).strip().lower(),
-                        "fromBlock": hex(int(cur)),
-                        "toBlock": hex(int(hi)),
-                        "topics": [topic_swap],
-                    }],
-                    timeout_sec=12.0,
-                ).get("result") or [])
-            except Exception as e:
-                msg = str(e).lower()
-                if ("range" in msg or "block range" in msg) and int(hi) > int(cur):
-                    # Provider block-range cap: halve and retry.
-                    mid = int((cur + hi) // 2)
-                    if mid <= cur:
-                        cur = hi + 1
-                    else:
-                        hi = mid
-                    continue
-                cur = hi + 1
-                continue
-            for lg in logs:
-                data_hex = str(lg.get("data") or "").strip().lower().replace("0x", "")
-                if len(data_hex) < 128:
-                    continue
-                try:
-                    a0_raw = abs(_decode_int256_word(data_hex[0:64]))
-                    a1_raw = abs(_decode_int256_word(data_hex[64:128]))
-                except Exception:
-                    continue
-                a0 = float(a0_raw) / float(10 ** max(0, int(dec0)))
-                a1 = float(a1_raw) / float(10 ** max(0, int(dec1)))
-                u0 = float(a0 * p0) if p0 > 0 else 0.0
-                u1 = float(a1 * p1) if p1 > 0 else 0.0
-                if u0 > 0 and u1 > 0:
-                    day_volume_usd += max(u0, u1)
-                else:
-                    day_volume_usd += max(u0, u1, 0.0)
-            cur = hi + 1
-        out.append((int(day_ts), max(0.0, float(day_volume_usd) * fee_frac)))
     return out
 
 
@@ -1375,9 +954,6 @@ def _query_base_v3_pools_light(
         totalValueLockedUSD
         totalValueLockedToken0
         totalValueLockedToken1
-        volumeUSD
-        feesUSD
-        txCount
       }
       pools1: pools(
         first: 100,
@@ -1393,9 +969,6 @@ def _query_base_v3_pools_light(
         totalValueLockedUSD
         totalValueLockedToken0
         totalValueLockedToken1
-        volumeUSD
-        feesUSD
-        txCount
       }
     }
     """ % (a, b, b, a)
@@ -1427,7 +1000,7 @@ def _query_base_v3_pools_light(
     skip = 0
     try:
         while True:
-            data = graphql_query(endpoint, q, {"skip": int(skip)}, retries=_base_graphql_retries())
+            data = graphql_query(endpoint, q, {"skip": int(skip)}, retries=1)
             d = data.get("data", {}) or {}
             p0 = d.get("pools0", []) or []
             p1 = d.get("pools1", []) or []
@@ -1447,7 +1020,7 @@ def _query_base_v3_pools_light(
     max_scan_pages = max(1, _env_int("V3_BASE_LIGHT_SCAN_PAGES", 3))
     pages = 0
     while pages < max_scan_pages:
-        data = graphql_query(endpoint, q_unfiltered, {"skip": int(skip)}, retries=_base_graphql_retries())
+        data = graphql_query(endpoint, q_unfiltered, {"skip": int(skip)}, retries=1)
         rows = (data.get("data", {}) or {}).get("pools", []) or []
         if not rows:
             break
@@ -1497,29 +1070,14 @@ def discover_pools_v3(
             and _base_v3_goldsky_endpoint()
         )
         endpoint = _base_v3_goldsky_endpoint() if use_base_goldsky else get_graph_endpoint(chain, "v3")
-        # If endpoint resolver returns Goldsky (e.g. missing/invalid Graph key),
-        # force Goldsky schema path even when isolated pipeline flag is off.
-        if chain == "base" and _is_goldsky_public_endpoint(endpoint):
-            use_base_goldsky = True
         if not endpoint:
             return out_chain
-        symbol_lookup_endpoints: list[str] = [str(endpoint or "").strip()]
-        if chain == "base" and use_base_goldsky:
-            # For symbol->address resolution, Goldsky can be sparse/slow for token lookup.
-            # Add The Graph Base endpoint as secondary resolver when available.
-            graph_ep = get_graph_endpoint("base", "v3")
-            if graph_ep and graph_ep not in symbol_lookup_endpoints:
-                symbol_lookup_endpoints.append(graph_ep)
         check_enabled = str(os.environ.get("V3_ENDPOINT_HEALTHCHECK", "1")).strip().lower() in {"1", "true", "yes", "on"}
-        if check_enabled and _skip_healthcheck_for_endpoint(endpoint):
-            check_enabled = False
+        health_ok = True
         if check_enabled:
-            health_ok, health_detail = _quick_graphql_healthcheck(endpoint)
-        else:
-            health_ok, health_detail = True, ""
+            health_ok = _quick_graphql_healthcheck(endpoint)
         if check_enabled and not health_ok:
-            detail = f": {health_detail}" if health_detail else ""
-            print(f"  [{chain}] v3: skip (endpoint healthcheck failed{detail})")
+            print(f"  [{chain}] v3: skip (endpoint healthcheck failed)")
             return out_chain
 
         def _resolve_with_cache(sym: str) -> list[str]:
@@ -1529,16 +1087,12 @@ def discover_pools_v3(
                     out.extend(get_token_addresses(c, sym, dynamic_tokens))
             out = list(dict.fromkeys(out))[:1]
             if not out:
-                for ep in symbol_lookup_endpoints:
-                    if not ep:
-                        continue
-                    addr = query_token_by_symbol(ep, sym)
-                    if addr:
-                        with dyn_lock:
-                            save_dynamic_token(chain, sym, addr)
-                            dynamic_tokens.setdefault(chain, {})[sym.lower()] = addr
-                        out = [addr]
-                        break
+                addr = query_token_by_symbol(endpoint, sym)
+                if addr:
+                    with dyn_lock:
+                        save_dynamic_token(chain, sym, addr)
+                        dynamic_tokens.setdefault(chain, {})[sym.lower()] = addr
+                    out = [addr]
             return out
 
         for base, quote in pairs:
@@ -1563,25 +1117,46 @@ def discover_pools_v3(
                 continue
             try:
                 if use_base_goldsky:
-                    sym_by_addr = {
-                        str(base_addrs[0]).strip().lower(): str(base or "").strip().upper(),
-                        str(quote_addrs[0]).strip().lower(): str(quote or "").strip().upper(),
-                    }
                     pools = []
-                    if _base_v3_onchain_discovery_enabled():
-                        pools = _base_v3_discover_onchain_factory_pools(
-                            base_addrs[0],
-                            quote_addrs[0],
-                            sym_by_addr=sym_by_addr,
-                            max_results=int(discovery_cap),
-                        )
-                    if not pools:
+                    try:
                         pools = _discover_base_v3_goldsky_pools(
                             endpoint,
                             base_addrs[0],
                             quote_addrs[0],
                             max_results=int(discovery_cap),
                         )
+                    except Exception as ge:
+                        # Goldsky Base v3 can time out intermittently; fallback to The Graph endpoint when available.
+                        if _is_timeout_error(ge):
+                            graph_ep = get_graph_endpoint("base", "v3")
+                            if graph_ep and graph_ep != endpoint:
+                                try:
+                                    fb_read_timeout = max(3.0, float(os.environ.get("V3_BASE_FALLBACK_READ_TIMEOUT_SEC", "6")))
+                                except Exception:
+                                    fb_read_timeout = 6.0
+                                print("  [base] v3 fallback: goldsky timeout; trying thegraph endpoint")
+                                _warn_fallback_once(
+                                    "base_v3_goldsky_to_thegraph",
+                                    "base v3 discovery source fallback: goldsky timeout -> thegraph endpoint",
+                                )
+                                prev_read_timeout = os.environ.get("GRAPHQL_READ_TIMEOUT_SEC")
+                                try:
+                                    os.environ["GRAPHQL_READ_TIMEOUT_SEC"] = str(fb_read_timeout)
+                                    pools = _query_base_v3_pools_light(
+                                        graph_ep,
+                                        base_addrs[0],
+                                        quote_addrs[0],
+                                        max_results=int(discovery_cap),
+                                    )
+                                finally:
+                                    if prev_read_timeout is None:
+                                        os.environ.pop("GRAPHQL_READ_TIMEOUT_SEC", None)
+                                    else:
+                                        os.environ["GRAPHQL_READ_TIMEOUT_SEC"] = prev_read_timeout
+                            else:
+                                raise
+                        else:
+                            raise
                 else:
                     if chain == "base":
                         # For Base on The Graph route use lightweight query shape first.
@@ -1665,30 +1240,11 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
         day_data = _query_base_v3_goldsky_day_data(endpoint, pool["id"], start_ts, end_ts)
     else:
         day_data = query_pool_day_data(endpoint, pool["id"], start_ts, end_ts)
-    def _clip_window(rows: list[dict]) -> list[dict]:
-        out_rows: list[dict] = []
-        for d in (rows or []):
-            try:
-                ts = int(d.get("date") or d.get("timestamp") or 0)
-            except Exception:
-                ts = 0
-            if ts <= 0:
-                continue
-            if int(start_ts) <= ts <= int(end_ts + 86399):
-                out_rows.append(dict(d))
-        out_rows.sort(key=lambda x: int(x.get("date") or x.get("timestamp") or 0))
-        return out_rows
-
-    day_data = _clip_window(day_data)
     fees_usd_series = []
-    fees_source = "day_data"
     raw_tvl_series = []
-    try:
-        fee_tier_ppm = int(pool.get("feeTier") or 0)
-    except (TypeError, ValueError):
-        fee_tier_ppm = 0
     for d in day_data:
-        fees = poolday_lp_fees_usd_exact(d, fee_tier_ppm)
+        fees = float(d.get("feesUSD") or 0)
+        # feesUSD=0: do not estimate from volume; subgraph volume can be unreliable
         if fees <= 0:
             fees = 0.0
         ts = int(d["date"])
@@ -1698,76 +1254,7 @@ def compute_fee_and_tvl_series(pool: dict, endpoint: str) -> dict:
         except Exception:
             raw_tvl = 0.0
         raw_tvl_series.append((ts, max(0.0, raw_tvl)))
-    # Base-specific root issue: Goldsky may return zeroed daily fee/volume for valid pools.
-    # If so, recover day data from The Graph endpoint when a real API key is available.
-    fees_sum = sum(float(x[1] or 0.0) for x in fees_usd_series) if fees_usd_series else 0.0
-    is_base_goldsky = (
-        str(pool.get("chain") or "").strip().lower() == "base"
-        and str(pool.get("_base_schema") or "").strip() == "goldsky_v3_alt"
-    )
-    if is_base_goldsky and (not fees_usd_series or fees_sum <= 0.0):
-        graph_ep = str(get_graph_endpoint("base", "v3") or "").strip()
-        if graph_ep and (not _is_goldsky_public_endpoint(graph_ep)):
-            try:
-                graph_days = _clip_window(query_pool_day_data(graph_ep, pool["id"], start_ts, end_ts))
-                graph_fees: list[tuple[int, float]] = []
-                graph_tvl: list[tuple[int, float]] = []
-                for d in graph_days:
-                    ts = int(d["date"])
-                    fees = max(0.0, float(poolday_lp_fees_usd_exact(d, fee_tier_ppm)))
-                    graph_fees.append((ts, fees))
-                    try:
-                        graph_tvl.append((ts, max(0.0, float(d.get("tvlUSD") or 0.0))))
-                    except Exception:
-                        graph_tvl.append((ts, 0.0))
-                if graph_fees and sum(v for _, v in graph_fees) > 0.0:
-                    fees_usd_series = graph_fees
-                    if graph_tvl and len(graph_tvl) == len(graph_fees):
-                        raw_tvl_series = graph_tvl
-                    fees_source = "base_graph_daydata"
-            except Exception:
-                pass
-    # If day snapshots have no usable fees, reconstruct from swaps.
-    fees_sum = sum(float(x[1] or 0.0) for x in fees_usd_series) if fees_usd_series else 0.0
-    if _v3_swaps_fallback_enabled() and (not fees_usd_series or fees_sum <= 0.0):
-        try:
-            swaps_daily_fees = _query_pool_swaps_daily_fees_v3(
-                endpoint=endpoint,
-                pool_id=str(pool.get("id") or ""),
-                start_ts=int(start_ts),
-                end_ts=int(end_ts + 86399),
-                fee_tier_ppm=int(fee_tier_ppm),
-            )
-            if swaps_daily_fees:
-                fees_usd_series = swaps_daily_fees
-                fees_source = "swaps_fallback"
-        except Exception:
-            pass
-    # Last-resort exact path: recover fees from on-chain Swap logs by day.
-    fees_sum = sum(float(x[1] or 0.0) for x in fees_usd_series) if fees_usd_series else 0.0
-    if _v3_onchain_swaps_fallback_enabled() and (not fees_usd_series or fees_sum <= 0.0):
-        try:
-            t0 = str(((pool.get("token0") or {}).get("id") or "")).strip().lower()
-            t1 = str(((pool.get("token1") or {}).get("id") or "")).strip().lower()
-            d0 = int(((pool.get("token0") or {}).get("decimals") or 18))
-            d1 = int(((pool.get("token1") or {}).get("decimals") or 18))
-            onchain_daily_fees = _query_pool_onchain_daily_fees_v3(
-                chain=str(pool.get("chain") or ""),
-                pool_id=str(pool.get("id") or ""),
-                token0=t0,
-                token1=t1,
-                dec0=int(d0),
-                dec1=int(d1),
-                start_ts=int(start_ts),
-                end_ts=int(end_ts),
-                fee_tier_ppm=int(fee_tier_ppm),
-            )
-            if onchain_daily_fees and sum(float(v or 0.0) for _, v in onchain_daily_fees) > 0.0:
-                fees_usd_series = onchain_daily_fees
-                fees_source = "onchain_swaps_fallback"
-        except Exception:
-            pass
-    return {"_fees_usd": fees_usd_series, "_raw_tvl_usd": raw_tvl_series, "_fees_source": fees_source}
+    return {"_fees_usd": fees_usd_series, "_raw_tvl_usd": raw_tvl_series}
 
 
 def _build_exact_tvl_series_v3(
@@ -1964,6 +1451,11 @@ def main() -> None:
     print("Discovering v3 pools...")
     fresh = "TOKEN_PAIRS" in os.environ
     pools = discover_pools_v3(token_pairs, args.min_tvl, fresh_token_lookup=fresh)
+    target_pool = _target_pool_id()
+    strict_target_run = bool(target_pool and V3_EXACT_TVL_STRICT_MODE)
+    if target_pool:
+        pools = [p for p in pools if str((p or {}).get("id") or "").strip().lower() == target_pool]
+        print(f"Target pool filter enabled: {target_pool} | matched {len(pools)}")
     max_per_pair_chain = max(0, _env_int("MAX_POOLS_PER_PAIR_CHAIN", 40))
     max_total = max(0, _env_int("MAX_POOLS_TOTAL", 300))
     pools = _cap_pools(pools, max_per_pair_chain=max_per_pair_chain, max_total=max_total)
@@ -2011,10 +1503,11 @@ def main() -> None:
         tvl_quality_reason = "default_scaled"
         estimated_tvl_compare: list[tuple[int, float]] = []
         estimated_fees_compare: list[tuple[int, float]] = []
+        exact_tvl_compare: list[tuple[int, float]] = []
+        exact_fees_compare: list[tuple[int, float]] = []
         try:
             fees_usd = data.get("_fees_usd") or []
             raw_tvl = data.get("_raw_tvl_usd") or []
-            fees_source = str(data.get("_fees_source") or "day_data")
             if fees_usd and pool_tvl_now_usd > 0:
                 tvl_series = [(int(ts), float(pool_tvl_now_usd)) for ts, _ in fees_usd]
                 if raw_tvl and len(raw_tvl) == len(fees_usd):
@@ -2045,21 +1538,28 @@ def main() -> None:
                         estimated_cumul += float(fees_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day_est))
                     estimated_fees_compare.append((int(ts), float(estimated_cumul)))
                 exact_used = False
+                strict_hard_fail = False
                 if V3_EXACT_TVL_ENABLE and str(chain).strip().lower() in V3_EXACT_TVL_CHAINS and fees_usd:
                     chain_id = int(CHAIN_ID_BY_KEY.get(str(chain).strip().lower(), 0) or 0)
                     rpc_ready = bool(chain_id > 0 and _rpc_urls(chain_id))
                     if not rpc_ready:
-                        tvl_quality_reason = "exact_skipped:no_rpc_urls"
+                        if strict_target_run:
+                            tvl_quality = "strict_unavailable"
+                            tvl_quality_reason = "strict_required:no_rpc_urls"
+                            strict_hard_fail = True
+                        else:
+                            tvl_quality_reason = "exact_skipped:no_rpc_urls"
                     else:
-                        take_slot = False
+                        take_slot = bool(strict_target_run)
                         slot_reserved = False
-                        with exact_slots_lock:
-                            if exact_slots_left > 0:
-                                exact_slots_left -= 1
-                                take_slot = True
-                                slot_reserved = True
+                        if not strict_target_run:
+                            with exact_slots_lock:
+                                if exact_slots_left > 0:
+                                    exact_slots_left -= 1
+                                    take_slot = True
+                                    slot_reserved = True
                         if take_slot:
-                            exact_days = max(1, int(V3_EXACT_TVL_DAYS_MAX))
+                            exact_days = len(fees_usd) if strict_target_run else max(1, int(V3_EXACT_TVL_DAYS_MAX))
                             fees_exact = fees_usd[-min(len(fees_usd), exact_days):]
                             day_start_ts = int((int(fees_exact[0][0]) // 86400) * 86400)
                             day_end_ts = int((int(fees_exact[-1][0]) // 86400) * 86400)
@@ -2073,58 +1573,92 @@ def main() -> None:
                                 budget_sec=float(V3_EXACT_TVL_POOL_BUDGET_SEC),
                             )
                             if exact_series and len(exact_series) == len(fees_exact):
-                                merged_exact = list(tvl_series)
-                                exact_points = 0
-                                exact_start = len(fees_usd) - len(fees_exact)
-                                for i, (ts, ex_v) in enumerate(exact_series):
-                                    tvl_idx = exact_start + i
-                                    if float(ex_v) > 0:
-                                        exact_points += 1
-                                        merged_exact[tvl_idx] = (int(ts), float(ex_v))
+                                if strict_target_run:
+                                    exact_points = len([1 for _ts, ex_v in exact_series if float(ex_v) > 0.0])
+                                    coverage = float(exact_points) / float(max(1, len(exact_series)))
+                                    if exact_points == len(exact_series):
+                                        tvl_series = list(exact_series)
+                                        exact_used = True
+                                        exact_tvl_compare = list(exact_series)
+                                        exact_cumul = 0.0
+                                        for i, (ts, fees_day) in enumerate(fees_usd):
+                                            tvl_day_ex = float(exact_tvl_compare[i][1] or 0.0) if i < len(exact_tvl_compare) else float(pool_tvl_now_usd)
+                                            if float(fees_day) > 0:
+                                                exact_cumul += float(fees_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day_ex))
+                                            exact_fees_compare.append((int(ts), float(exact_cumul)))
+                                        tvl_quality = "exact"
+                                        tvl_quality_reason = "ok"
                                     else:
-                                        merged_exact[tvl_idx] = (
-                                            int(ts),
-                                            float(tvl_series[tvl_idx][1] if tvl_idx < len(tvl_series) else pool_tvl_now_usd),
-                                        )
-                                coverage = float(exact_points) / float(max(1, len(exact_series)))
-                                tvl_series = merged_exact
-                                exact_used = True
-                                full_window = len(fees_exact) == len(fees_usd)
-                                full_exact_mode = not str(exact_reason).startswith("sparse_")
-                                if full_exact_mode and full_window and coverage >= float(V3_EXACT_TVL_MIN_COVERAGE_EXACT) and exact_points == len(exact_series):
-                                    tvl_quality = "exact"
-                                    tvl_quality_reason = "ok"
+                                        tvl_quality = "strict_unavailable"
+                                        tvl_quality_reason = f"strict_required:non_positive_days:{coverage:.2f}"
+                                        strict_hard_fail = True
                                 else:
-                                    tvl_quality = "exact_partial"
-                                    tvl_quality_reason = f"{exact_reason}:{coverage:.2f}"
+                                    merged_exact = list(tvl_series)
+                                    exact_points = 0
+                                    exact_start = len(fees_usd) - len(fees_exact)
+                                    for i, (ts, ex_v) in enumerate(exact_series):
+                                        tvl_idx = exact_start + i
+                                        if float(ex_v) > 0:
+                                            exact_points += 1
+                                            merged_exact[tvl_idx] = (int(ts), float(ex_v))
+                                        else:
+                                            merged_exact[tvl_idx] = (
+                                                int(ts),
+                                                float(tvl_series[tvl_idx][1] if tvl_idx < len(tvl_series) else pool_tvl_now_usd),
+                                            )
+                                    coverage = float(exact_points) / float(max(1, len(exact_series)))
+                                    tvl_series = merged_exact
+                                    exact_used = True
+                                    exact_tvl_compare = list(merged_exact)
+                                    exact_cumul = 0.0
+                                    for i, (ts, fees_day) in enumerate(fees_usd):
+                                        tvl_day_ex = float(exact_tvl_compare[i][1] or 0.0) if i < len(exact_tvl_compare) else float(pool_tvl_now_usd)
+                                        if float(fees_day) > 0:
+                                            exact_cumul += float(fees_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day_ex))
+                                        exact_fees_compare.append((int(ts), float(exact_cumul)))
+                                    full_window = len(fees_exact) == len(fees_usd)
+                                    full_exact_mode = not str(exact_reason).startswith("sparse_")
+                                    if full_exact_mode and full_window and coverage >= float(V3_EXACT_TVL_MIN_COVERAGE_EXACT) and exact_points == len(exact_series):
+                                        tvl_quality = "exact"
+                                        tvl_quality_reason = "ok"
+                                    else:
+                                        tvl_quality = "exact_partial"
+                                        tvl_quality_reason = f"{exact_reason}:{coverage:.2f}"
                             else:
-                                tvl_quality_reason = f"exact_failed:{exact_reason}:{exact_cov:.2f}"
+                                if strict_target_run:
+                                    tvl_quality = "strict_unavailable"
+                                    tvl_quality_reason = f"strict_required:{exact_reason}:{exact_cov:.2f}"
+                                    strict_hard_fail = True
+                                else:
+                                    tvl_quality_reason = f"exact_failed:{exact_reason}:{exact_cov:.2f}"
                             # Return exact slot when no exact data was produced for this pool.
                             if slot_reserved and not exact_used:
                                 with exact_slots_lock:
                                     exact_slots_left += 1
                         else:
-                            tvl_quality_reason = "exact_skipped:no_slots"
-                data["tvl"] = tvl_series
-                cumul = 0.0
-                fees_rebuilt = []
-                for i, (ts, fees_day) in enumerate(fees_usd):
-                    tvl_day = float(data["tvl"][i][1] or 0.0) if i < len(data["tvl"]) else float(pool_tvl_now_usd)
-                    if float(fees_day) > 0:
-                        cumul += float(fees_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day))
-                    fees_rebuilt.append((ts, cumul))
-                data["fees"] = fees_rebuilt
-                if fees_source == "swaps_fallback" and tvl_quality_reason == "default_scaled":
-                    tvl_quality_reason = "fees_from_swaps_fallback"
-                elif fees_source == "base_graph_daydata" and tvl_quality_reason == "default_scaled":
-                    tvl_quality_reason = "fees_from_base_graph_daydata"
-                elif fees_source == "onchain_swaps_fallback" and tvl_quality_reason == "default_scaled":
-                    tvl_quality_reason = "fees_from_onchain_swaps"
+                            if strict_target_run:
+                                tvl_quality = "strict_unavailable"
+                                tvl_quality_reason = "strict_required:no_slots_disabled"
+                                strict_hard_fail = True
+                            else:
+                                tvl_quality_reason = "exact_skipped:no_slots"
+                if strict_hard_fail:
+                    data["tvl"] = []
+                    data["fees"] = []
+                else:
+                    data["tvl"] = tvl_series
+                    cumul = 0.0
+                    fees_rebuilt = []
+                    for i, (ts, fees_day) in enumerate(fees_usd):
+                        tvl_day = float(data["tvl"][i][1] or 0.0) if i < len(data["tvl"]) else float(pool_tvl_now_usd)
+                        if float(fees_day) > 0:
+                            cumul += float(fees_day) * (LP_ALLOCATION_USD / max(1e-12, tvl_day))
+                        fees_rebuilt.append((ts, cumul))
+                    data["fees"] = fees_rebuilt
         except Exception:
             pass
         data.pop("_fees_usd", None)
         data.pop("_raw_tvl_usd", None)
-        data.pop("_fees_source", None)
         try:
             raw_pool_tvl = float(pool.get("totalValueLockedUSD") or 0.0)
         except Exception:
@@ -2144,8 +1678,11 @@ def main() -> None:
             "data_quality": tvl_quality,
             "data_quality_reason": tvl_quality_reason,
         }
-        payload["strict_compare_estimated_tvl"] = estimated_tvl_compare
-        payload["strict_compare_estimated_fees"] = estimated_fees_compare
+        if strict_target_run:
+            payload["strict_compare_estimated_tvl"] = estimated_tvl_compare
+            payload["strict_compare_estimated_fees"] = estimated_fees_compare
+            payload["strict_compare_exact_tvl"] = exact_tvl_compare
+            payload["strict_compare_exact_fees"] = exact_fees_compare
         msg = f"  [{idx+1}/{len(pools)}] {chain} {pair}: {len(data.get('fees') or [])} days"
         if V3_EXACT_TVL_DEBUG:
             msg += f" | quality={tvl_quality} reason={tvl_quality_reason}"
