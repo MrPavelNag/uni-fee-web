@@ -1,6 +1,6 @@
 {
   "schema_version": 19,
-  "updated_at": "2026-04-08T13:33:52Z",
+  "updated_at": "2026-04-22T05:01:08Z",
   "source": "manual_only_catalog+manual_fiat_override+manual_nonusd_override+manual_algo_override+manual_coins_override+manual_meme_override",
   "stablecoins": [
     "usdt",

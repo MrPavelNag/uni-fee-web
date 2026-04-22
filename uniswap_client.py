@@ -373,7 +373,26 @@ def query_pool_day_data(
     endpoint: str, pool_id: str, start_ts: int, end_ts: int
 ) -> list[dict]:
     """Fetch PoolDayData for a pool for the given date range (date = unix/86400)."""
-    query = """
+    query_with_untracked = """
+    query PoolDayData($pool: String!, $start: Int!, $end: Int!, $skip: Int!) {
+      poolDayDatas(
+        first: 100,
+        skip: $skip,
+        orderBy: date,
+        orderDirection: asc,
+        where: { pool: $pool, date_gte: $start, date_lte: $end }
+      ) {
+        id
+        date
+        tvlUSD
+        volumeUSD
+        untrackedVolumeUSD
+        feesUSD
+        liquidity
+      }
+    }
+    """
+    query_basic = """
     query PoolDayData($pool: String!, $start: Int!, $end: Int!, $skip: Int!) {
       poolDayDatas(
         first: 100,
@@ -396,14 +415,27 @@ def query_pool_day_data(
         cached = _POOL_DAY_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    query = query_with_untracked
+    use_basic = False
     all_data = []
     skip = 0
     while True:
-        data = graphql_query(
-            endpoint,
-            query,
-            {"pool": pool_id, "start": start_ts, "end": end_ts, "skip": skip},
-        )
+        try:
+            data = graphql_query(
+                endpoint,
+                query,
+                {"pool": pool_id, "start": start_ts, "end": end_ts, "skip": skip},
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if (not use_basic) and ("untrackedvolumeusd" in msg) and ("cannot query field" in msg):
+                # Some indexers/schemas may not expose untrackedVolumeUSD.
+                use_basic = True
+                query = query_basic
+                skip = 0
+                all_data = []
+                continue
+            raise
         items = data.get("data", {}).get("poolDayDatas", [])
         if not items:
             break

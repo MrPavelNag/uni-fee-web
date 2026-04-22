@@ -2,11 +2,12 @@
 
 Агент для поиска пар Uniswap v3/v4, фильтрации по TVL и расчёта накопленных комиссий LP.
 
-## Архитектура: 3 агента
+## Архитектура: 4 агента
 
 - **Agent 1 (agent_v3.py)** — базовая версия, только v3. Ищет пулы, сохраняет `data/pools_v3_{пары}.json`.
 - **Agent 2 (agent_v4.py)** — только v4 (The Graph, нужен API ключ). Сохраняет `data/pools_v4_{пары}.json`.
-- **Agent 3 (agent_merge.py)** — объединяет данные Agent 1 и Agent 2 на одном графике.
+- **Agent Smart (agent_smart.py)** — выбирает top пулов из v3+v4 по smart score, сохраняет `data/pools_smart_{пары}.json`.
+- **Agent 3 (agent_merge.py)** — объединяет данные Agent 1, Agent 2 и Agent Smart на одном графике.
 
 ### Запуск одной командой
 
@@ -17,7 +18,7 @@ python run_all.py fluid,eth --min-tvl 500
 python run_all.py "wbtc,usdt;wbtc,usdc" --min-tvl 500000   # несколько пар — в кавычках!
 ```
 
-Запускает по очереди: agent_v3 → agent_v4 → agent_merge.
+Запускает по очереди: agent_v3 → agent_v4 → agent_smart → agent_merge.
 
 **По каждому токену:** для каждого указанного токена запускается отдельный полный прогон (пары с usdt, usdc, eth) — свои PDF и графики на токен:
 
@@ -85,6 +86,7 @@ docker run -p 8000:8000 -e THE_GRAPH_API_KEY="ваш_ключ" uni-fee-web
 - быстрый ввод токенов списком (каждый токен автоматически парится с `usdt/usdc/eth`);
 - include chains (или пусто = все поддерживаемые);
 - `min TVL`, `days`, `exclude chains`, `exclude pool suffix`;
+- отдельная страница `GET /riko` для интерфейса RIKO Vault (deposit/mint/redeem + admin whitelist);
 - результат: таблица + 2 интерактивных графика (fees/tvl), без PDF.
 
 ## Deploy на Render

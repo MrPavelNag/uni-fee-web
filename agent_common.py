@@ -107,6 +107,10 @@ def poolday_lp_fees_usd_exact(day_row: dict, fee_tier_ppm: int) -> float:
     except (TypeError, ValueError):
         vol = 0.0
     try:
+        vol_untracked = float(day_row.get("untrackedVolumeUSD") or 0)
+    except (TypeError, ValueError):
+        vol_untracked = 0.0
+    try:
         fees_rep = float(day_row.get("feesUSD") or 0)
     except (TypeError, ValueError):
         fees_rep = 0.0
@@ -117,8 +121,11 @@ def poolday_lp_fees_usd_exact(day_row: dict, fee_tier_ppm: int) -> float:
     if ft <= 0:
         return max(0.0, fees_rep)
     tier_frac = float(ft) / 1_000_000.0
-    fees_from_vol = max(0.0, vol * tier_frac)
-    if vol <= 0:
+    # Root fix for v3 zero-fee rows: some indexers keep tracked volume at 0
+    # while exposing real notional in untrackedVolumeUSD.
+    effective_vol = vol if vol > 0 else max(0.0, vol_untracked)
+    fees_from_vol = max(0.0, effective_vol * tier_frac)
+    if effective_vol <= 0:
         return max(0.0, fees_rep)
     if fees_rep <= 0:
         return fees_from_vol

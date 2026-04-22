@@ -42,6 +42,7 @@ def main() -> None:
 
     v3_path = f"data/pools_v3_{suffix}.json"
     v4_path = f"data/pools_v4_{suffix}.json"
+    smart_path = f"data/pools_smart_{suffix}.json"
     chart_path = f"data/fee_chart_{suffix}.pdf"
     list_pdf_path = f"data/available_pairs_merged_{suffix}.pdf"
 
@@ -51,19 +52,25 @@ def main() -> None:
         print("  Missing:", v3_path, "→ run: TOKEN_PAIRS=\"%s\" python agent_v3.py" % token_pairs)
     if not os.path.isfile(v4_path):
         print("  Missing:", v4_path, "→ run: TOKEN_PAIRS=\"%s\" python agent_v4.py" % token_pairs)
+    if not os.path.isfile(smart_path):
+        print("  Missing:", smart_path, "→ optional: TOKEN_PAIRS=\"%s\" python agent_smart.py" % token_pairs)
 
     v3_data = load_chart_data_json(v3_path)
     v4_data = load_chart_data_json(v4_path)
+    smart_data = load_chart_data_json(smart_path)
 
     merged: dict[str, dict] = {}
     for k, v in v3_data.items():
         merged[k] = v
     for k, v in v4_data.items():
         merged[k] = v
+    for k, v in smart_data.items():
+        merged[k] = v
 
     n_v3 = len(v3_data)
     n_v4 = len(v4_data)
-    print(f"Merged: {n_v3} v3 pools + {n_v4} v4 pools = {len(merged)} total")
+    n_smart = len(smart_data)
+    print(f"Merged: {n_v3} v3 pools + {n_v4} v4 pools + {n_smart} smart pools = {len(merged)} total")
 
     # Filter only at chart render stage (JSON data remains complete)
     exclude = {c.strip().lower() for c in (args.exclude_chains or "").split(",") if c.strip()}

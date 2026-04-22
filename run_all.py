@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run all agents with one command: v3 -> v4 -> merge.
+Run all agents with one command: v3 -> v4 -> smart -> merge.
 
 Modes:
   1) Pair mode: python run_all.py "paxg,usdt;paxg,usdc"
@@ -18,7 +18,7 @@ DEFAULT_QUOTE_TOKENS = ["usdt", "usdc", "eth"]
 
 
 def run_pipeline(env: dict, args, token_pairs: str) -> int:
-    """Run v3 -> v4 -> merge for given TOKEN_PAIRS. Returns exit code."""
+    """Run v3 -> v4 -> smart -> merge for given TOKEN_PAIRS. Returns exit code."""
     env = env.copy()
     env["TOKEN_PAIRS"] = token_pairs
     print("TOKEN_PAIRS:", token_pairs)
@@ -32,6 +32,7 @@ def run_pipeline(env: dict, args, token_pairs: str) -> int:
     agents = [
         ("agent_v3.py", "Agent 1 (v3)", True),
         ("agent_v4.py", "Agent 2 (v4)", True),
+        ("agent_smart.py", "Agent Smart", True),
         ("agent_merge.py", "Agent 3 (merge)", False),
     ]
     for script, name, takes_min_tvl in agents:
@@ -53,7 +54,7 @@ def run_pipeline(env: dict, args, token_pairs: str) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run all agents: v3 → v4 → merge",
+        description="Run all agents: v3 → v4 → smart → merge",
         epilog=(
             "Examples:\n"
             "  python run_all.py uni,eth --min-tvl 500\n"
