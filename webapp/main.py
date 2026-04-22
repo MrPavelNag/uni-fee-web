@@ -23190,12 +23190,16 @@ def _render_riko_page() -> str:
     async function applyRikoGlobalCap() {
       try {
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
+        if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) {
+          throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        }
         const capInput = document.getElementById("rikoGlobalCapUsd");
         const capUsd = Number(String(capInput?.value || "").trim());
         if (!Number.isFinite(capUsd) || capUsd <= 0) throw new Error("Global cap must be > 0 USD.");
         const capUsd6 = BigInt(Math.round(capUsd * 1e6));
         const signer = await getRikoSigner();
-        const vault = new (await ensureEthers()).Contract(String(RIKO_VAULT_ADDRESS || "").trim(), RIKO_ABI, signer);
+        const vault = new (await ensureEthers()).Contract(contractAddress, RIKO_ABI, signer);
         setRikoAdminStatus(`Applying global cap $${capUsd.toLocaleString()} on-chain...`, false);
         const tx = await vault.setGlobalSupplyCapUsd6(capUsd6);
         setRikoAdminStatus("Global cap tx sent: " + tx.hash, false);
@@ -28769,6 +28773,10 @@ def _render_admin_page() -> str:
         <div class="row"><label>Analytics DB</label><div id="dbPath">-</div></div>
         <div class="row"><label>Tracked events</label><div id="eventsCount">-</div></div>
         <div class="row"><label>Token catalog</label><div id="tokenCatalogInfo">-</div></div>
+      </section>
+      <section class="card">
+        <h3>Pilot read-only</h3>
+        <div class="row"><label>Active RIKO whitelist</label><div id="adminRikoWhitelistIndicator">-</div></div>
         <button class="btn btn-soft" onclick="sendTelegramTestMessage()">Send Telegram test</button>
       </section>
     </div>
@@ -29335,11 +29343,39 @@ def _render_admin_page() -> str:
         renderPendingProtectAdminWallets(data.admin_wallets_pending_protect_updates || [], Number(data.admin_wallet_add_delay_sec || 0));
         renderPendingRemoveAdminWallets(data.admin_wallets_pending_removals || [], Number(data.admin_wallet_add_delay_sec || 0));
         renderManualPairListsSettings(data.pair_lists_manual || {{}});
+        await loadAdminRikoWhitelistIndicator();
         if (data.pilot_config_frozen) {{
           setAdminStatus("Pilot config is frozen (RIKO_PILOT_CONFIG_FROZEN=1). Admin updates are disabled by server.", false);
         }}
       }} catch (e) {{
         setAdminStatus("Load failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    function _quickHash32(text) {{
+      let h = 5381;
+      const s = String(text || "");
+      for (let i = 0; i < s.length; i++) {{
+        h = ((h << 5) + h) ^ s.charCodeAt(i);
+      }}
+      return (h >>> 0).toString(16).padStart(8, "0");
+    }}
+    async function loadAdminRikoWhitelistIndicator() {{
+      const el = document.getElementById("adminRikoWhitelistIndicator");
+      if (!el) return;
+      try {{
+        const r = await fetch("/api/riko/whitelist");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "failed");
+        const active = data.active || {{}};
+        const items = Array.isArray(active.items) ? active.items : [];
+        const canonical = items
+          .map((it) => `${{String(it?.symbol || "").toLowerCase()}}:${{String(it?.address || "").toLowerCase()}}`)
+          .sort()
+          .join("|");
+        const hash = _quickHash32(canonical);
+        el.textContent = `${{items.length}} symbols, snapshot #${{hash}}`;
+      }} catch (_) {{
+        el.textContent = "Unavailable";
       }}
     }}
     function formatUtcTs(ts) {{
