@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 import shutil
+import xml.etree.ElementTree as ET
 from bisect import bisect_right
 from queue import Empty, Queue
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, wait
@@ -246,6 +247,10 @@ AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 AUTH_LOCK = threading.Lock()
 RIKO_APPLY_SIGN_TTL_SEC = int(os.environ.get("RIKO_APPLY_SIGN_TTL_SEC", "600"))
 RIKO_APPLY_NONCES: dict[str, dict[str, Any]] = {}
+RIKO_VAULT_ADDRESS = os.environ.get("RIKO_VAULT_ADDRESS", "").strip()
+TREASURY_YIELD_CACHE_TTL_SEC = max(300, int(os.environ.get("TREASURY_YIELD_CACHE_TTL_SEC", "21600")))
+TREASURY_YIELD_CACHE: dict[str, Any] = {}
+TREASURY_YIELD_CACHE_LOCK = threading.Lock()
 ADMIN_WALLETS_DEFAULT = "0xD3155f6A7525F81595609E83789bbb95d91aaEdf"
 ADMIN_WALLET_ADDRESSES_ENV = os.environ.get("ADMIN_WALLET_ADDRESSES", ADMIN_WALLETS_DEFAULT)
 ADMIN_WALLETS_ENC_KEY = os.environ.get("ADMIN_WALLETS_ENC_KEY", "").strip()
@@ -20827,10 +20832,24 @@ def _riko_resolve_symbol_addresses(symbol: str) -> list[str]:
     if not _is_clean_symbol(sym):
         return []
     addrs: list[str] = []
+    # Ethereum fallbacks for major symbols that may be absent in TOKEN_ADDRESSES/token-catalog.
+    # Keep lowercase to match _is_eth_address checks.
+    eth_fallback: dict[str, str] = {
+        "link": "0x514910771af9ca656af840dff83e8264ecf986ca",
+        "bnb": "0xb8c77482e45f1f44de1745f52c74426c631bdd52",
+        "steth": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+        "wsteth": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+        "weeth": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",
+        "arb": "0xb50721bcf8d664c30412cfbc6cf7a15145234ad1",
+        "avax": "0x85f138bfee4ef8e540890cfb48f620571d67eda3",
+    }
     eth_cfg = TOKEN_ADDRESSES.get("ethereum", {}) if isinstance(TOKEN_ADDRESSES.get("ethereum"), dict) else {}
     direct = str(eth_cfg.get(sym) or "").strip().lower()
     if _is_eth_address(direct):
         addrs.append(direct)
+    fb = str(eth_fallback.get(sym) or "").strip().lower()
+    if _is_eth_address(fb) and fb not in addrs:
+        addrs.append(fb)
     tok_catalog = _load_token_catalog(refresh=False)
     by_chain = tok_catalog.get("by_chain") if isinstance(tok_catalog.get("by_chain"), dict) else {}
     eth_map = by_chain.get("ethereum") if isinstance(by_chain.get("ethereum"), dict) else {}
@@ -20903,6 +20922,65 @@ def _riko_apply_message(
         f"Pending Hash: {pending_hash}\n"
         f"Issued At: {issued_at}"
     )
+
+
+def _fetch_us_treasury_daily_10y() -> dict[str, Any]:
+    now_ts = float(time.time())
+    with TREASURY_YIELD_CACHE_LOCK:
+        cached = dict(TREASURY_YIELD_CACHE)
+    cached_at = float(cached.get("cached_at_ts") or 0)
+    if cached and cached_at > 0 and (now_ts - cached_at) < float(TREASURY_YIELD_CACHE_TTL_SEC):
+        return cached
+
+    year = datetime.now(timezone.utc).year
+    url = (
+        "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml"
+        f"?data=daily_treasury_yield_curve&field_tdr_date_value={int(year)}"
+    )
+    req = UrlRequest(url, method="GET", headers={"User-Agent": "uni_fee/1.0"})
+    with urlopen(req, timeout=18) as resp:
+        raw = resp.read()
+    root = ET.fromstring(raw)
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "d": "http://schemas.microsoft.com/ado/2007/08/dataservices",
+        "m": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
+    }
+    rows: list[tuple[str, float]] = []
+    for entry in root.findall("atom:entry", ns):
+        props = entry.find("atom:content/m:properties", ns)
+        if props is None:
+            continue
+        date_el = props.find("d:NEW_DATE", ns)
+        y10_el = props.find("d:BC_10YEAR", ns)
+        if date_el is None or y10_el is None:
+            continue
+        date_s = str(date_el.text or "").strip()
+        y10_s = str(y10_el.text or "").strip()
+        if not date_s or not y10_s:
+            continue
+        try:
+            y10 = float(y10_s)
+        except Exception:
+            continue
+        rows.append((date_s, y10))
+    if not rows:
+        raise RuntimeError("Treasury feed returned no usable 10Y points.")
+    rows.sort(key=lambda x: x[0])
+    latest_date, annual_pct = rows[-1]
+    daily_pct = float(annual_pct) / 365.0
+    out = {
+        "source": "US Treasury Daily Treasury Par Yield Curve Rates (10Y)",
+        "source_url": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
+        "date": latest_date.split("T")[0],
+        "annual_pct": round(float(annual_pct), 4),
+        "daily_pct": round(float(daily_pct), 6),
+        "cached_at_ts": now_ts,
+    }
+    with TREASURY_YIELD_CACHE_LOCK:
+        TREASURY_YIELD_CACHE.clear()
+        TREASURY_YIELD_CACHE.update(out)
+    return out
 
 
 def _riko_backfill_item_addresses(items: list[dict[str, str]]) -> tuple[list[dict[str, str]], bool]:
@@ -21009,7 +21087,6 @@ def _validate_riko_whitelist_items(items: list[dict[str, str]]) -> dict[str, Any
     for row in clean:
         s = str(row.get("symbol") or "").strip().lower()
         addr = str(row.get("address") or "").strip().lower()
-        symbols.append(s)
         addrs = _riko_resolve_symbol_addresses(s)
         effective_addr = addr if _is_eth_address(addr) else ""
         if not effective_addr:
@@ -21021,11 +21098,21 @@ def _validate_riko_whitelist_items(items: list[dict[str, str]]) -> dict[str, Any
                 else:
                     effective_addr = ""
             if not effective_addr:
-                errors.append(f"{s}: exact token address is missing or invalid.")
+                # If admin entered some address and it is invalid, keep this as an error.
+                if addr:
+                    errors.append(f"{s}: exact token address is missing or invalid.")
+                else:
+                    # For symbols with unknown Ethereum address, skip row instead of blocking apply.
+                    warnings.append(f"{s}: skipped, no known Ethereum address.")
+                symbol_addresses[s] = addrs
+                continue
         elif addrs and effective_addr not in addrs:
             warnings.append(f"{s}: address is not in catalog/config known addresses.")
         symbol_addresses[s] = [a for a in [effective_addr] if _is_eth_address(a)] or addrs
         normalized_items.append({"symbol": s, "address": effective_addr})
+        symbols.append(s)
+    if not normalized_items:
+        errors.append("No valid whitelist items with Ethereum addresses.")
     return {
         "valid": not errors,
         "items": normalized_items,
@@ -21636,7 +21723,7 @@ def _render_placeholder_page(
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
           {options_html}
         </select>
-        <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
+        <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect wallet</button>
       </div>
     </div>
     <div id="jsRuntimeBanner" class="js-runtime-banner"></div>
@@ -22048,8 +22135,29 @@ def _render_placeholder_page(
 
 
 def _render_riko_page() -> str:
+    yield_text = "На сегодня доходность составляет: недоступно"
+    try:
+        y = _fetch_us_treasury_daily_10y()
+        daily = float(y.get("daily_pct") or 0.0)
+        annual = float(y.get("annual_pct") or 0.0)
+        as_of = str(y.get("date") or "-")
+        yield_text = (
+            f"На сегодня доходность составляет: {daily:.4f}% в день "
+            f"(US Treasury 10Y: {annual:.2f}% годовых, {as_of})"
+        )
+    except Exception:
+        pass
     extra_css = """
     .riko-grid { display:grid; grid-template-columns: 1fr; gap: 14px; }
+    .riko-yield {
+      border: 1px solid #d7e1ef;
+      background: #f8fbff;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 15px;
+      font-weight: 700;
+      color: #0f172a;
+    }
     .riko-row { display:grid; grid-template-columns: 190px 1fr; gap: 10px; align-items: start; }
     .riko-row label { font-weight: 700; padding-top: 8px; }
     .riko-actions { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
@@ -22112,12 +22220,7 @@ def _render_riko_page() -> str:
       <div class="badge-wrap" id="rikoWhitelistBadges"></div>
     </section>
     <section class="card riko-grid">
-      <div class="riko-row">
-        <label for="rikoContract">Vault contract</label>
-        <div>
-          <input id="rikoContract" placeholder="0x..." />
-        </div>
-      </div>
+      <div class="riko-yield" id="rikoTreasuryYield">""" + yield_text + """</div>
       <div class="riko-row">
         <label for="rikoTokenSymbol">Deposit token</label>
         <div>
@@ -22154,17 +22257,17 @@ def _render_riko_page() -> str:
     <section class="card admin-only" id="rikoAdminCard">
       <h3>Admin: RIKO whitelist</h3>
       <div class="muted">Vault contract interface (reference): deposit(token,amount,minRiko,receiver), redeem(token,riko,minToken,receiver).</div>
-      <div class="muted">Workflow: save pending -> apply (wallet signature required on apply). Addresses for known symbols are auto-filled on load. Set one symbol and exact token address per row.</div>
+      <div class="muted">Workflow: apply directly (wallet signature required). Current rows are saved and applied in one action. Addresses for known symbols are auto-filled on load.</div>
       <div class="riko-list" id="rikoWhitelistRows"></div>
       <div class="riko-actions">
         <button class="btn" type="button" onclick="addRikoWhitelistRow()">Add row</button>
-        <button class="btn" type="button" onclick="saveRikoWhitelistPending()">Save pending</button>
         <button class="btn" type="button" onclick="applyRikoWhitelistPending()">Apply pending</button>
       </div>
       <div class="riko-status" id="rikoAdminStatus"></div>
     </section>
     """
     extra_script = """
+    const RIKO_VAULT_ADDRESS = "__RIKO_VAULT_ADDRESS__";
     let rikoWhitelistState = [];
     let rikoPendingWhitelistState = [];
     let rikoWhitelistAddrMap = {};
@@ -22252,6 +22355,7 @@ def _render_riko_page() -> str:
       const hint = document.getElementById("rikoBalanceHint");
       if (!hint) return;
       const tokenAddress = getSelectedRikoTokenAddress();
+      const symRaw = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
       const sym = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toUpperCase();
       const symLabel = sym || "TOKEN";
       if (!authState?.authenticated) {
@@ -22278,13 +22382,19 @@ def _render_riko_page() -> str:
       try {
         const ethers = await ensureEthers();
         const provider = new ethers.BrowserProvider(window.ethereum);
-        const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-        const [decimals, balance] = await Promise.all([
-          token.decimals(),
-          token.balanceOf(wallet),
-        ]);
-        rikoWalletTokenBalanceRaw = BigInt(balance);
-        rikoWalletTokenBalanceDecimals = Number(decimals || 18);
+        if (symRaw === "eth") {
+          const nativeBal = await provider.getBalance(wallet);
+          rikoWalletTokenBalanceRaw = BigInt(nativeBal);
+          rikoWalletTokenBalanceDecimals = 18;
+        } else {
+          const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+          const [decimals, balance] = await Promise.all([
+            token.decimals(),
+            token.balanceOf(wallet),
+          ]);
+          rikoWalletTokenBalanceRaw = BigInt(balance);
+          rikoWalletTokenBalanceDecimals = Number(decimals || 18);
+        }
         rikoWalletTokenBalanceFormatted = formatTokenAmount(rikoWalletTokenBalanceRaw, rikoWalletTokenBalanceDecimals);
         hint.textContent = `Available: ${rikoWalletTokenBalanceFormatted} ${symLabel}`;
       } catch (_) {
@@ -22412,6 +22522,14 @@ def _render_riko_page() -> str:
     }
     async function applyRikoWhitelistPending() {
       try {
+        const items = collectRikoWhitelistItemsFromEditor();
+        if (!items.length) throw new Error("Whitelist cannot be empty");
+        const saved = await postJson("/api/admin/riko/whitelist/pending", { items });
+        const savedPending = saved.pending || {};
+        rikoPendingWhitelistState = Array.isArray(savedPending.items) ? savedPending.items : items;
+        if (!savedPending.valid) {
+          throw new Error(formatValidationLines(savedPending) || "Pending whitelist failed validation.");
+        }
         setRikoAdminStatus("Requesting admin signature for apply...", false);
         const challenge = await postJson("/api/admin/riko/whitelist/apply-nonce", {});
         const signer = await getRikoSigner();
@@ -22489,12 +22607,12 @@ def _render_riko_page() -> str:
       return /^0x[a-f0-9]{40}$/.test(first.toLowerCase()) ? first : "";
     }
     function getRikoInputs() {
-      const contractAddress = String(document.getElementById("rikoContract")?.value || "").trim();
+      const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
       const tokenAddress = getSelectedRikoTokenAddress();
       const symbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
       const amount = String(document.getElementById("rikoAmount")?.value || "").trim();
       const activeSymbols = (rikoWhitelistState || []).map((x) => String(x?.symbol || "").toLowerCase()).filter(Boolean);
-      if (!contractAddress) throw new Error("Contract address is required");
+      if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured on server");
       if (!symbol || !activeSymbols.includes(symbol)) throw new Error("Token symbol is not in whitelist");
       if (!tokenAddress) throw new Error("No token address is available for selected symbol");
       if (!amount || Number(amount) <= 0) throw new Error("Amount must be > 0");
@@ -22567,7 +22685,7 @@ def _render_riko_page() -> str:
       setInterval(() => { refreshRikoWalletBalance(); }, 15000);
     })();
     """
-    return _render_placeholder_page(
+    html = _render_placeholder_page(
         "RIKO Vault",
         "Whitelist-gated token vault with RIKO mint/redeem flow.",
         "/riko",
@@ -22576,6 +22694,7 @@ def _render_riko_page() -> str:
         extra_script=extra_script,
         show_intro=False,
     )
+    return html.replace("__RIKO_VAULT_ADDRESS__", str(RIKO_VAULT_ADDRESS or "").strip())
 
 
 def _render_positions_page() -> str:
@@ -27971,6 +28090,9 @@ def _render_admin_page() -> str:
     .ticket-message-block {{ margin-top: 8px; }}
     .ticket-message-block .label, .ticket-reply-block .label {{ font-size: 11px; color: #64748b; margin-bottom: 4px; }}
     .ticket-message {{ margin: 0; max-height: 120px; overflow: auto; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; font-size: 12px; white-space: pre-wrap; color: #334155; }}
+    .stats-inline-fields {{ display:grid; grid-template-columns: minmax(220px, 1fr) minmax(160px, 260px); gap:10px; margin-bottom:8px; }}
+    .stats-inline-field {{ display:grid; grid-template-columns: 70px 1fr; gap:8px; align-items:center; }}
+    .stats-inline-field label {{ font-size:13px; color:#334155; font-weight:600; }}
     .ticket-thread-details > summary {{ cursor: pointer; color: #1d4ed8; font-size: 12px; font-weight: 700; margin-bottom: 4px; }}
     .admin-thread {{ display: grid; gap: 8px; }}
     .admin-msg-bubble {{ border: 1px solid #dbe3ef; border-radius: 10px; padding: 8px 10px; white-space: pre-wrap; font-size: 13px; color: #334155; background: #f8fbff; }}
@@ -27993,6 +28115,8 @@ def _render_admin_page() -> str:
       .ticket-author {{ grid-template-columns: 1fr; }}
       .ticket-reply-block {{ grid-template-columns: 1fr; }}
       .ticket-actions {{ flex-direction: row; flex-wrap: wrap; }}
+      .stats-inline-fields {{ grid-template-columns: 1fr; }}
+      .stats-inline-field {{ grid-template-columns: 70px 1fr; }}
     }}
     .app-footer {{ margin-top: 20px; padding-top: 14px; border-top: 1px solid #dbe3ef; text-align: center; font-size: 12px; color: #64748b; letter-spacing: 0.02em; }}
   </style>
@@ -28012,8 +28136,8 @@ def _render_admin_page() -> str:
     </div>
     <div class="tabs">
       <button class="tab-btn active" id="tabBtnSettings" onclick="switchTab('settings')">Settings</button>
+      <button class="tab-btn" id="tabBtnPairLists" onclick="switchTab('pairlists')">Pair lists</button>
       <button class="tab-btn" id="tabBtnStats" onclick="switchTab('stats')">Stats</button>
-      <button class="tab-btn" id="tabBtnFailures" onclick="switchTab('failures')">Failed runs</button>
       <button class="tab-btn" id="tabBtnTickets" onclick="switchTab('tickets')">Help tickets</button>
       <button class="tab-btn" id="tabBtnFeedback" onclick="switchTab('feedback')">Feedback</button>
       <button class="tab-btn" id="tabBtnFaq" onclick="switchTab('faq')">FAQ</button>
@@ -28024,7 +28148,6 @@ def _render_admin_page() -> str:
         <p class="hint">Manage wallets with admin rights. New admins are added only after delay.</p>
         <div class="row"><label>Add admin wallet</label><input id="newAdminWallet" type="text" placeholder="0x..."/></div>
         <button class="btn" onclick="addAdminWallet()">Schedule admin add</button>
-        <button class="btn btn-soft" onclick="sendTelegramTestMessage()">Send Telegram test</button>
         <div class="row"><label>Admin wallets</label><div id="adminWalletsList">-</div></div>
         <div class="row"><label>Pending admin additions</label><div id="adminPendingWalletsList">-</div></div>
       </section>
@@ -28033,8 +28156,11 @@ def _render_admin_page() -> str:
         <div class="row"><label>Analytics DB</label><div id="dbPath">-</div></div>
         <div class="row"><label>Tracked events</label><div id="eventsCount">-</div></div>
         <div class="row"><label>Token catalog</label><div id="tokenCatalogInfo">-</div></div>
+        <button class="btn btn-soft" onclick="sendTelegramTestMessage()">Send Telegram test</button>
         <span id="adminStatus" class="status">Ready</span>
       </section>
+    </div>
+    <div class="grid" id="tabPairLists" style="display:none">
       <section class="card">
         <h3>Pair Lists Manual Override</h3>
         <p class="hint">Manual pair-lists controls (fiat-backed stables, non-USD fiat stables, commodities, coins, memes). Saved in admin state and applied on next catalog refresh.</p>
@@ -28051,24 +28177,14 @@ def _render_admin_page() -> str:
     <div class="grid" id="tabStats" style="display:none">
       <section class="card">
         <h3>Stats by period</h3>
-        <p class="hint">Browse analytics by day, week, month, or year.</p>
-        <div class="row"><label>Period</label><select id="statsPeriod"><option value="day">day</option><option value="week">week</option><option value="month">month</option><option value="year">year</option></select></div>
-        <div class="row"><label>Rows</label><input id="statsLimit" type="number" min="1" max="365" step="1" value="30"/></div>
+        <div class="stats-inline-fields">
+          <div class="stats-inline-field"><label>Period</label><select id="statsPeriod"><option value="day">day</option><option value="week">week</option><option value="month">month</option><option value="year">year</option></select></div>
+          <div class="stats-inline-field"><label>Rows</label><input id="statsLimit" type="number" min="1" max="365" step="1" value="30"/></div>
+        </div>
         <button class="btn" onclick="loadStats()">Refresh stats</button>
         <span id="statsStatus" class="status">Ready</span>
         <div class="table-wrap" style="margin-top:10px">
           <table id="statsTable"></table>
-        </div>
-      </section>
-    </div>
-    <div class="grid" id="tabFailures" style="display:none">
-      <section class="card">
-        <h3>Recent failed runs</h3>
-        <p class="hint">Manual review of latest run_failed records.</p>
-        <button class="btn" onclick="loadFailures()">Refresh failures</button>
-        <span id="failStatus" class="status">Ready</span>
-        <div class="table-wrap" style="margin-top:10px">
-          <table id="failuresTable"></table>
         </div>
       </section>
     </div>
@@ -28152,7 +28268,7 @@ def _render_admin_page() -> str:
     function closeWalletModal(event) {{ if(event&&event.target&&event.target.id!=="walletModalBackdrop") return; document.getElementById("walletModalBackdrop").style.display="none"; }}
     async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
     function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} refreshIntentMenu(); }}
-    function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; if(authState?.authenticated) {{ btn.textContent=authState.address_short||"Wallet connected"; }} else {{ btn.textContent="Connect Wallet"; }} syncAdminIntentOption(); }}
+    function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; if(authState?.authenticated) {{ btn.textContent=authState.address_short||"Wallet connected"; }} else {{ btn.textContent="Connect wallet"; }} syncAdminIntentOption(); }}
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
@@ -28252,25 +28368,24 @@ def _render_admin_page() -> str:
     }}
     function switchTab(tab) {{
       const isSettings = tab === "settings";
+      const isPairLists = tab === "pairlists";
       const isStats = tab === "stats";
-      const isFailures = tab === "failures";
       const isTickets = tab === "tickets";
       const isFeedback = tab === "feedback";
       const isFaq = tab === "faq";
       document.getElementById("tabSettings").style.display = isSettings ? "grid" : "none";
+      document.getElementById("tabPairLists").style.display = isPairLists ? "grid" : "none";
       document.getElementById("tabStats").style.display = isStats ? "grid" : "none";
-      document.getElementById("tabFailures").style.display = isFailures ? "grid" : "none";
       document.getElementById("tabTickets").style.display = isTickets ? "grid" : "none";
       document.getElementById("tabFeedback").style.display = isFeedback ? "grid" : "none";
       document.getElementById("tabFaq").style.display = isFaq ? "grid" : "none";
       document.getElementById("tabBtnSettings").classList.toggle("active", isSettings);
+      document.getElementById("tabBtnPairLists").classList.toggle("active", isPairLists);
       document.getElementById("tabBtnStats").classList.toggle("active", isStats);
-      document.getElementById("tabBtnFailures").classList.toggle("active", isFailures);
       document.getElementById("tabBtnTickets").classList.toggle("active", isTickets);
       document.getElementById("tabBtnFeedback").classList.toggle("active", isFeedback);
       document.getElementById("tabBtnFaq").classList.toggle("active", isFaq);
       if (isStats) loadStats();
-      if (isFailures) loadFailures();
       if (isTickets) loadTickets();
       if (isFeedback) loadFeedback();
       if (isFaq) loadFaqAdmin();
@@ -29647,6 +29762,22 @@ def riko_whitelist() -> dict[str, Any]:
         "pending": pending_validation,
         "defaults_hint": "top-20 coins + top-20 fiat-backed stablecoins",
     }
+
+
+@app.get("/api/riko/treasury-yield")
+def riko_treasury_yield() -> dict[str, Any]:
+    try:
+        payload = _fetch_us_treasury_daily_10y()
+        return {
+            "ok": True,
+            "source": payload.get("source"),
+            "source_url": payload.get("source_url"),
+            "date": payload.get("date"),
+            "annual_pct": float(payload.get("annual_pct") or 0.0),
+            "daily_pct": float(payload.get("daily_pct") or 0.0),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to load US Treasury yield: {e}") from e
 
 
 @app.post("/api/admin/riko/whitelist/pending")
