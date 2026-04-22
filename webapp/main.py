@@ -22617,17 +22617,6 @@ def _render_riko_page() -> str:
       <h3>Admin: RIKO whitelist</h3>
       <div class="muted">Vault contract interface (reference): deposit(token,amount,minRiko,receiver), redeem(token,riko,minToken,receiver).</div>
       <div class="muted">Workflow: apply directly (wallet signature required). Current rows are saved and applied in one action. Addresses for known symbols are auto-filled on load.</div>
-      <div class="riko-row" style="margin-top:8px">
-        <label for="rikoGlobalCapUsd">Global cap (USD)</label>
-        <div>
-          <div class="riko-actions" style="margin-top:0">
-            <input id="rikoGlobalCapUsd" type="number" min="1" step="1" value="1000" style="max-width:180px" />
-            <button class="btn" type="button" onclick="applyRikoGlobalCap()">Apply on-chain</button>
-            <span class="muted" id="rikoGlobalCapCurrent">Current cap: -</span>
-          </div>
-          <div class="muted">Pilot default: $1000. You can increase later from this admin block.</div>
-        </div>
-      </div>
       <div class="riko-list" id="rikoWhitelistRows"></div>
       <div class="riko-actions">
         <button class="btn" type="button" onclick="addRikoWhitelistRow()">Add row</button>
@@ -28621,7 +28610,7 @@ def _render_stables_page() -> str:
 
 def _render_admin_page() -> str:
     options_html = _intent_options_html("/admin") + '\n<option value="/admin" selected>Administer project</option>'
-    return f"""<!doctype html>
+    html = f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -28779,6 +28768,17 @@ def _render_admin_page() -> str:
         <div class="row"><label>Active RIKO whitelist</label><div id="adminRikoWhitelistIndicator">-</div></div>
         <button class="btn btn-soft" onclick="sendTelegramTestMessage()">Send Telegram test</button>
       </section>
+      <section class="card">
+        <h3>RIKO on-chain controls</h3>
+        <div class="row"><label>Vault address</label><div id="adminRikoVaultAddress" class="mono">-</div></div>
+        <div class="row"><label>Current global cap</label><div id="adminRikoGlobalCapCurrent">-</div></div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Set global cap (USD)</label>
+          <input id="adminRikoGlobalCapUsd" type="number" min="1" step="1" value="1000" />
+          <button class="btn" onclick="applyAdminRikoGlobalCap()">Apply on-chain</button>
+        </div>
+        <p class="hint">Use for pilot cap updates (e.g. 1000 -> higher later).</p>
+      </section>
     </div>
     <div class="grid" id="tabPairLists" style="display:none">
       <section class="card">
@@ -28877,6 +28877,7 @@ def _render_admin_page() -> str:
   </div>
   <script>
     let authState = {{authenticated: false}};
+    const RIKO_VAULT_ADDRESS = "__RIKO_VAULT_ADDRESS__";
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
@@ -28930,6 +28931,93 @@ def _render_admin_page() -> str:
       }} catch(e) {{ closeWcQrModal(); alert("WalletConnect failed: "+(e?.message||"unknown error")+". Add this site to Reown Domain allowlist and try again."); }}
     }}
     function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
+    function isWalletUserRejectedError(err) {{
+      const msg = String(err?.message || "").toLowerCase();
+      const shortMsg = String(err?.shortMessage || "").toLowerCase();
+      const reason = String(err?.reason || "").toLowerCase();
+      const code = String(err?.code || "");
+      return (
+        code === "4001" ||
+        code === "ACTION_REJECTED" ||
+        msg.includes("user rejected") ||
+        shortMsg.includes("user rejected") ||
+        reason.includes("rejected")
+      );
+    }}
+    async function ensureEthersAdmin() {{
+      if (window.ethers) return window.ethers;
+      await new Promise((resolve, reject) => {{
+        const s = document.createElement("script");
+        s.src = "https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js";
+        s.onload = resolve;
+        s.onerror = () => reject(new Error("ethers load failed"));
+        document.head.appendChild(s);
+      }});
+      return window.ethers;
+    }}
+    async function getAdminSigner() {{
+      if (!window.ethereum) throw new Error("Wallet provider not found");
+      const ethers = await ensureEthersAdmin();
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      await provider.send("eth_requestAccounts", []);
+      return await provider.getSigner();
+    }}
+    function formatUsdFromUsd6Admin(v) {{
+      const n = Number(v || 0) / 1e6;
+      if (!Number.isFinite(n)) return "0";
+      return n.toLocaleString(undefined, {{maximumFractionDigits: 2}});
+    }}
+    const ADMIN_RIKO_ABI = [
+      "function globalSupplyCapUsd6() view returns (uint256)",
+      "function setGlobalSupplyCapUsd6(uint256 capUsd6) external"
+    ];
+    async function loadAdminRikoGlobalCap() {{
+      const elAddr = document.getElementById("adminRikoVaultAddress");
+      const elCap = document.getElementById("adminRikoGlobalCapCurrent");
+      const addr = String(RIKO_VAULT_ADDRESS || "").trim();
+      if (elAddr) elAddr.textContent = addr || "-";
+      if (!elCap) return;
+      if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) {{
+        elCap.textContent = "vault address is not configured";
+        return;
+      }}
+      try {{
+        const ethers = await ensureEthersAdmin();
+        const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+        const vault = new ethers.Contract(addr, ADMIN_RIKO_ABI, provider);
+        const capUsd6 = await vault.globalSupplyCapUsd6();
+        const capNum = Number(capUsd6 || 0n);
+        elCap.textContent = capNum <= 0 ? "no cap" : `$${{formatUsdFromUsd6Admin(capNum)}}`;
+      }} catch (_) {{
+        elCap.textContent = "unavailable";
+      }}
+    }}
+    async function applyAdminRikoGlobalCap() {{
+      try {{
+        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        const capInput = document.getElementById("adminRikoGlobalCapUsd");
+        const capUsd = Number(String(capInput?.value || "").trim());
+        if (!Number.isFinite(capUsd) || capUsd <= 0) throw new Error("Global cap must be > 0 USD.");
+        const capUsd6 = BigInt(Math.round(capUsd * 1e6));
+        const signer = await getAdminSigner();
+        const ethers = await ensureEthersAdmin();
+        const vault = new ethers.Contract(addr, ADMIN_RIKO_ABI, signer);
+        setAdminStatus(`Applying global cap $${{capUsd.toLocaleString()}} on-chain...`, false);
+        const tx = await vault.setGlobalSupplyCapUsd6(capUsd6);
+        setAdminStatus("Global cap tx sent: " + tx.hash, false);
+        await tx.wait();
+        setAdminStatus(`Global cap updated to $${{capUsd.toLocaleString()}}.`, false);
+        await loadAdminRikoGlobalCap();
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminStatus("Signature was rejected in wallet. Global cap update was canceled.", true);
+          return;
+        }}
+        setAdminStatus("Global cap update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
     function setStatsStatus(text, isErr) {{ const el=document.getElementById("statsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFailStatus(text, isErr) {{ const el=document.getElementById("failStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setTicketsStatus(text, isErr) {{ const el=document.getElementById("ticketsStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
@@ -29344,6 +29432,7 @@ def _render_admin_page() -> str:
         renderPendingRemoveAdminWallets(data.admin_wallets_pending_removals || [], Number(data.admin_wallet_add_delay_sec || 0));
         renderManualPairListsSettings(data.pair_lists_manual || {{}});
         await loadAdminRikoWhitelistIndicator();
+        await loadAdminRikoGlobalCap();
         if (data.pilot_config_frozen) {{
           setAdminStatus("Pilot config is frozen (RIKO_PILOT_CONFIG_FROZEN=1). Admin updates are disabled by server.", false);
         }}
@@ -29686,6 +29775,7 @@ def _render_admin_page() -> str:
 </body>
 </html>
 """
+    return html.replace("__RIKO_VAULT_ADDRESS__", str(RIKO_VAULT_ADDRESS or "").strip())
 
 
 def _render_help_page() -> str:
