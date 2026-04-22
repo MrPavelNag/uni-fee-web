@@ -20868,6 +20868,14 @@ def _riko_default_whitelist_items() -> list[dict[str, str]]:
     return items
 
 
+def _riko_items_from_symbols(symbols: list[str]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for s in _normalize_symbol_list(symbols or []):
+        addrs = _riko_resolve_symbol_addresses(s)
+        out.append({"symbol": s, "address": str(addrs[0] if addrs else "").strip().lower()})
+    return out
+
+
 def _load_riko_whitelist_items() -> list[dict[str, str]]:
     saved = _analytics_get_state(RIKO_WHITELIST_STATE_KEY)
     if saved:
@@ -20879,7 +20887,7 @@ def _load_riko_whitelist_items() -> list[dict[str, str]]:
                     return items
                 symbols = _normalize_symbol_list(payload.get("symbols") if isinstance(payload.get("symbols"), list) else [])
                 if symbols:
-                    return [{"symbol": s, "address": ""} for s in symbols]
+                    return _riko_items_from_symbols(symbols)
             if isinstance(payload, list):
                 if payload and isinstance(payload[0], dict):
                     items = _normalize_riko_whitelist_items(payload)
@@ -20887,7 +20895,7 @@ def _load_riko_whitelist_items() -> list[dict[str, str]]:
                         return items
                 symbols = _normalize_symbol_list(payload)
                 if symbols:
-                    return [{"symbol": s, "address": ""} for s in symbols]
+                    return _riko_items_from_symbols(symbols)
         except Exception:
             pass
     return _riko_default_whitelist_items()
@@ -20914,12 +20922,12 @@ def _load_riko_pending_whitelist_items() -> list[dict[str, str]]:
         if items:
             return items
         syms = _normalize_symbol_list(payload.get("symbols") if isinstance(payload.get("symbols"), list) else [])
-        return [{"symbol": s, "address": ""} for s in syms]
+        return _riko_items_from_symbols(syms)
     if isinstance(payload, list):
         if payload and isinstance(payload[0], dict):
             return _normalize_riko_whitelist_items(payload)
         syms = _normalize_symbol_list(payload)
-        return [{"symbol": s, "address": ""} for s in syms]
+        return _riko_items_from_symbols(syms)
     return []
 
 
@@ -21318,7 +21326,7 @@ INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/pancake", "Find the best pool on PancakeSwap"),
     ("/stables", "Find the best lending positions"),
     ("/positions", "Optimize my pool positions"),
-    ("/riko", "Manage RIKO vault"),
+    ("/riko", "Consistent Yield at US Treasuries Rates"),
     ("/help", "Send wishes or report issues"),
 ]
 
@@ -21782,6 +21790,26 @@ def _render_placeholder_page(
         authState = {{authenticated: false}};
       }}
       setAuthUI();
+      maybeRedirectAfterAuth();
+    }}
+
+    function getPostAuthRedirectPath() {{
+      try {{
+        const params = new URLSearchParams(window.location.search || "");
+        const nextPath = String(params.get("next") || "").trim();
+        if (!nextPath || !nextPath.startsWith("/") || nextPath.startsWith("//")) return "";
+        return nextPath;
+      }} catch (_) {{
+        return "";
+      }}
+    }}
+
+    function maybeRedirectAfterAuth() {{
+      if (!authState?.authenticated) return;
+      if (window.location.pathname !== "/connect") return;
+      const nextPath = getPostAuthRedirectPath();
+      if (!nextPath) return;
+      window.location.assign(nextPath);
     }}
 
     async function onConnectWalletClick() {{
@@ -21823,6 +21851,7 @@ def _render_placeholder_page(
         authState = {{authenticated: true, ...verifyResp}};
         setAuthUI();
         closeWalletModal({{target: {{id: "walletModalBackdrop"}}}});
+        maybeRedirectAfterAuth();
       }} catch (e) {{
         console.warn("wallet auth failed", e);
       }}
@@ -21934,6 +21963,7 @@ def _render_placeholder_page(
         authState = {{authenticated: true, ...verifyResp}};
         setAuthUI();
         closeWalletModal({{target: {{id: "walletModalBackdrop"}}}});
+        maybeRedirectAfterAuth();
       }} catch (e) {{
         closeWcQrModal();
         alert("WalletConnect failed: " + (e?.message || "unknown error") + ". Add this site to Reown Domain allowlist and try again.");
@@ -22014,8 +22044,7 @@ def _render_riko_page() -> str:
       <div class="riko-row">
         <label for="rikoContract">Vault contract</label>
         <div>
-          <input id="rikoContract" placeholder="0x... deployed RIKOVault address" />
-          <div class="muted">Contract must expose: deposit(token,amount,minRiko,receiver), redeem(token,riko,minToken,receiver).</div>
+          <input id="rikoContract" placeholder="0x..." />
         </div>
       </div>
       <div class="riko-row">
@@ -22044,7 +22073,7 @@ def _render_riko_page() -> str:
             <input id="rikoAmount" type="number" min="0" step="any" placeholder="e.g. 100" />
             <button class="btn riko-max-btn" type="button" onclick="setRikoMaxAmount()">Max</button>
           </div>
-          <div class="muted" id="rikoBalanceHint">Wallet balance: -</div>
+          <div class="muted" id="rikoBalanceHint">Available: -</div>
         </div>
       </div>
       <div class="riko-actions">
@@ -22056,6 +22085,7 @@ def _render_riko_page() -> str:
     </section>
     <section class="card admin-only" id="rikoAdminCard">
       <h3>Admin: RIKO whitelist</h3>
+      <div class="muted">Vault contract interface (reference): deposit(token,amount,minRiko,receiver), redeem(token,riko,minToken,receiver).</div>
       <div class="muted">Workflow: save pending -> validate -> apply. Set one symbol and exact token address per row.</div>
       <div class="riko-list" id="rikoWhitelistRows"></div>
       <div class="riko-actions">
@@ -22072,6 +22102,8 @@ def _render_riko_page() -> str:
     let rikoPendingWhitelistState = [];
     let rikoWhitelistAddrMap = {};
     let rikoWhitelistExactBySymbol = {};
+    let rikoDisplayAddrMap = {};
+    let rikoDisplayExactBySymbol = {};
     let rikoWalletTokenBalanceRaw = 0n;
     let rikoWalletTokenBalanceDecimals = 18;
     let rikoWalletTokenBalanceFormatted = "0";
@@ -22088,10 +22120,31 @@ def _render_riko_page() -> str:
       el.textContent = String(msg || "");
       el.className = isErr ? "riko-status err" : "riko-status";
     }
-    function renderRikoWhitelist() {
+    function updateRikoPublicWhitelistView() {
       const wrap = document.getElementById("rikoWhitelistBadges");
       const select = document.getElementById("rikoTokenSymbol");
-      const activeSymbols = (rikoWhitelistState || []).map((x) => String(x?.symbol || "").toLowerCase()).filter(Boolean);
+      const sourceItems = (Array.isArray(rikoPendingWhitelistState) && rikoPendingWhitelistState.length)
+        ? rikoPendingWhitelistState
+        : rikoWhitelistState;
+      const activeSymbols = (sourceItems || []).map((x) => String(x?.symbol || "").toLowerCase()).filter(Boolean);
+      const map = {};
+      const exact = {};
+      for (const it of (sourceItems || [])) {
+        const s = String(it?.symbol || "").toLowerCase();
+        if (!s) continue;
+        const fromRow = normalizeAddressHex(it?.address || "");
+        const merged = [];
+        if (/^0x[a-f0-9]{40}$/.test(fromRow)) merged.push(fromRow);
+        const catalogAddrs = Array.isArray(rikoWhitelistAddrMap?.[s]) ? rikoWhitelistAddrMap[s] : [];
+        for (const aRaw of catalogAddrs) {
+          const a = normalizeAddressHex(aRaw || "");
+          if (/^0x[a-f0-9]{40}$/.test(a) && !merged.includes(a)) merged.push(a);
+        }
+        map[s] = merged;
+        if (/^0x[a-f0-9]{40}$/.test(fromRow)) exact[s] = fromRow;
+      }
+      rikoDisplayAddrMap = map;
+      rikoDisplayExactBySymbol = exact;
       if (wrap) {
         wrap.innerHTML = activeSymbols.map((s) => `<span class="badge"><img src="/api/token-icon/${encodeURIComponent(s)}" alt="${String(s || "").toUpperCase()} icon"/>${String(s || "").toUpperCase()}</span>`).join("");
       }
@@ -22100,6 +22153,9 @@ def _render_riko_page() -> str:
         select.innerHTML = activeSymbols.map((s) => `<option value="${s}">${String(s || "").toUpperCase()}</option>`).join("");
         if (cur && activeSymbols.includes(cur)) select.value = cur;
       }
+    }
+    function renderRikoWhitelist() {
+      updateRikoPublicWhitelistView();
       renderRikoWhitelistEditor();
     }
     function normalizeAddressHex(v) {
@@ -22129,25 +22185,27 @@ def _render_riko_page() -> str:
       const hint = document.getElementById("rikoBalanceHint");
       if (!hint) return;
       const tokenAddress = String(document.getElementById("rikoTokenAddress")?.value || "").trim();
+      const sym = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toUpperCase();
+      const symLabel = sym || "TOKEN";
       if (!authState?.authenticated) {
-        hint.textContent = "Wallet balance: connect wallet";
+        hint.textContent = `Available: connect wallet (${symLabel})`;
         rikoWalletTokenBalanceRaw = 0n;
         rikoWalletTokenBalanceFormatted = "0";
         return;
       }
       if (!/^0x[a-fA-F0-9]{40}$/.test(tokenAddress)) {
-        hint.textContent = "Wallet balance: enter a valid token address";
+        hint.textContent = `Available: enter token address (${symLabel})`;
         rikoWalletTokenBalanceRaw = 0n;
         rikoWalletTokenBalanceFormatted = "0";
         return;
       }
       const wallet = String(authState?.address || "").trim();
       if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
-        hint.textContent = "Wallet balance: wallet address not available";
+        hint.textContent = `Available: wallet not ready (${symLabel})`;
         return;
       }
       if (!window.ethereum) {
-        hint.textContent = "Wallet balance: wallet provider not found";
+        hint.textContent = `Available: provider not found (${symLabel})`;
         return;
       }
       try {
@@ -22161,9 +22219,9 @@ def _render_riko_page() -> str:
         rikoWalletTokenBalanceRaw = BigInt(balance);
         rikoWalletTokenBalanceDecimals = Number(decimals || 18);
         rikoWalletTokenBalanceFormatted = formatTokenAmount(rikoWalletTokenBalanceRaw, rikoWalletTokenBalanceDecimals);
-        hint.textContent = "Wallet balance: " + rikoWalletTokenBalanceFormatted;
+        hint.textContent = `Available: ${rikoWalletTokenBalanceFormatted} ${symLabel}`;
       } catch (_) {
-        hint.textContent = "Wallet balance: unavailable";
+        hint.textContent = `Available: unavailable (${symLabel})`;
         rikoWalletTokenBalanceRaw = 0n;
         rikoWalletTokenBalanceFormatted = "0";
       }
@@ -22189,6 +22247,16 @@ def _render_riko_page() -> str:
           <button type="button" class="btn warn riko-row-remove" onclick="removeRikoWhitelistRow(${idx})">-</button>
         </div>
       `).join("");
+      const editors = rowsEl.querySelectorAll('input[data-riko-field="symbol"], input[data-riko-field="address"]');
+      editors.forEach((el) => {
+        el.addEventListener("input", onRikoWhitelistEditorInput);
+      });
+    }
+    function onRikoWhitelistEditorInput() {
+      const items = collectRikoWhitelistItemsFromEditor();
+      rikoPendingWhitelistState = items;
+      updateRikoPublicWhitelistView();
+      onRikoSymbolChanged();
     }
     function collectRikoWhitelistItemsFromEditor() {
       const rowsEl = document.getElementById("rikoWhitelistRows");
@@ -22213,20 +22281,22 @@ def _render_riko_page() -> str:
         rikoPendingWhitelistState = (Array.isArray(rikoWhitelistState) && rikoWhitelistState.length) ? [...rikoWhitelistState] : [];
       }
       rikoPendingWhitelistState.push({symbol: "", address: ""});
-      renderRikoWhitelistEditor();
+      renderRikoWhitelist();
     }
     function removeRikoWhitelistRow(idx) {
       const cur = collectRikoWhitelistItemsFromEditor();
       const out = cur.filter((_, i) => i !== idx);
       rikoPendingWhitelistState = out.length ? out : [{symbol: "", address: ""}];
-      renderRikoWhitelistEditor();
+      renderRikoWhitelist();
     }
     function formatValidationLines(v) {
       if (!v) return "";
       const errs = Array.isArray(v.errors) ? v.errors : [];
       const warns = Array.isArray(v.warnings) ? v.warnings : [];
-      const e = errs.length ? ("Errors: " + errs.join(" | ")) : "";
-      const w = warns.length ? ("Warnings: " + warns.join(" | ")) : "";
+      const errPreview = errs.slice(0, 3).join(" | ");
+      const warnPreview = warns.slice(0, 2).join(" | ");
+      const e = errs.length ? (`Errors (${errs.length}): ` + errPreview + (errs.length > 3 ? " | ..." : "")) : "";
+      const w = warns.length ? (`Warnings (${warns.length}): ` + warnPreview + (warns.length > 2 ? " | ..." : "")) : "";
       return [e, w].filter(Boolean).join(" || ");
     }
     async function loadRikoWhitelist() {
@@ -22313,8 +22383,8 @@ def _render_riko_page() -> str:
         iconEl.src = `/api/token-icon/${encodeURIComponent(safeSym)}`;
         iconEl.alt = `${String(safeSym).toUpperCase()} icon`;
       }
-      const addrs = Array.isArray(rikoWhitelistAddrMap?.[sym]) ? rikoWhitelistAddrMap[sym] : [];
-      const exact = String(rikoWhitelistExactBySymbol?.[sym] || "");
+      const addrs = Array.isArray(rikoDisplayAddrMap?.[sym]) ? rikoDisplayAddrMap[sym] : [];
+      const exact = String(rikoDisplayExactBySymbol?.[sym] || "");
       const ref = document.getElementById("rikoSymbolReference");
       if (ref) {
         const symLabel = sym ? String(sym).toUpperCase() : "-";
@@ -29051,7 +29121,6 @@ def connect_page(request: Request) -> HTMLResponse:
         """
         extra_html = """
     <section class="card connect-cta-card">
-      <h2>Connect</h2>
       <p class="connect-cta-subtitle">Connect wallet to continue.</p>
       <button class="connect-btn connect-cta-btn" type="button" onclick="onConnectWalletClick()">Connect Wallet</button>
     </section>
@@ -29498,7 +29567,7 @@ def admin_riko_whitelist_set_pending(
     _require_admin(request, response)
     payload_items = [{"symbol": str(x.symbol or ""), "address": str(x.address or "")} for x in (req.items or [])]
     if not payload_items:
-        payload_items = [{"symbol": s, "address": ""} for s in _normalize_symbol_list(req.symbols or [])]
+        payload_items = _riko_items_from_symbols(_normalize_symbol_list(req.symbols or []))
     items = _save_riko_pending_whitelist_items(payload_items)
     validation = _validate_riko_whitelist_items(items)
     return {"ok": True, "pending": validation}
@@ -34160,7 +34229,7 @@ HTML_PAGE = """
           <option value="/pancake">Find the best pool on PancakeSwap</option>
           <option value="/stables">Find the best lending positions</option>
           <option value="/positions">Optimize my pool positions</option>
-          <option value="/riko">Manage RIKO vault</option>
+          <option value="/riko">Consistent Yield at US Treasuries Rates</option>
           <option value="/help">Send wishes or report issues</option>
         </select>
         <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
