@@ -18,6 +18,7 @@ contract RIKOVaultTest is Test {
 
         bytes32 feedHash = keccak256(bytes("USDC / USD"));
         vault.setTokenConfig(address(usdc), true, address(usdcUsdFeed), 1 days, feedHash);
+        usdc.approve(address(vault), type(uint256).max);
 
         usdc.mint(alice, 1_000_000e6);
     }
@@ -38,7 +39,8 @@ contract RIKOVaultTest is Test {
 
         assertEq(rikoMinted, 100e6, "minted RIKO should equal USD6 value");
         assertEq(vault.balanceOf(alice), 100e6, "alice RIKO balance");
-        assertEq(usdc.balanceOf(address(vault)), depositAmount, "vault token balance");
+        assertEq(usdc.balanceOf(address(vault)), 0, "vault keeps no idle liquidity");
+        assertEq(usdc.balanceOf(address(this)), depositAmount, "custody receives deposited funds");
     }
 
     function testRedeemBurnsRikoAndReturnsToken() public {
@@ -74,5 +76,45 @@ contract RIKOVaultTest is Test {
         vm.expectRevert(RIKOVault.TokenCapExceeded.selector);
         vault.deposit(address(usdc), 50e6, 0, alice);
         vm.stopPrank();
+    }
+
+    function testClaimDailyYieldPaysFromConfiguredPayer() public {
+        vault.setYieldTokenAddress(address(usdc));
+        vault.setYieldPayerAddress(address(this));
+        vault.setDailyYieldRateBps(1); // 0.01% daily
+
+        uint256 depositAmount = 100e6;
+        vm.startPrank(alice);
+        usdc.approve(address(vault), depositAmount);
+        vault.deposit(address(usdc), depositAmount, 0, alice);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 1 days + 1);
+        uint256 beforeBal = usdc.balanceOf(alice);
+        vm.prank(alice);
+        uint256 payout = vault.claimDailyYield();
+        uint256 afterBal = usdc.balanceOf(alice);
+
+        assertEq(payout, 10_000, "daily payout amount");
+        assertEq(afterBal - beforeBal, payout, "alice receives payout");
+    }
+
+    function testProcessPendingRedeemCompletesWhenCustodyRefilled() public {
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 50e6, 0, alice);
+        vm.stopPrank();
+
+        usdc.transfer(address(0xBEEF), 45e6);
+
+        vm.prank(alice);
+        uint256 first = vault.redeem(address(usdc), 50e6, 0, alice);
+        assertEq(first, 0, "first redeem must queue");
+
+        usdc.mint(address(this), 100e6);
+        (bool completedBefore, uint256 sentBefore) = vault.processPendingRedemption(alice, address(usdc));
+        assertTrue(completedBefore, "pending redeem completed");
+        assertEq(sentBefore, 50e6, "token sent");
+        assertEq(vault.balanceOf(alice), 0, "riko burned after completion");
     }
 }

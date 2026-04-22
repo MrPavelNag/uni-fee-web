@@ -61,6 +61,7 @@ contract RIKOVaultInvariantTest is StdInvariant, Test {
         vault.setTokenConfig(address(usdc), true, address(usdcUsdFeed), 1 days, feedHash);
         vault.setGlobalSupplyCapUsd6(GLOBAL_CAP);
         vault.setTokenTvlCapUsd6(address(usdc), GLOBAL_CAP);
+        usdc.approve(address(vault), type(uint256).max);
 
         handler = new RIKOVaultHandler(vault, usdc);
         targetContract(address(handler));
@@ -71,8 +72,9 @@ contract RIKOVaultInvariantTest is StdInvariant, Test {
     }
 
     function invariant_FullyBackedInSingleAssetMode() public view {
-        // With single whitelisted USDC and 1 USD oracle, minted RIKO should
-        // remain fully backed by current vault USDC reserves.
-        assertEq(vault.totalSupply(), usdc.balanceOf(address(vault)), "backing invariant");
+        // Deposits are forwarded to custody and pulled back during redemption.
+        // Backing should be preserved across vault+custody balances.
+        uint256 totalBacking = usdc.balanceOf(address(vault)) + usdc.balanceOf(address(this));
+        assertEq(vault.totalSupply(), totalBacking, "backing invariant");
     }
 }

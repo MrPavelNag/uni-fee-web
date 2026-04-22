@@ -17,6 +17,7 @@ contract RIKOVaultFuzzTest is Test {
         usdcUsdFeed = new MockAggregatorV3(8, "USDC / USD", 1e8);
         bytes32 feedHash = keccak256(bytes("USDC / USD"));
         vault.setTokenConfig(address(usdc), true, address(usdcUsdFeed), 1 days, feedHash);
+        usdc.approve(address(vault), type(uint256).max);
     }
 
     function testFuzz_DepositMintsExpectedAmount(uint96 amount) public {
@@ -30,7 +31,7 @@ contract RIKOVaultFuzzTest is Test {
 
         assertEq(minted, depositAmount, "RIKO mint amount");
         assertEq(vault.balanceOf(alice), depositAmount, "RIKO balance");
-        assertEq(usdc.balanceOf(address(vault)), depositAmount, "vault token balance");
+        assertEq(usdc.balanceOf(address(vault)), 0, "vault token balance");
     }
 
     function testFuzz_DepositRespectsMinOut(uint96 amount, uint96 minOutBump) public {
