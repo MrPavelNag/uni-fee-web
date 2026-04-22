@@ -21160,10 +21160,14 @@ def _riko_resolve_symbol_addresses(symbol: str) -> list[str]:
     sym = str(symbol or "").strip().lower()
     if not _is_clean_symbol(sym):
         return []
+    # Native ETH has no ERC20 token contract address.
+    if sym == "eth":
+        return []
     addrs: list[str] = []
     # Ethereum fallbacks for major symbols that may be absent in TOKEN_ADDRESSES/token-catalog.
     # Keep lowercase to match _is_eth_address checks.
     eth_fallback: dict[str, str] = {
+        "weth": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
         "link": "0x514910771af9ca656af840dff83e8264ecf986ca",
         "bnb": "0xb8c77482e45f1f44de1745f52c74426c631bdd52",
         "aave": "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9",
@@ -21320,6 +21324,13 @@ def _riko_backfill_item_addresses(items: list[dict[str, str]]) -> tuple[list[dic
     for row in clean:
         sym = str(row.get("symbol") or "").strip().lower()
         addr = str(row.get("address") or "").strip().lower()
+        if sym == "eth":
+            fixed_native = "native"
+            if addr != fixed_native:
+                addr = fixed_native
+                changed = True
+            out.append({"symbol": sym, "address": addr})
+            continue
         if sym and not _is_eth_address(addr):
             addrs = _riko_resolve_symbol_addresses(sym)
             fixed = str(addrs[0] if addrs else "").strip().lower()
@@ -21417,6 +21428,16 @@ def _validate_riko_whitelist_items(items: list[dict[str, str]]) -> dict[str, Any
     for row in clean:
         s = str(row.get("symbol") or "").strip().lower()
         addr = str(row.get("address") or "").strip().lower()
+        if s == "eth":
+            is_native_marker = addr in {"", "native", "eth"}
+            if not is_native_marker:
+                errors.append("eth: must use native marker (leave empty or set 'native').")
+                symbol_addresses[s] = []
+                continue
+            symbol_addresses[s] = []
+            normalized_items.append({"symbol": s, "address": "native"})
+            symbols.append(s)
+            continue
         addrs = _riko_resolve_symbol_addresses(s)
         effective_addr = addr if _is_eth_address(addr) else ""
         if not effective_addr:
@@ -22687,12 +22708,38 @@ def _render_riko_page() -> str:
       const hint = document.getElementById("rikoBalanceHint");
       if (!hint) return;
       const tokenAddress = getSelectedRikoTokenAddress();
+      const symRaw = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
       const sym = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toUpperCase();
       const symLabel = sym || "TOKEN";
       if (!authState?.authenticated) {
         hint.textContent = `Available: connect wallet (${symLabel})`;
         rikoWalletTokenBalanceRaw = 0n;
         rikoWalletTokenBalanceFormatted = "0";
+        return;
+      }
+      if (symRaw === "eth") {
+        const wallet = String(authState?.address || "").trim();
+        if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
+          hint.textContent = `Available: wallet not ready (${symLabel})`;
+          return;
+        }
+        if (!window.ethereum) {
+          hint.textContent = `Available: provider not found (${symLabel})`;
+          return;
+        }
+        try {
+          const ethers = await ensureEthers();
+          const provider = new ethers.BrowserProvider(window.ethereum);
+          const nativeBal = await provider.getBalance(wallet);
+          rikoWalletTokenBalanceRaw = BigInt(nativeBal);
+          rikoWalletTokenBalanceDecimals = 18;
+          rikoWalletTokenBalanceFormatted = formatTokenAmount(rikoWalletTokenBalanceRaw, rikoWalletTokenBalanceDecimals);
+          hint.textContent = `Available: ${rikoWalletTokenBalanceFormatted} ${symLabel}`;
+        } catch (_) {
+          hint.textContent = `Available: unavailable (${symLabel})`;
+          rikoWalletTokenBalanceRaw = 0n;
+          rikoWalletTokenBalanceFormatted = "0";
+        }
         return;
       }
       if (!/^0x[a-fA-F0-9]{40}$/.test(tokenAddress)) {
@@ -22745,7 +22792,7 @@ def _render_riko_page() -> str:
         <div class="riko-list-row">
           <img class="riko-icon" src="/api/token-icon/${encodeURIComponent(String(row.symbol || ""))}" alt="${escAttr(String(row.symbol || "").toUpperCase())} icon"/>
           <input data-riko-field="symbol" data-riko-idx="${idx}" placeholder="symbol (e.g. usdt)" value="${escAttr(row.symbol)}"/>
-          <input data-riko-field="address" data-riko-idx="${idx}" placeholder="0x... exact token address" value="${escAttr(row.address)}"/>
+          <input data-riko-field="address" data-riko-idx="${idx}" placeholder="0x... exact token address (or native for ETH)" value="${escAttr(row.address)}"/>
           <button type="button" class="btn warn riko-row-remove" onclick="removeRikoWhitelistRow(${idx})">-</button>
         </div>
       `).join("");
@@ -22757,6 +22804,7 @@ def _render_riko_page() -> str:
     function resolveRikoWhitelistAddressBySymbol(symbol) {
       const s = String(symbol || "").trim().toLowerCase();
       if (!/^[a-z0-9._-]{2,24}$/.test(s)) return "";
+      if (s === "eth") return "native";
       const exactActive = normalizeAddressHex(rikoWhitelistExactBySymbol?.[s] || "");
       if (/^0x[a-f0-9]{40}$/.test(exactActive)) return exactActive;
       const exactDisplay = normalizeAddressHex(rikoDisplayExactBySymbol?.[s] || "");
@@ -22785,6 +22833,13 @@ def _render_riko_page() -> str:
         const sym = String(symbolInputs[i]?.value || "").trim().toLowerCase();
         if (!/^[a-z0-9._-]{2,24}$/.test(sym)) continue;
         const current = normalizeAddressHex(addrInputs[i]?.value || "");
+        if (sym === "eth") {
+          if (current !== "native") {
+            addrInputs[i].value = "native";
+            autoFilled += 1;
+          }
+          continue;
+        }
         if (/^0x[a-f0-9]{40}$/.test(current)) continue;
         const resolved = resolveRikoWhitelistAddressBySymbol(sym);
         if (/^0x[a-f0-9]{40}$/.test(resolved)) {
@@ -22874,6 +22929,19 @@ def _render_riko_page() -> str:
       const w = warns.length ? (`Warnings (${warns.length}): ` + warnPreview) : "";
       return [e, w].filter(Boolean).join(" || ");
     }
+    function isWalletUserRejectedError(err) {
+      const msg = String(err?.message || "").toLowerCase();
+      const shortMsg = String(err?.shortMessage || "").toLowerCase();
+      const reason = String(err?.reason || "").toLowerCase();
+      const code = String(err?.code || "");
+      return (
+        code === "4001" ||
+        code === "ACTION_REJECTED" ||
+        msg.includes("user rejected") ||
+        shortMsg.includes("user rejected") ||
+        reason.includes("rejected")
+      );
+    }
     async function loadRikoWhitelist() {
       try {
         const r = await fetch("/api/riko/whitelist");
@@ -22951,7 +23019,11 @@ def _render_riko_page() -> str:
         setRikoAdminStatus("Pending applied to active whitelist.", false);
         onRikoSymbolChanged();
       } catch (e) {
-        setRikoAdminStatus("Apply failed: " + (e?.message || "unknown"), true);
+        if (isWalletUserRejectedError(e)) {
+          setRikoAdminStatus("Signature was rejected in wallet. Apply was canceled.", true);
+          return;
+        }
+        setRikoAdminStatus("Apply failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }
     }
     function onRikoSymbolChanged() {
@@ -22967,18 +23039,19 @@ def _render_riko_page() -> str:
       const ref = document.getElementById("rikoSymbolReference");
       if (ref) {
         const symLabel = sym ? String(sym).toUpperCase() : "-";
+        if (sym === "eth") {
+          const wethAddr = resolveVaultTokenAddressForSymbol("eth");
+          const suffix = /^0x[a-f0-9]{40}$/.test(String(wethAddr || "").toLowerCase())
+            ? ` WETH for vault: ${wethAddr}`
+            : " WETH for vault: -";
+          ref.textContent = `Ethereum token addresses (${symLabel}): native ETH (no ERC-20 address).${suffix}`;
+          refreshRikoWalletBalance();
+          return;
+        }
         if (exact) {
-          if (sym === "eth") {
-            ref.textContent = `Ethereum token addresses (${symLabel}, via WETH ERC-20): ${exact}`;
-          } else {
-            ref.textContent = `Ethereum token addresses (${symLabel}): ${exact}`;
-          }
+          ref.textContent = `Ethereum token addresses (${symLabel}): ${exact}`;
         } else if (addrs.length) {
-          if (sym === "eth") {
-            ref.textContent = `Ethereum token addresses (${symLabel}, via WETH ERC-20): ${addrs.join(", ")}`;
-          } else {
-            ref.textContent = `Ethereum token addresses (${symLabel}): ${addrs.join(", ")}`;
-          }
+          ref.textContent = `Ethereum token addresses (${symLabel}): ${addrs.join(", ")}`;
         } else {
           ref.textContent = `Ethereum token addresses (${symLabel}): -`;
         }
@@ -23006,29 +23079,53 @@ def _render_riko_page() -> str:
     function getSelectedRikoTokenAddress() {
       const symbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
       if (!symbol) return "";
+      if (symbol === "eth") return "";
       const exact = String(rikoDisplayExactBySymbol?.[symbol] || "").trim();
       if (/^0x[a-f0-9]{40}$/.test(exact.toLowerCase())) return exact;
       const addrs = Array.isArray(rikoDisplayAddrMap?.[symbol]) ? rikoDisplayAddrMap[symbol] : [];
       const first = String(addrs[0] || "").trim();
       return /^0x[a-f0-9]{40}$/.test(first.toLowerCase()) ? first : "";
     }
+    function getTokenAddressBySymbol(symbol) {
+      const s = String(symbol || "").trim().toLowerCase();
+      if (!s) return "";
+      const exact = String(rikoDisplayExactBySymbol?.[s] || "").trim();
+      if (/^0x[a-f0-9]{40}$/.test(exact.toLowerCase())) return exact;
+      const addrs = Array.isArray(rikoDisplayAddrMap?.[s]) ? rikoDisplayAddrMap[s] : [];
+      const first = String(addrs[0] || "").trim();
+      return /^0x[a-f0-9]{40}$/.test(first.toLowerCase()) ? first : "";
+    }
+    function resolveVaultTokenAddressForSymbol(symbol) {
+      const s = String(symbol || "").trim().toLowerCase();
+      if (s !== "eth") return getTokenAddressBySymbol(s);
+      const fromWeth = getTokenAddressBySymbol("weth");
+      if (/^0x[a-f0-9]{40}$/.test(String(fromWeth || "").toLowerCase())) return fromWeth;
+      return "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+    }
     function getRikoInputs() {
       const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
       const tokenAddress = getSelectedRikoTokenAddress();
       const symbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
+      const vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
       const amount = String(document.getElementById("rikoAmount")?.value || "").trim();
       const activeSymbols = (rikoWhitelistState || []).map((x) => String(x?.symbol || "").toLowerCase()).filter(Boolean);
       if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured on server");
       if (!symbol || !activeSymbols.includes(symbol)) throw new Error("Token symbol is not in whitelist");
-      if (!tokenAddress) throw new Error("No token address is available for selected symbol");
+      if (symbol !== "eth" && !tokenAddress) throw new Error("No token address is available for selected symbol");
+      if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
       if (!amount || Number(amount) <= 0) throw new Error("Amount must be > 0");
-      return { contractAddress, tokenAddress, amount };
+      return { contractAddress, tokenAddress, vaultTokenAddress, amount, symbol };
     }
     const ERC20_ABI = [
       "function approve(address spender, uint256 value) external returns (bool)",
       "function allowance(address owner, address spender) external view returns (uint256)",
       "function decimals() external view returns (uint8)",
       "function balanceOf(address account) external view returns (uint256)"
+    ];
+    const WETH_ABI = [
+      ...ERC20_ABI,
+      "function deposit() payable",
+      "function withdraw(uint256 wad)"
     ];
     const RIKO_ABI = [
       "function deposit(address token,uint256 amountIn,uint256 minRikoOut,address receiver) external returns (uint256)",
@@ -23037,14 +23134,24 @@ def _render_riko_page() -> str:
     async function rikoDeposit() {
       try {
         setRikoStatus("Preparing deposit...", false);
-        const { contractAddress, tokenAddress, amount } = getRikoInputs();
+        const { contractAddress, tokenAddress, vaultTokenAddress, amount, symbol } = getRikoInputs();
         const ethers = await ensureEthers();
         const signer = await getRikoSigner();
         const user = await signer.getAddress();
-        const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
         const vault = new ethers.Contract(contractAddress, RIKO_ABI, signer);
-        const decimals = Number(await token.decimals());
-        const raw = ethers.parseUnits(amount, decimals);
+        let token;
+        let raw;
+        if (symbol === "eth") {
+          token = new ethers.Contract(vaultTokenAddress, WETH_ABI, signer);
+          raw = ethers.parseUnits(amount, 18);
+          setRikoStatus("Wrapping ETH to WETH...", false);
+          const wrapTx = await token.deposit({ value: raw });
+          await wrapTx.wait();
+        } else {
+          token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
+          const decimals = Number(await token.decimals());
+          raw = ethers.parseUnits(amount, decimals);
+        }
         const allowance = await token.allowance(user, contractAddress);
         if (allowance < raw) {
           const autoApprove = !!document.getElementById("rikoAutoApprove")?.checked;
@@ -23056,7 +23163,7 @@ def _render_riko_page() -> str:
           setRikoStatus("Approve tx sent: " + approveTx.hash, false);
           await approveTx.wait();
         }
-        const tx = await vault.deposit(tokenAddress, raw, 0, user);
+        const tx = await vault.deposit(vaultTokenAddress, raw, 0, user);
         setRikoStatus("Deposit tx sent: " + tx.hash, false);
         await tx.wait();
         setRikoStatus("Deposit confirmed", false);
@@ -23067,16 +23174,31 @@ def _render_riko_page() -> str:
     async function rikoRedeem() {
       try {
         setRikoStatus("Preparing redeem...", false);
-        const { contractAddress, tokenAddress, amount } = getRikoInputs();
+        const { contractAddress, vaultTokenAddress, amount, symbol } = getRikoInputs();
         const ethers = await ensureEthers();
         const signer = await getRikoSigner();
         const user = await signer.getAddress();
         const vault = new ethers.Contract(contractAddress, RIKO_ABI, signer);
         // RIKO has 6 decimals in contract.
         const rawRiko = ethers.parseUnits(amount, 6);
-        const tx = await vault.redeem(tokenAddress, rawRiko, 0, user);
+        let beforeWeth = 0n;
+        let weth = null;
+        if (symbol === "eth") {
+          weth = new ethers.Contract(vaultTokenAddress, WETH_ABI, signer);
+          beforeWeth = BigInt(await weth.balanceOf(user));
+        }
+        const tx = await vault.redeem(vaultTokenAddress, rawRiko, 0, user);
         setRikoStatus("Redeem tx sent: " + tx.hash, false);
         await tx.wait();
+        if (symbol === "eth" && weth) {
+          const afterWeth = BigInt(await weth.balanceOf(user));
+          const delta = afterWeth > beforeWeth ? (afterWeth - beforeWeth) : 0n;
+          if (delta > 0n) {
+            setRikoStatus("Unwrapping WETH to ETH...", false);
+            const unwrapTx = await weth.withdraw(delta);
+            await unwrapTx.wait();
+          }
+        }
         setRikoStatus("Redeem confirmed", false);
       } catch (e) {
         setRikoStatus("Redeem failed: " + (e?.shortMessage || e?.message || "unknown"), true);

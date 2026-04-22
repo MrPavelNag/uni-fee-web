@@ -68,6 +68,9 @@ Mainnet launch is allowed only when all gates below are green:
 3. **Audit gate:** independent audit issues of High/Critical severity are closed.
 4. **Launch gate:** successful testnet rehearsal with production-like parameters.
 
+Pilot policy note (current project decision):
+- **Multisig migration trigger:** switch owner control to multisig immediately before any public launch, public user onboarding, or public announcement. Until then, run private pilot only with low caps and strict whitelist.
+
 ## Recommended execution order
 
 1. Add Solidity toolchain and write unit tests.
