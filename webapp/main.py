@@ -264,6 +264,7 @@ ADMIN_WALLETS_PENDING_REMOVE_STATE_KEY = "admin_wallets_pending_remove_v1"
 ADMIN_WALLETS_TG_DAILY_QUEUE_STATE_KEY = "admin_wallets_tg_daily_queue_v1"
 ADMIN_WALLETS_TG_LAST_SENT_DATE_STATE_KEY = "admin_wallets_tg_last_sent_date_v1"
 ADMIN_ADD_DELAY_SEC = max(60, int(os.environ.get("ADMIN_ADD_DELAY_SEC", "3600")))
+RIKO_PILOT_CONFIG_FROZEN = os.environ.get("RIKO_PILOT_CONFIG_FROZEN", "0").strip().lower() in ("1", "true", "yes", "on")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 PAIR_LISTS_MANUAL_STATE_KEY = "pair_lists_manual_overrides_v1"
@@ -2069,6 +2070,14 @@ def _require_authenticated_wallet(request: Request, response: Response) -> tuple
     return sid, wallet, auth
 
 
+def _require_pilot_config_mutable(action_label: str = "this action") -> None:
+    if RIKO_PILOT_CONFIG_FROZEN:
+        raise HTTPException(
+            status_code=423,
+            detail=f"Pilot config is frozen. {action_label} is disabled.",
+        )
+
+
 def _parse_admin_wallets_csv(raw: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -2321,11 +2330,8 @@ def _notify_admin_wallet_change(event: str, target_address: str, actor_address: 
         if not queue:
             return True, "queue is empty"
         today = datetime.now(timezone.utc).date().isoformat()
-        last_sent = str(_analytics_get_state(ADMIN_WALLETS_TG_LAST_SENT_DATE_STATE_KEY) or "").strip()
-        if last_sent == today:
-            return True, "daily message already sent"
         shown = queue[-20:]
-        lines = ["[UNI_FEE] Admin wallet changes (daily digest)", f"date: {today}", f"events: {len(queue)}"]
+        lines = ["[UNI_FEE] Admin wallet changes", f"time: {_iso_now()}", f"events: {len(queue)}"]
         for item in shown:
             t = str(item.get("iso_time") or _iso_now())
             row = (
@@ -22611,6 +22617,17 @@ def _render_riko_page() -> str:
       <h3>Admin: RIKO whitelist</h3>
       <div class="muted">Vault contract interface (reference): deposit(token,amount,minRiko,receiver), redeem(token,riko,minToken,receiver).</div>
       <div class="muted">Workflow: apply directly (wallet signature required). Current rows are saved and applied in one action. Addresses for known symbols are auto-filled on load.</div>
+      <div class="riko-row" style="margin-top:8px">
+        <label for="rikoGlobalCapUsd">Global cap (USD)</label>
+        <div>
+          <div class="riko-actions" style="margin-top:0">
+            <input id="rikoGlobalCapUsd" type="number" min="1" step="1" value="1000" style="max-width:180px" />
+            <button class="btn" type="button" onclick="applyRikoGlobalCap()">Apply on-chain</button>
+            <span class="muted" id="rikoGlobalCapCurrent">Current cap: -</span>
+          </div>
+          <div class="muted">Pilot default: $1000. You can increase later from this admin block.</div>
+        </div>
+      </div>
       <div class="riko-list" id="rikoWhitelistRows"></div>
       <div class="riko-actions">
         <button class="btn" type="button" onclick="addRikoWhitelistRow()">Add row</button>
@@ -22630,6 +22647,7 @@ def _render_riko_page() -> str:
     let rikoWalletTokenBalanceRaw = 0n;
     let rikoWalletTokenBalanceDecimals = 18;
     let rikoWalletTokenBalanceFormatted = "0";
+    let rikoLastCapLoadTs = 0;
 
     function setRikoStatus(msg, isErr) {
       const el = document.getElementById("rikoStatus");
@@ -22805,6 +22823,11 @@ def _render_riko_page() -> str:
       const s = String(symbol || "").trim().toLowerCase();
       if (!/^[a-z0-9._-]{2,24}$/.test(s)) return "";
       if (s === "eth") return "native";
+      const staticFallback = {
+        weth: "0xc02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+      };
+      const fallbackAddr = normalizeAddressHex(staticFallback[s] || "");
+      if (/^0x[a-f0-9]{40}$/.test(fallbackAddr)) return fallbackAddr;
       const exactActive = normalizeAddressHex(rikoWhitelistExactBySymbol?.[s] || "");
       if (/^0x[a-f0-9]{40}$/.test(exactActive)) return exactActive;
       const exactDisplay = normalizeAddressHex(rikoDisplayExactBySymbol?.[s] || "");
@@ -22971,7 +22994,14 @@ def _render_riko_page() -> str:
     function syncRikoAdminCard() {
       const card = document.getElementById("rikoAdminCard");
       if (!card) return;
-      card.style.display = (authState?.authenticated && authState?.is_admin) ? "block" : "none";
+      const isAdmin = !!(authState?.authenticated && authState?.is_admin);
+      card.style.display = isAdmin ? "block" : "none";
+      if (isAdmin) {
+        const now = Date.now();
+        if (!rikoLastCapLoadTs || (now - rikoLastCapLoadTs) > 30000) {
+          loadRikoGlobalCap();
+        }
+      }
     }
     async function saveRikoWhitelistPending() {
       try {
@@ -23040,11 +23070,7 @@ def _render_riko_page() -> str:
       if (ref) {
         const symLabel = sym ? String(sym).toUpperCase() : "-";
         if (sym === "eth") {
-          const wethAddr = resolveVaultTokenAddressForSymbol("eth");
-          const suffix = /^0x[a-f0-9]{40}$/.test(String(wethAddr || "").toLowerCase())
-            ? ` WETH for vault: ${wethAddr}`
-            : " WETH for vault: -";
-          ref.textContent = `Ethereum token addresses (${symLabel}): native ETH (no ERC-20 address).${suffix}`;
+          ref.textContent = `Ethereum token addresses (${symLabel}): native ETH (no ERC-20 address).`;
           refreshRikoWalletBalance();
           return;
         }
@@ -23116,6 +23142,11 @@ def _render_riko_page() -> str:
       if (!amount || Number(amount) <= 0) throw new Error("Amount must be > 0");
       return { contractAddress, tokenAddress, vaultTokenAddress, amount, symbol };
     }
+    function formatUsdFromUsd6(v) {
+      const n = Number(v || 0) / 1e6;
+      if (!Number.isFinite(n)) return "0";
+      return n.toLocaleString(undefined, {maximumFractionDigits: 2});
+    }
     const ERC20_ABI = [
       "function approve(address spender, uint256 value) external returns (bool)",
       "function allowance(address owner, address spender) external view returns (uint256)",
@@ -23129,8 +23160,56 @@ def _render_riko_page() -> str:
     ];
     const RIKO_ABI = [
       "function deposit(address token,uint256 amountIn,uint256 minRikoOut,address receiver) external returns (uint256)",
-      "function redeem(address token,uint256 rikoAmountIn,uint256 minTokenOut,address receiver) external returns (uint256)"
+      "function redeem(address token,uint256 rikoAmountIn,uint256 minTokenOut,address receiver) external returns (uint256)",
+      "function globalSupplyCapUsd6() view returns (uint256)",
+      "function setGlobalSupplyCapUsd6(uint256 capUsd6) external"
     ];
+    async function loadRikoGlobalCap() {
+      const elCurrent = document.getElementById("rikoGlobalCapCurrent");
+      if (!elCurrent) return;
+      if (!/^0x[a-fA-F0-9]{40}$/.test(String(RIKO_VAULT_ADDRESS || "").trim())) {
+        elCurrent.textContent = "Current cap: vault address is not configured";
+        return;
+      }
+      try {
+        const ethers = await ensureEthers();
+        const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+        const vault = new ethers.Contract(String(RIKO_VAULT_ADDRESS || "").trim(), RIKO_ABI, provider);
+        const capUsd6 = await vault.globalSupplyCapUsd6();
+        rikoLastCapLoadTs = Date.now();
+        const capNum = Number(capUsd6 || 0n);
+        if (capNum <= 0) {
+          elCurrent.textContent = "Current cap: no cap";
+        } else {
+          elCurrent.textContent = `Current cap: $${formatUsdFromUsd6(capNum)}`;
+        }
+      } catch (_) {
+        elCurrent.textContent = "Current cap: unavailable";
+      }
+    }
+    async function applyRikoGlobalCap() {
+      try {
+        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        const capInput = document.getElementById("rikoGlobalCapUsd");
+        const capUsd = Number(String(capInput?.value || "").trim());
+        if (!Number.isFinite(capUsd) || capUsd <= 0) throw new Error("Global cap must be > 0 USD.");
+        const capUsd6 = BigInt(Math.round(capUsd * 1e6));
+        const signer = await getRikoSigner();
+        const vault = new (await ensureEthers()).Contract(String(RIKO_VAULT_ADDRESS || "").trim(), RIKO_ABI, signer);
+        setRikoAdminStatus(`Applying global cap $${capUsd.toLocaleString()} on-chain...`, false);
+        const tx = await vault.setGlobalSupplyCapUsd6(capUsd6);
+        setRikoAdminStatus("Global cap tx sent: " + tx.hash, false);
+        await tx.wait();
+        setRikoAdminStatus(`Global cap updated to $${capUsd.toLocaleString()}.`, false);
+        await loadRikoGlobalCap();
+      } catch (e) {
+        if (isWalletUserRejectedError(e)) {
+          setRikoAdminStatus("Signature was rejected in wallet. Global cap update was canceled.", true);
+          return;
+        }
+        setRikoAdminStatus("Global cap update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }
+    }
     async function rikoDeposit() {
       try {
         setRikoStatus("Preparing deposit...", false);
@@ -29256,6 +29335,9 @@ def _render_admin_page() -> str:
         renderPendingProtectAdminWallets(data.admin_wallets_pending_protect_updates || [], Number(data.admin_wallet_add_delay_sec || 0));
         renderPendingRemoveAdminWallets(data.admin_wallets_pending_removals || [], Number(data.admin_wallet_add_delay_sec || 0));
         renderManualPairListsSettings(data.pair_lists_manual || {{}});
+        if (data.pilot_config_frozen) {{
+          setAdminStatus("Pilot config is frozen (RIKO_PILOT_CONFIG_FROZEN=1). Admin updates are disabled by server.", false);
+        }}
       }} catch (e) {{
         setAdminStatus("Load failed: " + (e?.message || "unknown"), true);
       }}
@@ -30163,6 +30245,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "admin_wallets_pending_protect_updates": _load_pending_admin_protect_updates(),
             "admin_wallets_pending_removals": _load_pending_admin_removals(),
             "admin_wallet_add_delay_sec": int(ADMIN_ADD_DELAY_SEC),
+            "pilot_config_frozen": bool(RIKO_PILOT_CONFIG_FROZEN),
             "admin_wallets_encrypted": bool(_admin_wallets_fernet()),
             "analytics_db_path": str(ANALYTICS_DB_PATH),
             "events_count": events_count,
@@ -30179,6 +30262,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "admin_wallets_pending_protect_updates": _load_pending_admin_protect_updates(),
             "admin_wallets_pending_removals": _load_pending_admin_removals(),
             "admin_wallet_add_delay_sec": int(ADMIN_ADD_DELAY_SEC),
+            "pilot_config_frozen": bool(RIKO_PILOT_CONFIG_FROZEN),
             "admin_wallets_encrypted": bool(_admin_wallets_fernet()),
             "analytics_db_path": str(ANALYTICS_DB_PATH),
             "events_count": 0,
@@ -30287,6 +30371,7 @@ def admin_stats(request: Request, response: Response, period: str = "day", limit
 @app.post("/api/admin/admin-wallets")
 def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Response) -> dict[str, Any]:
     _, auth = _require_admin(request, response)
+    _require_pilot_config_mutable("Admin wallet update")
     actor = str(auth.get("address") or "").strip().lower()
     action = (req.action or "").strip().lower()
     address = (req.address or "").strip().lower()
@@ -30455,6 +30540,7 @@ def admin_telegram_test(request: Request, response: Response) -> dict[str, Any]:
 @app.post("/api/admin/pair-lists-manual")
 def admin_pair_lists_manual_update(req: AdminPairListsManualUpdate, request: Request, response: Response) -> dict[str, Any]:
     _require_admin(request, response)
+    _require_pilot_config_mutable("Pair-lists manual override update")
     current = _load_manual_pair_lists_overrides()
     cur_fiat = current.get("fiat_stable") if isinstance(current.get("fiat_stable"), dict) else {}
     cur_nonusd = current.get("fiat_nonusd") if isinstance(current.get("fiat_nonusd"), dict) else {}
@@ -30543,6 +30629,7 @@ def admin_riko_whitelist_set_pending(
     response: Response,
 ) -> dict[str, Any]:
     _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO whitelist pending update")
     payload_items = [{"symbol": str(x.symbol or ""), "address": str(x.address or "")} for x in (req.items or [])]
     if not payload_items:
         payload_items = _riko_items_from_symbols(_normalize_symbol_list(req.symbols or []))
@@ -30554,6 +30641,7 @@ def admin_riko_whitelist_set_pending(
 @app.post("/api/admin/riko/whitelist/apply-nonce")
 def admin_riko_whitelist_apply_nonce(request: Request, response: Response) -> dict[str, Any]:
     sid, auth = _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO whitelist apply")
     pending = _load_riko_pending_whitelist_items()
     if not pending:
         raise HTTPException(status_code=400, detail="Pending whitelist is empty. Save draft first.")
@@ -30588,6 +30676,7 @@ def admin_riko_whitelist_apply_nonce(request: Request, response: Response) -> di
 @app.post("/api/admin/riko/whitelist/apply")
 def admin_riko_whitelist_apply(req: AdminRikoWhitelistApplySigned, request: Request, response: Response) -> dict[str, Any]:
     sid, auth = _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO whitelist apply")
     pending = _load_riko_pending_whitelist_items()
     if not pending:
         raise HTTPException(status_code=400, detail="Pending whitelist is empty. Save draft first.")
