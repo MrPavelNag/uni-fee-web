@@ -42,6 +42,17 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+### Solidity tests (RIKO / Foundry)
+
+```bash
+curl -L https://foundry.paradigm.xyz | bash
+source ~/.zshenv
+foundryup
+forge install openzeppelin/openzeppelin-contracts --no-git
+forge install foundry-rs/forge-std --no-git
+forge test -vv
+```
+
 ### Проектные env-переменные (рекомендуется)
 
 В репозитории есть шаблон `\.env.example` и локальный файл `\.env` (игнорируется git).
