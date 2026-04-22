@@ -32,7 +32,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.request import Request as UrlRequest, urlopen
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -249,6 +249,12 @@ ADMIN_WALLET_ADDRESSES_ENV = os.environ.get("ADMIN_WALLET_ADDRESSES", ADMIN_WALL
 ADMIN_WALLETS_ENC_KEY = os.environ.get("ADMIN_WALLETS_ENC_KEY", "").strip()
 ADMIN_WALLETS_STATE_KEY_PLAIN = "admin_wallets_csv"
 ADMIN_WALLETS_STATE_KEY_ENC = "admin_wallets_csv_enc_v1"
+ADMIN_WALLETS_PENDING_ADD_STATE_KEY = "admin_wallets_pending_add_v1"
+ADMIN_WALLETS_TG_DAILY_QUEUE_STATE_KEY = "admin_wallets_tg_daily_queue_v1"
+ADMIN_WALLETS_TG_LAST_SENT_DATE_STATE_KEY = "admin_wallets_tg_last_sent_date_v1"
+ADMIN_ADD_DELAY_SEC = max(60, int(os.environ.get("ADMIN_ADD_DELAY_SEC", "3600")))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 PAIR_LISTS_MANUAL_STATE_KEY = "pair_lists_manual_overrides_v1"
 RIKO_WHITELIST_STATE_KEY = "riko_whitelist_v1"
 RIKO_WHITELIST_PENDING_STATE_KEY = "riko_whitelist_pending_v1"
@@ -2154,6 +2160,243 @@ def _set_admin_wallets(addresses: list[str]) -> None:
         _analytics_set_state(ADMIN_WALLETS_STATE_KEY_PLAIN, "")
         return
     _analytics_set_state(ADMIN_WALLETS_STATE_KEY_PLAIN, csv_value)
+
+
+def _send_telegram_message(text: str) -> tuple[bool, str]:
+    token = str(TELEGRAM_BOT_TOKEN or "").strip()
+    chat_id = str(TELEGRAM_CHAT_ID or "").strip()
+    if not token or not chat_id:
+        return False, "Telegram is not configured."
+    payload = urlencode(
+        {
+            "chat_id": chat_id,
+            "text": str(text or "")[:3900],
+            "disable_web_page_preview": "true",
+        }
+    ).encode("utf-8")
+    req = UrlRequest(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw) if raw else {}
+        if bool(data.get("ok")):
+            return True, "sent"
+        return False, str(data.get("description") or "send failed")
+    except HTTPError as e:
+        return False, f"http {int(getattr(e, 'code', 0) or 0)}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _notify_admin_wallet_change(event: str, target_address: str, actor_address: str, extra: str = "") -> tuple[bool, str]:
+    def _normalize_daily_events(items: Any) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        if not isinstance(items, list):
+            return out
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            event_s = str(raw.get("event") or "").strip().lower()
+            target = str(raw.get("target") or "").strip().lower()
+            actor = str(raw.get("actor") or "").strip().lower()
+            ts = float(raw.get("ts") or 0)
+            if not event_s or not _is_eth_address(target) or not _is_eth_address(actor) or ts <= 0:
+                continue
+            out.append(
+                {
+                    "event": event_s,
+                    "target": target,
+                    "actor": actor,
+                    "details": str(raw.get("details") or "").strip(),
+                    "iso_time": str(raw.get("iso_time") or ""),
+                    "ts": ts,
+                }
+            )
+        out.sort(key=lambda x: float(x.get("ts") or 0))
+        return out
+
+    def _load_daily_events() -> list[dict[str, Any]]:
+        saved = _analytics_get_state(ADMIN_WALLETS_TG_DAILY_QUEUE_STATE_KEY)
+        if not saved:
+            return []
+        try:
+            payload = json.loads(saved)
+        except Exception:
+            return []
+        if isinstance(payload, dict):
+            return _normalize_daily_events(payload.get("items"))
+        if isinstance(payload, list):
+            return _normalize_daily_events(payload)
+        return []
+
+    def _save_daily_events(items: list[dict[str, Any]]) -> None:
+        clean = _normalize_daily_events(items)
+        _analytics_set_state(ADMIN_WALLETS_TG_DAILY_QUEUE_STATE_KEY, json.dumps({"items": clean}, ensure_ascii=False))
+
+    def _flush_daily_digest_if_due() -> tuple[bool, str]:
+        queue = _load_daily_events()
+        if not queue:
+            return True, "queue is empty"
+        today = datetime.now(timezone.utc).date().isoformat()
+        last_sent = str(_analytics_get_state(ADMIN_WALLETS_TG_LAST_SENT_DATE_STATE_KEY) or "").strip()
+        if last_sent == today:
+            return True, "daily message already sent"
+        shown = queue[-20:]
+        lines = ["[UNI_FEE] Admin wallet changes (daily digest)", f"date: {today}", f"events: {len(queue)}"]
+        for item in shown:
+            t = str(item.get("iso_time") or _iso_now())
+            row = (
+                f"- {t} | {str(item.get('event') or '')} | target={str(item.get('target') or '')} | "
+                f"actor={str(item.get('actor') or '')}"
+            )
+            details = str(item.get("details") or "")
+            if details:
+                row += f" | {details}"
+            lines.append(row)
+        if len(queue) > len(shown):
+            lines.append(f"... and {len(queue) - len(shown)} more events")
+        ok, info = _send_telegram_message("\n".join(lines))
+        if ok:
+            _analytics_set_state(ADMIN_WALLETS_TG_LAST_SENT_DATE_STATE_KEY, today)
+            _save_daily_events([])
+        return ok, info
+
+    event_s = str(event or "").strip().lower() or "unknown"
+    target = str(target_address or "").strip().lower()
+    actor = str(actor_address or "").strip().lower()
+    queue = _load_daily_events()
+    queue.append(
+        {
+            "event": event_s,
+            "target": target,
+            "actor": actor,
+            "details": str(extra or "").strip(),
+            "iso_time": _iso_now(),
+            "ts": float(time.time()),
+        }
+    )
+    _save_daily_events(queue)
+    return _flush_daily_digest_if_due()
+
+
+def _normalize_pending_admin_additions(items: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if not isinstance(items, list):
+        return out
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        address = str(raw.get("address") or "").strip().lower()
+        if not _is_eth_address(address):
+            continue
+        if address in seen:
+            continue
+        execute_after_ts = float(raw.get("execute_after_ts") or 0)
+        if execute_after_ts <= 0:
+            continue
+        seen.add(address)
+        created_at_ts = float(raw.get("created_at_ts") or 0)
+        if created_at_ts <= 0:
+            created_at_ts = max(0.0, execute_after_ts - float(ADMIN_ADD_DELAY_SEC))
+        out.append(
+            {
+                "address": address,
+                "created_by": str(raw.get("created_by") or "").strip().lower(),
+                "created_at_ts": created_at_ts,
+                "created_at": str(raw.get("created_at") or ""),
+                "execute_after_ts": execute_after_ts,
+                "execute_after": str(raw.get("execute_after") or ""),
+            }
+        )
+    out.sort(key=lambda x: (float(x.get("execute_after_ts") or 0), str(x.get("address") or "")))
+    return out
+
+
+def _load_pending_admin_additions() -> list[dict[str, Any]]:
+    saved = _analytics_get_state(ADMIN_WALLETS_PENDING_ADD_STATE_KEY)
+    if not saved:
+        return []
+    try:
+        payload = json.loads(saved)
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        return _normalize_pending_admin_additions(payload.get("items"))
+    if isinstance(payload, list):
+        return _normalize_pending_admin_additions(payload)
+    return []
+
+
+def _save_pending_admin_additions(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    clean = _normalize_pending_admin_additions(items)
+    _analytics_set_state(ADMIN_WALLETS_PENDING_ADD_STATE_KEY, json.dumps({"items": clean}, ensure_ascii=False))
+    return clean
+
+
+def _schedule_pending_admin_addition(address: str, actor_address: str) -> dict[str, Any]:
+    addr = str(address or "").strip().lower()
+    if not _is_eth_address(addr):
+        raise HTTPException(status_code=400, detail="Invalid wallet address.")
+    wallets = _admin_wallets_value()
+    if addr in wallets:
+        raise HTTPException(status_code=400, detail="Wallet is already an admin.")
+    current = _load_pending_admin_additions()
+    for it in current:
+        if str(it.get("address") or "") == addr:
+            return it
+    now_ts = float(time.time())
+    execute_after_ts = now_ts + float(ADMIN_ADD_DELAY_SEC)
+    item = {
+        "address": addr,
+        "created_by": str(actor_address or "").strip().lower(),
+        "created_at_ts": now_ts,
+        "created_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "execute_after_ts": execute_after_ts,
+        "execute_after": datetime.fromtimestamp(execute_after_ts, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    _save_pending_admin_additions(current + [item])
+    return item
+
+
+def _cancel_pending_admin_addition(address: str) -> dict[str, Any] | None:
+    addr = str(address or "").strip().lower()
+    current = _load_pending_admin_additions()
+    kept: list[dict[str, Any]] = []
+    removed: dict[str, Any] | None = None
+    for it in current:
+        if str(it.get("address") or "") == addr:
+            removed = it
+            continue
+        kept.append(it)
+    _save_pending_admin_additions(kept)
+    return removed
+
+
+def _execute_pending_admin_addition(address: str) -> dict[str, Any]:
+    addr = str(address or "").strip().lower()
+    if not _is_eth_address(addr):
+        raise HTTPException(status_code=400, detail="Invalid wallet address.")
+    current = _load_pending_admin_additions()
+    pending = next((it for it in current if str(it.get("address") or "") == addr), None)
+    if not pending:
+        raise HTTPException(status_code=404, detail="No pending admin addition for this address.")
+    now_ts = float(time.time())
+    ready_ts = float(pending.get("execute_after_ts") or 0)
+    if now_ts < ready_ts:
+        wait_sec = int(max(1, round(ready_ts - now_ts)))
+        raise HTTPException(status_code=400, detail=f"Pending delay is not over yet. Wait ~{wait_sec}s.")
+    wallets = _admin_wallets_value()
+    if addr not in wallets:
+        wallets.append(addr)
+        _set_admin_wallets(wallets)
+    _cancel_pending_admin_addition(addr)
+    return pending
 
 
 def _is_valid_email(value: str) -> bool:
@@ -27646,10 +27889,11 @@ def _render_admin_page() -> str:
     <div class="grid" id="tabSettings">
       <section class="card">
         <h3>Admin access</h3>
-        <p class="hint">Manage wallets with admin rights.</p>
+        <p class="hint">Manage wallets with admin rights. New admins are added only after delay.</p>
         <div class="row"><label>Add admin wallet</label><input id="newAdminWallet" type="text" placeholder="0x..."/></div>
-        <button class="btn" onclick="addAdminWallet()">Add admin</button>
+        <button class="btn" onclick="addAdminWallet()">Schedule admin add</button>
         <div class="row"><label>Admin wallets</label><div id="adminWalletsList">-</div></div>
+        <div class="row"><label>Pending admin additions</label><div id="adminPendingWalletsList">-</div></div>
       </section>
       <section class="card">
         <h3>Project summary</h3>
@@ -27900,7 +28144,7 @@ def _render_admin_page() -> str:
     }}
     function renderStats(rows) {{
       const table = document.getElementById("statsTable");
-      let html = "<tr><th>Period</th><th>Unique sessions</th><th>Page views</th><th>Run start</th><th>Run done</th><th>Run failed</th><th>Wallet auth</th><th>Help tickets</th><th>Position scans</th><th>Pool scans</th><th>Scan light mode</th><th>Index cache hits</th><th>Index cache misses</th><th>Index skip live</th><th>Legacy disabled</th><th>Row enrich off</th><th>Total events</th></tr>";
+      let html = "<tr><th>Period</th><th>Unique sessions</th><th>Page views</th><th>Run start</th><th>Run done</th><th>Run failed</th><th>Wallet auth</th><th>Help tickets</th><th>Position scans</th><th>Pool scans</th><th>Total events</th></tr>";
       for (const r of (rows || [])) {{
         html += "<tr>";
         html += `<td class="mono">${{esc(r.bucket)}}</td>`;
@@ -27913,16 +28157,10 @@ def _render_admin_page() -> str:
         html += `<td>${{Number(r.help_tickets || 0)}}</td>`;
         html += `<td>${{Number(r.positions_scans || 0)}}</td>`;
         html += `<td>${{Number(r.positions_pool_scans || 0)}}</td>`;
-        html += `<td>${{Number(r.positions_scan_light_mode || 0)}}</td>`;
-        html += `<td>${{Number(r.index_cache_hits || 0)}}</td>`;
-        html += `<td>${{Number(r.index_cache_misses || 0)}}</td>`;
-        html += `<td>${{Number(r.index_skip_live || 0)}}</td>`;
-        html += `<td>${{Number(r.index_legacy_disabled || 0)}}</td>`;
-        html += `<td>${{Number(r.index_row_live_enrich_disabled || 0)}}</td>`;
         html += `<td>${{Number(r.total_events || 0)}}</td>`;
         html += "</tr>";
       }}
-      if (!(rows || []).length) html += '<tr><td colspan="17">No stats yet.</td></tr>';
+      if (!(rows || []).length) html += '<tr><td colspan="11">No stats yet.</td></tr>';
       table.innerHTML = html;
     }}
     async function loadStats() {{
@@ -28227,10 +28465,28 @@ def _render_admin_page() -> str:
         document.getElementById("eventsCount").textContent = String(data.events_count || 0);
         document.getElementById("tokenCatalogInfo").textContent = `updated: ${{data.token_catalog_updated_at || "-"}}, count: ${{data.token_catalog_count || 0}}`;
         renderAdminWallets(data.admin_wallets || []);
+        renderPendingAdminWallets(data.admin_wallets_pending_additions || [], Number(data.admin_wallet_add_delay_sec || 0));
         renderManualPairListsSettings(data.pair_lists_manual || {{}});
       }} catch (e) {{
         setAdminStatus("Load failed: " + (e?.message || "unknown"), true);
       }}
+    }}
+    function formatUtcTs(ts) {{
+      const n = Number(ts || 0);
+      if (!Number.isFinite(n) || n <= 0) return "-";
+      try {{
+        return new Date(n * 1000).toISOString().replace("T", " ").replace(".000Z", "Z");
+      }} catch (_) {{
+        return "-";
+      }}
+    }}
+    function formatDelay(secRaw) {{
+      const sec = Math.max(0, Number(secRaw || 0));
+      if (sec < 60) return `${{Math.round(sec)}}s`;
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      if (h <= 0) return `${{m}}m`;
+      return m ? `${{h}}h ${{m}}m` : `${{h}}h`;
     }}
     function renderManualPairListsSettings(cfg) {{
       const fiat = cfg && cfg.fiat_stable ? cfg.fiat_stable : {{}};
@@ -28293,6 +28549,28 @@ def _render_admin_page() -> str:
       const rows = (items || []).map((a) => `<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span class="mono">${{a}}</span><button class="btn" style="padding:5px 10px;font-size:12px" onclick="removeAdminWallet('${{a}}')">Remove</button></div>`);
       wrap.innerHTML = rows.length ? rows.join("") : "-";
     }}
+    function renderPendingAdminWallets(items, delaySec) {{
+      const wrap = document.getElementById("adminPendingWalletsList");
+      if (!wrap) return;
+      const rows = (items || []).map((it) => {{
+        const a = String(it?.address || "");
+        const executeAfter = formatUtcTs(it?.execute_after_ts);
+        const leftSec = Math.max(0, Math.ceil(Number(it?.execute_after_ts || 0) - Date.now() / 1000));
+        const waitLabel = leftSec > 0 ? `wait: ${{formatDelay(leftSec)}}` : "ready";
+        return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+          <span class="mono">${{a}}</span>
+          <span class="hint">execute after: ${{executeAfter}}</span>
+          <span class="hint">${{waitLabel}}</span>
+          <button class="btn" style="padding:5px 10px;font-size:12px" onclick="executePendingAdminWallet('${{a}}')">Execute</button>
+          <button class="btn" style="padding:5px 10px;font-size:12px" onclick="cancelPendingAdminWallet('${{a}}')">Cancel</button>
+        </div>`;
+      }});
+      if (rows.length) {{
+        wrap.innerHTML = rows.join("");
+      }} else {{
+        wrap.textContent = `No pending additions (delay: ${{formatDelay(delaySec)}}).`;
+      }}
+    }}
     async function addAdminWallet() {{
       const address = (document.getElementById("newAdminWallet").value || "").trim();
       if (!address) {{
@@ -28301,11 +28579,30 @@ def _render_admin_page() -> str:
       }}
       try {{
         const data = await postJson("/api/admin/admin-wallets", {{action: "add", address}});
-        setAdminStatus(data.info || "Added", false);
+        setAdminStatus(data.info || "Scheduled", false);
         document.getElementById("newAdminWallet").value = "";
         await loadAdmin();
       }} catch (e) {{
-        setAdminStatus("Add admin failed: " + (e?.message || "unknown"), true);
+        setAdminStatus("Schedule admin add failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function executePendingAdminWallet(address) {{
+      try {{
+        const data = await postJson("/api/admin/admin-wallets", {{action: "execute_add", address}});
+        setAdminStatus(data.info || "Executed", false);
+        await loadAdmin();
+      }} catch (e) {{
+        setAdminStatus("Execute pending add failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function cancelPendingAdminWallet(address) {{
+      if (!confirm(`Cancel pending admin addition ${{address}}?`)) return;
+      try {{
+        const data = await postJson("/api/admin/admin-wallets", {{action: "cancel_add", address}});
+        setAdminStatus(data.info || "Canceled", false);
+        await loadAdmin();
+      }} catch (e) {{
+        setAdminStatus("Cancel pending add failed: " + (e?.message || "unknown"), true);
       }}
     }}
     async function removeAdminWallet(address) {{
@@ -28736,19 +29033,37 @@ def help_page(request: Request) -> HTMLResponse:
 @app.get("/connect", response_class=HTMLResponse)
 def connect_page(request: Request) -> HTMLResponse:
     reason = str(request.query_params.get("reason") or "").strip().lower()
-    next_path = str(request.query_params.get("next") or "").strip()
     subtitle = "Connect is a placeholder for wallet/account integration."
+    extra_css = ""
     extra_html = ""
+    show_intro = True
     if reason == "riko_auth_required":
         subtitle = "Connect wallet to continue."
-        safe_next = next_path if next_path.startswith("/") else "/riko"
-        extra_html = (
-            '<section class="card">'
-            '<p class="hint"><b>Access restricted:</b> connect wallet to open RIKO Vault.</p>'
-            f'<p class="hint">After successful sign-in, open: <a href="{safe_next}">{safe_next}</a></p>'
-            "</section>"
-        )
-    html = _render_placeholder_page("Connect", subtitle, "", extra_html=extra_html)
+        show_intro = False
+        extra_css = """
+    .connect-cta-card { text-align:center; }
+    .connect-cta-subtitle { margin: 6px 0 14px; font-size: 30px; font-weight: 800; color:#0f172a; line-height:1.15; }
+    .connect-cta-btn { min-width: 260px; font-size: 16px; padding: 12px 16px; }
+    @media (max-width: 780px) {
+      .connect-cta-subtitle { font-size: 24px; }
+      .connect-cta-btn { width: 100%; min-width: 0; }
+    }
+        """
+        extra_html = """
+    <section class="card connect-cta-card">
+      <h2>Connect</h2>
+      <p class="connect-cta-subtitle">Connect wallet to continue.</p>
+      <button class="connect-btn connect-cta-btn" type="button" onclick="onConnectWalletClick()">Connect Wallet</button>
+    </section>
+        """
+    html = _render_placeholder_page(
+        "Connect",
+        subtitle,
+        "",
+        extra_css=extra_css,
+        extra_html=extra_html,
+        show_intro=show_intro,
+    )
     html = html.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
     resp = HTMLResponse(html)
     sid = _ensure_session_cookie(request, resp)
@@ -28899,6 +29214,8 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
                 events_count = int(conn.execute("SELECT COUNT(*) FROM analytics_events").fetchone()[0])
         return {
             "admin_wallets": _admin_wallets_value(),
+            "admin_wallets_pending_additions": _load_pending_admin_additions(),
+            "admin_wallet_add_delay_sec": int(ADMIN_ADD_DELAY_SEC),
             "admin_wallets_encrypted": bool(_admin_wallets_fernet()),
             "analytics_db_path": str(ANALYTICS_DB_PATH),
             "events_count": events_count,
@@ -28909,6 +29226,8 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
     except Exception as e:
         return {
             "admin_wallets": _admin_wallets_value(),
+            "admin_wallets_pending_additions": _load_pending_admin_additions(),
+            "admin_wallet_add_delay_sec": int(ADMIN_ADD_DELAY_SEC),
             "admin_wallets_encrypted": bool(_admin_wallets_fernet()),
             "analytics_db_path": str(ANALYTICS_DB_PATH),
             "events_count": 0,
@@ -29016,28 +29335,90 @@ def admin_stats(request: Request, response: Response, period: str = "day", limit
 
 @app.post("/api/admin/admin-wallets")
 def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    actor = str(auth.get("address") or "").strip().lower()
     action = (req.action or "").strip().lower()
     address = (req.address or "").strip().lower()
-    if action not in {"add", "remove"}:
-        raise HTTPException(status_code=400, detail="action must be add or remove.")
+    if action not in {"add", "remove", "execute_add", "cancel_add"}:
+        raise HTTPException(status_code=400, detail="action must be add, remove, execute_add or cancel_add.")
     if not _is_eth_address(address):
         raise HTTPException(status_code=400, detail="Invalid wallet address.")
     wallets = _admin_wallets_value()
     if action == "add":
-        if address not in wallets:
-            wallets.append(address)
-            _set_admin_wallets(wallets)
-        return {"ok": True, "info": "Admin wallet added.", "items": _admin_wallets_value()}
+        if address in wallets:
+            return {
+                "ok": True,
+                "info": "Wallet is already an admin.",
+                "items": wallets,
+                "pending_additions": _load_pending_admin_additions(),
+                "delay_sec": int(ADMIN_ADD_DELAY_SEC),
+            }
+        item = _schedule_pending_admin_addition(address, actor)
+        _notify_admin_wallet_change(
+            "schedule_add",
+            address,
+            actor,
+            extra=f"execute_after={item.get('execute_after')}",
+        )
+        return {
+            "ok": True,
+            "info": f"Admin wallet add scheduled with delay {int(ADMIN_ADD_DELAY_SEC)}s.",
+            "items": _admin_wallets_value(),
+            "pending_additions": _load_pending_admin_additions(),
+            "delay_sec": int(ADMIN_ADD_DELAY_SEC),
+        }
+
+    if action == "execute_add":
+        pending = _execute_pending_admin_addition(address)
+        _notify_admin_wallet_change("execute_add", address, actor, extra=f"scheduled_by={pending.get('created_by')}")
+        return {
+            "ok": True,
+            "info": "Pending admin wallet addition executed.",
+            "items": _admin_wallets_value(),
+            "pending_additions": _load_pending_admin_additions(),
+            "delay_sec": int(ADMIN_ADD_DELAY_SEC),
+        }
+
+    if action == "cancel_add":
+        pending = _cancel_pending_admin_addition(address)
+        if not pending:
+            return {
+                "ok": True,
+                "info": "Pending addition already absent.",
+                "items": _admin_wallets_value(),
+                "pending_additions": _load_pending_admin_additions(),
+                "delay_sec": int(ADMIN_ADD_DELAY_SEC),
+            }
+        _notify_admin_wallet_change("cancel_add", address, actor, extra=f"scheduled_by={pending.get('created_by')}")
+        return {
+            "ok": True,
+            "info": "Pending admin wallet addition canceled.",
+            "items": _admin_wallets_value(),
+            "pending_additions": _load_pending_admin_additions(),
+            "delay_sec": int(ADMIN_ADD_DELAY_SEC),
+        }
 
     # remove
     if address not in wallets:
-        return {"ok": True, "info": "Wallet already absent.", "items": wallets}
+        return {
+            "ok": True,
+            "info": "Wallet already absent.",
+            "items": wallets,
+            "pending_additions": _load_pending_admin_additions(),
+            "delay_sec": int(ADMIN_ADD_DELAY_SEC),
+        }
     if len(wallets) <= 1:
         raise HTTPException(status_code=400, detail="Cannot remove the last admin wallet.")
     wallets = [w for w in wallets if w != address]
     _set_admin_wallets(wallets)
-    return {"ok": True, "info": "Admin wallet removed.", "items": _admin_wallets_value()}
+    _notify_admin_wallet_change("remove", address, actor)
+    return {
+        "ok": True,
+        "info": "Admin wallet removed.",
+        "items": _admin_wallets_value(),
+        "pending_additions": _load_pending_admin_additions(),
+        "delay_sec": int(ADMIN_ADD_DELAY_SEC),
+    }
 
 
 @app.post("/api/admin/pair-lists-manual")
