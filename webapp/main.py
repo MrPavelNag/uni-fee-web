@@ -21427,8 +21427,8 @@ def _eth_decode_address(result_hex: Any) -> str:
     return addr if _is_eth_address(addr) else ""
 
 
-def _riko_onchain_read_daily_bps(rpc_url: str, vault_address: str) -> int:
-    data = _eth_encode_call("dailyYieldRateBps()")
+def _riko_onchain_read_monthly_bps(rpc_url: str, vault_address: str) -> int:
+    data = _eth_encode_call("monthlyYieldRateBps()")
     out = _eth_rpc(rpc_url, "eth_call", [{"to": vault_address, "data": data}, "latest"])
     return _eth_decode_uint256(out)
 
@@ -21439,13 +21439,13 @@ def _riko_onchain_read_owner(rpc_url: str, vault_address: str) -> str:
     return _eth_decode_address(out)
 
 
-def _riko_send_set_daily_bps_tx(rpc_url: str, private_key: str, vault_address: str, next_bps: int) -> tuple[str, int]:
+def _riko_send_set_monthly_bps_tx(rpc_url: str, private_key: str, vault_address: str, next_bps: int) -> tuple[str, int]:
     acct = Account.from_key(private_key)
     from_addr = str(acct.address or "").strip()
     chain_id = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_chainId", []))
     nonce = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_getTransactionCount", [from_addr, "pending"]))
     gas_price = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_gasPrice", []))
-    data = _eth_encode_call("setDailyYieldRateBps(uint256)", ["uint256"], [int(next_bps)])
+    data = _eth_encode_call("setMonthlyYieldRateBps(uint256)", ["uint256"], [int(next_bps)])
     estimate_raw = _eth_rpc(
         rpc_url,
         "eth_estimateGas",
@@ -21514,12 +21514,13 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
     y = _fetch_us_treasury_daily_10y()
     annual_pct = float(y.get("annual_pct") or 0.0)
     daily_pct = float(y.get("daily_pct") or 0.0)
+    monthly_pct = float(annual_pct) / 12.0
     treasury_date = str(y.get("date") or "")
-    raw_target_bps = float(daily_pct) * 100.0
+    raw_target_bps = float(monthly_pct) * 100.0
     target_bps = int(round(raw_target_bps))
     bounded_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
 
-    current_bps = int(_riko_onchain_read_daily_bps(rpc_url, vault))
+    current_bps = int(_riko_onchain_read_monthly_bps(rpc_url, vault))
     next_bps = int(bounded_bps)
     delta = next_bps - current_bps
     max_delta = int(RIKO_AUTO_YIELD_MAX_DELTA_BPS)
@@ -21532,6 +21533,7 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
             "treasury_date": treasury_date,
             "annual_pct": round(annual_pct, 6),
             "daily_pct": round(daily_pct, 8),
+            "monthly_pct": round(monthly_pct, 8),
             "raw_target_bps": raw_target_bps,
             "target_bps": int(target_bps),
             "bounded_bps": int(bounded_bps),
@@ -21545,7 +21547,7 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
         result["action"] = "noop"
         return result
 
-    tx_hash, chain_id = _riko_send_set_daily_bps_tx(rpc_url, private_key, vault, int(next_bps))
+    tx_hash, chain_id = _riko_send_set_monthly_bps_tx(rpc_url, private_key, vault, int(next_bps))
     receipt = _riko_wait_receipt(rpc_url, tx_hash, timeout_sec=240)
     status_num = _eth_hex_to_int(receipt.get("status"))
     if status_num != 1:
@@ -21557,7 +21559,7 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
 
 def _riko_auto_yield_report(result: dict[str, Any]) -> None:
     status = str(result.get("status") or "unknown")
-    lines = ["[UNI_FEE] RIKO auto-yield daily update", f"time: {_iso_now()}", f"status: {status}"]
+    lines = ["[UNI_FEE] RIKO auto-yield monthly update", f"time: {_iso_now()}", f"status: {status}"]
     if result.get("reason"):
         lines.append(f"reason: {result.get('reason')}")
     if result.get("treasury_date"):
@@ -21566,6 +21568,8 @@ def _riko_auto_yield_report(result: dict[str, Any]) -> None:
         lines.append(f"10Y annual: {result.get('annual_pct')}%")
     if result.get("daily_pct") is not None:
         lines.append(f"daily pct: {result.get('daily_pct')}%")
+    if result.get("monthly_pct") is not None:
+        lines.append(f"monthly pct: {result.get('monthly_pct')}%")
     if result.get("target_bps") is not None:
         lines.append(
             f"bps: current={result.get('current_bps')} raw={result.get('target_bps')} "
@@ -22910,6 +22914,7 @@ def _render_riko_page() -> str:
           <button class="btn" type="button" onclick="rikoDeposit()">Deposit</button>
           <button class="btn" type="button" onclick="rikoRedeem()">Redeem</button>
           <button class="btn" type="button" onclick="rikoCheckPendingRedeem()">Check pending redeem</button>
+          <button class="btn" type="button" onclick="rikoCancelPendingRedeem()">Cancel pending redeem</button>
         </div>
       </div>
       <div class="riko-status" id="rikoStatus"></div>
@@ -23442,6 +23447,7 @@ def _render_riko_page() -> str:
       "function redeem(address token,uint256 rikoAmountIn,uint256 minTokenOut,address receiver) external returns (uint256)",
       "function pendingRedemptions(address account,address token) view returns (uint256 rikoLocked,uint256 tokenOut,uint256 minTokenOut,address receiver,bool exists)",
       "function processPendingRedemption(address account,address token) external returns (bool completed,uint256 tokenSent)",
+      "function cancelPendingRedemption(address token) external returns (uint256 rikoReturned)",
       "function globalSupplyCapUsd6() view returns (uint256)",
       "function setGlobalSupplyCapUsd6(uint256 capUsd6) external"
     ];
@@ -23617,6 +23623,35 @@ def _render_riko_page() -> str:
         setRikoStatus("Pending redeem completed.", false);
       } catch (e) {
         setRikoStatus("Pending redeem check failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }
+    }
+    async function rikoCancelPendingRedeem() {
+      try {
+        setRikoStatus("Canceling pending redeem...", false);
+        const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
+        if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured on server");
+        const symbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
+        const vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
+        if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
+        const ethers = await ensureEthers();
+        const signer = await getRikoSigner();
+        const user = await signer.getAddress();
+        const vault = new ethers.Contract(contractAddress, RIKO_ABI, signer);
+        const pending = await vault.pendingRedemptions(user, vaultTokenAddress);
+        if (!pending?.exists) {
+          setRikoStatus("No pending redeem to cancel for selected token.", false);
+          return;
+        }
+        const tx = await vault.cancelPendingRedemption(vaultTokenAddress);
+        setRikoStatus("Cancel pending redeem tx sent: " + tx.hash, false);
+        await tx.wait();
+        setRikoStatus("Pending redeem canceled. RIKO returned to wallet.", false);
+      } catch (e) {
+        if (isWalletUserRejectedError(e)) {
+          setRikoStatus("Signature was rejected in wallet. Cancel was canceled.", true);
+          return;
+        }
+        setRikoStatus("Cancel pending redeem failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }
     }
     (function initRikoPage() {
@@ -29119,7 +29154,8 @@ def _render_admin_page() -> str:
         <div class="row"><label>Custody address</label><div id="adminRikoCustodyCurrent" class="mono">-</div></div>
         <div class="row"><label>Yield payer address</label><div id="adminRikoYieldPayerCurrent" class="mono">-</div></div>
         <div class="row"><label>Yield token</label><div id="adminRikoYieldTokenCurrent" class="mono">-</div></div>
-        <div class="row"><label>Daily yield rate</label><div id="adminRikoDailyYieldCurrent">-</div></div>
+        <div class="row"><label>Monthly yield rate</label><div id="adminRikoMonthlyYieldCurrent">-</div></div>
+        <div class="row"><label>Pending redeem operator</label><div id="adminRikoPendingOperatorCurrent" class="mono">-</div></div>
         <div class="row"><label>RIKO price</label><div id="adminRikoPriceCurrent">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set global cap (USD)</label>
@@ -29142,9 +29178,14 @@ def _render_admin_page() -> str:
           <button class="btn" onclick="applyAdminRikoYieldTokenAddress()">Apply on-chain</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Set daily yield (bps)</label>
-          <input id="adminRikoDailyYieldBpsInput" type="number" min="0" step="1" value="0"/>
-          <button class="btn" onclick="applyAdminRikoDailyYieldBps()">Apply on-chain</button>
+          <label style="margin:0">Set monthly yield (bps)</label>
+          <input id="adminRikoMonthlyYieldBpsInput" type="number" min="0" step="1" value="0"/>
+          <button class="btn" onclick="applyAdminRikoMonthlyYieldBps()">Apply on-chain</button>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Set pending operator</label>
+          <input id="adminRikoPendingOperatorInput" type="text" placeholder="0x... operator"/>
+          <button class="btn" onclick="applyAdminRikoPendingOperator()">Apply on-chain</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set RIKO price (USD)</label>
@@ -29395,14 +29436,16 @@ def _render_admin_page() -> str:
       "function custodyAddress() view returns (address)",
       "function yieldPayerAddress() view returns (address)",
       "function yieldTokenAddress() view returns (address)",
-      "function dailyYieldRateBps() view returns (uint256)",
+      "function monthlyYieldRateBps() view returns (uint256)",
+      "function pendingRedemptionOperator() view returns (address)",
       "function rikoPriceUsd6() view returns (uint256)",
       "function tokenConfigs(address token) view returns (bool allowed,address oracle,uint32 maxOracleAge,bytes32 expectedFeedDescriptionHash,uint8 tokenDecimals)",
       "function setGlobalSupplyCapUsd6(uint256 capUsd6) external",
       "function setCustodyAddress(address newCustodyAddress) external",
       "function setYieldPayerAddress(address newYieldPayerAddress) external",
       "function setYieldTokenAddress(address newYieldTokenAddress) external",
-      "function setDailyYieldRateBps(uint256 newDailyYieldRateBps) external",
+      "function setMonthlyYieldRateBps(uint256 newMonthlyYieldRateBps) external",
+      "function setPendingRedemptionOperator(address operator) external",
       "function setRikoPriceUsd6(uint256 newRikoPriceUsd6) external",
       "function setTokenConfig(address token,bool allowed,address oracle,uint32 maxOracleAge,bytes32 expectedFeedDescriptionHash) external"
     ];
@@ -29416,7 +29459,8 @@ def _render_admin_page() -> str:
       const elCustody = document.getElementById("adminRikoCustodyCurrent");
       const elYieldPayer = document.getElementById("adminRikoYieldPayerCurrent");
       const elYieldToken = document.getElementById("adminRikoYieldTokenCurrent");
-      const elDailyYield = document.getElementById("adminRikoDailyYieldCurrent");
+      const elDailyYield = document.getElementById("adminRikoMonthlyYieldCurrent");
+      const elPendingOperator = document.getElementById("adminRikoPendingOperatorCurrent");
       const elRikoPrice = document.getElementById("adminRikoPriceCurrent");
       const addr = String(RIKO_VAULT_ADDRESS || "").trim();
       if (elAddr) elAddr.textContent = addr || "-";
@@ -29427,6 +29471,7 @@ def _render_admin_page() -> str:
         if (elYieldPayer) elYieldPayer.textContent = "-";
         if (elYieldToken) elYieldToken.textContent = "-";
         if (elDailyYield) elDailyYield.textContent = "-";
+        if (elPendingOperator) elPendingOperator.textContent = "-";
         if (elRikoPrice) elRikoPrice.textContent = "-";
         return;
       }}
@@ -29434,12 +29479,13 @@ def _render_admin_page() -> str:
         const ethers = await ensureEthersAdmin();
         const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
         const vault = new ethers.Contract(addr, ADMIN_RIKO_ABI, provider);
-        const [capUsd6, custody, yieldPayer, yieldToken, dailyBps, rikoPriceUsd6] = await Promise.all([
+        const [capUsd6, custody, yieldPayer, yieldToken, dailyBps, pendingOperator, rikoPriceUsd6] = await Promise.all([
           vault.globalSupplyCapUsd6(),
           vault.custodyAddress(),
           vault.yieldPayerAddress(),
           vault.yieldTokenAddress(),
-          vault.dailyYieldRateBps(),
+          vault.monthlyYieldRateBps(),
+          vault.pendingRedemptionOperator(),
           vault.rikoPriceUsd6(),
         ]);
         const capNum = Number(capUsd6 || 0n);
@@ -29447,18 +29493,21 @@ def _render_admin_page() -> str:
         if (elCustody) elCustody.textContent = String(custody || "-");
         if (elYieldPayer) elYieldPayer.textContent = String(yieldPayer || "-");
         if (elYieldToken) elYieldToken.textContent = String(yieldToken || "-");
-        if (elDailyYield) elDailyYield.textContent = `${{String(dailyBps || 0n)}} bps/day`;
+        if (elDailyYield) elDailyYield.textContent = `${{String(dailyBps || 0n)}} bps/month`;
+        if (elPendingOperator) elPendingOperator.textContent = String(pendingOperator || "-");
         const rikoPriceNum = Number(rikoPriceUsd6 || 0n);
         if (elRikoPrice) elRikoPrice.textContent = `$${{formatUsdFromUsd6Admin(rikoPriceNum)}} (usd6=${{String(rikoPriceUsd6 || 0n)}})`;
         const inCustody = document.getElementById("adminRikoCustodyInput");
         const inYieldPayer = document.getElementById("adminRikoYieldPayerInput");
         const inYieldToken = document.getElementById("adminRikoYieldTokenInput");
-        const inDailyBps = document.getElementById("adminRikoDailyYieldBpsInput");
+        const inDailyBps = document.getElementById("adminRikoMonthlyYieldBpsInput");
+        const inPendingOperator = document.getElementById("adminRikoPendingOperatorInput");
         const inRikoPrice = document.getElementById("adminRikoPriceUsdInput");
         if (inCustody && !String(inCustody.value || "").trim()) inCustody.value = String(custody || "");
         if (inYieldPayer && !String(inYieldPayer.value || "").trim()) inYieldPayer.value = String(yieldPayer || "");
         if (inYieldToken && !String(inYieldToken.value || "").trim()) inYieldToken.value = String(yieldToken || "");
         if (inDailyBps && !String(inDailyBps.value || "").trim()) inDailyBps.value = String(dailyBps || 0n);
+        if (inPendingOperator && !String(inPendingOperator.value || "").trim()) inPendingOperator.value = String(pendingOperator || "");
         if (inRikoPrice && !String(inRikoPrice.value || "").trim()) inRikoPrice.value = String((rikoPriceNum / 1e6) || 1);
       }} catch (_) {{
         elCap.textContent = "unavailable";
@@ -29466,6 +29515,7 @@ def _render_admin_page() -> str:
         if (elYieldPayer) elYieldPayer.textContent = "unavailable";
         if (elYieldToken) elYieldToken.textContent = "unavailable";
         if (elDailyYield) elDailyYield.textContent = "unavailable";
+        if (elPendingOperator) elPendingOperator.textContent = "unavailable";
         if (elRikoPrice) elRikoPrice.textContent = "unavailable";
       }}
     }}
@@ -29567,29 +29617,29 @@ def _render_admin_page() -> str:
         setAdminRikoOnchainStatus("Yield token update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
-    async function applyAdminRikoDailyYieldBps() {{
+    async function applyAdminRikoMonthlyYieldBps() {{
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(RIKO_VAULT_ADDRESS || "").trim();
         if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
-        const bpsInput = document.getElementById("adminRikoDailyYieldBpsInput");
+        const bpsInput = document.getElementById("adminRikoMonthlyYieldBpsInput");
         const bps = Number(String(bpsInput?.value || "").trim());
         if (!Number.isFinite(bps) || bps < 0) throw new Error("Daily yield bps must be >= 0.");
         const signer = await getAdminSigner();
         const ethers = await ensureEthersAdmin();
         const vault = new ethers.Contract(addr, ADMIN_RIKO_ABI, signer);
-        setAdminRikoOnchainStatus("Applying daily yield bps on-chain...", false);
-        const tx = await vault.setDailyYieldRateBps(BigInt(Math.round(bps)));
-        setAdminRikoOnchainStatus("Daily yield bps tx sent: " + tx.hash, false);
+        setAdminRikoOnchainStatus("Applying monthly yield bps on-chain...", false);
+        const tx = await vault.setMonthlyYieldRateBps(BigInt(Math.round(bps)));
+        setAdminRikoOnchainStatus("Monthly yield bps tx sent: " + tx.hash, false);
         await tx.wait();
-        setAdminRikoOnchainStatus("Daily yield bps updated.", false);
+        setAdminRikoOnchainStatus("Monthly yield bps updated.", false);
         await loadAdminRikoGlobalCap();
       }} catch (e) {{
         if (isWalletUserRejectedError(e)) {{
-          setAdminRikoOnchainStatus("Signature was rejected in wallet. Daily yield update was canceled.", true);
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Monthly yield update was canceled.", true);
           return;
         }}
-        setAdminRikoOnchainStatus("Daily yield update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+        setAdminRikoOnchainStatus("Monthly yield update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
     async function applyAdminRikoPriceUsd() {{
@@ -29617,6 +29667,30 @@ def _render_admin_page() -> str:
           return;
         }}
         setAdminRikoOnchainStatus("RIKO price update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function applyAdminRikoPendingOperator() {{
+      try {{
+        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        const opAddr = normalizeEthAddressInput(document.getElementById("adminRikoPendingOperatorInput")?.value || "");
+        if (!opAddr) throw new Error("Pending operator address must be valid.");
+        const signer = await getAdminSigner();
+        const ethers = await ensureEthersAdmin();
+        const vault = new ethers.Contract(addr, ADMIN_RIKO_ABI, signer);
+        setAdminRikoOnchainStatus("Applying pending redemption operator on-chain...", false);
+        const tx = await vault.setPendingRedemptionOperator(opAddr);
+        setAdminRikoOnchainStatus("Pending operator tx sent: " + tx.hash, false);
+        await tx.wait();
+        setAdminRikoOnchainStatus("Pending redemption operator updated.", false);
+        await loadAdminRikoGlobalCap();
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Pending operator update was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("Pending operator update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
     async function loadAdminRikoTokenConfig() {{

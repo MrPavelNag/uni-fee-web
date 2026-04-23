@@ -61,6 +61,9 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     error InvalidRikoPrice();
     error PendingRedemptionExists();
     error PendingRedemptionNotFound();
+    error InvalidPendingRedemptionOperator();
+    error PendingRedemptionOperatorOnly();
+    error YieldMonthlyCapExceeded();
 
     struct TokenConfig {
         bool allowed;
@@ -81,6 +84,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     // 1 RIKO = 1 USD with 6 decimals (USDT-style UX).
     uint256 public constant RIKO_DECIMALS_SCALE = 1e6;
     uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant MONTHLY_YIELD_CAP_BPS = 100; // 1% of monthly minted RIKO
 
     mapping(address => TokenConfig) public tokenConfigs;
     // 0 means "no cap".
@@ -89,10 +93,13 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     address public custodyAddress;
     address public yieldPayerAddress;
     address public yieldTokenAddress;
-    uint256 public dailyYieldRateBps;
+    uint256 public monthlyYieldRateBps;
     uint256 public rikoPriceUsd6;
-    mapping(address => uint256) public lastYieldDay;
+    mapping(address => uint256) public lastYieldMonth;
+    mapping(uint256 => uint256) public mintedRikoByMonth;
+    mapping(uint256 => uint256) public paidYieldByMonth;
     mapping(address => mapping(address => PendingRedemption)) public pendingRedemptions;
+    address public pendingRedemptionOperator;
 
     event TokenConfigUpdated(
         address indexed token,
@@ -108,9 +115,10 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     event CustodyAddressUpdated(address indexed custodyAddress);
     event YieldPayerAddressUpdated(address indexed yieldPayerAddress);
     event YieldTokenAddressUpdated(address indexed yieldTokenAddress);
-    event DailyYieldRateUpdated(uint256 dailyYieldRateBps);
+    event MonthlyYieldRateUpdated(uint256 monthlyYieldRateBps);
     event RikoPriceUpdated(uint256 rikoPriceUsd6);
-    event YieldPaid(address indexed account, uint256 amount, uint256 daysElapsed, uint256 rateBps);
+    event YieldPaid(address indexed account, uint256 amount, uint256 monthsElapsed, uint256 rateBps);
+    event PendingRedemptionOperatorUpdated(address indexed operator);
     event RedeemQueued(
         address indexed account,
         address indexed token,
@@ -179,15 +187,21 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         emit YieldTokenAddressUpdated(newYieldTokenAddress);
     }
 
-    function setDailyYieldRateBps(uint256 newDailyYieldRateBps) external onlyOwner {
-        dailyYieldRateBps = newDailyYieldRateBps;
-        emit DailyYieldRateUpdated(newDailyYieldRateBps);
+    function setMonthlyYieldRateBps(uint256 newMonthlyYieldRateBps) external onlyOwner {
+        monthlyYieldRateBps = newMonthlyYieldRateBps;
+        emit MonthlyYieldRateUpdated(newMonthlyYieldRateBps);
     }
 
     function setRikoPriceUsd6(uint256 newRikoPriceUsd6) external onlyOwner {
         if (newRikoPriceUsd6 == 0) revert InvalidRikoPrice();
         rikoPriceUsd6 = newRikoPriceUsd6;
         emit RikoPriceUpdated(newRikoPriceUsd6);
+    }
+
+    function setPendingRedemptionOperator(address operator) external onlyOwner {
+        if (operator == address(0)) revert InvalidPendingRedemptionOperator();
+        pendingRedemptionOperator = operator;
+        emit PendingRedemptionOperatorUpdated(operator);
     }
 
     function setTokenConfig(
@@ -247,6 +261,8 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         _checkGlobalCapAfterMint(rikoOut);
 
         _mint(receiver, rikoOut);
+        (uint256 currentMonth,) = _currentMonthAndDay();
+        mintedRikoByMonth[currentMonth] += rikoOut;
         address custody = custodyAddress;
         if (custody == address(0)) revert InvalidCustodyAddress();
         asset.safeTransfer(custody, received);
@@ -290,6 +306,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         whenNotPaused
         returns (bool completed, uint256 tokenSent)
     {
+        if (msg.sender != pendingRedemptionOperator) revert PendingRedemptionOperatorOnly();
         PendingRedemption storage p = pendingRedemptions[account][token];
         if (!p.exists) revert PendingRedemptionNotFound();
         TokenConfig memory cfg = _loadAllowedTokenConfig(token);
@@ -322,14 +339,24 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     function claimDailyYield() external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        return _claimDailyYieldFor(msg.sender);
+        // Backward-compatible alias: semantics are monthly payout on first day.
+        return _claimMonthlyYieldFor(msg.sender);
     }
 
     function claimDailyYieldFor(address account) external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        return _claimDailyYieldFor(account);
+        // Backward-compatible alias: semantics are monthly payout on first day.
+        return _claimMonthlyYieldFor(account);
     }
 
-    function _claimDailyYieldFor(address account) internal returns (uint256 payoutAmount) {
+    function claimMonthlyYield() external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
+        return _claimMonthlyYieldFor(msg.sender);
+    }
+
+    function claimMonthlyYieldFor(address account) external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
+        return _claimMonthlyYieldFor(account);
+    }
+
+    function _claimMonthlyYieldFor(address account) internal returns (uint256 payoutAmount) {
         address payer = yieldPayerAddress;
         address yieldToken = yieldTokenAddress;
         if (payer == address(0)) revert InvalidYieldPayerAddress();
@@ -338,26 +365,58 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 balance = balanceOf(account);
         if (balance == 0) revert InvalidAmount();
 
-        uint256 currentDay = _currentDayIndex();
-        uint256 lastDay = lastYieldDay[account];
-        if (lastDay == 0) {
-            lastYieldDay[account] = currentDay;
+        (uint256 currentMonth, uint256 dayOfMonth) = _currentMonthAndDay();
+        if (dayOfMonth != 1) revert YieldNotReady();
+        uint256 lastMonth = lastYieldMonth[account];
+        if (lastMonth == 0) {
+            lastYieldMonth[account] = currentMonth;
             revert YieldNotReady();
         }
-        uint256 daysElapsed = currentDay - lastDay;
-        if (daysElapsed == 0) revert YieldNotReady();
+        uint256 monthsElapsed = _monthsBetween(lastMonth, currentMonth);
+        if (monthsElapsed == 0) revert YieldNotReady();
 
-        uint256 rateBps = dailyYieldRateBps;
+        uint256 rateBps = monthlyYieldRateBps;
         if (rateBps == 0) {
-            lastYieldDay[account] = currentDay;
-            emit YieldPaid(account, 0, daysElapsed, 0);
+            lastYieldMonth[account] = currentMonth;
+            emit YieldPaid(account, 0, monthsElapsed, 0);
             return 0;
         }
 
-        payoutAmount = (balance * rateBps * daysElapsed) / BPS_DENOMINATOR;
-        lastYieldDay[account] = currentDay;
+        payoutAmount = (balance * rateBps * monthsElapsed) / BPS_DENOMINATOR;
+        _consumeMonthlyYieldBudget(lastMonth, monthsElapsed, payoutAmount);
+        lastYieldMonth[account] = currentMonth;
         IERC20Metadata(yieldToken).safeTransferFrom(payer, account, payoutAmount);
-        emit YieldPaid(account, payoutAmount, daysElapsed, rateBps);
+        emit YieldPaid(account, payoutAmount, monthsElapsed, rateBps);
+    }
+
+    function _consumeMonthlyYieldBudget(uint256 firstMonthIndex, uint256 monthsElapsed, uint256 payoutAmount) internal {
+        uint256 availableTotal = 0;
+        uint256 month = firstMonthIndex;
+        for (uint256 i = 0; i < monthsElapsed; i++) {
+            uint256 minted = mintedRikoByMonth[month];
+            uint256 cap = (minted * MONTHLY_YIELD_CAP_BPS) / BPS_DENOMINATOR;
+            uint256 used = paidYieldByMonth[month];
+            if (cap > used) {
+                availableTotal += (cap - used);
+            }
+            month = _nextMonthIndex(month);
+        }
+        if (payoutAmount > availableTotal) revert YieldMonthlyCapExceeded();
+
+        uint256 remaining = payoutAmount;
+        month = firstMonthIndex;
+        for (uint256 i = 0; i < monthsElapsed && remaining > 0; i++) {
+            uint256 minted = mintedRikoByMonth[month];
+            uint256 cap = (minted * MONTHLY_YIELD_CAP_BPS) / BPS_DENOMINATOR;
+            uint256 used = paidYieldByMonth[month];
+            uint256 free = cap > used ? (cap - used) : 0;
+            if (free > 0) {
+                uint256 take = remaining < free ? remaining : free;
+                paidYieldByMonth[month] = used + take;
+                remaining -= take;
+            }
+            month = _nextMonthIndex(month);
+        }
     }
 
     function _loadAllowedTokenConfig(address token) internal view returns (TokenConfig memory cfg) {
@@ -543,8 +602,48 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (receiverAfter - receiverBefore < minTokenOut) revert SlippageExceeded();
     }
 
-    function _currentDayIndex() internal view returns (uint256) {
-        return (block.timestamp / DAY_SECONDS) + 1;
+    function _currentMonthAndDay() internal view returns (uint256 monthIndex, uint256 dayOfMonth) {
+        (uint256 y, uint256 m, uint256 d) = _daysToDate(block.timestamp / DAY_SECONDS);
+        monthIndex = (y * 100) + m;
+        dayOfMonth = d;
+    }
+
+    function _monthsBetween(uint256 fromMonthIndex, uint256 toMonthIndex) internal pure returns (uint256) {
+        uint256 fromYear = fromMonthIndex / 100;
+        uint256 fromMonth = fromMonthIndex % 100;
+        uint256 toYear = toMonthIndex / 100;
+        uint256 toMonth = toMonthIndex % 100;
+        if (toYear < fromYear) return 0;
+        if (toYear == fromYear && toMonth <= fromMonth) return 0;
+        return ((toYear - fromYear) * 12) + (toMonth - fromMonth);
+    }
+
+    function _nextMonthIndex(uint256 monthIndex) internal pure returns (uint256) {
+        uint256 year = monthIndex / 100;
+        uint256 month = monthIndex % 100;
+        if (month >= 12) {
+            return (year + 1) * 100 + 1;
+        }
+        return year * 100 + (month + 1);
+    }
+
+    function _daysToDate(uint256 _days) internal pure returns (uint256 year, uint256 month, uint256 day) {
+        int256 __days = int256(_days);
+
+        int256 L = __days + 68569 + 2440588;
+        int256 N = (4 * L) / 146097;
+        L = L - ((146097 * N + 3) / 4);
+        int256 _year = (4000 * (L + 1)) / 1461001;
+        L = L - ((1461 * _year) / 4) + 31;
+        int256 _month = (80 * L) / 2447;
+        int256 _day = L - ((2447 * _month) / 80);
+        L = _month / 11;
+        _month = _month + 2 - (12 * L);
+        _year = 100 * (N - 49) + _year + L;
+
+        year = uint256(_year);
+        month = uint256(_month);
+        day = uint256(_day);
     }
 
     function _usd6ToRiko(uint256 usd6) internal view returns (uint256) {
@@ -564,12 +663,12 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
 
     function _update(address from, address to, uint256 value) internal override {
         super._update(from, to, value);
-        uint256 day = _currentDayIndex();
+        (uint256 monthIndex,) = _currentMonthAndDay();
         if (from != address(0)) {
-            lastYieldDay[from] = day;
+            lastYieldMonth[from] = monthIndex;
         }
         if (to != address(0)) {
-            lastYieldDay[to] = day;
+            lastYieldMonth[to] = monthIndex;
         }
     }
 }

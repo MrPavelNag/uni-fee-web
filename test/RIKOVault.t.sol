@@ -18,6 +18,7 @@ contract RIKOVaultTest is Test {
 
         bytes32 feedHash = keccak256(bytes("USDC / USD"));
         vault.setTokenConfig(address(usdc), true, address(usdcUsdFeed), 1 days, feedHash);
+        vault.setPendingRedemptionOperator(address(this));
         usdc.approve(address(vault), type(uint256).max);
 
         usdc.mint(alice, 1_000_000e6);
@@ -81,7 +82,11 @@ contract RIKOVaultTest is Test {
     function testClaimDailyYieldPaysFromConfiguredPayer() public {
         vault.setYieldTokenAddress(address(usdc));
         vault.setYieldPayerAddress(address(this));
-        vault.setDailyYieldRateBps(1); // 0.01% daily
+        vault.setMonthlyYieldRateBps(1); // 0.01% monthly
+
+        // 2025-01-15 00:00:00 UTC
+        vm.warp(1_736_899_200);
+        usdcUsdFeed.setRoundData(1e8, block.timestamp);
 
         uint256 depositAmount = 100e6;
         vm.startPrank(alice);
@@ -89,13 +94,14 @@ contract RIKOVaultTest is Test {
         vault.deposit(address(usdc), depositAmount, 0, alice);
         vm.stopPrank();
 
-        vm.warp(block.timestamp + 1 days + 1);
+        // 2025-02-01 00:00:00 UTC (monthly claim window)
+        vm.warp(1_738_368_000);
         uint256 beforeBal = usdc.balanceOf(alice);
         vm.prank(alice);
         uint256 payout = vault.claimDailyYield();
         uint256 afterBal = usdc.balanceOf(alice);
 
-        assertEq(payout, 10_000, "daily payout amount");
+        assertEq(payout, 10_000, "monthly payout amount");
         assertEq(afterBal - beforeBal, payout, "alice receives payout");
     }
 
@@ -129,5 +135,19 @@ contract RIKOVaultTest is Test {
         uint256 out = vault.redeem(address(usdc), 50e6, 0, alice);
         vm.stopPrank();
         assertEq(out, 100e6, "redeem should follow configurable RIKO price");
+    }
+
+    function testProcessPendingRedemptionOnlyOperator() public {
+        vault.setPendingRedemptionOperator(address(0xB0B));
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 50e6, 0, alice);
+        vm.stopPrank();
+        usdc.transfer(address(0xBEEF), 45e6);
+        vm.prank(alice);
+        vault.redeem(address(usdc), 50e6, 0, alice);
+
+        vm.expectRevert(RIKOVault.PendingRedemptionOperatorOnly.selector);
+        vault.processPendingRedemption(alice, address(usdc));
     }
 }

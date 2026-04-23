@@ -18,6 +18,7 @@ contract RIKOVaultNegativeTest is Test {
         usdcUsdFeed = new MockAggregatorV3(8, "USDC / USD", 1e8);
         bytes32 feedHash = keccak256(bytes("USDC / USD"));
         vault.setTokenConfig(address(usdc), true, address(usdcUsdFeed), 1 days, feedHash);
+        vault.setPendingRedemptionOperator(address(this));
         usdc.approve(address(vault), type(uint256).max);
         usdc.mint(alice, 1_000_000e6);
     }
@@ -164,7 +165,7 @@ contract RIKOVaultNegativeTest is Test {
     function testClaimDailyYieldRevertsWhenNoFullDayPassed() public {
         vault.setYieldTokenAddress(address(usdc));
         vault.setYieldPayerAddress(address(this));
-        vault.setDailyYieldRateBps(1);
+        vault.setMonthlyYieldRateBps(1);
 
         vm.startPrank(alice);
         usdc.approve(address(vault), 20e6);
@@ -192,5 +193,28 @@ contract RIKOVaultNegativeTest is Test {
     function testSetRikoPriceRevertsOnZero() public {
         vm.expectRevert(RIKOVault.InvalidRikoPrice.selector);
         vault.setRikoPriceUsd6(0);
+    }
+
+    function testSetPendingRedemptionOperatorRevertsOnZero() public {
+        vm.expectRevert(RIKOVault.InvalidPendingRedemptionOperator.selector);
+        vault.setPendingRedemptionOperator(address(0));
+    }
+
+    function testMonthlyYieldCapRevertsWhenPayoutExceedsOnePercentOfMonthlyMint() public {
+        vault.setYieldTokenAddress(address(usdc));
+        vault.setYieldPayerAddress(address(this));
+        vault.setMonthlyYieldRateBps(200); // 2% monthly > 1% cap
+
+        vm.warp(1_736_899_200); // 2025-01-15
+        usdcUsdFeed.setRoundData(1e8, block.timestamp);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 100e6, 0, alice);
+        vm.stopPrank();
+
+        vm.warp(1_738_368_000); // 2025-02-01
+        vm.prank(alice);
+        vm.expectRevert(RIKOVault.YieldMonthlyCapExceeded.selector);
+        vault.claimDailyYield();
     }
 }

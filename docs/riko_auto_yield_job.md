@@ -1,13 +1,13 @@
 # RIKO automatic daily yield updater
 
-This job updates `dailyYieldRateBps` on-chain from US Treasury 10Y daily data.
+This job updates `monthlyYieldRateBps` on-chain from US Treasury 10Y daily data.
 
 Flow:
 
 1. Read latest US Treasury 10Y from official XML feed.
 2. Convert to daily percent (`annual / 365`) and to `bps/day`.
 3. Apply guardrails (min/max and max step per run).
-4. Send on-chain tx `setDailyYieldRateBps(...)`.
+4. Send on-chain tx `setMonthlyYieldRateBps(...)`.
 5. Send Telegram report with result and tx hash.
 
 ## Required env vars
