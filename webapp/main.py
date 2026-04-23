@@ -29173,15 +29173,15 @@ def _render_admin_page() -> str:
       </section>
       <section class="card">
         <h3>RIKO on-chain controls</h3>
-        <div class="row"><label>Vault address</label><div id="adminRikoVaultAddress" class="mono">-</div></div>
-        <div class="row"><label>Yield distributor</label><div id="adminRikoYieldDistributorAddress" class="mono">-</div></div>
+        <div class="row"><label>Vault address</label><div id="adminRikoVaultAddress">-</div></div>
+        <div class="row"><label>Yield distributor</label><div id="adminRikoYieldDistributorAddress">-</div></div>
         <div class="row"><label>Current global cap</label><div id="adminRikoGlobalCapCurrent">-</div></div>
-        <div class="row"><label>Custody address</label><div id="adminRikoCustodyCurrent" class="mono">-</div></div>
-        <div class="row"><label>Yield payer address</label><div id="adminRikoYieldPayerCurrent" class="mono">-</div></div>
-        <div class="row"><label>Yield token</label><div id="adminRikoYieldTokenCurrent" class="mono">-</div></div>
+        <div class="row"><label>Custody address</label><div id="adminRikoCustodyCurrent">-</div></div>
+        <div class="row"><label>Yield payer address</label><div id="adminRikoYieldPayerCurrent">-</div></div>
+        <div class="row"><label>Yield token</label><div id="adminRikoYieldTokenCurrent">-</div></div>
         <div class="row"><label>Monthly yield rate</label><div id="adminRikoMonthlyYieldCurrent">-</div></div>
         <div class="row"><label>Yield cycle</label><div id="adminRikoYieldCycleCurrent">-</div></div>
-        <div class="row"><label>Pending redeem operator</label><div id="adminRikoPendingOperatorCurrent" class="mono">-</div></div>
+        <div class="row"><label>Pending redeem operator</label><div id="adminRikoPendingOperatorCurrent">-</div></div>
         <div class="row"><label>RIKO price</label><div id="adminRikoPriceCurrent">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set global cap (USD)</label>
