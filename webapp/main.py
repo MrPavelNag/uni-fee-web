@@ -29120,6 +29120,7 @@ def _render_admin_page() -> str:
         <div class="row"><label>Yield payer address</label><div id="adminRikoYieldPayerCurrent" class="mono">-</div></div>
         <div class="row"><label>Yield token</label><div id="adminRikoYieldTokenCurrent" class="mono">-</div></div>
         <div class="row"><label>Daily yield rate</label><div id="adminRikoDailyYieldCurrent">-</div></div>
+        <div class="row"><label>RIKO price</label><div id="adminRikoPriceCurrent">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set global cap (USD)</label>
           <input id="adminRikoGlobalCapUsd" type="number" min="1" step="1" value="1000" />
@@ -29145,6 +29146,40 @@ def _render_admin_page() -> str:
           <input id="adminRikoDailyYieldBpsInput" type="number" min="0" step="1" value="0"/>
           <button class="btn" onclick="applyAdminRikoDailyYieldBps()">Apply on-chain</button>
         </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Set RIKO price (USD)</label>
+          <input id="adminRikoPriceUsdInput" type="number" min="0.000001" step="0.000001" value="1"/>
+          <button class="btn" onclick="applyAdminRikoPriceUsd()">Apply on-chain</button>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Token config: token</label>
+          <input id="adminRikoTokenCfgTokenInput" type="text" placeholder="0x... token address"/>
+          <button class="btn btn-soft" onclick="loadAdminRikoTokenConfig()">Load config</button>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Token config: allowed</label>
+          <select id="adminRikoTokenCfgAllowedInput">
+            <option value="true">true</option>
+            <option value="false">false</option>
+          </select>
+          <span class="hint">false = disable token</span>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Token config: oracle</label>
+          <input id="adminRikoTokenCfgOracleInput" type="text" placeholder="0x... Chainlink feed"/>
+          <span class="hint">token/USD feed</span>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Token config: max age</label>
+          <input id="adminRikoTokenCfgMaxAgeInput" type="number" min="0" step="1" value="86400"/>
+          <span class="hint">seconds</span>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Token config: feed description</label>
+          <input id="adminRikoTokenCfgDescInput" type="text" placeholder="e.g. USDC / USD"/>
+          <button class="btn" onclick="applyAdminRikoTokenConfig()">Apply on-chain</button>
+        </div>
+        <div class="row"><label>Loaded token config</label><div id="adminRikoTokenCfgCurrent" class="mono">-</div></div>
         <p class="hint">Use for pilot cap updates (e.g. 1000 -> higher later).</p>
         <span id="adminRikoOnchainStatus" class="status">Ready</span>
       </section>
@@ -29156,8 +29191,8 @@ def _render_admin_page() -> str:
         <div class="row"><label>Vault interface</label><div class="mono">deposit(token,amount,minRiko,receiver), redeem(token,riko,minToken,receiver)</div></div>
         <div id="adminRikoWhitelistRows"></div>
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-          <button class="btn" onclick="addAdminRikoWhitelistRow()">Add row</button>
-          <button class="btn" onclick="applyAdminRikoWhitelist()">Apply</button>
+          <button type="button" class="btn" onclick="addAdminRikoWhitelistRow()">Add row</button>
+          <button type="button" class="btn" onclick="applyAdminRikoWhitelist()">Apply</button>
         </div>
         <span id="adminRikoWhitelistStatus" class="status">Ready</span>
       </section>
@@ -29361,11 +29396,15 @@ def _render_admin_page() -> str:
       "function yieldPayerAddress() view returns (address)",
       "function yieldTokenAddress() view returns (address)",
       "function dailyYieldRateBps() view returns (uint256)",
+      "function rikoPriceUsd6() view returns (uint256)",
+      "function tokenConfigs(address token) view returns (bool allowed,address oracle,uint32 maxOracleAge,bytes32 expectedFeedDescriptionHash,uint8 tokenDecimals)",
       "function setGlobalSupplyCapUsd6(uint256 capUsd6) external",
       "function setCustodyAddress(address newCustodyAddress) external",
       "function setYieldPayerAddress(address newYieldPayerAddress) external",
       "function setYieldTokenAddress(address newYieldTokenAddress) external",
-      "function setDailyYieldRateBps(uint256 newDailyYieldRateBps) external"
+      "function setDailyYieldRateBps(uint256 newDailyYieldRateBps) external",
+      "function setRikoPriceUsd6(uint256 newRikoPriceUsd6) external",
+      "function setTokenConfig(address token,bool allowed,address oracle,uint32 maxOracleAge,bytes32 expectedFeedDescriptionHash) external"
     ];
     function normalizeEthAddressInput(v) {{
       const raw = String(v || "").trim();
@@ -29378,6 +29417,7 @@ def _render_admin_page() -> str:
       const elYieldPayer = document.getElementById("adminRikoYieldPayerCurrent");
       const elYieldToken = document.getElementById("adminRikoYieldTokenCurrent");
       const elDailyYield = document.getElementById("adminRikoDailyYieldCurrent");
+      const elRikoPrice = document.getElementById("adminRikoPriceCurrent");
       const addr = String(RIKO_VAULT_ADDRESS || "").trim();
       if (elAddr) elAddr.textContent = addr || "-";
       if (!elCap) return;
@@ -29387,18 +29427,20 @@ def _render_admin_page() -> str:
         if (elYieldPayer) elYieldPayer.textContent = "-";
         if (elYieldToken) elYieldToken.textContent = "-";
         if (elDailyYield) elDailyYield.textContent = "-";
+        if (elRikoPrice) elRikoPrice.textContent = "-";
         return;
       }}
       try {{
         const ethers = await ensureEthersAdmin();
         const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
         const vault = new ethers.Contract(addr, ADMIN_RIKO_ABI, provider);
-        const [capUsd6, custody, yieldPayer, yieldToken, dailyBps] = await Promise.all([
+        const [capUsd6, custody, yieldPayer, yieldToken, dailyBps, rikoPriceUsd6] = await Promise.all([
           vault.globalSupplyCapUsd6(),
           vault.custodyAddress(),
           vault.yieldPayerAddress(),
           vault.yieldTokenAddress(),
           vault.dailyYieldRateBps(),
+          vault.rikoPriceUsd6(),
         ]);
         const capNum = Number(capUsd6 || 0n);
         elCap.textContent = capNum <= 0 ? "no cap" : `$${{formatUsdFromUsd6Admin(capNum)}}`;
@@ -29406,20 +29448,25 @@ def _render_admin_page() -> str:
         if (elYieldPayer) elYieldPayer.textContent = String(yieldPayer || "-");
         if (elYieldToken) elYieldToken.textContent = String(yieldToken || "-");
         if (elDailyYield) elDailyYield.textContent = `${{String(dailyBps || 0n)}} bps/day`;
+        const rikoPriceNum = Number(rikoPriceUsd6 || 0n);
+        if (elRikoPrice) elRikoPrice.textContent = `$${{formatUsdFromUsd6Admin(rikoPriceNum)}} (usd6=${{String(rikoPriceUsd6 || 0n)}})`;
         const inCustody = document.getElementById("adminRikoCustodyInput");
         const inYieldPayer = document.getElementById("adminRikoYieldPayerInput");
         const inYieldToken = document.getElementById("adminRikoYieldTokenInput");
         const inDailyBps = document.getElementById("adminRikoDailyYieldBpsInput");
+        const inRikoPrice = document.getElementById("adminRikoPriceUsdInput");
         if (inCustody && !String(inCustody.value || "").trim()) inCustody.value = String(custody || "");
         if (inYieldPayer && !String(inYieldPayer.value || "").trim()) inYieldPayer.value = String(yieldPayer || "");
         if (inYieldToken && !String(inYieldToken.value || "").trim()) inYieldToken.value = String(yieldToken || "");
         if (inDailyBps && !String(inDailyBps.value || "").trim()) inDailyBps.value = String(dailyBps || 0n);
+        if (inRikoPrice && !String(inRikoPrice.value || "").trim()) inRikoPrice.value = String((rikoPriceNum / 1e6) || 1);
       }} catch (_) {{
         elCap.textContent = "unavailable";
         if (elCustody) elCustody.textContent = "unavailable";
         if (elYieldPayer) elYieldPayer.textContent = "unavailable";
         if (elYieldToken) elYieldToken.textContent = "unavailable";
         if (elDailyYield) elDailyYield.textContent = "unavailable";
+        if (elRikoPrice) elRikoPrice.textContent = "unavailable";
       }}
     }}
     async function applyAdminRikoGlobalCap() {{
@@ -29545,6 +29592,102 @@ def _render_admin_page() -> str:
         setAdminRikoOnchainStatus("Daily yield update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
+    async function applyAdminRikoPriceUsd() {{
+      try {{
+        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        const priceInput = document.getElementById("adminRikoPriceUsdInput");
+        const priceUsd = Number(String(priceInput?.value || "").trim());
+        if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("RIKO price must be > 0 USD.");
+        const priceUsd6 = BigInt(Math.round(priceUsd * 1e6));
+        if (priceUsd6 <= 0n) throw new Error("RIKO price must be > 0 after conversion.");
+        const signer = await getAdminSigner();
+        const ethers = await ensureEthersAdmin();
+        const vault = new ethers.Contract(addr, ADMIN_RIKO_ABI, signer);
+        setAdminRikoOnchainStatus("Applying RIKO price on-chain...", false);
+        const tx = await vault.setRikoPriceUsd6(priceUsd6);
+        setAdminRikoOnchainStatus("RIKO price tx sent: " + tx.hash, false);
+        await tx.wait();
+        setAdminRikoOnchainStatus(`RIKO price updated to $${{priceUsd.toLocaleString(undefined, {{maximumFractionDigits: 6}})}}.`, false);
+        await loadAdminRikoGlobalCap();
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. RIKO price update was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("RIKO price update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function loadAdminRikoTokenConfig() {{
+      try {{
+        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        const token = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgTokenInput")?.value || "");
+        if (!token) throw new Error("Invalid token address.");
+        const ethers = await ensureEthersAdmin();
+        const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+        const vault = new ethers.Contract(addr, ADMIN_RIKO_ABI, provider);
+        const cfg = await vault.tokenConfigs(token);
+        const allowed = !!cfg?.allowed;
+        const oracle = String(cfg?.oracle || "");
+        const maxAge = Number(cfg?.maxOracleAge || 0n);
+        const descHash = String(cfg?.expectedFeedDescriptionHash || "");
+        const tokenDecimals = Number(cfg?.tokenDecimals || 0n);
+        const allowedInput = document.getElementById("adminRikoTokenCfgAllowedInput");
+        const oracleInput = document.getElementById("adminRikoTokenCfgOracleInput");
+        const maxAgeInput = document.getElementById("adminRikoTokenCfgMaxAgeInput");
+        if (allowedInput) allowedInput.value = allowed ? "true" : "false";
+        if (oracleInput) oracleInput.value = oracle;
+        if (maxAgeInput) maxAgeInput.value = String(maxAge || 0);
+        const cur = document.getElementById("adminRikoTokenCfgCurrent");
+        if (cur) {{
+          cur.textContent = `allowed=${{allowed}} oracle=${{oracle}} maxAge=${{maxAge}} hash=${{descHash}} tokenDecimals=${{tokenDecimals}}`;
+        }}
+        setAdminRikoOnchainStatus("Token config loaded.", false);
+      }} catch (e) {{
+        setAdminRikoOnchainStatus("Load token config failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function applyAdminRikoTokenConfig() {{
+      try {{
+        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        const token = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgTokenInput")?.value || "");
+        if (!token) throw new Error("Invalid token address.");
+        const allowed = String(document.getElementById("adminRikoTokenCfgAllowedInput")?.value || "true").trim() === "true";
+        let oracle = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgOracleInput")?.value || "");
+        let maxAge = Number(String(document.getElementById("adminRikoTokenCfgMaxAgeInput")?.value || "").trim());
+        const desc = String(document.getElementById("adminRikoTokenCfgDescInput")?.value || "").trim();
+        let feedHash = "0x" + "00".repeat(32);
+        const ethers = await ensureEthersAdmin();
+        if (allowed) {{
+          if (!oracle) throw new Error("Oracle address is required when allowed=true.");
+          if (!Number.isFinite(maxAge) || maxAge <= 0) throw new Error("Max age must be > 0 when allowed=true.");
+          if (!desc) throw new Error("Feed description is required when allowed=true (e.g. USDC / USD).");
+          feedHash = ethers.keccak256(ethers.toUtf8Bytes(desc));
+        }} else {{
+          oracle = "0x0000000000000000000000000000000000000000";
+          maxAge = 0;
+          feedHash = "0x" + "00".repeat(32);
+        }}
+        const signer = await getAdminSigner();
+        const vault = new ethers.Contract(addr, ADMIN_RIKO_ABI, signer);
+        setAdminRikoOnchainStatus("Applying token config on-chain...", false);
+        const tx = await vault.setTokenConfig(token, allowed, oracle, BigInt(Math.round(maxAge)), feedHash);
+        setAdminRikoOnchainStatus("Token config tx sent: " + tx.hash, false);
+        await tx.wait();
+        setAdminRikoOnchainStatus("Token config updated.", false);
+        await loadAdminRikoTokenConfig();
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Token config update was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("Token config update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
     let adminRikoWhitelistItems = [];
     let adminRikoWhitelistSymbolAddresses = {{}};
     function setAdminRikoWhitelistStatus(text, isErr) {{
@@ -29588,12 +29731,27 @@ def _render_admin_page() -> str:
         <div style="display:grid;grid-template-columns:minmax(120px,180px) minmax(180px,1fr) auto;gap:8px;align-items:center;margin:8px 0;">
           <input data-admin-riko-field="symbol" data-index="${{idx}}" placeholder="symbol" value="${{esc(it?.symbol || "")}}" />
           <input data-admin-riko-field="address" data-index="${{idx}}" placeholder="0x... or native" value="${{esc(it?.address || "")}}" />
-          <button class="btn danger" onclick="removeAdminRikoWhitelistRow(${{idx}})">-</button>
+          <button type="button" class="btn danger" onclick="removeAdminRikoWhitelistRow(${{idx}})">-</button>
         </div>
       `).join("");
       for (const input of rowsEl.querySelectorAll("input")) {{
         input.addEventListener("input", onAdminRikoWhitelistInputChanged);
       }}
+    }}
+    function snapshotAdminRikoWhitelistRows() {{
+      const rowsEl = document.getElementById("adminRikoWhitelistRows");
+      if (!rowsEl) return Array.isArray(adminRikoWhitelistItems) ? [...adminRikoWhitelistItems] : [];
+      const byIndex = new Map();
+      for (const input of rowsEl.querySelectorAll("input[data-index]")) {{
+        const idx = Number(input.dataset.index ?? -1);
+        if (!Number.isInteger(idx) || idx < 0) continue;
+        const entry = byIndex.get(idx) || {{symbol:"", address:""}};
+        const field = input.dataset.adminRikoField;
+        if (field === "symbol") entry.symbol = String(input.value || "").trim().toLowerCase();
+        if (field === "address") entry.address = String(input.value || "").trim();
+        byIndex.set(idx, entry);
+      }}
+      return Array.from(byIndex.keys()).sort((a, b) => a - b).map((idx) => byIndex.get(idx) || {{symbol:"", address:""}});
     }}
     function onAdminRikoWhitelistInputChanged(e) {{
       const field = e?.target?.dataset?.adminRikoField;
@@ -29617,12 +29775,15 @@ def _render_admin_page() -> str:
       adminRikoWhitelistItems[idx] = current;
     }}
     function addAdminRikoWhitelistRow() {{
-      adminRikoWhitelistItems.push({{symbol:"", address:""}});
+      const snapshot = snapshotAdminRikoWhitelistRows();
+      snapshot.push({{symbol:"", address:""}});
+      adminRikoWhitelistItems = snapshot;
       renderAdminRikoWhitelistEditor();
       setAdminRikoWhitelistStatus("Row added. Enter symbol; known address is auto-filled.", false);
     }}
     function removeAdminRikoWhitelistRow(idx) {{
-      adminRikoWhitelistItems = adminRikoWhitelistItems.filter((_, i) => i !== idx);
+      const snapshot = snapshotAdminRikoWhitelistRows();
+      adminRikoWhitelistItems = snapshot.filter((_, i) => i !== idx);
       renderAdminRikoWhitelistEditor();
       setAdminRikoWhitelistStatus("Row removed.", false);
     }}

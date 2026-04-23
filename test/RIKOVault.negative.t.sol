@@ -188,4 +188,9 @@ contract RIKOVaultNegativeTest is Test {
         assertFalse(completed, "must wait for custody refill");
         assertEq(sent, 0, "no transfer yet");
     }
+
+    function testSetRikoPriceRevertsOnZero() public {
+        vm.expectRevert(RIKOVault.InvalidRikoPrice.selector);
+        vault.setRikoPriceUsd6(0);
+    }
 }

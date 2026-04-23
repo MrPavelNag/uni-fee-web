@@ -117,4 +117,17 @@ contract RIKOVaultTest is Test {
         assertEq(sentBefore, 50e6, "token sent");
         assertEq(vault.balanceOf(alice), 0, "riko burned after completion");
     }
+
+    function testRikoPriceAffectsMintAndRedeem() public {
+        vault.setRikoPriceUsd6(2e6); // 1 RIKO = 2 USD
+
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        uint256 minted = vault.deposit(address(usdc), 100e6, 0, alice);
+        assertEq(minted, 50e6, "mint should follow configurable RIKO price");
+
+        uint256 out = vault.redeem(address(usdc), 50e6, 0, alice);
+        vm.stopPrank();
+        assertEq(out, 100e6, "redeem should follow configurable RIKO price");
+    }
 }
