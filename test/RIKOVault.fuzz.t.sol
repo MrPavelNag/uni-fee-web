@@ -41,7 +41,7 @@ contract RIKOVaultFuzzTest is Test {
 
         vm.startPrank(alice);
         usdc.approve(address(vault), depositAmount);
-        vm.expectRevert(RIKOVault.SlippageExceeded.selector);
+        vm.expectRevert(RIKOVault.RV_SlippageExceeded.selector);
         vault.deposit(address(usdc), depositAmount, minOut, alice);
         vm.stopPrank();
     }
@@ -69,7 +69,7 @@ contract RIKOVaultFuzzTest is Test {
 
         vm.startPrank(alice);
         usdc.approve(address(vault), depositAmount);
-        vm.expectRevert(RIKOVault.OraclePriceStale.selector);
+        vm.expectRevert(RIKOVault.RV_OraclePriceStale.selector);
         vault.deposit(address(usdc), depositAmount, 0, alice);
         vm.stopPrank();
     }

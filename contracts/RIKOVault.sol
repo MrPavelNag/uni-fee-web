@@ -8,16 +8,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-
-interface IChainlinkAggregatorV3 {
-    function latestRoundData()
-        external
-        view
-        returns (uint80, int256, uint256, uint256, uint80);
-
-    function decimals() external view returns (uint8);
-    function description() external view returns (string memory);
-}
+import {IChainlinkAggregatorV3} from "./interfaces/IChainlinkAggregatorV3.sol";
 
 /**
  * @title RIKOVault
@@ -36,34 +27,42 @@ interface IChainlinkAggregatorV3 {
 contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20Metadata;
 
+    /*//////////////////////////////////////////////////////////////
+                                CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
     uint8 private constant MIN_DECIMALS = 1;
     uint8 private constant MAX_DECIMALS = 18;
     uint8 private constant USD_DECIMALS = 6;
-    uint256 private constant DAY_SECONDS = 1 days;
+    uint8 private constant RIKO_DECIMALS = 6;
 
-    error UnsupportedToken();
-    error InvalidAmount();
-    error InvalidReceiver();
-    error InvalidOracle();
-    error OracleFeedMismatch();
-    error OraclePriceInvalid();
-    error OraclePriceStale();
-    error OracleDecimalsInvalid();
-    error TokenDecimalsInvalid();
-    error SlippageExceeded();
-    error InsufficientLiquidity();
-    error GlobalCapExceeded();
-    error TokenCapExceeded();
-    error InvalidCustodyAddress();
-    error InvalidYieldPayerAddress();
-    error InvalidYieldToken();
-    error YieldNotReady();
-    error InvalidRikoPrice();
-    error PendingRedemptionExists();
-    error PendingRedemptionNotFound();
-    error InvalidPendingRedemptionOperator();
-    error PendingRedemptionOperatorOnly();
-    error YieldMonthlyCapExceeded();
+    /*//////////////////////////////////////////////////////////////
+                                  ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    error RV_UnsupportedToken();
+    error RV_InvalidAmount();
+    error RV_InvalidReceiver();
+    error RV_InvalidOracle();
+    error RV_OracleFeedMismatch();
+    error RV_OraclePriceInvalid();
+    error RV_OraclePriceStale();
+    error RV_OracleDecimalsInvalid();
+    error RV_TokenDecimalsInvalid();
+    error RV_SlippageExceeded();
+    error RV_InsufficientLiquidity();
+    error RV_GlobalCapExceeded();
+    error RV_TokenCapExceeded();
+    error RV_InvalidCustodyAddress();
+    error RV_InvalidRikoPrice();
+    error RV_PendingRedemptionExists();
+    error RV_PendingRedemptionNotFound();
+    error RV_InvalidPendingRedemptionOperator();
+    error RV_PendingRedemptionOperatorOnly();
+
+    /*//////////////////////////////////////////////////////////////
+                                   TYPES
+    //////////////////////////////////////////////////////////////*/
 
     struct TokenConfig {
         bool allowed;
@@ -81,25 +80,25 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         bool exists;
     }
 
+    /*//////////////////////////////////////////////////////////////
+                                  STORAGE
+    //////////////////////////////////////////////////////////////*/
+
     // 1 RIKO = 1 USD with 6 decimals (USDT-style UX).
     uint256 public constant RIKO_DECIMALS_SCALE = 1e6;
-    uint256 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant MONTHLY_YIELD_CAP_BPS = 100; // 1% of monthly minted RIKO
 
     mapping(address => TokenConfig) public tokenConfigs;
     // 0 means "no cap".
     uint256 public globalSupplyCapUsd6;
     mapping(address => uint256) public tokenTvlCapUsd6;
     address public custodyAddress;
-    address public yieldPayerAddress;
-    address public yieldTokenAddress;
-    uint256 public monthlyYieldRateBps;
     uint256 public rikoPriceUsd6;
-    mapping(address => uint256) public lastYieldMonth;
-    mapping(uint256 => uint256) public mintedRikoByMonth;
-    mapping(uint256 => uint256) public paidYieldByMonth;
     mapping(address => mapping(address => PendingRedemption)) public pendingRedemptions;
     address public pendingRedemptionOperator;
+
+    /*//////////////////////////////////////////////////////////////
+                                   EVENTS
+    //////////////////////////////////////////////////////////////*/
 
     event TokenConfigUpdated(
         address indexed token,
@@ -113,11 +112,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     event GlobalSupplyCapUpdated(uint256 capUsd6);
     event TokenTvlCapUpdated(address indexed token, uint256 capUsd6);
     event CustodyAddressUpdated(address indexed custodyAddress);
-    event YieldPayerAddressUpdated(address indexed yieldPayerAddress);
-    event YieldTokenAddressUpdated(address indexed yieldTokenAddress);
-    event MonthlyYieldRateUpdated(uint256 monthlyYieldRateBps);
     event RikoPriceUpdated(uint256 rikoPriceUsd6);
-    event YieldPaid(address indexed account, uint256 amount, uint256 monthsElapsed, uint256 rateBps);
     event PendingRedemptionOperatorUpdated(address indexed operator);
     event RedeemQueued(
         address indexed account,
@@ -128,82 +123,86 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 minTokenOut
     );
     event RedeemCompleted(
-        address indexed account,
-        address indexed token,
-        address indexed receiver,
-        uint256 rikoBurned,
-        uint256 tokenOut
+        address indexed account, address indexed token, address indexed receiver, uint256 rikoBurned, uint256 tokenOut
     );
     event RedeemCancelled(address indexed account, address indexed token, uint256 rikoReturned);
 
+    /*//////////////////////////////////////////////////////////////
+                                 LIFECYCLE
+    //////////////////////////////////////////////////////////////*/
+
     constructor(address admin) ERC20("RIKO", "RIKO") Ownable(admin) {
-        if (admin == address(0)) revert InvalidReceiver();
+        if (admin == address(0)) revert RV_InvalidReceiver();
         custodyAddress = admin;
-        yieldPayerAddress = admin;
         rikoPriceUsd6 = RIKO_DECIMALS_SCALE;
         emit CustodyAddressUpdated(admin);
-        emit YieldPayerAddressUpdated(admin);
-        emit RikoPriceUpdated(RIKO_DECIMALS_SCALE);
+        emit RikoPriceUpdated(rikoPriceUsd6);
     }
+
+    /*//////////////////////////////////////////////////////////////
+                             ADMIN FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
 
     function decimals() public pure override returns (uint8) {
-        return 6;
+        return RIKO_DECIMALS;
     }
 
+    /// @notice Pause state-changing user actions.
     function pause() external onlyOwner {
         _pause();
     }
 
+    /// @notice Unpause state-changing user actions.
     function unpause() external onlyOwner {
         _unpause();
     }
 
+    /// @notice Set global TVL cap in USD6 for total minted RIKO supply.
+    /// @param capUsd6 Cap value in 6-decimal USD units. Zero disables the cap.
     function setGlobalSupplyCapUsd6(uint256 capUsd6) external onlyOwner {
         globalSupplyCapUsd6 = capUsd6;
         emit GlobalSupplyCapUpdated(capUsd6);
     }
 
+    /// @notice Set per-token TVL cap in USD6 based on vault + custody exposure.
+    /// @param token Whitelisted token address.
+    /// @param capUsd6 Cap value in 6-decimal USD units. Zero disables the cap.
     function setTokenTvlCapUsd6(address token, uint256 capUsd6) external onlyOwner {
-        if (token == address(0)) revert UnsupportedToken();
+        if (token == address(0)) revert RV_UnsupportedToken();
         tokenTvlCapUsd6[token] = capUsd6;
         emit TokenTvlCapUpdated(token, capUsd6);
     }
 
+    /// @notice Set custody address where incoming deposits are forwarded.
+    /// @param newCustodyAddress New custody wallet address.
     function setCustodyAddress(address newCustodyAddress) external onlyOwner {
-        if (newCustodyAddress == address(0)) revert InvalidCustodyAddress();
+        if (newCustodyAddress == address(0)) revert RV_InvalidCustodyAddress();
         custodyAddress = newCustodyAddress;
         emit CustodyAddressUpdated(newCustodyAddress);
     }
 
-    function setYieldPayerAddress(address newYieldPayerAddress) external onlyOwner {
-        if (newYieldPayerAddress == address(0)) revert InvalidYieldPayerAddress();
-        yieldPayerAddress = newYieldPayerAddress;
-        emit YieldPayerAddressUpdated(newYieldPayerAddress);
-    }
-
-    function setYieldTokenAddress(address newYieldTokenAddress) external onlyOwner {
-        if (newYieldTokenAddress == address(0)) revert InvalidYieldToken();
-        yieldTokenAddress = newYieldTokenAddress;
-        emit YieldTokenAddressUpdated(newYieldTokenAddress);
-    }
-
-    function setMonthlyYieldRateBps(uint256 newMonthlyYieldRateBps) external onlyOwner {
-        monthlyYieldRateBps = newMonthlyYieldRateBps;
-        emit MonthlyYieldRateUpdated(newMonthlyYieldRateBps);
-    }
-
+    /// @notice Set configurable RIKO price in USD6 for mint/redeem conversions.
+    /// @param newRikoPriceUsd6 New price in 6-decimal USD units.
     function setRikoPriceUsd6(uint256 newRikoPriceUsd6) external onlyOwner {
-        if (newRikoPriceUsd6 == 0) revert InvalidRikoPrice();
+        if (newRikoPriceUsd6 == 0) revert RV_InvalidRikoPrice();
         rikoPriceUsd6 = newRikoPriceUsd6;
         emit RikoPriceUpdated(newRikoPriceUsd6);
     }
 
+    /// @notice Set operator allowed to settle queued pending redemptions.
+    /// @param operator Operator address.
     function setPendingRedemptionOperator(address operator) external onlyOwner {
-        if (operator == address(0)) revert InvalidPendingRedemptionOperator();
+        if (operator == address(0)) revert RV_InvalidPendingRedemptionOperator();
         pendingRedemptionOperator = operator;
         emit PendingRedemptionOperatorUpdated(operator);
     }
 
+    /// @notice Add or update token whitelist config and oracle constraints.
+    /// @param token Token address.
+    /// @param allowed Whether token is enabled for deposit/redeem.
+    /// @param oracle Chainlink feed address for token/USD.
+    /// @param maxOracleAge Maximum accepted feed age in seconds.
+    /// @param expectedFeedDescriptionHash Keccak hash of expected feed description.
     function setTokenConfig(
         address token,
         bool allowed,
@@ -211,19 +210,12 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         uint32 maxOracleAge,
         bytes32 expectedFeedDescriptionHash
     ) external onlyOwner {
-        if (token == address(0)) revert UnsupportedToken();
+        if (token == address(0)) revert RV_UnsupportedToken();
         uint8 tokenDecimals = 0;
         if (allowed) {
             tokenDecimals = IERC20Metadata(token).decimals();
             _requireTokenDecimals(tokenDecimals);
-            if (oracle == address(0)) revert InvalidOracle();
-            if (maxOracleAge == 0) revert OraclePriceInvalid();
-            if (expectedFeedDescriptionHash == bytes32(0)) revert OracleFeedMismatch();
-            IChainlinkAggregatorV3 feed = IChainlinkAggregatorV3(oracle);
-            uint8 feedDecimals = feed.decimals();
-            _requireOracleDecimals(feedDecimals);
-            bytes32 gotHash = keccak256(bytes(feed.description()));
-            if (gotHash != expectedFeedDescriptionHash) revert OracleFeedMismatch();
+            _validateOracleConfig(oracle, maxOracleAge, expectedFeedDescriptionHash);
         }
         tokenConfigs[token] = TokenConfig({
             allowed: allowed,
@@ -235,6 +227,18 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         emit TokenConfigUpdated(token, allowed, oracle, maxOracleAge, expectedFeedDescriptionHash);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                             USER FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Deposit whitelisted token and mint RIKO to receiver.
+    /// @dev Security: uses pull-then-accounting flow with `nonReentrant`, strict oracle checks,
+    ///      global/per-token caps, and forwards received funds to custody.
+    /// @param token Input token address.
+    /// @param amountIn Token amount requested from sender.
+    /// @param minRikoOut Minimum accepted RIKO mint amount.
+    /// @param receiver Receiver of minted RIKO.
+    /// @return rikoOut Minted RIKO amount.
     function deposit(address token, uint256 amountIn, uint256 minRikoOut, address receiver)
         external
         nonReentrant
@@ -250,26 +254,31 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         asset.safeTransferFrom(msg.sender, address(this), amountIn);
         uint256 afterBal = asset.balanceOf(address(this));
         uint256 received = afterBal - beforeBal;
-        if (received == 0) revert InvalidAmount();
+        if (received == 0) revert RV_InvalidAmount();
 
         (uint256 price, uint8 oracleDecimals) = _readOracle(cfg);
         uint256 usd6 = _tokenToUsd6WithOracle(cfg, received, price, oracleDecimals);
-        if (usd6 == 0) revert OraclePriceInvalid();
+        if (usd6 == 0) revert RV_OraclePriceInvalid();
         rikoOut = _usd6ToRiko(usd6);
-        if (rikoOut == 0) revert InvalidAmount();
-        if (rikoOut < minRikoOut) revert SlippageExceeded();
+        if (rikoOut == 0) revert RV_InvalidAmount();
+        if (rikoOut < minRikoOut) revert RV_SlippageExceeded();
         _checkGlobalCapAfterMint(rikoOut);
 
         _mint(receiver, rikoOut);
-        (uint256 currentMonth,) = _currentMonthAndDay();
-        mintedRikoByMonth[currentMonth] += rikoOut;
-        address custody = custodyAddress;
-        if (custody == address(0)) revert InvalidCustodyAddress();
+        address custody = _requireConfiguredCustody();
         asset.safeTransfer(custody, received);
         _checkTokenCapAfterDeposit(token, cfg, asset, price, oracleDecimals);
         emit Deposited(receiver, token, received, rikoOut);
     }
 
+    /// @notice Redeem RIKO to selected whitelisted token.
+    /// @dev Security: enforces min-out check, and if liquidity is insufficient,
+    ///      queues redemption instead of force-reverting state.
+    /// @param token Output token address.
+    /// @param rikoAmountIn Amount of RIKO to redeem.
+    /// @param minTokenOut Minimum accepted token output amount.
+    /// @param receiver Receiver of output tokens.
+    /// @return tokenOut Output token amount, or zero if queued.
     function redeem(address token, uint256 rikoAmountIn, uint256 minTokenOut, address receiver)
         external
         nonReentrant
@@ -281,7 +290,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         TokenConfig memory cfg = _loadAllowedTokenConfig(token);
 
         tokenOut = _usd6ToToken(cfg, _rikoToUsd6(rikoAmountIn));
-        if (tokenOut < minTokenOut) revert SlippageExceeded();
+        if (tokenOut < minTokenOut) revert RV_SlippageExceeded();
 
         if (_canSettleNow(token, tokenOut)) {
             _settleRedeem(msg.sender, token, receiver, rikoAmountIn, tokenOut, minTokenOut);
@@ -289,7 +298,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         }
 
         PendingRedemption storage p = pendingRedemptions[msg.sender][token];
-        if (p.exists) revert PendingRedemptionExists();
+        if (p.exists) revert RV_PendingRedemptionExists();
         _transfer(msg.sender, address(this), rikoAmountIn);
         p.rikoLocked = rikoAmountIn;
         p.tokenOut = tokenOut;
@@ -300,18 +309,25 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         return 0;
     }
 
+    /// @notice Operator-only settlement of a queued redemption.
+    /// @dev Security: restricted to configured operator to avoid arbitrary third-party
+    ///      triggering of custody pull attempts.
+    /// @param account Account that owns queued redemption.
+    /// @param token Token address for queued redemption.
+    /// @return completed True when settlement executed.
+    /// @return tokenSent Actual token amount transferred to receiver.
     function processPendingRedemption(address account, address token)
         external
         nonReentrant
         whenNotPaused
         returns (bool completed, uint256 tokenSent)
     {
-        if (msg.sender != pendingRedemptionOperator) revert PendingRedemptionOperatorOnly();
+        if (msg.sender != pendingRedemptionOperator) revert RV_PendingRedemptionOperatorOnly();
         PendingRedemption storage p = pendingRedemptions[account][token];
-        if (!p.exists) revert PendingRedemptionNotFound();
+        if (!p.exists) revert RV_PendingRedemptionNotFound();
         TokenConfig memory cfg = _loadAllowedTokenConfig(token);
         uint256 tokenOutCurrent = _usd6ToToken(cfg, _rikoToUsd6(p.rikoLocked));
-        if (tokenOutCurrent < p.minTokenOut) revert SlippageExceeded();
+        if (tokenOutCurrent < p.minTokenOut) revert RV_SlippageExceeded();
         if (!_canSettleNow(token, tokenOutCurrent)) {
             return (false, 0);
         }
@@ -319,117 +335,51 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         return (true, tokenSent);
     }
 
+    /// @notice Cancel caller's queued redemption and return locked RIKO.
+    /// @param token Token key used for queued redemption.
+    /// @return rikoReturned Amount of RIKO returned to caller.
     function cancelPendingRedemption(address token) external nonReentrant whenNotPaused returns (uint256 rikoReturned) {
         PendingRedemption storage p = pendingRedemptions[msg.sender][token];
-        if (!p.exists) revert PendingRedemptionNotFound();
+        if (!p.exists) revert RV_PendingRedemptionNotFound();
         rikoReturned = p.rikoLocked;
         delete pendingRedemptions[msg.sender][token];
         _transfer(address(this), msg.sender, rikoReturned);
         emit RedeemCancelled(msg.sender, token, rikoReturned);
     }
 
+    /// @notice Quote RIKO mint amount for token deposit input.
+    /// @param token Input token address.
+    /// @param amountIn Input token amount.
+    /// @return rikoOut Expected RIKO output.
     function quoteDeposit(address token, uint256 amountIn) external view returns (uint256 rikoOut) {
         TokenConfig memory cfg = _loadAllowedTokenConfig(token);
         rikoOut = _tokenToUsd6(cfg, amountIn);
     }
 
+    /// @notice Quote token output amount for RIKO redemption input.
+    /// @param token Output token address.
+    /// @param rikoIn RIKO redemption amount.
+    /// @return tokenOut Expected token output.
     function quoteRedeem(address token, uint256 rikoIn) external view returns (uint256 tokenOut) {
         TokenConfig memory cfg = _loadAllowedTokenConfig(token);
         tokenOut = _usd6ToToken(cfg, _rikoToUsd6(rikoIn));
     }
 
-    function claimDailyYield() external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        // Backward-compatible alias: semantics are monthly payout on first day.
-        return _claimMonthlyYieldFor(msg.sender);
-    }
-
-    function claimDailyYieldFor(address account) external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        // Backward-compatible alias: semantics are monthly payout on first day.
-        return _claimMonthlyYieldFor(account);
-    }
-
-    function claimMonthlyYield() external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        return _claimMonthlyYieldFor(msg.sender);
-    }
-
-    function claimMonthlyYieldFor(address account) external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        return _claimMonthlyYieldFor(account);
-    }
-
-    function _claimMonthlyYieldFor(address account) internal returns (uint256 payoutAmount) {
-        address payer = yieldPayerAddress;
-        address yieldToken = yieldTokenAddress;
-        if (payer == address(0)) revert InvalidYieldPayerAddress();
-        if (yieldToken == address(0)) revert InvalidYieldToken();
-
-        uint256 balance = balanceOf(account);
-        if (balance == 0) revert InvalidAmount();
-
-        (uint256 currentMonth, uint256 dayOfMonth) = _currentMonthAndDay();
-        if (dayOfMonth != 1) revert YieldNotReady();
-        uint256 lastMonth = lastYieldMonth[account];
-        if (lastMonth == 0) {
-            lastYieldMonth[account] = currentMonth;
-            revert YieldNotReady();
-        }
-        uint256 monthsElapsed = _monthsBetween(lastMonth, currentMonth);
-        if (monthsElapsed == 0) revert YieldNotReady();
-
-        uint256 rateBps = monthlyYieldRateBps;
-        if (rateBps == 0) {
-            lastYieldMonth[account] = currentMonth;
-            emit YieldPaid(account, 0, monthsElapsed, 0);
-            return 0;
-        }
-
-        payoutAmount = (balance * rateBps * monthsElapsed) / BPS_DENOMINATOR;
-        _consumeMonthlyYieldBudget(lastMonth, monthsElapsed, payoutAmount);
-        lastYieldMonth[account] = currentMonth;
-        IERC20Metadata(yieldToken).safeTransferFrom(payer, account, payoutAmount);
-        emit YieldPaid(account, payoutAmount, monthsElapsed, rateBps);
-    }
-
-    function _consumeMonthlyYieldBudget(uint256 firstMonthIndex, uint256 monthsElapsed, uint256 payoutAmount) internal {
-        uint256 availableTotal = 0;
-        uint256 month = firstMonthIndex;
-        for (uint256 i = 0; i < monthsElapsed; i++) {
-            uint256 minted = mintedRikoByMonth[month];
-            uint256 cap = (minted * MONTHLY_YIELD_CAP_BPS) / BPS_DENOMINATOR;
-            uint256 used = paidYieldByMonth[month];
-            if (cap > used) {
-                availableTotal += (cap - used);
-            }
-            month = _nextMonthIndex(month);
-        }
-        if (payoutAmount > availableTotal) revert YieldMonthlyCapExceeded();
-
-        uint256 remaining = payoutAmount;
-        month = firstMonthIndex;
-        for (uint256 i = 0; i < monthsElapsed && remaining > 0; i++) {
-            uint256 minted = mintedRikoByMonth[month];
-            uint256 cap = (minted * MONTHLY_YIELD_CAP_BPS) / BPS_DENOMINATOR;
-            uint256 used = paidYieldByMonth[month];
-            uint256 free = cap > used ? (cap - used) : 0;
-            if (free > 0) {
-                uint256 take = remaining < free ? remaining : free;
-                paidYieldByMonth[month] = used + take;
-                remaining -= take;
-            }
-            month = _nextMonthIndex(month);
-        }
-    }
+    /*//////////////////////////////////////////////////////////////
+                             INTERNAL LOGIC
+    //////////////////////////////////////////////////////////////*/
 
     function _loadAllowedTokenConfig(address token) internal view returns (TokenConfig memory cfg) {
         cfg = tokenConfigs[token];
-        if (!cfg.allowed) revert UnsupportedToken();
+        if (!cfg.allowed) revert RV_UnsupportedToken();
     }
 
     function _requireValidReceiver(address receiver) internal pure {
-        if (receiver == address(0)) revert InvalidReceiver();
+        if (receiver == address(0)) revert RV_InvalidReceiver();
     }
 
     function _requirePositiveAmount(uint256 amount) internal pure {
-        if (amount == 0) revert InvalidAmount();
+        if (amount == 0) revert RV_InvalidAmount();
     }
 
     function _canSettleNow(address token, uint256 tokenOut) internal view returns (bool) {
@@ -449,8 +399,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         IERC20Metadata asset = IERC20Metadata(token);
         uint256 avail = asset.balanceOf(address(this));
         if (avail >= tokenOut) return;
-        address custody = custodyAddress;
-        if (custody == address(0)) revert InvalidCustodyAddress();
+        address custody = _requireConfiguredCustody();
         uint256 missing = tokenOut - avail;
         asset.safeTransferFrom(custody, address(this), missing);
     }
@@ -466,7 +415,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         IERC20Metadata asset = IERC20Metadata(token);
         _pullFromCustodyIfNeeded(token, tokenOut);
         uint256 avail = asset.balanceOf(address(this));
-        if (avail < tokenOut) revert InsufficientLiquidity();
+        if (avail < tokenOut) revert RV_InsufficientLiquidity();
         _safeTransferWithMinOutCheck(asset, receiver, tokenOut, minTokenOut);
         _burn(account, rikoAmountIn);
         emit Redeemed(receiver, token, rikoAmountIn, tokenOut);
@@ -520,29 +469,29 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     function _readOracle(TokenConfig memory cfg) internal view returns (uint256 price, uint8 oracleDecimals) {
-        if (cfg.oracle == address(0)) revert InvalidOracle();
+        if (cfg.oracle == address(0)) revert RV_InvalidOracle();
         IChainlinkAggregatorV3 feed = IChainlinkAggregatorV3(cfg.oracle);
         oracleDecimals = feed.decimals();
         _requireOracleDecimals(oracleDecimals);
         bytes32 gotHash = keccak256(bytes(feed.description()));
         if (cfg.expectedFeedDescriptionHash != bytes32(0) && gotHash != cfg.expectedFeedDescriptionHash) {
-            revert OracleFeedMismatch();
+            revert RV_OracleFeedMismatch();
         }
-        (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) = feed
-            .latestRoundData();
-        if (roundId == 0 || startedAt > updatedAt || answeredInRound < roundId) revert OraclePriceInvalid();
-        if (answer <= 0) revert OraclePriceInvalid();
-        if (updatedAt == 0 || block.timestamp - updatedAt > cfg.maxOracleAge) revert OraclePriceStale();
+        (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
+            feed.latestRoundData();
+        if (roundId == 0 || startedAt > updatedAt || answeredInRound < roundId) revert RV_OraclePriceInvalid();
+        if (answer <= 0) revert RV_OraclePriceInvalid();
+        if (updatedAt == 0 || block.timestamp - updatedAt > cfg.maxOracleAge) revert RV_OraclePriceStale();
         // Safe because `answer > 0` is enforced above.
         price = uint256(answer);
     }
 
     function _requireTokenDecimals(uint8 tokenDecimals) internal pure {
-        if (tokenDecimals < MIN_DECIMALS || tokenDecimals > MAX_DECIMALS) revert TokenDecimalsInvalid();
+        if (tokenDecimals < MIN_DECIMALS || tokenDecimals > MAX_DECIMALS) revert RV_TokenDecimalsInvalid();
     }
 
     function _requireOracleDecimals(uint8 oracleDecimals) internal pure {
-        if (oracleDecimals < MIN_DECIMALS || oracleDecimals > MAX_DECIMALS) revert OracleDecimalsInvalid();
+        if (oracleDecimals < MIN_DECIMALS || oracleDecimals > MAX_DECIMALS) revert RV_OracleDecimalsInvalid();
     }
 
     function _scaleOracleAmountToUsd6(uint256 amount, uint8 oracleDecimals) internal pure returns (uint256) {
@@ -569,7 +518,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 capGlobal = globalSupplyCapUsd6;
         if (capGlobal == 0) return;
         uint256 totalUsd6After = _rikoToUsd6(totalSupply() + rikoOut);
-        if (totalUsd6After > capGlobal) revert GlobalCapExceeded();
+        if (totalUsd6After > capGlobal) revert RV_GlobalCapExceeded();
     }
 
     function _checkTokenCapAfterDeposit(
@@ -587,7 +536,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
             totalTokenExposure += asset.balanceOf(custody);
         }
         uint256 tvlTokenUsd6After = _tokenToUsd6WithOracle(cfg, totalTokenExposure, oraclePrice, oracleDecimals);
-        if (tvlTokenUsd6After > capToken) revert TokenCapExceeded();
+        if (tvlTokenUsd6After > capToken) revert RV_TokenCapExceeded();
     }
 
     function _safeTransferWithMinOutCheck(
@@ -599,51 +548,25 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 receiverBefore = asset.balanceOf(receiver);
         asset.safeTransfer(receiver, transferAmount);
         uint256 receiverAfter = asset.balanceOf(receiver);
-        if (receiverAfter - receiverBefore < minTokenOut) revert SlippageExceeded();
+        if (receiverAfter - receiverBefore < minTokenOut) revert RV_SlippageExceeded();
     }
 
-    function _currentMonthAndDay() internal view returns (uint256 monthIndex, uint256 dayOfMonth) {
-        (uint256 y, uint256 m, uint256 d) = _daysToDate(block.timestamp / DAY_SECONDS);
-        monthIndex = (y * 100) + m;
-        dayOfMonth = d;
+    function _requireConfiguredCustody() internal view returns (address custody) {
+        custody = custodyAddress;
+        if (custody == address(0)) revert RV_InvalidCustodyAddress();
     }
 
-    function _monthsBetween(uint256 fromMonthIndex, uint256 toMonthIndex) internal pure returns (uint256) {
-        uint256 fromYear = fromMonthIndex / 100;
-        uint256 fromMonth = fromMonthIndex % 100;
-        uint256 toYear = toMonthIndex / 100;
-        uint256 toMonth = toMonthIndex % 100;
-        if (toYear < fromYear) return 0;
-        if (toYear == fromYear && toMonth <= fromMonth) return 0;
-        return ((toYear - fromYear) * 12) + (toMonth - fromMonth);
-    }
-
-    function _nextMonthIndex(uint256 monthIndex) internal pure returns (uint256) {
-        uint256 year = monthIndex / 100;
-        uint256 month = monthIndex % 100;
-        if (month >= 12) {
-            return (year + 1) * 100 + 1;
-        }
-        return year * 100 + (month + 1);
-    }
-
-    function _daysToDate(uint256 _days) internal pure returns (uint256 year, uint256 month, uint256 day) {
-        int256 __days = int256(_days);
-
-        int256 L = __days + 68569 + 2440588;
-        int256 N = (4 * L) / 146097;
-        L = L - ((146097 * N + 3) / 4);
-        int256 _year = (4000 * (L + 1)) / 1461001;
-        L = L - ((1461 * _year) / 4) + 31;
-        int256 _month = (80 * L) / 2447;
-        int256 _day = L - ((2447 * _month) / 80);
-        L = _month / 11;
-        _month = _month + 2 - (12 * L);
-        _year = 100 * (N - 49) + _year + L;
-
-        year = uint256(_year);
-        month = uint256(_month);
-        day = uint256(_day);
+    function _validateOracleConfig(address oracle, uint32 maxOracleAge, bytes32 expectedFeedDescriptionHash)
+        internal
+        view
+    {
+        if (oracle == address(0)) revert RV_InvalidOracle();
+        if (maxOracleAge == 0) revert RV_OraclePriceInvalid();
+        if (expectedFeedDescriptionHash == bytes32(0)) revert RV_OracleFeedMismatch();
+        IChainlinkAggregatorV3 feed = IChainlinkAggregatorV3(oracle);
+        _requireOracleDecimals(feed.decimals());
+        bytes32 gotHash = keccak256(bytes(feed.description()));
+        if (gotHash != expectedFeedDescriptionHash) revert RV_OracleFeedMismatch();
     }
 
     function _usd6ToRiko(uint256 usd6) internal view returns (uint256) {
@@ -658,17 +581,6 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
 
     function _rikoPriceOrRevert() internal view returns (uint256 price) {
         price = rikoPriceUsd6;
-        if (price == 0) revert InvalidRikoPrice();
-    }
-
-    function _update(address from, address to, uint256 value) internal override {
-        super._update(from, to, value);
-        (uint256 monthIndex,) = _currentMonthAndDay();
-        if (from != address(0)) {
-            lastYieldMonth[from] = monthIndex;
-        }
-        if (to != address(0)) {
-            lastYieldMonth[to] = monthIndex;
-        }
+        if (price == 0) revert RV_InvalidRikoPrice();
     }
 }

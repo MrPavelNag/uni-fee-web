@@ -26,22 +26,22 @@ contract RIKOVaultNegativeTest is Test {
     function testSetTokenConfigRevertsOnBadOracleDecimals() public {
         MockAggregatorV3 badFeedZero = new MockAggregatorV3(0, "USDC / USD", 1e8);
         bytes32 feedHash = keccak256(bytes("USDC / USD"));
-        vm.expectRevert(RIKOVault.OracleDecimalsInvalid.selector);
+        vm.expectRevert(RIKOVault.RV_OracleDecimalsInvalid.selector);
         vault.setTokenConfig(address(usdc), true, address(badFeedZero), 1 days, feedHash);
 
         MockAggregatorV3 badFeedTooHigh = new MockAggregatorV3(19, "USDC / USD", 1e8);
-        vm.expectRevert(RIKOVault.OracleDecimalsInvalid.selector);
+        vm.expectRevert(RIKOVault.RV_OracleDecimalsInvalid.selector);
         vault.setTokenConfig(address(usdc), true, address(badFeedTooHigh), 1 days, feedHash);
     }
 
     function testSetTokenConfigRevertsOnBadTokenDecimals() public {
         MockERC20 badTokenZero = new MockERC20("BAD", "BAD0", 0);
         bytes32 feedHash = keccak256(bytes("USDC / USD"));
-        vm.expectRevert(RIKOVault.TokenDecimalsInvalid.selector);
+        vm.expectRevert(RIKOVault.RV_TokenDecimalsInvalid.selector);
         vault.setTokenConfig(address(badTokenZero), true, address(usdcUsdFeed), 1 days, feedHash);
 
         MockERC20 badTokenTooHigh = new MockERC20("BAD", "BAD19", 19);
-        vm.expectRevert(RIKOVault.TokenDecimalsInvalid.selector);
+        vm.expectRevert(RIKOVault.RV_TokenDecimalsInvalid.selector);
         vault.setTokenConfig(address(badTokenTooHigh), true, address(usdcUsdFeed), 1 days, feedHash);
     }
 
@@ -64,7 +64,7 @@ contract RIKOVaultNegativeTest is Test {
         // One second older than maxAge => stale revert.
         usdcUsdFeed.setRoundData(1e8, block.timestamp - maxAge - 1);
         vm.prank(alice);
-        vm.expectRevert(RIKOVault.OraclePriceStale.selector);
+        vm.expectRevert(RIKOVault.RV_OraclePriceStale.selector);
         vault.deposit(address(usdc), 10e6, 0, alice);
     }
 
@@ -111,7 +111,7 @@ contract RIKOVaultNegativeTest is Test {
 
         vm.startPrank(alice);
         usdc.approve(address(vault), 50e6);
-        vm.expectRevert(RIKOVault.UnsupportedToken.selector);
+        vm.expectRevert(RIKOVault.RV_UnsupportedToken.selector);
         vault.deposit(address(usdc), 10e6, 0, alice);
         vm.stopPrank();
 
@@ -133,7 +133,7 @@ contract RIKOVaultNegativeTest is Test {
         feeToken.approve(address(vault), 100e6);
         vault.deposit(address(feeToken), 100e6, 0, alice);
         uint256 expectedOut = vault.quoteRedeem(address(feeToken), 50e6);
-        vm.expectRevert(RIKOVault.SlippageExceeded.selector);
+        vm.expectRevert(RIKOVault.RV_SlippageExceeded.selector);
         vault.redeem(address(feeToken), 50e6, expectedOut, alice);
         vm.stopPrank();
     }
@@ -157,21 +157,8 @@ contract RIKOVaultNegativeTest is Test {
         usdcUsdFeed.setRoundMeta(2, 1, ts - 10, ts - 5);
         vm.startPrank(alice);
         usdc.approve(address(vault), 10e6);
-        vm.expectRevert(RIKOVault.OraclePriceInvalid.selector);
+        vm.expectRevert(RIKOVault.RV_OraclePriceInvalid.selector);
         vault.deposit(address(usdc), 10e6, 0, alice);
-        vm.stopPrank();
-    }
-
-    function testClaimDailyYieldRevertsWhenNoFullDayPassed() public {
-        vault.setYieldTokenAddress(address(usdc));
-        vault.setYieldPayerAddress(address(this));
-        vault.setMonthlyYieldRateBps(1);
-
-        vm.startPrank(alice);
-        usdc.approve(address(vault), 20e6);
-        vault.deposit(address(usdc), 20e6, 0, alice);
-        vm.expectRevert(RIKOVault.YieldNotReady.selector);
-        vault.claimDailyYield();
         vm.stopPrank();
     }
 
@@ -191,30 +178,12 @@ contract RIKOVaultNegativeTest is Test {
     }
 
     function testSetRikoPriceRevertsOnZero() public {
-        vm.expectRevert(RIKOVault.InvalidRikoPrice.selector);
+        vm.expectRevert(RIKOVault.RV_InvalidRikoPrice.selector);
         vault.setRikoPriceUsd6(0);
     }
 
     function testSetPendingRedemptionOperatorRevertsOnZero() public {
-        vm.expectRevert(RIKOVault.InvalidPendingRedemptionOperator.selector);
+        vm.expectRevert(RIKOVault.RV_InvalidPendingRedemptionOperator.selector);
         vault.setPendingRedemptionOperator(address(0));
-    }
-
-    function testMonthlyYieldCapRevertsWhenPayoutExceedsOnePercentOfMonthlyMint() public {
-        vault.setYieldTokenAddress(address(usdc));
-        vault.setYieldPayerAddress(address(this));
-        vault.setMonthlyYieldRateBps(200); // 2% monthly > 1% cap
-
-        vm.warp(1_736_899_200); // 2025-01-15
-        usdcUsdFeed.setRoundData(1e8, block.timestamp);
-        vm.startPrank(alice);
-        usdc.approve(address(vault), 100e6);
-        vault.deposit(address(usdc), 100e6, 0, alice);
-        vm.stopPrank();
-
-        vm.warp(1_738_368_000); // 2025-02-01
-        vm.prank(alice);
-        vm.expectRevert(RIKOVault.YieldMonthlyCapExceeded.selector);
-        vault.claimDailyYield();
     }
 }

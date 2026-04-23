@@ -26,7 +26,7 @@ contract RIKOVaultTest is Test {
 
     function testSetTokenConfigRevertsOnFeedMismatch() public {
         bytes32 wrongHash = keccak256(bytes("ETH / USD"));
-        vm.expectRevert(RIKOVault.OracleFeedMismatch.selector);
+        vm.expectRevert(RIKOVault.RV_OracleFeedMismatch.selector);
         vault.setTokenConfig(address(usdc), true, address(usdcUsdFeed), 1 days, wrongHash);
     }
 
@@ -64,7 +64,7 @@ contract RIKOVaultTest is Test {
         vm.startPrank(alice);
         usdc.approve(address(vault), 100e6);
         vault.deposit(address(usdc), 50e6, 0, alice);
-        vm.expectRevert(RIKOVault.GlobalCapExceeded.selector);
+        vm.expectRevert(RIKOVault.RV_GlobalCapExceeded.selector);
         vault.deposit(address(usdc), 20e6, 0, alice);
         vm.stopPrank();
     }
@@ -74,35 +74,9 @@ contract RIKOVaultTest is Test {
 
         vm.startPrank(alice);
         usdc.approve(address(vault), 100e6);
-        vm.expectRevert(RIKOVault.TokenCapExceeded.selector);
+        vm.expectRevert(RIKOVault.RV_TokenCapExceeded.selector);
         vault.deposit(address(usdc), 50e6, 0, alice);
         vm.stopPrank();
-    }
-
-    function testClaimDailyYieldPaysFromConfiguredPayer() public {
-        vault.setYieldTokenAddress(address(usdc));
-        vault.setYieldPayerAddress(address(this));
-        vault.setMonthlyYieldRateBps(1); // 0.01% monthly
-
-        // 2025-01-15 00:00:00 UTC
-        vm.warp(1_736_899_200);
-        usdcUsdFeed.setRoundData(1e8, block.timestamp);
-
-        uint256 depositAmount = 100e6;
-        vm.startPrank(alice);
-        usdc.approve(address(vault), depositAmount);
-        vault.deposit(address(usdc), depositAmount, 0, alice);
-        vm.stopPrank();
-
-        // 2025-02-01 00:00:00 UTC (monthly claim window)
-        vm.warp(1_738_368_000);
-        uint256 beforeBal = usdc.balanceOf(alice);
-        vm.prank(alice);
-        uint256 payout = vault.claimDailyYield();
-        uint256 afterBal = usdc.balanceOf(alice);
-
-        assertEq(payout, 10_000, "monthly payout amount");
-        assertEq(afterBal - beforeBal, payout, "alice receives payout");
     }
 
     function testProcessPendingRedeemCompletesWhenCustodyRefilled() public {
@@ -147,7 +121,7 @@ contract RIKOVaultTest is Test {
         vm.prank(alice);
         vault.redeem(address(usdc), 50e6, 0, alice);
 
-        vm.expectRevert(RIKOVault.PendingRedemptionOperatorOnly.selector);
+        vm.expectRevert(RIKOVault.RV_PendingRedemptionOperatorOnly.selector);
         vault.processPendingRedemption(alice, address(usdc));
     }
 }
