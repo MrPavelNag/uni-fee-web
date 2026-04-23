@@ -1,6 +1,11 @@
-# RIKOVault deploy (Foundry)
+# RIKO contracts deploy (Foundry)
 
-This guide deploys `contracts/RIKOVault.sol` and prints the real contract address.
+This guide deploys:
+
+- `contracts/RIKOVault.sol`
+- `contracts/RIKOYieldDistributor.sol`
+
+Recommended: deploy both in one step via `script/DeployRIKOStack.s.sol`.
 
 ## 1) Prerequisites
 
@@ -41,6 +46,30 @@ forge build
 
 ## 4) Deploy
 
+### Option A (recommended): deploy both contracts in one run
+
+Dry-run (no broadcast):
+
+```bash
+forge script script/DeployRIKOStack.s.sol:DeployRIKOStack \
+  --rpc-url "$ETH_RPC_URL"
+```
+
+Real deploy:
+
+```bash
+forge script script/DeployRIKOStack.s.sol:DeployRIKOStack \
+  --rpc-url "$ETH_RPC_URL" \
+  --broadcast
+```
+
+After success you will see:
+
+- `RIKOVault deployed at: 0x...`
+- `RIKOYieldDistributor deployed at: 0x...`
+
+### Option B: deploy only vault (legacy / manual flow)
+
 Dry-run (no broadcast):
 
 ```bash
@@ -56,21 +85,30 @@ forge script script/DeployRIKOVault.s.sol:DeployRIKOVault \
   --broadcast
 ```
 
-After success you will see:
-- `RIKOVault deployed at: 0x...`
-- tx hash in Foundry output
-
-Use this `0x...` as runtime contract address.
+Use this flow only if you explicitly need manual step-by-step deployment.
 
 ## 5) Connect address to webapp
 
 ```bash
 export RIKO_VAULT_ADDRESS="0x...deployed_rikovault_address..."
+export RIKO_YIELD_DISTRIBUTOR_ADDRESS="0x...deployed_yield_distributor_address..."
 ```
 
 Restart your webapp process so it reads the new env.
 
-## 6) Optional: Etherscan verification
+## 6) First on-chain setup after deploy
+
+From admin UI (`/admin`, RIKO tab):
+
+1. Set `custodyAddress` in `RIKOVault`.
+2. Set `pendingRedemptionOperator` in `RIKOVault`.
+3. Configure whitelist tokens (`setTokenConfig`) and optional caps.
+4. In `RIKOYieldDistributor` set:
+   - `yieldPayerAddress`
+   - `yieldTokenAddress`
+   - `monthlyYieldRateBps` (opens first cycle)
+
+## 7) Optional: Etherscan verification
 
 ```bash
 export ETHERSCAN_API_KEY="<your_key>"
@@ -84,3 +122,15 @@ forge verify-contract \
 ```
 
 For Mainnet, use `--chain-id 1`.
+
+You can verify distributor similarly:
+
+```bash
+forge verify-contract \
+  --chain-id 11155111 \
+  --compiler-version v0.8.24+commit.e11b9ed9 \
+  <DEPLOYED_DISTRIBUTOR_ADDRESS> \
+  contracts/RIKOYieldDistributor.sol:RIKOYieldDistributor \
+  --constructor-args $(cast abi-encode "constructor(address,address)" "$RIKO_ADMIN" "$RIKO_VAULT_ADDRESS") \
+  --etherscan-api-key "$ETHERSCAN_API_KEY"
+```
