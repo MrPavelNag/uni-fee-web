@@ -7599,6 +7599,140 @@ def _explorer_txlist_hashes_for_owner(chain_id: int, owner: str, max_items: int 
     return []
 
 
+def _explorer_txlist_rows_for_owner(chain_id: int, owner: str, max_items: int = 120) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    o = str(owner or "").strip().lower()
+    if not _is_eth_address(o):
+        return []
+    chainid_for_v2 = _explorer_v2_chainid(cid)
+    if not chainid_for_v2:
+        return []
+    eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
+    bsc_key = os.environ.get("BSCSCAN_API_KEY", "").strip() or eth_key
+    base_key = os.environ.get("BASESCAN_API_KEY", "").strip() or eth_key
+    arb_key = os.environ.get("ARBISCAN_API_KEY", "").strip() or eth_key
+    optimistic_key = (
+        os.environ.get("OPTIMISTIC_ETHERSCAN_API_KEY", "").strip()
+        or os.environ.get("OPTIMISM_ETHERSCAN_API_KEY", "").strip()
+        or eth_key
+    )
+    uni_key = os.environ.get("UNISCAN_API_KEY", "").strip() or eth_key
+    urls: list[str] = []
+    offset = max(20, min(500, int(max_items)))
+    if eth_key:
+        urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=txlist"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}"
+        )
+    if cid == 56 and bsc_key:
+        urls.append(
+            "https://api.bscscan.com/api"
+            f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={bsc_key}"
+        )
+    elif cid == 8453 and base_key:
+        urls.append(
+            "https://api.basescan.org/api"
+            f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={base_key}"
+        )
+    elif cid == 42161 and arb_key:
+        urls.append(
+            "https://api.arbiscan.io/api"
+            f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={arb_key}"
+        )
+    elif cid == 10 and optimistic_key:
+        urls.append(
+            "https://api-optimistic.etherscan.io/api"
+            f"?module=account&action=txlist&address={o}&page=1&offset={offset}&sort=desc&apikey={optimistic_key}"
+        )
+    elif cid in {130, 1301} and uni_key:
+        uniscan_api = str(os.environ.get("UNISCAN_API_URL", "https://api.uniscan.xyz/api")).strip()
+        urls.append(
+            f"{uniscan_api}?module=account&action=txlist"
+            f"&address={o}&page=1&offset={offset}&sort=desc&apikey={uni_key}"
+        )
+    if not urls:
+        return []
+    for url in urls:
+        try:
+            req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+            _wait_etherscan_rps_slot(url)
+            with urlopen(req, timeout=12) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            rows = (payload or {}).get("result")
+            if not isinstance(rows, list):
+                continue
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                txh = str(r.get("hash") or "").strip().lower()
+                if not (txh.startswith("0x") and len(txh) == 66):
+                    continue
+                out.append(r)
+                if len(out) >= int(max_items):
+                    break
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
+
+
+def _explorer_tx_url_for_chain(chain_id: int, tx_hash: str) -> str:
+    h = str(tx_hash or "").strip().lower()
+    if not (h.startswith("0x") and len(h) == 66):
+        return ""
+    cid = int(chain_id)
+    if cid == 11155111:
+        return f"https://sepolia.etherscan.io/tx/{h}"
+    if cid == 1:
+        return f"https://etherscan.io/tx/{h}"
+    if cid == 8453:
+        return f"https://basescan.org/tx/{h}"
+    if cid == 42161:
+        return f"https://arbiscan.io/tx/{h}"
+    if cid == 56:
+        return f"https://bscscan.com/tx/{h}"
+    return ""
+
+
+def _riko_tx_action_label(row: dict[str, Any], vault_addr: str, distributor_addr: str) -> str:
+    fn = str(row.get("functionName") or "").strip()
+    method = str(row.get("methodId") or "").strip().lower()
+    to_addr = str(row.get("to") or "").strip().lower()
+    if fn:
+        if "deposit(" in fn:
+            return "Deposit"
+        if "redeem(" in fn:
+            return "Redeem"
+        if "cancelPendingRedemption(" in fn:
+            return "Cancel pending redeem"
+        if "claimMonthlyYield(" in fn or "claimMonthlyYieldFor(" in fn:
+            return "Claim monthly yield"
+        if "setYieldTokenAddress(" in fn:
+            return "Set yield token"
+        if "setYieldPayerAddress(" in fn:
+            return "Set yield payer"
+        if "setMonthlyYieldRateBps(" in fn:
+            return "Set monthly bps"
+        if "setRikoPriceUsd6(" in fn:
+            return "Set RIKO price"
+        if "setTokenConfig(" in fn:
+            return "Set token config"
+        if "setCustodyAddress(" in fn:
+            return "Set custody"
+        if "setPendingRedemptionOperator(" in fn:
+            return "Set pending operator"
+        return fn.split("(")[0] or "Contract call"
+    if method == "0x":
+        if to_addr == vault_addr:
+            return "Transfer to vault"
+        if to_addr == distributor_addr:
+            return "Transfer to distributor"
+        return "Transfer"
+    return f"Call {method[:10]}"
+
 def _discover_owner_erc721_contracts_from_tx_receipts(
     chain_id: int,
     owner: str,
@@ -22879,6 +23013,13 @@ def _render_riko_page() -> str:
     .muted { color: #64748b; font-size: 12px; }
     .riko-status { min-height: 18px; font-size: 13px; color: #0f172a; }
     .riko-status.err { color: #991b1b; }
+    .riko-status-link { margin-top: 4px; font-size: 12px; }
+    .riko-status-link a { color: #1d4ed8; text-decoration: underline; }
+    .riko-tx-history { margin-top: 10px; }
+    .riko-tx-history summary { cursor: pointer; color: #334155; font-size: 13px; font-weight: 600; }
+    .riko-tx-empty { margin-top: 8px; }
+    .riko-tx-list { margin: 8px 0 0 0; padding-left: 18px; display: grid; gap: 4px; }
+    .riko-tx-list a { color: #1d4ed8; text-decoration: underline; }
     .badge-wrap { display:flex; gap:6px; flex-wrap:wrap; }
     .badge {
       display:inline-flex;
@@ -22922,7 +23063,17 @@ def _render_riko_page() -> str:
     <section class="card riko-grid">
       <div class="riko-yield" id="rikoTreasuryYield">""" + yield_text + """</div>
       <div class="riko-row">
-        <label for="rikoTokenSymbol">Deposit token</label>
+        <label for="rikoMode">Mode</label>
+        <div>
+          <select id="rikoMode">
+            <option value="deposit">Deposit</option>
+            <option value="redeem">Redeem</option>
+          </select>
+          <div class="muted">Deposit: put token in and mint RIKO. Redeem: burn RIKO and receive selected token.</div>
+        </div>
+      </div>
+      <div class="riko-row">
+        <label for="rikoTokenSymbol" id="rikoTokenLabel">Deposit token</label>
         <div>
           <div class="riko-token-select-wrap">
             <div style="display:flex;gap:8px;align-items:center;min-width:0">
@@ -22935,26 +23086,33 @@ def _render_riko_page() -> str:
         </div>
       </div>
       <div class="riko-row">
-        <label for="rikoAmount">Amount</label>
+        <label for="rikoAmount" id="rikoAmountLabel">Amount</label>
         <div>
           <div class="riko-amount-wrap">
             <input id="rikoAmount" type="number" min="0" step="any" placeholder="e.g. 100" />
             <button class="btn riko-max-btn" type="button" onclick="setRikoMaxAmount()">Max</button>
           </div>
           <div class="muted" id="rikoBalanceHint">Available: -</div>
+          <div class="muted" id="rikoQuoteHint"></div>
         </div>
       </div>
       <div class="riko-row">
         <label></label>
         <div class="riko-actions riko-actions-main">
-          <label class="riko-approve-toggle"><input id="rikoAutoApprove" type="checkbox" checked />Auto-approve if needed</label>
-          <button class="btn" type="button" onclick="rikoDeposit()">Deposit</button>
-          <button class="btn" type="button" onclick="rikoRedeem()">Redeem</button>
+          <label class="riko-approve-toggle" id="rikoAutoApproveWrap"><input id="rikoAutoApprove" type="checkbox" checked />Auto-approve if needed</label>
+          <button class="btn" id="rikoDepositBtn" type="button" onclick="rikoDeposit()">Deposit</button>
+          <button class="btn" id="rikoRedeemBtn" type="button" onclick="rikoRedeem()">Redeem</button>
           <button class="btn" type="button" onclick="rikoCheckPendingRedeem()">Check pending redeem</button>
           <button class="btn" type="button" onclick="rikoCancelPendingRedeem()">Cancel pending redeem</button>
         </div>
       </div>
       <div class="riko-status" id="rikoStatus"></div>
+      <div class="riko-status-link" id="rikoStatusTxLink"></div>
+      <details class="riko-tx-history">
+        <summary>Transaction history</summary>
+        <div class="muted riko-tx-empty" id="rikoTxHistoryEmpty">No transactions yet.</div>
+        <ul class="riko-tx-list" id="rikoTxHistory"></ul>
+      </details>
     </section>
     """
     extra_script = """
@@ -22969,19 +23127,147 @@ def _render_riko_page() -> str:
     let rikoWalletTokenBalanceRaw = 0n;
     let rikoWalletTokenBalanceDecimals = 18;
     let rikoWalletTokenBalanceFormatted = "0";
+    let rikoWalletRikoBalanceRaw = 0n;
+    let rikoWalletRikoBalanceFormatted = "0";
+    let rikoTxHistory = [];
     let rikoLastCapLoadTs = 0;
 
-    function setRikoStatus(msg, isErr) {
+    function setRikoStatus(msg, isErr, keepTxLink) {
       const el = document.getElementById("rikoStatus");
       if (!el) return;
       el.textContent = String(msg || "");
       el.className = isErr ? "riko-status err" : "riko-status";
+      const linkEl = document.getElementById("rikoStatusTxLink");
+      if (linkEl && !keepTxLink) linkEl.innerHTML = "";
     }
     function setRikoAdminStatus(msg, isErr) {
       const el = document.getElementById("rikoAdminStatus");
       if (!el) return;
       el.textContent = String(msg || "");
       el.className = isErr ? "riko-status err" : "riko-status";
+    }
+    function getRikoMode() {
+      const mode = String(document.getElementById("rikoMode")?.value || "deposit").trim().toLowerCase();
+      return mode === "redeem" ? "redeem" : "deposit";
+    }
+    function shortTxHash(hash) {
+      const s = String(hash || "").trim();
+      if (!/^0x[a-fA-F0-9]{64}$/.test(s)) return s;
+      return `${s.slice(0, 10)}...${s.slice(-8)}`;
+    }
+    function explorerTxBaseForChain(chainId) {
+      const n = Number(chainId || 0);
+      if (n === 11155111) return "https://sepolia.etherscan.io/tx/";
+      if (n === 1) return "https://etherscan.io/tx/";
+      return "";
+    }
+    async function buildTxExplorerUrl(txHash, signerOrProvider) {
+      const hash = String(txHash || "").trim();
+      if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) return "";
+      try {
+        let provider = null;
+        if (signerOrProvider?.provider) {
+          provider = signerOrProvider.provider;
+        } else if (signerOrProvider) {
+          provider = signerOrProvider;
+        } else if (window.ethereum) {
+          const ethers = await ensureEthers();
+          provider = new ethers.BrowserProvider(window.ethereum);
+        }
+        if (!provider) return "";
+        const network = await provider.getNetwork();
+        const base = explorerTxBaseForChain(Number(network?.chainId || 0));
+        return base ? `${base}${hash}` : "";
+      } catch (_) {
+        return "";
+      }
+    }
+    function setRikoStatusTxLink(txHash, txUrl) {
+      const linkEl = document.getElementById("rikoStatusTxLink");
+      if (!linkEl) return;
+      const hash = String(txHash || "").trim();
+      if (!hash) {
+        linkEl.innerHTML = "";
+        return;
+      }
+      if (txUrl) {
+        linkEl.innerHTML = `Tx: <a href="${txUrl}" target="_blank" rel="noopener noreferrer">${shortTxHash(hash)}</a>`;
+      } else {
+        linkEl.textContent = `Tx: ${shortTxHash(hash)}`;
+      }
+    }
+    function renderRikoTxHistory() {
+      const listEl = document.getElementById("rikoTxHistory");
+      const emptyEl = document.getElementById("rikoTxHistoryEmpty");
+      if (!listEl || !emptyEl) return;
+      if (!Array.isArray(rikoTxHistory) || !rikoTxHistory.length) {
+        listEl.innerHTML = "";
+        emptyEl.style.display = "";
+        return;
+      }
+      emptyEl.style.display = "none";
+      listEl.innerHTML = rikoTxHistory.map((item) => {
+        const action = String(item?.action || "tx");
+        const hash = String(item?.hash || "");
+        const when = String(item?.when || item?.time_iso || "");
+        const url = String(item?.url || "");
+        const role = String(item?.contract_role || "");
+        const failed = !!item?.is_error;
+        const hashHtml = url
+          ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${shortTxHash(hash)}</a>`
+          : shortTxHash(hash);
+        const bits = [];
+        if (role && role !== "other") bits.push(role);
+        if (failed) bits.push("failed");
+        const suffix = bits.length ? `, ${bits.join(", ")}` : "";
+        return `<li>${action}: ${hashHtml} <span class="muted">(${when}${suffix})</span></li>`;
+      }).join("");
+    }
+    async function loadRikoTxHistory() {
+      const wallet = String(authState?.address || "").trim();
+      const qs = new URLSearchParams();
+      if (/^0x[a-fA-F0-9]{40}$/.test(wallet)) qs.set("address", wallet);
+      qs.set("limit", "40");
+      const url = `/api/riko/tx-history?${qs.toString()}`;
+      try {
+        const r = await fetch(url);
+        const data = await r.json();
+        const items = Array.isArray(data?.items) ? data.items : [];
+        rikoTxHistory = items.map((x) => ({
+          action: String(x?.action || "tx"),
+          hash: String(x?.hash || ""),
+          url: String(x?.url || ""),
+          when: String(x?.time_iso || ""),
+          time_iso: String(x?.time_iso || ""),
+          contract_role: String(x?.contract_role || ""),
+          is_error: !!x?.is_error,
+        }));
+      } catch (_) {
+        rikoTxHistory = [];
+      }
+      renderRikoTxHistory();
+    }
+    async function addRikoTxHistory(action, txHash, signerOrProvider) {
+      const hash = String(txHash || "").trim();
+      if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) return;
+      const url = await buildTxExplorerUrl(hash, signerOrProvider);
+      setRikoStatusTxLink(hash, url);
+      await loadRikoTxHistory();
+    }
+    function updateRikoModeUi() {
+      const mode = getRikoMode();
+      const tokenLabel = document.getElementById("rikoTokenLabel");
+      const amountLabel = document.getElementById("rikoAmountLabel");
+      const approveWrap = document.getElementById("rikoAutoApproveWrap");
+      const depositBtn = document.getElementById("rikoDepositBtn");
+      const redeemBtn = document.getElementById("rikoRedeemBtn");
+      const amountEl = document.getElementById("rikoAmount");
+      if (tokenLabel) tokenLabel.textContent = mode === "redeem" ? "Token to receive" : "Deposit token";
+      if (amountLabel) amountLabel.textContent = mode === "redeem" ? "RIKO amount to redeem" : "Deposit amount";
+      if (approveWrap) approveWrap.style.display = mode === "redeem" ? "none" : "";
+      if (depositBtn) depositBtn.style.display = mode === "redeem" ? "none" : "";
+      if (redeemBtn) redeemBtn.style.display = mode === "redeem" ? "" : "none";
+      if (amountEl) amountEl.placeholder = mode === "redeem" ? "e.g. 100 RIKO" : "e.g. 100";
     }
     function updateRikoPublicWhitelistView() {
       const wrap = document.getElementById("rikoWhitelistBadges");
@@ -23047,6 +23333,48 @@ def _render_riko_page() -> str:
     async function refreshRikoWalletBalance() {
       const hint = document.getElementById("rikoBalanceHint");
       if (!hint) return;
+      const mode = getRikoMode();
+      const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
+      if (mode === "redeem") {
+        if (!authState?.authenticated) {
+          hint.textContent = "Available to redeem: connect wallet (RIKO)";
+          rikoWalletRikoBalanceRaw = 0n;
+          rikoWalletRikoBalanceFormatted = "0";
+          return;
+        }
+        if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) {
+          hint.textContent = "Available to redeem: vault address is not configured";
+          rikoWalletRikoBalanceRaw = 0n;
+          rikoWalletRikoBalanceFormatted = "0";
+          return;
+        }
+        const wallet = String(authState?.address || "").trim();
+        if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
+          hint.textContent = "Available to redeem: wallet not ready (RIKO)";
+          return;
+        }
+        if (!window.ethereum) {
+          hint.textContent = "Available to redeem: provider not found (RIKO)";
+          return;
+        }
+        try {
+          const ethers = await ensureEthers();
+          const provider = new ethers.BrowserProvider(window.ethereum);
+          const riko = new ethers.Contract(contractAddress, ERC20_ABI, provider);
+          const [decimals, balance] = await Promise.all([
+            riko.decimals(),
+            riko.balanceOf(wallet),
+          ]);
+          rikoWalletRikoBalanceRaw = BigInt(balance);
+          rikoWalletRikoBalanceFormatted = formatTokenAmount(rikoWalletRikoBalanceRaw, Number(decimals || 6));
+          hint.textContent = `Available to redeem: ${rikoWalletRikoBalanceFormatted} RIKO`;
+        } catch (_) {
+          hint.textContent = "Available to redeem: unavailable (RIKO)";
+          rikoWalletRikoBalanceRaw = 0n;
+          rikoWalletRikoBalanceFormatted = "0";
+        }
+        return;
+      }
       const tokenAddress = getSelectedRikoTokenAddress();
       const symRaw = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
       const sym = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toUpperCase();
@@ -23118,7 +23446,13 @@ def _render_riko_page() -> str:
     function setRikoMaxAmount() {
       const amountEl = document.getElementById("rikoAmount");
       if (!amountEl) return;
-      amountEl.value = String(rikoWalletTokenBalanceFormatted || "0");
+      const mode = getRikoMode();
+      if (mode === "redeem") {
+        amountEl.value = String(rikoWalletRikoBalanceFormatted || "0");
+      } else {
+        amountEl.value = String(rikoWalletTokenBalanceFormatted || "0");
+      }
+      refreshRikoQuoteHint();
     }
     function renderRikoWhitelistEditor() {
       const rowsEl = document.getElementById("rikoWhitelistRows");
@@ -23405,6 +23739,7 @@ def _render_riko_page() -> str:
         }
       }
       refreshRikoWalletBalance();
+      refreshRikoQuoteHint();
     }
     async function ensureEthers() {
       if (window.ethers) return window.ethers;
@@ -23483,11 +23818,42 @@ def _render_riko_page() -> str:
     const RIKO_ABI = [
       "function deposit(address token,uint256 amountIn,uint256 minRikoOut,address receiver) external returns (uint256)",
       "function redeem(address token,uint256 rikoAmountIn,uint256 minTokenOut,address receiver) external returns (uint256)",
+      "function quoteRedeem(address token,uint256 rikoIn) external view returns (uint256 tokenOut)",
       "function pendingRedemptions(address account,address token) view returns (uint256 rikoLocked,uint256 tokenOut,uint256 minTokenOut,address receiver,bool exists)",
       "function cancelPendingRedemption(address token) external returns (uint256 rikoReturned)",
       "function globalSupplyCapUsd6() view returns (uint256)",
       "function setGlobalSupplyCapUsd6(uint256 capUsd6) external"
     ];
+    async function refreshRikoQuoteHint() {
+      const hint = document.getElementById("rikoQuoteHint");
+      if (!hint) return;
+      hint.textContent = "";
+      const mode = getRikoMode();
+      if (mode !== "redeem") return;
+      const amount = String(document.getElementById("rikoAmount")?.value || "").trim();
+      if (!amount || Number(amount) <= 0) return;
+      const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
+      const symbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
+      const vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
+      if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress) || !/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) return;
+      try {
+        const ethers = await ensureEthers();
+        const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+        const vault = new ethers.Contract(contractAddress, RIKO_ABI, provider);
+        const rawRiko = ethers.parseUnits(amount, 6);
+        const rawOut = await vault.quoteRedeem(vaultTokenAddress, rawRiko);
+        let outDecimals = 18;
+        if (symbol !== "eth") {
+          const token = new ethers.Contract(vaultTokenAddress, ERC20_ABI, provider);
+          outDecimals = Number(await token.decimals());
+        }
+        const outFmt = formatTokenAmount(BigInt(rawOut || 0n), outDecimals);
+        const outSymbol = symbol ? String(symbol).toUpperCase() : "TOKEN";
+        hint.textContent = `Estimated receive: ${outFmt} ${outSymbol}`;
+      } catch (_) {
+        hint.textContent = "Estimated receive: unavailable";
+      }
+    }
     async function loadRikoGlobalCap() {
       const elCurrent = document.getElementById("rikoGlobalCapCurrent");
       if (!elCurrent) return;
@@ -23553,6 +23919,8 @@ def _render_riko_page() -> str:
           raw = ethers.parseUnits(amount, 18);
           setRikoStatus("Wrapping ETH to WETH...", false);
           const wrapTx = await token.deposit({ value: raw });
+          await addRikoTxHistory("Wrap ETH->WETH", wrapTx.hash, signer);
+          setRikoStatus("Wrap tx sent", false, true);
           await wrapTx.wait();
         } else {
           token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
@@ -23567,11 +23935,13 @@ def _render_riko_page() -> str:
           }
           setRikoStatus("Allowance too low. Requesting approve signature...", false);
           const approveTx = await token.approve(contractAddress, raw);
-          setRikoStatus("Approve tx sent: " + approveTx.hash, false);
+          await addRikoTxHistory("Approve token", approveTx.hash, signer);
+          setRikoStatus("Approve tx sent", false, true);
           await approveTx.wait();
         }
         const tx = await vault.deposit(vaultTokenAddress, raw, 0, user);
-        setRikoStatus("Deposit tx sent: " + tx.hash, false);
+        await addRikoTxHistory("Deposit", tx.hash, signer);
+        setRikoStatus("Deposit tx sent", false, true);
         await tx.wait();
         setRikoStatus("Deposit confirmed", false);
       } catch (e) {
@@ -23595,7 +23965,8 @@ def _render_riko_page() -> str:
           beforeWeth = BigInt(await weth.balanceOf(user));
         }
         const tx = await vault.redeem(vaultTokenAddress, rawRiko, 0, user);
-        setRikoStatus("Redeem tx sent: " + tx.hash, false);
+        await addRikoTxHistory("Redeem", tx.hash, signer);
+        setRikoStatus("Redeem tx sent", false, true);
         await tx.wait();
         const pending = await vault.pendingRedemptions(user, vaultTokenAddress);
         const isPending = !!pending?.exists;
@@ -23609,6 +23980,8 @@ def _render_riko_page() -> str:
           if (delta > 0n) {
             setRikoStatus("Unwrapping WETH to ETH...", false);
             const unwrapTx = await weth.withdraw(delta);
+            await addRikoTxHistory("Unwrap WETH->ETH", unwrapTx.hash, signer);
+            setRikoStatus("Unwrap tx sent", false, true);
             await unwrapTx.wait();
           }
         }
@@ -23663,7 +24036,8 @@ def _render_riko_page() -> str:
           return;
         }
         const tx = await vault.cancelPendingRedemption(vaultTokenAddress);
-        setRikoStatus("Cancel pending redeem tx sent: " + tx.hash, false);
+        await addRikoTxHistory("Cancel pending redeem", tx.hash, signer);
+        setRikoStatus("Cancel pending redeem tx sent", false, true);
         await tx.wait();
         setRikoStatus("Pending redeem canceled. RIKO returned to wallet.", false);
       } catch (e) {
@@ -23677,10 +24051,23 @@ def _render_riko_page() -> str:
     (function initRikoPage() {
       const sel = document.getElementById("rikoTokenSymbol");
       if (sel) sel.addEventListener("change", onRikoSymbolChanged);
+      const modeSel = document.getElementById("rikoMode");
+      if (modeSel) {
+        modeSel.addEventListener("change", () => {
+          updateRikoModeUi();
+          refreshRikoWalletBalance();
+          refreshRikoQuoteHint();
+        });
+      }
+      const amountEl = document.getElementById("rikoAmount");
+      if (amountEl) amountEl.addEventListener("input", refreshRikoQuoteHint);
+      updateRikoModeUi();
       loadRikoWhitelist();
+      loadRikoTxHistory();
       setTimeout(syncRikoAdminCard, 150);
       setInterval(syncRikoAdminCard, 3000);
-      setInterval(() => { refreshRikoWalletBalance(); }, 15000);
+      setInterval(() => { refreshRikoWalletBalance(); refreshRikoQuoteHint(); }, 15000);
+      setInterval(() => { loadRikoTxHistory(); }, 20000);
     })();
     """
     html = _render_placeholder_page(
@@ -31794,6 +32181,75 @@ def riko_whitelist() -> dict[str, Any]:
         "active": active_validation,
         "pending": pending_validation,
         "defaults_hint": "top-20 coins + top-20 fiat-backed stablecoins",
+    }
+
+
+@app.get("/api/riko/tx-history")
+def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    q_addr = str(request.query_params.get("address") or "").strip().lower()
+    try:
+        limit = max(5, min(100, int(str(request.query_params.get("limit") or "40").strip())))
+    except Exception:
+        limit = 40
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    auth_addr = str(auth.get("address") or "").strip().lower()
+    address = q_addr if _is_eth_address(q_addr) else auth_addr
+    if not _is_eth_address(address):
+        return {"ok": True, "items": [], "address": "", "chain_id": None, "count": 0}
+    chain_id = int(auth.get("chain_id") or 11155111)
+    vault_addr = str(RIKO_VAULT_ADDRESS or "").strip().lower()
+    distributor_addr = str(RIKO_YIELD_DISTRIBUTOR_ADDRESS or "").strip().lower()
+    tracked_targets = {x for x in (vault_addr, distributor_addr) if _is_eth_address(x)}
+    rows = _explorer_txlist_rows_for_owner(chain_id, address, max_items=max(limit * 4, 60))
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        txh = str(r.get("hash") or "").strip().lower()
+        if not (txh.startswith("0x") and len(txh) == 66):
+            continue
+        to_addr = str(r.get("to") or "").strip().lower()
+        from_addr = str(r.get("from") or "").strip().lower()
+        if tracked_targets and to_addr not in tracked_targets and from_addr not in tracked_targets:
+            continue
+        ts_raw = str(r.get("timeStamp") or "").strip()
+        ts = 0
+        try:
+            ts = int(ts_raw)
+        except Exception:
+            ts = 0
+        item = {
+            "hash": txh,
+            "url": _explorer_tx_url_for_chain(chain_id, txh),
+            "from": from_addr,
+            "to": to_addr,
+            "time_ts": ts,
+            "time_iso": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts > 0 else "",
+            "block_number": int(str(r.get("blockNumber") or "0") or 0),
+            "is_error": str(r.get("isError") or "0").strip() == "1",
+            "txreceipt_status": str(r.get("txreceipt_status") or "").strip(),
+            "function_name": str(r.get("functionName") or "").strip(),
+            "method_id": str(r.get("methodId") or "").strip().lower(),
+            "action": _riko_tx_action_label(r, vault_addr, distributor_addr),
+            "contract_role": (
+                "vault" if to_addr == vault_addr or from_addr == vault_addr else
+                "distributor" if to_addr == distributor_addr or from_addr == distributor_addr else
+                "other"
+            ),
+        }
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return {
+        "ok": True,
+        "address": address,
+        "chain_id": chain_id,
+        "vault_address": vault_addr if _is_eth_address(vault_addr) else "",
+        "distributor_address": distributor_addr if _is_eth_address(distributor_addr) else "",
+        "items": items,
+        "count": len(items),
     }
 
 
