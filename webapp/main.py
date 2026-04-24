@@ -7625,6 +7625,13 @@ def _explorer_txlist_rows_for_owner(chain_id: int, owner: str, max_items: int = 
             f"?chainid={chainid_for_v2}&module=account&action=txlist"
             f"&address={o}&page=1&offset={offset}&sort=desc&apikey={eth_key}"
         )
+    else:
+        # Best-effort public fallback for local/dev usage.
+        urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=account&action=txlist"
+            f"&address={o}&page=1&offset={offset}&sort=desc"
+        )
     if cid == 56 and bsc_key:
         urls.append(
             "https://api.bscscan.com/api"
@@ -7694,6 +7701,15 @@ def _explorer_tx_url_for_chain(chain_id: int, tx_hash: str) -> str:
         return f"https://arbiscan.io/tx/{h}"
     if cid == 56:
         return f"https://bscscan.com/tx/{h}"
+    return ""
+
+
+def _wrapped_native_by_chain(chain_id: int) -> str:
+    cid = int(chain_id)
+    if cid == 11155111:
+        return "0xfff9976782d46cc05630d1f6ebab18b2324d6b14"
+    if cid == 1:
+        return "0xc02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".lower()
     return ""
 
 
@@ -22992,13 +23008,13 @@ def _render_riko_page() -> str:
       font-weight: 700;
       color: #0f172a;
     }
-    .riko-row { display:grid; grid-template-columns: 190px 1fr; gap: 10px; align-items: start; }
-    .riko-row label { font-weight: 700; padding-top: 8px; }
+    .riko-row { display:grid; grid-template-columns: 210px 1fr; gap: 12px; align-items: center; }
+    .riko-row label { font-weight: 700; padding-top: 0; }
     .riko-actions { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
     .riko-actions-main { justify-content: flex-end; }
     .riko-approve-toggle { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:#475569; margin-right: 6px; }
     .riko-approve-toggle input { margin:0; width:14px; height:14px; }
-    .riko-token-select-wrap { display:grid; grid-template-columns: minmax(220px, 360px) 1fr; gap:10px; align-items:center; }
+    .riko-token-select-wrap { display:grid; grid-template-columns: minmax(280px, 460px) 1fr; gap:12px; align-items:center; }
     .riko-ref-box {
       border: 1px solid #d7e1ef;
       background: #f8fbff;
@@ -23033,13 +23049,30 @@ def _render_riko_page() -> str:
       font-size:12px;
     }
     .badge img, .riko-icon {
-      width:14px;
-      height:14px;
+      width:22px;
+      height:22px;
       border-radius:999px;
       object-fit:cover;
       background:#e5e7eb;
-      flex:0 0 14px;
+      flex:0 0 22px;
     }
+    .riko-switches { display:flex; gap:8px; flex-wrap:wrap; }
+    .riko-switch {
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      border:1px solid #cbd5e1;
+      border-radius:999px;
+      padding:6px 11px;
+      background:#fff;
+      color:#1e293b;
+      cursor:pointer;
+      font-size:13px;
+      font-weight:600;
+    }
+    .riko-switch input { margin:0; width:14px; height:14px; accent-color:#2563eb; }
+    .riko-switch.active { border-color:#2563eb; background:#eff6ff; color:#1d4ed8; }
+    .riko-token-select-hidden { position:absolute; pointer-events:none; opacity:0; width:1px; height:1px; }
     .riko-list { display:grid; gap:8px; margin-top:8px; }
     .riko-list-row { display:grid; grid-template-columns: 20px 180px 1fr auto; gap:8px; align-items:center; }
     .riko-list-row input { width:100%; }
@@ -23076,10 +23109,11 @@ def _render_riko_page() -> str:
       <div class="riko-row">
         <label for="rikoMode">Mode</label>
         <div>
-          <select id="rikoMode">
+          <select id="rikoMode" class="riko-token-select-hidden">
             <option value="deposit">Deposit</option>
             <option value="redeem">Redeem</option>
           </select>
+          <div id="rikoModeSwitch" class="riko-switches"></div>
         </div>
       </div>
       <div class="riko-row">
@@ -23087,12 +23121,12 @@ def _render_riko_page() -> str:
         <div>
           <div class="riko-token-select-wrap">
             <div style="display:flex;gap:8px;align-items:center;min-width:0">
-              <img id="rikoSelectedTokenIcon" class="riko-icon" src="/api/token-icon/eth" alt="token icon"/>
-              <select id="rikoTokenSymbol" style="min-width:0"></select>
+              <img id="rikoSelectedTokenIcon" class="riko-icon" src="https://assets.coingecko.com/coins/images/279/large/ethereum.png" alt="ETH icon"/>
+              <select id="rikoTokenSymbol" class="riko-token-select-hidden" style="min-width:0"></select>
+              <div id="rikoTokenSwitch" class="riko-switches"></div>
             </div>
             <div id="rikoSymbolReference" class="riko-ref-box">Ethereum token addresses: -</div>
           </div>
-          <div class="muted">Only symbols from whitelist are accepted by business logic.</div>
         </div>
       </div>
       <div class="riko-row">
@@ -23161,6 +23195,60 @@ def _render_riko_page() -> str:
     function getRikoMode() {
       const mode = String(document.getElementById("rikoMode")?.value || "deposit").trim().toLowerCase();
       return mode === "redeem" ? "redeem" : "deposit";
+    }
+    function tokenIconUrl(symbolLower) {
+      const s = String(symbolLower || "").trim().toLowerCase();
+      if (s === "eth" || s === "weth") return "https://assets.coingecko.com/coins/images/279/large/ethereum.png";
+      return `/api/token-icon/${encodeURIComponent(s || "eth")}`;
+    }
+    function renderRikoModeSwitch() {
+      const root = document.getElementById("rikoModeSwitch");
+      const sel = document.getElementById("rikoMode");
+      if (!root || !sel) return;
+      const cur = getRikoMode();
+      const items = [
+        { value: "deposit", label: "Deposit" },
+        { value: "redeem", label: "Redeem" },
+      ];
+      root.innerHTML = items.map((x) => (
+        `<label class="riko-switch ${cur === x.value ? "active" : ""}">` +
+        `<input type="checkbox" data-riko-mode="${x.value}" ${cur === x.value ? "checked" : ""} />` +
+        `<span>${x.label}</span></label>`
+      )).join("");
+      root.querySelectorAll("input[data-riko-mode]").forEach((el) => {
+        el.addEventListener("change", () => {
+          const v = String(el.getAttribute("data-riko-mode") || "").trim().toLowerCase();
+          if (sel) sel.value = v === "redeem" ? "redeem" : "deposit";
+          renderRikoModeSwitch();
+          updateRikoModeUi();
+          refreshRikoWalletBalance();
+          refreshRikoQuoteHint();
+        });
+      });
+    }
+    function renderRikoTokenSwitch(symbols) {
+      const root = document.getElementById("rikoTokenSwitch");
+      const sel = document.getElementById("rikoTokenSymbol");
+      if (!root || !sel) return;
+      const list = Array.isArray(symbols) ? symbols : [];
+      const cur = String(sel.value || "");
+      root.innerHTML = list.map((s) => {
+        const lbl = String(s || "").toUpperCase();
+        const active = cur === s;
+        return (
+          `<label class="riko-switch ${active ? "active" : ""}">` +
+          `<input type="checkbox" data-riko-symbol="${s}" ${active ? "checked" : ""} />` +
+          `<span>${lbl}</span></label>`
+        );
+      }).join("");
+      root.querySelectorAll("input[data-riko-symbol]").forEach((el) => {
+        el.addEventListener("change", () => {
+          const v = String(el.getAttribute("data-riko-symbol") || "").trim().toLowerCase();
+          sel.value = v;
+          onRikoSymbolChanged();
+          renderRikoTokenSwitch(list);
+        });
+      });
     }
     function shortTxHash(hash) {
       const s = String(hash || "").trim();
@@ -23236,7 +23324,13 @@ def _render_riko_page() -> str:
       }).join("");
     }
     async function loadRikoTxHistory() {
-      const wallet = String(authState?.address || "").trim();
+      let wallet = String(authState?.address || "").trim();
+      if (!/^0x[a-fA-F0-9]{40}$/.test(wallet) && window.ethereum) {
+        try {
+          const accounts = await window.ethereum.request({ method: "eth_accounts" });
+          wallet = String((accounts || [])[0] || "").trim();
+        } catch (_) {}
+      }
       const qs = new URLSearchParams();
       if (/^0x[a-fA-F0-9]{40}$/.test(wallet)) qs.set("address", wallet);
       qs.set("limit", "40");
@@ -23280,6 +23374,7 @@ def _render_riko_page() -> str:
       if (depositBtn) depositBtn.style.display = mode === "redeem" ? "none" : "";
       if (redeemBtn) redeemBtn.style.display = mode === "redeem" ? "" : "none";
       if (amountEl) amountEl.placeholder = mode === "redeem" ? "e.g. 100 RIKO" : "e.g. 100";
+      renderRikoModeSwitch();
     }
     function updateRikoPublicWhitelistView() {
       const wrap = document.getElementById("rikoWhitelistBadges");
@@ -23313,6 +23408,8 @@ def _render_riko_page() -> str:
         const cur = String(select.value || "");
         select.innerHTML = activeSymbols.map((s) => `<option value="${s}">${String(s || "").toUpperCase()}</option>`).join("");
         if (cur && activeSymbols.includes(cur)) select.value = cur;
+        if ((!cur || !activeSymbols.includes(cur)) && activeSymbols.length) select.value = activeSymbols[0];
+        renderRikoTokenSwitch(activeSymbols);
       }
     }
     function renderRikoWhitelist() {
@@ -23729,8 +23826,12 @@ def _render_riko_page() -> str:
       const iconEl = document.getElementById("rikoSelectedTokenIcon");
       if (iconEl) {
         const safeSym = sym || "eth";
-        iconEl.src = `/api/token-icon/${encodeURIComponent(safeSym)}`;
+        iconEl.src = tokenIconUrl(safeSym);
         iconEl.alt = `${String(safeSym).toUpperCase()} icon`;
+        iconEl.onerror = () => {
+          iconEl.onerror = null;
+          iconEl.src = "https://assets.coingecko.com/coins/images/279/large/ethereum.png";
+        };
       }
       const addrs = Array.isArray(rikoDisplayAddrMap?.[sym]) ? rikoDisplayAddrMap[sym] : [];
       const exact = String(rikoDisplayExactBySymbol?.[sym] || "");
@@ -23856,6 +23957,7 @@ def _render_riko_page() -> str:
     const RIKO_ABI = [
       "function deposit(address token,uint256 amountIn,uint256 minRikoOut,address receiver) external returns (uint256)",
       "function redeem(address token,uint256 rikoAmountIn,uint256 minTokenOut,address receiver) external returns (uint256)",
+      "function quoteDeposit(address token,uint256 amountIn) external view returns (uint256 rikoOut)",
       "function quoteRedeem(address token,uint256 rikoIn) external view returns (uint256 tokenOut)",
       "function pendingRedemptions(address account,address token) view returns (uint256 rikoLocked,uint256 tokenOut,uint256 minTokenOut,address receiver,bool exists)",
       "function cancelPendingRedemption(address token) external returns (uint256 rikoReturned)",
@@ -23865,19 +23967,44 @@ def _render_riko_page() -> str:
     async function refreshRikoQuoteHint() {
       const hint = document.getElementById("rikoQuoteHint");
       if (!hint) return;
-      hint.innerHTML = '<span class="k">Estimated receive:</span>-';
       const mode = getRikoMode();
-      if (mode !== "redeem") return;
+      if (mode === "deposit") {
+        hint.innerHTML = '<span class="k">Estimated mint:</span>-';
+      } else {
+        hint.innerHTML = '<span class="k">Estimated receive:</span>-';
+      }
       const amount = String(document.getElementById("rikoAmount")?.value || "").trim();
       if (!amount || Number(amount) <= 0) return;
       const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
       const symbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
-      const vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
-      if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress) || !/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) return;
+      if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) return;
       try {
         const ethers = await ensureEthers();
         const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+        let vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
+        if (symbol === "eth") {
+          const net = await provider.getNetwork();
+          const wrapped = wrappedNativeByChainId(Number(net?.chainId || 0));
+          if (/^0x[a-fA-F0-9]{40}$/.test(String(wrapped || "").trim())) {
+            vaultTokenAddress = wrapped;
+          }
+        }
+        if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) return;
         const vault = new ethers.Contract(contractAddress, RIKO_ABI, provider);
+        if (mode === "deposit") {
+          let rawIn;
+          if (symbol === "eth") {
+            rawIn = ethers.parseUnits(amount, 18);
+          } else {
+            const token = new ethers.Contract(vaultTokenAddress, ERC20_ABI, provider);
+            const inDecimals = Number(await token.decimals());
+            rawIn = ethers.parseUnits(amount, inDecimals);
+          }
+          const rawRiko = await vault.quoteDeposit(vaultTokenAddress, rawIn);
+          const rikoFmt = formatTokenAmount(BigInt(rawRiko || 0n), 6);
+          hint.innerHTML = `<span class="k">Estimated mint:</span>${rikoFmt} RIKO`;
+          return;
+        }
         const rawRiko = ethers.parseUnits(amount, 6);
         const rawOut = await vault.quoteRedeem(vaultTokenAddress, rawRiko);
         let outDecimals = 18;
@@ -24088,11 +24215,14 @@ def _render_riko_page() -> str:
         const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured on server");
         const symbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
-        const vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
-        if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
         const ethers = await ensureEthers();
         const signer = await getRikoSigner();
         const user = await signer.getAddress();
+        let vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
+        if (symbol === "eth") {
+          vaultTokenAddress = await resolveEthVaultTokenAddressForSigner(signer, vaultTokenAddress);
+        }
+        if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
         const vault = new ethers.Contract(contractAddress, RIKO_ABI, signer);
         const pending = await vault.pendingRedemptions(user, vaultTokenAddress);
         if (!pending?.exists) {
@@ -24116,11 +24246,14 @@ def _render_riko_page() -> str:
         const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured on server");
         const symbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
-        const vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
-        if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
         const ethers = await ensureEthers();
         const signer = await getRikoSigner();
         const user = await signer.getAddress();
+        let vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
+        if (symbol === "eth") {
+          vaultTokenAddress = await resolveEthVaultTokenAddressForSigner(signer, vaultTokenAddress);
+        }
+        if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
         const vault = new ethers.Contract(contractAddress, RIKO_ABI, signer);
         const pending = await vault.pendingRedemptions(user, vaultTokenAddress);
         if (!pending?.exists) {
@@ -24146,6 +24279,7 @@ def _render_riko_page() -> str:
       const modeSel = document.getElementById("rikoMode");
       if (modeSel) {
         modeSel.addEventListener("change", () => {
+          renderRikoModeSwitch();
           updateRikoModeUi();
           refreshRikoWalletBalance();
           refreshRikoQuoteHint();
@@ -32293,7 +32427,8 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
     chain_id = int(auth.get("chain_id") or 11155111)
     vault_addr = str(RIKO_VAULT_ADDRESS or "").strip().lower()
     distributor_addr = str(RIKO_YIELD_DISTRIBUTOR_ADDRESS or "").strip().lower()
-    tracked_targets = {x for x in (vault_addr, distributor_addr) if _is_eth_address(x)}
+    wrapped_addr = _wrapped_native_by_chain(chain_id)
+    tracked_targets = {x for x in (vault_addr, distributor_addr, wrapped_addr) if _is_eth_address(x)}
     rows = _explorer_txlist_rows_for_owner(chain_id, address, max_items=max(limit * 4, 60))
     items: list[dict[str, Any]] = []
     for r in rows:
@@ -32304,7 +32439,9 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
             continue
         to_addr = str(r.get("to") or "").strip().lower()
         from_addr = str(r.get("from") or "").strip().lower()
-        if tracked_targets and to_addr not in tracked_targets and from_addr not in tracked_targets:
+        fn_hint = str(r.get("functionName") or "").strip().lower()
+        is_wrap_flow = any(x in fn_hint for x in ("deposit()", "withdraw(", "approve("))
+        if tracked_targets and to_addr not in tracked_targets and from_addr not in tracked_targets and not is_wrap_flow:
             continue
         ts_raw = str(r.get("timeStamp") or "").strip()
         ts = 0
@@ -32327,6 +32464,7 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
             "action": _riko_tx_action_label(r, vault_addr, distributor_addr),
             "contract_role": (
                 "vault" if to_addr == vault_addr or from_addr == vault_addr else
+                "wrapped_native" if to_addr == wrapped_addr or from_addr == wrapped_addr else
                 "distributor" if to_addr == distributor_addr or from_addr == distributor_addr else
                 "other"
             ),
