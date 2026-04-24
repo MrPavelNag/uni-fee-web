@@ -29399,7 +29399,7 @@ def _render_admin_page() -> str:
         if(!accounts.length) accounts=(await provider.request({{method:"eth_accounts"}}))||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[];
         const address=normalizeAddress(accounts[0]||"");
-        if(!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
+        if(!/^0x[a-fA-F0-9]{{40}}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
         const chainHex=await provider.request({{method:"eth_chainId"}});
         const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1;
         const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet:"walletconnect"}});
@@ -29481,7 +29481,7 @@ def _render_admin_page() -> str:
     ];
     function normalizeEthAddressInput(v) {{
       const raw = String(v || "").trim();
-      return /^0x[a-fA-F0-9]{40}$/.test(raw) ? raw : "";
+      return /^0x[a-fA-F0-9]{{40}}$/.test(raw) ? raw : "";
     }}
     async function loadAdminRikoGlobalCap() {{
       const elAddr = document.getElementById("adminRikoVaultAddress");
@@ -29500,7 +29500,7 @@ def _render_admin_page() -> str:
       if (elYieldAddr) elYieldAddr.textContent = yieldAddr || "-";
       if (!elCap) return;
 
-      if (!/^0x[a-fA-F0-9]{40}$/.test(vaultAddr)) {{
+      if (!/^0x[a-fA-F0-9]{{40}}$/.test(vaultAddr)) {{
         elCap.textContent = "vault address is not configured";
         if (elCustody) elCustody.textContent = "-";
         if (elPendingOperator) elPendingOperator.textContent = "-";
@@ -29536,7 +29536,7 @@ def _render_admin_page() -> str:
         }}
       }}
 
-      if (!/^0x[a-fA-F0-9]{40}$/.test(yieldAddr)) {{
+      if (!/^0x[a-fA-F0-9]{{40}}$/.test(yieldAddr)) {{
         if (elYieldPayer) elYieldPayer.textContent = "yield distributor is not configured";
         if (elYieldToken) elYieldToken.textContent = "-";
         if (elDailyYield) elDailyYield.textContent = "-";
@@ -29574,7 +29574,7 @@ def _render_admin_page() -> str:
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
         const capInput = document.getElementById("adminRikoGlobalCapUsd");
         const capUsd = Number(String(capInput?.value || "").trim());
         if (!Number.isFinite(capUsd) || capUsd <= 0) throw new Error("Global cap must be > 0 USD.");
@@ -29600,7 +29600,7 @@ def _render_admin_page() -> str:
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
         const nextAddr = normalizeEthAddressInput(document.getElementById("adminRikoCustodyInput")?.value || "");
         if (!nextAddr) throw new Error("Invalid custody address.");
         const signer = await getAdminSigner();
@@ -29624,7 +29624,7 @@ def _render_admin_page() -> str:
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(RIKO_YIELD_DISTRIBUTOR_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Yield distributor address is not configured on server (RIKO_YIELD_DISTRIBUTOR_ADDRESS).");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Yield distributor address is not configured on server (RIKO_YIELD_DISTRIBUTOR_ADDRESS).");
         const nextAddr = normalizeEthAddressInput(document.getElementById("adminRikoYieldPayerInput")?.value || "");
         if (!nextAddr) throw new Error("Invalid yield payer address.");
         const signer = await getAdminSigner();
@@ -29648,7 +29648,7 @@ def _render_admin_page() -> str:
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(RIKO_YIELD_DISTRIBUTOR_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Yield distributor address is not configured on server (RIKO_YIELD_DISTRIBUTOR_ADDRESS).");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Yield distributor address is not configured on server (RIKO_YIELD_DISTRIBUTOR_ADDRESS).");
         const nextAddr = normalizeEthAddressInput(document.getElementById("adminRikoYieldTokenInput")?.value || "");
         if (!nextAddr) throw new Error("Invalid yield token address.");
         const signer = await getAdminSigner();
@@ -29672,7 +29672,7 @@ def _render_admin_page() -> str:
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(RIKO_YIELD_DISTRIBUTOR_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Yield distributor address is not configured on server (RIKO_YIELD_DISTRIBUTOR_ADDRESS).");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Yield distributor address is not configured on server (RIKO_YIELD_DISTRIBUTOR_ADDRESS).");
         const bpsInput = document.getElementById("adminRikoMonthlyYieldBpsInput");
         const bps = Number(String(bpsInput?.value || "").trim());
         if (!Number.isFinite(bps) || bps < 0 || bps > 10000) throw new Error("Monthly yield bps must be between 0 and 10000.");
@@ -29697,7 +29697,7 @@ def _render_admin_page() -> str:
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
         const priceInput = document.getElementById("adminRikoPriceUsdInput");
         const priceUsd = Number(String(priceInput?.value || "").trim());
         if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("RIKO price must be > 0 USD.");
@@ -29724,7 +29724,7 @@ def _render_admin_page() -> str:
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
         const opAddr = normalizeEthAddressInput(document.getElementById("adminRikoPendingOperatorInput")?.value || "");
         if (!opAddr) throw new Error("Pending operator address must be valid.");
         const signer = await getAdminSigner();
@@ -29747,7 +29747,7 @@ def _render_admin_page() -> str:
     async function loadAdminRikoTokenConfig() {{
       try {{
         const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
         const token = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgTokenInput")?.value || "");
         if (!token) throw new Error("Invalid token address.");
         const ethers = await ensureEthersAdmin();
@@ -29778,7 +29778,7 @@ def _render_admin_page() -> str:
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
         const token = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgTokenInput")?.value || "");
         if (!token) throw new Error("Invalid token address.");
         const allowed = String(document.getElementById("adminRikoTokenCfgAllowedInput")?.value || "true").trim() === "true";
@@ -29825,7 +29825,7 @@ def _render_admin_page() -> str:
       const s = String(v || "").trim();
       if (!s) return "";
       if (s.toLowerCase() === "native") return "native";
-      return /^0x[a-fA-F0-9]{40}$/.test(s) ? s.toLowerCase() : "";
+      return /^0x[a-fA-F0-9]{{40}}$/.test(s) ? s.toLowerCase() : "";
     }}
     function resolveAdminRikoAddressBySymbol(symbol) {{
       const sym = String(symbol || "").trim().toLowerCase();
