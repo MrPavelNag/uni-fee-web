@@ -29107,9 +29107,39 @@ def _render_admin_page() -> str:
     .ticket-actions .btn {{ width: 100%; text-align: center; }}
     .btn-soft {{ background: #f8fbff; }}
     .btn-danger {{ border-color: #fecaca; color: #b91c1c; background: #fef2f2; }}
+    .admin-wallets-wrap {{ display: grid; gap: 8px; }}
+    .admin-wallet-item {{
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 8px 10px;
+      border: 1px solid #dbe3ef;
+      border-radius: 10px;
+      background: #f8fbff;
+    }}
+    .admin-wallet-left {{ display: grid; gap: 6px; min-width: 0; }}
+    .admin-wallet-address {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; color: #0f172a; }}
+    .admin-wallet-badges {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+    .role-chip {{
+      display: inline-block;
+      border: 1px solid #cbd5e1;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      color: #334155;
+      background: #f8fafc;
+      line-height: 1.2;
+      white-space: nowrap;
+    }}
+    .role-chip.root {{ border-color: #93c5fd; background: #dbeafe; color: #1e3a8a; }}
+    .role-chip.protected {{ border-color: #86efac; background: #f0fdf4; color: #166534; }}
+    .role-chip.onchain {{ border-color: #fcd34d; background: #fffbeb; color: #92400e; }}
+    .admin-wallet-actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }}
     .feedback-board {{ display: grid; gap: 10px; margin-top: 10px; }}
     .feedback-meta {{ margin-top: 6px; font-size: 12px; color: #64748b; }}
-    @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} .admin-wallet-item {{ grid-template-columns: 1fr; }} .admin-wallet-actions {{ justify-content: flex-start; }} }}
     @media (max-width: 1100px) {{
       .ticket-controls {{ padding: 8px; }}
       .ticket-toolbar {{ grid-template-columns: 1fr 1fr; }}
@@ -29458,7 +29488,10 @@ def _render_admin_page() -> str:
       if (!Number.isFinite(n)) return "0";
       return n.toLocaleString(undefined, {{maximumFractionDigits: 2}});
     }}
+    let adminLastSettings = null;
+    let adminOnchainRoleMap = {{}};
     const ADMIN_RIKO_VAULT_ABI = [
+      "function owner() view returns (address)",
       "function globalSupplyCapUsd6() view returns (uint256)",
       "function custodyAddress() view returns (address)",
       "function pendingRedemptionOperator() view returns (address)",
@@ -29471,6 +29504,7 @@ def _render_admin_page() -> str:
       "function setTokenConfig(address token,bool allowed,address oracle,uint32 maxOracleAge,bytes32 expectedFeedDescriptionHash) external"
     ];
     const ADMIN_RIKO_YIELD_ABI = [
+      "function owner() view returns (address)",
       "function yieldPayerAddress() view returns (address)",
       "function yieldTokenAddress() view returns (address)",
       "function monthlyYieldRateBps() view returns (uint256)",
@@ -29482,6 +29516,35 @@ def _render_admin_page() -> str:
     function normalizeEthAddressInput(v) {{
       const raw = String(v || "").trim();
       return /^0x[a-fA-F0-9]{{40}}$/.test(raw) ? raw : "";
+    }}
+    function normAddrLower(v) {{
+      const s = String(v || "").trim().toLowerCase();
+      return /^0x[a-f0-9]{{40}}$/.test(s) ? s : "";
+    }}
+    function getAdminRoleBadges(addressLower, isRoot, isProtected, hasPendingProtect, hasPendingRemove) {{
+      const out = [];
+      if (isRoot) out.push('<span class="role-chip root">ROOT</span>');
+      if (isProtected) out.push('<span class="role-chip protected">PROTECTED</span>');
+      if (hasPendingProtect) out.push('<span class="role-chip">PENDING PROTECT</span>');
+      if (hasPendingRemove) out.push('<span class="role-chip">PENDING REMOVE</span>');
+      const roles = Array.isArray(adminOnchainRoleMap[addressLower]) ? adminOnchainRoleMap[addressLower] : [];
+      roles.forEach((r) => out.push(`<span class="role-chip onchain">${{r}}</span>`));
+      return out.join("");
+    }}
+    function setAdminOnchainRoles(payload) {{
+      const map = {{}};
+      const add = (addr, role) => {{
+        const key = normAddrLower(addr);
+        if (!key) return;
+        if (!map[key]) map[key] = [];
+        if (!map[key].includes(role)) map[key].push(role);
+      }};
+      add(payload?.vault_owner, "VAULT_OWNER");
+      add(payload?.distributor_owner, "YIELD_OWNER");
+      add(payload?.custody, "CUSTODY");
+      add(payload?.pending_operator, "PENDING_OPERATOR");
+      add(payload?.yield_payer, "YIELD_PAYER");
+      adminOnchainRoleMap = map;
     }}
     async function loadAdminRikoGlobalCap() {{
       const elAddr = document.getElementById("adminRikoVaultAddress");
@@ -29500,6 +29563,7 @@ def _render_admin_page() -> str:
       if (elYieldAddr) elYieldAddr.textContent = yieldAddr || "-";
       if (!elCap) return;
 
+      let rolePayload = {{ vault_owner: "", distributor_owner: "", custody: "", pending_operator: "", yield_payer: "" }};
       if (!/^0x[a-fA-F0-9]{{40}}$/.test(vaultAddr)) {{
         elCap.textContent = "vault address is not configured";
         if (elCustody) elCustody.textContent = "-";
@@ -29510,7 +29574,8 @@ def _render_admin_page() -> str:
           const ethers = await ensureEthersAdmin();
           const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
           const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
-          const [capUsd6, custody, pendingOperator, rikoPriceUsd6] = await Promise.all([
+          const [vaultOwner, capUsd6, custody, pendingOperator, rikoPriceUsd6] = await Promise.all([
+            vault.owner(),
             vault.globalSupplyCapUsd6(),
             vault.custodyAddress(),
             vault.pendingRedemptionOperator(),
@@ -29520,6 +29585,9 @@ def _render_admin_page() -> str:
           elCap.textContent = capNum <= 0 ? "no cap" : `$${{formatUsdFromUsd6Admin(capNum)}}`;
           if (elCustody) elCustody.textContent = String(custody || "-");
           if (elPendingOperator) elPendingOperator.textContent = String(pendingOperator || "-");
+          rolePayload.vault_owner = String(vaultOwner || "");
+          rolePayload.custody = String(custody || "");
+          rolePayload.pending_operator = String(pendingOperator || "");
           const rikoPriceNum = Number(rikoPriceUsd6 || 0n);
           if (elRikoPrice) elRikoPrice.textContent = `$${{formatUsdFromUsd6Admin(rikoPriceNum)}} (usd6=${{String(rikoPriceUsd6 || 0n)}})`;
           const inCustody = document.getElementById("adminRikoCustodyInput");
@@ -29546,7 +29614,8 @@ def _render_admin_page() -> str:
           const ethers = await ensureEthersAdmin();
           const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
           const distributor = new ethers.Contract(yieldAddr, ADMIN_RIKO_YIELD_ABI, provider);
-          const [yieldPayer, yieldToken, dailyBps, yieldCycle] = await Promise.all([
+          const [distributorOwner, yieldPayer, yieldToken, dailyBps, yieldCycle] = await Promise.all([
+            distributor.owner(),
             distributor.yieldPayerAddress(),
             distributor.yieldTokenAddress(),
             distributor.monthlyYieldRateBps(),
@@ -29556,6 +29625,8 @@ def _render_admin_page() -> str:
           if (elYieldToken) elYieldToken.textContent = String(yieldToken || "-");
           if (elDailyYield) elDailyYield.textContent = `${{String(dailyBps || 0n)}} bps/month`;
           if (elYieldCycle) elYieldCycle.textContent = String(yieldCycle || 0n);
+          rolePayload.distributor_owner = String(distributorOwner || "");
+          rolePayload.yield_payer = String(yieldPayer || "");
           const inYieldPayer = document.getElementById("adminRikoYieldPayerInput");
           const inYieldToken = document.getElementById("adminRikoYieldTokenInput");
           const inDailyBps = document.getElementById("adminRikoMonthlyYieldBpsInput");
@@ -29568,6 +29639,16 @@ def _render_admin_page() -> str:
           if (elDailyYield) elDailyYield.textContent = "unavailable";
           if (elYieldCycle) elYieldCycle.textContent = "unavailable";
         }}
+      }}
+      setAdminOnchainRoles(rolePayload);
+      if (adminLastSettings) {{
+        renderAdminWallets(
+          adminLastSettings.admin_wallets || [],
+          adminLastSettings.admin_wallets_root || [],
+          adminLastSettings.admin_wallets_protected || [],
+          adminLastSettings.admin_wallets_pending_protect_updates || [],
+          adminLastSettings.admin_wallets_pending_removals || [],
+        );
       }}
     }}
     async function applyAdminRikoGlobalCap() {{
@@ -30397,6 +30478,7 @@ def _render_admin_page() -> str:
         const r = await fetch("/api/admin/settings");
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || "Failed to load admin settings");
+        adminLastSettings = data || null;
         document.getElementById("dbPath").textContent = data.analytics_db_path || "-";
         document.getElementById("eventsCount").textContent = String(data.events_count || 0);
         document.getElementById("tokenCatalogInfo").textContent = `updated: ${{data.token_catalog_updated_at || "-"}}, count: ${{data.token_catalog_count || 0}}`;
@@ -30532,12 +30614,7 @@ def _render_admin_page() -> str:
         const isProtected = protectedSet.has(a);
         const hasPendingProtect = pendingProtectSet.has(a);
         const hasPendingRemove = pendingRemoveSet.has(a);
-        const badges = [
-          isRoot ? `<span class="hint">ROOT</span>` : "",
-          isProtected ? `<span class="hint">PROTECTED</span>` : "",
-          hasPendingProtect ? `<span class="hint">PENDING PROTECT</span>` : "",
-          hasPendingRemove ? `<span class="hint">PENDING REMOVE</span>` : "",
-        ].filter(Boolean).join(" ");
+        const badges = getAdminRoleBadges(a, isRoot, isProtected, hasPendingProtect, hasPendingRemove);
         const canRemoveNow = !isRoot && !isProtected && !hasPendingRemove;
         const removeLabel = isProtected ? "Schedule remove" : "Remove";
         const removeBtn = isRoot ? "" : `<button class="btn" style="padding:5px 10px;font-size:12px" onclick="removeAdminWallet('${{a}}')">${{removeLabel}}</button>`;
@@ -30548,12 +30625,16 @@ def _render_admin_page() -> str:
           ? `<button class="btn btn-soft" style="padding:5px 10px;font-size:12px" onclick="unprotectAdminWallet('${{a}}')">Unset PROTECTED</button>`
           : "";
         const removeNowBtn = canRemoveNow ? removeBtn : (isProtected ? removeBtn : "");
-        return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
-          <span class="mono">${{a}}</span>
-          ${{badges}}
-          ${{protectBtn}}
-          ${{unprotectBtn}}
-          ${{removeNowBtn}}
+        return `<div class="admin-wallet-item">
+          <div class="admin-wallet-left">
+            <span class="admin-wallet-address">${{a}}</span>
+            <div class="admin-wallet-badges">${{badges || '<span class="role-chip">NO ROLE</span>'}}</div>
+          </div>
+          <div class="admin-wallet-actions">
+            ${{protectBtn}}
+            ${{unprotectBtn}}
+            ${{removeNowBtn}}
+          </div>
         </div>`;
       }});
       if (!rows.length) {{
@@ -30564,7 +30645,7 @@ def _render_admin_page() -> str:
       const hint = hasNonRoot
         ? ""
         : `<div class="hint" style="margin-top:4px">Only ROOT admin is present. ROOT is always protected and cannot be toggled.</div>`;
-      wrap.innerHTML = rows.join("") + hint;
+      wrap.innerHTML = `<div class="admin-wallets-wrap">${{rows.join("")}}</div>` + hint;
     }}
     function renderPendingAdminWallets(items, delaySec) {{
       const wrap = document.getElementById("adminPendingWalletsList");
