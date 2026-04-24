@@ -23046,6 +23046,17 @@ def _render_riko_page() -> str:
     .riko-row-remove { min-width:36px; }
     .riko-amount-wrap { display:grid; grid-template-columns: 1fr auto; gap:8px; align-items:center; }
     .riko-max-btn { min-width:72px; }
+    .riko-hints-box {
+      margin-top: 8px;
+      border: 1px solid #d7e1ef;
+      background: #f8fbff;
+      border-radius: 10px;
+      padding: 8px 10px;
+      display: grid;
+      gap: 4px;
+    }
+    .riko-hint-line { font-size: 13px; color: #334155; }
+    .riko-hint-line .k { color: #64748b; margin-right: 6px; }
     .admin-only { display:none; }
     @media (max-width: 780px) {
       .riko-row { grid-template-columns: 1fr; }
@@ -23069,7 +23080,6 @@ def _render_riko_page() -> str:
             <option value="deposit">Deposit</option>
             <option value="redeem">Redeem</option>
           </select>
-          <div class="muted">Deposit: put token in and mint RIKO. Redeem: burn RIKO and receive selected token.</div>
         </div>
       </div>
       <div class="riko-row">
@@ -23092,8 +23102,10 @@ def _render_riko_page() -> str:
             <input id="rikoAmount" type="number" min="0" step="any" placeholder="e.g. 100" />
             <button class="btn riko-max-btn" type="button" onclick="setRikoMaxAmount()">Max</button>
           </div>
-          <div class="muted" id="rikoBalanceHint">Available: -</div>
-          <div class="muted" id="rikoQuoteHint"></div>
+          <div class="riko-hints-box">
+            <div class="riko-hint-line" id="rikoBalanceHint"><span class="k">Available:</span>-</div>
+            <div class="riko-hint-line" id="rikoQuoteHint"><span class="k">Estimated receive:</span>-</div>
+          </div>
         </div>
       </div>
       <div class="riko-row">
@@ -23783,7 +23795,33 @@ def _render_riko_page() -> str:
       if (s !== "eth") return getTokenAddressBySymbol(s);
       const fromWeth = getTokenAddressBySymbol("weth");
       if (/^0x[a-f0-9]{40}$/.test(String(fromWeth || "").toLowerCase())) return fromWeth;
+      const chainId = Number(authState?.chain_id || 0);
+      if (chainId === 11155111) return "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14";
       return "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+    }
+    function wrappedNativeByChainId(chainId) {
+      const n = Number(chainId || 0);
+      if (n === 11155111) return "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"; // Sepolia WETH
+      if (n === 1) return "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"; // Mainnet WETH
+      return "";
+    }
+    async function resolveEthVaultTokenAddressForSigner(signer, fallbackAddr) {
+      const addr = String(fallbackAddr || "").trim();
+      const ethers = await ensureEthers();
+      const provider = signer?.provider ? signer.provider : (window.ethereum ? new ethers.BrowserProvider(window.ethereum) : null);
+      if (!provider) return addr;
+      try {
+        if (/^0x[a-fA-F0-9]{40}$/.test(addr)) {
+          const code = await provider.getCode(addr);
+          if (String(code || "0x") !== "0x") return addr;
+        }
+      } catch (_) {}
+      try {
+        const network = await provider.getNetwork();
+        const alt = wrappedNativeByChainId(Number(network?.chainId || 0));
+        if (/^0x[a-fA-F0-9]{40}$/.test(alt)) return alt;
+      } catch (_) {}
+      return addr;
     }
     function getRikoInputs() {
       const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
@@ -23827,7 +23865,7 @@ def _render_riko_page() -> str:
     async function refreshRikoQuoteHint() {
       const hint = document.getElementById("rikoQuoteHint");
       if (!hint) return;
-      hint.textContent = "";
+      hint.innerHTML = '<span class="k">Estimated receive:</span>-';
       const mode = getRikoMode();
       if (mode !== "redeem") return;
       const amount = String(document.getElementById("rikoAmount")?.value || "").trim();
@@ -23849,9 +23887,9 @@ def _render_riko_page() -> str:
         }
         const outFmt = formatTokenAmount(BigInt(rawOut || 0n), outDecimals);
         const outSymbol = symbol ? String(symbol).toUpperCase() : "TOKEN";
-        hint.textContent = `Estimated receive: ${outFmt} ${outSymbol}`;
+        hint.innerHTML = `<span class="k">Estimated receive:</span>${outFmt} ${outSymbol}`;
       } catch (_) {
-        hint.textContent = "Estimated receive: unavailable";
+        hint.innerHTML = '<span class="k">Estimated receive:</span>unavailable';
       }
     }
     async function loadRikoGlobalCap() {
@@ -23905,6 +23943,10 @@ def _render_riko_page() -> str:
       }
     }
     async function rikoDeposit() {
+      let wrappedInThisFlow = false;
+      let wrappedAmount = 0n;
+      let wrappedTokenAddress = "";
+      let wrappedToken = null;
       try {
         setRikoStatus("Preparing deposit...", false);
         const { contractAddress, tokenAddress, vaultTokenAddress, amount, symbol } = getRikoInputs();
@@ -23915,13 +23957,20 @@ def _render_riko_page() -> str:
         let token;
         let raw;
         if (symbol === "eth") {
-          token = new ethers.Contract(vaultTokenAddress, WETH_ABI, signer);
+          wrappedTokenAddress = await resolveEthVaultTokenAddressForSigner(signer, vaultTokenAddress);
+          if (!/^0x[a-fA-F0-9]{40}$/.test(String(wrappedTokenAddress || "").trim())) {
+            throw new Error("No wrapped token address found for ETH on this network.");
+          }
+          token = new ethers.Contract(wrappedTokenAddress, WETH_ABI, signer);
+          wrappedToken = token;
           raw = ethers.parseUnits(amount, 18);
           setRikoStatus("Wrapping ETH to WETH...", false);
           const wrapTx = await token.deposit({ value: raw });
           await addRikoTxHistory("Wrap ETH->WETH", wrapTx.hash, signer);
           setRikoStatus("Wrap tx sent", false, true);
           await wrapTx.wait();
+          wrappedInThisFlow = true;
+          wrappedAmount = BigInt(raw);
         } else {
           token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
           const decimals = Number(await token.decimals());
@@ -23939,13 +23988,37 @@ def _render_riko_page() -> str:
           setRikoStatus("Approve tx sent", false, true);
           await approveTx.wait();
         }
-        const tx = await vault.deposit(vaultTokenAddress, raw, 0, user);
+        const depositTokenAddress = symbol === "eth" ? wrappedTokenAddress : vaultTokenAddress;
+        const tx = await vault.deposit(depositTokenAddress, raw, 0, user);
         await addRikoTxHistory("Deposit", tx.hash, signer);
         setRikoStatus("Deposit tx sent", false, true);
         await tx.wait();
         setRikoStatus("Deposit confirmed", false);
       } catch (e) {
-        setRikoStatus("Deposit failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+        const baseErr = e?.shortMessage || e?.message || "unknown";
+        if (wrappedInThisFlow && wrappedToken && wrappedAmount > 0n) {
+          try {
+            setRikoStatus("Deposit failed after wrap. Rolling back WETH to ETH...", true);
+            const signerAddr = await wrappedToken.runner.getAddress();
+            const curBal = BigInt(await wrappedToken.balanceOf(signerAddr));
+            const toUnwrap = curBal >= wrappedAmount ? wrappedAmount : curBal;
+            if (toUnwrap > 0n) {
+              const rollbackTx = await wrappedToken.withdraw(toUnwrap);
+              await addRikoTxHistory("Rollback unwrap", rollbackTx.hash, wrappedToken.runner);
+              setRikoStatus("Rollback tx sent", true, true);
+              await rollbackTx.wait();
+              setRikoStatus(`Deposit failed and rolled back to ETH: ${baseErr}`, true);
+              return;
+            }
+            setRikoStatus(`Deposit failed: ${baseErr}`, true);
+            return;
+          } catch (rollbackErr) {
+            const rollbackMsg = rollbackErr?.shortMessage || rollbackErr?.message || "rollback failed";
+            setRikoStatus(`Deposit failed: ${baseErr}. Rollback failed: ${rollbackMsg}`, true);
+            return;
+          }
+        }
+        setRikoStatus("Deposit failed: " + baseErr, true);
       }
     }
     async function rikoRedeem() {
@@ -23960,29 +24033,48 @@ def _render_riko_page() -> str:
         const rawRiko = ethers.parseUnits(amount, 6);
         let beforeWeth = 0n;
         let weth = null;
+        let redeemTokenAddress = vaultTokenAddress;
         if (symbol === "eth") {
-          weth = new ethers.Contract(vaultTokenAddress, WETH_ABI, signer);
-          beforeWeth = BigInt(await weth.balanceOf(user));
+          redeemTokenAddress = await resolveEthVaultTokenAddressForSigner(signer, vaultTokenAddress);
+          if (!/^0x[a-fA-F0-9]{40}$/.test(String(redeemTokenAddress || "").trim())) {
+            throw new Error("No wrapped token address found for ETH on this network.");
+          }
+          try {
+            weth = new ethers.Contract(redeemTokenAddress, WETH_ABI, signer);
+            beforeWeth = BigInt(await weth.balanceOf(user));
+          } catch (_) {
+            weth = null;
+            beforeWeth = 0n;
+          }
         }
-        const tx = await vault.redeem(vaultTokenAddress, rawRiko, 0, user);
+        const tx = await vault.redeem(redeemTokenAddress, rawRiko, 0, user);
         await addRikoTxHistory("Redeem", tx.hash, signer);
         setRikoStatus("Redeem tx sent", false, true);
         await tx.wait();
-        const pending = await vault.pendingRedemptions(user, vaultTokenAddress);
-        const isPending = !!pending?.exists;
+        let isPending = false;
+        try {
+          const pending = await vault.pendingRedemptions(user, redeemTokenAddress);
+          isPending = !!pending?.exists;
+        } catch (_) {
+          isPending = false;
+        }
         if (isPending) {
           setRikoStatus("ожидаю воздврата, обычно жто занимает не более 3 дней", false);
           return;
         }
         if (symbol === "eth" && weth) {
-          const afterWeth = BigInt(await weth.balanceOf(user));
-          const delta = afterWeth > beforeWeth ? (afterWeth - beforeWeth) : 0n;
-          if (delta > 0n) {
-            setRikoStatus("Unwrapping WETH to ETH...", false);
-            const unwrapTx = await weth.withdraw(delta);
-            await addRikoTxHistory("Unwrap WETH->ETH", unwrapTx.hash, signer);
-            setRikoStatus("Unwrap tx sent", false, true);
-            await unwrapTx.wait();
+          try {
+            const afterWeth = BigInt(await weth.balanceOf(user));
+            const delta = afterWeth > beforeWeth ? (afterWeth - beforeWeth) : 0n;
+            if (delta > 0n) {
+              setRikoStatus("Unwrapping WETH to ETH...", false);
+              const unwrapTx = await weth.withdraw(delta);
+              await addRikoTxHistory("Unwrap WETH->ETH", unwrapTx.hash, signer);
+              setRikoStatus("Unwrap tx sent", false, true);
+              await unwrapTx.wait();
+            }
+          } catch (_) {
+            // Redeem already succeeded; unwrap read/tx helpers should not flip final status to failed.
           }
         }
         setRikoStatus("Redeem confirmed", false);
