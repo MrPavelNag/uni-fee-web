@@ -23333,8 +23333,6 @@ def _render_riko_page() -> str:
     }
     .riko-hint-line { font-size: 13px; color: #334155; }
     .riko-hint-line .k { color: #64748b; margin-right: 6px; }
-    .riko-compact-toggle { display:inline-flex; align-items:center; gap:6px; margin-top:8px; color:#475569; font-size:12px; font-weight:600; }
-    .riko-compact-toggle input { width:14px; height:14px; margin:0; accent-color:#2563eb; }
     .riko-grid.compact { gap: 10px; }
     .riko-grid.compact .riko-yield { font-size: 17px; }
     .riko-grid.compact .riko-row { grid-template-columns: 190px 1fr; gap: 8px; }
@@ -23362,7 +23360,7 @@ def _render_riko_page() -> str:
       <p class="muted">For security, we only support whitelisted tokens.</p>
       <div class="badge-wrap" id="rikoWhitelistBadges"></div>
     </section>
-    <section class="card riko-grid" id="rikoMainCard">
+    <section class="card riko-grid compact" id="rikoMainCard">
       <div class="riko-yield" id="rikoTreasuryYield">""" + yield_text + """</div>
       <div class="riko-row">
         <label for="rikoMode">Mode</label>
@@ -23372,7 +23370,6 @@ def _render_riko_page() -> str:
             <option value="redeem">Redeem</option>
           </select>
           <div id="rikoModeSwitch" class="riko-switches"></div>
-          <label class="riko-compact-toggle"><input id="rikoCompactMode" type="checkbox" />Compact mode</label>
         </div>
       </div>
       <div class="riko-row">
@@ -23455,21 +23452,6 @@ def _render_riko_page() -> str:
       const s = String(symbolLower || "").trim().toLowerCase();
       if (s === "eth" || s === "weth") return "https://assets.coingecko.com/coins/images/279/large/ethereum.png";
       return `/api/token-icon/${encodeURIComponent(s || "eth")}`;
-    }
-    function applyRikoCompactMode() {
-      const card = document.getElementById("rikoMainCard");
-      const isCompact = !!document.getElementById("rikoCompactMode")?.checked;
-      if (card) card.classList.toggle("compact", isCompact);
-    }
-    function restoreRikoCompactMode() {
-      const el = document.getElementById("rikoCompactMode");
-      if (!el) return;
-      try {
-        el.checked = String(localStorage.getItem("rikoCompactMode") || "0") === "1";
-      } catch (_) {
-        el.checked = false;
-      }
-      applyRikoCompactMode();
     }
     function renderRikoModeSwitch() {
       const root = document.getElementById("rikoModeSwitch");
@@ -24654,15 +24636,7 @@ def _render_riko_page() -> str:
       }
       const amountEl = document.getElementById("rikoAmount");
       if (amountEl) amountEl.addEventListener("input", refreshRikoQuoteHint);
-      const compactEl = document.getElementById("rikoCompactMode");
-      if (compactEl) {
-        compactEl.addEventListener("change", () => {
-          try { localStorage.setItem("rikoCompactMode", compactEl.checked ? "1" : "0"); } catch (_) {}
-          applyRikoCompactMode();
-        });
-      }
       updateRikoModeUi();
-      restoreRikoCompactMode();
       loadRikoWhitelist();
       loadRikoTxHistory();
       setTimeout(syncRikoAdminCard, 150);
@@ -30151,7 +30125,11 @@ def _render_admin_page() -> str:
       <div class="top-controls">
         <span class="intent-prefix">I want to</span>
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">{options_html}</select>
-        <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
+        <button
+          class="connect-btn"
+          id="connectWalletBtn"
+          onclick="if (typeof onConnectWalletClick==='function') {{ onConnectWalletClick(); }} else {{ window.location.href='/connect?next=/admin'; }}"
+        >Connect Wallet</button>
       </div>
     </div>
     <div class="tabs">
@@ -32586,6 +32564,11 @@ def connect_page(request: Request) -> HTMLResponse:
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(request: Request, response: Response) -> HTMLResponse:
     try:
+        sid = _ensure_session_cookie(request, response)
+        with AUTH_LOCK:
+            auth = dict(AUTH_SESSIONS.get(sid, {}))
+        if (not auth) or (not _is_admin_address(str(auth.get("address") or ""))):
+            return RedirectResponse(url="/connect?next=/admin", status_code=302)
         html = _render_admin_page().replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
         resp = HTMLResponse(html)
         _require_admin(request, resp)
