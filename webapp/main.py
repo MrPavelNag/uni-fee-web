@@ -21531,6 +21531,16 @@ def _riko_is_valid_month_day(month: int, day: int) -> bool:
             return False
 
 
+def _normalize_riko_payout_time_utc(raw_value: Any) -> tuple[int, int, str]:
+    raw = str(raw_value or "").strip()
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", raw)
+    if not m:
+        return 0, 0, "00:00"
+    hour = int(m.group(1))
+    minute = int(m.group(2))
+    return hour, minute, f"{hour:02d}:{minute:02d}"
+
+
 def _normalize_riko_payout_schedule_items(items: Any) -> list[dict[str, int]]:
     out: list[dict[str, int]] = []
     seen: set[tuple[int, int]] = set()
@@ -21555,21 +21565,46 @@ def _normalize_riko_payout_schedule_items(items: Any) -> list[dict[str, int]]:
     return out
 
 
-def _riko_next_schedule_date(items: list[dict[str, int]], now_utc: datetime | None = None) -> date | None:
+def _riko_next_schedule_datetime(
+    items: list[dict[str, int]], payout_hour_utc: int, payout_minute_utc: int, now_utc: datetime | None = None
+) -> datetime | None:
     clean = _normalize_riko_payout_schedule_items(items)
-    if not clean:
-        return None
     now_dt = now_utc if isinstance(now_utc, datetime) else datetime.now(timezone.utc)
-    today = now_dt.date()
-    for year_offset in range(0, 9):
-        y = int(today.year) + int(year_offset)
-        for item in clean:
-            try:
-                candidate = date(y, int(item["month"]), int(item["day"]))
-            except Exception:
-                continue
-            if candidate >= today:
-                return candidate
+    if clean:
+        today = now_dt.date()
+        for year_offset in range(0, 9):
+            y = int(today.year) + int(year_offset)
+            for item in clean:
+                try:
+                    candidate_date = date(y, int(item["month"]), int(item["day"]))
+                except Exception:
+                    continue
+                candidate_dt = datetime(
+                    candidate_date.year,
+                    candidate_date.month,
+                    candidate_date.day,
+                    int(payout_hour_utc),
+                    int(payout_minute_utc),
+                    0,
+                    tzinfo=timezone.utc,
+                )
+                if candidate_dt >= now_dt:
+                    return candidate_dt
+    else:
+        # Fallback mode (no explicit dates): first day of each month at configured UTC time.
+        first_this_month = datetime(now_dt.year, now_dt.month, 1, int(payout_hour_utc), int(payout_minute_utc), tzinfo=timezone.utc)
+        if first_this_month >= now_dt:
+            return first_this_month
+        next_month_start = (date(now_dt.year, now_dt.month, 1) + timedelta(days=32)).replace(day=1)
+        return datetime(
+            next_month_start.year,
+            next_month_start.month,
+            1,
+            int(payout_hour_utc),
+            int(payout_minute_utc),
+            0,
+            tzinfo=timezone.utc,
+        )
     return None
 
 
@@ -21584,19 +21619,28 @@ def _load_riko_payout_schedule() -> dict[str, Any]:
         except Exception:
             raw = {}
     items = _normalize_riko_payout_schedule_items(raw.get("items"))
-    next_due_date = _riko_next_schedule_date(items)
+    payout_hour_utc, payout_minute_utc, payout_time_utc = _normalize_riko_payout_time_utc(raw.get("payout_time_utc"))
+    next_due_at = _riko_next_schedule_datetime(items, payout_hour_utc, payout_minute_utc)
     return {
         "items": items,
         "count": int(len(items)),
-        "next_due_date": next_due_date.isoformat() if isinstance(next_due_date, date) else "",
+        "payout_time_utc": payout_time_utc,
+        "payout_hour_utc": int(payout_hour_utc),
+        "payout_minute_utc": int(payout_minute_utc),
+        "next_due_date": next_due_at.date().isoformat() if isinstance(next_due_at, datetime) else "",
+        "next_due_at_utc": next_due_at.strftime("%Y-%m-%d %H:%M UTC") if isinstance(next_due_at, datetime) else "",
         "updated_at": str(raw.get("updated_at") or ""),
     }
 
 
-def _save_riko_payout_schedule(items: list[dict[str, Any]]) -> dict[str, Any]:
+def _save_riko_payout_schedule(items: list[dict[str, Any]], payout_time_utc: str | None = None) -> dict[str, Any]:
     clean_items = _normalize_riko_payout_schedule_items(items)
+    cur = _load_riko_payout_schedule()
+    raw_time = str(payout_time_utc or "").strip() or str(cur.get("payout_time_utc") or "00:00")
+    _, _, norm_time = _normalize_riko_payout_time_utc(raw_time)
     payload = {
         "items": clean_items,
+        "payout_time_utc": norm_time,
         "updated_at": _iso_now(),
     }
     _analytics_set_state(RIKO_PAYOUT_SCHEDULE_STATE_KEY, json.dumps(payload, ensure_ascii=False))
@@ -21761,6 +21805,11 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
     month_key = f"{now_utc.year:04d}-{now_utc.month:02d}"
     schedule = _load_riko_payout_schedule()
     schedule_items = _normalize_riko_payout_schedule_items(schedule.get("items"))
+    schedule_hour = int(schedule.get("payout_hour_utc") or 0)
+    schedule_minute = int(schedule.get("payout_minute_utc") or 0)
+    payout_time_utc = str(schedule.get("payout_time_utc") or "00:00")
+    now_minutes = (int(now_utc.hour) * 60) + int(now_utc.minute)
+    scheduled_minutes = (schedule_hour * 60) + schedule_minute
     schedule_key = ""
     if schedule_items:
         today_month = int(now_utc.month)
@@ -21776,11 +21825,38 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
                 }
             )
             return result
+        if now_minutes < scheduled_minutes:
+            result.update(
+                {
+                    "status": "skip",
+                    "reason": "before_scheduled_utc_time",
+                    "month_key": month_key,
+                    "schedule_time_utc": payout_time_utc,
+                    "schedule_next_due_date": str(schedule.get("next_due_date") or ""),
+                    "schedule_next_due_at_utc": str(schedule.get("next_due_at_utc") or ""),
+                }
+            )
+            return result
         schedule_key = f"{now_utc.year:04d}-{today_month:02d}-{today_day:02d}"
     else:
         if now_utc.day != 1:
             result.update({"status": "skip", "reason": "not_first_day_of_month", "month_key": month_key})
             return result
+        if now_minutes < scheduled_minutes:
+            result.update(
+                {
+                    "status": "skip",
+                    "reason": "before_scheduled_utc_time",
+                    "month_key": month_key,
+                    "schedule_time_utc": payout_time_utc,
+                    "schedule_next_due_date": str(schedule.get("next_due_date") or ""),
+                    "schedule_next_due_at_utc": str(schedule.get("next_due_at_utc") or ""),
+                }
+            )
+            return result
+        schedule_key = f"{now_utc.year:04d}-{now_utc.month:02d}-{now_utc.day:02d}-{schedule_hour:02d}{schedule_minute:02d}"
+    if schedule_items:
+        schedule_key = f"{now_utc.year:04d}-{now_utc.month:02d}-{now_utc.day:02d}-{schedule_hour:02d}{schedule_minute:02d}"
     last_raw = _analytics_get_state(RIKO_AUTO_YIELD_STATE_KEY)
     if last_raw:
         try:
@@ -21833,7 +21909,9 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
             "max_delta_bps": int(max_delta),
             "month_key": month_key,
             "schedule_key": schedule_key,
+            "schedule_time_utc": payout_time_utc,
             "schedule_next_due_date": str(schedule.get("next_due_date") or ""),
+            "schedule_next_due_at_utc": str(schedule.get("next_due_at_utc") or ""),
         }
     )
 
@@ -21887,6 +21965,10 @@ def _riko_auto_yield_report(result: dict[str, Any]) -> None:
         lines.append(f"schedule_key: {result.get('schedule_key')}")
     if result.get("schedule_next_due_date"):
         lines.append(f"next_due_date: {result.get('schedule_next_due_date')}")
+    if result.get("schedule_next_due_at_utc"):
+        lines.append(f"next_due_at_utc: {result.get('schedule_next_due_at_utc')}")
+    if result.get("schedule_time_utc"):
+        lines.append(f"schedule_time_utc: {result.get('schedule_time_utc')}")
     if result.get("action"):
         lines.append(f"action: {result.get('action')}")
     if result.get("tx_hash"):
@@ -22147,6 +22229,7 @@ class AdminRikoPayoutDateItem(BaseModel):
 
 class AdminRikoPayoutScheduleUpdate(BaseModel):
     items: list[AdminRikoPayoutDateItem] = Field(default_factory=list)
+    payout_time_utc: str = "00:00"
 
 
 class RikoWhitelistItemUpdate(BaseModel):
@@ -30185,7 +30268,18 @@ def _render_admin_page() -> str:
           <label>Dates (MM-DD)</label>
           <textarea id="adminRikoPayoutDatesInput" placeholder="01-15&#10;04-15&#10;07-15&#10;10-15"></textarea>
         </div>
-        <div class="row"><label>Next scheduled date (UTC)</label><div id="adminRikoPayoutNextDate">-</div></div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Payout time (UTC)</label>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+            <input id="adminRikoPayoutTimeUtcInput" type="time" step="60" value="00:00"/>
+            <button type="button" class="btn btn-soft" onclick="setAdminRikoPayoutTimePreset('00:30')">00:30</button>
+            <button type="button" class="btn btn-soft" onclick="setAdminRikoPayoutTimePreset('02:00')">02:00</button>
+            <button type="button" class="btn btn-soft" onclick="setAdminRikoPayoutTimePreset('03:00')">03:00</button>
+            <button type="button" class="btn btn-soft" onclick="setAdminRikoPayoutTimePreset('05:00')">05:00</button>
+          </div>
+          <span class="hint">one time for all payouts (UTC)</span>
+        </div>
+        <div class="row"><label>Next scheduled payout (UTC)</label><div id="adminRikoPayoutNextDate">-</div></div>
         <div class="row"><label>Auto-yield job</label><div id="adminRikoPayoutJobMode">-</div></div>
         <div class="row"><label>Last schedule update</label><div id="adminRikoPayoutUpdatedAt">-</div></div>
         <button class="btn" onclick="saveAdminRikoPayoutSchedule()">Save payout schedule</button>
@@ -30342,7 +30436,30 @@ def _render_admin_page() -> str:
     function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} refreshIntentMenu(); }}
     function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; if(authState?.authenticated) {{ btn.textContent=authState.address_short||"Wallet connected"; }} else {{ btn.textContent="Connect wallet"; }} syncAdminIntentOption(); }}
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
-    async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
+    async function onConnectWalletClick() {{
+      if (authState?.authenticated) {{
+        if (!confirm("Disconnect wallet?")) return;
+        try {{
+          await postJson("/api/auth/logout", {{}});
+          authState = {{ authenticated: false }};
+          setAuthUI();
+        }} catch (e) {{
+          console.warn("disconnect failed", e);
+        }}
+        return;
+      }}
+      try {{
+        openWalletModal();
+        const backdrop = document.getElementById("walletModalBackdrop");
+        // Fallback: if modal did not open for any reason, route to dedicated connect page.
+        if (!backdrop || backdrop.style.display !== "flex") {{
+          window.location.href = "/connect";
+        }}
+      }} catch (e) {{
+        console.warn("open wallet modal failed", e);
+        window.location.href = "/connect";
+      }}
+    }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
     function showWcQrModal(uri){{ let el=document.getElementById("wcQrBackdrop"); if(!el){{ el=document.createElement("div"); el.id="wcQrBackdrop"; el.style.cssText="position:fixed;inset:0;background:linear-gradient(180deg,rgba(217,227,245,0.95),rgba(236,242,255,0.95));backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:10001;"; el.innerHTML='<div style="background:#f8fbff;border:1px solid #cbd5e1;border-radius:14px;padding:20px;text-align:center"><p style="margin:0 0 12px;font-size:16px;font-weight:700;color:#0f172a">Scan with your wallet app</p><img id="wcQrImg" alt="QR" style="display:block;background:#fff;padding:10px;border-radius:10px;width:260px;height:260px"/><button id="wcQrCancel" type="button" style="margin-top:14px;padding:8px 16px;border-radius:10px;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:700;cursor:pointer">Cancel</button></div>'; document.body.appendChild(el); document.getElementById("wcQrCancel").onclick=closeWcQrModal; }} document.getElementById("wcQrImg").src="https://api.qrserver.com/v1/create-qr-code/?size=260x260&data="+encodeURIComponent(uri); el.style.display="flex"; }}
     function closeWcQrModal(){{ const el=document.getElementById("wcQrBackdrop"); if(el) el.style.display="none"; if(window._wcProvider) try {{ window._wcProvider.disconnect(); }} catch(_) {{}} window._wcProvider=null; }}
@@ -31607,7 +31724,12 @@ def _render_admin_page() -> str:
           setAdminStatus("Pilot config is frozen (RIKO_PILOT_CONFIG_FROZEN=1). Admin updates are disabled by server.", false);
         }}
       }} catch (e) {{
-        setAdminStatus("Load failed: " + (e?.message || "unknown"), true);
+        const msg = String(e?.message || "unknown");
+        if (msg.toLowerCase().includes("401") || msg.toLowerCase().includes("403") || msg.toLowerCase().includes("admin")) {{
+          setAdminStatus("Admin session missing. Click Connect Wallet to sign in.", true);
+        }} else {{
+          setAdminStatus("Load failed: " + msg, true);
+        }}
       }}
     }}
     function _quickHash32(text) {{
@@ -31660,6 +31782,13 @@ def _render_admin_page() -> str:
       el.textContent = msg || "";
       el.classList.toggle("err", !!isErr);
     }}
+    function setAdminRikoPayoutTimePreset(hhmm) {{
+      const inTime = document.getElementById("adminRikoPayoutTimeUtcInput");
+      if (!inTime) return;
+      const m = String(hhmm || "").match(/^([01]\\d|2[0-3]):([0-5]\\d)$/);
+      if (!m) return;
+      inTime.value = String(hhmm);
+    }}
     function parseAdminRikoPayoutLines(raw) {{
       const lines = String(raw || "")
         .split(/\r?\n/)
@@ -31686,6 +31815,7 @@ def _render_admin_page() -> str:
     function renderAdminRikoPayoutSchedule(cfg, autoEnabled) {{
       const items = Array.isArray(cfg?.items) ? cfg.items : [];
       const inDates = document.getElementById("adminRikoPayoutDatesInput");
+      const inTime = document.getElementById("adminRikoPayoutTimeUtcInput");
       const nextEl = document.getElementById("adminRikoPayoutNextDate");
       const modeEl = document.getElementById("adminRikoPayoutJobMode");
       const updEl = document.getElementById("adminRikoPayoutUpdatedAt");
@@ -31695,16 +31825,18 @@ def _render_admin_page() -> str:
           .join("\n");
         inDates.value = text;
       }}
-      if (nextEl) nextEl.textContent = String(cfg?.next_due_date || "-");
+      if (inTime) inTime.value = String(cfg?.payout_time_utc || "00:00");
+      if (nextEl) nextEl.textContent = String(cfg?.next_due_at_utc || cfg?.next_due_date || "-");
       if (modeEl) modeEl.textContent = autoEnabled ? "enabled" : "disabled (set RIKO_AUTO_YIELD_ENABLED=1 on server)";
       if (updEl) updEl.textContent = String(cfg?.updated_at || "-");
     }}
     async function saveAdminRikoPayoutSchedule() {{
       try {{
         const raw = document.getElementById("adminRikoPayoutDatesInput")?.value || "";
+        const payout_time_utc = String(document.getElementById("adminRikoPayoutTimeUtcInput")?.value || "00:00").trim() || "00:00";
         const items = parseAdminRikoPayoutLines(raw);
         if (!items.length) throw new Error("Add at least one valid MM-DD date.");
-        const data = await postJson("/api/admin/riko/payout-schedule", {{ items }});
+        const data = await postJson("/api/admin/riko/payout-schedule", {{ items, payout_time_utc }});
         renderAdminRikoPayoutSchedule(data.riko_payout_schedule || {{}}, !!adminLastSettings?.riko_auto_yield_enabled);
         setAdminRikoPayoutStatus(data.info || "Payout schedule saved.", false);
       }} catch (e) {{
@@ -32958,7 +33090,7 @@ def admin_riko_payout_schedule_update(
     raw_items: list[dict[str, Any]] = []
     for item in (req.items or []):
         raw_items.append({"month": int(item.month), "day": int(item.day)})
-    saved = _save_riko_payout_schedule(raw_items)
+    saved = _save_riko_payout_schedule(raw_items, payout_time_utc=str(req.payout_time_utc or "").strip())
     return {"ok": True, "info": "RIKO payout schedule saved.", "riko_payout_schedule": saved}
 
 

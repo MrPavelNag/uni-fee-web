@@ -29,6 +29,8 @@ contract RIKOYieldDistributor is Ownable2Step, ReentrancyGuard, Pausable {
     error RYD_YieldNotReady();
     error RYD_YieldAccountMismatch();
     error RYD_InvalidRikoToken();
+    error RYD_ClaimDisabled();
+    error RYD_InvalidCycle();
 
     /*//////////////////////////////////////////////////////////////
                                   STORAGE
@@ -39,7 +41,8 @@ contract RIKOYieldDistributor is Ownable2Step, ReentrancyGuard, Pausable {
     address public yieldTokenAddress;
     uint256 public monthlyYieldRateBps;
     uint256 public currentYieldCycle;
-    mapping(address => uint256) public lastClaimedYieldCycle;
+    mapping(uint256 => uint256) public yieldRateBpsByCycle;
+    mapping(uint256 => mapping(address => bool)) public wasPaidInCycle;
 
     /*//////////////////////////////////////////////////////////////
                                    EVENTS
@@ -49,6 +52,7 @@ contract RIKOYieldDistributor is Ownable2Step, ReentrancyGuard, Pausable {
     event YieldTokenAddressUpdated(address indexed yieldTokenAddress);
     event MonthlyYieldRateUpdated(uint256 monthlyYieldRateBps, uint256 yieldCycle);
     event YieldPaid(address indexed account, uint256 amount, uint256 yieldCycle, uint256 rateBps);
+    event YieldBatchPaid(uint256 indexed yieldCycle, uint256 accountsProcessed, uint256 totalPayout, uint256 rateBps);
 
     /*//////////////////////////////////////////////////////////////
                                  LIFECYCLE
@@ -101,6 +105,7 @@ contract RIKOYieldDistributor is Ownable2Step, ReentrancyGuard, Pausable {
         if (newMonthlyYieldRateBps > BPS_DENOMINATOR) revert RYD_InvalidAmount();
         monthlyYieldRateBps = newMonthlyYieldRateBps;
         currentYieldCycle += 1;
+        yieldRateBpsByCycle[currentYieldCycle] = newMonthlyYieldRateBps;
         emit MonthlyYieldRateUpdated(newMonthlyYieldRateBps, currentYieldCycle);
     }
 
@@ -110,64 +115,73 @@ contract RIKOYieldDistributor is Ownable2Step, ReentrancyGuard, Pausable {
 
     /// @notice Backward-compatible alias for `claimMonthlyYield`.
     /// @return payoutAmount Payout amount transferred to caller.
-    function claimDailyYield() external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        // Backward-compatible alias for integrators that still call "daily".
-        return _claimYieldFor(msg.sender);
+    function claimDailyYield() external nonReentrant whenNotPaused returns (uint256) {
+        // Pull-claim is deprecated; payouts are now pushed by operator/owner.
+        revert RYD_ClaimDisabled();
     }
 
     /// @notice Backward-compatible alias for `claimMonthlyYieldFor`.
     /// @param account Receiver account (must match `msg.sender`).
     /// @return payoutAmount Payout amount transferred to account.
-    function claimDailyYieldFor(address account) external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        if (account != msg.sender) revert RYD_YieldAccountMismatch();
-        // Backward-compatible alias for integrators that still call "daily".
-        return _claimYieldFor(account);
+    function claimDailyYieldFor(address account) external nonReentrant whenNotPaused returns (uint256) {
+        account; // silence lint about unused argument in deprecated path
+        revert RYD_ClaimDisabled();
     }
 
     /// @notice Claim current cycle payout based on caller's RIKO balance.
     /// @dev Security: cycle gate prevents double-claim in same cycle; payout amount is
     ///      based on current RIKO balance and paid via `safeTransferFrom`.
     /// @return payoutAmount Payout amount transferred to caller.
-    function claimMonthlyYield() external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        return _claimYieldFor(msg.sender);
+    function claimMonthlyYield() external nonReentrant whenNotPaused returns (uint256) {
+        revert RYD_ClaimDisabled();
     }
 
     /// @notice Claim current cycle payout for account.
     /// @param account Receiver account (must match `msg.sender`).
     /// @return payoutAmount Payout amount transferred to account.
-    function claimMonthlyYieldFor(address account) external nonReentrant whenNotPaused returns (uint256 payoutAmount) {
-        if (account != msg.sender) revert RYD_YieldAccountMismatch();
-        return _claimYieldFor(account);
+    function claimMonthlyYieldFor(address account) external nonReentrant whenNotPaused returns (uint256) {
+        account; // silence lint about unused argument in deprecated path
+        revert RYD_ClaimDisabled();
     }
 
-    /*//////////////////////////////////////////////////////////////
-                             INTERNAL LOGIC
-    //////////////////////////////////////////////////////////////*/
-
-    function _claimYieldFor(address account) internal returns (uint256 payoutAmount) {
+    /// @notice Push payout to holders for a specific cycle in batch.
+    /// @dev Caller provides holder list (on-chain holder enumeration is not feasible gas-wise).
+    ///      Payout per holder = `rikoBalance * cycleRateBps / 10_000`.
+    ///      Each holder can be paid once per cycle.
+    /// @param cycle Yield cycle number to settle.
+    /// @param accounts Holder addresses to pay.
+    /// @return totalPayout Total amount transferred in this batch.
+    function distributeYieldBatch(uint256 cycle, address[] calldata accounts)
+        external
+        onlyOwner
+        nonReentrant
+        whenNotPaused
+        returns (uint256 totalPayout)
+    {
         address payer = yieldPayerAddress;
         address yieldToken = yieldTokenAddress;
         if (payer == address(0)) revert RYD_InvalidYieldPayerAddress();
         if (yieldToken == address(0)) revert RYD_InvalidYieldToken();
+        if (cycle == 0 || cycle > currentYieldCycle) revert RYD_InvalidCycle();
 
-        uint256 balance = rikoToken.balanceOf(account);
-        if (balance == 0) revert RYD_InvalidAmount();
+        uint256 rateBps = yieldRateBpsByCycle[cycle];
+        IERC20Metadata payoutToken = IERC20Metadata(yieldToken);
+        uint256 len = accounts.length;
+        for (uint256 i = 0; i < len; ++i) {
+            address account = accounts[i];
+            if (account == address(0)) revert RYD_InvalidReceiver();
+            if (wasPaidInCycle[cycle][account]) continue;
 
-        uint256 cycle = currentYieldCycle;
-        if (cycle == 0) revert RYD_YieldNotReady();
-        if (lastClaimedYieldCycle[account] >= cycle) revert RYD_YieldNotReady();
-
-        uint256 rateBps = monthlyYieldRateBps;
-        if (rateBps == 0) {
-            lastClaimedYieldCycle[account] = cycle;
-            emit YieldPaid(account, 0, cycle, 0);
-            return 0;
+            wasPaidInCycle[cycle][account] = true;
+            uint256 balance = rikoToken.balanceOf(account);
+            uint256 payoutAmount = (balance * rateBps) / BPS_DENOMINATOR;
+            if (payoutAmount > 0) {
+                payoutToken.safeTransferFrom(payer, account, payoutAmount);
+                totalPayout += payoutAmount;
+            }
+            emit YieldPaid(account, payoutAmount, cycle, rateBps);
         }
-
-        payoutAmount = (balance * rateBps) / BPS_DENOMINATOR;
-        lastClaimedYieldCycle[account] = cycle;
-        IERC20Metadata(yieldToken).safeTransferFrom(payer, account, payoutAmount);
-        emit YieldPaid(account, payoutAmount, cycle, rateBps);
+        emit YieldBatchPaid(cycle, len, totalPayout, rateBps);
     }
 
     function _requireNonZeroPayerAddress(address value) internal pure {

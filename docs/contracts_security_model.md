@@ -13,19 +13,19 @@ It is intended as a quick release checklist reference for pilot/mainnet operatio
 - `Pending Redemption Operator` (vault-specific)
 - `Custody Address` (vault-specific)
 - `Yield Payer Address` (distributor-specific)
-- `User` (depositor/redeemer/claimer)
+- `User` (depositor/redeemer)
 
 ## Permission Matrix
 
 | Role | Contract | Can do |
 |---|---|---|
 | `Owner` | `RIKOVault` | `pause/unpause`, set global cap, set per-token cap, set custody, set RIKO price, set token config, set pending redemption operator |
-| `Owner` | `RIKOYieldDistributor` | `pause/unpause`, set yield payer, set yield token, set monthly yield bps (opens new cycle) |
+| `Owner` | `RIKOYieldDistributor` | `pause/unpause`, set yield payer, set yield token, set monthly yield bps (opens new cycle), execute batched push payouts |
 | `Pending Redemption Operator` | `RIKOVault` | call `processPendingRedemption(account, token)` |
 | `Custody Address` | `RIKOVault` | holds deposited assets, grants allowance to vault for pull-based redemption settlement |
-| `Yield Payer Address` | `RIKOYieldDistributor` | provides payout token via `safeTransferFrom` on successful user claim |
+| `Yield Payer Address` | `RIKOYieldDistributor` | provides payout token via `safeTransferFrom` during owner-triggered batch payout |
 | `User` | `RIKOVault` | `deposit`, `redeem`, `cancelPendingRedemption`, read quotes |
-| `User` | `RIKOYieldDistributor` | `claimMonthlyYield`, `claimMonthlyYieldFor(self)` (and backward-compatible `claimDaily*`) |
+| `User` | `RIKOYieldDistributor` | no direct payout action (claim paths disabled) |
 
 ## Core Trust Boundaries
 
@@ -66,22 +66,23 @@ It is intended as a quick release checklist reference for pilot/mainnet operatio
 
 ### Yield Invariants (`RIKOYieldDistributor`)
 
-1. **Cycle-based single-claim**
-   - A user can claim at most once per `currentYieldCycle`.
+1. **Cycle-based payout**
    - New cycle opens only when owner updates `monthlyYieldRateBps`.
+   - Rate is snapshotted per-cycle (`yieldRateBpsByCycle`) at cycle-open time.
 
-2. **Balance-based payout**
-   - Payout is computed from current `RIKO` balance of claimer.
+2. **Balance-based push payout**
+   - Payout is computed from current `RIKO` balance of each account in the batch.
+   - Each account can be paid at most once per cycle (`wasPaidInCycle`).
 
-3. **Self-claim restriction**
-   - `claim*For(account)` requires `account == msg.sender`.
+3. **No pull-claim path**
+   - `claim*` functions are disabled by design (`RYD_ClaimDisabled`).
 
 4. **Payout source safety**
    - Payout token transfer is pull-based from `yieldPayerAddress` via `safeTransferFrom`.
-   - Claim requires non-zero configured yield token and payer address.
+   - Batch payout requires non-zero configured yield token and payer address.
 
 5. **Reentrancy and pause controls**
-   - Claims are guarded by `nonReentrant` and `whenNotPaused`.
+   - Batch payouts are guarded by `nonReentrant` and `whenNotPaused`.
 
 ## Operational Notes
 
@@ -91,11 +92,12 @@ It is intended as a quick release checklist reference for pilot/mainnet operatio
   - configure and verify token feeds
   - set initial RIKO price
 
-- Before enabling yield claims:
+- Before enabling yield payouts:
   - set yield token
   - set yield payer
   - ensure yield payer funded and approved distributor
-  - set monthly yield bps (opens claim cycle)
+  - set monthly yield bps (opens payout cycle)
+  - run owner batch payout over holder list
 
 - For incident response:
   - `pause()` both contracts if abnormal behavior is detected
