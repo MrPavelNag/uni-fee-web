@@ -30125,11 +30125,7 @@ def _render_admin_page() -> str:
       <div class="top-controls">
         <span class="intent-prefix">I want to</span>
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">{options_html}</select>
-        <button
-          class="connect-btn"
-          id="connectWalletBtn"
-          onclick="if (typeof onConnectWalletClick==='function') {{ onConnectWalletClick(); }} else {{ window.location.href='/connect?next=/admin'; }}"
-        >Connect Wallet</button>
+        <button class="connect-btn" id="connectWalletBtn" onclick="onConnectWalletClick()">Connect Wallet</button>
       </div>
     </div>
     <div class="tabs">
@@ -30426,17 +30422,7 @@ def _render_admin_page() -> str:
         }}
         return;
       }}
-      try {{
-        openWalletModal();
-        const backdrop = document.getElementById("walletModalBackdrop");
-        // Fallback: if modal did not open for any reason, route to dedicated connect page.
-        if (!backdrop || backdrop.style.display !== "flex") {{
-          window.location.href = "/connect";
-        }}
-      }} catch (e) {{
-        console.warn("open wallet modal failed", e);
-        window.location.href = "/connect";
-      }}
+      openWalletModal();
     }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); location.reload(); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
     function showWcQrModal(uri){{ let el=document.getElementById("wcQrBackdrop"); if(!el){{ el=document.createElement("div"); el.id="wcQrBackdrop"; el.style.cssText="position:fixed;inset:0;background:linear-gradient(180deg,rgba(217,227,245,0.95),rgba(236,242,255,0.95));backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:10001;"; el.innerHTML='<div style="background:#f8fbff;border:1px solid #cbd5e1;border-radius:14px;padding:20px;text-align:center"><p style="margin:0 0 12px;font-size:16px;font-weight:700;color:#0f172a">Scan with your wallet app</p><img id="wcQrImg" alt="QR" style="display:block;background:#fff;padding:10px;border-radius:10px;width:260px;height:260px"/><button id="wcQrCancel" type="button" style="margin-top:14px;padding:8px 16px;border-radius:10px;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:700;cursor:pointer">Cancel</button></div>'; document.body.appendChild(el); document.getElementById("wcQrCancel").onclick=closeWcQrModal; }} document.getElementById("wcQrImg").src="https://api.qrserver.com/v1/create-qr-code/?size=260x260&data="+encodeURIComponent(uri); el.style.display="flex"; }}
@@ -32567,7 +32553,7 @@ def admin_page(request: Request, response: Response) -> HTMLResponse:
         sid = _ensure_session_cookie(request, response)
         with AUTH_LOCK:
             auth = dict(AUTH_SESSIONS.get(sid, {}))
-        if (not auth) or (not _is_admin_address(str(auth.get("address") or ""))):
+        if not auth:
             return RedirectResponse(url="/connect?next=/admin", status_code=302)
         html = _render_admin_page().replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
         resp = HTMLResponse(html)
@@ -38544,6 +38530,9 @@ HTML_PAGE = """
         authState = {authenticated: false};
       }
       setAuthUI();
+      if (authState?.authenticated) {
+        redirectAfterAuth();
+      }
     }
 
     async function onConnectWalletClick() {
@@ -38560,6 +38549,24 @@ HTML_PAGE = """
         return;
       }
       openWalletModal();
+    }
+
+    function getSafeNextPath() {
+      try {
+        const raw = String(new URLSearchParams(window.location.search).get("next") || "").trim();
+        if (!raw) return "";
+        if (!raw.startsWith("/")) return "";
+        if (raw.startsWith("//")) return "";
+        return raw;
+      } catch (_) {
+        return "";
+      }
+    }
+    function redirectAfterAuth() {
+      const next = getSafeNextPath();
+      if (!next) return false;
+      window.location.href = next;
+      return true;
     }
 
     async function connectWalletFlow(wallet) {
@@ -38591,7 +38598,9 @@ HTML_PAGE = """
         authState = {authenticated: true, ...verifyResp};
         setAuthUI();
         closeWalletModal({target: {id: "walletModalBackdrop"}});
-        setStatus(`Connected: ${verifyResp.address_short}`, "ok");
+        if (!redirectAfterAuth()) {
+          setStatus(`Connected: ${verifyResp.address_short}`, "ok");
+        }
       } catch (e) {
         setStatus("Wallet auth failed: " + (e?.message || "unknown"), "fail");
       }
@@ -38704,7 +38713,9 @@ HTML_PAGE = """
         authState = {authenticated: true, ...verifyResp};
         setAuthUI();
         closeWalletModal({target: {id: "walletModalBackdrop"}});
-        setStatus(`Connected: ${verifyResp.address_short}`, "ok");
+        if (!redirectAfterAuth()) {
+          setStatus(`Connected: ${verifyResp.address_short}`, "ok");
+        }
       } catch (e) {
         closeWcQrModal();
         setStatus("WalletConnect failed: " + (e?.message || "unknown") + ". Add this site to Reown Domain allowlist.", "fail");
