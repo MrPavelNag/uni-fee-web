@@ -32532,6 +32532,24 @@ def connect_page(request: Request) -> HTMLResponse:
       <button class="connect-btn connect-cta-btn" type="button" onclick="onConnectWalletClick()">Connect Wallet</button>
     </section>
         """
+    elif reason == "admin_required":
+        subtitle = "This wallet is not in admin list. Connect an admin wallet."
+        show_intro = False
+        extra_css = """
+    .connect-cta-card { text-align:center; }
+    .connect-cta-subtitle { margin: 6px 0 14px; font-size: 26px; font-weight: 800; color:#0f172a; line-height:1.2; }
+    .connect-cta-btn { min-width: 260px; font-size: 16px; padding: 12px 16px; }
+    @media (max-width: 780px) {
+      .connect-cta-subtitle { font-size: 22px; }
+      .connect-cta-btn { width: 100%; min-width: 0; }
+    }
+        """
+        extra_html = """
+    <section class="card connect-cta-card">
+      <p class="connect-cta-subtitle">This wallet is not in admin list.</p>
+      <button class="connect-btn connect-cta-btn" type="button" onclick="onConnectWalletClick()">Connect another wallet</button>
+    </section>
+        """
     html = _render_placeholder_page(
         "Connect",
         subtitle,
@@ -32555,6 +32573,8 @@ def admin_page(request: Request, response: Response) -> HTMLResponse:
             auth = dict(AUTH_SESSIONS.get(sid, {}))
         if not auth:
             return RedirectResponse(url="/connect?next=/admin", status_code=302)
+        if not _is_admin_address(str(auth.get("address") or "")):
+            return RedirectResponse(url="/connect?reason=admin_required", status_code=302)
         html = _render_admin_page().replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
         resp = HTMLResponse(html)
         _require_admin(request, resp)
@@ -38530,9 +38550,6 @@ HTML_PAGE = """
         authState = {authenticated: false};
       }
       setAuthUI();
-      if (authState?.authenticated) {
-        redirectAfterAuth();
-      }
     }
 
     async function onConnectWalletClick() {
@@ -38565,6 +38582,10 @@ HTML_PAGE = """
     function redirectAfterAuth() {
       const next = getSafeNextPath();
       if (!next) return false;
+      if (next === "/admin" && !authState?.is_admin) {
+        setStatus("Wallet connected, but this address is not admin.", "fail");
+        return false;
+      }
       window.location.href = next;
       return true;
     }
