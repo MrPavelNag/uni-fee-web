@@ -23001,19 +23001,18 @@ def _render_riko_page() -> str:
     except Exception:
         pass
     extra_css = """
-    .riko-grid { display:grid; grid-template-columns: 1fr; gap: 14px; }
+    .riko-grid { display:grid; grid-template-columns: 1fr; gap: 16px; }
     .riko-yield {
-      padding: 2px 0 4px;
-      font-size: 22px;
+      padding: 2px 0 2px;
+      font-size: 20px;
+      line-height: 1.3;
       font-weight: 700;
       color: #0f172a;
     }
-    .riko-row { display:grid; grid-template-columns: 210px 1fr; gap: 12px; align-items: center; }
-    .riko-row label { font-weight: 700; padding-top: 0; }
+    .riko-row { display:grid; grid-template-columns: 210px 1fr; gap: 12px; align-items: start; }
+    .riko-row label { font-weight: 700; padding-top: 10px; color:#0f172a; }
     .riko-actions { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
     .riko-actions-main { justify-content: flex-end; }
-    .riko-approve-toggle { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:#475569; margin-right: 6px; }
-    .riko-approve-toggle input { margin:0; width:14px; height:14px; }
     .riko-token-select-wrap { display:grid; grid-template-columns: minmax(280px, 460px) 1fr; gap:12px; align-items:center; }
     .riko-ref-box {
       border: 1px solid #d7e1ef;
@@ -23024,15 +23023,34 @@ def _render_riko_page() -> str:
       color: #475569;
       min-height: 38px;
     }
-    .btn { border: 1px solid #bfdbfe; border-radius: 10px; padding: 9px 12px; font-weight: 700; cursor: pointer; background: #eff6ff; color: #1d4ed8; }
+    .btn {
+      border: 1px solid #bfdbfe;
+      border-radius: 10px;
+      padding: 9px 12px;
+      font-weight: 700;
+      cursor: pointer;
+      background: #eff6ff;
+      color: #1d4ed8;
+      transition: background .18s ease, border-color .18s ease, transform .06s ease;
+    }
+    .btn:hover { background:#dbeafe; border-color:#93c5fd; }
+    .btn:active { transform: translateY(1px); }
     .btn.warn { border-color: #fca5a5; color: #991b1b; background: #fef2f2; }
     .muted { color: #64748b; font-size: 12px; }
-    .riko-status { min-height: 18px; font-size: 13px; color: #0f172a; }
+    .riko-status { min-height: 20px; font-size: 13px; color: #0f172a; margin-top: 2px; }
     .riko-status.err { color: #991b1b; }
     .riko-status-link { margin-top: 4px; font-size: 12px; }
     .riko-status-link a { color: #1d4ed8; text-decoration: underline; }
-    .riko-tx-history { margin-top: 10px; }
+    .riko-tx-history {
+      margin-top: 10px;
+      border: 1px solid #d7e1ef;
+      border-radius: 12px;
+      background:#f8fbff;
+      padding: 8px 10px;
+    }
     .riko-tx-history summary { cursor: pointer; color: #334155; font-size: 13px; font-weight: 600; }
+    .riko-tx-history[open] summary { margin-bottom: 4px; }
+    .riko-tx-history-actions { margin-top: 8px; display:flex; gap:8px; flex-wrap:wrap; }
     .riko-tx-empty { margin-top: 8px; }
     .riko-tx-list { margin: 8px 0 0 0; padding-left: 18px; display: grid; gap: 4px; }
     .riko-tx-list a { color: #1d4ed8; text-decoration: underline; }
@@ -23060,25 +23078,29 @@ def _render_riko_page() -> str:
     .riko-switch {
       display:inline-flex;
       align-items:center;
-      gap:6px;
-      border:1px solid #cbd5e1;
+      border:none;
       border-radius:999px;
-      padding:6px 11px;
-      background:#fff;
+      padding:7px 12px;
+      background:#e2e8f0;
       color:#1e293b;
       cursor:pointer;
       font-size:13px;
       font-weight:600;
+      user-select:none;
+      transition: background .18s ease, color .18s ease, transform .06s ease;
     }
-    .riko-switch input { margin:0; width:14px; height:14px; accent-color:#2563eb; }
-    .riko-switch.active { border-color:#2563eb; background:#eff6ff; color:#1d4ed8; }
+    .riko-switch:hover { background:#cbd5e1; }
+    .riko-switch:active { transform: translateY(1px); }
+    .riko-switch.active { background:#dbeafe; color:#1d4ed8; }
     .riko-token-select-hidden { position:absolute; pointer-events:none; opacity:0; width:1px; height:1px; }
     .riko-list { display:grid; gap:8px; margin-top:8px; }
     .riko-list-row { display:grid; grid-template-columns: 20px 180px 1fr auto; gap:8px; align-items:center; }
     .riko-list-row input { width:100%; }
     .riko-row-remove { min-width:36px; }
-    .riko-amount-wrap { display:grid; grid-template-columns: 1fr auto; gap:8px; align-items:center; }
+    .riko-amount-wrap { display:grid; grid-template-columns: minmax(240px, 420px) auto auto auto; gap:10px; align-items:center; }
+    .riko-amount-wrap input { width:100%; }
     .riko-max-btn { min-width:72px; }
+    .riko-main-action-btn { min-width:96px; }
     .riko-hints-box {
       margin-top: 8px;
       border: 1px solid #d7e1ef;
@@ -23090,9 +23112,24 @@ def _render_riko_page() -> str:
     }
     .riko-hint-line { font-size: 13px; color: #334155; }
     .riko-hint-line .k { color: #64748b; margin-right: 6px; }
+    .riko-compact-toggle { display:inline-flex; align-items:center; gap:6px; margin-top:8px; color:#475569; font-size:12px; font-weight:600; }
+    .riko-compact-toggle input { width:14px; height:14px; margin:0; accent-color:#2563eb; }
+    .riko-grid.compact { gap: 10px; }
+    .riko-grid.compact .riko-yield { font-size: 17px; }
+    .riko-grid.compact .riko-row { grid-template-columns: 190px 1fr; gap: 8px; }
+    .riko-grid.compact .riko-row label { padding-top: 7px; }
+    .riko-grid.compact .riko-switch { padding: 5px 10px; font-size: 12px; }
+    .riko-grid.compact .riko-amount-wrap { gap: 8px; grid-template-columns: minmax(200px, 360px) auto auto auto; }
+    .riko-grid.compact .riko-hints-box { padding: 6px 8px; gap: 3px; }
+    .riko-grid.compact .riko-hint-line { font-size: 12px; }
+    .riko-grid.compact .btn { padding: 8px 10px; }
+    .riko-grid.compact .riko-main-action-btn { min-width: 88px; }
+    .riko-grid.compact .riko-ref-box { min-height: 34px; padding: 7px 9px; }
+    .riko-grid.compact .riko-tx-history { padding: 6px 8px; margin-top: 6px; }
     .admin-only { display:none; }
     @media (max-width: 780px) {
-      .riko-row { grid-template-columns: 1fr; }
+      .riko-row { grid-template-columns: 1fr; gap:8px; }
+      .riko-row label { padding-top: 0; }
       .riko-list-row { grid-template-columns: 1fr; }
       .riko-token-select-wrap { grid-template-columns: 1fr; }
       .riko-amount-wrap { grid-template-columns: 1fr; }
@@ -23104,7 +23141,7 @@ def _render_riko_page() -> str:
       <p class="muted">For security, we only support whitelisted tokens.</p>
       <div class="badge-wrap" id="rikoWhitelistBadges"></div>
     </section>
-    <section class="card riko-grid">
+    <section class="card riko-grid" id="rikoMainCard">
       <div class="riko-yield" id="rikoTreasuryYield">""" + yield_text + """</div>
       <div class="riko-row">
         <label for="rikoMode">Mode</label>
@@ -23114,6 +23151,7 @@ def _render_riko_page() -> str:
             <option value="redeem">Redeem</option>
           </select>
           <div id="rikoModeSwitch" class="riko-switches"></div>
+          <label class="riko-compact-toggle"><input id="rikoCompactMode" type="checkbox" />Compact mode</label>
         </div>
       </div>
       <div class="riko-row">
@@ -23135,6 +23173,8 @@ def _render_riko_page() -> str:
           <div class="riko-amount-wrap">
             <input id="rikoAmount" type="number" min="0" step="any" placeholder="e.g. 100" />
             <button class="btn riko-max-btn" type="button" onclick="setRikoMaxAmount()">Max</button>
+            <button class="btn riko-main-action-btn" id="rikoDepositBtn" type="button" onclick="rikoDeposit()">Deposit</button>
+            <button class="btn riko-main-action-btn" id="rikoRedeemBtn" type="button" onclick="rikoRedeem()">Redeem</button>
           </div>
           <div class="riko-hints-box">
             <div class="riko-hint-line" id="rikoBalanceHint"><span class="k">Available:</span>-</div>
@@ -23142,20 +23182,14 @@ def _render_riko_page() -> str:
           </div>
         </div>
       </div>
-      <div class="riko-row">
-        <label></label>
-        <div class="riko-actions riko-actions-main">
-          <label class="riko-approve-toggle" id="rikoAutoApproveWrap"><input id="rikoAutoApprove" type="checkbox" checked />Auto-approve if needed</label>
-          <button class="btn" id="rikoDepositBtn" type="button" onclick="rikoDeposit()">Deposit</button>
-          <button class="btn" id="rikoRedeemBtn" type="button" onclick="rikoRedeem()">Redeem</button>
-          <button class="btn" type="button" onclick="rikoCheckPendingRedeem()">Check pending redeem</button>
-          <button class="btn" type="button" onclick="rikoCancelPendingRedeem()">Cancel pending redeem</button>
-        </div>
-      </div>
       <div class="riko-status" id="rikoStatus"></div>
       <div class="riko-status-link" id="rikoStatusTxLink"></div>
       <details class="riko-tx-history">
         <summary>Transaction history</summary>
+        <div class="riko-tx-history-actions">
+          <button class="btn" type="button" onclick="rikoCheckPendingRedeem()">Check pending redeem</button>
+          <button class="btn" type="button" onclick="rikoCancelPendingRedeem()">Cancel pending redeem</button>
+        </div>
         <div class="muted riko-tx-empty" id="rikoTxHistoryEmpty">No transactions yet.</div>
         <ul class="riko-tx-list" id="rikoTxHistory"></ul>
       </details>
@@ -23201,6 +23235,21 @@ def _render_riko_page() -> str:
       if (s === "eth" || s === "weth") return "https://assets.coingecko.com/coins/images/279/large/ethereum.png";
       return `/api/token-icon/${encodeURIComponent(s || "eth")}`;
     }
+    function applyRikoCompactMode() {
+      const card = document.getElementById("rikoMainCard");
+      const isCompact = !!document.getElementById("rikoCompactMode")?.checked;
+      if (card) card.classList.toggle("compact", isCompact);
+    }
+    function restoreRikoCompactMode() {
+      const el = document.getElementById("rikoCompactMode");
+      if (!el) return;
+      try {
+        el.checked = String(localStorage.getItem("rikoCompactMode") || "0") === "1";
+      } catch (_) {
+        el.checked = false;
+      }
+      applyRikoCompactMode();
+    }
     function renderRikoModeSwitch() {
       const root = document.getElementById("rikoModeSwitch");
       const sel = document.getElementById("rikoMode");
@@ -23211,12 +23260,10 @@ def _render_riko_page() -> str:
         { value: "redeem", label: "Redeem" },
       ];
       root.innerHTML = items.map((x) => (
-        `<label class="riko-switch ${cur === x.value ? "active" : ""}">` +
-        `<input type="checkbox" data-riko-mode="${x.value}" ${cur === x.value ? "checked" : ""} />` +
-        `<span>${x.label}</span></label>`
+        `<button type="button" class="riko-switch ${cur === x.value ? "active" : ""}" data-riko-mode="${x.value}" aria-pressed="${cur === x.value ? "true" : "false"}">${x.label}</button>`
       )).join("");
-      root.querySelectorAll("input[data-riko-mode]").forEach((el) => {
-        el.addEventListener("change", () => {
+      root.querySelectorAll("button[data-riko-mode]").forEach((el) => {
+        el.addEventListener("click", () => {
           const v = String(el.getAttribute("data-riko-mode") || "").trim().toLowerCase();
           if (sel) sel.value = v === "redeem" ? "redeem" : "deposit";
           renderRikoModeSwitch();
@@ -23236,13 +23283,11 @@ def _render_riko_page() -> str:
         const lbl = String(s || "").toUpperCase();
         const active = cur === s;
         return (
-          `<label class="riko-switch ${active ? "active" : ""}">` +
-          `<input type="checkbox" data-riko-symbol="${s}" ${active ? "checked" : ""} />` +
-          `<span>${lbl}</span></label>`
+          `<button type="button" class="riko-switch ${active ? "active" : ""}" data-riko-symbol="${s}" aria-pressed="${active ? "true" : "false"}">${lbl}</button>`
         );
       }).join("");
-      root.querySelectorAll("input[data-riko-symbol]").forEach((el) => {
-        el.addEventListener("change", () => {
+      root.querySelectorAll("button[data-riko-symbol]").forEach((el) => {
+        el.addEventListener("click", () => {
           const v = String(el.getAttribute("data-riko-symbol") || "").trim().toLowerCase();
           sel.value = v;
           onRikoSymbolChanged();
@@ -23323,6 +23368,58 @@ def _render_riko_page() -> str:
         return `<li>${action}: ${hashHtml} <span class="muted">(${when}${suffix})</span></li>`;
       }).join("");
     }
+    function resolveHistoryAddress() {
+      let wallet = String(authState?.address || "").trim().toLowerCase();
+      if (/^0x[a-f0-9]{40}$/.test(wallet)) return wallet;
+      try {
+        const cached = String(localStorage.getItem("rikoLastWallet") || "").trim().toLowerCase();
+        if (/^0x[a-f0-9]{40}$/.test(cached)) return cached;
+      } catch (_) {}
+      return "";
+    }
+    function historyStorageKey(addr, chainId) {
+      const a = String(addr || "").trim().toLowerCase();
+      const c = Number(chainId || 0);
+      return `rikoTxHistory:${c}:${a}`;
+    }
+    function loadLocalRikoTxHistory(addr, chainId) {
+      const a = String(addr || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{40}$/.test(a)) return [];
+      try {
+        const raw = localStorage.getItem(historyStorageKey(a, chainId));
+        const arr = JSON.parse(String(raw || "[]"));
+        if (!Array.isArray(arr)) return [];
+        return arr.filter((x) => /^0x[a-fA-F0-9]{64}$/.test(String(x?.hash || "")));
+      } catch (_) {
+        return [];
+      }
+    }
+    function saveLocalRikoTxHistory(addr, chainId, items) {
+      const a = String(addr || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{40}$/.test(a)) return;
+      try {
+        localStorage.setItem("rikoLastWallet", a);
+        localStorage.setItem(historyStorageKey(a, chainId), JSON.stringify(Array.isArray(items) ? items : []));
+      } catch (_) {}
+    }
+    function mergeTxHistoryLists(primary, secondary) {
+      const out = [];
+      const seen = new Set();
+      const push = (row) => {
+        const h = String(row?.hash || "").trim().toLowerCase();
+        if (!/^0x[a-f0-9]{64}$/.test(h) || seen.has(h)) return;
+        seen.add(h);
+        out.push(row);
+      };
+      (Array.isArray(primary) ? primary : []).forEach(push);
+      (Array.isArray(secondary) ? secondary : []).forEach(push);
+      out.sort((a, b) => {
+        const ta = String(a?.time_iso || a?.when || "");
+        const tb = String(b?.time_iso || b?.when || "");
+        return tb.localeCompare(ta);
+      });
+      return out.slice(0, 40);
+    }
     async function loadRikoTxHistory() {
       let wallet = String(authState?.address || "").trim();
       if (!/^0x[a-fA-F0-9]{40}$/.test(wallet) && window.ethereum) {
@@ -23331,6 +23428,9 @@ def _render_riko_page() -> str:
           wallet = String((accounts || [])[0] || "").trim();
         } catch (_) {}
       }
+      const chainId = Number(authState?.chain_id || 11155111);
+      const walletLower = String(wallet || "").trim().toLowerCase();
+      const localItems = loadLocalRikoTxHistory(walletLower, chainId);
       const qs = new URLSearchParams();
       if (/^0x[a-fA-F0-9]{40}$/.test(wallet)) qs.set("address", wallet);
       qs.set("limit", "40");
@@ -23339,7 +23439,7 @@ def _render_riko_page() -> str:
         const r = await fetch(url);
         const data = await r.json();
         const items = Array.isArray(data?.items) ? data.items : [];
-        rikoTxHistory = items.map((x) => ({
+        const backendItems = items.map((x) => ({
           action: String(x?.action || "tx"),
           hash: String(x?.hash || ""),
           url: String(x?.url || ""),
@@ -23348,8 +23448,10 @@ def _render_riko_page() -> str:
           contract_role: String(x?.contract_role || ""),
           is_error: !!x?.is_error,
         }));
+        rikoTxHistory = mergeTxHistoryLists(backendItems, localItems);
+        saveLocalRikoTxHistory(walletLower, chainId, rikoTxHistory);
       } catch (_) {
-        rikoTxHistory = [];
+        rikoTxHistory = localItems;
       }
       renderRikoTxHistory();
     }
@@ -23357,6 +23459,21 @@ def _render_riko_page() -> str:
       const hash = String(txHash || "").trim();
       if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) return;
       const url = await buildTxExplorerUrl(hash, signerOrProvider);
+      const chainId = Number(authState?.chain_id || 11155111);
+      const addr = resolveHistoryAddress();
+      const localRow = {
+        action: String(action || "tx"),
+        hash,
+        url: String(url || ""),
+        when: new Date().toISOString(),
+        time_iso: new Date().toISOString(),
+        contract_role: "local",
+        is_error: false,
+      };
+      const localItems = mergeTxHistoryLists([localRow], loadLocalRikoTxHistory(addr, chainId));
+      saveLocalRikoTxHistory(addr, chainId, localItems);
+      rikoTxHistory = mergeTxHistoryLists(localItems, rikoTxHistory);
+      renderRikoTxHistory();
       setRikoStatusTxLink(hash, url);
       await loadRikoTxHistory();
     }
@@ -23364,13 +23481,11 @@ def _render_riko_page() -> str:
       const mode = getRikoMode();
       const tokenLabel = document.getElementById("rikoTokenLabel");
       const amountLabel = document.getElementById("rikoAmountLabel");
-      const approveWrap = document.getElementById("rikoAutoApproveWrap");
       const depositBtn = document.getElementById("rikoDepositBtn");
       const redeemBtn = document.getElementById("rikoRedeemBtn");
       const amountEl = document.getElementById("rikoAmount");
       if (tokenLabel) tokenLabel.textContent = mode === "redeem" ? "Token to receive" : "Deposit token";
       if (amountLabel) amountLabel.textContent = mode === "redeem" ? "RIKO amount to redeem" : "Deposit amount";
-      if (approveWrap) approveWrap.style.display = mode === "redeem" ? "none" : "";
       if (depositBtn) depositBtn.style.display = mode === "redeem" ? "none" : "";
       if (redeemBtn) redeemBtn.style.display = mode === "redeem" ? "" : "none";
       if (amountEl) amountEl.placeholder = mode === "redeem" ? "e.g. 100 RIKO" : "e.g. 100";
@@ -24105,15 +24220,7 @@ def _render_riko_page() -> str:
         }
         const allowance = await token.allowance(user, contractAddress);
         if (allowance < raw) {
-          const autoApprove = !!document.getElementById("rikoAutoApprove")?.checked;
-          if (!autoApprove) {
-            throw new Error("Allowance is too low. Enable 'Auto-approve if needed'.");
-          }
-          setRikoStatus("Allowance too low. Requesting approve signature...", false);
-          const approveTx = await token.approve(contractAddress, raw);
-          await addRikoTxHistory("Approve token", approveTx.hash, signer);
-          setRikoStatus("Approve tx sent", false, true);
-          await approveTx.wait();
+          throw new Error("Allowance is insufficient. Approve the token for the vault address and try again.");
         }
         const depositTokenAddress = symbol === "eth" ? wrappedTokenAddress : vaultTokenAddress;
         const tx = await vault.deposit(depositTokenAddress, raw, 0, user);
@@ -24232,8 +24339,7 @@ def _render_riko_page() -> str:
         const rikoLocked = pending?.rikoLocked ?? pending?.[0] ?? 0n;
         const tokenOut = pending?.tokenOut ?? pending?.[1] ?? 0n;
         setRikoStatus(
-          `Pending redeem is active. Locked RIKO: ${String(rikoLocked)}. Expected token out: ${String(tokenOut)}. ` +
-          `Processing is performed by operator.`,
+          `Pending redeem is active. Locked RIKO: ${String(rikoLocked)}. Expected token out: ${String(tokenOut)}.`,
           false
         );
       } catch (e) {
@@ -24287,7 +24393,15 @@ def _render_riko_page() -> str:
       }
       const amountEl = document.getElementById("rikoAmount");
       if (amountEl) amountEl.addEventListener("input", refreshRikoQuoteHint);
+      const compactEl = document.getElementById("rikoCompactMode");
+      if (compactEl) {
+        compactEl.addEventListener("change", () => {
+          try { localStorage.setItem("rikoCompactMode", compactEl.checked ? "1" : "0"); } catch (_) {}
+          applyRikoCompactMode();
+        });
+      }
       updateRikoModeUi();
+      restoreRikoCompactMode();
       loadRikoWhitelist();
       loadRikoTxHistory();
       setTimeout(syncRikoAdminCard, 150);
@@ -29857,6 +29971,14 @@ def _render_admin_page() -> str:
           <button class="btn" onclick="applyAdminRikoPendingOperator()">Apply on-chain</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Process pending redeem</label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <input id="adminRikoProcessAccountInput" type="text" placeholder="account 0x..."/>
+            <input id="adminRikoProcessTokenInput" type="text" placeholder="token 0x... or ETH"/>
+          </div>
+          <button class="btn" onclick="applyAdminRikoProcessPendingRedeem()">Apply on-chain</button>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set RIKO price (USD)</label>
           <input id="adminRikoPriceUsdInput" type="number" min="0.000001" step="0.000001" value="1"/>
           <button class="btn" onclick="applyAdminRikoPriceUsd()">Apply on-chain</button>
@@ -30110,6 +30232,7 @@ def _render_admin_page() -> str:
       "function pendingRedemptionOperator() view returns (address)",
       "function rikoPriceUsd6() view returns (uint256)",
       "function tokenConfigs(address token) view returns (bool allowed,address oracle,uint32 maxOracleAge,bytes32 expectedFeedDescriptionHash,uint8 tokenDecimals)",
+      "function processPendingRedemption(address account,address token) external returns (bool completed,uint256 tokenSent)",
       "function setGlobalSupplyCapUsd6(uint256 capUsd6) external",
       "function setCustodyAddress(address newCustodyAddress) external",
       "function setPendingRedemptionOperator(address operator) external",
@@ -30129,6 +30252,39 @@ def _render_admin_page() -> str:
     function normalizeEthAddressInput(v) {{
       const raw = String(v || "").trim();
       return /^0x[a-fA-F0-9]{{40}}$/.test(raw) ? raw : "";
+    }}
+    function requireAdminWalletAuth() {{
+      if (!authState?.authenticated || !authState?.is_admin) {{
+        throw new Error("Admin wallet authorization required.");
+      }}
+    }}
+    function requireConfiguredAddress(raw, envVarName) {{
+      const addr = String(raw || "").trim();
+      if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) {{
+        throw new Error(`${{envVarName}} is not configured on server.`);
+      }}
+      return addr;
+    }}
+    function requireValidInputAddress(raw, errorMessage) {{
+      const addr = normalizeEthAddressInput(raw);
+      if (!addr) throw new Error(String(errorMessage || "Invalid address."));
+      return addr;
+    }}
+    async function getAdminVaultContract(signer) {{
+      const ethers = await ensureEthersAdmin();
+      const contractAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
+      return new ethers.Contract(contractAddr, ADMIN_RIKO_VAULT_ABI, signer);
+    }}
+    async function getAdminYieldContract(signer) {{
+      const ethers = await ensureEthersAdmin();
+      const contractAddr = requireConfiguredAddress(RIKO_YIELD_DISTRIBUTOR_ADDRESS, "RIKO_YIELD_DISTRIBUTOR_ADDRESS");
+      return new ethers.Contract(contractAddr, ADMIN_RIKO_YIELD_ABI, signer);
+    }}
+    function wrappedNativeByChainIdAdmin(chainId) {{
+      const n = Number(chainId || 0);
+      if (n === 11155111) return "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14";
+      if (n === 1) return "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+      return "";
     }}
     function normAddrLower(v) {{
       const s = String(v || "").trim().toLowerCase();
@@ -30266,16 +30422,13 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoGlobalCap() {{
       try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
-        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        requireAdminWalletAuth();
         const capInput = document.getElementById("adminRikoGlobalCapUsd");
         const capUsd = Number(String(capInput?.value || "").trim());
         if (!Number.isFinite(capUsd) || capUsd <= 0) throw new Error("Global cap must be > 0 USD.");
         const capUsd6 = BigInt(Math.round(capUsd * 1e6));
         const signer = await getAdminSigner();
-        const ethers = await ensureEthersAdmin();
-        const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, signer);
+        const vault = await getAdminVaultContract(signer);
         setAdminRikoOnchainStatus(`Applying global cap $${{capUsd.toLocaleString()}} on-chain...`, false);
         const tx = await vault.setGlobalSupplyCapUsd6(capUsd6);
         setAdminRikoOnchainStatus("Global cap tx sent: " + tx.hash, false);
@@ -30292,14 +30445,13 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoCustodyAddress() {{
       try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
-        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
-        const nextAddr = normalizeEthAddressInput(document.getElementById("adminRikoCustodyInput")?.value || "");
-        if (!nextAddr) throw new Error("Invalid custody address.");
+        requireAdminWalletAuth();
+        const nextAddr = requireValidInputAddress(
+          document.getElementById("adminRikoCustodyInput")?.value || "",
+          "Invalid custody address."
+        );
         const signer = await getAdminSigner();
-        const ethers = await ensureEthersAdmin();
-        const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, signer);
+        const vault = await getAdminVaultContract(signer);
         setAdminRikoOnchainStatus("Applying custody address on-chain...", false);
         const tx = await vault.setCustodyAddress(nextAddr);
         setAdminRikoOnchainStatus("Custody address tx sent: " + tx.hash, false);
@@ -30316,14 +30468,13 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoYieldPayerAddress() {{
       try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
-        const addr = String(RIKO_YIELD_DISTRIBUTOR_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Yield distributor address is not configured on server (RIKO_YIELD_DISTRIBUTOR_ADDRESS).");
-        const nextAddr = normalizeEthAddressInput(document.getElementById("adminRikoYieldPayerInput")?.value || "");
-        if (!nextAddr) throw new Error("Invalid yield payer address.");
+        requireAdminWalletAuth();
+        const nextAddr = requireValidInputAddress(
+          document.getElementById("adminRikoYieldPayerInput")?.value || "",
+          "Invalid yield payer address."
+        );
         const signer = await getAdminSigner();
-        const ethers = await ensureEthersAdmin();
-        const distributor = new ethers.Contract(addr, ADMIN_RIKO_YIELD_ABI, signer);
+        const distributor = await getAdminYieldContract(signer);
         setAdminRikoOnchainStatus("Applying yield payer address on-chain...", false);
         const tx = await distributor.setYieldPayerAddress(nextAddr);
         setAdminRikoOnchainStatus("Yield payer tx sent: " + tx.hash, false);
@@ -30340,14 +30491,13 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoYieldTokenAddress() {{
       try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
-        const addr = String(RIKO_YIELD_DISTRIBUTOR_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Yield distributor address is not configured on server (RIKO_YIELD_DISTRIBUTOR_ADDRESS).");
-        const nextAddr = normalizeEthAddressInput(document.getElementById("adminRikoYieldTokenInput")?.value || "");
-        if (!nextAddr) throw new Error("Invalid yield token address.");
+        requireAdminWalletAuth();
+        const nextAddr = requireValidInputAddress(
+          document.getElementById("adminRikoYieldTokenInput")?.value || "",
+          "Invalid yield token address."
+        );
         const signer = await getAdminSigner();
-        const ethers = await ensureEthersAdmin();
-        const distributor = new ethers.Contract(addr, ADMIN_RIKO_YIELD_ABI, signer);
+        const distributor = await getAdminYieldContract(signer);
         setAdminRikoOnchainStatus("Applying yield token address on-chain...", false);
         const tx = await distributor.setYieldTokenAddress(nextAddr);
         setAdminRikoOnchainStatus("Yield token tx sent: " + tx.hash, false);
@@ -30364,15 +30514,12 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoMonthlyYieldBps() {{
       try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
-        const addr = String(RIKO_YIELD_DISTRIBUTOR_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Yield distributor address is not configured on server (RIKO_YIELD_DISTRIBUTOR_ADDRESS).");
+        requireAdminWalletAuth();
         const bpsInput = document.getElementById("adminRikoMonthlyYieldBpsInput");
         const bps = Number(String(bpsInput?.value || "").trim());
         if (!Number.isFinite(bps) || bps < 0 || bps > 10000) throw new Error("Monthly yield bps must be between 0 and 10000.");
         const signer = await getAdminSigner();
-        const ethers = await ensureEthersAdmin();
-        const distributor = new ethers.Contract(addr, ADMIN_RIKO_YIELD_ABI, signer);
+        const distributor = await getAdminYieldContract(signer);
         setAdminRikoOnchainStatus("Applying monthly yield bps on-chain (starts new cycle)...", false);
         const tx = await distributor.setMonthlyYieldRateBps(BigInt(Math.round(bps)));
         setAdminRikoOnchainStatus("Monthly yield bps tx sent: " + tx.hash, false);
@@ -30389,17 +30536,14 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoPriceUsd() {{
       try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
-        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        requireAdminWalletAuth();
         const priceInput = document.getElementById("adminRikoPriceUsdInput");
         const priceUsd = Number(String(priceInput?.value || "").trim());
         if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("RIKO price must be > 0 USD.");
         const priceUsd6 = BigInt(Math.round(priceUsd * 1e6));
         if (priceUsd6 <= 0n) throw new Error("RIKO price must be > 0 after conversion.");
         const signer = await getAdminSigner();
-        const ethers = await ensureEthersAdmin();
-        const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, signer);
+        const vault = await getAdminVaultContract(signer);
         setAdminRikoOnchainStatus("Applying RIKO price on-chain...", false);
         const tx = await vault.setRikoPriceUsd6(priceUsd6);
         setAdminRikoOnchainStatus("RIKO price tx sent: " + tx.hash, false);
@@ -30416,14 +30560,13 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoPendingOperator() {{
       try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
-        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
-        const opAddr = normalizeEthAddressInput(document.getElementById("adminRikoPendingOperatorInput")?.value || "");
-        if (!opAddr) throw new Error("Pending operator address must be valid.");
+        requireAdminWalletAuth();
+        const opAddr = requireValidInputAddress(
+          document.getElementById("adminRikoPendingOperatorInput")?.value || "",
+          "Pending operator address must be valid."
+        );
         const signer = await getAdminSigner();
-        const ethers = await ensureEthersAdmin();
-        const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, signer);
+        const vault = await getAdminVaultContract(signer);
         setAdminRikoOnchainStatus("Applying pending redemption operator on-chain...", false);
         const tx = await vault.setPendingRedemptionOperator(opAddr);
         setAdminRikoOnchainStatus("Pending operator tx sent: " + tx.hash, false);
@@ -30436,6 +30579,41 @@ def _render_admin_page() -> str:
           return;
         }}
         setAdminRikoOnchainStatus("Pending operator update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function applyAdminRikoProcessPendingRedeem() {{
+      try {{
+        requireAdminWalletAuth();
+        const accountAddr = requireValidInputAddress(
+          document.getElementById("adminRikoProcessAccountInput")?.value || "",
+          "Account address must be valid."
+        );
+        const signer = await getAdminSigner();
+        const ethers = await ensureEthersAdmin();
+        const provider = signer?.provider || (window.ethereum ? new ethers.BrowserProvider(window.ethereum) : null);
+        const tokenRaw = String(document.getElementById("adminRikoProcessTokenInput")?.value || "").trim();
+        let tokenAddr = normalizeEthAddressInput(tokenRaw);
+        if (!tokenAddr && tokenRaw.toLowerCase() === "eth") {{
+          const network = provider ? await provider.getNetwork() : null;
+          tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
+        }}
+        if (!tokenAddr) throw new Error("Token address must be valid (or use ETH to auto-map WETH).");
+        const vault = await getAdminVaultContract(signer);
+        setAdminRikoOnchainStatus("Processing pending redemption on-chain...", false);
+        const tx = await vault.processPendingRedemption(accountAddr, tokenAddr);
+        setAdminRikoOnchainStatus("Process pending tx sent: " + tx.hash, false);
+        const receipt = await tx.wait();
+        if (receipt?.status === 1) {{
+          setAdminRikoOnchainStatus("Pending redemption processed.", false);
+        }} else {{
+          setAdminRikoOnchainStatus("Process pending tx reverted.", true);
+        }}
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Process pending redeem was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("Process pending redeem failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
     async function loadAdminRikoTokenConfig() {{
