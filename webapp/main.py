@@ -31755,7 +31755,7 @@ def _render_admin_page() -> str:
     }}
     function parseAdminRikoPayoutLines(raw) {{
       const lines = String(raw || "")
-        .split(/\r?\n/)
+        .split(/\\r?\\n/)
         .map((x) => String(x || "").trim())
         .filter(Boolean);
       const out = [];
@@ -31786,7 +31786,7 @@ def _render_admin_page() -> str:
       if (inDates) {{
         const text = items
           .map((it) => `${{String(Number(it?.month || 0)).padStart(2, "0")}}-${{String(Number(it?.day || 0)).padStart(2, "0")}}`)
-          .join("\n");
+          .join("\\n");
         inDates.value = text;
       }}
       if (inTime) inTime.value = String(cfg?.payout_time_utc || "00:00");
