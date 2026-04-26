@@ -22208,35 +22208,77 @@ def _eth_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
     rpc = _normalize_rpc_url(rpc_url)
     if not rpc or not rpc.lower().startswith(("http://", "https://")):
         raise RuntimeError("rpc url is invalid or missing")
-    req_payload = json.dumps(
-        {"jsonrpc": "2.0", "id": int(time.time() * 1000) % 1_000_000_000, "method": method, "params": params or []}
-    ).encode("utf-8")
-    req = UrlRequest(
-        rpc,
-        data=req_payload,
-        method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
-    )
-    try:
-        with urlopen(req, timeout=20) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-    except HTTPError as e:
-        body = ""
-        with contextlib.suppress(Exception):
-            body = (e.read() or b"").decode("utf-8", errors="ignore")
-        body_one_line = re.sub(r"\s+", " ", str(body or "").strip())
-        body_hint = body_one_line[:220] if body_one_line else ""
-        suffix = f": {body_hint}" if body_hint else ""
-        raise RuntimeError(
-            f"rpc {method} http {int(getattr(e, 'code', 0) or 0)} at {_rpc_url_label(rpc)}{suffix}"
-        ) from e
-    payload = json.loads(body) if body else {}
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"rpc invalid response for {method}")
-    if payload.get("error"):
-        err = payload.get("error")
-        raise RuntimeError(f"rpc {method} error: {err}")
-    return payload.get("result")
+    max_attempts = 5
+    base_backoff_sec = 0.25
+    for attempt in range(max_attempts):
+        req_payload = json.dumps(
+            {"jsonrpc": "2.0", "id": int(time.time() * 1000) % 1_000_000_000, "method": method, "params": params or []}
+        ).encode("utf-8")
+        req = UrlRequest(
+            rpc,
+            data=req_payload,
+            method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
+        )
+        try:
+            with urlopen(req, timeout=20) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+        except HTTPError as e:
+            body = ""
+            with contextlib.suppress(Exception):
+                body = (e.read() or b"").decode("utf-8", errors="ignore")
+            body_one_line = re.sub(r"\s+", " ", str(body or "").strip())
+            body_hint = body_one_line[:220] if body_one_line else ""
+            hint_l = body_hint.lower()
+            http_code = int(getattr(e, "code", 0) or 0)
+            is_rate_limited = (
+                http_code == 429
+                or "rate limit" in hint_l
+                or "too many requests" in hint_l
+                or "compute units per second" in hint_l
+            )
+            if is_rate_limited and attempt < (max_attempts - 1):
+                retry_after_sec = 0.0
+                with contextlib.suppress(Exception):
+                    retry_after_sec = float(str(getattr(e, "headers", {}).get("Retry-After", "0")).strip() or 0)
+                sleep_sec = retry_after_sec if retry_after_sec > 0 else min(
+                    4.0,
+                    float(base_backoff_sec) * (2 ** attempt),
+                )
+                time.sleep(sleep_sec)
+                continue
+            suffix = f": {body_hint}" if body_hint else ""
+            raise RuntimeError(
+                f"rpc {method} http {http_code} at {_rpc_url_label(rpc)}{suffix}"
+            ) from e
+
+        payload = json.loads(body) if body else {}
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"rpc invalid response for {method}")
+        if payload.get("error"):
+            err = payload.get("error")
+            err_code = None
+            err_msg = ""
+            if isinstance(err, dict):
+                err_code = err.get("code")
+                err_msg = str(err.get("message") or "")
+            err_text_l = str(err_msg or err).lower()
+            is_rate_limited = (
+                str(err_code) == "429"
+                or "rate limit" in err_text_l
+                or "too many requests" in err_text_l
+                or "compute units per second" in err_text_l
+            )
+            if is_rate_limited and attempt < (max_attempts - 1):
+                sleep_sec = min(
+                    4.0,
+                    float(base_backoff_sec) * (2 ** attempt),
+                )
+                time.sleep(sleep_sec)
+                continue
+            raise RuntimeError(f"rpc {method} error: {err}")
+        return payload.get("result")
+    raise RuntimeError(f"rpc {method} failed after retries")
 
 
 def _eth_hex_to_int(value: Any) -> int:
@@ -31312,7 +31354,7 @@ def _render_admin_page() -> str:
     <div class="tabs">
       <button class="tab-btn active" id="tabBtnSettings" onclick="switchTab('settings')">Settings</button>
       <button class="tab-btn" id="tabBtnAccess" onclick="switchTab('access')">Access</button>
-      <button class="tab-btn" id="tabBtnPendingRedeem" onclick="switchTab('pendingredeem')">Pending redeem</button>
+      <button class="tab-btn" id="tabBtnPendingRedeem" onclick="switchTab('pendingredeem')">Redeem</button>
       <button class="tab-btn" id="tabBtnPairLists" onclick="switchTab('pairlists')">Pair lists</button>
       <button class="tab-btn" id="tabBtnStats" onclick="switchTab('stats')">Stats</button>
       <button class="tab-btn" id="tabBtnTickets" onclick="switchTab('tickets')">Help tickets</button>
@@ -32661,6 +32703,19 @@ def _render_admin_page() -> str:
         if (accountInput) accountInput.value = accountAddr;
         if (tokenInput) tokenInput.value = tokenRaw;
         vault = await getAdminVaultContract(signer);
+        const signerAddr = String(await signer.getAddress() || "").trim().toLowerCase();
+        const pendingOp = String(await vault.pendingRedemptionOperator() || "").trim().toLowerCase();
+        if (!/^0x[a-f0-9]{{40}}$/.test(pendingOp)) {{
+          setAdminRikoPendingOpsStatus("Pending redemption operator is not configured on vault.", true);
+          return;
+        }}
+        if (signerAddr !== pendingOp) {{
+          setAdminRikoPendingOpsStatus(
+            `Connected wallet ${{shortAddrAdmin(signerAddr)}} is not pending operator ${{shortAddrAdmin(pendingOp)}}. Connect operator wallet and retry.`,
+            true
+          );
+          return;
+        }}
         const preview = await vault.processPendingRedemption.staticCall(accountAddr, tokenAddr);
         const previewCompleted = !!(preview?.completed ?? preview?.[0]);
         if (!previewCompleted) {{
@@ -32769,6 +32824,9 @@ def _render_admin_page() -> str:
         const queuedTokenOut = BigInt(pending?.tokenOut ?? pending?.[1] ?? 0n);
         const minTokenOut = BigInt(pending?.minTokenOut ?? pending?.[2] ?? 0n);
         const custodyAddr = String(await vault.custodyAddress() || "").trim();
+        const pendingOp = String(await vault.pendingRedemptionOperator() || "").trim().toLowerCase();
+        const authAddr = String(authState?.address || "").trim().toLowerCase();
+        const operatorOk = /^0x[a-f0-9]{{40}}$/.test(pendingOp) && /^0x[a-f0-9]{{40}}$/.test(authAddr) && authAddr === pendingOp;
         let quoteNow = 0n;
         try {{
           quoteNow = BigInt(await vault.quoteRedeem(tokenAddr, rikoLocked));
@@ -32811,8 +32869,11 @@ def _render_admin_page() -> str:
         checklist.push(`quote/minOut: ${{quoteCheckOk ? "OK" : "FAIL"}} (quote=${{formatAdminRawUnits(String(quoteNow), decimals, 8)}}, minOut=${{formatAdminRawUnits(String(minTokenOut), decimals, 8)}})`);
         checklist.push(`liquidity: ${{liquidityOk ? "OK" : "FAIL"}} (available=${{formatAdminRawUnits(String(totalAvailable), decimals, 8)}}, need=${{formatAdminRawUnits(String(tokenOutToSend), decimals, 8)}})`);
         checklist.push(`allowance(custody->vault): ${{allowanceOk ? "OK" : "FAIL"}} (allowance=${{formatAdminRawUnits(String(allowance), decimals, 8)}}, needFromCustody=${{formatAdminRawUnits(String(requiredFromCustody), decimals, 8)}})`);
+        checklist.push(`operator wallet: ${{operatorOk ? "OK" : "FAIL"}} (connected=${{shortAddrAdmin(authAddr || "-")}}, operator=${{shortAddrAdmin(pendingOp || "-")}})`);
         let action = "Ready: click Apply on-chain.";
-        if (!quoteCheckOk) {{
+        if (!operatorOk) {{
+          action = "Action: connect/sign in with current pending redemption operator wallet.";
+        }} else if (!quoteCheckOk) {{
           action = "Action: minOut check fails now. Wait for better quote or cancel and redeem again with lower minOut.";
         }} else if (!liquidityOk) {{
           action = `Action: top up ${{tokenLabel}} liquidity (vault and/or custody) by at least ${{formatAdminRawUnits(String(tokenOutToSend > totalAvailable ? (tokenOutToSend - totalAvailable) : 0n), decimals, 8)}}.`;
@@ -32821,7 +32882,10 @@ def _render_admin_page() -> str:
         }} else if (!allowanceOk) {{
           action = `Action: sign approve from custody to vault for at least ${{formatAdminRawUnits(String(requiredFromCustody), decimals, 8)}} (or max).`;
         }}
-        setAdminRikoPendingOpsStatus("Diagnose -> " + checklist.join(" | ") + " | " + action, !(quoteCheckOk && liquidityOk && allowanceOk && custodyBalOk));
+        setAdminRikoPendingOpsStatus(
+          "Diagnose -> " + checklist.join(" | ") + " | " + action,
+          !(operatorOk && quoteCheckOk && liquidityOk && allowanceOk && custodyBalOk)
+        );
       }} catch (e) {{
         setAdminRikoPendingOpsStatus("Diagnose failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }} finally {{
@@ -33118,6 +33182,19 @@ def _render_admin_page() -> str:
       const rows = collectAdminRikoCustodyAllowancePresetItems();
       if (!rows.length) {{
         setAdminRikoCustodyStatus("No non-empty allowance presets to apply.", true);
+        return;
+      }}
+      try {{
+        const saved = await postJson("/api/admin/riko/custody-allowance-presets", {{ items: rows }});
+        if (saved && typeof saved === "object") {{
+          const nextPresets = saved.riko_custody_allowance_presets || adminLastSettings?.riko_custody_allowance_presets || {{ items: [] }};
+          adminLastSettings = {{
+            ...(adminLastSettings || {{}}),
+            riko_custody_allowance_presets: nextPresets,
+          }};
+        }}
+      }} catch (e) {{
+        setAdminRikoCustodyStatus("Failed to save allowance presets: " + (e?.shortMessage || e?.message || "unknown"), true);
         return;
       }}
       let okCount = 0;
