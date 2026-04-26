@@ -22111,12 +22111,25 @@ def _eth_encode_call(signature: str, arg_types: list[str] | None = None, args: l
     return selector + encoded.hex()
 
 
+def _normalize_rpc_url(raw_url: str) -> str:
+    raw = str(raw_url or "").strip()
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        raw = raw[1:-1].strip()
+    # Guard against accidental trailing tokens (e.g. copied ".../v2/<key> Ready").
+    if any(ch.isspace() for ch in raw):
+        raw = raw.split()[0].strip()
+    return raw
+
+
 def _eth_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
+    rpc = _normalize_rpc_url(rpc_url)
+    if not rpc or not rpc.lower().startswith(("http://", "https://")):
+        raise RuntimeError("rpc url is invalid or missing")
     req_payload = json.dumps(
         {"jsonrpc": "2.0", "id": int(time.time() * 1000) % 1_000_000_000, "method": method, "params": params or []}
     ).encode("utf-8")
     req = UrlRequest(
-        str(rpc_url or "").strip(),
+        rpc,
         data=req_payload,
         method="POST",
         headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
@@ -22335,7 +22348,7 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
     if payout_token.lower() not in _riko_active_whitelist_erc20_addresses():
         result.update({"status": "skip", "reason": "payout_token_not_in_active_whitelist"})
         return result
-    rpc_url = str(RIKO_AUTO_YIELD_RPC_URL or "").strip()
+    rpc_url = _normalize_rpc_url(str(RIKO_AUTO_YIELD_RPC_URL or ""))
     private_key = str(RIKO_AUTO_YIELD_PRIVATE_KEY or "").strip()
     if not rpc_url or not private_key:
         result.update({"status": "skip", "reason": "auto_yield_rpc_or_key_missing"})
@@ -22357,17 +22370,21 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
         result.update({"status": "error", "reason": str(e)[:280]})
         return result
 
-    latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
-    holder_cache = _riko_auto_yield_load_holder_cache()
-    cached_holders = set([str(x).strip().lower() for x in holder_cache.get("holders") or [] if _is_eth_address(str(x).strip().lower())])
-    last_scanned_block = max(0, int(holder_cache.get("last_scanned_block") or 0))
-    if last_scanned_block <= 0:
-        last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
-    from_block = last_scanned_block + 1
-    if from_block <= latest_block:
-        discovered = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, latest_block)
-        cached_holders.update(discovered)
-    _riko_auto_yield_save_holder_cache(sorted(cached_holders), latest_block)
+    try:
+        latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
+        holder_cache = _riko_auto_yield_load_holder_cache()
+        cached_holders = set([str(x).strip().lower() for x in holder_cache.get("holders") or [] if _is_eth_address(str(x).strip().lower())])
+        last_scanned_block = max(0, int(holder_cache.get("last_scanned_block") or 0))
+        if last_scanned_block <= 0:
+            last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
+        from_block = last_scanned_block + 1
+        if from_block <= latest_block:
+            discovered = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, latest_block)
+            cached_holders.update(discovered)
+        _riko_auto_yield_save_holder_cache(sorted(cached_holders), latest_block)
+    except Exception as e:
+        result.update({"status": "error", "reason": f"rpc error: {str(e)[:240]}"})
+        return result
 
     holders_with_balance: list[tuple[str, int]] = []
     for holder in sorted(cached_holders):
@@ -31122,10 +31139,17 @@ def _render_admin_page() -> str:
       line-height: 1;
       justify-content: center;
     }}
+    .admin-riko-signers-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(360px, 1fr));
+      gap: 12px;
+      align-items: start;
+    }}
     #adminRikoPayoutStatus {{ margin-left: 0; }}
     .feedback-board {{ display: grid; gap: 10px; margin-top: 10px; }}
     .feedback-meta {{ margin-top: 6px; font-size: 12px; color: #64748b; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} .admin-wallet-item {{ grid-template-columns: 1fr; }} .admin-wallet-actions {{ justify-content: flex-start; }} }}
+    @media (max-width: 1080px) {{ .admin-riko-signers-grid {{ grid-template-columns: 1fr; }} }}
     @media (max-width: 1100px) {{
       .ticket-controls {{ padding: 8px; }}
       .ticket-toolbar {{ grid-template-columns: 1fr 1fr; }}
@@ -31196,16 +31220,6 @@ def _render_admin_page() -> str:
           <input id="adminRikoCustodyInput" type="text" placeholder="0x..."/>
           <button class="btn" onclick="applyAdminRikoCustodyAddress()">Apply on-chain</button>
         </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:start;">
-          <label style="margin:0">Custody allowances</label>
-          <div>
-            <div class="hint" style="margin-bottom:6px">Signed by CUSTODY wallet.</div>
-            <div id="adminRikoAllowanceRows"></div>
-            <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
-              <button type="button" class="btn btn-soft" onclick="applyAllAdminRikoCustodyAllowancePresets()">Apply allowances on-chain</button>
-            </div>
-          </div>
-        </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set pending operator</label>
           <input id="adminRikoPendingOperatorInput" type="text" placeholder="0x... operator"/>
@@ -31265,16 +31279,26 @@ def _render_admin_page() -> str:
         <span id="adminRikoPayoutPreviewStatus" class="status">Ready</span>
         <span id="adminRikoPayoutStatus" class="status">Ready</span>
       </section>
-      <section class="card admin-riko-whitelist-card">
-        <h3>Admin: RIKO whitelist</h3>
-        <p class="hint">Signed by ADMIN wallet.</p>
-        <div id="adminRikoWhitelistRows"></div>
-        <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
-          <button type="button" class="btn" onclick="addAdminRikoWhitelistRow()">Add row</button>
-          <button type="button" class="btn" onclick="applyAdminRikoWhitelist()">Apply on-chain</button>
-        </div>
-        <span id="adminRikoWhitelistStatus" class="status">Ready</span>
-      </section>
+      <div class="admin-riko-signers-grid">
+        <section class="card admin-riko-whitelist-card">
+          <h3>Admin: RIKO whitelist</h3>
+          <p class="hint">Signed by ADMIN wallet.</p>
+          <div id="adminRikoWhitelistRows"></div>
+          <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+            <button type="button" class="btn" onclick="addAdminRikoWhitelistRow()">Add row</button>
+            <button type="button" class="btn" onclick="applyAdminRikoWhitelist()">Apply on-chain</button>
+          </div>
+          <span id="adminRikoWhitelistStatus" class="status">Ready</span>
+        </section>
+        <section class="card">
+          <h3>Custody allowances</h3>
+          <p class="hint">Signed by CUSTODY wallet.</p>
+          <div id="adminRikoAllowanceRows"></div>
+          <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+            <button type="button" class="btn btn-soft" onclick="applyAllAdminRikoCustodyAllowancePresets()">Apply allowances on-chain</button>
+          </div>
+        </section>
+      </div>
     </div>
     <div class="grid" id="tabPendingRedeem" style="display:none">
       <section class="card">
@@ -32812,6 +32836,27 @@ def _render_admin_page() -> str:
       }}
       return out;
     }}
+    function rebuildAdminRikoAllowanceItemsFromWhitelistDraft() {{
+      const allowanceMap = getAdminRikoCustodyAllowancePresetMap();
+      const draftRows = snapshotAdminRikoWhitelistRows();
+      const out = [];
+      const seen = new Set();
+      for (const row of draftRows) {{
+        const symbol = String(row?.symbol || "").trim().toLowerCase();
+        if (!symbol) continue;
+        let address = normalizeAdminRikoAddress(row?.address || "");
+        if (!address) address = normalizeAdminRikoAddress(resolveAdminRikoAddressBySymbol(symbol));
+        if (!address || address === "native" || !/^0x[a-f0-9]{{40}}$/.test(address)) continue;
+        if (seen.has(address)) continue;
+        seen.add(address);
+        out.push({{
+          symbol,
+          address,
+          allowance: String(allowanceMap.get(address) || ""),
+        }});
+      }}
+      adminRikoAllowanceItems = out;
+    }}
     function renderAdminRikoAllowanceEditor() {{
       const rowsEl = document.getElementById("adminRikoAllowanceRows");
       if (!rowsEl) return;
@@ -32936,18 +32981,24 @@ def _render_admin_page() -> str:
         current.address = String(e.target.value || "").trim();
       }}
       adminRikoWhitelistItems[idx] = current;
+      rebuildAdminRikoAllowanceItemsFromWhitelistDraft();
+      renderAdminRikoAllowanceEditor();
     }}
     function addAdminRikoWhitelistRow() {{
       const snapshot = snapshotAdminRikoWhitelistRows();
       snapshot.push({{symbol:"", address:""}});
       adminRikoWhitelistItems = snapshot;
       renderAdminRikoWhitelistEditor();
+      rebuildAdminRikoAllowanceItemsFromWhitelistDraft();
+      renderAdminRikoAllowanceEditor();
       setAdminRikoWhitelistStatus("Row added. Enter symbol; known address is auto-filled.", false);
     }}
     function removeAdminRikoWhitelistRow(idx) {{
       const snapshot = snapshotAdminRikoWhitelistRows();
       adminRikoWhitelistItems = snapshot.filter((_, i) => i !== idx);
       renderAdminRikoWhitelistEditor();
+      rebuildAdminRikoAllowanceItemsFromWhitelistDraft();
+      renderAdminRikoAllowanceEditor();
       setAdminRikoWhitelistStatus("Row removed.", false);
     }}
     function collectAdminRikoWhitelistItems() {{
@@ -32990,22 +33041,12 @@ def _render_admin_page() -> str:
           symbol: String(it?.symbol || "").trim().toLowerCase(),
           address: String(it?.address || "").trim(),
         }}));
-        const allowanceMap = getAdminRikoCustodyAllowancePresetMap();
         const draft = (data.pending && data.pending.items) || (data.active && data.active.items) || [];
         adminRikoWhitelistItems = (Array.isArray(draft) ? draft : []).map((it) => ({{
           symbol: String(it?.symbol || "").trim().toLowerCase(),
           address: String(it?.address || "").trim(),
         }}));
-        adminRikoAllowanceItems = adminRikoWhitelistActiveItems
-          .filter((it) => /^0x[a-f0-9]{40}$/.test(normalizeAdminRikoAddress(it?.address || "")))
-          .map((it) => {{
-            const addr = normalizeAdminRikoAddress(it?.address || "");
-            return {{
-              symbol: String(it?.symbol || "").trim().toLowerCase(),
-              address: String(addr || "").trim(),
-              allowance: String(allowanceMap.get(addr) || ""),
-            }};
-          }});
+        rebuildAdminRikoAllowanceItemsFromWhitelistDraft();
         renderAdminRikoWhitelistEditor();
         renderAdminRikoAllowanceEditor();
         const payoutSel = document.getElementById("adminRikoAutoYieldPayoutTokenInput");
@@ -35285,7 +35326,7 @@ def admin_riko_auto_payout_preview(request: Request, response: Response) -> dict
         data = _riko_auto_payout_preview()
         return {"ok": True, **data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"RIKO payout preview failed: {e}") from e
+        return {"ok": True, "status": "error", "reason": f"preview failed: {str(e)[:240]}"}
 
 
 @app.get("/api/riko/whitelist")
