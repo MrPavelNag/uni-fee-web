@@ -53,6 +53,41 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 
+def _load_local_env_file() -> None:
+    """Best-effort .env loader for local runs.
+
+    - Loads BASE_DIR/.env if present.
+    - Keeps already-exported env vars untouched.
+    - Supports simple KEY=VALUE lines (optional quotes).
+    """
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return
+    try:
+        raw_text = env_path.read_text(encoding="utf-8")
+    except Exception:
+        return
+    for line in raw_text.splitlines():
+        s = str(line or "").strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        key, value = s.split("=", 1)
+        k = str(key or "").strip()
+        if not k:
+            continue
+        v = str(value or "").strip()
+        if "#" in v:
+            hash_idx = v.find("#")
+            if hash_idx > 0 and v[hash_idx - 1].isspace():
+                v = v[:hash_idx].rstrip()
+        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+            v = v[1:-1]
+        os.environ.setdefault(k, v)
+
+
+_load_local_env_file()
+
+
 def _resolve_catalog_dir() -> Path:
     # Highest priority: explicit path from env.
     explicit = os.environ.get("CATALOG_STORAGE_DIR", "").strip()
@@ -31121,7 +31156,7 @@ def _render_admin_page() -> str:
     }}
     .admin-riko-allowance-row {{
       display: grid;
-      grid-template-columns: minmax(120px,180px) minmax(180px,1fr) minmax(140px,220px) auto;
+      grid-template-columns: minmax(120px,220px) minmax(140px,1fr) auto;
       gap: 6px;
       align-items: center;
       margin: 0;
@@ -31143,7 +31178,10 @@ def _render_admin_page() -> str:
       display: grid;
       grid-template-columns: minmax(560px, 1.65fr) minmax(320px, 0.85fr);
       gap: 12px;
-      align-items: start;
+      align-items: stretch;
+    }}
+    .admin-riko-signers-grid > .card {{
+      height: 100%;
     }}
     #adminRikoPayoutStatus {{ margin-left: 0; }}
     .feedback-board {{ display: grid; gap: 10px; margin-top: 10px; }}
@@ -32346,7 +32384,6 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoCustodyApprove(tokenAddressInput, amountInput) {{
       try {{
-        requireAdminWalletAuth();
         const signer = await getAdminSigner();
         const signerAddr = String(await signer.getAddress() || "").trim().toLowerCase();
         const vaultAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
@@ -32354,7 +32391,7 @@ def _render_admin_page() -> str:
         const custodyAddr = String(await vault.custodyAddress() || "").trim().toLowerCase();
         if (!/^0x[a-f0-9]{{40}}$/.test(custodyAddr)) throw new Error("Custody is not configured on vault.");
         if (signerAddr !== custodyAddr) {{
-          throw new Error(`Switch wallet to custody address ${{shortAddrAdmin(custodyAddr)}} and retry.`);
+          throw new Error(`Switch wallet account to custody address ${{shortAddrAdmin(custodyAddr)}} and retry.`);
         }}
         const rawToken = String(tokenAddressInput || "").trim();
         let tokenAddr = normalizeEthAddressInput(rawToken);
@@ -32841,9 +32878,14 @@ def _render_admin_page() -> str:
       const draftRows = snapshotAdminRikoWhitelistRows();
       const out = [];
       const seen = new Set();
+      let hasNativeEth = false;
       for (const row of draftRows) {{
         const symbol = String(row?.symbol || "").trim().toLowerCase();
         if (!symbol) continue;
+        if (symbol === "eth") {{
+          hasNativeEth = true;
+          continue;
+        }}
         let address = normalizeAdminRikoAddress(row?.address || "");
         if (!address) address = normalizeAdminRikoAddress(resolveAdminRikoAddressBySymbol(symbol));
         if (!address || address === "native" || !/^0x[a-f0-9]{{40}}$/.test(address)) continue;
@@ -32854,6 +32896,9 @@ def _render_admin_page() -> str:
           address,
           allowance: String(allowanceMap.get(address) || ""),
         }});
+      }}
+      if (hasNativeEth) {{
+        out.unshift({{ symbol: "eth", address: "native", allowance: "" }});
       }}
       adminRikoAllowanceItems = out;
     }}
@@ -32868,8 +32913,13 @@ def _render_admin_page() -> str:
       rowsEl.innerHTML = rows.map((it, idx) => `
         <div class="admin-riko-allowance-row">
           <input value="${{esc(it?.symbol || "")}}" readonly />
-          <input value="${{esc(it?.address || "")}}" readonly />
-          <input data-admin-riko-allowance-field="allowance" data-index="${{idx}}" placeholder="allowance or max" value="${{esc(it?.allowance || "")}}" />
+          <input
+            data-admin-riko-allowance-field="allowance"
+            data-index="${{idx}}"
+            placeholder="${{String(it?.symbol || "").toLowerCase() === "eth" ? "native (no approve)" : "allowance or max"}}"
+            value="${{esc(it?.allowance || "")}}"
+            ${{String(it?.symbol || "").toLowerCase() === "eth" ? "readonly" : ""}}
+          />
           <button type="button" class="btn danger" onclick="clearAdminRikoAllowanceRow(${{idx}})">-</button>
         </div>
       `).join("");
