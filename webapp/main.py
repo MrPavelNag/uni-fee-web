@@ -30089,6 +30089,18 @@ def _render_admin_page() -> str:
     .role-chip.protected {{ border-color: #86efac; background: #f0fdf4; color: #166534; }}
     .role-chip.onchain {{ border-color: #fcd34d; background: #fffbeb; color: #92400e; }}
     .admin-wallet-actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }}
+    .admin-pending-row {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:0; }}
+    .admin-pending-main {{ font-size:13px; color:#0f172a; margin:0; }}
+    .admin-pending-meta {{ font-size:13px; color:#334155; margin:0; }}
+    .admin-pending-actions {{ display:flex; gap:8px; align-items:center; }}
+    .riko-payout-actions {{
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 12px;
+      margin-top: -4px;
+    }}
+    #adminRikoPayoutStatus {{ margin-left: 0; }}
     .feedback-board {{ display: grid; gap: 10px; margin-top: 10px; }}
     .feedback-meta {{ margin-top: 6px; font-size: 12px; color: #64748b; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} .admin-wallet-item {{ grid-template-columns: 1fr; }} .admin-wallet-actions {{ justify-content: flex-start; }} }}
@@ -30128,7 +30140,7 @@ def _render_admin_page() -> str:
       <button class="tab-btn" id="tabBtnFeedback" onclick="switchTab('feedback')">Feedback</button>
       <button class="tab-btn" id="tabBtnFaq" onclick="switchTab('faq')">FAQ</button>
       <div class="tabs-actions">
-        <button class="btn btn-soft" onclick="sendTelegramTestMessage()">Send Telegram test</button>
+        <button class="btn btn-soft" id="adminTelegramTestBtn" onclick="sendTelegramTestMessage()">Send Telegram test</button>
       </div>
     </div>
     <div class="grid" id="tabAccess" style="display:none">
@@ -30142,17 +30154,13 @@ def _render_admin_page() -> str:
         </div>
         <div class="row"><label>Delay (all pending ops)</label><div id="adminPendingDelayInfo">-</div></div>
         <div class="row"><label>Admin wallets</label><div id="adminWalletsList">-</div></div>
-        <div class="row"><label>Pending admin additions</label><div id="adminPendingWalletsList">-</div></div>
-        <div class="row"><label>Pending PROTECTED updates</label><div id="adminPendingProtectList">-</div></div>
-        <div class="row"><label>Pending protected removals</label><div id="adminPendingRemoveList">-</div></div>
+        <div class="row" id="adminPendingAddRow" style="display:none"><label>Pending admin additions</label><div id="adminPendingWalletsList">-</div></div>
+        <div class="row" id="adminPendingProtectRow" style="display:none"><label>Pending PROTECTED updates</label><div id="adminPendingProtectList">-</div></div>
+        <div class="row" id="adminPendingRemoveRow" style="display:none"><label>Pending protected removals</label><div id="adminPendingRemoveList">-</div></div>
         <span id="adminStatus" class="status">Ready</span>
       </section>
     </div>
     <div class="grid" id="tabSettings">
-      <section class="card">
-        <h3>Pilot read-only</h3>
-        <div class="row"><label>Active RIKO whitelist</label><div id="adminRikoWhitelistIndicator">-</div></div>
-      </section>
       <section class="card">
         <h3>RIKO on-chain controls</h3>
         <div class="row"><label>Vault address</label><div id="adminRikoVaultAddress">-</div></div>
@@ -30193,36 +30201,6 @@ def _render_admin_page() -> str:
           <input id="adminRikoPriceUsdInput" type="number" min="0.000001" step="0.000001" value="1"/>
           <button class="btn" onclick="applyAdminRikoPriceUsd()">Apply on-chain</button>
         </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Token config: token</label>
-          <input id="adminRikoTokenCfgTokenInput" type="text" placeholder="0x... token address"/>
-          <button class="btn btn-soft" onclick="loadAdminRikoTokenConfig()">Load config</button>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Token config: allowed</label>
-          <select id="adminRikoTokenCfgAllowedInput">
-            <option value="true">true</option>
-            <option value="false">false</option>
-          </select>
-          <span class="hint">false = disable token</span>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Token config: oracle</label>
-          <input id="adminRikoTokenCfgOracleInput" type="text" placeholder="0x... Chainlink feed"/>
-          <span class="hint">token/USD feed</span>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Token config: max age</label>
-          <input id="adminRikoTokenCfgMaxAgeInput" type="number" min="0" step="1" value="86400"/>
-          <span class="hint">seconds</span>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Token config: feed description</label>
-          <input id="adminRikoTokenCfgDescInput" type="text" placeholder="e.g. USDC / USD"/>
-          <button class="btn" onclick="applyAdminRikoTokenConfig()">Apply on-chain</button>
-        </div>
-        <div class="row"><label>Loaded token config</label><div id="adminRikoTokenCfgCurrent" class="mono">-</div></div>
-        <p class="hint">Use for pilot cap updates (e.g. 1000 -> higher later).</p>
         <span id="adminRikoOnchainStatus" class="status">Ready</span>
       </section>
       <section class="card">
@@ -30248,8 +30226,24 @@ def _render_admin_page() -> str:
         <div class="row"><label>Next scheduled payout (UTC)</label><div id="adminRikoPayoutNextDate">-</div></div>
         <div class="row"><label>Auto-yield job</label><div id="adminRikoPayoutJobMode">-</div></div>
         <div class="row"><label>Last schedule update</label><div id="adminRikoPayoutUpdatedAt">-</div></div>
-        <button class="btn" onclick="saveAdminRikoPayoutSchedule()">Apply on-chain</button>
-        <span id="adminRikoPayoutStatus" class="status">Ready</span>
+        <div class="riko-payout-actions">
+          <button class="btn" onclick="saveAdminRikoPayoutSchedule()">Apply on-chain</button>
+          <span id="adminRikoPayoutStatus" class="status">Ready</span>
+        </div>
+      </section>
+      <section class="card">
+        <h3>Process pending redeem</h3>
+        <div class="row" style="display:grid;grid-template-columns:170px minmax(220px,1fr) minmax(170px,260px) auto auto;gap:8px;align-items:center;">
+          <label style="margin:0">Process pending redeem</label>
+          <input id="adminRikoProcessAccountInput" type="text" placeholder="0x... account"/>
+          <input id="adminRikoProcessTokenInput" type="text" placeholder="Token address or ETH"/>
+          <button class="btn btn-soft" type="button" onclick="setAdminProcessPendingTokenEth()">Use ETH</button>
+          <button class="btn" type="button" onclick="applyAdminRikoProcessPendingRedeem()">Apply on-chain</button>
+        </div>
+        <div class="table-wrap" style="margin-top:8px">
+          <table id="adminRikoPendingQueueTable"></table>
+        </div>
+        <span id="adminRikoPendingOpsStatus" class="status">Ready</span>
       </section>
     </div>
     <div class="grid" id="tabRiko" style="display:none">
@@ -31080,6 +31074,9 @@ def _render_admin_page() -> str:
         const maxAge = Number(cfg?.maxOracleAge || 0n);
         const descHash = String(cfg?.expectedFeedDescriptionHash || "");
         const tokenDecimals = Number(cfg?.tokenDecimals || 0n);
+        const isZeroAddress = /^0x0{40}$/i.test(oracle);
+        const isZeroHash = /^0x0{64}$/i.test(descHash);
+        const isUnconfigured = !allowed && isZeroAddress && maxAge === 0 && isZeroHash && tokenDecimals === 0;
         const allowedInput = document.getElementById("adminRikoTokenCfgAllowedInput");
         const oracleInput = document.getElementById("adminRikoTokenCfgOracleInput");
         const maxAgeInput = document.getElementById("adminRikoTokenCfgMaxAgeInput");
@@ -31088,9 +31085,20 @@ def _render_admin_page() -> str:
         if (maxAgeInput) maxAgeInput.value = String(maxAge || 0);
         const cur = document.getElementById("adminRikoTokenCfgCurrent");
         if (cur) {{
-          cur.textContent = `allowed=${{allowed}} oracle=${{oracle}} maxAge=${{maxAge}} hash=${{descHash}} tokenDecimals=${{tokenDecimals}}`;
+          if (isUnconfigured) {{
+            cur.textContent = "No on-chain token config for selected token.";
+          }} else {{
+            cur.textContent = `allowed=${{allowed}} | oracle=${{oracle}} | maxAge=${{maxAge}} | hash=${{descHash}} | tokenDecimals=${{tokenDecimals}}`;
+          }}
         }}
-        setAdminRikoOnchainStatus("Token config loaded.", false);
+        if (isUnconfigured) {{
+          setAdminRikoOnchainStatus(
+            "Token config is empty on-chain for this token (not configured in vault whitelist yet).",
+            true
+          );
+        }} else {{
+          setAdminRikoOnchainStatus("Token config loaded.", false);
+        }}
       }} catch (e) {{
         if (silent) return;
         setAdminRikoOnchainStatus("Load token config failed: " + (e?.shortMessage || e?.message || "unknown"), true);
@@ -31740,16 +31748,7 @@ def _render_admin_page() -> str:
         if (delayInfoEl) delayInfoEl.textContent = formatDelay(Number(data.admin_wallet_add_delay_sec || 0));
         renderManualPairListsSettings(data.pair_lists_manual || {{}});
         renderAdminRikoPayoutSchedule(data.riko_payout_schedule || {{}}, !!data.riko_auto_yield_enabled);
-        await loadAdminRikoWhitelistIndicator();
         await loadAdminRikoGlobalCap();
-        const cfgTokenInput = document.getElementById("adminRikoTokenCfgTokenInput");
-        const yieldTokenInput = document.getElementById("adminRikoYieldTokenInput");
-        const tokenRaw = String(cfgTokenInput?.value || "").trim();
-        if (cfgTokenInput && !/^0x[a-fA-F0-9]{{40}}$/.test(tokenRaw)) {{
-          const fallback = normalizeEthAddressInput(String(yieldTokenInput?.value || "").trim());
-          if (fallback) cfgTokenInput.value = fallback;
-        }}
-        await loadAdminRikoTokenConfig(true);
         if (data.pilot_config_frozen) {{
           setAdminStatus("Pilot config is frozen (RIKO_PILOT_CONFIG_FROZEN=1). Admin updates are disabled by server.", false);
         }}
@@ -31760,33 +31759,6 @@ def _render_admin_page() -> str:
         }} else {{
           setAdminStatus("Load failed: " + msg, true);
         }}
-      }}
-    }}
-    function _quickHash32(text) {{
-      let h = 5381;
-      const s = String(text || "");
-      for (let i = 0; i < s.length; i++) {{
-        h = ((h << 5) + h) ^ s.charCodeAt(i);
-      }}
-      return (h >>> 0).toString(16).padStart(8, "0");
-    }}
-    async function loadAdminRikoWhitelistIndicator() {{
-      const el = document.getElementById("adminRikoWhitelistIndicator");
-      if (!el) return;
-      try {{
-        const r = await fetch("/api/riko/whitelist");
-        const data = await r.json();
-        if (!r.ok) throw new Error(data.detail || "failed");
-        const active = data.active || {{}};
-        const items = Array.isArray(active.items) ? active.items : [];
-        const canonical = items
-          .map((it) => `${{String(it?.symbol || "").toLowerCase()}}:${{String(it?.address || "").toLowerCase()}}`)
-          .sort()
-          .join("|");
-        const hash = _quickHash32(canonical);
-        el.textContent = `${{items.length}} symbols, snapshot #${{hash}}`;
-      }} catch (_) {{
-        el.textContent = "Unavailable";
       }}
     }}
     function formatUtcTs(ts) {{
@@ -31818,6 +31790,49 @@ def _render_admin_page() -> str:
       const m = String(hhmm || "").match(/^([01]\\d|2[0-3]):([0-5]\\d)$/);
       if (!m) return;
       inTime.value = String(hhmm);
+      updateAdminRikoPayoutDraftPreview();
+    }}
+    function formatAdminRikoUtcDate(dt) {{
+      if (!(dt instanceof Date) || Number.isNaN(dt.getTime())) return "";
+      const y = dt.getUTCFullYear();
+      const m = String(dt.getUTCMonth() + 1).padStart(2, "0");
+      const d = String(dt.getUTCDate()).padStart(2, "0");
+      const hh = String(dt.getUTCHours()).padStart(2, "0");
+      const mm = String(dt.getUTCMinutes()).padStart(2, "0");
+      return `${{y}}-${{m}}-${{d}} ${{hh}}:${{mm}} UTC`;
+    }}
+    function computeAdminRikoNextDueUtc(items, payoutTimeUtc) {{
+      const list = Array.isArray(items) ? items : [];
+      if (!list.length) return "";
+      const m = String(payoutTimeUtc || "").trim().match(/^([01]\\d|2[0-3]):([0-5]\\d)$/);
+      if (!m) return "";
+      const hour = Number(m[1]);
+      const minute = Number(m[2]);
+      const now = new Date();
+      const nowMs = now.getTime();
+      const baseYear = now.getUTCFullYear();
+      for (let yOff = 0; yOff <= 8; yOff += 1) {{
+        const y = baseYear + yOff;
+        for (const it of list) {{
+          const month = Number(it?.month || 0);
+          const day = Number(it?.day || 0);
+          if (!Number.isInteger(month) || !Number.isInteger(day)) continue;
+          const candidate = new Date(Date.UTC(y, month - 1, day, hour, minute, 0, 0));
+          if (candidate.getUTCMonth() !== (month - 1) || candidate.getUTCDate() !== day) continue;
+          if (candidate.getTime() >= nowMs) return formatAdminRikoUtcDate(candidate);
+        }}
+      }}
+      return "";
+    }}
+    function updateAdminRikoPayoutDraftPreview() {{
+      const nextEl = document.getElementById("adminRikoPayoutNextDate");
+      const inDates = document.getElementById("adminRikoPayoutDatesInput");
+      const inTime = document.getElementById("adminRikoPayoutTimeUtcInput");
+      if (!nextEl || !inDates || !inTime) return;
+      const draftItems = parseAdminRikoPayoutLines(inDates.value || "");
+      const nextDraft = computeAdminRikoNextDueUtc(draftItems, String(inTime.value || "00:00"));
+      if (!nextDraft) return;
+      nextEl.textContent = nextDraft + " (draft)";
     }}
     function parseAdminRikoPayoutLines(raw) {{
       const lines = String(raw || "")
@@ -31835,7 +31850,7 @@ def _render_admin_page() -> str:
           .replaceAll(".", "-")
           .replaceAll("/", "-")
           .trim();
-        const m = line.match(/^(\\d{1,2})\\D+(\\d{1,2})$/);
+        const m = line.match(/^(\\d{{1,2}})\\D+(\\d{{1,2}})$/);
         if (!m) continue;
         const month = Number(m[1]);
         const day = Number(m[2]);
@@ -31849,23 +31864,38 @@ def _render_admin_page() -> str:
       out.sort((a, b) => (a.month - b.month) || (a.day - b.day));
       return out;
     }}
-    function renderAdminRikoPayoutSchedule(cfg, autoEnabled) {{
+    function renderAdminRikoPayoutSchedule(cfg, autoEnabled, force) {{
+      const forceUpdate = !!force;
       const items = Array.isArray(cfg?.items) ? cfg.items : [];
       const inDates = document.getElementById("adminRikoPayoutDatesInput");
       const inTime = document.getElementById("adminRikoPayoutTimeUtcInput");
       const nextEl = document.getElementById("adminRikoPayoutNextDate");
       const modeEl = document.getElementById("adminRikoPayoutJobMode");
       const updEl = document.getElementById("adminRikoPayoutUpdatedAt");
+      const savedDatesText = items
+        .map((it) => `${{String(Number(it?.month || 0)).padStart(2, "0")}}-${{String(Number(it?.day || 0)).padStart(2, "0")}}`)
+        .join("; ");
+      const savedTimeText = String(cfg?.payout_time_utc || "00:00");
       if (inDates) {{
-        const text = items
-          .map((it) => `${{String(Number(it?.month || 0)).padStart(2, "0")}}-${{String(Number(it?.day || 0)).padStart(2, "0")}}`)
-          .join("; ");
-        inDates.value = text;
+        if (forceUpdate || document.activeElement !== inDates) inDates.value = savedDatesText;
       }}
-      if (inTime) inTime.value = String(cfg?.payout_time_utc || "00:00");
+      if (inTime) {{
+        if (forceUpdate || document.activeElement !== inTime) inTime.value = savedTimeText;
+      }}
       if (nextEl) nextEl.textContent = String(cfg?.next_due_at_utc || cfg?.next_due_date || "-");
       if (modeEl) modeEl.textContent = autoEnabled ? "enabled" : "disabled (set RIKO_AUTO_YIELD_ENABLED=1 on server)";
       if (updEl) updEl.textContent = String(cfg?.updated_at || "-");
+      if (nextEl && inDates && inTime && !forceUpdate) {{
+        const draftDates = String(inDates.value || "").trim();
+        const draftTime = String(inTime.value || "00:00").trim() || "00:00";
+        const editing = document.activeElement === inDates || document.activeElement === inTime;
+        const differsFromSaved = draftDates !== savedDatesText || draftTime !== savedTimeText;
+        if (editing || differsFromSaved) {{
+          const draftItems = parseAdminRikoPayoutLines(draftDates);
+          const draftNext = computeAdminRikoNextDueUtc(draftItems, draftTime);
+          if (draftNext) nextEl.textContent = draftNext + " (draft)";
+        }}
+      }}
     }}
     async function saveAdminRikoPayoutSchedule() {{
       try {{
@@ -31874,7 +31904,7 @@ def _render_admin_page() -> str:
         const items = parseAdminRikoPayoutLines(raw);
         if (!items.length) throw new Error("Add at least one valid MM-DD date.");
         const data = await postJson("/api/admin/riko/payout-schedule", {{ items, payout_time_utc }});
-        renderAdminRikoPayoutSchedule(data.riko_payout_schedule || {{}}, !!adminLastSettings?.riko_auto_yield_enabled);
+        renderAdminRikoPayoutSchedule(data.riko_payout_schedule || {{}}, !!adminLastSettings?.riko_auto_yield_enabled, true);
         setAdminRikoPayoutStatus(data.info || "Payout schedule saved.", false);
       }} catch (e) {{
         setAdminRikoPayoutStatus("Payout schedule save failed: " + (e?.message || "unknown"), true);
@@ -31983,28 +32013,34 @@ def _render_admin_page() -> str:
     }}
     function renderPendingAdminWallets(items, delaySec) {{
       const wrap = document.getElementById("adminPendingWalletsList");
+      const row = document.getElementById("adminPendingAddRow");
       if (!wrap) return;
       const rows = (items || []).map((it) => {{
         const a = String(it?.address || "");
         const executeAfter = formatUtcTs(it?.execute_after_ts);
         const leftSec = Math.max(0, Math.ceil(Number(it?.execute_after_ts || 0) - Date.now() / 1000));
         const waitLabel = leftSec > 0 ? `wait: ${{formatDelay(leftSec)}}` : "ready";
-        return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
-          <span class="mono">${{a}}</span>
-          <span class="hint">execute after: ${{executeAfter}}</span>
-          <span class="hint">${{waitLabel}}</span>
-          <button class="btn" style="padding:5px 10px;font-size:12px" onclick="executePendingAdminWallet('${{a}}')">Execute</button>
-          <button class="btn" style="padding:5px 10px;font-size:12px" onclick="cancelPendingAdminWallet('${{a}}')">Cancel</button>
+        return `<div class="admin-pending-row">
+          <span class="admin-pending-main">${{a}}</span>
+          <span class="admin-pending-meta">execute after: ${{executeAfter}}</span>
+          <span class="admin-pending-meta">${{waitLabel}}</span>
+          <div class="admin-pending-actions">
+            <button class="btn" style="padding:5px 10px;font-size:12px" onclick="executePendingAdminWallet('${{a}}')">Execute</button>
+            <button class="btn" style="padding:5px 10px;font-size:12px" onclick="cancelPendingAdminWallet('${{a}}')">Cancel</button>
+          </div>
         </div>`;
       }});
       if (rows.length) {{
         wrap.innerHTML = rows.join("");
+        if (row) row.style.display = "grid";
       }} else {{
-        wrap.textContent = "No pending additions.";
+        wrap.innerHTML = "";
+        if (row) row.style.display = "none";
       }}
     }}
     function renderPendingProtectAdminWallets(items, delaySec) {{
       const wrap = document.getElementById("adminPendingProtectList");
+      const row = document.getElementById("adminPendingProtectRow");
       if (!wrap) return;
       const rows = (items || []).map((it) => {{
         const a = String(it?.address || "");
@@ -32012,42 +32048,51 @@ def _render_admin_page() -> str:
         const leftSec = Math.max(0, Math.ceil(Number(it?.execute_after_ts || 0) - Date.now() / 1000));
         const waitLabel = leftSec > 0 ? `wait: ${{formatDelay(leftSec)}}` : "ready";
         const targetLabel = Boolean(it?.target_protected) ? "Set PROTECTED" : "Unset PROTECTED";
-        return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
-          <span class="mono">${{a}}</span>
-          <span class="hint">${{targetLabel}}</span>
-          <span class="hint">execute after: ${{executeAfter}}</span>
-          <span class="hint">${{waitLabel}}</span>
-          <button class="btn" style="padding:5px 10px;font-size:12px" onclick="executePendingProtectAdminWallet('${{a}}')">Execute</button>
-          <button class="btn" style="padding:5px 10px;font-size:12px" onclick="cancelPendingProtectAdminWallet('${{a}}')">Cancel</button>
+        return `<div class="admin-pending-row">
+          <span class="admin-pending-main">${{a}}</span>
+          <span class="admin-pending-meta">${{targetLabel}}</span>
+          <span class="admin-pending-meta">execute after: ${{executeAfter}}</span>
+          <span class="admin-pending-meta">${{waitLabel}}</span>
+          <div class="admin-pending-actions">
+            <button class="btn" style="padding:5px 10px;font-size:12px" onclick="executePendingProtectAdminWallet('${{a}}')">Execute</button>
+            <button class="btn" style="padding:5px 10px;font-size:12px" onclick="cancelPendingProtectAdminWallet('${{a}}')">Cancel</button>
+          </div>
         </div>`;
       }});
       if (rows.length) {{
         wrap.innerHTML = rows.join("");
+        if (row) row.style.display = "grid";
       }} else {{
-        wrap.textContent = "No pending PROTECTED updates.";
+        wrap.innerHTML = "";
+        if (row) row.style.display = "none";
       }}
     }}
     function renderPendingRemoveAdminWallets(items, delaySec) {{
       const wrap = document.getElementById("adminPendingRemoveList");
+      const row = document.getElementById("adminPendingRemoveRow");
       if (!wrap) return;
       const rows = (items || []).map((it) => {{
         const a = String(it?.address || "");
         const executeAfter = formatUtcTs(it?.execute_after_ts);
         const leftSec = Math.max(0, Math.ceil(Number(it?.execute_after_ts || 0) - Date.now() / 1000));
         const waitLabel = leftSec > 0 ? `wait: ${{formatDelay(leftSec)}}` : "ready";
-        return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
-          <span class="mono">${{a}}</span>
-          <span class="hint">remove protected admin</span>
-          <span class="hint">execute after: ${{executeAfter}}</span>
-          <span class="hint">${{waitLabel}}</span>
-          <button class="btn" style="padding:5px 10px;font-size:12px" onclick="executePendingRemoveAdminWallet('${{a}}')">Execute</button>
-          <button class="btn" style="padding:5px 10px;font-size:12px" onclick="cancelPendingRemoveAdminWallet('${{a}}')">Cancel</button>
+        return `<div class="admin-pending-row">
+          <span class="admin-pending-main">${{a}}</span>
+          <span class="admin-pending-meta">remove protected admin</span>
+          <span class="admin-pending-meta">execute after: ${{executeAfter}}</span>
+          <span class="admin-pending-meta">${{waitLabel}}</span>
+          <div class="admin-pending-actions">
+            <button class="btn" style="padding:5px 10px;font-size:12px" onclick="executePendingRemoveAdminWallet('${{a}}')">Execute</button>
+            <button class="btn" style="padding:5px 10px;font-size:12px" onclick="cancelPendingRemoveAdminWallet('${{a}}')">Cancel</button>
+          </div>
         </div>`;
       }});
       if (rows.length) {{
         wrap.innerHTML = rows.join("");
+        if (row) row.style.display = "grid";
       }} else {{
-        wrap.textContent = "No pending protected removals.";
+        wrap.innerHTML = "";
+        if (row) row.style.display = "none";
       }}
     }}
     async function addAdminWallet() {{
@@ -32066,11 +32111,20 @@ def _render_admin_page() -> str:
       }}
     }}
     async function sendTelegramTestMessage() {{
+      const btn = document.getElementById("adminTelegramTestBtn");
+      if (btn?.disabled) return;
+      const startedAt = Date.now();
       try {{
-        const data = await postJson("/api/admin/telegram/test", {{}});
-        setAdminStatus(data.info || "Telegram test sent", false);
+        if (btn) btn.disabled = true;
+        await postJson("/api/admin/telegram/test", {{}});
       }} catch (e) {{
         setAdminStatus("Telegram test failed: " + (e?.message || "unknown"), true);
+      }} finally {{
+        const elapsed = Date.now() - startedAt;
+        const waitMs = Math.max(0, 2000 - elapsed);
+        setTimeout(() => {{
+          if (btn) btn.disabled = false;
+        }}, waitMs);
       }}
     }}
     async function executePendingAdminWallet(address) {{
@@ -32159,6 +32213,16 @@ def _render_admin_page() -> str:
       }} catch (e) {{
         setAdminStatus("Remove admin failed: " + (e?.message || "unknown"), true);
       }}
+    }}
+    const adminRikoPayoutDatesEl = document.getElementById("adminRikoPayoutDatesInput");
+    if (adminRikoPayoutDatesEl) {{
+      adminRikoPayoutDatesEl.addEventListener("input", updateAdminRikoPayoutDraftPreview);
+      adminRikoPayoutDatesEl.addEventListener("change", updateAdminRikoPayoutDraftPreview);
+    }}
+    const adminRikoPayoutTimeEl = document.getElementById("adminRikoPayoutTimeUtcInput");
+    if (adminRikoPayoutTimeEl) {{
+      adminRikoPayoutTimeEl.addEventListener("input", updateAdminRikoPayoutDraftPreview);
+      adminRikoPayoutTimeEl.addEventListener("change", updateAdminRikoPayoutDraftPreview);
     }}
     loadAuthState();
     loadAdmin();
