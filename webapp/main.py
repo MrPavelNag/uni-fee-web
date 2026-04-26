@@ -186,6 +186,7 @@ def _on_startup() -> None:
     _start_positions_index_workers()
     _start_erc721_contract_refresh_weekly()
     _start_riko_auto_yield_job()
+    _start_riko_holder_scan_bg_job()
 
 
 @app.on_event("shutdown")
@@ -193,6 +194,7 @@ def _on_shutdown() -> None:
     _stop_catalog_auto_refresh()
     _stop_positions_index_workers()
     _stop_erc721_contract_refresh_weekly()
+    _stop_riko_holder_scan_bg_job()
     _stop_riko_auto_yield_job()
     _stop_analytics()
 
@@ -319,6 +321,9 @@ RIKO_AUTO_YIELD_PREVIEW_SCAN_MAX_BLOCKS = max(
     10, int(os.environ.get("RIKO_AUTO_YIELD_PREVIEW_SCAN_MAX_BLOCKS", "120"))
 )
 RIKO_PREVIEW_USE_EXPLORER = os.environ.get("RIKO_PREVIEW_USE_EXPLORER", "1").strip().lower() in ("1", "true", "yes", "on")
+RIKO_HOLDER_SCAN_BG_ENABLED = os.environ.get("RIKO_HOLDER_SCAN_BG_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+RIKO_HOLDER_SCAN_BG_INTERVAL_SEC = max(15, int(os.environ.get("RIKO_HOLDER_SCAN_BG_INTERVAL_SEC", "45")))
+RIKO_HOLDER_SCAN_BG_MAX_BLOCKS = max(10, int(os.environ.get("RIKO_HOLDER_SCAN_BG_MAX_BLOCKS", "240")))
 RIKO_AUTO_YIELD_STATE_KEY = "riko_auto_yield_state_v1"
 RIKO_AUTO_YIELD_HOLDER_CACHE_STATE_KEY = "riko_auto_yield_holder_cache_v1"
 RIKO_AUTO_YIELD_BOT_CONFIG_STATE_KEY = "riko_auto_yield_bot_config_v1"
@@ -329,6 +334,8 @@ RIKO_AUTO_YIELD_HISTORY_STATE_KEY = "riko_auto_yield_history_v1"
 RIKO_CUSTODY_ALLOWANCE_PRESETS_STATE_KEY = "riko_custody_allowance_presets_v1"
 RIKO_AUTO_YIELD_STOP = threading.Event()
 RIKO_AUTO_YIELD_THREAD: threading.Thread | None = None
+RIKO_HOLDER_SCAN_BG_STOP = threading.Event()
+RIKO_HOLDER_SCAN_BG_THREAD: threading.Thread | None = None
 RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS: set[str] = set()
 RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS_LOCK = threading.Lock()
 ADMIN_WALLETS_DEFAULT = "0xD3155f6A7525F81595609E83789bbb95d91aaEdf"
@@ -5680,7 +5687,10 @@ def _riko_holder_activity_from_explorer_logs(
         topics = lg.get("topics")
         if not isinstance(topics, list) or len(topics) < 3:
             continue
-        tx_hash = str(lg.get("transactionHash") or "").strip().lower()
+        tx_hash_raw = str(lg.get("transactionHash") or lg.get("txHash") or lg.get("hash") or "").strip().lower()
+        tx_hash = tx_hash_raw
+        if re.fullmatch(r"[a-f0-9]{64}", tx_hash):
+            tx_hash = "0x" + tx_hash
         block_number = _parse_int_like(lg.get("blockNumber") or 0)
         ts = _parse_int_like(lg.get("timeStamp") or lg.get("timestamp") or 0)
         for raw_addr in (_eth_topic_to_address(str(topics[1] or "")), _eth_topic_to_address(str(topics[2] or ""))):
@@ -22783,6 +22793,8 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
     rows: list[dict[str, Any]] = []
     for holder in holders:
+        if str(holder or "").strip().lower() == riko_token:
+            continue
         try:
             bal = int(_riko_erc20_balance_of(rpc_url, riko_token, holder))
         except Exception:
@@ -23214,6 +23226,88 @@ def _riko_auto_yield_loop(interval_sec: int, run_on_startup: bool) -> None:
             _riko_auto_yield_save_state(out)
             _append_riko_auto_yield_history(out)
             _riko_auto_yield_report(out)
+
+
+def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
+    riko_token = str(RIKO_VAULT_ADDRESS or "").strip().lower()
+    if not _is_eth_address(riko_token):
+        return {"status": "skip", "reason": "riko_token_not_configured"}
+    rpc_url = _riko_auto_yield_rpc_url_runtime()
+    if not rpc_url:
+        return {"status": "skip", "reason": "rpc_missing"}
+    latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
+    holder_cache = _riko_auto_yield_load_holder_cache()
+    cached_holders = set(
+        [str(x).strip().lower() for x in holder_cache.get("holders") or [] if _is_eth_address(str(x).strip().lower())]
+    )
+    bot_cfg = _load_riko_auto_yield_bot_config()
+    last_scanned_block = max(0, int(holder_cache.get("last_scanned_block") or 0))
+    if last_scanned_block <= 0:
+        last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
+    from_block = last_scanned_block + 1
+    if from_block > latest_block:
+        return {
+            "status": "ok",
+            "source": "cache",
+            "from_block": int(from_block),
+            "to_block": int(last_scanned_block),
+            "latest_block": int(latest_block),
+            "holders": int(len(cached_holders)),
+            "has_more": False,
+        }
+    scan_to_block = min(int(latest_block), int(from_block) + max(10, int(max_scan_blocks)) - 1)
+    discovered, source = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, scan_to_block)
+    if discovered:
+        cached_holders.update(discovered)
+    _riko_auto_yield_save_holder_cache(sorted(cached_holders), scan_to_block)
+    return {
+        "status": "ok",
+        "source": str(source or "rpc"),
+        "from_block": int(from_block),
+        "to_block": int(scan_to_block),
+        "latest_block": int(latest_block),
+        "holders": int(len(cached_holders)),
+        "has_more": bool(scan_to_block < latest_block),
+    }
+
+
+def _riko_holder_scan_bg_loop(interval_sec: int, max_scan_blocks: int) -> None:
+    # One immediate step at startup to warm cache.
+    try:
+        _riko_holder_scan_bg_step(max_scan_blocks=max_scan_blocks)
+    except Exception as e:
+        print(f"[riko-holder-scan-bg] startup step failed: {str(e)[:220]}")
+    while not RIKO_HOLDER_SCAN_BG_STOP.wait(interval_sec):
+        try:
+            _riko_holder_scan_bg_step(max_scan_blocks=max_scan_blocks)
+        except Exception as e:
+            print(f"[riko-holder-scan-bg] step failed: {str(e)[:220]}")
+
+
+def _start_riko_holder_scan_bg_job() -> None:
+    global RIKO_HOLDER_SCAN_BG_THREAD
+    if not bool(RIKO_HOLDER_SCAN_BG_ENABLED):
+        return
+    if RIKO_HOLDER_SCAN_BG_THREAD and RIKO_HOLDER_SCAN_BG_THREAD.is_alive():
+        return
+    RIKO_HOLDER_SCAN_BG_STOP.clear()
+    RIKO_HOLDER_SCAN_BG_THREAD = threading.Thread(
+        target=_riko_holder_scan_bg_loop,
+        args=(RIKO_HOLDER_SCAN_BG_INTERVAL_SEC, RIKO_HOLDER_SCAN_BG_MAX_BLOCKS),
+        daemon=True,
+        name="riko-holder-scan-bg",
+    )
+    RIKO_HOLDER_SCAN_BG_THREAD.start()
+
+
+def _stop_riko_holder_scan_bg_job() -> None:
+    RIKO_HOLDER_SCAN_BG_STOP.set()
+    t = RIKO_HOLDER_SCAN_BG_THREAD
+    if t and t.is_alive():
+        try:
+            t.join(timeout=2.0)
+        except Exception:
+            pass
 
 
 def _start_riko_auto_yield_job() -> None:
@@ -31776,6 +31870,13 @@ def _render_admin_page() -> str:
           <div id="adminRikoHoldersSummary">-</div>
           <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolders()">Refresh</button>
         </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;">
+          <label style="margin:0">Filter</label>
+          <label class="hint" style="display:flex;align-items:center;gap:8px;margin:0;">
+            <input id="adminRikoHoldersOnlyPositive" type="checkbox" onchange="loadAdminRikoHolders()" />
+            Only positive balance
+          </label>
+        </div>
         <div class="table-wrap" style="margin-top:8px">
           <table id="adminRikoHoldersTable" class="admin-history-table"></table>
         </div>
@@ -32473,18 +32574,21 @@ def _render_admin_page() -> str:
         rows.sort((a, b) => {{
           const ad = Number(a.date || 0);
           const bd = Number(b.date || 0);
-          if (ad !== bd) return ad - bd;
+          if (ad !== bd) return bd - ad;
           const ab = Number(a.blockNumber || 0);
           const bb = Number(b.blockNumber || 0);
-          if (ab !== bb) return ab - bb;
-          return Number(a.logIndex || 0) - Number(b.logIndex || 0);
+          if (ab !== bb) return bb - ab;
+          return Number(b.logIndex || 0) - Number(a.logIndex || 0);
         }});
+        const maxPendingRows = 800;
+        const pendingRowsTruncated = rows.length > maxPendingRows;
+        const rowsToRender = pendingRowsTruncated ? rows.slice(0, maxPendingRows) : rows;
         if (!rows.length) {{
           table.innerHTML = "<tr><td class='muted'>No active pending redemptions.</td></tr>";
         }} else {{
           table.innerHTML =
             "<tr><th style='text-align:left'>Date</th><th>Status</th><th>Account</th><th>Token</th><th>RIKO</th><th>Expected out</th><th>Diag</th><th></th></tr>" +
-            rows.map((r) => (
+            rowsToRender.map((r) => (
               (() => {{
                 const st = String(r.status || "active");
                 const active = st === "active";
@@ -32681,7 +32785,11 @@ def _render_admin_page() -> str:
         }} else {{
           setAdminRikoPendingOpsStatus(
             rows.length
-              ? `Pending queue loaded (scan window: ${{fromBlock}}..${{latest}}).`
+              ? (
+                pendingRowsTruncated
+                  ? `Pending queue loaded (showing ${{rowsToRender.length}} of ${{rows.length}} rows; scan window: ${{fromBlock}}..${{latest}}).`
+                  : `Pending queue loaded (scan window: ${{fromBlock}}..${{latest}}).`
+              )
               : `Pending queue is empty (scan window: ${{fromBlock}}..${{latest}}).`,
             false
           );
@@ -32698,6 +32806,7 @@ def _render_admin_page() -> str:
       const table = document.getElementById("adminRikoHoldersTable");
       const statusEl = document.getElementById("adminRikoHoldersStatus");
       const summaryEl = document.getElementById("adminRikoHoldersSummary");
+      const onlyPositiveEl = document.getElementById("adminRikoHoldersOnlyPositive");
       if (!table || !statusEl || !summaryEl) return;
       try {{
         statusEl.textContent = "Loading holders...";
@@ -32705,11 +32814,21 @@ def _render_admin_page() -> str:
         const r = await fetch("/api/admin/riko/holders?limit=1000");
         const data = await r.json();
         if (!r.ok) throw new Error(data?.detail || "Failed to load RIKO holders");
-        const rows = Array.isArray(data?.items) ? data.items : [];
+        const rowsAll = Array.isArray(data?.items) ? data.items : [];
+        const onlyPositive = !!onlyPositiveEl?.checked;
+        const rows = onlyPositive
+          ? rowsAll.filter((it) => {{
+              try {{
+                return BigInt(String(it?.balance_raw || "0")) > 0n;
+              }} catch (_) {{
+                return false;
+              }}
+            }})
+          : rowsAll;
         const decimals = Number(data?.riko_decimals || 6);
         const head = "<tr><th>Address</th><th>Balance</th><th>Last change date</th><th>Tx hash</th></tr>";
         if (!rows.length) {{
-          table.innerHTML = head + "<tr><td class='muted' colspan='4'>No holders found.</td></tr>";
+          table.innerHTML = head + `<tr><td class='muted' colspan='4'>${{onlyPositive ? "No positive-balance holders found." : "No holders found."}}</td></tr>`;
         }} else {{
           table.innerHTML = head + rows.map((it) => {{
             const addr = String(it?.address || "").trim().toLowerCase();
@@ -32718,7 +32837,7 @@ def _render_admin_page() -> str:
             const dateTxt = ts > 0 ? formatAdminRikoDate(ts) : "-";
             const txHash = String(it?.last_change_hash || "").trim().toLowerCase();
             const txUrl = String(it?.last_change_tx_url || "").trim();
-            const txHtml = /^0x[a-f0-9]{64}$/.test(txHash)
+            const txHtml = /^0x[a-f0-9]{{64}}$/.test(txHash)
               ? (txUrl ? `<a href="${{esc(txUrl)}}" target="_blank" rel="noopener">${{shortHexAdmin(txHash)}}</a>` : `<span class='mono'>${{shortHexAdmin(txHash)}}</span>`)
               : "-";
             return (
@@ -32732,8 +32851,8 @@ def _render_admin_page() -> str:
           }}).join("");
         }}
         summaryEl.textContent =
-          `holders=${{Number(data?.count || rows.length)}} | token=${{shortAddrAdmin(String(data?.riko_token || ""))}} | scan=${{Number(data?.holder_scan_start_block || 0)}}..${{Number(data?.holder_scan_latest_block || 0)}}`;
-        statusEl.textContent = `Loaded ${{rows.length}} holder rows.`;
+          `holders=${{rows.length}}/${{Number(data?.count || rowsAll.length)}} | token=${{shortAddrAdmin(String(data?.riko_token || ""))}} | scan=${{Number(data?.holder_scan_start_block || 0)}}..${{Number(data?.holder_scan_latest_block || 0)}}`;
+        statusEl.textContent = `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}.`;
       }} catch (e) {{
         table.innerHTML = "<tr><td class='muted'>Failed to load holders.</td></tr>";
         statusEl.textContent = "RIKO holders load failed: " + (e?.shortMessage || e?.message || "unknown");
