@@ -326,6 +326,7 @@ RIKO_HOLDER_SCAN_BG_INTERVAL_SEC = max(15, int(os.environ.get("RIKO_HOLDER_SCAN_
 RIKO_HOLDER_SCAN_BG_MAX_BLOCKS = max(10, int(os.environ.get("RIKO_HOLDER_SCAN_BG_MAX_BLOCKS", "240")))
 RIKO_AUTO_YIELD_STATE_KEY = "riko_auto_yield_state_v1"
 RIKO_AUTO_YIELD_HOLDER_CACHE_STATE_KEY = "riko_auto_yield_holder_cache_v1"
+RIKO_HOLDER_SCAN_BG_STATUS_STATE_KEY = "riko_holder_scan_bg_status_v1"
 RIKO_AUTO_YIELD_BOT_CONFIG_STATE_KEY = "riko_auto_yield_bot_config_v1"
 RIKO_AUTO_PAYOUT_SCHEDULE_CLAIM_KEY_PREFIX = "riko_auto_payout_claim_v1:"
 RIKO_PAYOUT_SCHEDULE_STATE_KEY = "riko_payout_schedule_v1"
@@ -22505,6 +22506,25 @@ def _riko_auto_yield_save_holder_cache(holders: list[str], last_scanned_block: i
     _analytics_set_state(RIKO_AUTO_YIELD_HOLDER_CACHE_STATE_KEY, json.dumps(payload, ensure_ascii=False))
 
 
+def _riko_holder_scan_bg_load_status() -> dict[str, Any]:
+    raw = _analytics_get_state(RIKO_HOLDER_SCAN_BG_STATUS_STATE_KEY)
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _riko_holder_scan_bg_save_status(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        return
+    safe = dict(payload)
+    safe["updated_at"] = str(safe.get("updated_at") or _iso_now())
+    _analytics_set_state(RIKO_HOLDER_SCAN_BG_STATUS_STATE_KEY, json.dumps(safe, ensure_ascii=False))
+
+
 def _riko_erc20_decimals(rpc_url: str, token_address: str) -> int:
     data = _eth_encode_call("decimals()")
     out = _eth_rpc(rpc_url, "eth_call", [{"to": token_address, "data": data}, "latest"])
@@ -23229,12 +23249,18 @@ def _riko_auto_yield_loop(interval_sec: int, run_on_startup: bool) -> None:
 
 
 def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
+    def _done(payload: dict[str, Any]) -> dict[str, Any]:
+        p = dict(payload or {})
+        p["updated_at"] = _iso_now()
+        _riko_holder_scan_bg_save_status(p)
+        return p
+
     riko_token = str(RIKO_VAULT_ADDRESS or "").strip().lower()
     if not _is_eth_address(riko_token):
-        return {"status": "skip", "reason": "riko_token_not_configured"}
+        return _done({"status": "skip", "reason": "riko_token_not_configured"})
     rpc_url = _riko_auto_yield_rpc_url_runtime()
     if not rpc_url:
-        return {"status": "skip", "reason": "rpc_missing"}
+        return _done({"status": "skip", "reason": "rpc_missing"})
     latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
     holder_cache = _riko_auto_yield_load_holder_cache()
     cached_holders = set(
@@ -23246,7 +23272,7 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
         last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
     from_block = last_scanned_block + 1
     if from_block > latest_block:
-        return {
+        return _done({
             "status": "ok",
             "source": "cache",
             "from_block": int(from_block),
@@ -23254,13 +23280,13 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
             "latest_block": int(latest_block),
             "holders": int(len(cached_holders)),
             "has_more": False,
-        }
+        })
     scan_to_block = min(int(latest_block), int(from_block) + max(10, int(max_scan_blocks)) - 1)
     discovered, source = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, scan_to_block)
     if discovered:
         cached_holders.update(discovered)
     _riko_auto_yield_save_holder_cache(sorted(cached_holders), scan_to_block)
-    return {
+    return _done({
         "status": "ok",
         "source": str(source or "rpc"),
         "from_block": int(from_block),
@@ -23268,7 +23294,7 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
         "latest_block": int(latest_block),
         "holders": int(len(cached_holders)),
         "has_more": bool(scan_to_block < latest_block),
-    }
+    })
 
 
 def _riko_holder_scan_bg_loop(interval_sec: int, max_scan_blocks: int) -> None:
@@ -24615,14 +24641,47 @@ def _render_riko_page() -> str:
     .riko-tx-history summary { cursor: pointer; color: #334155; font-size: 13px; font-weight: 600; }
     .riko-tx-history[open] summary { margin-bottom: 4px; }
     .riko-tx-inline-row { margin-top: 8px; display:flex; align-items:center; gap:6px; flex-wrap:nowrap; overflow-x:auto; }
-    .riko-tx-history-actions { margin-top: 0; display:flex; gap:6px; flex-wrap:nowrap; flex:0 0 auto; }
+    .riko-tx-history-row { margin-top: 8px; display:grid; gap:6px; align-items:start; }
+    .riko-tx-history-title { color:#334155; font-size:12px; font-weight:700; min-width:94px; flex:0 0 94px; }
+    .riko-tx-history-actions {
+      margin-top: 0;
+      display:flex;
+      gap:6px;
+      align-items:center;
+      flex-wrap:nowrap;
+      width:100%;
+      justify-content:flex-end;
+    }
+    .riko-tx-show-hidden { display:inline-flex; align-items:center; gap:4px; color:#475569; font-size:12px; user-select:none; }
+    .riko-tx-show-hidden input { margin:0; }
     .riko-tx-action-btn { padding:5px 10px; font-size:12px; border-radius:8px; }
-    .riko-tx-empty { margin-top: 0; flex:0 0 auto; }
-    .riko-tx-list { margin: 0; padding-left: 0; list-style: none; display: flex; gap: 8px; min-width:0; flex:1 1 auto; }
-    .riko-tx-list li { display:flex; align-items:center; gap:8px; min-width:0; white-space:nowrap; }
-    .riko-tx-time { color:#64748b; font-size:12px; font-variant-numeric: tabular-nums; width:64px; flex:0 0 64px; }
-    .riko-tx-main { min-width:0; overflow:hidden; text-overflow:ellipsis; }
-    .riko-tx-meta { color:#64748b; font-size:12px; flex:0 0 auto; }
+    .riko-tx-empty { margin-top: 0; }
+    .riko-tx-list { margin: 0; padding-left: 0; list-style: none; display: grid; gap: 6px; min-width:0; }
+    .riko-tx-list li { display:grid; grid-template-columns: 170px minmax(160px, auto) 1fr auto; align-items:center; gap:8px; min-width:0; }
+    .riko-tx-time { color:#64748b; font-size:13px; font-variant-numeric: tabular-nums; white-space:nowrap; }
+    .riko-tx-main { min-width:0; overflow:hidden; text-overflow:ellipsis; font-size:13px; color:#0f172a; display:flex; align-items:center; gap:8px; white-space:nowrap; }
+    .riko-tx-meta { color:#64748b; font-size:13px; flex:0 0 auto; }
+    .riko-tx-label { font-weight:600; color:#1f2937; }
+    .riko-tx-tools { display:inline-flex; gap:4px; align-items:center; }
+    .riko-tx-visibility { display:inline-flex; align-items:center; gap:4px; color:#475569; font-size:12px; user-select:none; white-space:nowrap; }
+    .riko-tx-visibility input { margin:0; }
+    .riko-tx-tool-btn {
+      border:1px solid #cbd5e1;
+      border-radius:7px;
+      background:#ffffff;
+      color:#1d4ed8;
+      font-size:12px;
+      line-height:1;
+      padding:4px 6px;
+      cursor:pointer;
+      text-decoration:none;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      min-width:24px;
+      min-height:22px;
+    }
+    .riko-tx-tool-btn:hover { background:#eff6ff; border-color:#93c5fd; }
     .riko-tx-list a { color: #1d4ed8; text-decoration: underline; }
     .badge-wrap { display:flex; gap:6px; flex-wrap:wrap; }
     .badge {
@@ -24715,6 +24774,8 @@ def _render_riko_page() -> str:
       .riko-list-row { grid-template-columns: 1fr; }
       .riko-token-select-wrap { grid-template-columns: 1fr; }
       .riko-amount-wrap { grid-template-columns: 1fr; }
+      .riko-tx-list li { grid-template-columns: 1fr; gap:4px; align-items:start; }
+      .riko-tx-main { white-space:normal; }
     }
     """
     extra_html = """
@@ -24766,13 +24827,23 @@ def _render_riko_page() -> str:
       <div class="riko-status-link" id="rikoStatusTxLink"></div>
       <details class="riko-tx-history">
         <summary>Transaction history</summary>
-        <div class="riko-tx-inline-row">
+        <div class="riko-tx-history-row">
+          <div class="riko-tx-history-title">Redeem history</div>
           <div class="riko-tx-history-actions" id="rikoTxHistoryActions">
+            <label class="riko-tx-show-hidden" title="Show hidden rows in history">
+              <input id="rikoTxShowHidden" type="checkbox" onchange="setRikoTxShowHidden(this.checked)" />
+              Show hidden
+            </label>
             <button class="btn riko-tx-action-btn" type="button" onclick="rikoCheckPendingRedeem()">Check</button>
             <button class="btn riko-tx-action-btn" type="button" onclick="rikoCancelPendingRedeem()">Cancel</button>
           </div>
-          <div class="muted riko-tx-empty" id="rikoTxHistoryEmpty">No transactions yet.</div>
-          <ul class="riko-tx-list" id="rikoTxHistory"></ul>
+          <div class="muted riko-tx-empty" id="rikoTxHistoryEmptyRedeem">No redeem transactions yet.</div>
+          <ul class="riko-tx-list" id="rikoTxHistoryRedeem"></ul>
+        </div>
+        <div class="riko-tx-history-row">
+          <div class="riko-tx-history-title">Deposit history</div>
+          <div class="muted riko-tx-empty" id="rikoTxHistoryEmptyDeposit">No deposit transactions yet.</div>
+          <ul class="riko-tx-list" id="rikoTxHistoryDeposit"></ul>
         </div>
       </details>
     </section>
@@ -24791,6 +24862,7 @@ def _render_riko_page() -> str:
     let rikoWalletRikoBalanceRaw = 0n;
     let rikoWalletRikoBalanceFormatted = "0";
     let rikoTxHistory = [];
+    let rikoShowHiddenTxRows = false;
     let rikoLastCapLoadTs = 0;
 
     function setRikoStatus(msg, isErr, keepTxLink) {
@@ -24844,17 +24916,39 @@ def _render_riko_page() -> str:
       if (!/^0x[a-fA-F0-9]{64}$/.test(s)) return s;
       return `${s.slice(0, 10)}...${s.slice(-8)}`;
     }
+    async function copyTxHashRiko(value) {
+      const txt = String(value || "").trim();
+      if (!txt) return;
+      try {
+        await navigator.clipboard.writeText(txt);
+        setRikoStatus("Tx hash copied.", false);
+      } catch (_) {
+        setRikoStatus("Failed to copy tx hash.", true);
+      }
+    }
     function formatTxTimeDisplay(raw) {
       const s = String(raw || "").trim();
-      if (!s) return "--:--:--";
+      if (!s) return "--.--.---- --:--:--";
       try {
         const d = new Date(s);
         if (!Number.isNaN(d.getTime())) {
-          return d.toLocaleTimeString([], { hour12: false });
+          const pad = (n) => String(Number(n || 0)).padStart(2, "0");
+          const dd = pad(d.getDate());
+          const mm = pad(d.getMonth() + 1);
+          const yyyy = String(d.getFullYear());
+          const hh = pad(d.getHours());
+          const mi = pad(d.getMinutes());
+          const ss = pad(d.getSeconds());
+          return `${dd}.${mm}.${yyyy} ${hh}:${mi}:${ss}`;
         }
       } catch (_) {}
-      if (/^\d{2}:\d{2}:\d{2}/.test(s)) return s.slice(0, 8);
-      return s.slice(0, 8);
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(s)) {
+        const core = s.slice(0, 19);
+        const [dPart, tPart] = core.split("T");
+        const [yy, mo, da] = String(dPart || "").split("-");
+        if (yy && mo && da && tPart) return `${da}.${mo}.${yy} ${tPart}`;
+      }
+      return s;
     }
     function explorerTxBaseForChain(chainId) {
       const n = Number(chainId || 0);
@@ -24898,40 +24992,97 @@ def _render_riko_page() -> str:
       }
     }
     function renderRikoTxHistory() {
-      const listEl = document.getElementById("rikoTxHistory");
-      const emptyEl = document.getElementById("rikoTxHistoryEmpty");
+      const redeemListEl = document.getElementById("rikoTxHistoryRedeem");
+      const redeemEmptyEl = document.getElementById("rikoTxHistoryEmptyRedeem");
+      const depositListEl = document.getElementById("rikoTxHistoryDeposit");
+      const depositEmptyEl = document.getElementById("rikoTxHistoryEmptyDeposit");
       const actionsEl = document.getElementById("rikoTxHistoryActions");
-      if (!listEl || !emptyEl) return;
+      const showHiddenEl = document.getElementById("rikoTxShowHidden");
+      if (!redeemListEl || !redeemEmptyEl || !depositListEl || !depositEmptyEl) return;
+      if (showHiddenEl) showHiddenEl.checked = !!rikoShowHiddenTxRows;
       if (!Array.isArray(rikoTxHistory) || !rikoTxHistory.length) {
-        listEl.innerHTML = "";
-        emptyEl.style.display = "";
+        redeemListEl.innerHTML = "";
+        depositListEl.innerHTML = "";
+        redeemEmptyEl.style.display = "";
+        depositEmptyEl.style.display = "";
         if (actionsEl) actionsEl.style.display = "none";
         return;
       }
-      emptyEl.style.display = "none";
-      if (actionsEl) actionsEl.style.display = "flex";
-      listEl.innerHTML = rikoTxHistory.map((item) => {
-        const action = String(item?.action || "tx");
+      const humanAction = (raw) => {
+        const a = String(raw || "").trim().toLowerCase();
+        if (a === "deposit") return "Deposit";
+        if (a === "redeem") return "Redeem";
+        if (a.includes("redeem queued")) return "Redeem (queued)";
+        if (a.includes("cancel pending redeem")) return "Cancel redeem";
+        if (a.includes("wrap eth->weth")) return "Wrap ETH to WETH";
+        if (a.includes("unwrap weth->eth")) return "Unwrap WETH to ETH";
+        if (a === "withdraw") return "Withdraw";
+        if (a) return a.replace(/[_-]+/g, " ").replace(/\s+/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
+        return "Transaction";
+      };
+      const renderTxTools = (hash, url) => {
+        const h = String(hash || "").trim();
+        if (!/^0x[a-fA-F0-9]{64}$/.test(h)) return "<span class='muted'>-</span>";
+        const safeHash = esc(h).replace(/'/g, "\\'");
+        const openBtn = url
+          ? `<a class="riko-tx-tool-btn" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Open in Etherscan">↗</a>`
+          : `<button type="button" class="riko-tx-tool-btn" title="No explorer link" disabled>↗</button>`;
+        const copyBtn = `<button type="button" class="riko-tx-tool-btn" title="Copy tx hash" onclick="copyTxHashRiko('${safeHash}')">⧉</button>`;
+        return `<span class="riko-tx-tools">${openBtn}${copyBtn}</span>`;
+      };
+      const chainId = Number(authState?.chain_id || 11155111);
+      const addr = resolveHistoryAddress();
+      const hiddenRows = loadHiddenRikoTxRows(addr, chainId);
+      const renderRows = (items) => (Array.isArray(items) ? items : []).map((item) => {
+        const action = humanAction(String(item?.action || "tx"));
         const hash = String(item?.hash || "");
         const when = String(item?.when || item?.time_iso || "");
         const url = String(item?.url || "");
         const role = String(item?.contract_role || "");
         const failed = !!item?.is_error;
-        const hashHtml = url
-          ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${shortTxHash(hash)}</a>`
-          : shortTxHash(hash);
+        const txTools = renderTxTools(hash, url);
         const bits = [];
-        if (role && role !== "other" && role !== "local") bits.push(role);
+        if (role && role !== "other" && role !== "local" && role !== "wrapped_native") bits.push(role.replace(/[_-]+/g, " "));
         if (failed) bits.push("failed");
         const meta = bits.join(", ");
+        const rowKey = buildRikoTxRowKey(item);
+        const safeRowKey = esc(rowKey).replace(/'/g, "\\'");
+        const isVisible = !(rowKey && hiddenRows.has(rowKey));
+        const visCtrl = rowKey
+          ? `<label class="riko-tx-visibility" title="Toggle row visibility"><input type="checkbox" ${isVisible ? "checked" : ""} onchange="toggleRikoTxRowVisibility('${safeRowKey}', this.checked)" />Visible</label>`
+          : "";
         return (
           `<li>` +
           `<span class="riko-tx-time">${formatTxTimeDisplay(when)}</span>` +
-          `<span class="riko-tx-main">${action}: ${hashHtml}</span>` +
-          `<span class="riko-tx-meta">${meta}</span>` +
+          `<span class="riko-tx-main"><span class="riko-tx-label">${action}</span>${txTools}</span>` +
+          `<span class="riko-tx-meta">${meta || ""}</span>` +
+          `<span>${visCtrl}</span>` +
           `</li>`
         );
       }).join("");
+      const isRedeemAction = (item) => {
+        const a = String(item?.action || "").trim().toLowerCase();
+        return (
+          a.includes("redeem")
+          || a.includes("withdraw")
+          || a.includes("cancel pending redeem")
+          || a.includes("unwrap weth->eth")
+        );
+      };
+      const allRows = Array.isArray(rikoTxHistory) ? rikoTxHistory : [];
+      const visibleRows = allRows.filter((row) => {
+        const key = buildRikoTxRowKey(row);
+        if (!key) return true;
+        return rikoShowHiddenTxRows ? true : !hiddenRows.has(key);
+      });
+      const redeemRows = visibleRows.filter((row) => isRedeemAction(row));
+      const depositRows = visibleRows.filter((row) => !isRedeemAction(row));
+      const hasAnyRedeemRows = allRows.some((row) => isRedeemAction(row));
+      redeemListEl.innerHTML = renderRows(redeemRows);
+      depositListEl.innerHTML = renderRows(depositRows);
+      redeemEmptyEl.style.display = redeemRows.length ? "none" : "";
+      depositEmptyEl.style.display = depositRows.length ? "none" : "";
+      if (actionsEl) actionsEl.style.display = hasAnyRedeemRows ? "flex" : "none";
     }
     function resolveHistoryAddress() {
       let wallet = String(authState?.address || "").trim().toLowerCase();
@@ -24946,6 +25097,52 @@ def _render_riko_page() -> str:
       const a = String(addr || "").trim().toLowerCase();
       const c = Number(chainId || 0);
       return `rikoTxHistory:${c}:${a}`;
+    }
+    function hiddenHistoryStorageKey(addr, chainId) {
+      const a = String(addr || "").trim().toLowerCase();
+      const c = Number(chainId || 0);
+      return `rikoTxHistoryHidden:${c}:${a}`;
+    }
+    function buildRikoTxRowKey(item) {
+      const hash = String(item?.hash || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{64}$/.test(hash)) return "";
+      const action = String(item?.action || "").trim().toLowerCase();
+      const when = String(item?.time_iso || item?.when || "").trim();
+      return `${hash}|${action}|${when}`;
+    }
+    function loadHiddenRikoTxRows(addr, chainId) {
+      const a = String(addr || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{40}$/.test(a)) return new Set();
+      try {
+        const raw = localStorage.getItem(hiddenHistoryStorageKey(a, chainId));
+        const arr = JSON.parse(String(raw || "[]"));
+        if (!Array.isArray(arr)) return new Set();
+        return new Set(arr.map((x) => String(x || "")));
+      } catch (_) {
+        return new Set();
+      }
+    }
+    function saveHiddenRikoTxRows(addr, chainId, keySet) {
+      const a = String(addr || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{40}$/.test(a)) return;
+      try {
+        localStorage.setItem(hiddenHistoryStorageKey(a, chainId), JSON.stringify(Array.from(keySet || [])));
+      } catch (_) {}
+    }
+    function setRikoTxShowHidden(next) {
+      rikoShowHiddenTxRows = !!next;
+      renderRikoTxHistory();
+    }
+    function toggleRikoTxRowVisibility(rowKey, isVisible) {
+      const key = String(rowKey || "").trim();
+      if (!key) return;
+      const chainId = Number(authState?.chain_id || 11155111);
+      const addr = resolveHistoryAddress();
+      const hidden = loadHiddenRikoTxRows(addr, chainId);
+      if (isVisible) hidden.delete(key);
+      else hidden.add(key);
+      saveHiddenRikoTxRows(addr, chainId, hidden);
+      renderRikoTxHistory();
     }
     function loadLocalRikoTxHistory(addr, chainId) {
       const a = String(addr || "").trim().toLowerCase();
@@ -31666,7 +31863,7 @@ def _render_admin_page() -> str:
       flex-direction: column;
     }}
     #adminRikoPayoutStatus {{ margin-left: 0; }}
-    #adminRikoPayoutPreviewStatus,
+    #adminRikoHolderScanStatus,
     #adminRikoPayoutStatus {{
       display: block;
     }}
@@ -31794,14 +31991,11 @@ def _render_admin_page() -> str:
         </div>
         <div class="row"><label>Last schedule update</label><div id="adminRikoPayoutUpdatedAt">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Preview payout</label>
-          <div id="adminRikoPayoutPreviewSummary">-</div>
-          <button type="button" class="btn btn-soft" onclick="loadAdminRikoPayoutPreview()">Refresh preview</button>
+          <label style="margin:0">Holder scan</label>
+          <div id="adminRikoHolderScanSummary">-</div>
+          <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolderScanStatus()">Refresh scan</button>
         </div>
-        <div class="table-wrap" style="margin-top:6px">
-          <table id="adminRikoPayoutPreviewTable" class="admin-history-table"></table>
-        </div>
-        <span id="adminRikoPayoutPreviewStatus" class="status">Ready</span>
+        <span id="adminRikoHolderScanStatus" class="status">Ready</span>
         <span id="adminRikoPayoutStatus" class="status">Ready</span>
       </section>
       <div class="admin-riko-signers-grid">
@@ -31868,14 +32062,13 @@ def _render_admin_page() -> str:
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Snapshot</label>
           <div id="adminRikoHoldersSummary">-</div>
-          <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolders()">Refresh</button>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;">
-          <label style="margin:0">Filter</label>
-          <label class="hint" style="display:flex;align-items:center;gap:8px;margin:0;">
-            <input id="adminRikoHoldersOnlyPositive" type="checkbox" onchange="loadAdminRikoHolders()" />
-            Only positive balance
-          </label>
+          <div style="display:flex;align-items:center;gap:10px;justify-content:flex-end;white-space:nowrap;">
+            <label class="hint" style="display:flex;align-items:center;gap:8px;margin:0;">
+              <input id="adminRikoHoldersOnlyPositive" type="checkbox" onchange="loadAdminRikoHolders()" />
+              Only positive balance
+            </label>
+            <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolders()">Refresh</button>
+          </div>
         </div>
         <div class="table-wrap" style="margin-top:8px">
           <table id="adminRikoHoldersTable" class="admin-history-table"></table>
@@ -34336,90 +34529,48 @@ def _render_admin_page() -> str:
       el.textContent = msg || "";
       el.classList.toggle("err", !!isErr);
     }}
-    function setAdminRikoPayoutPreviewStatus(msg, isErr) {{
-      const el = document.getElementById("adminRikoPayoutPreviewStatus");
+    function setAdminRikoHolderScanStatus(msg, isErr) {{
+      const el = document.getElementById("adminRikoHolderScanStatus");
       if (!el) return;
       el.textContent = String(msg || "");
       el.classList.toggle("err", !!isErr);
     }}
-    function formatAdminRikoPayoutPreviewDebug(data) {{
-      const label = String(data?.rpc_url_label || "").trim();
-      const keyPresent = !!data?.rpc_key_present;
-      const source = String(data?.holder_scan_source || "").trim();
-      const fromBlock = Number(data?.holder_scan_from_block || 0);
-      const toBlock = Number(data?.holder_scan_to_block || 0);
-      const latest = Number(data?.holder_scan_latest_block || 0);
-      const hasMore = !!data?.holder_scan_has_more;
-      const parts = [];
-      if (label || keyPresent) parts.push(`rpc=${{label || "missing"}}; key=${{keyPresent ? "present" : "missing"}}`);
-      if (source) parts.push(`source=${{source}}`);
-      if (toBlock > 0 || latest > 0) parts.push(`scan=${{fromBlock}}..${{toBlock}}/${{latest}}${{hasMore ? " (more)" : ""}}`);
-      if (!parts.length) return "";
-      return ` [${{parts.join("; ")}}]`;
-    }}
-    function renderAdminRikoPayoutPreview(data) {{
-      const summaryEl = document.getElementById("adminRikoPayoutPreviewSummary");
-      const table = document.getElementById("adminRikoPayoutPreviewTable");
-      if (!summaryEl || !table) return;
-      const status = String(data?.status || "unknown");
-      const debugSuffix = formatAdminRikoPayoutPreviewDebug(data);
-      if (status !== "ok") {{
-        summaryEl.textContent = status === "skip"
-          ? `Preview skipped: ${{String(data?.reason || "unknown")}}${{debugSuffix}}`
-          : `Preview unavailable: ${{String(data?.reason || "unknown")}}${{debugSuffix}}`;
-        table.innerHTML = "<tr><td class='muted'>No preview rows.</td></tr>";
-        return;
-      }}
-      const bps = Number(data?.next_bps || data?.bounded_bps || 0);
-      const holders = Number(data?.holders_positive || 0);
-      const payoutCount = Number(data?.payout_count || 0);
-      const payoutDecimals = Number(data?.payout_decimals || 18);
-      const rikoDecimals = Number(data?.riko_decimals || 6);
-      const totalRaw = String(data?.total_payout_raw || "0");
-      const availableRaw = String(data?.available_raw || "0");
-      const canPay = !!data?.can_pay;
-      const source = String(data?.holder_scan_source || "unknown").trim();
-      const scanFrom = Number(data?.holder_scan_from_block || 0);
-      const scanTo = Number(data?.holder_scan_to_block || 0);
-      const scanLatest = Number(data?.holder_scan_latest_block || 0);
-      const scanTail = scanTo > 0 || scanLatest > 0
-        ? ` | scan=${{scanFrom}}..${{scanTo}}/${{scanLatest}}${{data?.holder_scan_has_more ? " (more)" : ""}}`
-        : "";
+    function renderAdminRikoHolderScanStatus(data) {{
+      const summaryEl = document.getElementById("adminRikoHolderScanSummary");
+      if (!summaryEl) return;
+      const enabled = !!data?.enabled;
+      const running = !!data?.running;
+      const status = String(data?.status || "").trim() || "unknown";
+      const reason = String(data?.reason || "").trim();
+      const source = String(data?.source || "").trim() || "-";
+      const updatedAt = String(data?.updated_at || "").trim() || "-";
+      const holders = Number(data?.holders ?? data?.cache_holders ?? 0);
+      const fromBlock = Number(data?.from_block || 0);
+      const toBlock = Number(data?.to_block || data?.cache_last_scanned_block || 0);
+      const latest = Number(data?.latest_block || 0);
+      const lagBlocks = Number(data?.lag_blocks || 0);
+      const hasMore = !!data?.has_more;
+      const healthy = !!data?.healthy;
       summaryEl.textContent =
-        `bps=${{bps}} | holders=${{holders}} | payouts=${{payoutCount}} | total=${{formatAdminRawUnits(totalRaw, payoutDecimals, 8)}} | wallet=${{formatAdminRawUnits(availableRaw, payoutDecimals, 8)}} | ${{canPay ? "funded" : "insufficient"}} | source=${{source}}${{scanTail}}`;
-      const top = Array.isArray(data?.top_recipients) ? data.top_recipients : [];
-      if (!top.length) {{
-        table.innerHTML = "<tr><th>Top-10 recipient preview</th></tr><tr><td class='muted'>No positive payouts.</td></tr>";
-        return;
+        `enabled=${{enabled ? "yes" : "no"}} | running=${{running ? "yes" : "no"}} | healthy=${{healthy ? "yes" : "no"}} | status=${{status}}${{reason ? " (" + reason + ")" : ""}} | source=${{source}} | holders=${{holders}} | scan=${{fromBlock}}..${{toBlock}}/${{latest}}${{hasMore ? " (more)" : ""}} | lag=${{lagBlocks}} blocks | updated=${{updatedAt}}`;
+    }}
+    async function loadAdminRikoHolderScanStatus() {{
+      try {{
+        setAdminRikoHolderScanStatus("Loading scan status...", false);
+        const r = await fetch("/api/admin/riko/holder-scan-status");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data?.detail || "Failed to load holder scan status.");
+        renderAdminRikoHolderScanStatus(data || {{}});
+        const healthy = !!data?.healthy;
+        const st = String(data?.status || "unknown");
+        setAdminRikoHolderScanStatus(`Scan status updated: ${{st}}${{healthy ? "" : " (check status)"}}`, !healthy);
+      }} catch (e) {{
+        setAdminRikoHolderScanStatus("Scan status load failed: " + (e?.message || "unknown"), true);
       }}
-      let html = "<tr><th>Address</th><th>RIKO balance</th><th>Payout</th></tr>";
-      for (const row of top) {{
-        const addr = String(row?.address || "");
-        const rikoBalRaw = String(row?.riko_balance_raw || "0");
-        const payoutRaw = String(row?.payout_raw || "0");
-        html += "<tr>" +
-          `<td class='mono'>${{shortAddrAdmin(addr)}}</td>` +
-          `<td class='mono'>${{formatAdminRawUnits(rikoBalRaw, rikoDecimals, 6)}}</td>` +
-          `<td class='mono'>${{formatAdminRawUnits(payoutRaw, payoutDecimals, 8)}}</td>` +
-          "</tr>";
-      }}
-      table.innerHTML = html;
     }}
     async function loadAdminRikoPayoutPreview() {{
-      try {{
-        setAdminRikoPayoutPreviewStatus("Loading preview...", false);
-        const r = await fetch("/api/admin/riko/auto-payout-preview");
-        const data = await r.json();
-        if (!r.ok) throw new Error(data?.detail || "Failed to load payout preview.");
-        renderAdminRikoPayoutPreview(data || {{}});
-        if (String(data?.status || "") === "ok") {{
-          setAdminRikoPayoutPreviewStatus("Preview updated.", false);
-        }} else {{
-          setAdminRikoPayoutPreviewStatus(`Preview status: ${{String(data?.status || "unknown")}} / ${{String(data?.reason || "-")}}${{formatAdminRikoPayoutPreviewDebug(data)}}`, true);
-        }}
-      }} catch (e) {{
-        setAdminRikoPayoutPreviewStatus("Preview load failed: " + (e?.message || "unknown"), true);
-      }}
+      // Backward-compatible alias for old calls in startup/update flows.
+      await loadAdminRikoHolderScanStatus();
     }}
     function setAdminRikoPayoutTimePreset(hhmm) {{
       const inTime = document.getElementById("adminRikoPayoutTimeUtcInput");
@@ -36130,6 +36281,44 @@ def admin_riko_holders(request: Request, response: Response) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to load RIKO holders: {e}") from e
+
+
+@app.get("/api/admin/riko/holder-scan-status")
+def admin_riko_holder_scan_status(request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    status = _riko_holder_scan_bg_load_status()
+    holder_cache = _riko_auto_yield_load_holder_cache()
+    out = {
+        "ok": True,
+        "enabled": bool(RIKO_HOLDER_SCAN_BG_ENABLED),
+        "running": bool(RIKO_HOLDER_SCAN_BG_THREAD and RIKO_HOLDER_SCAN_BG_THREAD.is_alive()),
+        "interval_sec": int(RIKO_HOLDER_SCAN_BG_INTERVAL_SEC),
+        "max_blocks_per_step": int(RIKO_HOLDER_SCAN_BG_MAX_BLOCKS),
+        "cache_holders": int(len(holder_cache.get("holders") or [])),
+        "cache_last_scanned_block": int(holder_cache.get("last_scanned_block") or 0),
+    }
+    if isinstance(status, dict):
+        out.update(
+            {
+                "status": str(status.get("status") or ""),
+                "reason": str(status.get("reason") or ""),
+                "source": str(status.get("source") or ""),
+                "from_block": int(status.get("from_block") or 0),
+                "to_block": int(status.get("to_block") or 0),
+                "latest_block": int(status.get("latest_block") or 0),
+                "holders": int(status.get("holders") or 0),
+                "has_more": bool(status.get("has_more")),
+                "updated_at": str(status.get("updated_at") or ""),
+            }
+        )
+    latest = int(out.get("latest_block") or 0)
+    to_block = int(out.get("to_block") or 0)
+    out["lag_blocks"] = max(0, latest - to_block) if latest > 0 and to_block > 0 else 0
+    out["healthy"] = bool(
+        str(out.get("status") or "").lower() in {"ok", ""}
+        and (not bool(out.get("enabled")) or bool(out.get("running")))
+    )
+    return out
 
 
 @app.get("/api/admin/riko/auto-payout-preview")
