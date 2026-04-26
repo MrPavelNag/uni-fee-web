@@ -24826,9 +24826,8 @@ def _render_riko_page() -> str:
       <div class="riko-status" id="rikoStatus"></div>
       <div class="riko-status-link" id="rikoStatusTxLink"></div>
       <details class="riko-tx-history">
-        <summary>Transaction history</summary>
+        <summary>Redeem history</summary>
         <div class="riko-tx-history-row">
-          <div class="riko-tx-history-title">Redeem history</div>
           <div class="riko-tx-history-actions" id="rikoTxHistoryActions">
             <label class="riko-tx-show-hidden" title="Show hidden rows in history">
               <input id="rikoTxShowHidden" type="checkbox" onchange="setRikoTxShowHidden(this.checked)" />
@@ -24840,8 +24839,10 @@ def _render_riko_page() -> str:
           <div class="muted riko-tx-empty" id="rikoTxHistoryEmptyRedeem">No redeem transactions yet.</div>
           <ul class="riko-tx-list" id="rikoTxHistoryRedeem"></ul>
         </div>
+      </details>
+      <details class="riko-tx-history">
+        <summary>Deposit history</summary>
         <div class="riko-tx-history-row">
-          <div class="riko-tx-history-title">Deposit history</div>
           <div class="muted riko-tx-empty" id="rikoTxHistoryEmptyDeposit">No deposit transactions yet.</div>
           <ul class="riko-tx-list" id="rikoTxHistoryDeposit"></ul>
         </div>
@@ -24864,6 +24865,14 @@ def _render_riko_page() -> str:
     let rikoTxHistory = [];
     let rikoShowHiddenTxRows = false;
     let rikoLastCapLoadTs = 0;
+    function esc(v) {
+      return String(v == null ? "" : v)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
 
     function setRikoStatus(msg, isErr, keepTxLink) {
       const el = document.getElementById("rikoStatus");
@@ -25023,9 +25032,14 @@ def _render_riko_page() -> str:
       const renderTxTools = (hash, url) => {
         const h = String(hash || "").trim();
         if (!/^0x[a-fA-F0-9]{64}$/.test(h)) return "<span class='muted'>-</span>";
-        const safeHash = esc(h).replace(/'/g, "\\'");
+        const safeHash = h.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        const safeUrl = String(url || "")
+          .replace(/&/g, "&amp;")
+          .replace(/"/g, "&quot;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
         const openBtn = url
-          ? `<a class="riko-tx-tool-btn" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Open in Etherscan">↗</a>`
+          ? `<a class="riko-tx-tool-btn" href="${safeUrl}" target="_blank" rel="noopener noreferrer" title="Open in Etherscan">↗</a>`
           : `<button type="button" class="riko-tx-tool-btn" title="No explorer link" disabled>↗</button>`;
         const copyBtn = `<button type="button" class="riko-tx-tool-btn" title="Copy tx hash" onclick="copyTxHashRiko('${safeHash}')">⧉</button>`;
         return `<span class="riko-tx-tools">${openBtn}${copyBtn}</span>`;
@@ -25046,7 +25060,7 @@ def _render_riko_page() -> str:
         if (failed) bits.push("failed");
         const meta = bits.join(", ");
         const rowKey = buildRikoTxRowKey(item);
-        const safeRowKey = esc(rowKey).replace(/'/g, "\\'");
+        const safeRowKey = String(rowKey || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
         const isVisible = !(rowKey && hiddenRows.has(rowKey));
         const visCtrl = rowKey
           ? `<label class="riko-tx-visibility" title="Toggle row visibility"><input type="checkbox" ${isVisible ? "checked" : ""} onchange="toggleRikoTxRowVisibility('${safeRowKey}', this.checked)" />Visible</label>`
