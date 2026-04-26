@@ -251,6 +251,7 @@ AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 AUTH_LOCK = threading.Lock()
 RIKO_APPLY_SIGN_TTL_SEC = int(os.environ.get("RIKO_APPLY_SIGN_TTL_SEC", "600"))
 RIKO_APPLY_NONCES: dict[str, dict[str, Any]] = {}
+RIKO_AUTO_PAYOUT_APPLY_NONCES: dict[str, dict[str, Any]] = {}
 RIKO_VAULT_ADDRESS = os.environ.get("RIKO_VAULT_ADDRESS", "").strip()
 TREASURY_YIELD_CACHE_TTL_SEC = max(300, int(os.environ.get("TREASURY_YIELD_CACHE_TTL_SEC", "21600")))
 TREASURY_YIELD_CACHE: dict[str, Any] = {}
@@ -276,6 +277,7 @@ RIKO_AUTO_YIELD_BOT_CONFIG_STATE_KEY = "riko_auto_yield_bot_config_v1"
 RIKO_AUTO_PAYOUT_SCHEDULE_CLAIM_KEY_PREFIX = "riko_auto_payout_claim_v1:"
 RIKO_PAYOUT_SCHEDULE_STATE_KEY = "riko_payout_schedule_v1"
 RIKO_AUTO_YIELD_CONTROL_STATE_KEY = "riko_auto_yield_control_v1"
+RIKO_CUSTODY_ALLOWANCE_PRESETS_STATE_KEY = "riko_custody_allowance_presets_v1"
 RIKO_AUTO_YIELD_STOP = threading.Event()
 RIKO_AUTO_YIELD_THREAD: threading.Thread | None = None
 RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS: set[str] = set()
@@ -21568,6 +21570,50 @@ def _riko_apply_message(
     )
 
 
+def _riko_auto_payout_apply_digest(
+    *,
+    payout_token_address: str,
+    holder_scan_start_block: int,
+    items: list[dict[str, int]],
+    payout_time_utc: str,
+) -> str:
+    clean_items: list[dict[str, int]] = []
+    for raw in (items or []):
+        month = int(raw.get("month") or 0)
+        day = int(raw.get("day") or 0)
+        clean_items.append({"month": month, "day": day})
+    clean_items.sort(key=lambda it: (int(it.get("month") or 0), int(it.get("day") or 0)))
+    payload = {
+        "payout_token_address": str(payout_token_address or "").strip().lower(),
+        "holder_scan_start_block": max(0, int(holder_scan_start_block or 0)),
+        "items": clean_items,
+        "payout_time_utc": str(payout_time_utc or "").strip(),
+    }
+    blob = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _riko_auto_payout_apply_message(
+    *,
+    domain: str,
+    uri: str,
+    address: str,
+    nonce: str,
+    payload_hash: str,
+    issued_at: str,
+) -> str:
+    return (
+        f"{domain} wants you to sign an admin action with your Ethereum account:\n"
+        f"{address}\n\n"
+        "Confirm apply of RIKO auto-payout configuration and schedule.\n\n"
+        f"URI: {uri}\n"
+        "Version: 1\n"
+        f"Nonce: {nonce}\n"
+        f"Payload Hash: {payload_hash}\n"
+        f"Issued At: {issued_at}"
+    )
+
+
 def _fetch_us_treasury_daily_10y() -> dict[str, Any]:
     now_ts = float(time.time())
     with TREASURY_YIELD_CACHE_LOCK:
@@ -21743,6 +21789,93 @@ def _riko_active_whitelist_erc20_addresses() -> set[str]:
         if _is_eth_address(addr):
             out.add(addr)
     return out
+
+
+def _normalize_riko_custody_allowance_text(raw: Any) -> str:
+    txt = str(raw or "").strip()
+    if not txt:
+        return ""
+    if txt.lower() in {"max", "unlimited", "infinite"}:
+        return "max"
+    if not re.fullmatch(r"\d+(?:\.\d{1,36})?", txt):
+        raise ValueError("allowance must be a positive decimal number or 'max'")
+    try:
+        if Decimal(txt) <= 0:
+            raise ValueError("allowance must be > 0")
+    except Exception as e:
+        raise ValueError(f"allowance parse failed: {e}") from e
+    return txt
+
+
+def _load_riko_custody_allowance_presets() -> dict[str, Any]:
+    saved_map: dict[str, str] = {}
+    updated_at = ""
+    raw = _analytics_get_state(RIKO_CUSTODY_ALLOWANCE_PRESETS_STATE_KEY)
+    if raw:
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                updated_at = str(payload.get("updated_at") or "")
+                saved_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+                for it in saved_items:
+                    if not isinstance(it, dict):
+                        continue
+                    addr = str(it.get("address") or "").strip().lower()
+                    if not _is_eth_address(addr):
+                        continue
+                    try:
+                        saved_map[addr] = _normalize_riko_custody_allowance_text(it.get("allowance"))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    active_items = _validate_riko_whitelist_items(_load_riko_whitelist_items()).get("items")
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    if isinstance(active_items, list):
+        for raw_it in active_items:
+            if not isinstance(raw_it, dict):
+                continue
+            symbol = str(raw_it.get("symbol") or "").strip().lower()
+            address = str(raw_it.get("address") or "").strip().lower()
+            if not _is_eth_address(address):
+                continue
+            if address in seen:
+                continue
+            seen.add(address)
+            out.append(
+                {
+                    "symbol": symbol,
+                    "address": address,
+                    "allowance": str(saved_map.get(address) or ""),
+                }
+            )
+    out.sort(key=lambda x: (str(x.get("symbol") or ""), str(x.get("address") or "")))
+    return {"items": out, "updated_at": updated_at}
+
+
+def _save_riko_custody_allowance_presets(items: list[dict[str, Any]]) -> dict[str, Any]:
+    allowed = _riko_active_whitelist_erc20_addresses()
+    by_addr: dict[str, dict[str, str]] = {}
+    for raw in (items or []):
+        if not isinstance(raw, dict):
+            continue
+        symbol = str(raw.get("symbol") or "").strip().lower()
+        address = str(raw.get("address") or "").strip().lower()
+        if not _is_eth_address(address):
+            raise ValueError(f"invalid token address: {address or '-'}")
+        if address not in allowed:
+            raise ValueError(f"token {address} is not in active RIKO whitelist (ERC-20)")
+        allowance = _normalize_riko_custody_allowance_text(raw.get("allowance"))
+        by_addr[address] = {"symbol": symbol, "address": address, "allowance": allowance}
+    persist_rows: list[dict[str, str]] = []
+    for row in sorted(by_addr.values(), key=lambda x: (str(x.get("symbol") or ""), str(x.get("address") or ""))):
+        if not str(row.get("allowance") or "").strip():
+            continue
+        persist_rows.append({"address": str(row.get("address") or ""), "allowance": str(row.get("allowance") or "")})
+    payload = {"items": persist_rows, "updated_at": _iso_now()}
+    _analytics_set_state(RIKO_CUSTODY_ALLOWANCE_PRESETS_STATE_KEY, json.dumps(payload, ensure_ascii=False))
+    return _load_riko_custody_allowance_presets()
 
 
 def _riko_is_valid_month_day(month: int, day: int) -> bool:
@@ -22097,6 +22230,121 @@ def _riko_wait_receipt(rpc_url: str, tx_hash: str, timeout_sec: int = 180) -> di
         if (time.time() - start) >= float(timeout_sec):
             raise TimeoutError("tx receipt timeout")
         time.sleep(3)
+
+
+def _riko_auto_payout_preview() -> dict[str, Any]:
+    result: dict[str, Any] = {"ts": _iso_now(), "status": "unknown"}
+    riko_token = str(RIKO_VAULT_ADDRESS or "").strip()
+    if not _is_eth_address(riko_token):
+        result.update({"status": "skip", "reason": "riko_token_not_configured"})
+        return result
+    bot_cfg = _load_riko_auto_yield_bot_config()
+    payout_token = str(bot_cfg.get("payout_token_address") or "").strip()
+    if not _is_eth_address(payout_token):
+        result.update({"status": "skip", "reason": "payout_token_not_configured"})
+        return result
+    if payout_token.lower() not in _riko_active_whitelist_erc20_addresses():
+        result.update({"status": "skip", "reason": "payout_token_not_in_active_whitelist"})
+        return result
+    rpc_url = str(RIKO_AUTO_YIELD_RPC_URL or "").strip()
+    private_key = str(RIKO_AUTO_YIELD_PRIVATE_KEY or "").strip()
+    if not rpc_url or not private_key:
+        result.update({"status": "skip", "reason": "auto_yield_rpc_or_key_missing"})
+        return result
+    sender = str(Account.from_key(private_key).address or "").strip().lower()
+    y = _fetch_us_treasury_daily_10y()
+    annual_pct = float(y.get("annual_pct") or 0.0)
+    daily_pct = float(y.get("daily_pct") or 0.0)
+    monthly_pct = float(annual_pct) / 12.0
+    raw_target_bps = float(monthly_pct) * 100.0
+    target_bps = int(round(raw_target_bps))
+    next_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
+    schedule = _load_riko_payout_schedule()
+
+    try:
+        riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
+        payout_decimals = _riko_erc20_decimals(rpc_url, payout_token)
+    except Exception as e:
+        result.update({"status": "error", "reason": str(e)[:280]})
+        return result
+
+    latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
+    holder_cache = _riko_auto_yield_load_holder_cache()
+    cached_holders = set([str(x).strip().lower() for x in holder_cache.get("holders") or [] if _is_eth_address(str(x).strip().lower())])
+    last_scanned_block = max(0, int(holder_cache.get("last_scanned_block") or 0))
+    if last_scanned_block <= 0:
+        last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
+    from_block = last_scanned_block + 1
+    if from_block <= latest_block:
+        discovered = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, latest_block)
+        cached_holders.update(discovered)
+    _riko_auto_yield_save_holder_cache(sorted(cached_holders), latest_block)
+
+    holders_with_balance: list[tuple[str, int]] = []
+    for holder in sorted(cached_holders):
+        try:
+            bal = int(_riko_erc20_balance_of(rpc_url, riko_token, holder))
+        except Exception:
+            continue
+        if bal > 0:
+            holders_with_balance.append((holder, bal))
+
+    payout_rows: list[tuple[str, int, int]] = []
+    scale_up = max(0, int(payout_decimals) - int(riko_decimals))
+    scale_down = max(0, int(riko_decimals) - int(payout_decimals))
+    total_payout_raw = 0
+    for holder, bal in holders_with_balance:
+        base_amount = int(bal)
+        if scale_up > 0:
+            base_amount *= 10**scale_up
+        elif scale_down > 0:
+            base_amount //= 10**scale_down
+        payout_raw = (base_amount * int(next_bps)) // 10_000
+        if payout_raw <= 0:
+            continue
+        payout_rows.append((holder, int(bal), int(payout_raw)))
+        total_payout_raw += int(payout_raw)
+    payout_rows.sort(key=lambda x: int(x[2]), reverse=True)
+
+    payout_wallet_balance = int(_riko_erc20_balance_of(rpc_url, payout_token, sender))
+    top_recipients: list[dict[str, Any]] = []
+    for holder, riko_bal, payout_raw in payout_rows[:10]:
+        top_recipients.append(
+            {
+                "address": holder,
+                "riko_balance_raw": int(riko_bal),
+                "payout_raw": int(payout_raw),
+            }
+        )
+    result.update(
+        {
+            "status": "ok",
+            "treasury_date": str(y.get("date") or ""),
+            "annual_pct": round(annual_pct, 6),
+            "daily_pct": round(daily_pct, 8),
+            "monthly_pct": round(monthly_pct, 8),
+            "target_bps": int(target_bps),
+            "bounded_bps": int(next_bps),
+            "next_bps": int(next_bps),
+            "payout_wallet": sender,
+            "riko_token": riko_token.lower(),
+            "payout_token": payout_token.lower(),
+            "riko_decimals": int(riko_decimals),
+            "payout_decimals": int(payout_decimals),
+            "holder_scan_start_block": int(bot_cfg.get("holder_scan_start_block") or 0),
+            "holders_scanned": int(len(cached_holders)),
+            "holders_positive": int(len(holders_with_balance)),
+            "payout_count": int(len(payout_rows)),
+            "total_payout_raw": int(total_payout_raw),
+            "available_raw": int(payout_wallet_balance),
+            "can_pay": bool(payout_wallet_balance >= total_payout_raw),
+            "top_recipients": top_recipients,
+            "schedule_time_utc": str(schedule.get("payout_time_utc") or "00:00"),
+            "schedule_next_due_date": str(schedule.get("next_due_date") or ""),
+            "schedule_next_due_at_utc": str(schedule.get("next_due_at_utc") or ""),
+        }
+    )
+    return result
 
 
 def _riko_auto_yield_try_once() -> dict[str, Any]:
@@ -22735,6 +22983,29 @@ class AdminRikoAutoYieldModeUpdate(BaseModel):
 class AdminRikoAutoYieldBotConfigUpdate(BaseModel):
     payout_token_address: str = ""
     holder_scan_start_block: int = 0
+
+
+class AdminRikoAutoPayoutApplyNonceRequest(BaseModel):
+    payout_token_address: str = ""
+    holder_scan_start_block: int = 0
+    items: list[AdminRikoPayoutDateItem] = Field(default_factory=list)
+    payout_time_utc: str = "00:00"
+
+
+class AdminRikoAutoPayoutApplySigned(AdminRikoAutoPayoutApplyNonceRequest):
+    nonce: str
+    message: str
+    signature: str
+
+
+class AdminRikoCustodyAllowancePresetItem(BaseModel):
+    symbol: str = ""
+    address: str
+    allowance: str = ""
+
+
+class AdminRikoCustodyAllowancePresetUpdate(BaseModel):
+    items: list[AdminRikoCustodyAllowancePresetItem] = Field(default_factory=list)
 
 
 class RikoWhitelistItemUpdate(BaseModel):
@@ -30733,7 +31004,7 @@ def _render_admin_page() -> str:
     }}
     .admin-riko-whitelist-row {{
       display: grid;
-      grid-template-columns: minmax(120px,180px) minmax(180px,1fr) auto;
+      grid-template-columns: minmax(120px,170px) minmax(180px,1fr) minmax(140px,200px) auto auto;
       gap: 6px;
       align-items: center;
       margin: 0;
@@ -30825,6 +31096,13 @@ def _render_admin_page() -> str:
           <input id="adminRikoCustodyInput" type="text" placeholder="0x..."/>
           <button class="btn" onclick="applyAdminRikoCustodyAddress()">Apply on-chain</button>
         </div>
+        <div class="row" style="display:grid;grid-template-columns:170px minmax(180px,1fr) minmax(160px,220px) auto;gap:10px;align-items:center;">
+          <label style="margin:0">Approve custody -> vault</label>
+          <input id="adminRikoCustodyApproveTokenInput" type="text" placeholder="Token address or ETH (WETH by chain)"/>
+          <input id="adminRikoCustodyApproveAmountInput" type="text" placeholder="Amount or max"/>
+          <button class="btn btn-soft" onclick="applyAdminRikoCustodyApprove()">Approve</button>
+        </div>
+        <div class="row"><label>Custody allowance (to vault)</label><div id="adminRikoCustodyAllowanceInfo">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set pending operator</label>
           <input id="adminRikoPendingOperatorInput" type="text" placeholder="0x... operator"/>
@@ -30863,7 +31141,7 @@ def _render_admin_page() -> str:
           <label style="margin:0">Bot config</label>
           <select id="adminRikoAutoYieldPayoutTokenInput"></select>
           <input id="adminRikoAutoYieldStartBlockInput" type="number" min="0" step="1" placeholder="Holder scan start block"/>
-          <button type="button" class="btn btn-soft" onclick="saveAdminRikoAutoYieldConfig()">Apply</button>
+          <button type="button" class="btn btn-soft" onclick="applyAdminRikoAutoYieldSettings()">Apply</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Auto-payout bot</label>
@@ -30871,18 +31149,28 @@ def _render_admin_page() -> str:
           <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:nowrap;">
             <button type="button" class="btn btn-soft" onclick="setAdminRikoAutoYieldMode(true)">Enable</button>
             <button type="button" class="btn btn-soft" onclick="setAdminRikoAutoYieldMode(false)">Disable</button>
-            <button type="button" class="btn" onclick="saveAdminRikoPayoutSchedule()">Save schedule</button>
           </div>
         </div>
         <div class="row"><label>Last schedule update</label><div id="adminRikoPayoutUpdatedAt">-</div></div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Preview payout</label>
+          <div id="adminRikoPayoutPreviewSummary">-</div>
+          <button type="button" class="btn btn-soft" onclick="loadAdminRikoPayoutPreview()">Refresh preview</button>
+        </div>
+        <div class="table-wrap" style="margin-top:6px">
+          <table id="adminRikoPayoutPreviewTable" class="admin-history-table"></table>
+        </div>
+        <span id="adminRikoPayoutPreviewStatus" class="status">Ready</span>
         <span id="adminRikoPayoutStatus" class="status">Ready</span>
       </section>
       <section class="card admin-riko-whitelist-card">
         <h3>Admin: RIKO whitelist</h3>
-        <p class="hint">Workflow: edit rows -> Apply (wallet signature required).</p>
+        <p class="hint">Workflow: edit rows -> Save allowances -> Apply whitelist (wallet signature required).</p>
         <div id="adminRikoWhitelistRows"></div>
         <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
           <button type="button" class="btn" onclick="addAdminRikoWhitelistRow()">Add row</button>
+          <button type="button" class="btn btn-soft" onclick="saveAdminRikoCustodyAllowancePresets()">Save allowances</button>
+          <button type="button" class="btn btn-soft" onclick="applyAllAdminRikoCustodyAllowancePresets()">Approve non-empty allowances</button>
           <button type="button" class="btn" onclick="applyAdminRikoWhitelist()">Apply on-chain</button>
         </div>
         <span id="adminRikoWhitelistStatus" class="status">Ready</span>
@@ -31184,6 +31472,11 @@ def _render_admin_page() -> str:
     ];
     const ADMIN_ERC20_DECIMALS_ABI = [
       "function decimals() view returns (uint8)"
+    ];
+    const ADMIN_ERC20_WRITE_ABI = [
+      "function decimals() view returns (uint8)",
+      "function allowance(address owner,address spender) view returns (uint256)",
+      "function approve(address spender,uint256 value) returns (bool)"
     ];
     const ADMIN_ERC20_READ_ABI = [
       "function balanceOf(address account) view returns (uint256)",
@@ -31769,6 +32062,12 @@ def _render_admin_page() -> str:
       const elAddr = document.getElementById("adminRikoVaultAddress");
       const vaultAddr = String(RIKO_VAULT_ADDRESS || "").trim();
       if (elAddr) elAddr.textContent = vaultAddr || "-";
+      const custodyApproveTokenEl = document.getElementById("adminRikoCustodyApproveTokenInput");
+      if (custodyApproveTokenEl && !custodyApproveTokenEl.dataset.boundAllowanceRefresh) {{
+        custodyApproveTokenEl.dataset.boundAllowanceRefresh = "1";
+        custodyApproveTokenEl.addEventListener("change", () => {{ refreshAdminRikoCustodyAllowanceInfo(); }});
+        custodyApproveTokenEl.addEventListener("input", () => {{ refreshAdminRikoCustodyAllowanceInfo(); }});
+      }}
 
       let rolePayload = {{ vault_owner: "", custody: "", pending_operator: "" }};
       if (!/^0x[a-fA-F0-9]{{40}}$/.test(vaultAddr)) {{
@@ -31794,9 +32093,11 @@ def _render_admin_page() -> str:
           rolePayload.pending_operator = String(pendingOperator || "");
           const rikoPriceNum = Number(rikoPriceUsd6 || 0n);
           const inCustody = document.getElementById("adminRikoCustodyInput");
+          const inCustodyApproveToken = document.getElementById("adminRikoCustodyApproveTokenInput");
           const inPendingOperator = document.getElementById("adminRikoPendingOperatorInput");
           const inRikoPrice = document.getElementById("adminRikoPriceUsdInput");
           if (inCustody && !String(inCustody.value || "").trim()) inCustody.value = String(custody || "");
+          if (inCustodyApproveToken && !String(inCustodyApproveToken.value || "").trim()) inCustodyApproveToken.value = "ETH";
           if (inPendingOperator && !String(inPendingOperator.value || "").trim()) inPendingOperator.value = String(pendingOperator || "");
           if (inRikoPrice && !String(inRikoPrice.value || "").trim()) inRikoPrice.value = String((rikoPriceNum / 1e6) || 1);
         }} catch (_) {{
@@ -31804,6 +32105,7 @@ def _render_admin_page() -> str:
           if (inCap && !String(inCap.value || "").trim()) inCap.value = "0";
         }}
       }}
+      await refreshAdminRikoCustodyAllowanceInfo();
 
       setAdminOnchainRoles(rolePayload);
       setAdminProcessPendingDefaults(false);
@@ -31870,6 +32172,102 @@ def _render_admin_page() -> str:
           return;
         }}
         setAdminRikoOnchainStatus("Custody update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function refreshAdminRikoCustodyAllowanceInfo() {{
+      const infoEl = document.getElementById("adminRikoCustodyAllowanceInfo");
+      if (!infoEl) return;
+      try {{
+        const vaultAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
+        const tokenInputEl = document.getElementById("adminRikoCustodyApproveTokenInput");
+        const payoutTokenEl = document.getElementById("adminRikoAutoYieldPayoutTokenInput");
+        const rawToken = String(tokenInputEl?.value || payoutTokenEl?.value || "").trim();
+        let tokenAddr = normalizeEthAddressInput(rawToken);
+        const ethers = await ensureEthersAdmin();
+        const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+        if (!tokenAddr && String(rawToken || "").toLowerCase() === "eth") {{
+          const network = await provider.getNetwork();
+          tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
+        }}
+        if (!tokenAddr) {{
+          infoEl.textContent = "Enter token address (or ETH) to read allowance.";
+          return;
+        }}
+        const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
+        const custodyAddr = String(await vault.custodyAddress() || "").trim().toLowerCase();
+        if (!/^0x[a-f0-9]{{40}}$/.test(custodyAddr)) {{
+          infoEl.textContent = "Custody is not configured on vault.";
+          return;
+        }}
+        const erc20 = new ethers.Contract(tokenAddr, ADMIN_ERC20_READ_ABI, provider);
+        const [decimalsRaw, allowanceRaw] = await Promise.all([
+          erc20.decimals(),
+          erc20.allowance(custodyAddr, vaultAddr),
+        ]);
+        const decimals = Number(decimalsRaw || 18);
+        const allowance = BigInt(allowanceRaw || 0n);
+        const allowanceText = allowance === ethers.MaxUint256
+          ? "MAX"
+          : ethers.formatUnits(allowance, Number.isFinite(decimals) ? decimals : 18);
+        infoEl.textContent = `${{shortAddrAdmin(custodyAddr)}} -> ${{shortAddrAdmin(vaultAddr)}} on ${{shortAddrAdmin(tokenAddr)}}: ${{allowanceText}}`;
+      }} catch (e) {{
+        infoEl.textContent = "Failed to read allowance: " + String(e?.shortMessage || e?.message || "unknown");
+      }}
+    }}
+    async function applyAdminRikoCustodyApprove() {{
+      try {{
+        requireAdminWalletAuth();
+        const signer = await getAdminSigner();
+        const signerAddr = String(await signer.getAddress() || "").trim().toLowerCase();
+        const vaultAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
+        const vault = await getAdminVaultContract(signer);
+        const custodyAddr = String(await vault.custodyAddress() || "").trim().toLowerCase();
+        if (!/^0x[a-f0-9]{{40}}$/.test(custodyAddr)) throw new Error("Custody is not configured on vault.");
+        if (signerAddr !== custodyAddr) {{
+          throw new Error(`Switch wallet to custody address ${{shortAddrAdmin(custodyAddr)}} and retry.`);
+        }}
+        const tokenInputEl = document.getElementById("adminRikoCustodyApproveTokenInput");
+        const amountInputEl = document.getElementById("adminRikoCustodyApproveAmountInput");
+        const payoutTokenEl = document.getElementById("adminRikoAutoYieldPayoutTokenInput");
+        const rawToken = String(tokenInputEl?.value || payoutTokenEl?.value || "").trim();
+        let tokenAddr = normalizeEthAddressInput(rawToken);
+        if (!tokenAddr && String(rawToken || "").toLowerCase() === "eth") {{
+          const network = signer?.provider ? await signer.provider.getNetwork() : null;
+          tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
+        }}
+        if (!tokenAddr) throw new Error("Token address must be valid (or use ETH to auto-map WETH).");
+        const ethers = await ensureEthersAdmin();
+        const erc20 = new ethers.Contract(tokenAddr, ADMIN_ERC20_WRITE_ABI, signer);
+        const decimals = Number(await erc20.decimals());
+        if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) throw new Error("Token decimals are invalid.");
+        const rawAmountText = String(amountInputEl?.value || "").trim();
+        const useMax = !rawAmountText || /^max$/i.test(rawAmountText);
+        const approveAmount = useMax ? ethers.MaxUint256 : ethers.parseUnits(rawAmountText, decimals);
+        if (!useMax && approveAmount <= 0n) throw new Error("Approve amount must be greater than 0.");
+        setAdminRikoOnchainStatus(
+          useMax
+            ? `Approving max allowance for ${{shortAddrAdmin(tokenAddr)}}...`
+            : `Approving ${{rawAmountText}} for ${{shortAddrAdmin(tokenAddr)}}...`,
+          false
+        );
+        const tx = await erc20.approve(vaultAddr, approveAmount);
+        setAdminRikoOnchainStatus("Custody approve tx sent: " + tx.hash, false);
+        await tx.wait();
+        const allowance = BigInt(await erc20.allowance(custodyAddr, vaultAddr));
+        const allowanceText = allowance === ethers.MaxUint256
+          ? "MAX"
+          : ethers.formatUnits(allowance, decimals);
+        setAdminRikoOnchainStatus(
+          `Custody approve confirmed. allowance(custody->vault) = ${{allowanceText}}`,
+          false
+        );
+        await refreshAdminRikoCustodyAllowanceInfo();
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Custody approve was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("Custody approve failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
     async function applyAdminRikoPriceUsd() {{
@@ -32284,14 +32682,103 @@ def _render_admin_page() -> str:
       }}
       sel.innerHTML = parts.join("");
     }}
+    function getAdminRikoCustodyAllowancePresetMap() {{
+      const out = new Map();
+      const rawItems = Array.isArray(adminLastSettings?.riko_custody_allowance_presets?.items)
+        ? adminLastSettings.riko_custody_allowance_presets.items
+        : [];
+      for (const it of rawItems) {{
+        const addr = normalizeAdminRikoAddress(it?.address || "");
+        if (!/^0x[a-f0-9]{{40}}$/.test(addr)) continue;
+        out.set(addr, String(it?.allowance || "").trim());
+      }}
+      return out;
+    }}
+    function collectAdminRikoCustodyAllowancePresetItems() {{
+      const rows = snapshotAdminRikoWhitelistRows();
+      const out = [];
+      const seen = new Set();
+      for (const it of rows) {{
+        const symbol = String(it?.symbol || "").trim().toLowerCase();
+        const address = normalizeAdminRikoAddress(it?.address || "");
+        const allowance = String(it?.allowance || "").trim();
+        if (!symbol || !/^0x[a-f0-9]{{40}}$/.test(address) || !allowance) continue;
+        if (seen.has(address)) continue;
+        seen.add(address);
+        out.push({{ symbol, address, allowance }});
+      }}
+      return out;
+    }}
+    async function saveAdminRikoCustodyAllowancePresets() {{
+      try {{
+        requireAdminWalletAuth();
+        const items = collectAdminRikoCustodyAllowancePresetItems();
+        const data = await postJson("/api/admin/riko/custody-allowance-presets", {{ items }});
+        const saved = data?.riko_custody_allowance_presets || {{}};
+        if (adminLastSettings && typeof adminLastSettings === "object") {{
+          adminLastSettings.riko_custody_allowance_presets = saved;
+        }}
+        const allowanceMap = getAdminRikoCustodyAllowancePresetMap();
+        adminRikoWhitelistItems = snapshotAdminRikoWhitelistRows().map((it) => {{
+          const address = normalizeAdminRikoAddress(it?.address || "");
+          const currentAllowance = String(it?.allowance || "").trim();
+          const allowance = currentAllowance || String(allowanceMap.get(address) || "");
+          return {{
+            symbol: String(it?.symbol || "").trim().toLowerCase(),
+            address: String(it?.address || "").trim(),
+            allowance,
+          }};
+        }});
+        renderAdminRikoWhitelistEditor();
+        setAdminRikoOnchainStatus(data?.info || "Custody allowance presets saved.", false);
+      }} catch (e) {{
+        setAdminRikoOnchainStatus("Save custody allowance presets failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function applyAdminRikoCustodyAllowancePreset(idx) {{
+      const n = Number(idx ?? -1);
+      const rows = snapshotAdminRikoWhitelistRows();
+      if (!Number.isInteger(n) || n < 0 || n >= rows.length) return;
+      const row = rows[n] || {{}};
+      const amount = String(row?.allowance || "").trim();
+      if (!amount) {{
+        setAdminRikoOnchainStatus("Set allowance amount for preset row first.", true);
+        return;
+      }}
+      const tokenEl = document.getElementById("adminRikoCustodyApproveTokenInput");
+      const amountEl = document.getElementById("adminRikoCustodyApproveAmountInput");
+      if (tokenEl) tokenEl.value = String(normalizeAdminRikoAddress(row?.address || "") || "");
+      if (amountEl) amountEl.value = amount;
+      await refreshAdminRikoCustodyAllowanceInfo();
+      await applyAdminRikoCustodyApprove();
+    }}
+    async function applyAllAdminRikoCustodyAllowancePresets() {{
+      const rows = collectAdminRikoCustodyAllowancePresetItems();
+      if (!rows.length) {{
+        setAdminRikoOnchainStatus("No non-empty allowance presets to apply.", true);
+        return;
+      }}
+      for (let i = 0; i < rows.length; i += 1) {{
+        const row = rows[i];
+        const tokenEl = document.getElementById("adminRikoCustodyApproveTokenInput");
+        const amountEl = document.getElementById("adminRikoCustodyApproveAmountInput");
+        if (tokenEl) tokenEl.value = String(row?.address || "");
+        if (amountEl) amountEl.value = String(row?.allowance || "");
+        setAdminRikoOnchainStatus(`Applying preset ${{i + 1}} / ${{rows.length}}...`, false);
+        await refreshAdminRikoCustodyAllowanceInfo();
+        await applyAdminRikoCustodyApprove();
+      }}
+    }}
     function renderAdminRikoWhitelistEditor() {{
       const rowsEl = document.getElementById("adminRikoWhitelistRows");
       if (!rowsEl) return;
-      const rows = adminRikoWhitelistItems.length ? adminRikoWhitelistItems : [{{symbol:"", address:""}}];
+      const rows = adminRikoWhitelistItems.length ? adminRikoWhitelistItems : [{{symbol:"", address:"", allowance:""}}];
       rowsEl.innerHTML = rows.map((it, idx) => `
         <div class="admin-riko-whitelist-row">
           <input data-admin-riko-field="symbol" data-index="${{idx}}" placeholder="symbol" value="${{esc(it?.symbol || "")}}" />
           <input data-admin-riko-field="address" data-index="${{idx}}" placeholder="0x... or native" value="${{esc(it?.address || "")}}" />
+          <input data-admin-riko-field="allowance" data-index="${{idx}}" placeholder="allowance or max" value="${{esc(it?.allowance || "")}}" />
+          <button type="button" class="btn btn-soft" onclick="applyAdminRikoCustodyAllowancePreset(${{idx}})">Approve</button>
           <button type="button" class="btn danger" onclick="removeAdminRikoWhitelistRow(${{idx}})">-</button>
         </div>
       `).join("");
@@ -32306,41 +32793,48 @@ def _render_admin_page() -> str:
       for (const input of rowsEl.querySelectorAll("input[data-index]")) {{
         const idx = Number(input.dataset.index ?? -1);
         if (!Number.isInteger(idx) || idx < 0) continue;
-        const entry = byIndex.get(idx) || {{symbol:"", address:""}};
+        const entry = byIndex.get(idx) || {{symbol:"", address:"", allowance:""}};
         const field = input.dataset.adminRikoField;
         if (field === "symbol") entry.symbol = String(input.value || "").trim().toLowerCase();
         if (field === "address") entry.address = String(input.value || "").trim();
+        if (field === "allowance") entry.allowance = String(input.value || "").trim();
         byIndex.set(idx, entry);
       }}
-      return Array.from(byIndex.keys()).sort((a, b) => a - b).map((idx) => byIndex.get(idx) || {{symbol:"", address:""}});
+      return Array.from(byIndex.keys()).sort((a, b) => a - b).map((idx) => byIndex.get(idx) || {{symbol:"", address:"", allowance:""}});
     }}
     function onAdminRikoWhitelistInputChanged(e) {{
       const field = e?.target?.dataset?.adminRikoField;
       const idx = Number(e?.target?.dataset?.index ?? -1);
       if (!Number.isInteger(idx) || idx < 0) return;
-      while (adminRikoWhitelistItems.length <= idx) adminRikoWhitelistItems.push({{symbol:"", address:""}});
-      const current = adminRikoWhitelistItems[idx] || {{symbol:"", address:""}};
+      while (adminRikoWhitelistItems.length <= idx) adminRikoWhitelistItems.push({{symbol:"", address:"", allowance:""}});
+      const current = adminRikoWhitelistItems[idx] || {{symbol:"", address:"", allowance:""}};
+      const allowanceMap = getAdminRikoCustodyAllowancePresetMap();
       if (field === "symbol") {{
         const sym = String(e.target.value || "").trim().toLowerCase();
         current.symbol = sym;
         const nextAddr = resolveAdminRikoAddressBySymbol(sym);
         if (nextAddr) {{
           current.address = nextAddr;
+          if (!String(current.allowance || "").trim()) current.allowance = String(allowanceMap.get(nextAddr) || "");
           const addrInput = document.querySelector(`input[data-admin-riko-field="address"][data-index="${{idx}}"]`);
           if (addrInput) addrInput.value = nextAddr;
           setAdminRikoWhitelistStatus(`Address auto-filled for ${{sym}}. Click Apply to confirm changes.`, false);
         }}
       }} else if (field === "address") {{
         current.address = String(e.target.value || "").trim();
+        const normAddr = normalizeAdminRikoAddress(current.address);
+        if (normAddr && !String(current.allowance || "").trim()) current.allowance = String(allowanceMap.get(normAddr) || "");
+      }} else if (field === "allowance") {{
+        current.allowance = String(e.target.value || "").trim();
       }}
       adminRikoWhitelistItems[idx] = current;
     }}
     function addAdminRikoWhitelistRow() {{
       const snapshot = snapshotAdminRikoWhitelistRows();
-      snapshot.push({{symbol:"", address:""}});
+      snapshot.push({{symbol:"", address:"", allowance:""}});
       adminRikoWhitelistItems = snapshot;
       renderAdminRikoWhitelistEditor();
-      setAdminRikoWhitelistStatus("Row added. Enter symbol; known address is auto-filled.", false);
+      setAdminRikoWhitelistStatus("Row added. Enter symbol; known address is auto-filled. Optional allowance can be set in same row.", false);
     }}
     function removeAdminRikoWhitelistRow(idx) {{
       const snapshot = snapshotAdminRikoWhitelistRows();
@@ -32388,10 +32882,12 @@ def _render_admin_page() -> str:
           symbol: String(it?.symbol || "").trim().toLowerCase(),
           address: String(it?.address || "").trim(),
         }}));
+        const allowanceMap = getAdminRikoCustodyAllowancePresetMap();
         const draft = (data.pending && data.pending.items) || (data.active && data.active.items) || [];
         adminRikoWhitelistItems = (Array.isArray(draft) ? draft : []).map((it) => ({{
           symbol: String(it?.symbol || "").trim().toLowerCase(),
           address: String(it?.address || "").trim(),
+          allowance: String(allowanceMap.get(normalizeAdminRikoAddress(it?.address || "")) || ""),
         }}));
         renderAdminRikoWhitelistEditor();
         const payoutSel = document.getElementById("adminRikoAutoYieldPayoutTokenInput");
@@ -32869,6 +33365,7 @@ def _render_admin_page() -> str:
         );
         await loadAdminRikoGlobalCap();
         await loadAdminRikoWhitelist();
+        await loadAdminRikoPayoutPreview();
         if (data.pilot_config_frozen) {{
           setAdminStatus("Pilot config is frozen (RIKO_PILOT_CONFIG_FROZEN=1). Admin updates are disabled by server.", false);
         }}
@@ -32903,6 +33400,68 @@ def _render_admin_page() -> str:
       if (!el) return;
       el.textContent = msg || "";
       el.classList.toggle("err", !!isErr);
+    }}
+    function setAdminRikoPayoutPreviewStatus(msg, isErr) {{
+      const el = document.getElementById("adminRikoPayoutPreviewStatus");
+      if (!el) return;
+      el.textContent = String(msg || "");
+      el.classList.toggle("err", !!isErr);
+    }}
+    function renderAdminRikoPayoutPreview(data) {{
+      const summaryEl = document.getElementById("adminRikoPayoutPreviewSummary");
+      const table = document.getElementById("adminRikoPayoutPreviewTable");
+      if (!summaryEl || !table) return;
+      const status = String(data?.status || "unknown");
+      if (status !== "ok") {{
+        summaryEl.textContent = status === "skip"
+          ? `Preview skipped: ${{String(data?.reason || "unknown")}}`
+          : `Preview unavailable: ${{String(data?.reason || "unknown")}}`;
+        table.innerHTML = "<tr><td class='muted'>No preview rows.</td></tr>";
+        return;
+      }}
+      const bps = Number(data?.next_bps || data?.bounded_bps || 0);
+      const holders = Number(data?.holders_positive || 0);
+      const payoutCount = Number(data?.payout_count || 0);
+      const payoutDecimals = Number(data?.payout_decimals || 18);
+      const rikoDecimals = Number(data?.riko_decimals || 6);
+      const totalRaw = String(data?.total_payout_raw || "0");
+      const availableRaw = String(data?.available_raw || "0");
+      const canPay = !!data?.can_pay;
+      summaryEl.textContent =
+        `bps=${{bps}} | holders=${{holders}} | payouts=${{payoutCount}} | total=${{formatAdminRawUnits(totalRaw, payoutDecimals, 8)}} | wallet=${{formatAdminRawUnits(availableRaw, payoutDecimals, 8)}} | ${{canPay ? "funded" : "insufficient"}}`;
+      const top = Array.isArray(data?.top_recipients) ? data.top_recipients : [];
+      if (!top.length) {{
+        table.innerHTML = "<tr><th>Top-10 recipient preview</th></tr><tr><td class='muted'>No positive payouts.</td></tr>";
+        return;
+      }}
+      let html = "<tr><th>Address</th><th>RIKO balance</th><th>Payout</th></tr>";
+      for (const row of top) {{
+        const addr = String(row?.address || "");
+        const rikoBalRaw = String(row?.riko_balance_raw || "0");
+        const payoutRaw = String(row?.payout_raw || "0");
+        html += "<tr>" +
+          `<td class='mono'>${{shortAddrAdmin(addr)}}</td>` +
+          `<td class='mono'>${{formatAdminRawUnits(rikoBalRaw, rikoDecimals, 6)}}</td>` +
+          `<td class='mono'>${{formatAdminRawUnits(payoutRaw, payoutDecimals, 8)}}</td>` +
+          "</tr>";
+      }}
+      table.innerHTML = html;
+    }}
+    async function loadAdminRikoPayoutPreview() {{
+      try {{
+        setAdminRikoPayoutPreviewStatus("Loading preview...", false);
+        const r = await fetch("/api/admin/riko/auto-payout-preview");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data?.detail || "Failed to load payout preview.");
+        renderAdminRikoPayoutPreview(data || {{}});
+        if (String(data?.status || "") === "ok") {{
+          setAdminRikoPayoutPreviewStatus("Preview updated.", false);
+        }} else {{
+          setAdminRikoPayoutPreviewStatus(`Preview status: ${{String(data?.status || "unknown")}} / ${{String(data?.reason || "-")}}`, true);
+        }}
+      }} catch (e) {{
+        setAdminRikoPayoutPreviewStatus("Preview load failed: " + (e?.message || "unknown"), true);
+      }}
     }}
     function setAdminRikoPayoutTimePreset(hhmm) {{
       const inTime = document.getElementById("adminRikoPayoutTimeUtcInput");
@@ -32999,31 +33558,68 @@ def _render_admin_page() -> str:
           true
         );
         setAdminRikoPayoutStatus("", false);
+        await loadAdminRikoPayoutPreview();
       }} catch (e) {{
         setAdminRikoPayoutStatus("Auto-payout mode update failed: " + (e?.message || "unknown"), true);
       }}
     }}
-    async function saveAdminRikoAutoYieldConfig() {{
+    async function applyAdminRikoAutoYieldSettings() {{
       try {{
+        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const payout_token_address = normalizeAdminRikoAddress(document.getElementById("adminRikoAutoYieldPayoutTokenInput")?.value || "");
         if (!payout_token_address || payout_token_address === "native") throw new Error("Select payout token from active whitelist.");
         const holder_scan_start_block_raw = String(document.getElementById("adminRikoAutoYieldStartBlockInput")?.value || "0").trim();
         const holder_scan_start_block = Math.max(0, Number.parseInt(holder_scan_start_block_raw || "0", 10) || 0);
-        const data = await postJson("/api/admin/riko/auto-payout-config", {{ payout_token_address, holder_scan_start_block }});
+        const rawDates = document.getElementById("adminRikoPayoutDatesInput")?.value || "";
+        const payout_time_utc = String(document.getElementById("adminRikoPayoutTimeUtcInput")?.value || "00:00").trim() || "00:00";
+        const items = parseAdminRikoPayoutLines(rawDates);
+        if (!items.length) throw new Error("Add at least one valid MM-DD date.");
+        setAdminRikoPayoutStatus("Requesting signature challenge...", false);
+        const signer = await getAdminSigner();
+        const signerAddress = String(await signer.getAddress()).toLowerCase();
+        const nonceResp = await postJson("/api/admin/riko/auto-payout/apply-nonce", {{
+          wallet: signerAddress,
+          payout_token_address,
+          holder_scan_start_block,
+          items,
+          payout_time_utc,
+        }});
+        const challenge = String(nonceResp?.message || "").trim();
+        const signature = await signer.signMessage(challenge);
+        setAdminRikoPayoutStatus("Applying signed auto-payout settings...", false);
+        const data = await postJson("/api/admin/riko/auto-payout/apply", {{
+          wallet: signerAddress,
+          nonce: String(nonceResp?.nonce || ""),
+          message: challenge,
+          signature,
+          payout_token_address,
+          holder_scan_start_block,
+          items,
+          payout_time_utc,
+        }});
         if (adminLastSettings && typeof adminLastSettings === "object") {{
           adminLastSettings.riko_auto_yield_bot_config = data?.riko_auto_yield_bot_config || {{}};
+          adminLastSettings.riko_payout_schedule = data?.riko_payout_schedule || {{}};
         }}
         renderAdminRikoPayoutSchedule(
-          adminLastSettings?.riko_payout_schedule || {{}},
+          data?.riko_payout_schedule || adminLastSettings?.riko_payout_schedule || {{}},
           !!adminLastSettings?.riko_auto_yield_enabled,
-          data?.riko_auto_yield_bot_config || {{}},
+          data?.riko_auto_yield_bot_config || adminLastSettings?.riko_auto_yield_bot_config || {{}},
           String(adminLastSettings?.riko_auto_yield_source || "env"),
           true
         );
-        setAdminRikoPayoutStatus(data?.info || "Bot config saved on server.", false);
+        setAdminRikoPayoutStatus(data?.info || "RIKO auto-payout settings applied.", false);
+        await loadAdminRikoPayoutPreview();
       }} catch (e) {{
-        setAdminRikoPayoutStatus("Bot config save failed: " + (e?.message || "unknown"), true);
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoPayoutStatus("Signature was rejected in wallet. Apply was canceled.", true);
+          return;
+        }}
+        setAdminRikoPayoutStatus("Apply failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
+    }}
+    async function saveAdminRikoAutoYieldConfig() {{
+      await applyAdminRikoAutoYieldSettings();
     }}
     function renderAdminRikoPayoutSchedule(cfg, autoEnabled, botCfg, autoSource, force) {{
       const forceUpdate = !!force;
@@ -33080,23 +33676,7 @@ def _render_admin_page() -> str:
       }}
     }}
     async function saveAdminRikoPayoutSchedule() {{
-      try {{
-        const raw = document.getElementById("adminRikoPayoutDatesInput")?.value || "";
-        const payout_time_utc = String(document.getElementById("adminRikoPayoutTimeUtcInput")?.value || "00:00").trim() || "00:00";
-        const items = parseAdminRikoPayoutLines(raw);
-        if (!items.length) throw new Error("Add at least one valid MM-DD date.");
-        const data = await postJson("/api/admin/riko/payout-schedule", {{ items, payout_time_utc }});
-        renderAdminRikoPayoutSchedule(
-          data.riko_payout_schedule || {{}},
-          !!adminLastSettings?.riko_auto_yield_enabled,
-          adminLastSettings?.riko_auto_yield_bot_config || {{}},
-          String(adminLastSettings?.riko_auto_yield_source || "env"),
-          true
-        );
-        setAdminRikoPayoutStatus(data.info || "Payout schedule saved on server.", false);
-      }} catch (e) {{
-        setAdminRikoPayoutStatus("Payout schedule save failed: " + (e?.message || "unknown"), true);
-      }}
+      await applyAdminRikoAutoYieldSettings();
     }}
     function renderManualPairListsSettings(cfg) {{
       const fiat = cfg && cfg.fiat_stable ? cfg.fiat_stable : {{}};
@@ -34063,6 +34643,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "riko_auto_yield_enabled": bool(auto_yield_ctl.get("enabled")),
             "riko_auto_yield_source": str(auto_yield_ctl.get("source") or "env"),
             "riko_auto_yield_bot_config": auto_yield_bot_cfg,
+            "riko_custody_allowance_presets": _load_riko_custody_allowance_presets(),
         }
     except Exception as e:
         return {
@@ -34084,6 +34665,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "riko_auto_yield_enabled": bool(auto_yield_ctl.get("enabled")),
             "riko_auto_yield_source": str(auto_yield_ctl.get("source") or "env"),
             "riko_auto_yield_bot_config": auto_yield_bot_cfg,
+            "riko_custody_allowance_presets": _load_riko_custody_allowance_presets(),
             "info": f"Admin settings fallback mode. Error: {e}",
         }
 
@@ -34418,6 +35000,128 @@ def admin_riko_payout_schedule_update(
     return {"ok": True, "info": "RIKO payout schedule saved on server.", "riko_payout_schedule": saved}
 
 
+@app.post("/api/admin/riko/auto-payout/apply-nonce")
+@app.post("/api/admin/riko/auto-yield/apply-nonce")
+def admin_riko_auto_payout_apply_nonce(
+    req: AdminRikoAutoPayoutApplyNonceRequest, request: Request, response: Response
+) -> dict[str, Any]:
+    sid, auth = _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO auto-payout apply nonce")
+    raw_items: list[dict[str, int]] = []
+    for item in (req.items or []):
+        raw_items.append({"month": int(item.month), "day": int(item.day)})
+    if not raw_items:
+        raise HTTPException(status_code=400, detail="Add at least one valid MM-DD date.")
+    payload_hash = _riko_auto_payout_apply_digest(
+        payout_token_address=str(req.payout_token_address or "").strip(),
+        holder_scan_start_block=max(0, int(req.holder_scan_start_block or 0)),
+        items=raw_items,
+        payout_time_utc=str(req.payout_time_utc or "").strip(),
+    )
+    nonce = _new_nonce()
+    issued_at = _iso_now()
+    address = str(auth.get("address") or "").strip().lower()
+    base = _public_base_url(request)
+    message = _riko_auto_payout_apply_message(
+        domain=request.url.hostname or "uni-fee.local",
+        uri=f"{base}/admin",
+        address=address,
+        nonce=nonce,
+        payload_hash=payload_hash,
+        issued_at=issued_at,
+    )
+    with AUTH_LOCK:
+        RIKO_AUTO_PAYOUT_APPLY_NONCES[sid] = {
+            "nonce": nonce,
+            "message": message,
+            "address": address,
+            "payload_hash": payload_hash,
+            "issued_at_ts": time.time(),
+        }
+    return {"ok": True, "nonce": nonce, "message": message, "issued_at": issued_at, "payload_hash": payload_hash}
+
+
+@app.post("/api/admin/riko/auto-payout/apply")
+@app.post("/api/admin/riko/auto-yield/apply")
+def admin_riko_auto_payout_apply(
+    req: AdminRikoAutoPayoutApplySigned, request: Request, response: Response
+) -> dict[str, Any]:
+    sid, auth = _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO auto-payout apply")
+    raw_items: list[dict[str, int]] = []
+    for item in (req.items or []):
+        raw_items.append({"month": int(item.month), "day": int(item.day)})
+    if not raw_items:
+        raise HTTPException(status_code=400, detail="Add at least one valid MM-DD date.")
+    payload_hash = _riko_auto_payout_apply_digest(
+        payout_token_address=str(req.payout_token_address or "").strip(),
+        holder_scan_start_block=max(0, int(req.holder_scan_start_block or 0)),
+        items=raw_items,
+        payout_time_utc=str(req.payout_time_utc or "").strip(),
+    )
+    with AUTH_LOCK:
+        challenge = dict(RIKO_AUTO_PAYOUT_APPLY_NONCES.get(sid, {}))
+    if not challenge:
+        raise HTTPException(status_code=400, detail="Apply signature challenge missing. Start Apply again.")
+    age = time.time() - float(challenge.get("issued_at_ts") or 0)
+    if age < 0 or age > max(60, int(RIKO_APPLY_SIGN_TTL_SEC)):
+        with AUTH_LOCK:
+            RIKO_AUTO_PAYOUT_APPLY_NONCES.pop(sid, None)
+        raise HTTPException(status_code=400, detail="Apply signature expired. Start Apply again.")
+    expected_nonce = str(challenge.get("nonce") or "")
+    expected_message = str(challenge.get("message") or "")
+    expected_address = str(challenge.get("address") or "").strip().lower()
+    expected_hash = str(challenge.get("payload_hash") or "")
+    signer_address = str(auth.get("address") or "").strip().lower()
+    if (
+        expected_nonce != str(req.nonce or "")
+        or expected_message != str(req.message or "")
+        or expected_address != signer_address
+        or expected_hash != payload_hash
+    ):
+        raise HTTPException(status_code=400, detail="Apply signature payload mismatch. Start Apply again.")
+    try:
+        recovered = Account.recover_message(encode_defunct(text=expected_message), signature=str(req.signature or "")).lower()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Apply signature verification failed: {e}") from e
+    if recovered != signer_address:
+        raise HTTPException(status_code=403, detail="Apply must be signed by current admin wallet.")
+    with AUTH_LOCK:
+        RIKO_AUTO_PAYOUT_APPLY_NONCES.pop(sid, None)
+    try:
+        saved_bot = _save_riko_auto_yield_bot_config(
+            payout_token_address=str(req.payout_token_address or "").strip(),
+            holder_scan_start_block=max(0, int(req.holder_scan_start_block or 0)),
+        )
+        saved_schedule = _save_riko_payout_schedule(raw_items, payout_time_utc=str(req.payout_time_utc or "").strip())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "info": "RIKO auto-payout settings applied with wallet signature.",
+        "riko_auto_yield_bot_config": saved_bot,
+        "riko_payout_schedule": saved_schedule,
+    }
+
+
+@app.post("/api/admin/riko/custody-allowance-presets")
+@app.post("/api/admin/riko/custody-allowances")
+def admin_riko_custody_allowance_presets_update(
+    req: AdminRikoCustodyAllowancePresetUpdate, request: Request, response: Response
+) -> dict[str, Any]:
+    _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO custody allowance presets update")
+    payload_items = [
+        {"symbol": str(x.symbol or ""), "address": str(x.address or ""), "allowance": str(x.allowance or "")}
+        for x in (req.items or [])
+    ]
+    try:
+        saved = _save_riko_custody_allowance_presets(payload_items)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "info": "RIKO custody allowance presets saved.", "riko_custody_allowance_presets": saved}
+
+
 @app.post("/api/admin/riko/auto-payout-config")
 @app.post("/api/admin/riko/auto-yield-config")
 def admin_riko_auto_yield_config_update(
@@ -34455,6 +35159,17 @@ def admin_riko_auto_yield_mode_update(
         "riko_payout_schedule": _load_riko_payout_schedule(),
         "riko_auto_yield_bot_config": _load_riko_auto_yield_bot_config(),
     }
+
+
+@app.get("/api/admin/riko/auto-payout-preview")
+@app.get("/api/admin/riko/auto-yield-preview")
+def admin_riko_auto_payout_preview(request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    try:
+        data = _riko_auto_payout_preview()
+        return {"ok": True, **data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"RIKO payout preview failed: {e}") from e
 
 
 @app.get("/api/riko/whitelist")
