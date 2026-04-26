@@ -318,6 +318,7 @@ RIKO_AUTO_YIELD_HOLDER_SCAN_START_BLOCK = max(0, int(os.environ.get("RIKO_AUTO_Y
 RIKO_AUTO_YIELD_PREVIEW_SCAN_MAX_BLOCKS = max(
     10, int(os.environ.get("RIKO_AUTO_YIELD_PREVIEW_SCAN_MAX_BLOCKS", "120"))
 )
+RIKO_PREVIEW_USE_EXPLORER = os.environ.get("RIKO_PREVIEW_USE_EXPLORER", "1").strip().lower() in ("1", "true", "yes", "on")
 RIKO_AUTO_YIELD_STATE_KEY = "riko_auto_yield_state_v1"
 RIKO_AUTO_YIELD_HOLDER_CACHE_STATE_KEY = "riko_auto_yield_holder_cache_v1"
 RIKO_AUTO_YIELD_BOT_CONFIG_STATE_KEY = "riko_auto_yield_bot_config_v1"
@@ -5225,6 +5226,7 @@ def _explorer_v2_chainid(chain_id: int) -> str:
         1: "1",
         10: "10",
         56: "56",
+        11155111: "11155111",
         130: "130",
         1301: "1301",
         137: "137",
@@ -5570,6 +5572,131 @@ def _explorer_v2_api_keys(chain_id: int) -> list[str]:
     _ = int(chain_id)
     eth_key = os.environ.get("ETHERSCAN_API_KEY", "").strip()
     return [eth_key] if eth_key else []
+
+
+def _explorer_v2_get_logs_rows(
+    chain_id: int,
+    contract_address: str,
+    topic0: str,
+    *,
+    from_block: int,
+    to_block: int,
+    max_rows: int = 10_000,
+) -> list[dict[str, Any]]:
+    cid = int(chain_id)
+    chainid_for_v2 = _explorer_v2_chainid(cid)
+    addr = str(contract_address or "").strip().lower()
+    t0 = str(topic0 or "").strip().lower()
+    if not chainid_for_v2 or not _is_eth_address(addr) or not re.fullmatch(r"0x[a-f0-9]{64}", t0):
+        return []
+    fb = max(0, int(from_block))
+    tb = max(fb, int(to_block))
+    page_size = 1000
+    out: list[dict[str, Any]] = []
+    api_keys = _explorer_v2_api_keys(cid)
+    base_urls: list[str] = []
+    for key in api_keys:
+        base_urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=logs&action=getLogs"
+            f"&fromBlock={fb}&toBlock={tb}&address={addr}&topic0={t0}&apikey={key}"
+        )
+    if not base_urls:
+        # Best effort for local/dev (public no-key endpoint).
+        base_urls.append(
+            "https://api.etherscan.io/v2/api"
+            f"?chainid={chainid_for_v2}&module=logs&action=getLogs"
+            f"&fromBlock={fb}&toBlock={tb}&address={addr}&topic0={t0}"
+        )
+    for base_url in base_urls:
+        page = 1
+        while len(out) < int(max_rows):
+            need = max(1, min(page_size, int(max_rows) - len(out)))
+            url = f"{base_url}&page={int(page)}&offset={int(need)}"
+            payload = None
+            for attempt in range(3):
+                try:
+                    req = UrlRequest(url, headers={"User-Agent": APP_USER_AGENT})
+                    _wait_etherscan_rps_slot(url)
+                    with urlopen(req, timeout=12) as resp:
+                        payload = json.loads(resp.read().decode("utf-8"))
+                    break
+                except Exception:
+                    if attempt >= 2:
+                        payload = None
+                        break
+                    time.sleep(0.5 * (attempt + 1))
+            if not isinstance(payload, dict):
+                break
+            rows = payload.get("result")
+            if not isinstance(rows, list):
+                msg = str(payload.get("message") or "").strip().lower()
+                res = str(payload.get("result") or "").strip().lower()
+                # Normal end-of-list variants.
+                if "no records" in res or "no records" in msg or "not found" in res:
+                    break
+                break
+            if not rows:
+                break
+            appended = 0
+            for row in rows:
+                if isinstance(row, dict):
+                    out.append(row)
+                    appended += 1
+                    if len(out) >= int(max_rows):
+                        break
+            if appended < int(need):
+                break
+            page += 1
+        if out:
+            return out
+    return out
+
+
+def _riko_holder_activity_from_explorer_logs(
+    chain_id: int,
+    riko_token: str,
+    *,
+    from_block: int,
+    to_block: int,
+    max_rows: int = 10_000,
+) -> dict[str, dict[str, Any]]:
+    token = str(riko_token or "").strip().lower()
+    if not _is_eth_address(token):
+        return {}
+    logs = _explorer_v2_get_logs_rows(
+        int(chain_id),
+        token,
+        "0x" + keccak(text="Transfer(address,address,uint256)").hex(),
+        from_block=int(from_block),
+        to_block=int(to_block),
+        max_rows=int(max_rows),
+    )
+    out: dict[str, dict[str, Any]] = {}
+    zero = "0x0000000000000000000000000000000000000000"
+    for lg in logs:
+        if not isinstance(lg, dict):
+            continue
+        topics = lg.get("topics")
+        if not isinstance(topics, list) or len(topics) < 3:
+            continue
+        tx_hash = str(lg.get("transactionHash") or "").strip().lower()
+        block_number = _parse_int_like(lg.get("blockNumber") or 0)
+        ts = _parse_int_like(lg.get("timeStamp") or lg.get("timestamp") or 0)
+        for raw_addr in (_eth_topic_to_address(str(topics[1] or "")), _eth_topic_to_address(str(topics[2] or ""))):
+            addr = str(raw_addr or "").strip().lower()
+            if not _is_eth_address(addr) or addr == zero:
+                continue
+            prev = out.get(addr) or {}
+            prev_block = int(prev.get("last_change_block") or 0)
+            if int(block_number) < prev_block:
+                continue
+            out[addr] = {
+                "last_change_block": int(block_number),
+                "last_change_ts": int(ts),
+                "last_change_hash": tx_hash if tx_hash.startswith("0x") and len(tx_hash) == 66 else "",
+            }
+    return out
 
 
 def _explorer_contract_creation_block(chain_id: int, contract_address: str) -> int:
@@ -22385,10 +22512,25 @@ def _riko_erc20_balance_of(rpc_url: str, token_address: str, holder: str) -> int
 
 def _riko_collect_holder_candidates_from_transfers(
     rpc_url: str, riko_token: str, from_block: int, to_block: int
-) -> set[str]:
+) -> tuple[set[str], str]:
     out: set[str] = set()
     if to_block < from_block:
-        return out
+        return out, "none"
+    if bool(RIKO_PREVIEW_USE_EXPLORER):
+        try:
+            chain_id = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_chainId", []))
+            activity = _riko_holder_activity_from_explorer_logs(
+                int(chain_id),
+                str(riko_token or "").strip().lower(),
+                from_block=int(from_block),
+                to_block=int(to_block),
+                max_rows=12_000,
+            )
+            if activity:
+                return set(activity.keys()), "explorer"
+        except Exception:
+            # Fallback to direct eth_getLogs below.
+            pass
     topic_transfer = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
     # Some providers/plans (e.g. Alchemy Free on Sepolia) enforce very small
     # eth_getLogs ranges. Start wide, then shrink adaptively down to 10 blocks.
@@ -22429,7 +22571,7 @@ def _riko_collect_holder_candidates_from_transfers(
         # Keep the discovered working chunk size to avoid oscillation
         # (grow->fail->shrink) on strict provider limits.
         start = end + 1
-    return out
+    return out, "rpc"
 
 
 def _riko_send_erc20_transfer_tx(
@@ -22525,18 +22667,23 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
             last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
         from_block = last_scanned_block + 1
         scan_to_block = latest_block
+        holder_scan_source = "none"
         if from_block <= latest_block:
             max_scan_blocks = max(10, int(RIKO_AUTO_YIELD_PREVIEW_SCAN_MAX_BLOCKS))
             scan_to_block = min(latest_block, from_block + max_scan_blocks - 1)
-            discovered = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, scan_to_block)
+            discovered, holder_scan_source = _riko_collect_holder_candidates_from_transfers(
+                rpc_url, riko_token, from_block, scan_to_block
+            )
             cached_holders.update(discovered)
             _riko_auto_yield_save_holder_cache(sorted(cached_holders), scan_to_block)
         else:
             _riko_auto_yield_save_holder_cache(sorted(cached_holders), last_scanned_block)
+            holder_scan_source = "cache"
         result["holder_scan_from_block"] = int(from_block)
         result["holder_scan_to_block"] = int(scan_to_block)
         result["holder_scan_latest_block"] = int(latest_block)
         result["holder_scan_has_more"] = bool(scan_to_block < latest_block)
+        result["holder_scan_source"] = str(holder_scan_source or "none")
     except Exception as e:
         result.update({"status": "error", "reason": f"rpc error: {str(e)[:240]}"})
         return result
@@ -22606,6 +22753,71 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
         }
     )
     return result
+
+
+def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
+    riko_token = str(RIKO_VAULT_ADDRESS or "").strip().lower()
+    if not _is_eth_address(riko_token):
+        raise ValueError("RIKO_VAULT_ADDRESS is not configured.")
+    rpc_url = _riko_auto_yield_rpc_url_runtime()
+    if not rpc_url:
+        raise ValueError("RIKO_AUTO_YIELD_RPC_URL is not configured.")
+    chain_id = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_chainId", []))
+    latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
+    bot_cfg = _load_riko_auto_yield_bot_config()
+    start_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0))
+    if start_block <= 0:
+        start_block = max(0, int(RIKO_AUTO_YIELD_HOLDER_SCAN_START_BLOCK))
+    from_block = max(0, int(start_block))
+    to_block = max(from_block, int(latest_block))
+    activity = _riko_holder_activity_from_explorer_logs(
+        int(chain_id),
+        riko_token,
+        from_block=from_block,
+        to_block=to_block,
+        max_rows=20_000,
+    )
+    holders = sorted(activity.keys(), key=lambda a: int((activity.get(a) or {}).get("last_change_block") or 0), reverse=True)
+    if int(limit) > 0:
+        holders = holders[: max(1, min(2000, int(limit)))]
+    riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
+    rows: list[dict[str, Any]] = []
+    for holder in holders:
+        try:
+            bal = int(_riko_erc20_balance_of(rpc_url, riko_token, holder))
+        except Exception:
+            continue
+        meta = activity.get(holder) or {}
+        tx_hash = str(meta.get("last_change_hash") or "").strip().lower()
+        tx_url = _explorer_tx_url_for_chain(int(chain_id), tx_hash) if tx_hash else ""
+        ts = int(meta.get("last_change_ts") or 0)
+        rows.append(
+            {
+                "address": holder,
+                "balance_raw": int(bal),
+                "last_change_ts": int(ts),
+                "last_change_iso": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts > 0 else "",
+                "last_change_hash": tx_hash,
+                "last_change_tx_url": tx_url,
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            int(r.get("last_change_ts") or 0),
+            int(r.get("balance_raw") or 0),
+        ),
+        reverse=True,
+    )
+    return {
+        "ok": True,
+        "chain_id": int(chain_id),
+        "riko_token": riko_token,
+        "riko_decimals": int(riko_decimals),
+        "holder_scan_start_block": int(from_block),
+        "holder_scan_latest_block": int(latest_block),
+        "count": int(len(rows)),
+        "items": rows,
+    }
 
 
 def _riko_auto_yield_try_once() -> dict[str, Any]:
@@ -22731,7 +22943,7 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
         last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
     from_block = last_scanned_block + 1
     if from_block <= latest_block:
-        discovered = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, latest_block)
+        discovered, _ = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, latest_block)
         cached_holders.update(discovered)
     _riko_auto_yield_save_holder_cache(sorted(cached_holders), latest_block)
 
@@ -31398,6 +31610,7 @@ def _render_admin_page() -> str:
       <button class="tab-btn active" id="tabBtnSettings" onclick="switchTab('settings')">Settings</button>
       <button class="tab-btn" id="tabBtnAccess" onclick="switchTab('access')">Access</button>
       <button class="tab-btn" id="tabBtnPendingRedeem" onclick="switchTab('pendingredeem')">Redeem</button>
+      <button class="tab-btn" id="tabBtnRikoHolders" onclick="switchTab('rikoholders')">RIKO holders</button>
       <button class="tab-btn" id="tabBtnPairLists" onclick="switchTab('pairlists')">Pair lists</button>
       <button class="tab-btn" id="tabBtnStats" onclick="switchTab('stats')">Stats</button>
       <button class="tab-btn" id="tabBtnTickets" onclick="switchTab('tickets')">Help tickets</button>
@@ -31553,6 +31766,20 @@ def _render_admin_page() -> str:
             <table id="adminRikoYieldHistoryTable" class="admin-history-table"></table>
           </div>
         </details>
+      </section>
+    </div>
+    <div class="grid" id="tabRikoHolders" style="display:none">
+      <section class="card">
+        <h3>RIKO holders</h3>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Snapshot</label>
+          <div id="adminRikoHoldersSummary">-</div>
+          <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolders()">Refresh</button>
+        </div>
+        <div class="table-wrap" style="margin-top:8px">
+          <table id="adminRikoHoldersTable" class="admin-history-table"></table>
+        </div>
+        <span id="adminRikoHoldersStatus" class="status">Ready</span>
       </section>
     </div>
     <div class="grid" id="tabPairLists" style="display:none">
@@ -32454,6 +32681,52 @@ def _render_admin_page() -> str:
         renderAdminRikoHistoryTable("adminRikoDepositHistoryTable", ["Info"], [], "Failed to load deposit history.");
         renderAdminRikoHistoryTable("adminRikoYieldHistoryTable", ["Info"], [], "Failed to load yield payout history.");
         setAdminRikoPendingOpsStatus("Pending queue load failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function loadAdminRikoHolders() {{
+      const table = document.getElementById("adminRikoHoldersTable");
+      const statusEl = document.getElementById("adminRikoHoldersStatus");
+      const summaryEl = document.getElementById("adminRikoHoldersSummary");
+      if (!table || !statusEl || !summaryEl) return;
+      try {{
+        statusEl.textContent = "Loading holders...";
+        statusEl.classList.remove("err");
+        const r = await fetch("/api/admin/riko/holders?limit=1000");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data?.detail || "Failed to load RIKO holders");
+        const rows = Array.isArray(data?.items) ? data.items : [];
+        const decimals = Number(data?.riko_decimals || 6);
+        const head = "<tr><th>Address</th><th>Balance</th><th>Last change date</th><th>Tx hash</th></tr>";
+        if (!rows.length) {{
+          table.innerHTML = head + "<tr><td class='muted' colspan='4'>No holders found.</td></tr>";
+        }} else {{
+          table.innerHTML = head + rows.map((it) => {{
+            const addr = String(it?.address || "").trim().toLowerCase();
+            const balRaw = String(it?.balance_raw || "0");
+            const ts = Number(it?.last_change_ts || 0);
+            const dateTxt = ts > 0 ? formatAdminRikoDate(ts) : "-";
+            const txHash = String(it?.last_change_hash || "").trim().toLowerCase();
+            const txUrl = String(it?.last_change_tx_url || "").trim();
+            const txHtml = /^0x[a-f0-9]{64}$/.test(txHash)
+              ? (txUrl ? `<a href="${{esc(txUrl)}}" target="_blank" rel="noopener">${{shortHexAdmin(txHash)}}</a>` : `<span class='mono'>${{shortHexAdmin(txHash)}}</span>`)
+              : "-";
+            return (
+              "<tr>" +
+              `<td class='mono'>${{shortAddrAdmin(addr)}}</td>` +
+              `<td class='mono'>${{formatAdminRawUnits(balRaw, decimals, 8)}}</td>` +
+              `<td>${{dateTxt}}</td>` +
+              `<td>${{txHtml}}</td>` +
+              "</tr>"
+            );
+          }}).join("");
+        }}
+        summaryEl.textContent =
+          `holders=${{Number(data?.count || rows.length)}} | token=${{shortAddrAdmin(String(data?.riko_token || ""))}} | scan=${{Number(data?.holder_scan_start_block || 0)}}..${{Number(data?.holder_scan_latest_block || 0)}}`;
+        statusEl.textContent = `Loaded ${{rows.length}} holder rows.`;
+      }} catch (e) {{
+        table.innerHTML = "<tr><td class='muted'>Failed to load holders.</td></tr>";
+        statusEl.textContent = "RIKO holders load failed: " + (e?.shortMessage || e?.message || "unknown");
+        statusEl.classList.add("err");
       }}
     }}
     function normAddrLower(v) {{
@@ -33521,6 +33794,7 @@ def _render_admin_page() -> str:
       const isAccess = tab === "access";
       const isSettings = tab === "settings";
       const isPendingRedeem = tab === "pendingredeem";
+      const isRikoHolders = tab === "rikoholders";
       const isPairLists = tab === "pairlists";
       const isStats = tab === "stats";
       const isTickets = tab === "tickets";
@@ -33529,6 +33803,7 @@ def _render_admin_page() -> str:
       document.getElementById("tabAccess").style.display = isAccess ? "grid" : "none";
       document.getElementById("tabSettings").style.display = isSettings ? "grid" : "none";
       document.getElementById("tabPendingRedeem").style.display = isPendingRedeem ? "grid" : "none";
+      document.getElementById("tabRikoHolders").style.display = isRikoHolders ? "grid" : "none";
       document.getElementById("tabPairLists").style.display = isPairLists ? "grid" : "none";
       document.getElementById("tabStats").style.display = isStats ? "grid" : "none";
       document.getElementById("tabTickets").style.display = isTickets ? "grid" : "none";
@@ -33537,12 +33812,14 @@ def _render_admin_page() -> str:
       document.getElementById("tabBtnAccess").classList.toggle("active", isAccess);
       document.getElementById("tabBtnSettings").classList.toggle("active", isSettings);
       document.getElementById("tabBtnPendingRedeem").classList.toggle("active", isPendingRedeem);
+      document.getElementById("tabBtnRikoHolders").classList.toggle("active", isRikoHolders);
       document.getElementById("tabBtnPairLists").classList.toggle("active", isPairLists);
       document.getElementById("tabBtnStats").classList.toggle("active", isStats);
       document.getElementById("tabBtnTickets").classList.toggle("active", isTickets);
       document.getElementById("tabBtnFeedback").classList.toggle("active", isFeedback);
       document.getElementById("tabBtnFaq").classList.toggle("active", isFaq);
       if (isPendingRedeem) loadAdminRikoPendingQueue();
+      if (isRikoHolders) loadAdminRikoHolders();
       if (isStats) loadStats();
       if (isTickets) loadTickets();
       if (isFeedback) loadFeedback();
@@ -33938,8 +34215,17 @@ def _render_admin_page() -> str:
     function formatAdminRikoPayoutPreviewDebug(data) {{
       const label = String(data?.rpc_url_label || "").trim();
       const keyPresent = !!data?.rpc_key_present;
-      if (!label && !keyPresent) return "";
-      return ` [rpc=${{label || "missing"}}; key=${{keyPresent ? "present" : "missing"}}]`;
+      const source = String(data?.holder_scan_source || "").trim();
+      const fromBlock = Number(data?.holder_scan_from_block || 0);
+      const toBlock = Number(data?.holder_scan_to_block || 0);
+      const latest = Number(data?.holder_scan_latest_block || 0);
+      const hasMore = !!data?.holder_scan_has_more;
+      const parts = [];
+      if (label || keyPresent) parts.push(`rpc=${{label || "missing"}}; key=${{keyPresent ? "present" : "missing"}}`);
+      if (source) parts.push(`source=${{source}}`);
+      if (toBlock > 0 || latest > 0) parts.push(`scan=${{fromBlock}}..${{toBlock}}/${{latest}}${{hasMore ? " (more)" : ""}}`);
+      if (!parts.length) return "";
+      return ` [${{parts.join("; ")}}]`;
     }}
     function renderAdminRikoPayoutPreview(data) {{
       const summaryEl = document.getElementById("adminRikoPayoutPreviewSummary");
@@ -33962,8 +34248,15 @@ def _render_admin_page() -> str:
       const totalRaw = String(data?.total_payout_raw || "0");
       const availableRaw = String(data?.available_raw || "0");
       const canPay = !!data?.can_pay;
+      const source = String(data?.holder_scan_source || "unknown").trim();
+      const scanFrom = Number(data?.holder_scan_from_block || 0);
+      const scanTo = Number(data?.holder_scan_to_block || 0);
+      const scanLatest = Number(data?.holder_scan_latest_block || 0);
+      const scanTail = scanTo > 0 || scanLatest > 0
+        ? ` | scan=${{scanFrom}}..${{scanTo}}/${{scanLatest}}${{data?.holder_scan_has_more ? " (more)" : ""}}`
+        : "";
       summaryEl.textContent =
-        `bps=${{bps}} | holders=${{holders}} | payouts=${{payoutCount}} | total=${{formatAdminRawUnits(totalRaw, payoutDecimals, 8)}} | wallet=${{formatAdminRawUnits(availableRaw, payoutDecimals, 8)}} | ${{canPay ? "funded" : "insufficient"}}`;
+        `bps=${{bps}} | holders=${{holders}} | payouts=${{payoutCount}} | total=${{formatAdminRawUnits(totalRaw, payoutDecimals, 8)}} | wallet=${{formatAdminRawUnits(availableRaw, payoutDecimals, 8)}} | ${{canPay ? "funded" : "insufficient"}} | source=${{source}}${{scanTail}}`;
       const top = Array.isArray(data?.top_recipients) ? data.top_recipients : [];
       if (!top.length) {{
         table.innerHTML = "<tr><th>Top-10 recipient preview</th></tr><tr><td class='muted'>No positive payouts.</td></tr>";
@@ -35692,6 +35985,21 @@ def admin_riko_auto_yield_mode_update(
         "riko_payout_schedule": _load_riko_payout_schedule(),
         "riko_auto_yield_bot_config": _load_riko_auto_yield_bot_config(),
     }
+
+
+@app.get("/api/admin/riko/holders")
+def admin_riko_holders(request: Request, response: Response) -> dict[str, Any]:
+    _require_admin(request, response)
+    try:
+        limit = max(1, min(2000, int(str(request.query_params.get("limit") or "500").strip())))
+    except Exception:
+        limit = 500
+    try:
+        return _riko_admin_holders_snapshot(limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to load RIKO holders: {e}") from e
 
 
 @app.get("/api/admin/riko/auto-payout-preview")
