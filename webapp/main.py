@@ -22208,8 +22208,9 @@ def _eth_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
     rpc = _normalize_rpc_url(rpc_url)
     if not rpc or not rpc.lower().startswith(("http://", "https://")):
         raise RuntimeError("rpc url is invalid or missing")
-    max_attempts = 5
-    base_backoff_sec = 0.25
+    is_logs_method = str(method or "").strip().lower() == "eth_getlogs"
+    max_attempts = 8 if is_logs_method else 5
+    base_backoff_sec = 1.0 if is_logs_method else 0.25
     for attempt in range(max_attempts):
         req_payload = json.dumps(
             {"jsonrpc": "2.0", "id": int(time.time() * 1000) % 1_000_000_000, "method": method, "params": params or []}
@@ -22242,7 +22243,7 @@ def _eth_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
                 with contextlib.suppress(Exception):
                     retry_after_sec = float(str(getattr(e, "headers", {}).get("Retry-After", "0")).strip() or 0)
                 sleep_sec = retry_after_sec if retry_after_sec > 0 else min(
-                    4.0,
+                    12.0 if is_logs_method else 4.0,
                     float(base_backoff_sec) * (2 ** attempt),
                 )
                 time.sleep(sleep_sec)
@@ -22271,7 +22272,7 @@ def _eth_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
             )
             if is_rate_limited and attempt < (max_attempts - 1):
                 sleep_sec = min(
-                    4.0,
+                    12.0 if is_logs_method else 4.0,
                     float(base_backoff_sec) * (2 ** attempt),
                 )
                 time.sleep(sleep_sec)
@@ -33075,7 +33076,11 @@ def _render_admin_page() -> str:
         const symbol = String(it?.symbol || "").trim().toLowerCase();
         const address = normalizeAdminRikoAddress(it?.address || "");
         const allowance = String(it?.allowance || "").trim();
-        if (!symbol || !/^0x[a-f0-9]{{40}}$/.test(address) || !allowance) continue;
+        const allowanceNormalized = allowance.toLowerCase();
+        // Treat explicit zero as "skip this row" for presets/apply-all flow.
+        // Backend preset storage accepts only positive values or "max".
+        const isZeroAllowance = /^0+(?:\.0+)?$/.test(allowanceNormalized);
+        if (!symbol || !/^0x[a-f0-9]{{40}}$/.test(address) || !allowance || isZeroAllowance) continue;
         if (seen.has(address)) continue;
         seen.add(address);
         out.push({{ symbol, address, allowance }});
