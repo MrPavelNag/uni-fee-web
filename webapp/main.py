@@ -32260,7 +32260,10 @@ def _render_admin_page() -> str:
         const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
         const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, provider);
         const latest = Number(await provider.getBlockNumber());
-        const fromBlock = Math.max(0, latest - 80000);
+        // Pending queue must include older user redeems as well.
+        // Keep a large lookback window to avoid silently missing valid pending entries.
+        const pendingQueueLookbackBlocks = 2500000;
+        const fromBlock = Math.max(0, latest - pendingQueueLookbackBlocks);
         const loadWarns = [];
         async function queryFilterChunked(filterObj, label) {{
           const out = [];
@@ -32671,9 +32674,17 @@ def _render_admin_page() -> str:
         );
 
         if (loadWarns.length) {{
-          setAdminRikoPendingOpsStatus("Pending queue loaded with partial RPC warnings.", true);
+          setAdminRikoPendingOpsStatus(
+            `Pending queue loaded with partial RPC warnings (scan window: ${{fromBlock}}..${{latest}}).`,
+            true
+          );
         }} else {{
-          setAdminRikoPendingOpsStatus(rows.length ? "Pending queue loaded." : "Pending queue is empty.", false);
+          setAdminRikoPendingOpsStatus(
+            rows.length
+              ? `Pending queue loaded (scan window: ${{fromBlock}}..${{latest}}).`
+              : `Pending queue is empty (scan window: ${{fromBlock}}..${{latest}}).`,
+            false
+          );
         }}
       }} catch (e) {{
         table.innerHTML = "<tr><td class='muted'>Failed to load pending queue.</td></tr>";
