@@ -252,7 +252,6 @@ AUTH_LOCK = threading.Lock()
 RIKO_APPLY_SIGN_TTL_SEC = int(os.environ.get("RIKO_APPLY_SIGN_TTL_SEC", "600"))
 RIKO_APPLY_NONCES: dict[str, dict[str, Any]] = {}
 RIKO_VAULT_ADDRESS = os.environ.get("RIKO_VAULT_ADDRESS", "").strip()
-RIKO_YIELD_DISTRIBUTOR_ADDRESS = os.environ.get("RIKO_YIELD_DISTRIBUTOR_ADDRESS", "").strip()
 TREASURY_YIELD_CACHE_TTL_SEC = max(300, int(os.environ.get("TREASURY_YIELD_CACHE_TTL_SEC", "21600")))
 TREASURY_YIELD_CACHE: dict[str, Any] = {}
 TREASURY_YIELD_CACHE_LOCK = threading.Lock()
@@ -269,11 +268,18 @@ RIKO_AUTO_YIELD_MAX_BPS = max(RIKO_AUTO_YIELD_MIN_BPS, int(os.environ.get("RIKO_
 RIKO_AUTO_YIELD_MAX_DELTA_BPS = max(1, int(os.environ.get("RIKO_AUTO_YIELD_MAX_DELTA_BPS", "3")))
 RIKO_AUTO_YIELD_RPC_URL = os.environ.get("RIKO_AUTO_YIELD_RPC_URL", "").strip()
 RIKO_AUTO_YIELD_PRIVATE_KEY = os.environ.get("RIKO_AUTO_YIELD_PRIVATE_KEY", "").strip()
+RIKO_AUTO_YIELD_PAYOUT_TOKEN_ADDRESS = os.environ.get("RIKO_AUTO_YIELD_PAYOUT_TOKEN_ADDRESS", "").strip()
+RIKO_AUTO_YIELD_HOLDER_SCAN_START_BLOCK = max(0, int(os.environ.get("RIKO_AUTO_YIELD_HOLDER_SCAN_START_BLOCK", "0")))
 RIKO_AUTO_YIELD_STATE_KEY = "riko_auto_yield_state_v1"
+RIKO_AUTO_YIELD_HOLDER_CACHE_STATE_KEY = "riko_auto_yield_holder_cache_v1"
+RIKO_AUTO_YIELD_BOT_CONFIG_STATE_KEY = "riko_auto_yield_bot_config_v1"
+RIKO_AUTO_PAYOUT_SCHEDULE_CLAIM_KEY_PREFIX = "riko_auto_payout_claim_v1:"
 RIKO_PAYOUT_SCHEDULE_STATE_KEY = "riko_payout_schedule_v1"
 RIKO_AUTO_YIELD_CONTROL_STATE_KEY = "riko_auto_yield_control_v1"
 RIKO_AUTO_YIELD_STOP = threading.Event()
 RIKO_AUTO_YIELD_THREAD: threading.Thread | None = None
+RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS: set[str] = set()
+RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS_LOCK = threading.Lock()
 ADMIN_WALLETS_DEFAULT = "0xD3155f6A7525F81595609E83789bbb95d91aaEdf"
 ADMIN_WALLET_ADDRESSES_ENV = os.environ.get("ADMIN_WALLET_ADDRESSES", ADMIN_WALLETS_DEFAULT)
 ADMIN_ROOT_WALLETS_ENV = os.environ.get("ADMIN_ROOT_WALLETS", ADMIN_WALLETS_DEFAULT)
@@ -1401,6 +1407,48 @@ def _analytics_get_state(key: str) -> str:
     return str(row[0]) if row else ""
 
 
+def _riko_auto_payout_claim_key(schedule_date_key: str) -> str:
+    return f"{RIKO_AUTO_PAYOUT_SCHEDULE_CLAIM_KEY_PREFIX}{str(schedule_date_key or '').strip()}"
+
+
+def _riko_auto_payout_try_claim_schedule_date(schedule_date_key: str) -> bool:
+    day_key = str(schedule_date_key or "").strip()
+    if not day_key:
+        return False
+    if not ANALYTICS_ENABLED:
+        # Best effort in no-analytics mode (per-process memory).
+        with RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS_LOCK:
+            if day_key in RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS:
+                return False
+            RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS.add(day_key)
+            return True
+    key = _riko_auto_payout_claim_key(day_key)
+    now_iso = _iso_now()
+    with _analytics_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM analytics_state WHERE key = ?", (key,)).fetchone()
+        if row is not None:
+            conn.rollback()
+            return False
+        conn.execute("INSERT INTO analytics_state(key, value) VALUES(?, ?)", (key, now_iso))
+        conn.commit()
+    return True
+
+
+def _riko_auto_payout_release_schedule_date_claim(schedule_date_key: str) -> None:
+    day_key = str(schedule_date_key or "").strip()
+    if not day_key:
+        return
+    if not ANALYTICS_ENABLED:
+        with RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS_LOCK:
+            RIKO_AUTO_PAYOUT_VOLATILE_CLAIMS.discard(day_key)
+        return
+    key = _riko_auto_payout_claim_key(day_key)
+    with _analytics_conn() as conn:
+        conn.execute("DELETE FROM analytics_state WHERE key = ?", (key,))
+        conn.commit()
+
+
 def _parse_int_like(value: Any) -> int:
     raw = str(value or "").strip()
     if not raw:
@@ -2328,21 +2376,21 @@ def _human_admin_wallet_event_name(event: str) -> str:
 def _human_riko_auto_yield_reason(reason: str) -> tuple[str, str]:
     r = str(reason or "").strip().lower()
     mapping: dict[str, tuple[str, str]] = {
-        "yield_distributor_not_configured": (
-            "Yield distributor address is not configured on server.",
-            "Set RIKO_YIELD_DISTRIBUTOR_ADDRESS.",
+        "riko_token_not_configured": (
+            "RIKO token (vault) address is not configured on server.",
+            "Set RIKO_VAULT_ADDRESS.",
+        ),
+        "payout_token_not_configured": (
+            "Payout token address is not configured on server.",
+            "Set RIKO_AUTO_YIELD_PAYOUT_TOKEN_ADDRESS.",
         ),
         "pilot_config_frozen": (
-            "Pilot config is frozen; auto-yield updates are blocked.",
+            "Pilot config is frozen; auto-payout updates are blocked.",
             "Unset RIKO_PILOT_CONFIG_FROZEN or use mutable mode.",
         ),
         "auto_yield_rpc_or_key_missing": (
             "Server RPC URL and/or private key is missing for on-chain payout transaction.",
             "Set RIKO_AUTO_YIELD_RPC_URL and RIKO_AUTO_YIELD_PRIVATE_KEY.",
-        ),
-        "signer_is_not_owner": (
-            "Configured signer is not the owner of yield distributor.",
-            "Use owner key or transfer ownership to this signer.",
         ),
         "not_scheduled_payout_date": (
             "Today is not in payout dates list.",
@@ -2365,8 +2413,20 @@ def _human_riko_auto_yield_reason(reason: str) -> tuple[str, str]:
             "No action needed.",
         ),
         "tx_reverted": (
-            "On-chain transaction reverted.",
-            "Check token config, oracle freshness, liquidity and signer permissions.",
+            "On-chain transfer transaction reverted.",
+            "Check payout token, sender balance and recipient addresses.",
+        ),
+        "no_holders_with_balance": (
+            "No RIKO holders with positive balance were found.",
+            "No action needed.",
+        ),
+        "no_positive_payouts": (
+            "Calculated payout amounts are zero for all holders.",
+            "Increase payout rate or wait for larger balances.",
+        ),
+        "insufficient_payout_balance": (
+            "Payout wallet balance is lower than required total payout.",
+            "Top up payout wallet or reduce payout amount/rate.",
         ),
     }
     return mapping.get(r, (r.replace("_", " ") or "unknown reason", "Check server logs for details."))
@@ -7790,7 +7850,7 @@ def _wrapped_native_by_chain(chain_id: int) -> str:
     return ""
 
 
-def _riko_tx_action_label(row: dict[str, Any], vault_addr: str, distributor_addr: str) -> str:
+def _riko_tx_action_label(row: dict[str, Any], vault_addr: str) -> str:
     fn = str(row.get("functionName") or "").strip()
     method = str(row.get("methodId") or "").strip().lower()
     to_addr = str(row.get("to") or "").strip().lower()
@@ -7802,13 +7862,7 @@ def _riko_tx_action_label(row: dict[str, Any], vault_addr: str, distributor_addr
         if "cancelPendingRedemption(" in fn:
             return "Cancel pending redeem"
         if "claimMonthlyYield(" in fn or "claimMonthlyYieldFor(" in fn:
-            return "Claim monthly yield"
-        if "setYieldTokenAddress(" in fn:
-            return "Set yield token"
-        if "setYieldPayerAddress(" in fn:
-            return "Set yield payer"
-        if "setMonthlyYieldRateBps(" in fn:
-            return "Set monthly bps"
+            return "Legacy yield claim (deprecated)"
         if "setRikoPriceUsd6(" in fn:
             return "Set RIKO price"
         if "setTokenConfig(" in fn:
@@ -7821,8 +7875,6 @@ def _riko_tx_action_label(row: dict[str, Any], vault_addr: str, distributor_addr
     if method == "0x":
         if to_addr == vault_addr:
             return "Transfer to vault"
-        if to_addr == distributor_addr:
-            return "Transfer to distributor"
         return "Transfer"
     return f"Call {method[:10]}"
 
@@ -21587,7 +21639,11 @@ def _riko_auto_yield_load_state() -> dict[str, Any]:
 def _riko_auto_yield_save_state(state: dict[str, Any]) -> None:
     if not isinstance(state, dict):
         return
+    prev = _riko_auto_yield_load_state()
     clean = dict(state)
+    for k in ("applied_month", "applied_schedule_date"):
+        if k not in clean and prev.get(k):
+            clean[k] = prev.get(k)
     clean["updated_at"] = _iso_now()
     _analytics_set_state(RIKO_AUTO_YIELD_STATE_KEY, json.dumps(clean, ensure_ascii=False))
 
@@ -21627,6 +21683,47 @@ def _set_riko_auto_yield_enabled(enabled: bool) -> dict[str, Any]:
     else:
         _stop_riko_auto_yield_job()
     return _riko_auto_yield_control_payload()
+
+
+def _load_riko_auto_yield_bot_config() -> dict[str, Any]:
+    payout_token_address = str(RIKO_AUTO_YIELD_PAYOUT_TOKEN_ADDRESS or "").strip().lower()
+    holder_scan_start_block = max(0, int(RIKO_AUTO_YIELD_HOLDER_SCAN_START_BLOCK))
+    source = "env"
+    raw = _analytics_get_state(RIKO_AUTO_YIELD_BOT_CONFIG_STATE_KEY)
+    updated_at = ""
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                token_raw = str(parsed.get("payout_token_address") or "").strip().lower()
+                if _is_eth_address(token_raw):
+                    payout_token_address = token_raw
+                block_raw = parsed.get("holder_scan_start_block")
+                if block_raw is not None:
+                    holder_scan_start_block = max(0, int(block_raw))
+                updated_at = str(parsed.get("updated_at") or "")
+                source = "admin_override"
+        except Exception:
+            pass
+    return {
+        "payout_token_address": payout_token_address,
+        "holder_scan_start_block": int(holder_scan_start_block),
+        "source": source,
+        "updated_at": updated_at,
+    }
+
+
+def _save_riko_auto_yield_bot_config(payout_token_address: str, holder_scan_start_block: int) -> dict[str, Any]:
+    token = str(payout_token_address or "").strip().lower()
+    if token and (not _is_eth_address(token)):
+        raise ValueError("payout token address must be a valid 0x address")
+    payload = {
+        "payout_token_address": token,
+        "holder_scan_start_block": max(0, int(holder_scan_start_block or 0)),
+        "updated_at": _iso_now(),
+    }
+    _analytics_set_state(RIKO_AUTO_YIELD_BOT_CONFIG_STATE_KEY, json.dumps(payload, ensure_ascii=False))
+    return _load_riko_auto_yield_bot_config()
 
 
 def _riko_is_valid_month_day(month: int, day: int) -> bool:
@@ -21823,42 +21920,140 @@ def _eth_decode_address(result_hex: Any) -> str:
     return addr if _is_eth_address(addr) else ""
 
 
-def _riko_onchain_read_monthly_bps(rpc_url: str, vault_address: str) -> int:
-    data = _eth_encode_call("monthlyYieldRateBps()")
-    out = _eth_rpc(rpc_url, "eth_call", [{"to": vault_address, "data": data}, "latest"])
-    return _eth_decode_uint256(out)
+def _eth_topic_to_address(topic_hex: str) -> str:
+    raw = str(topic_hex or "").strip().lower()
+    if raw.startswith("0x"):
+        raw = raw[2:]
+    if len(raw) != 64:
+        return ""
+    return _eth_decode_address("0x" + raw)
 
 
-def _riko_onchain_read_yield_cycle(rpc_url: str, vault_address: str) -> int:
-    data = _eth_encode_call("currentYieldCycle()")
-    out = _eth_rpc(rpc_url, "eth_call", [{"to": vault_address, "data": data}, "latest"])
-    return _eth_decode_uint256(out)
+def _eth_to_hex_block(block_number: int) -> str:
+    return hex(max(0, int(block_number)))
 
 
-def _riko_onchain_read_owner(rpc_url: str, vault_address: str) -> str:
-    data = _eth_encode_call("owner()")
-    out = _eth_rpc(rpc_url, "eth_call", [{"to": vault_address, "data": data}, "latest"])
-    return _eth_decode_address(out)
+def _riko_auto_yield_load_holder_cache() -> dict[str, Any]:
+    raw = _analytics_get_state(RIKO_AUTO_YIELD_HOLDER_CACHE_STATE_KEY)
+    if not raw:
+        return {"holders": [], "last_scanned_block": 0}
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return {"holders": [], "last_scanned_block": 0}
+        holders_raw = payload.get("holders")
+        holders: list[str] = []
+        if isinstance(holders_raw, list):
+            seen: set[str] = set()
+            for item in holders_raw:
+                a = str(item or "").strip().lower()
+                if _is_eth_address(a) and a not in seen:
+                    seen.add(a)
+                    holders.append(a)
+        last_scanned_block = max(0, int(payload.get("last_scanned_block") or 0))
+        return {"holders": holders, "last_scanned_block": last_scanned_block}
+    except Exception:
+        return {"holders": [], "last_scanned_block": 0}
 
 
-def _riko_send_set_monthly_bps_tx(rpc_url: str, private_key: str, vault_address: str, next_bps: int) -> tuple[str, int]:
+def _riko_auto_yield_save_holder_cache(holders: list[str], last_scanned_block: int) -> None:
+    clean_holders: list[str] = []
+    seen: set[str] = set()
+    for item in holders or []:
+        a = str(item or "").strip().lower()
+        if not _is_eth_address(a) or a in seen:
+            continue
+        seen.add(a)
+        clean_holders.append(a)
+    payload = {
+        "holders": clean_holders,
+        "last_scanned_block": max(0, int(last_scanned_block or 0)),
+        "updated_at": _iso_now(),
+    }
+    _analytics_set_state(RIKO_AUTO_YIELD_HOLDER_CACHE_STATE_KEY, json.dumps(payload, ensure_ascii=False))
+
+
+def _riko_erc20_decimals(rpc_url: str, token_address: str) -> int:
+    data = _eth_encode_call("decimals()")
+    out = _eth_rpc(rpc_url, "eth_call", [{"to": token_address, "data": data}, "latest"])
+    dec = _eth_decode_uint256(out)
+    if dec < 0 or dec > 36:
+        raise RuntimeError("invalid token decimals")
+    return int(dec)
+
+
+def _riko_erc20_balance_of(rpc_url: str, token_address: str, holder: str) -> int:
+    data = _eth_encode_call("balanceOf(address)", ["address"], [holder])
+    out = _eth_rpc(rpc_url, "eth_call", [{"to": token_address, "data": data}, "latest"])
+    return int(_eth_decode_uint256(out))
+
+
+def _riko_collect_holder_candidates_from_transfers(
+    rpc_url: str, riko_token: str, from_block: int, to_block: int
+) -> set[str]:
+    out: set[str] = set()
+    if to_block < from_block:
+        return out
+    topic_transfer = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
+    chunk = 10_000
+    start = max(0, int(from_block))
+    end_target = max(0, int(to_block))
+    while start <= end_target:
+        end = min(end_target, start + chunk - 1)
+        params = [
+            {
+                "address": riko_token,
+                "fromBlock": _eth_to_hex_block(start),
+                "toBlock": _eth_to_hex_block(end),
+                "topics": [topic_transfer],
+            }
+        ]
+        try:
+            logs = _eth_rpc(rpc_url, "eth_getLogs", params)
+        except Exception:
+            if chunk <= 250:
+                raise
+            chunk = max(250, chunk // 2)
+            continue
+        if isinstance(logs, list):
+            for lg in logs:
+                if not isinstance(lg, dict):
+                    continue
+                topics = lg.get("topics")
+                if not isinstance(topics, list) or len(topics) < 3:
+                    continue
+                addr_from = _eth_topic_to_address(str(topics[1] or ""))
+                addr_to = _eth_topic_to_address(str(topics[2] or ""))
+                if _is_eth_address(addr_from) and addr_from != "0x0000000000000000000000000000000000000000":
+                    out.add(addr_from.lower())
+                if _is_eth_address(addr_to) and addr_to != "0x0000000000000000000000000000000000000000":
+                    out.add(addr_to.lower())
+        if chunk < 10_000:
+            chunk = min(10_000, chunk * 2)
+        start = end + 1
+    return out
+
+
+def _riko_send_erc20_transfer_tx(
+    rpc_url: str, private_key: str, token_address: str, to_address: str, amount_raw: int, nonce: int | None = None
+) -> tuple[str, int, int]:
     acct = Account.from_key(private_key)
     from_addr = str(acct.address or "").strip()
     chain_id = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_chainId", []))
-    nonce = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_getTransactionCount", [from_addr, "pending"]))
+    tx_nonce = int(nonce) if nonce is not None else _eth_hex_to_int(_eth_rpc(rpc_url, "eth_getTransactionCount", [from_addr, "pending"]))
     gas_price = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_gasPrice", []))
-    data = _eth_encode_call("setMonthlyYieldRateBps(uint256)", ["uint256"], [int(next_bps)])
+    data = _eth_encode_call("transfer(address,uint256)", ["address", "uint256"], [to_address, int(amount_raw)])
     estimate_raw = _eth_rpc(
         rpc_url,
         "eth_estimateGas",
-        [{"from": from_addr, "to": vault_address, "data": data, "value": hex(0)}],
+        [{"from": from_addr, "to": token_address, "data": data, "value": hex(0)}],
     )
     gas_estimate = max(21_000, _eth_hex_to_int(estimate_raw))
-    gas_limit = int(gas_estimate * 1.2) + 5_000
+    gas_limit = int(gas_estimate * 1.2) + 7_500
     tx = {
         "chainId": int(chain_id),
-        "nonce": int(nonce),
-        "to": vault_address,
+        "nonce": int(tx_nonce),
+        "to": token_address,
         "value": 0,
         "data": data,
         "gas": int(gas_limit),
@@ -21871,7 +22066,7 @@ def _riko_send_set_monthly_bps_tx(rpc_url: str, private_key: str, vault_address:
     if raw_tx is None:
         raise RuntimeError("failed to sign tx")
     tx_hash = _eth_rpc(rpc_url, "eth_sendRawTransaction", ["0x" + bytes(raw_tx).hex()])
-    return str(tx_hash or ""), int(chain_id)
+    return str(tx_hash or ""), int(chain_id), int(tx_nonce)
 
 
 def _riko_wait_receipt(rpc_url: str, tx_hash: str, timeout_sec: int = 180) -> dict[str, Any]:
@@ -21887,9 +22082,14 @@ def _riko_wait_receipt(rpc_url: str, tx_hash: str, timeout_sec: int = 180) -> di
 
 def _riko_auto_yield_try_once() -> dict[str, Any]:
     result: dict[str, Any] = {"ts": _iso_now(), "status": "unknown"}
-    distributor = str(RIKO_YIELD_DISTRIBUTOR_ADDRESS or "").strip()
-    if not _is_eth_address(distributor):
-        result.update({"status": "skip", "reason": "yield_distributor_not_configured"})
+    riko_token = str(RIKO_VAULT_ADDRESS or "").strip()
+    if not _is_eth_address(riko_token):
+        result.update({"status": "skip", "reason": "riko_token_not_configured"})
+        return result
+    bot_cfg = _load_riko_auto_yield_bot_config()
+    payout_token = str(bot_cfg.get("payout_token_address") or "").strip()
+    if not _is_eth_address(payout_token):
+        result.update({"status": "skip", "reason": "payout_token_not_configured"})
         return result
     if RIKO_PILOT_CONFIG_FROZEN:
         result.update({"status": "skip", "reason": "pilot_config_frozen"})
@@ -21899,19 +22099,7 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
     if not rpc_url or not private_key:
         result.update({"status": "skip", "reason": "auto_yield_rpc_or_key_missing"})
         return result
-
-    owner = _riko_onchain_read_owner(rpc_url, distributor)
     sender = str(Account.from_key(private_key).address or "").strip().lower()
-    if _is_eth_address(owner) and owner.lower() != sender:
-        result.update(
-            {
-                "status": "error",
-                "reason": "signer_is_not_owner",
-                "owner": owner.lower(),
-                "signer": sender,
-            }
-        )
-        return result
 
     y = _fetch_us_treasury_daily_10y()
     now_utc = datetime.now(timezone.utc)
@@ -21923,7 +22111,7 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
     payout_time_utc = str(schedule.get("payout_time_utc") or "00:00")
     now_minutes = (int(now_utc.hour) * 60) + int(now_utc.minute)
     scheduled_minutes = (schedule_hour * 60) + schedule_minute
-    schedule_key = ""
+    schedule_date_key = ""
     if schedule_items:
         today_month = int(now_utc.month)
         today_day = int(now_utc.day)
@@ -21950,7 +22138,7 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
                 }
             )
             return result
-        schedule_key = f"{now_utc.year:04d}-{today_month:02d}-{today_day:02d}"
+        schedule_date_key = f"{now_utc.year:04d}-{today_month:02d}-{today_day:02d}"
     else:
         if now_utc.day != 1:
             result.update({"status": "skip", "reason": "not_first_day_of_month", "month_key": month_key})
@@ -21967,25 +22155,23 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
                 }
             )
             return result
-        schedule_key = f"{now_utc.year:04d}-{now_utc.month:02d}-{now_utc.day:02d}-{schedule_hour:02d}{schedule_minute:02d}"
-    if schedule_items:
-        schedule_key = f"{now_utc.year:04d}-{now_utc.month:02d}-{now_utc.day:02d}-{schedule_hour:02d}{schedule_minute:02d}"
+        schedule_date_key = f"{now_utc.year:04d}-{now_utc.month:02d}-{now_utc.day:02d}"
     last_raw = _analytics_get_state(RIKO_AUTO_YIELD_STATE_KEY)
     if last_raw:
         try:
             last_state = json.loads(last_raw)
             if isinstance(last_state, dict):
-                if schedule_key and str(last_state.get("applied_schedule_key") or "") == schedule_key:
+                if schedule_date_key and str(last_state.get("applied_schedule_date") or "") == schedule_date_key:
                     result.update(
                         {
                             "status": "skip",
                             "reason": "already_applied_for_scheduled_date",
-                            "schedule_key": schedule_key,
+                            "schedule_date_key": schedule_date_key,
                             "month_key": month_key,
                         }
                     )
                     return result
-                if (not schedule_key) and str(last_state.get("applied_month") or "") == month_key:
+                if (not schedule_date_key) and str(last_state.get("applied_month") or "") == month_key:
                     result.update({"status": "skip", "reason": "already_applied_this_month", "month_key": month_key})
                     return result
         except Exception:
@@ -21997,18 +22183,100 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
     raw_target_bps = float(monthly_pct) * 100.0
     target_bps = int(round(raw_target_bps))
     bounded_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
-
-    current_bps = int(_riko_onchain_read_monthly_bps(rpc_url, distributor))
-    current_cycle = int(_riko_onchain_read_yield_cycle(rpc_url, distributor))
     next_bps = int(bounded_bps)
-    delta = next_bps - current_bps
-    max_delta = int(RIKO_AUTO_YIELD_MAX_DELTA_BPS)
-    if abs(delta) > max_delta:
-        next_bps = current_bps + (max_delta if delta > 0 else -max_delta)
+
+    try:
+        riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
+        payout_decimals = _riko_erc20_decimals(rpc_url, payout_token)
+    except Exception as e:
+        result.update({"status": "error", "reason": str(e)[:280]})
+        return result
+
+    latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
+    holder_cache = _riko_auto_yield_load_holder_cache()
+    cached_holders = set([str(x).strip().lower() for x in holder_cache.get("holders") or [] if _is_eth_address(str(x).strip().lower())])
+    last_scanned_block = max(0, int(holder_cache.get("last_scanned_block") or 0))
+    if last_scanned_block <= 0:
+        last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
+    from_block = last_scanned_block + 1
+    if from_block <= latest_block:
+        discovered = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, latest_block)
+        cached_holders.update(discovered)
+    _riko_auto_yield_save_holder_cache(sorted(cached_holders), latest_block)
+
+    holders_with_balance: list[tuple[str, int]] = []
+    for holder in sorted(cached_holders):
+        try:
+            bal = int(_riko_erc20_balance_of(rpc_url, riko_token, holder))
+        except Exception:
+            continue
+        if bal > 0:
+            holders_with_balance.append((holder, bal))
+    if not holders_with_balance:
+        result.update(
+            {
+                "status": "skip",
+                "reason": "no_holders_with_balance",
+                "holders_scanned": int(len(cached_holders)),
+                "holders_positive": 0,
+                "month_key": month_key,
+                "schedule_date_key": schedule_date_key,
+            }
+        )
+        return result
+
+    payout_rows: list[tuple[str, int]] = []
+    scale_up = max(0, int(payout_decimals) - int(riko_decimals))
+    scale_down = max(0, int(riko_decimals) - int(payout_decimals))
+    total_payout_raw = 0
+    for holder, bal in holders_with_balance:
+        base_amount = int(bal)
+        if scale_up > 0:
+            base_amount *= 10**scale_up
+        elif scale_down > 0:
+            base_amount //= 10**scale_down
+        payout_raw = (base_amount * int(next_bps)) // 10_000
+        if payout_raw <= 0:
+            continue
+        payout_rows.append((holder, int(payout_raw)))
+        total_payout_raw += int(payout_raw)
+    if not payout_rows or total_payout_raw <= 0:
+        result.update(
+            {
+                "status": "skip",
+                "reason": "no_positive_payouts",
+                "holders_scanned": int(len(cached_holders)),
+                "holders_positive": int(len(holders_with_balance)),
+                "bps": int(next_bps),
+                "month_key": month_key,
+                "schedule_date_key": schedule_date_key,
+            }
+        )
+        return result
+
+    payout_wallet_balance = int(_riko_erc20_balance_of(rpc_url, payout_token, sender))
+    if payout_wallet_balance < total_payout_raw:
+        result.update(
+            {
+                "status": "skip",
+                "reason": "insufficient_payout_balance",
+                "payout_wallet": sender,
+                "required_raw": int(total_payout_raw),
+                "available_raw": int(payout_wallet_balance),
+                "payout_token": payout_token.lower(),
+                "holders_scanned": int(len(cached_holders)),
+                "holders_positive": int(len(holders_with_balance)),
+                "payout_count": int(len(payout_rows)),
+                "month_key": month_key,
+                "schedule_date_key": schedule_date_key,
+            }
+        )
+        return result
 
     result.update(
         {
             "status": "ok",
+            "action": "erc20_payouts_sent",
             "treasury_date": treasury_date,
             "annual_pct": round(annual_pct, 6),
             "daily_pct": round(daily_pct, 8),
@@ -22016,37 +22284,101 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
             "raw_target_bps": raw_target_bps,
             "target_bps": int(target_bps),
             "bounded_bps": int(bounded_bps),
-            "current_bps": int(current_bps),
-            "current_cycle": int(current_cycle),
             "next_bps": int(next_bps),
-            "max_delta_bps": int(max_delta),
+            "payout_wallet": sender,
+            "payout_token": payout_token.lower(),
+            "riko_token": riko_token.lower(),
+            "bot_config_source": str(bot_cfg.get("source") or "env"),
+            "holder_scan_start_block": int(bot_cfg.get("holder_scan_start_block") or 0),
+            "riko_decimals": int(riko_decimals),
+            "payout_decimals": int(payout_decimals),
+            "holders_scanned": int(len(cached_holders)),
+            "holders_positive": int(len(holders_with_balance)),
+            "payout_count": int(len(payout_rows)),
+            "total_payout_raw": int(total_payout_raw),
             "month_key": month_key,
-            "schedule_key": schedule_key,
+            "schedule_date_key": schedule_date_key,
             "schedule_time_utc": payout_time_utc,
             "schedule_next_due_date": str(schedule.get("next_due_date") or ""),
             "schedule_next_due_at_utc": str(schedule.get("next_due_at_utc") or ""),
         }
     )
 
-    if next_bps == current_bps:
-        # Calling with the same bps still opens a new claim cycle.
-        result["action_hint"] = "reopen_cycle_same_bps"
+    claimed_schedule_date = False
+    if schedule_date_key:
+        claimed_schedule_date = _riko_auto_payout_try_claim_schedule_date(schedule_date_key)
+        if not claimed_schedule_date:
+            result.update(
+                {
+                    "status": "skip",
+                    "reason": "already_applied_for_scheduled_date",
+                    "schedule_date_key": schedule_date_key,
+                    "month_key": month_key,
+                }
+            )
+            return result
 
-    tx_hash, chain_id = _riko_send_set_monthly_bps_tx(rpc_url, private_key, distributor, int(next_bps))
-    receipt = _riko_wait_receipt(rpc_url, tx_hash, timeout_sec=240)
-    status_num = _eth_hex_to_int(receipt.get("status"))
-    if status_num != 1:
-        result.update({"status": "error", "reason": "tx_reverted", "tx_hash": tx_hash, "chain_id": chain_id})
-        return result
+    tx_hashes: list[str] = []
+    chain_id = 0
+    nonce: int | None = None
+    for holder_addr, payout_amount in payout_rows:
+        try:
+            tx_hash, tx_chain_id, tx_nonce = _riko_send_erc20_transfer_tx(
+                rpc_url,
+                private_key,
+                payout_token,
+                holder_addr,
+                int(payout_amount),
+                nonce=nonce,
+            )
+            nonce = int(tx_nonce) + 1
+            chain_id = int(tx_chain_id)
+            tx_hashes.append(str(tx_hash))
+            receipt = _riko_wait_receipt(rpc_url, tx_hash, timeout_sec=240)
+            status_num = _eth_hex_to_int(receipt.get("status"))
+            if status_num != 1:
+                result.update(
+                    {
+                        "status": "error",
+                        "reason": "tx_reverted",
+                        "tx_hash": tx_hash,
+                        "chain_id": int(chain_id),
+                        "sent_count": int(len(tx_hashes)),
+                    }
+                )
+                if tx_hashes:
+                    # Prevent duplicate payouts on retry after partial success.
+                    result["applied_schedule_date"] = schedule_date_key
+                    result["partial_payout_incomplete"] = True
+                elif claimed_schedule_date:
+                    _riko_auto_payout_release_schedule_date_claim(schedule_date_key)
+                return result
+        except Exception as e:
+            result.update(
+                {
+                    "status": "error",
+                    "reason": str(e)[:280],
+                    "chain_id": int(chain_id),
+                    "sent_count": int(len(tx_hashes)),
+                }
+            )
+            if tx_hashes:
+                # Prevent duplicate payouts on retry after partial success.
+                result["applied_schedule_date"] = schedule_date_key
+                result["partial_payout_incomplete"] = True
+                result["tx_hash"] = tx_hashes[-1]
+                result["tx_hashes"] = tx_hashes[-20:]
+            # Keep schedule-date claim on unknown send outcome to avoid duplicate payouts.
+            return result
+
     result.update(
         {
-            "action": "tx_sent",
-            "tx_hash": tx_hash,
-            "chain_id": chain_id,
-            "receipt_status": status_num,
+            "tx_hash": tx_hashes[-1] if tx_hashes else "",
+            "tx_hashes": tx_hashes[-20:],
+            "chain_id": int(chain_id),
+            "sent_count": int(len(tx_hashes)),
             "applied_month": month_key,
-            "applied_schedule_key": schedule_key,
-            "next_cycle": current_cycle + 1,
+            "applied_schedule_date": schedule_date_key,
         }
     )
     return result
@@ -22055,7 +22387,7 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
 def _riko_auto_yield_report(result: dict[str, Any]) -> None:
     status = str(result.get("status") or "unknown")
     status_label = {"ok": "OK", "skip": "SKIPPED", "error": "ERROR"}.get(status, status.upper())
-    lines = ["[UNI_FEE] RIKO Auto-Yield", f"Time (UTC): {_iso_now()}", f"Result: {status_label}"]
+    lines = ["[UNI_FEE] RIKO Auto-Payout Bot", f"Time (UTC): {_iso_now()}", f"Result: {status_label}"]
     reason_raw = str(result.get("reason") or "").strip()
     if reason_raw:
         reason_human, next_step = _human_riko_auto_yield_reason(reason_raw)
@@ -22070,16 +22402,28 @@ def _riko_auto_yield_report(result: dict[str, Any]) -> None:
     if result.get("monthly_pct") is not None:
         lines.append(f"Monthly rate: {result.get('monthly_pct')}%")
     if result.get("target_bps") is not None:
+        lines.append(f"BPS: raw={result.get('target_bps')}, bounded={result.get('bounded_bps')}, applied={result.get('next_bps')}")
+    if result.get("holders_scanned") is not None:
         lines.append(
-            f"BPS: current={result.get('current_bps')}, raw={result.get('target_bps')}, "
-            f"bounded={result.get('bounded_bps')}, next={result.get('next_bps')}"
+            f"Holders: scanned={result.get('holders_scanned')}, positive={result.get('holders_positive', 0)}, "
+            f"paid={result.get('payout_count', 0)}"
         )
-    if result.get("current_cycle") is not None:
-        lines.append(f"Yield cycle: current={result.get('current_cycle')}, next={result.get('next_cycle', '-')}")
+    if result.get("total_payout_raw") is not None:
+        lines.append(f"Total payout (raw units): {result.get('total_payout_raw')}")
+    if result.get("payout_wallet"):
+        lines.append(f"Payout wallet: {result.get('payout_wallet')}")
+    if result.get("payout_token"):
+        lines.append(f"Payout token: {result.get('payout_token')}")
+    if result.get("bot_config_source"):
+        lines.append(f"Bot config source: {result.get('bot_config_source')}")
+    if result.get("holder_scan_start_block") is not None:
+        lines.append(f"Holder scan start block: {result.get('holder_scan_start_block')}")
+    if result.get("riko_token"):
+        lines.append(f"RIKO token: {result.get('riko_token')}")
     if result.get("month_key"):
         lines.append(f"Month: {result.get('month_key')}")
-    if result.get("schedule_key"):
-        lines.append(f"Schedule key: {result.get('schedule_key')}")
+    if result.get("schedule_date_key"):
+        lines.append(f"Schedule date: {result.get('schedule_date_key')}")
     if result.get("schedule_next_due_date"):
         lines.append(f"Next due date: {result.get('schedule_next_due_date')}")
     if result.get("schedule_next_due_at_utc"):
@@ -22088,13 +22432,20 @@ def _riko_auto_yield_report(result: dict[str, Any]) -> None:
         lines.append(f"Schedule time (UTC): {result.get('schedule_time_utc')}")
     if result.get("action"):
         lines.append(f"Action done: {result.get('action')}")
+    if bool(result.get("partial_payout_incomplete")):
+        lines.append("Warning: partial payout completed; retry is blocked for this schedule date.")
     if result.get("tx_hash"):
         lines.append(f"Tx hash: {result.get('tx_hash')}")
     if result.get("chain_id"):
         lines.append(f"Chain ID: {result.get('chain_id')}")
+    tx_hashes = result.get("tx_hashes")
+    if isinstance(tx_hashes, list) and tx_hashes:
+        lines.append(f"Transfers sent: {len(tx_hashes)} (showing last {len(tx_hashes)})")
+        for h in tx_hashes:
+            lines.append(f" - {h}")
     ok, info = _send_telegram_message("\n".join(lines))
     if not ok:
-        print(f"[riko-auto-yield] telegram send failed: {info}")
+        print(f"[riko-auto-payout] telegram send failed: {info}")
 
 
 def _riko_auto_yield_loop(interval_sec: int, run_on_startup: bool) -> None:
@@ -22129,7 +22480,7 @@ def _start_riko_auto_yield_job() -> None:
         target=_riko_auto_yield_loop,
         args=(RIKO_AUTO_YIELD_INTERVAL_SEC, RIKO_AUTO_YIELD_RUN_ON_STARTUP),
         daemon=True,
-        name="riko-auto-yield",
+        name="riko-auto-payout",
     )
     RIKO_AUTO_YIELD_THREAD.start()
 
@@ -22357,6 +22708,11 @@ class AdminRikoPayoutScheduleUpdate(BaseModel):
 
 class AdminRikoAutoYieldModeUpdate(BaseModel):
     enabled: bool
+
+
+class AdminRikoAutoYieldBotConfigUpdate(BaseModel):
+    payout_token_address: str = ""
+    holder_scan_start_block: int = 0
 
 
 class RikoWhitelistItemUpdate(BaseModel):
@@ -23558,7 +23914,6 @@ def _render_riko_page() -> str:
     """
     extra_script = """
     const RIKO_VAULT_ADDRESS = "__RIKO_VAULT_ADDRESS__";
-    const RIKO_YIELD_DISTRIBUTOR_ADDRESS = "__RIKO_YIELD_DISTRIBUTOR_ADDRESS__";
     let rikoWhitelistState = [];
     let rikoPendingWhitelistState = [];
     let rikoWhitelistAddrMap = {};
@@ -24793,11 +25148,7 @@ def _render_riko_page() -> str:
         extra_script=extra_script,
         show_intro=False,
     )
-    return (
-        html.replace("__RIKO_VAULT_ADDRESS__", str(RIKO_VAULT_ADDRESS or "").strip()).replace(
-            "__RIKO_YIELD_DISTRIBUTOR_ADDRESS__", str(RIKO_YIELD_DISTRIBUTOR_ADDRESS or "").strip()
-        )
-    )
+    return html.replace("__RIKO_VAULT_ADDRESS__", str(RIKO_VAULT_ADDRESS or "").strip())
 
 
 def _render_positions_page() -> str:
@@ -30404,8 +30755,6 @@ def _render_admin_page() -> str:
       <section class="card">
         <h3>RIKO on-chain controls</h3>
         <div class="row"><label>Vault address (RIKO)</label><div id="adminRikoVaultAddress">-</div></div>
-        <div class="row"><label>Yield distributor</label><div id="adminRikoYieldDistributorAddress">-</div></div>
-        <div class="row"><label>Yield cycle</label><div id="adminRikoYieldCycleCurrent">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set global cap (USD)</label>
           <input id="adminRikoGlobalCapUsd" type="number" min="0" step="1" value="0" />
@@ -30415,21 +30764,6 @@ def _render_admin_page() -> str:
           <label style="margin:0">Set custody address</label>
           <input id="adminRikoCustodyInput" type="text" placeholder="0x..."/>
           <button class="btn" onclick="applyAdminRikoCustodyAddress()">Apply on-chain</button>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Set yield payer</label>
-          <input id="adminRikoYieldPayerInput" type="text" placeholder="0x..."/>
-          <button class="btn" onclick="applyAdminRikoYieldPayerAddress()">Apply on-chain</button>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Set yield token</label>
-          <input id="adminRikoYieldTokenInput" type="text" placeholder="0x... ERC-20"/>
-          <button class="btn" onclick="applyAdminRikoYieldTokenAddress()">Apply on-chain</button>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Set monthly yield (bps)</label>
-          <input id="adminRikoMonthlyYieldBpsInput" type="number" min="0" step="1" value="0"/>
-          <button class="btn" onclick="applyAdminRikoMonthlyYieldBps()">Apply on-chain</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set pending operator</label>
@@ -30444,8 +30778,9 @@ def _render_admin_page() -> str:
         <span id="adminRikoOnchainStatus" class="status">Ready</span>
       </section>
       <section class="card">
-        <h3>RIKO payout schedule</h3>
+        <h3>RIKO off-chain payout schedule</h3>
         <p class="hint">Set exact UTC payout dates as MM-DD. At end of list, schedule restarts from the first date in next year.</p>
+        <p class="hint">Bot sends ERC-20 payouts directly to current RIKO holders (balances from on-chain `balanceOf`).</p>
         <div class="row">
           <label>Dates (MM-DD; separated by ;)</label>
           <input id="adminRikoPayoutDatesInput" type="text" placeholder="01-15;04-15;07-15;10-15"/>
@@ -30464,8 +30799,14 @@ def _render_admin_page() -> str:
           <span class="hint">one time for all payouts (UTC)</span>
         </div>
         <div class="row"><label>Next scheduled payout (UTC)</label><div id="adminRikoPayoutNextDate">-</div></div>
+        <div class="row" style="display:grid;grid-template-columns:170px minmax(260px,1fr) minmax(180px,260px) auto;gap:10px;align-items:center;">
+          <label style="margin:0">Bot config</label>
+          <input id="adminRikoAutoYieldPayoutTokenInput" type="text" placeholder="Payout token 0x..."/>
+          <input id="adminRikoAutoYieldStartBlockInput" type="number" min="0" step="1" placeholder="Holder scan start block"/>
+          <button type="button" class="btn btn-soft" onclick="saveAdminRikoAutoYieldConfig()">Apply</button>
+        </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Auto-yield job</label>
+          <label style="margin:0">Auto-payout bot</label>
           <div id="adminRikoPayoutJobMode">-</div>
           <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:nowrap;">
             <button type="button" class="btn btn-soft" onclick="setAdminRikoAutoYieldMode(true)">Enable</button>
@@ -30510,15 +30851,6 @@ def _render_admin_page() -> str:
           </div>
           <div class="table-wrap">
             <table id="adminRikoDepositHistoryTable" class="admin-history-table"></table>
-          </div>
-        </details>
-        <details class="admin-history-block">
-          <summary>Yield distribution history</summary>
-          <div class="admin-history-actions">
-            <button type="button" class="btn btn-soft" onclick="deleteSelectedAdminRikoHistory('yield', event)">Delete selected</button>
-          </div>
-          <div class="table-wrap">
-            <table id="adminRikoYieldHistoryTable" class="admin-history-table"></table>
           </div>
         </details>
       </section>
@@ -30627,7 +30959,6 @@ def _render_admin_page() -> str:
   <script>
     let authState = {{authenticated: false}};
     const RIKO_VAULT_ADDRESS = "__RIKO_VAULT_ADDRESS__";
-    const RIKO_YIELD_DISTRIBUTOR_ADDRESS = "__RIKO_YIELD_DISTRIBUTOR_ADDRESS__";
     const WALLETCONNECT_PROJECT_ID = "__WALLETCONNECT_PROJECT_ID__";
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
@@ -30791,23 +31122,12 @@ def _render_admin_page() -> str:
       "function setRikoPriceUsd6(uint256 newRikoPriceUsd6) external",
       "function setTokenConfig(address token,bool allowed,address oracle,uint32 maxOracleAge,bytes32 expectedFeedDescriptionHash) external"
     ];
-    const ADMIN_RIKO_YIELD_ABI = [
-      "function owner() view returns (address)",
-      "function yieldPayerAddress() view returns (address)",
-      "function yieldTokenAddress() view returns (address)",
-      "function monthlyYieldRateBps() view returns (uint256)",
-      "function currentYieldCycle() view returns (uint256)",
-      "event YieldBatchPaid(uint256 indexed yieldCycle,uint256 accountsProcessed,uint256 totalPayout,uint256 rateBps)",
-      "function setYieldPayerAddress(address newYieldPayerAddress) external",
-      "function setYieldTokenAddress(address newYieldTokenAddress) external",
-      "function setMonthlyYieldRateBps(uint256 newMonthlyYieldRateBps) external"
-    ];
     const ADMIN_ERC20_DECIMALS_ABI = [
       "function decimals() view returns (uint8)"
     ];
     const adminPendingRedeemInFlight = new Set();
     const ADMIN_RIKO_HISTORY_HIDDEN_TX_KEY = "admin_riko_history_hidden_tx_v1";
-    const adminRikoHistorySelection = { redeem: new Set(), deposit: new Set(), yield: new Set() };
+    const adminRikoHistorySelection = { redeem: new Set(), deposit: new Set() };
     function normalizeEthAddressInput(v) {{
       const raw = String(v || "").trim();
       return /^0x[a-fA-F0-9]{{40}}$/.test(raw) ? raw : "";
@@ -30833,11 +31153,6 @@ def _render_admin_page() -> str:
       const ethers = await ensureEthersAdmin();
       const contractAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
       return new ethers.Contract(contractAddr, ADMIN_RIKO_VAULT_ABI, signer);
-    }}
-    async function getAdminYieldContract(signer) {{
-      const ethers = await ensureEthersAdmin();
-      const contractAddr = requireConfiguredAddress(RIKO_YIELD_DISTRIBUTOR_ADDRESS, "RIKO_YIELD_DISTRIBUTOR_ADDRESS");
-      return new ethers.Contract(contractAddr, ADMIN_RIKO_YIELD_ABI, signer);
     }}
     function wrappedNativeByChainIdAdmin(chainId) {{
       const n = Number(chainId || 0);
@@ -31155,13 +31470,10 @@ def _render_admin_page() -> str:
         const nowSec = Math.floor(Date.now() / 1000);
         const hiddenRedeemTx = getAdminRikoHiddenTxSet("redeem");
         const hiddenDepositTx = getAdminRikoHiddenTxSet("deposit");
-        const hiddenYieldTx = getAdminRikoHiddenTxSet("yield");
         if (!(adminRikoHistorySelection.redeem instanceof Set)) adminRikoHistorySelection.redeem = new Set();
         if (!(adminRikoHistorySelection.deposit instanceof Set)) adminRikoHistorySelection.deposit = new Set();
-        if (!(adminRikoHistorySelection.yield instanceof Set)) adminRikoHistorySelection.yield = new Set();
         for (const txh of Array.from(adminRikoHistorySelection.redeem)) if (hiddenRedeemTx.has(String(txh || "").toLowerCase())) adminRikoHistorySelection.redeem.delete(txh);
         for (const txh of Array.from(adminRikoHistorySelection.deposit)) if (hiddenDepositTx.has(String(txh || "").toLowerCase())) adminRikoHistorySelection.deposit.delete(txh);
-        for (const txh of Array.from(adminRikoHistorySelection.yield)) if (hiddenYieldTx.has(String(txh || "").toLowerCase())) adminRikoHistorySelection.yield.delete(txh);
         const closeBeforeSec = nowSec - (5 * 24 * 60 * 60);
 
         const redeemHistoryRows = [];
@@ -31275,66 +31587,6 @@ def _render_admin_page() -> str:
           "No deposits in history."
         );
 
-        const yieldHistoryRows = [];
-        const yieldAddr = String(RIKO_YIELD_DISTRIBUTOR_ADDRESS || "").trim();
-        if (/^0x[a-fA-F0-9]{{40}}$/.test(yieldAddr)) {{
-          const yieldContract = new ethers.Contract(yieldAddr, ADMIN_RIKO_YIELD_ABI, provider);
-          let yieldTokenAddr = "";
-          let yieldTokenDecimals = null;
-          try {{
-            yieldTokenAddr = String(await yieldContract.yieldTokenAddress() || "").trim();
-            const lower = String(yieldTokenAddr || "").toLowerCase();
-            yieldTokenDecimals = await resolveTokenDecimals(yieldTokenAddr, lower);
-          }} catch (_) {{
-            yieldTokenAddr = "";
-            yieldTokenDecimals = null;
-          }}
-          const yieldEvents = [];
-          const chunk = 12000;
-          for (let start = fromBlock; start <= latest; start += chunk) {{
-            const end = Math.min(latest, start + chunk - 1);
-            try {{
-              const part = await yieldContract.queryFilter(yieldContract.filters.YieldBatchPaid(), start, end);
-              if (Array.isArray(part) && part.length) yieldEvents.push(...part);
-            }} catch (e) {{
-              loadWarns.push(`YieldBatchPaid ${{start}}-${{end}}: ${{e?.shortMessage || e?.message || "failed"}}`);
-            }}
-          }}
-          for (const ev of yieldEvents) {{
-            const bn = Number(ev?.blockNumber || 0);
-            const ts = await getBlockTimestampSec(bn);
-            const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
-            if (!ts) continue;
-            if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenYieldTx.has(txHash)) continue;
-            const totalRaw = String(ev?.args?.totalPayout ?? 0n);
-            const payoutDisplay = yieldTokenDecimals === null
-              ? `${{formatAdminIntegerWithCommas(totalRaw)}} (raw)`
-              : formatAdminRawUnits(totalRaw, yieldTokenDecimals, 8);
-            const checked = /^0x[a-f0-9]{{64}}$/.test(txHash) && adminRikoHistorySelection.yield.has(txHash) ? "checked" : "";
-            yieldHistoryRows.push({{
-              ts,
-              bn,
-              idx: Number(ev?.index || 0),
-              html:
-                `<tr>` +
-                `<td class='admin-history-check-cell'><input type='checkbox' class='admin-history-check' ${{checked}} onchange="toggleAdminRikoHistorySelected('yield','${{txHash}}',this.checked)"/></td>` +
-                `<td>${{formatAdminRikoDate(ts)}}</td>` +
-                `<td class='mono'>${{String(ev?.args?.yieldCycle ?? "0")}}</td>` +
-                `<td class='mono'>${{formatAdminIntegerWithCommas(String(ev?.args?.accountsProcessed ?? "0"))}}</td>` +
-                `<td class='mono'>${{payoutDisplay}}</td>` +
-                `<td class='mono'>${{formatAdminIntegerWithCommas(String(ev?.args?.rateBps ?? "0"))}} bps</td>` +
-                `<td>${{renderAdminTxLink(txBase, txHash)}}</td>` +
-                `</tr>`
-            }});
-          }}
-        }}
-        yieldHistoryRows.sort((a, b) => (Number(b.ts || 0) - Number(a.ts || 0)) || (Number(b.bn || 0) - Number(a.bn || 0)) || (Number(b.idx || 0) - Number(a.idx || 0)));
-        renderAdminRikoHistoryTable(
-          "adminRikoYieldHistoryTable",
-          ["", "Date", "Cycle", "Accounts", "Total payout", "Rate", "Tx"],
-          yieldHistoryRows.map((r) => r.html),
-          "No yield distribution records."
-        );
         if (loadWarns.length) {{
           setAdminRikoPendingOpsStatus("Pending queue loaded with partial RPC warnings.", true);
         }} else {{
@@ -31344,7 +31596,6 @@ def _render_admin_page() -> str:
         table.innerHTML = "<tr><td class='muted'>Failed to load pending queue.</td></tr>";
         renderAdminRikoHistoryTable("adminRikoRedeemHistoryTable", ["Info"], [], "Failed to load redemption history.");
         renderAdminRikoHistoryTable("adminRikoDepositHistoryTable", ["Info"], [], "Failed to load deposit history.");
-        renderAdminRikoHistoryTable("adminRikoYieldHistoryTable", ["Info"], [], "Failed to load yield history.");
         setAdminRikoPendingOpsStatus("Pending queue load failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
@@ -31371,22 +31622,16 @@ def _render_admin_page() -> str:
         if (!map[key].includes(role)) map[key].push(role);
       }};
       add(payload?.vault_owner, "VAULT_OWNER");
-      add(payload?.distributor_owner, "YIELD_OWNER");
       add(payload?.custody, "CUSTODY");
       add(payload?.pending_operator, "PENDING_OPERATOR");
-      add(payload?.yield_payer, "YIELD_PAYER");
       adminOnchainRoleMap = map;
     }}
     async function loadAdminRikoGlobalCap() {{
       const elAddr = document.getElementById("adminRikoVaultAddress");
-      const elYieldAddr = document.getElementById("adminRikoYieldDistributorAddress");
-      const elYieldCycle = document.getElementById("adminRikoYieldCycleCurrent");
       const vaultAddr = String(RIKO_VAULT_ADDRESS || "").trim();
-      const yieldAddr = String(RIKO_YIELD_DISTRIBUTOR_ADDRESS || "").trim();
       if (elAddr) elAddr.textContent = vaultAddr || "-";
-      if (elYieldAddr) elYieldAddr.textContent = yieldAddr || "-";
 
-      let rolePayload = {{ vault_owner: "", distributor_owner: "", custody: "", pending_operator: "", yield_payer: "" }};
+      let rolePayload = {{ vault_owner: "", custody: "", pending_operator: "" }};
       if (!/^0x[a-fA-F0-9]{{40}}$/.test(vaultAddr)) {{
         const inCap = document.getElementById("adminRikoGlobalCapUsd");
         if (inCap) inCap.value = "0";
@@ -31421,33 +31666,6 @@ def _render_admin_page() -> str:
         }}
       }}
 
-      if (!/^0x[a-fA-F0-9]{{40}}$/.test(yieldAddr)) {{
-        if (elYieldCycle) elYieldCycle.textContent = "-";
-      }} else {{
-        try {{
-          const ethers = await ensureEthersAdmin();
-          const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
-          const distributor = new ethers.Contract(yieldAddr, ADMIN_RIKO_YIELD_ABI, provider);
-          const [distributorOwner, yieldPayer, yieldToken, dailyBps, yieldCycle] = await Promise.all([
-            distributor.owner(),
-            distributor.yieldPayerAddress(),
-            distributor.yieldTokenAddress(),
-            distributor.monthlyYieldRateBps(),
-            distributor.currentYieldCycle(),
-          ]);
-          if (elYieldCycle) elYieldCycle.textContent = String(yieldCycle || 0n);
-          rolePayload.distributor_owner = String(distributorOwner || "");
-          rolePayload.yield_payer = String(yieldPayer || "");
-          const inYieldPayer = document.getElementById("adminRikoYieldPayerInput");
-          const inYieldToken = document.getElementById("adminRikoYieldTokenInput");
-          const inDailyBps = document.getElementById("adminRikoMonthlyYieldBpsInput");
-          if (inYieldPayer) inYieldPayer.value = String(yieldPayer || "");
-          if (inYieldToken) inYieldToken.value = String(yieldToken || "");
-          if (inDailyBps) inDailyBps.value = String(dailyBps || 0n);
-        }} catch (_) {{
-          if (elYieldCycle) elYieldCycle.textContent = "unavailable";
-        }}
-      }}
       setAdminOnchainRoles(rolePayload);
       setAdminProcessPendingDefaults(false);
       await loadAdminRikoPendingQueue();
@@ -31513,74 +31731,6 @@ def _render_admin_page() -> str:
           return;
         }}
         setAdminRikoOnchainStatus("Custody update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
-      }}
-    }}
-    async function applyAdminRikoYieldPayerAddress() {{
-      try {{
-        requireAdminWalletAuth();
-        const nextAddr = requireValidInputAddress(
-          document.getElementById("adminRikoYieldPayerInput")?.value || "",
-          "Invalid yield payer address."
-        );
-        const signer = await getAdminSigner();
-        const distributor = await getAdminYieldContract(signer);
-        setAdminRikoOnchainStatus("Applying yield payer address on-chain...", false);
-        const tx = await distributor.setYieldPayerAddress(nextAddr);
-        setAdminRikoOnchainStatus("Yield payer tx sent: " + tx.hash, false);
-        await tx.wait();
-        setAdminRikoOnchainStatus("Yield payer address updated.", false);
-        await loadAdminRikoGlobalCap();
-      }} catch (e) {{
-        if (isWalletUserRejectedError(e)) {{
-          setAdminRikoOnchainStatus("Signature was rejected in wallet. Yield payer update was canceled.", true);
-          return;
-        }}
-        setAdminRikoOnchainStatus("Yield payer update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
-      }}
-    }}
-    async function applyAdminRikoYieldTokenAddress() {{
-      try {{
-        requireAdminWalletAuth();
-        const nextAddr = requireValidInputAddress(
-          document.getElementById("adminRikoYieldTokenInput")?.value || "",
-          "Invalid yield token address."
-        );
-        const signer = await getAdminSigner();
-        const distributor = await getAdminYieldContract(signer);
-        setAdminRikoOnchainStatus("Applying yield token address on-chain...", false);
-        const tx = await distributor.setYieldTokenAddress(nextAddr);
-        setAdminRikoOnchainStatus("Yield token tx sent: " + tx.hash, false);
-        await tx.wait();
-        setAdminRikoOnchainStatus("Yield token address updated.", false);
-        await loadAdminRikoGlobalCap();
-      }} catch (e) {{
-        if (isWalletUserRejectedError(e)) {{
-          setAdminRikoOnchainStatus("Signature was rejected in wallet. Yield token update was canceled.", true);
-          return;
-        }}
-        setAdminRikoOnchainStatus("Yield token update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
-      }}
-    }}
-    async function applyAdminRikoMonthlyYieldBps() {{
-      try {{
-        requireAdminWalletAuth();
-        const bpsInput = document.getElementById("adminRikoMonthlyYieldBpsInput");
-        const bps = Number(String(bpsInput?.value || "").trim());
-        if (!Number.isFinite(bps) || bps < 0 || bps > 10000) throw new Error("Monthly yield bps must be between 0 and 10000.");
-        const signer = await getAdminSigner();
-        const distributor = await getAdminYieldContract(signer);
-        setAdminRikoOnchainStatus("Applying monthly yield bps on-chain (starts new cycle)...", false);
-        const tx = await distributor.setMonthlyYieldRateBps(BigInt(Math.round(bps)));
-        setAdminRikoOnchainStatus("Monthly yield bps tx sent: " + tx.hash, false);
-        await tx.wait();
-        setAdminRikoOnchainStatus("Monthly yield bps updated. New yield cycle opened.", false);
-        await loadAdminRikoGlobalCap();
-      }} catch (e) {{
-        if (isWalletUserRejectedError(e)) {{
-          setAdminRikoOnchainStatus("Signature was rejected in wallet. Monthly yield update was canceled.", true);
-          return;
-        }}
-        setAdminRikoOnchainStatus("Monthly yield update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
     async function applyAdminRikoPriceUsd() {{
@@ -32440,6 +32590,7 @@ def _render_admin_page() -> str:
         renderAdminRikoPayoutSchedule(
           data.riko_payout_schedule || {{}},
           !!data.riko_auto_yield_enabled,
+          data.riko_auto_yield_bot_config || {{}},
           String(data.riko_auto_yield_source || "env"),
           false
         );
@@ -32562,7 +32713,7 @@ def _render_admin_page() -> str:
     }}
     async function setAdminRikoAutoYieldMode(enabled) {{
       try {{
-        const data = await postJson("/api/admin/riko/auto-yield-mode", {{ enabled: !!enabled }});
+        const data = await postJson("/api/admin/riko/auto-payout-mode", {{ enabled: !!enabled }});
         if (adminLastSettings && typeof adminLastSettings === "object") {{
           adminLastSettings.riko_auto_yield_enabled = !!data?.riko_auto_yield_enabled;
           adminLastSettings.riko_auto_yield_source = String(data?.riko_auto_yield_source || "env");
@@ -32570,19 +32721,43 @@ def _render_admin_page() -> str:
         renderAdminRikoPayoutSchedule(
           data?.riko_payout_schedule || (adminLastSettings?.riko_payout_schedule || {{}}),
           !!data?.riko_auto_yield_enabled,
+          data?.riko_auto_yield_bot_config || (adminLastSettings?.riko_auto_yield_bot_config || {{}}),
           String(data?.riko_auto_yield_source || adminLastSettings?.riko_auto_yield_source || "env"),
           true
         );
         setAdminRikoPayoutStatus("", false);
       }} catch (e) {{
-        setAdminRikoPayoutStatus("Auto-yield mode update failed: " + (e?.message || "unknown"), true);
+        setAdminRikoPayoutStatus("Auto-payout mode update failed: " + (e?.message || "unknown"), true);
       }}
     }}
-    function renderAdminRikoPayoutSchedule(cfg, autoEnabled, autoSource, force) {{
+    async function saveAdminRikoAutoYieldConfig() {{
+      try {{
+        const payout_token_address = String(document.getElementById("adminRikoAutoYieldPayoutTokenInput")?.value || "").trim();
+        const holder_scan_start_block_raw = String(document.getElementById("adminRikoAutoYieldStartBlockInput")?.value || "0").trim();
+        const holder_scan_start_block = Math.max(0, Number.parseInt(holder_scan_start_block_raw || "0", 10) || 0);
+        const data = await postJson("/api/admin/riko/auto-payout-config", {{ payout_token_address, holder_scan_start_block }});
+        if (adminLastSettings && typeof adminLastSettings === "object") {{
+          adminLastSettings.riko_auto_yield_bot_config = data?.riko_auto_yield_bot_config || {{}};
+        }}
+        renderAdminRikoPayoutSchedule(
+          adminLastSettings?.riko_payout_schedule || {{}},
+          !!adminLastSettings?.riko_auto_yield_enabled,
+          data?.riko_auto_yield_bot_config || {{}},
+          String(adminLastSettings?.riko_auto_yield_source || "env"),
+          true
+        );
+        setAdminRikoPayoutStatus(data?.info || "Bot config saved on server.", false);
+      }} catch (e) {{
+        setAdminRikoPayoutStatus("Bot config save failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    function renderAdminRikoPayoutSchedule(cfg, autoEnabled, botCfg, autoSource, force) {{
       const forceUpdate = !!force;
       const items = Array.isArray(cfg?.items) ? cfg.items : [];
       const inDates = document.getElementById("adminRikoPayoutDatesInput");
       const inTime = document.getElementById("adminRikoPayoutTimeUtcInput");
+      const inPayoutToken = document.getElementById("adminRikoAutoYieldPayoutTokenInput");
+      const inStartBlock = document.getElementById("adminRikoAutoYieldStartBlockInput");
       const nextEl = document.getElementById("adminRikoPayoutNextDate");
       const modeEl = document.getElementById("adminRikoPayoutJobMode");
       const updEl = document.getElementById("adminRikoPayoutUpdatedAt");
@@ -32596,16 +32771,26 @@ def _render_admin_page() -> str:
       if (inTime) {{
         if (forceUpdate || document.activeElement !== inTime) inTime.value = savedTimeText;
       }}
+      if (inPayoutToken) {{
+        const tokenText = String(botCfg?.payout_token_address || "");
+        if (forceUpdate || document.activeElement !== inPayoutToken) inPayoutToken.value = tokenText;
+      }}
+      if (inStartBlock) {{
+        const startBlockText = String(Number(botCfg?.holder_scan_start_block || 0));
+        if (forceUpdate || document.activeElement !== inStartBlock) inStartBlock.value = startBlockText;
+      }}
       if (nextEl) nextEl.textContent = String(cfg?.next_due_at_utc || cfg?.next_due_date || "-");
       if (modeEl) {{
         const source = String(autoSource || "env");
+        const cfgSource = String(botCfg?.source || "env");
+        const cfgSuffix = cfgSource === "admin_override" ? " Bot config from admin panel." : " Bot config from server env.";
         modeEl.textContent = autoEnabled
           ? (source === "admin_override"
-              ? "Enabled. Auto payouts are ON (set in admin panel)."
-              : "Enabled by server. Auto payouts are ON.")
+              ? "Enabled. Auto payouts are ON (set in admin panel)." + cfgSuffix
+              : "Enabled by server. Auto payouts are ON." + cfgSuffix)
           : (source === "admin_override"
-              ? "Disabled. Auto payouts are OFF (set in admin panel)."
-              : "Disabled by server. Click Enable below to turn auto payouts ON.");
+              ? "Disabled. Auto payouts are OFF (set in admin panel)." + cfgSuffix
+              : "Disabled by server. Click Enable below to turn auto payouts ON." + cfgSuffix);
       }}
       if (updEl) updEl.textContent = String(cfg?.updated_at || "-");
       if (nextEl && inDates && inTime && !forceUpdate) {{
@@ -32630,6 +32815,7 @@ def _render_admin_page() -> str:
         renderAdminRikoPayoutSchedule(
           data.riko_payout_schedule || {{}},
           !!adminLastSettings?.riko_auto_yield_enabled,
+          adminLastSettings?.riko_auto_yield_bot_config || {{}},
           String(adminLastSettings?.riko_auto_yield_source || "env"),
           true
         );
@@ -32969,11 +33155,7 @@ def _render_admin_page() -> str:
 </body>
 </html>
 """
-    return (
-        html.replace("__RIKO_VAULT_ADDRESS__", str(RIKO_VAULT_ADDRESS or "").strip()).replace(
-            "__RIKO_YIELD_DISTRIBUTOR_ADDRESS__", str(RIKO_YIELD_DISTRIBUTOR_ADDRESS or "").strip()
-        )
-    )
+    return html.replace("__RIKO_VAULT_ADDRESS__", str(RIKO_VAULT_ADDRESS or "").strip())
 
 
 def _render_help_page() -> str:
@@ -33580,6 +33762,7 @@ def auth_logout(request: Request, response: Response) -> dict[str, Any]:
 def admin_settings(request: Request, response: Response) -> dict[str, Any]:
     _require_admin(request, response)
     auto_yield_ctl = _riko_auto_yield_control_payload()
+    auto_yield_bot_cfg = _load_riko_auto_yield_bot_config()
     try:
         token_catalog = _load_token_catalog(refresh=False)
         manual_cfg = _load_manual_pair_lists_overrides()
@@ -33605,6 +33788,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "riko_payout_schedule": _load_riko_payout_schedule(),
             "riko_auto_yield_enabled": bool(auto_yield_ctl.get("enabled")),
             "riko_auto_yield_source": str(auto_yield_ctl.get("source") or "env"),
+            "riko_auto_yield_bot_config": auto_yield_bot_cfg,
         }
     except Exception as e:
         return {
@@ -33625,6 +33809,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "riko_payout_schedule": _load_riko_payout_schedule(),
             "riko_auto_yield_enabled": bool(auto_yield_ctl.get("enabled")),
             "riko_auto_yield_source": str(auto_yield_ctl.get("source") or "env"),
+            "riko_auto_yield_bot_config": auto_yield_bot_cfg,
             "info": f"Admin settings fallback mode. Error: {e}",
         }
 
@@ -33959,23 +34144,42 @@ def admin_riko_payout_schedule_update(
     return {"ok": True, "info": "RIKO payout schedule saved on server.", "riko_payout_schedule": saved}
 
 
+@app.post("/api/admin/riko/auto-payout-config")
+@app.post("/api/admin/riko/auto-yield-config")
+def admin_riko_auto_yield_config_update(
+    req: AdminRikoAutoYieldBotConfigUpdate, request: Request, response: Response
+) -> dict[str, Any]:
+    _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO auto-payout bot config update")
+    try:
+        saved = _save_riko_auto_yield_bot_config(
+            payout_token_address=str(req.payout_token_address or "").strip(),
+            holder_scan_start_block=max(0, int(req.holder_scan_start_block or 0)),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "info": "RIKO auto-payout bot config saved on server.", "riko_auto_yield_bot_config": saved}
+
+
+@app.post("/api/admin/riko/auto-payout-mode")
 @app.post("/api/admin/riko/auto-yield-mode")
 def admin_riko_auto_yield_mode_update(
     req: AdminRikoAutoYieldModeUpdate, request: Request, response: Response
 ) -> dict[str, Any]:
     _require_admin(request, response)
-    _require_pilot_config_mutable("RIKO auto-yield mode update")
+    _require_pilot_config_mutable("RIKO auto-payout mode update")
     ctl = _set_riko_auto_yield_enabled(bool(req.enabled))
     return {
         "ok": True,
         "info": (
-            "Auto-yield enabled. Scheduled payouts will run automatically."
+            "Auto-payout enabled. Scheduled payouts will run automatically."
             if bool(ctl.get("enabled"))
-            else "Auto-yield disabled. Scheduled payouts require manual run."
+            else "Auto-payout disabled. Scheduled payouts require manual run."
         ),
         "riko_auto_yield_enabled": bool(ctl.get("enabled")),
         "riko_auto_yield_source": str(ctl.get("source") or "admin_override"),
         "riko_payout_schedule": _load_riko_payout_schedule(),
+        "riko_auto_yield_bot_config": _load_riko_auto_yield_bot_config(),
     }
 
 
@@ -34012,9 +34216,8 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
         return {"ok": True, "items": [], "address": "", "chain_id": None, "count": 0}
     chain_id = int(auth.get("chain_id") or 11155111)
     vault_addr = str(RIKO_VAULT_ADDRESS or "").strip().lower()
-    distributor_addr = str(RIKO_YIELD_DISTRIBUTOR_ADDRESS or "").strip().lower()
     wrapped_addr = _wrapped_native_by_chain(chain_id)
-    tracked_targets = {x for x in (vault_addr, distributor_addr, wrapped_addr) if _is_eth_address(x)}
+    tracked_targets = {x for x in (vault_addr, wrapped_addr) if _is_eth_address(x)}
     rows = _explorer_txlist_rows_for_owner(chain_id, address, max_items=max(limit * 4, 60))
     items: list[dict[str, Any]] = []
     for r in rows:
@@ -34047,11 +34250,10 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
             "txreceipt_status": str(r.get("txreceipt_status") or "").strip(),
             "function_name": str(r.get("functionName") or "").strip(),
             "method_id": str(r.get("methodId") or "").strip().lower(),
-            "action": _riko_tx_action_label(r, vault_addr, distributor_addr),
+            "action": _riko_tx_action_label(r, vault_addr),
             "contract_role": (
                 "vault" if to_addr == vault_addr or from_addr == vault_addr else
                 "wrapped_native" if to_addr == wrapped_addr or from_addr == wrapped_addr else
-                "distributor" if to_addr == distributor_addr or from_addr == distributor_addr else
                 "other"
             ),
         }
@@ -34063,7 +34265,6 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
         "address": address,
         "chain_id": chain_id,
         "vault_address": vault_addr if _is_eth_address(vault_addr) else "",
-        "distributor_address": distributor_addr if _is_eth_address(distributor_addr) else "",
         "items": items,
         "count": len(items),
     }

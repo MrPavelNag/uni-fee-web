@@ -20,6 +20,9 @@ When freeze is enabled, the backend blocks these admin mutations with HTTP `423`
 - `/api/admin/riko/whitelist/pending`
 - `/api/admin/riko/whitelist/apply-nonce`
 - `/api/admin/riko/whitelist/apply`
+- `/api/admin/riko/payout-schedule`
+- `/api/admin/riko/auto-payout-config` (legacy alias: `/api/admin/riko/auto-yield-config`)
+- `/api/admin/riko/auto-payout-mode` (legacy alias: `/api/admin/riko/auto-yield-mode`)
 
 Read-only APIs continue to work.
 

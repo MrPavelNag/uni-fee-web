@@ -3,7 +3,7 @@
 This document summarizes operational roles, permissions, and core invariants for:
 
 - `RIKOVault`
-- `RIKOYieldDistributor`
+- off-chain RIKO payout bot (server-side scheduler + signer wallet)
 
 It is intended as a quick release checklist reference for pilot/mainnet operations.
 
@@ -12,27 +12,25 @@ It is intended as a quick release checklist reference for pilot/mainnet operatio
 - `Owner` (`Ownable2Step`)
 - `Pending Redemption Operator` (vault-specific)
 - `Custody Address` (vault-specific)
-- `Yield Payer Address` (distributor-specific)
+- `Payout Wallet` (bot signer, off-chain)
 - `User` (depositor/redeemer)
 
 ## Permission Matrix
 
-| Role | Contract | Can do |
+| Role | System | Can do |
 |---|---|---|
 | `Owner` | `RIKOVault` | `pause/unpause`, set global cap, set per-token cap, set custody, set RIKO price, set token config, set pending redemption operator |
-| `Owner` | `RIKOYieldDistributor` | `pause/unpause`, set yield payer, set yield token, set monthly yield bps (opens new cycle), execute batched push payouts |
 | `Pending Redemption Operator` | `RIKOVault` | call `processPendingRedemption(account, token)` |
 | `Custody Address` | `RIKOVault` | holds deposited assets, grants allowance to vault for pull-based redemption settlement |
-| `Yield Payer Address` | `RIKOYieldDistributor` | provides payout token via `safeTransferFrom` during owner-triggered batch payout |
 | `User` | `RIKOVault` | `deposit`, `redeem`, `cancelPendingRedemption`, read quotes |
-| `User` | `RIKOYieldDistributor` | no direct payout action (claim paths disabled) |
+| `Payout Wallet` | off-chain bot | signs direct ERC-20 `transfer` payouts to current RIKO holders by schedule |
 
 ## Core Trust Boundaries
 
-- `RIKOVault` and `RIKOYieldDistributor` are intentionally decoupled.
-- Yield payout logic is not used in vault mint/redeem accounting.
+- Vault mint/redeem accounting is fully isolated from payout logic.
+- Payout logic is off-chain and configurable in admin panel.
 - Vault asset solvency depends on custody balances + custody allowance.
-- Distributor payout solvency depends on yield payer balances + yield payer allowance.
+- Bot payout solvency depends on payout-wallet token balance and private key safety.
 
 ## Security Invariants
 
@@ -64,25 +62,23 @@ It is intended as a quick release checklist reference for pilot/mainnet operatio
 6. **Reentrancy and pause controls**
    - State-changing user actions are guarded by `nonReentrant` and `whenNotPaused`.
 
-### Yield Invariants (`RIKOYieldDistributor`)
+### Off-chain Payout Invariants (Bot)
 
-1. **Cycle-based payout**
-   - New cycle opens only when owner updates `monthlyYieldRateBps`.
-   - Rate is snapshotted per-cycle (`yieldRateBpsByCycle`) at cycle-open time.
+1. **Holder source of truth**
+   - Candidate holder addresses are collected from `RIKO` `Transfer` logs.
+   - Final eligibility always uses live on-chain `balanceOf()` per address.
 
-2. **Balance-based push payout**
-   - Payout is computed from current `RIKO` balance of each account in the batch.
-   - Each account can be paid at most once per cycle (`wasPaidInCycle`).
+2. **Schedule gate**
+   - Bot only executes on configured UTC dates/time.
+   - Duplicate execution for same schedule key is blocked by saved run state.
 
-3. **No pull-claim path**
-   - `claim*` functions are disabled by design (`RYD_ClaimDisabled`).
+3. **Balance-based payout**
+   - Payout is computed from current `RIKO` balances with configured BPS logic.
+   - Zero-amount payouts are skipped.
 
 4. **Payout source safety**
-   - Payout token transfer is pull-based from `yieldPayerAddress` via `safeTransferFrom`.
-   - Batch payout requires non-zero configured yield token and payer address.
-
-5. **Reentrancy and pause controls**
-   - Batch payouts are guarded by `nonReentrant` and `whenNotPaused`.
+   - Payout token is transferred directly from configured payout wallet.
+   - Run is skipped when payout-wallet balance is insufficient.
 
 ## Operational Notes
 
@@ -92,14 +88,15 @@ It is intended as a quick release checklist reference for pilot/mainnet operatio
   - configure and verify token feeds
   - set initial RIKO price
 
-- Before enabling yield payouts:
-  - set yield token
-  - set yield payer
-  - ensure yield payer funded and approved distributor
-  - set monthly yield bps (opens payout cycle)
-  - run owner batch payout over holder list
+- Before enabling off-chain payouts:
+  - set payout token address in admin panel
+  - set holder scan start block in admin panel
+  - ensure payout wallet is funded
+  - ensure server has `RIKO_AUTO_YIELD_RPC_URL` and `RIKO_AUTO_YIELD_PRIVATE_KEY`
+  - verify payout schedule (dates + UTC time)
 
 - For incident response:
-  - `pause()` both contracts if abnormal behavior is detected
-  - investigate custody/yield-payer balances and allowances first
+  - `pause()` vault if mint/redeem behavior is abnormal
+  - disable auto-payout bot in admin panel
+  - investigate custody and payout-wallet balances first
 
