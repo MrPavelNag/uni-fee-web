@@ -67,6 +67,11 @@ def _load_local_env_file() -> None:
         raw_text = env_path.read_text(encoding="utf-8")
     except Exception:
         return
+    # For these keys, .env should win over stale shell exports so local behavior is deterministic.
+    force_override_keys = {
+        "RIKO_AUTO_YIELD_RPC_URL",
+        "RIKO_AUTO_YIELD_PRIVATE_KEY",
+    }
     for line in raw_text.splitlines():
         s = str(line or "").strip()
         if not s or s.startswith("#") or "=" not in s:
@@ -82,7 +87,10 @@ def _load_local_env_file() -> None:
                 v = v[:hash_idx].rstrip()
         if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
             v = v[1:-1]
-        os.environ.setdefault(k, v)
+        if k in force_override_keys:
+            os.environ[k] = v
+        else:
+            os.environ.setdefault(k, v)
 
 
 _load_local_env_file()
@@ -22150,10 +22158,25 @@ def _normalize_rpc_url(raw_url: str) -> str:
     raw = str(raw_url or "").strip()
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
         raw = raw[1:-1].strip()
-    # Guard against accidental trailing tokens (e.g. copied ".../v2/<key> Ready").
+    # Extract first URL-like token to guard accidental tails: ".../v2/<key> Ready"
+    m = re.search(r"https?://[^\s\"'<>]+", raw, flags=re.IGNORECASE)
+    if m:
+        raw = str(m.group(0) or "").strip()
     if any(ch.isspace() for ch in raw):
         raw = raw.split()[0].strip()
+    # Trim accidental trailing punctuation from copy/paste.
+    raw = raw.rstrip(".,;")
     return raw
+
+
+def _riko_auto_yield_rpc_url_runtime() -> str:
+    # Prefer live env over module-level constant to avoid stale values after local edits/restarts.
+    raw = str(os.environ.get("RIKO_AUTO_YIELD_RPC_URL", "") or RIKO_AUTO_YIELD_RPC_URL or "").strip()
+    return _normalize_rpc_url(raw)
+
+
+def _riko_auto_yield_private_key_runtime() -> str:
+    return str(os.environ.get("RIKO_AUTO_YIELD_PRIVATE_KEY", "") or RIKO_AUTO_YIELD_PRIVATE_KEY or "").strip()
 
 
 def _eth_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
@@ -22383,8 +22406,8 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
     if payout_token.lower() not in _riko_active_whitelist_erc20_addresses():
         result.update({"status": "skip", "reason": "payout_token_not_in_active_whitelist"})
         return result
-    rpc_url = _normalize_rpc_url(str(RIKO_AUTO_YIELD_RPC_URL or ""))
-    private_key = str(RIKO_AUTO_YIELD_PRIVATE_KEY or "").strip()
+    rpc_url = _riko_auto_yield_rpc_url_runtime()
+    private_key = _riko_auto_yield_private_key_runtime()
     if not rpc_url or not private_key:
         result.update({"status": "skip", "reason": "auto_yield_rpc_or_key_missing"})
         return result
@@ -22505,8 +22528,8 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
     if RIKO_PILOT_CONFIG_FROZEN:
         result.update({"status": "skip", "reason": "pilot_config_frozen"})
         return result
-    rpc_url = str(RIKO_AUTO_YIELD_RPC_URL or "").strip()
-    private_key = str(RIKO_AUTO_YIELD_PRIVATE_KEY or "").strip()
+    rpc_url = _riko_auto_yield_rpc_url_runtime()
+    private_key = _riko_auto_yield_private_key_runtime()
     if not rpc_url or not private_key:
         result.update({"status": "skip", "reason": "auto_yield_rpc_or_key_missing"})
         return result
@@ -31147,6 +31170,10 @@ def _render_admin_page() -> str:
       display: grid;
       gap: 6px;
     }}
+    #adminRikoAllowanceRows {{
+      display: grid;
+      gap: 6px;
+    }}
     .admin-riko-whitelist-row {{
       display: grid;
       grid-template-columns: minmax(120px,180px) minmax(180px,1fr) auto;
@@ -31160,6 +31187,16 @@ def _render_admin_page() -> str:
       gap: 6px;
       align-items: center;
       margin: 0;
+    }}
+    .admin-riko-allowance-row.native-lock input {{
+      background: #eef2f7;
+      color: #64748b;
+      border-color: #d5dee8;
+    }}
+    .admin-riko-allowance-row.native-lock .btn.danger {{
+      opacity: 0.45;
+      cursor: not-allowed;
+      pointer-events: none;
     }}
     .admin-riko-whitelist-card #adminRikoWhitelistStatus {{
       display: block;
@@ -31335,6 +31372,7 @@ def _render_admin_page() -> str:
           <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
             <button type="button" class="btn btn-soft" onclick="applyAllAdminRikoCustodyAllowancePresets()">Apply allowances on-chain</button>
           </div>
+          <span id="adminRikoCustodyStatus" class="status">Ready</span>
         </section>
       </div>
     </div>
@@ -31546,6 +31584,12 @@ def _render_admin_page() -> str:
     function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setAdminRikoOnchainStatus(text, isErr) {{
       const el = document.getElementById("adminRikoOnchainStatus");
+      if (!el) return;
+      el.textContent = String(text || "");
+      el.style.color = isErr ? "#b91c1c" : "#475569";
+    }}
+    function setAdminRikoCustodyStatus(text, isErr) {{
+      const el = document.getElementById("adminRikoCustodyStatus");
       if (!el) return;
       el.textContent = String(text || "");
       el.style.color = isErr ? "#b91c1c" : "#475569";
@@ -32384,14 +32428,29 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoCustodyApprove(tokenAddressInput, amountInput) {{
       try {{
-        const signer = await getAdminSigner();
-        const signerAddr = String(await signer.getAddress() || "").trim().toLowerCase();
+        const ethers = await ensureEthersAdmin();
+        if (!window.ethereum) throw new Error("Wallet provider not found");
+        const provider = new ethers.BrowserProvider(window.ethereum);
         const vaultAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
-        const vault = await getAdminVaultContract(signer);
+        const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
         const custodyAddr = String(await vault.custodyAddress() || "").trim().toLowerCase();
         if (!/^0x[a-f0-9]{{40}}$/.test(custodyAddr)) throw new Error("Custody is not configured on vault.");
-        if (signerAddr !== custodyAddr) {{
-          throw new Error(`Switch wallet account to custody address ${{shortAddrAdmin(custodyAddr)}} and retry.`);
+        const connectedAccountsRaw = await provider.send("eth_requestAccounts", []);
+        const connectedAccounts = Array.isArray(connectedAccountsRaw)
+          ? connectedAccountsRaw.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean)
+          : [];
+        let signer = null;
+        if (connectedAccounts.includes(custodyAddr)) {{
+          signer = await provider.getSigner(custodyAddr);
+        }} else {{
+          const fallbackSigner = await provider.getSigner();
+          const fallbackAddr = String(await fallbackSigner.getAddress() || "").trim().toLowerCase();
+          if (fallbackAddr === custodyAddr) {{
+            signer = fallbackSigner;
+          }}
+        }}
+        if (!signer) {{
+          throw new Error(`Connect/select custody wallet ${{shortAddrAdmin(custodyAddr)}} in wallet extension and retry (relogin is not required).`);
         }}
         const rawToken = String(tokenAddressInput || "").trim();
         let tokenAddr = normalizeEthAddressInput(rawToken);
@@ -32400,37 +32459,43 @@ def _render_admin_page() -> str:
           tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
         }}
         if (!tokenAddr) throw new Error("Token address must be valid (or use ETH to auto-map WETH).");
-        const ethers = await ensureEthersAdmin();
         const erc20 = new ethers.Contract(tokenAddr, ADMIN_ERC20_WRITE_ABI, signer);
-        const decimals = Number(await erc20.decimals());
+        let decimals = 0;
+        try {{
+          decimals = Number(await erc20.decimals());
+        }} catch (_) {{
+          throw new Error(`Token ${{shortAddrAdmin(tokenAddr)}} is not a valid ERC-20 contract (decimals() failed).`);
+        }}
         if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) throw new Error("Token decimals are invalid.");
         const rawAmountText = String(amountInput || "").trim();
         const useMax = !rawAmountText || /^max$/i.test(rawAmountText);
         const approveAmount = useMax ? ethers.MaxUint256 : ethers.parseUnits(rawAmountText, decimals);
         if (!useMax && approveAmount <= 0n) throw new Error("Approve amount must be greater than 0.");
-        setAdminRikoOnchainStatus(
+        setAdminRikoCustodyStatus(
           useMax
             ? `Approving max allowance for ${{shortAddrAdmin(tokenAddr)}}...`
             : `Approving ${{rawAmountText}} for ${{shortAddrAdmin(tokenAddr)}}...`,
           false
         );
         const tx = await erc20.approve(vaultAddr, approveAmount);
-        setAdminRikoOnchainStatus("Custody approve tx sent: " + tx.hash, false);
+        setAdminRikoCustodyStatus("Custody approve tx sent: " + tx.hash, false);
         await tx.wait();
         const allowance = BigInt(await erc20.allowance(custodyAddr, vaultAddr));
         const allowanceText = allowance === ethers.MaxUint256
           ? "MAX"
           : ethers.formatUnits(allowance, decimals);
-        setAdminRikoOnchainStatus(
+        setAdminRikoCustodyStatus(
           `Custody approve confirmed. allowance(custody->vault) = ${{allowanceText}}`,
           false
         );
+        return true;
       }} catch (e) {{
         if (isWalletUserRejectedError(e)) {{
-          setAdminRikoOnchainStatus("Signature was rejected in wallet. Custody approve was canceled.", true);
-          return;
+          setAdminRikoCustodyStatus("Signature was rejected in wallet. Custody approve was canceled.", true);
+          return false;
         }}
-        setAdminRikoOnchainStatus("Custody approve failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+        setAdminRikoCustodyStatus("Custody approve failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+        return false;
       }}
     }}
     async function applyAdminRikoPriceUsd() {{
@@ -32911,7 +32976,7 @@ def _render_admin_page() -> str:
         return;
       }}
       rowsEl.innerHTML = rows.map((it, idx) => `
-        <div class="admin-riko-allowance-row">
+        <div class="admin-riko-allowance-row ${{String(it?.symbol || "").toLowerCase() === "eth" ? "native-lock" : ""}}">
           <input value="${{esc(it?.symbol || "")}}" readonly />
           <input
             data-admin-riko-allowance-field="allowance"
@@ -32920,7 +32985,7 @@ def _render_admin_page() -> str:
             value="${{esc(it?.allowance || "")}}"
             ${{String(it?.symbol || "").toLowerCase() === "eth" ? "readonly" : ""}}
           />
-          <button type="button" class="btn danger" onclick="clearAdminRikoAllowanceRow(${{idx}})">-</button>
+          <button type="button" class="btn danger" onclick="clearAdminRikoAllowanceRow(${{idx}})" ${{String(it?.symbol || "").toLowerCase() === "eth" ? "disabled" : ""}}>-</button>
         </div>
       `).join("");
       for (const input of rowsEl.querySelectorAll("input[data-admin-riko-allowance-field]")) {{
@@ -32972,13 +33037,20 @@ def _render_admin_page() -> str:
     async function applyAllAdminRikoCustodyAllowancePresets() {{
       const rows = collectAdminRikoCustodyAllowancePresetItems();
       if (!rows.length) {{
-        setAdminRikoOnchainStatus("No non-empty allowance presets to apply.", true);
+        setAdminRikoCustodyStatus("No non-empty allowance presets to apply.", true);
         return;
       }}
+      let okCount = 0;
       for (let i = 0; i < rows.length; i += 1) {{
         const row = rows[i];
-        setAdminRikoOnchainStatus(`Applying preset ${{i + 1}} / ${{rows.length}}...`, false);
-        await applyAdminRikoCustodyApprove(String(row?.address || ""), String(row?.allowance || ""));
+        setAdminRikoCustodyStatus(`Applying preset ${{i + 1}} / ${{rows.length}}...`, false);
+        const ok = await applyAdminRikoCustodyApprove(String(row?.address || ""), String(row?.allowance || ""));
+        if (ok) okCount += 1;
+      }}
+      if (okCount === rows.length) {{
+        setAdminRikoCustodyStatus(`All allowances applied: ${{okCount}} / ${{rows.length}}.`, false);
+      }} else if (okCount > 0) {{
+        setAdminRikoCustodyStatus(`Partially applied: ${{okCount}} / ${{rows.length}}.`, true);
       }}
     }}
     function renderAdminRikoWhitelistEditor() {{
