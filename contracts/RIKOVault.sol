@@ -10,6 +10,10 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IChainlinkAggregatorV3} from "./interfaces/IChainlinkAggregatorV3.sol";
 
+interface IWETHLike {
+    function withdraw(uint256 amount) external;
+}
+
 /**
  * @title RIKOVault
  * @notice Custody vault with whitelist-gated deposits and ERC20 share token (RIKO).
@@ -59,6 +63,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     error RV_PendingRedemptionNotFound();
     error RV_InvalidPendingRedemptionOperator();
     error RV_PendingRedemptionOperatorOnly();
+    error RV_NativeTransferFailed();
 
     /*//////////////////////////////////////////////////////////////
                                    TYPES
@@ -95,6 +100,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public rikoPriceUsd6;
     mapping(address => mapping(address => PendingRedemption)) public pendingRedemptions;
     address public pendingRedemptionOperator;
+    address public wrappedNativeToken;
 
     /*//////////////////////////////////////////////////////////////
                                    EVENTS
@@ -114,6 +120,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     event CustodyAddressUpdated(address indexed custodyAddress);
     event RikoPriceUpdated(uint256 rikoPriceUsd6);
     event PendingRedemptionOperatorUpdated(address indexed operator);
+    event WrappedNativeTokenUpdated(address indexed wrappedNativeToken);
     event RedeemQueued(
         address indexed account,
         address indexed token,
@@ -135,8 +142,10 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (admin == address(0)) revert RV_InvalidReceiver();
         custodyAddress = admin;
         rikoPriceUsd6 = RIKO_DECIMALS_SCALE;
+        wrappedNativeToken = _defaultWrappedNativeToken(block.chainid);
         emit CustodyAddressUpdated(admin);
         emit RikoPriceUpdated(rikoPriceUsd6);
+        emit WrappedNativeTokenUpdated(wrappedNativeToken);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -195,6 +204,13 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (operator == address(0)) revert RV_InvalidPendingRedemptionOperator();
         pendingRedemptionOperator = operator;
         emit PendingRedemptionOperatorUpdated(operator);
+    }
+
+    /// @notice Set wrapped native token that should be unwrapped and paid as native ETH on redeem.
+    /// @param token Wrapped native token address. Zero disables auto-unwrap path.
+    function setWrappedNativeToken(address token) external onlyOwner {
+        wrappedNativeToken = token;
+        emit WrappedNativeTokenUpdated(token);
     }
 
     /// @notice Add or update token whitelist config and oracle constraints.
@@ -416,7 +432,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         _pullFromCustodyIfNeeded(token, tokenOut);
         uint256 avail = asset.balanceOf(address(this));
         if (avail < tokenOut) revert RV_InsufficientLiquidity();
-        _safeTransferWithMinOutCheck(asset, receiver, tokenOut, minTokenOut);
+        _transferOutWithMinOutCheck(token, asset, receiver, tokenOut, minTokenOut);
         _burn(account, rikoAmountIn);
         emit Redeemed(receiver, token, rikoAmountIn, tokenOut);
         emit RedeemCompleted(account, token, receiver, rikoAmountIn, tokenOut);
@@ -551,6 +567,28 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (receiverAfter - receiverBefore < minTokenOut) revert RV_SlippageExceeded();
     }
 
+    function _transferOutWithMinOutCheck(
+        address token,
+        IERC20Metadata asset,
+        address receiver,
+        uint256 tokenOut,
+        uint256 minTokenOut
+    ) internal {
+        if (_isWrappedNativeToken(token)) {
+            if (tokenOut < minTokenOut) revert RV_SlippageExceeded();
+            IWETHLike(token).withdraw(tokenOut);
+            (bool ok,) = receiver.call{value: tokenOut}("");
+            if (!ok) revert RV_NativeTransferFailed();
+            return;
+        }
+        _safeTransferWithMinOutCheck(asset, receiver, tokenOut, minTokenOut);
+    }
+
+    function _isWrappedNativeToken(address token) internal view returns (bool) {
+        address wrapped = wrappedNativeToken;
+        return wrapped != address(0) && token == wrapped;
+    }
+
     function _requireConfiguredCustody() internal view returns (address custody) {
         custody = custodyAddress;
         if (custody == address(0)) revert RV_InvalidCustodyAddress();
@@ -583,4 +621,12 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         price = rikoPriceUsd6;
         if (price == 0) revert RV_InvalidRikoPrice();
     }
+
+    function _defaultWrappedNativeToken(uint256 chainId) internal pure returns (address) {
+        if (chainId == 1) return 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+        if (chainId == 11155111) return 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14;
+        return address(0);
+    }
+
+    receive() external payable {}
 }

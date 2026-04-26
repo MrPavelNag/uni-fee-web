@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import {RIKOVault} from "../contracts/RIKOVault.sol";
-import {MockERC20, MockAggregatorV3} from "./mocks/RIKOMocks.sol";
+import {MockERC20, MockWETH, MockAggregatorV3} from "./mocks/RIKOMocks.sol";
 
 contract RIKOVaultTest is Test {
     RIKOVault internal vault;
@@ -123,5 +123,72 @@ contract RIKOVaultTest is Test {
 
         vm.expectRevert(RIKOVault.RV_PendingRedemptionOperatorOnly.selector);
         vault.processPendingRedemption(alice, address(usdc));
+    }
+
+    function testRedeemWrappedNativeSendsNativeEth() public {
+        MockWETH weth = new MockWETH();
+        MockAggregatorV3 wethUsdFeed = new MockAggregatorV3(8, "WETH / USD", 2_000e8);
+        bytes32 feedHash = keccak256(bytes("WETH / USD"));
+        vault.setTokenConfig(address(weth), true, address(wethUsdFeed), 1 days, feedHash);
+        vault.setWrappedNativeToken(address(weth));
+
+        vm.deal(address(weth), 5 ether);
+        weth.mint(alice, 1 ether);
+        weth.approve(address(vault), type(uint256).max);
+        uint256 rikoIn = vault.quoteDeposit(address(weth), 1 ether);
+
+        vm.startPrank(alice);
+        weth.approve(address(vault), type(uint256).max);
+        vault.deposit(address(weth), 1 ether, 0, alice);
+        uint256 ethBefore = alice.balance;
+        uint256 expectedOut = vault.quoteRedeem(address(weth), rikoIn);
+        uint256 tokenOut = vault.redeem(address(weth), rikoIn, 0, alice);
+        vm.stopPrank();
+
+        assertEq(tokenOut, expectedOut, "tokenOut should match quote");
+        assertEq(alice.balance, ethBefore + expectedOut, "alice receives native ETH");
+        assertEq(weth.balanceOf(alice), 0, "alice should not receive WETH");
+    }
+
+    function testProcessPendingWrappedNativeSendsNativeEth() public {
+        MockWETH weth = new MockWETH();
+        MockAggregatorV3 wethUsdFeed = new MockAggregatorV3(8, "WETH / USD", 2_000e8);
+        bytes32 feedHash = keccak256(bytes("WETH / USD"));
+        vault.setTokenConfig(address(weth), true, address(wethUsdFeed), 1 days, feedHash);
+        vault.setWrappedNativeToken(address(weth));
+
+        vm.deal(address(weth), 10 ether);
+        weth.mint(alice, 1 ether);
+
+        vm.startPrank(alice);
+        weth.approve(address(vault), type(uint256).max);
+        vault.deposit(address(weth), 1 ether, 0, alice);
+        vm.stopPrank();
+
+        // Make immediate settlement impossible: drain custody WETH.
+        weth.transfer(address(0xBEEF), weth.balanceOf(address(this)));
+        uint256 aliceRiko = vault.balanceOf(alice);
+
+        vm.prank(alice);
+        uint256 queued = vault.redeem(address(weth), aliceRiko, 0, alice);
+        assertEq(queued, 0, "redeem should queue while underfunded");
+
+        uint256 rikoLocked;
+        uint256 minTokenOut;
+        bool exists;
+        (rikoLocked,, minTokenOut,, exists) = vault.pendingRedemptions(alice, address(weth));
+        assertTrue(exists, "pending redemption exists");
+        uint256 expectedOut = vault.quoteRedeem(address(weth), rikoLocked);
+
+        weth.mint(address(this), expectedOut);
+        weth.approve(address(vault), type(uint256).max);
+        vm.deal(address(weth), expectedOut);
+        uint256 ethBefore = alice.balance;
+        (bool completed, uint256 sent) = vault.processPendingRedemption(alice, address(weth));
+
+        assertTrue(completed, "pending redeem completed");
+        assertEq(sent, expectedOut, "sent amount should match quote");
+        assertEq(alice.balance, ethBefore + expectedOut, "alice receives native ETH");
+        assertEq(minTokenOut, 0, "min out from queued redeem");
     }
 }
