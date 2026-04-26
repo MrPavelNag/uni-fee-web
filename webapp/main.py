@@ -30093,6 +30093,21 @@ def _render_admin_page() -> str:
     .admin-pending-main {{ font-size:13px; color:#0f172a; margin:0; }}
     .admin-pending-meta {{ font-size:13px; color:#334155; margin:0; }}
     .admin-pending-actions {{ display:flex; gap:8px; align-items:center; }}
+    #adminRikoPendingQueueTable {{
+      min-width: 0;
+      width: 100%;
+      font-size: 14px;
+    }}
+    #adminRikoPendingQueueTable th,
+    #adminRikoPendingQueueTable td {{
+      text-align: left;
+      vertical-align: middle;
+      white-space: nowrap;
+      font-size: 14px;
+    }}
+    #adminRikoPendingQueueTable td:last-child {{
+      text-align: right;
+    }}
     .riko-payout-actions {{
       display: flex;
       justify-content: flex-end;
@@ -30163,7 +30178,7 @@ def _render_admin_page() -> str:
     <div class="grid" id="tabSettings">
       <section class="card">
         <h3>RIKO on-chain controls</h3>
-        <div class="row"><label>Vault address</label><div id="adminRikoVaultAddress">-</div></div>
+        <div class="row"><label>Vault address (RIKO)</label><div id="adminRikoVaultAddress">-</div></div>
         <div class="row"><label>Yield distributor</label><div id="adminRikoYieldDistributorAddress">-</div></div>
         <div class="row"><label>Yield cycle</label><div id="adminRikoYieldCycleCurrent">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
@@ -30508,6 +30523,9 @@ def _render_admin_page() -> str:
       "function setYieldTokenAddress(address newYieldTokenAddress) external",
       "function setMonthlyYieldRateBps(uint256 newMonthlyYieldRateBps) external"
     ];
+    const ADMIN_ERC20_DECIMALS_ABI = [
+      "function decimals() view returns (uint8)"
+    ];
     function normalizeEthAddressInput(v) {{
       const raw = String(v || "").trim();
       return /^0x[a-fA-F0-9]{{40}}$/.test(raw) ? raw : "";
@@ -30565,6 +30583,30 @@ def _render_admin_page() -> str:
       if (!/^0x[a-fA-F0-9]{{40}}$/.test(s)) return s || "-";
       return `${{s.slice(0, 8)}}...${{s.slice(-6)}}`;
     }}
+    function formatAdminIntegerWithCommas(raw) {{
+      const s = String(raw || "0").trim();
+      if (!/^[-]?\\d+$/.test(s)) return s || "0";
+      const negative = s.startsWith("-");
+      const body = negative ? s.slice(1) : s;
+      const out = body.replace(/\\B(?=(\\d{3})+(?!\\d))/g, ",");
+      return negative ? `-${{out}}` : out;
+    }}
+    function formatAdminRawUnits(rawValue, decimals, maxFrac = 6) {{
+      try {{
+        const d = Math.max(0, Number(decimals || 0));
+        const fracDigits = Math.max(0, Math.min(12, Number(maxFrac || 6)));
+        const bi = BigInt(String(rawValue ?? "0"));
+        if (d === 0) return formatAdminIntegerWithCommas(String(bi));
+        const base = 10n ** BigInt(d);
+        const whole = bi / base;
+        const fracRaw = (bi % base).toString().padStart(d, "0");
+        const fracTrimmed = fracRaw.slice(0, fracDigits).replace(/0+$/, "");
+        const wholeText = formatAdminIntegerWithCommas(String(whole));
+        return fracTrimmed ? `${{wholeText}}.${{fracTrimmed}}` : wholeText;
+      }} catch (_) {{
+        return String(rawValue ?? "0");
+      }}
+    }}
     function formatAdminRikoDate(tsSec) {{
       const n = Number(tsSec || 0);
       if (!Number.isFinite(n) || n <= 0) return "-";
@@ -30574,13 +30616,6 @@ def _render_admin_page() -> str:
       }} catch (_) {{
         return "-";
       }}
-    }}
-    function setAdminPendingFromRow(account, token) {{
-      const accEl = document.getElementById("adminRikoProcessAccountInput");
-      const tokEl = document.getElementById("adminRikoProcessTokenInput");
-      if (accEl) accEl.value = String(account || "");
-      if (tokEl) tokEl.value = String(token || "");
-      setAdminRikoPendingOpsStatus("Pending request selected.", false);
     }}
     async function loadAdminRikoPendingQueue() {{
       const table = document.getElementById("adminRikoPendingQueueTable");
@@ -30659,12 +30694,29 @@ def _render_admin_page() -> str:
           if (!latestQueuedByKey.has(key)) latestQueuedByKey.set(key, ev);
         }}
         const blockTsCache = new Map();
+        const tokenDecimalsCache = new Map();
         let wrapped = "";
         try {{
           const net = await provider.getNetwork();
           wrapped = String(wrappedNativeByChainIdAdmin(Number(net?.chainId || 0)) || "").toLowerCase();
         }} catch (_) {{
           wrapped = "";
+        }}
+        async function resolveTokenDecimals(tokenAddress, tokenLower) {{
+          if (tokenLower && tokenLower === wrapped) return 18;
+          if (!/^0x[a-fA-F0-9]{{40}}$/.test(String(tokenAddress || ""))) return null;
+          const key = String(tokenAddress || "").toLowerCase();
+          if (tokenDecimalsCache.has(key)) return tokenDecimalsCache.get(key);
+          try {{
+            const erc20 = new ethers.Contract(tokenAddress, ADMIN_ERC20_DECIMALS_ABI, provider);
+            const dec = Number(await erc20.decimals());
+            if (Number.isInteger(dec) && dec >= 0 && dec <= 36) {{
+              tokenDecimalsCache.set(key, dec);
+              return dec;
+            }}
+          }} catch (_) {{}}
+          tokenDecimalsCache.set(key, null);
+          return null;
         }}
         const rows = [];
         for (const [, ev] of latestQueuedByKey) {{
@@ -30685,6 +30737,10 @@ def _render_admin_page() -> str:
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
           const rikoLockedRaw = ev?.args?.rikoLocked;
           const tokenOutRaw = ev?.args?.tokenOut;
+          const tokenDecimals = await resolveTokenDecimals(token, tokenLower);
+          const expectedOutDisplay = tokenDecimals === null
+            ? `${{formatAdminIntegerWithCommas(String(tokenOutRaw ?? 0n))}} (raw)`
+            : `${{formatAdminRawUnits(String(tokenOutRaw ?? 0n), tokenDecimals, 8)}} ${{tokenLabel === "ETH" ? "ETH" : ""}}`.trim();
           rows.push({{
             date: Number(ts || 0),
             blockNumber: bn,
@@ -30694,6 +30750,7 @@ def _render_admin_page() -> str:
             tokenLabel,
             rikoLocked: String(rikoLockedRaw ?? 0n),
             tokenOut: String(tokenOutRaw ?? 0n),
+            expectedOutDisplay,
           }});
         }}
         rows.sort((a, b) => {{
@@ -30721,9 +30778,9 @@ def _render_admin_page() -> str:
             `<td style='text-align:left;white-space:nowrap'>${{formatAdminRikoDate(r.date)}}</td>` +
             `<td class='mono'>${{shortAddrAdmin(r.account)}}</td>` +
             `<td class='mono'>${{String(r.tokenLabel || "-")}}</td>` +
-            `<td class='mono'>${{String((Number(r.rikoLocked || "0") / 1e6).toFixed(6))}}</td>` +
-            `<td class='mono'>${{String(r.tokenOut || "0")}}</td>` +
-            `<td><button type='button' class='btn btn-soft' onclick="setAdminPendingFromRow('${{String(r.account)}}','${{String(r.token)}}')">Use</button></td>` +
+            `<td class='mono'>${{formatAdminRawUnits(String(r.rikoLocked || "0"), 6, 6)}}</td>` +
+            `<td class='mono' title="${{String(r.tokenOut || "0")}}">${{String(r.expectedOutDisplay || "-")}}</td>` +
+            `<td><button type='button' class='btn' onclick="applyAdminRikoProcessPendingRedeem('${{String(r.account)}}','${{String(r.token)}}')">Apply on-chain</button></td>` +
             `</tr>`
           )).join("");
         if (loadWarns.length) {{
@@ -31018,23 +31075,26 @@ def _render_admin_page() -> str:
         setAdminRikoOnchainStatus("Pending operator update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
-    async function applyAdminRikoProcessPendingRedeem() {{
+    async function applyAdminRikoProcessPendingRedeem(accountOverride, tokenOverride) {{
       try {{
         requireAdminWalletAuth();
-        const accountAddr = requireValidInputAddress(
-          document.getElementById("adminRikoProcessAccountInput")?.value || "",
-          "Account address must be valid."
-        );
+        const accountRaw = String(accountOverride || document.getElementById("adminRikoProcessAccountInput")?.value || "").trim();
+        const tokenRawInput = String(tokenOverride || document.getElementById("adminRikoProcessTokenInput")?.value || "").trim();
+        const accountAddr = requireValidInputAddress(accountRaw, "Account address must be valid.");
         const signer = await getAdminSigner();
         const ethers = await ensureEthersAdmin();
         const provider = signer?.provider || (window.ethereum ? new ethers.BrowserProvider(window.ethereum) : null);
-        const tokenRaw = String(document.getElementById("adminRikoProcessTokenInput")?.value || "").trim();
+        const tokenRaw = tokenRawInput;
         let tokenAddr = normalizeEthAddressInput(tokenRaw);
         if (!tokenAddr && tokenRaw.toLowerCase() === "eth") {{
           const network = provider ? await provider.getNetwork() : null;
           tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
         }}
         if (!tokenAddr) throw new Error("Token address must be valid (or use ETH to auto-map WETH).");
+        const accountInput = document.getElementById("adminRikoProcessAccountInput");
+        const tokenInput = document.getElementById("adminRikoProcessTokenInput");
+        if (accountInput) accountInput.value = accountAddr;
+        if (tokenInput) tokenInput.value = tokenRaw;
         const vault = await getAdminVaultContract(signer);
         setAdminRikoPendingOpsStatus("Processing pending redemption on-chain...", false);
         const tx = await vault.processPendingRedemption(accountAddr, tokenAddr);

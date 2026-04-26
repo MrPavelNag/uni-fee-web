@@ -19,6 +19,30 @@ contract MockERC20 is ERC20 {
     }
 }
 
+contract MockWETH is ERC20 {
+    constructor() ERC20("Wrapped Ether", "WETH") {}
+
+    function decimals() public pure override returns (uint8) {
+        return 18;
+    }
+
+    function deposit() external payable {
+        _mint(msg.sender, msg.value);
+    }
+
+    function withdraw(uint256 amount) external {
+        _burn(msg.sender, amount);
+        (bool ok,) = msg.sender.call{value: amount}("");
+        require(ok, "ETH transfer failed");
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    receive() external payable {}
+}
+
 contract MockMutableDecimalsERC20 is ERC20 {
     uint8 private _customDecimals;
 
