@@ -22169,6 +22169,31 @@ def _normalize_rpc_url(raw_url: str) -> str:
     return raw
 
 
+def _rpc_url_label(raw_url: str) -> str:
+    rpc = _normalize_rpc_url(raw_url)
+    if not rpc:
+        return "missing_rpc_url"
+    try:
+        p = urlparse(rpc)
+    except Exception:
+        return "invalid_rpc_url"
+    scheme = str(p.scheme or "https")
+    host = str(p.netloc or "")
+    path = str(p.path or "")
+    # Hide API keys in /v2/<key> style paths.
+    if path.startswith("/v2/"):
+        key = path[4:].strip("/")
+        if key:
+            if len(key) <= 8:
+                key_mask = "***"
+            else:
+                key_mask = f"{key[:4]}...{key[-4:]}"
+            path = f"/v2/{key_mask}"
+        else:
+            path = "/v2/"
+    return f"{scheme}://{host}{path}"
+
+
 def _riko_auto_yield_rpc_url_runtime() -> str:
     # Prefer live env over module-level constant to avoid stale values after local edits/restarts.
     raw = str(os.environ.get("RIKO_AUTO_YIELD_RPC_URL", "") or RIKO_AUTO_YIELD_RPC_URL or "").strip()
@@ -22192,8 +22217,19 @@ def _eth_rpc(rpc_url: str, method: str, params: list[Any]) -> Any:
         method="POST",
         headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
     )
-    with urlopen(req, timeout=20) as resp:
-        body = resp.read().decode("utf-8", errors="ignore")
+    try:
+        with urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+    except HTTPError as e:
+        body = ""
+        with contextlib.suppress(Exception):
+            body = (e.read() or b"").decode("utf-8", errors="ignore")
+        body_one_line = re.sub(r"\s+", " ", str(body or "").strip())
+        body_hint = body_one_line[:220] if body_one_line else ""
+        suffix = f": {body_hint}" if body_hint else ""
+        raise RuntimeError(
+            f"rpc {method} http {int(getattr(e, 'code', 0) or 0)} at {_rpc_url_label(rpc)}{suffix}"
+        ) from e
     payload = json.loads(body) if body else {}
     if not isinstance(payload, dict):
         raise RuntimeError(f"rpc invalid response for {method}")
@@ -22408,6 +22444,8 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
         return result
     rpc_url = _riko_auto_yield_rpc_url_runtime()
     private_key = _riko_auto_yield_private_key_runtime()
+    result["rpc_url_label"] = _rpc_url_label(rpc_url)
+    result["rpc_key_present"] = bool(private_key)
     if not rpc_url or not private_key:
         result.update({"status": "skip", "reason": "auto_yield_rpc_or_key_missing"})
         return result
@@ -31166,27 +31204,37 @@ def _render_admin_page() -> str:
     .admin-riko-whitelist-card .row {{
       margin: 6px 0;
     }}
+    .admin-riko-signers-grid {{
+      --admin-riko-row-gap: 6px;
+      --admin-riko-row-height: 34px;
+    }}
     #adminRikoWhitelistRows {{
       display: grid;
-      gap: 6px;
+      gap: var(--admin-riko-row-gap);
     }}
     #adminRikoAllowanceRows {{
       display: grid;
-      gap: 6px;
+      gap: var(--admin-riko-row-gap);
     }}
     .admin-riko-whitelist-row {{
       display: grid;
       grid-template-columns: minmax(120px,180px) minmax(180px,1fr) auto;
-      gap: 6px;
+      gap: var(--admin-riko-row-gap);
       align-items: center;
       margin: 0;
+      min-height: var(--admin-riko-row-height);
     }}
     .admin-riko-allowance-row {{
       display: grid;
       grid-template-columns: minmax(120px,220px) minmax(140px,1fr) auto;
-      gap: 6px;
+      gap: var(--admin-riko-row-gap);
       align-items: center;
       margin: 0;
+      min-height: var(--admin-riko-row-height);
+    }}
+    .admin-riko-whitelist-row input,
+    .admin-riko-allowance-row input {{
+      min-height: var(--admin-riko-row-height);
     }}
     .admin-riko-allowance-row.native-lock input {{
       background: #eef2f7;
@@ -31202,8 +31250,9 @@ def _render_admin_page() -> str:
       display: block;
       margin-top: 6px;
     }}
-    .admin-riko-whitelist-row .btn.danger {{
-      min-height: 28px;
+    .admin-riko-whitelist-row .btn.danger,
+    .admin-riko-allowance-row .btn.danger {{
+      min-height: var(--admin-riko-row-height);
       width: 28px;
       min-width: 28px;
       padding: 4px 9px;
@@ -31219,8 +31268,14 @@ def _render_admin_page() -> str:
     }}
     .admin-riko-signers-grid > .card {{
       height: 100%;
+      display: flex;
+      flex-direction: column;
     }}
     #adminRikoPayoutStatus {{ margin-left: 0; }}
+    #adminRikoPayoutPreviewStatus,
+    #adminRikoPayoutStatus {{
+      display: block;
+    }}
     .feedback-board {{ display: grid; gap: 10px; margin-top: 10px; }}
     .feedback-meta {{ margin-top: 6px; font-size: 12px; color: #64748b; }}
     @media (max-width: 980px) {{ .row {{ grid-template-columns: 1fr; }} .admin-wallet-item {{ grid-template-columns: 1fr; }} .admin-wallet-actions {{ justify-content: flex-start; }} }}
@@ -32454,17 +32509,33 @@ def _render_admin_page() -> str:
         }}
         const rawToken = String(tokenAddressInput || "").trim();
         let tokenAddr = normalizeEthAddressInput(rawToken);
+        const network = signer?.provider ? await signer.provider.getNetwork() : null;
+        const chainId = Number(network?.chainId || 0);
         if (!tokenAddr && String(rawToken || "").toLowerCase() === "eth") {{
-          const network = signer?.provider ? await signer.provider.getNetwork() : null;
-          tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
+          tokenAddr = wrappedNativeByChainIdAdmin(chainId);
         }}
         if (!tokenAddr) throw new Error("Token address must be valid (or use ETH to auto-map WETH).");
+        const mainnetWeth = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+        if (String(tokenAddr || "").toLowerCase() === mainnetWeth && chainId !== 1) {{
+          const chainWrapped = wrappedNativeByChainIdAdmin(chainId);
+          if (chainWrapped && String(chainWrapped).toLowerCase() !== mainnetWeth) {{
+            tokenAddr = chainWrapped;
+            setAdminRikoCustodyStatus(
+              `Detected mainnet WETH in non-mainnet network. Using wrapped native for chain ${{chainId}}: ${{shortAddrAdmin(tokenAddr)}}.`,
+              false
+            );
+          }}
+        }}
+        const code = String(await provider.getCode(tokenAddr) || "");
+        if (!code || code === "0x") {{
+          throw new Error(`No token contract at ${{shortAddrAdmin(tokenAddr)}} on chainId ${{chainId}}.`);
+        }}
         const erc20 = new ethers.Contract(tokenAddr, ADMIN_ERC20_WRITE_ABI, signer);
         let decimals = 0;
         try {{
           decimals = Number(await erc20.decimals());
         }} catch (_) {{
-          throw new Error(`Token ${{shortAddrAdmin(tokenAddr)}} is not a valid ERC-20 contract (decimals() failed).`);
+          throw new Error(`Token ${{shortAddrAdmin(tokenAddr)}} is not a valid ERC-20 on chainId ${{chainId}} (decimals() failed).`);
         }}
         if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) throw new Error("Token decimals are invalid.");
         const rawAmountText = String(amountInput || "").trim();
@@ -33691,15 +33762,22 @@ def _render_admin_page() -> str:
       el.textContent = String(msg || "");
       el.classList.toggle("err", !!isErr);
     }}
+    function formatAdminRikoPayoutPreviewDebug(data) {{
+      const label = String(data?.rpc_url_label || "").trim();
+      const keyPresent = !!data?.rpc_key_present;
+      if (!label && !keyPresent) return "";
+      return ` [rpc=${{label || "missing"}}; key=${{keyPresent ? "present" : "missing"}}]`;
+    }}
     function renderAdminRikoPayoutPreview(data) {{
       const summaryEl = document.getElementById("adminRikoPayoutPreviewSummary");
       const table = document.getElementById("adminRikoPayoutPreviewTable");
       if (!summaryEl || !table) return;
       const status = String(data?.status || "unknown");
+      const debugSuffix = formatAdminRikoPayoutPreviewDebug(data);
       if (status !== "ok") {{
         summaryEl.textContent = status === "skip"
-          ? `Preview skipped: ${{String(data?.reason || "unknown")}}`
-          : `Preview unavailable: ${{String(data?.reason || "unknown")}}`;
+          ? `Preview skipped: ${{String(data?.reason || "unknown")}}${{debugSuffix}}`
+          : `Preview unavailable: ${{String(data?.reason || "unknown")}}${{debugSuffix}}`;
         table.innerHTML = "<tr><td class='muted'>No preview rows.</td></tr>";
         return;
       }}
@@ -33741,7 +33819,7 @@ def _render_admin_page() -> str:
         if (String(data?.status || "") === "ok") {{
           setAdminRikoPayoutPreviewStatus("Preview updated.", false);
         }} else {{
-          setAdminRikoPayoutPreviewStatus(`Preview status: ${{String(data?.status || "unknown")}} / ${{String(data?.reason || "-")}}`, true);
+          setAdminRikoPayoutPreviewStatus(`Preview status: ${{String(data?.status || "unknown")}} / ${{String(data?.reason || "-")}}${{formatAdminRikoPayoutPreviewDebug(data)}}`, true);
         }}
       }} catch (e) {{
         setAdminRikoPayoutPreviewStatus("Preview load failed: " + (e?.message || "unknown"), true);

@@ -30,7 +30,7 @@ Scope: `contracts/RIKOVault.sol` + RIKO admin workflow in `webapp/main.py`.
 - [x] Negative tests (bad feed, stale feed, bad decimals, pause, insufficient liquidity, disable/re-enable) — `test/RIKOVault.negative.t.sol`
 - [x] Invariant tests (supply and accounting invariants) — `test/RIKOVault.invariant.t.sol`
 - [x] Fuzz tests (amounts/decimals/oracle edge cases) — `test/RIKOVault.fuzz.t.sol`
-- [ ] Differential / scenario tests for basket stress
+- [x] Differential / scenario tests for basket stress — `test/RIKOVault.scenario.t.sol`
 
 Notes:
 - Solidity tooling is now present: `foundry.toml` + `forge` tests.
