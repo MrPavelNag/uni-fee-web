@@ -31097,7 +31097,14 @@ def _render_admin_page() -> str:
     }}
     .admin-riko-whitelist-row {{
       display: grid;
-      grid-template-columns: minmax(120px,170px) minmax(180px,1fr) minmax(140px,200px) auto;
+      grid-template-columns: minmax(120px,180px) minmax(180px,1fr) auto;
+      gap: 6px;
+      align-items: center;
+      margin: 0;
+    }}
+    .admin-riko-allowance-row {{
+      display: grid;
+      grid-template-columns: minmax(120px,180px) minmax(180px,1fr) minmax(140px,220px) auto;
       gap: 6px;
       align-items: center;
       margin: 0;
@@ -31189,11 +31196,15 @@ def _render_admin_page() -> str:
           <input id="adminRikoCustodyInput" type="text" placeholder="0x..."/>
           <button class="btn" onclick="applyAdminRikoCustodyAddress()">Apply on-chain</button>
         </div>
-        <div class="row" style="display:grid;grid-template-columns:170px minmax(180px,1fr) minmax(160px,220px) auto;gap:10px;align-items:center;">
-          <label style="margin:0">Approve custody -> vault</label>
-          <input id="adminRikoCustodyApproveTokenInput" type="text" placeholder="Token address or ETH (WETH by chain)"/>
-          <input id="adminRikoCustodyApproveAmountInput" type="text" placeholder="Amount or max"/>
-          <button class="btn btn-soft" onclick="applyAdminRikoCustodyApprove()">Approve</button>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:start;">
+          <label style="margin:0">Custody allowances</label>
+          <div>
+            <div class="hint" style="margin-bottom:6px">Signed by CUSTODY wallet.</div>
+            <div id="adminRikoAllowanceRows"></div>
+            <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+              <button type="button" class="btn btn-soft" onclick="applyAllAdminRikoCustodyAllowancePresets()">Apply allowances on-chain</button>
+            </div>
+          </div>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set pending operator</label>
@@ -31256,12 +31267,10 @@ def _render_admin_page() -> str:
       </section>
       <section class="card admin-riko-whitelist-card">
         <h3>Admin: RIKO whitelist</h3>
-        <p class="hint">Workflow: edit rows -> Save allowances -> Apply whitelist (wallet signature required).</p>
+        <p class="hint">Signed by ADMIN wallet.</p>
         <div id="adminRikoWhitelistRows"></div>
         <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
           <button type="button" class="btn" onclick="addAdminRikoWhitelistRow()">Add row</button>
-          <button type="button" class="btn btn-soft" onclick="saveAdminRikoCustodyAllowancePresets()">Save allowances</button>
-          <button type="button" class="btn btn-soft" onclick="applyAllAdminRikoCustodyAllowancePresets()">Approve non-empty allowances</button>
           <button type="button" class="btn" onclick="applyAdminRikoWhitelist()">Apply on-chain</button>
         </div>
         <span id="adminRikoWhitelistStatus" class="status">Ready</span>
@@ -32209,12 +32218,6 @@ def _render_admin_page() -> str:
       const elAddr = document.getElementById("adminRikoVaultAddress");
       const vaultAddr = String(RIKO_VAULT_ADDRESS || "").trim();
       if (elAddr) elAddr.textContent = vaultAddr || "-";
-      const custodyApproveTokenEl = document.getElementById("adminRikoCustodyApproveTokenInput");
-      if (custodyApproveTokenEl && !custodyApproveTokenEl.dataset.boundAllowanceRefresh) {{
-        custodyApproveTokenEl.dataset.boundAllowanceRefresh = "1";
-        custodyApproveTokenEl.addEventListener("change", () => {{ refreshAdminRikoCustodyAllowanceInfo(); }});
-        custodyApproveTokenEl.addEventListener("input", () => {{ refreshAdminRikoCustodyAllowanceInfo(); }});
-      }}
 
       let rolePayload = {{ vault_owner: "", custody: "", pending_operator: "" }};
       if (!/^0x[a-fA-F0-9]{{40}}$/.test(vaultAddr)) {{
@@ -32240,11 +32243,9 @@ def _render_admin_page() -> str:
           rolePayload.pending_operator = String(pendingOperator || "");
           const rikoPriceNum = Number(rikoPriceUsd6 || 0n);
           const inCustody = document.getElementById("adminRikoCustodyInput");
-          const inCustodyApproveToken = document.getElementById("adminRikoCustodyApproveTokenInput");
           const inPendingOperator = document.getElementById("adminRikoPendingOperatorInput");
           const inRikoPrice = document.getElementById("adminRikoPriceUsdInput");
           if (inCustody && !String(inCustody.value || "").trim()) inCustody.value = String(custody || "");
-          if (inCustodyApproveToken && !String(inCustodyApproveToken.value || "").trim()) inCustodyApproveToken.value = "ETH";
           if (inPendingOperator && !String(inPendingOperator.value || "").trim()) inPendingOperator.value = String(pendingOperator || "");
           if (inRikoPrice && !String(inRikoPrice.value || "").trim()) inRikoPrice.value = String((rikoPriceNum / 1e6) || 1);
         }} catch (_) {{
@@ -32252,8 +32253,6 @@ def _render_admin_page() -> str:
           if (inCap && !String(inCap.value || "").trim()) inCap.value = "0";
         }}
       }}
-      await refreshAdminRikoCustodyAllowanceInfo();
-
       setAdminOnchainRoles(rolePayload);
       setAdminProcessPendingDefaults(false);
       await loadAdminRikoPendingQueue();
@@ -32321,47 +32320,7 @@ def _render_admin_page() -> str:
         setAdminRikoOnchainStatus("Custody update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
-    async function refreshAdminRikoCustodyAllowanceInfo() {{
-      const infoEl = document.getElementById("adminRikoCustodyAllowanceInfo");
-      if (!infoEl) return;
-      try {{
-        const vaultAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
-        const tokenInputEl = document.getElementById("adminRikoCustodyApproveTokenInput");
-        const payoutTokenEl = document.getElementById("adminRikoAutoYieldPayoutTokenInput");
-        const rawToken = String(tokenInputEl?.value || payoutTokenEl?.value || "").trim();
-        let tokenAddr = normalizeEthAddressInput(rawToken);
-        const ethers = await ensureEthersAdmin();
-        const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
-        if (!tokenAddr && String(rawToken || "").toLowerCase() === "eth") {{
-          const network = await provider.getNetwork();
-          tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
-        }}
-        if (!tokenAddr) {{
-          infoEl.textContent = "Enter token address (or ETH) to read allowance.";
-          return;
-        }}
-        const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
-        const custodyAddr = String(await vault.custodyAddress() || "").trim().toLowerCase();
-        if (!/^0x[a-f0-9]{{40}}$/.test(custodyAddr)) {{
-          infoEl.textContent = "Custody is not configured on vault.";
-          return;
-        }}
-        const erc20 = new ethers.Contract(tokenAddr, ADMIN_ERC20_READ_ABI, provider);
-        const [decimalsRaw, allowanceRaw] = await Promise.all([
-          erc20.decimals(),
-          erc20.allowance(custodyAddr, vaultAddr),
-        ]);
-        const decimals = Number(decimalsRaw || 18);
-        const allowance = BigInt(allowanceRaw || 0n);
-        const allowanceText = allowance === ethers.MaxUint256
-          ? "MAX"
-          : ethers.formatUnits(allowance, Number.isFinite(decimals) ? decimals : 18);
-        infoEl.textContent = `${{shortAddrAdmin(custodyAddr)}} -> ${{shortAddrAdmin(vaultAddr)}} on ${{shortAddrAdmin(tokenAddr)}}: ${{allowanceText}}`;
-      }} catch (e) {{
-        infoEl.textContent = "Failed to read allowance: " + String(e?.shortMessage || e?.message || "unknown");
-      }}
-    }}
-    async function applyAdminRikoCustodyApprove() {{
+    async function applyAdminRikoCustodyApprove(tokenAddressInput, amountInput) {{
       try {{
         requireAdminWalletAuth();
         const signer = await getAdminSigner();
@@ -32373,10 +32332,7 @@ def _render_admin_page() -> str:
         if (signerAddr !== custodyAddr) {{
           throw new Error(`Switch wallet to custody address ${{shortAddrAdmin(custodyAddr)}} and retry.`);
         }}
-        const tokenInputEl = document.getElementById("adminRikoCustodyApproveTokenInput");
-        const amountInputEl = document.getElementById("adminRikoCustodyApproveAmountInput");
-        const payoutTokenEl = document.getElementById("adminRikoAutoYieldPayoutTokenInput");
-        const rawToken = String(tokenInputEl?.value || payoutTokenEl?.value || "").trim();
+        const rawToken = String(tokenAddressInput || "").trim();
         let tokenAddr = normalizeEthAddressInput(rawToken);
         if (!tokenAddr && String(rawToken || "").toLowerCase() === "eth") {{
           const network = signer?.provider ? await signer.provider.getNetwork() : null;
@@ -32387,7 +32343,7 @@ def _render_admin_page() -> str:
         const erc20 = new ethers.Contract(tokenAddr, ADMIN_ERC20_WRITE_ABI, signer);
         const decimals = Number(await erc20.decimals());
         if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) throw new Error("Token decimals are invalid.");
-        const rawAmountText = String(amountInputEl?.value || "").trim();
+        const rawAmountText = String(amountInput || "").trim();
         const useMax = !rawAmountText || /^max$/i.test(rawAmountText);
         const approveAmount = useMax ? ethers.MaxUint256 : ethers.parseUnits(rawAmountText, decimals);
         if (!useMax && approveAmount <= 0n) throw new Error("Approve amount must be greater than 0.");
@@ -32408,7 +32364,6 @@ def _render_admin_page() -> str:
           `Custody approve confirmed. allowance(custody->vault) = ${{allowanceText}}`,
           false
         );
-        await refreshAdminRikoCustodyAllowanceInfo();
       }} catch (e) {{
         if (isWalletUserRejectedError(e)) {{
           setAdminRikoOnchainStatus("Signature was rejected in wallet. Custody approve was canceled.", true);
@@ -32763,6 +32718,7 @@ def _render_admin_page() -> str:
     let adminRikoWhitelistItems = [];
     let adminRikoWhitelistActiveItems = [];
     let adminRikoWhitelistSymbolAddresses = {{}};
+    let adminRikoAllowanceItems = [];
     function setAdminRikoWhitelistStatus(text, isErr) {{
       const el = document.getElementById("adminRikoWhitelistStatus");
       if (!el) return;
@@ -32842,7 +32798,7 @@ def _render_admin_page() -> str:
       return out;
     }}
     function collectAdminRikoCustodyAllowancePresetItems() {{
-      const rows = snapshotAdminRikoWhitelistRows();
+      const rows = snapshotAdminRikoAllowanceRows();
       const out = [];
       const seen = new Set();
       for (const it of rows) {{
@@ -32856,41 +32812,67 @@ def _render_admin_page() -> str:
       }}
       return out;
     }}
-    async function saveAdminRikoCustodyAllowancePresets() {{
-      try {{
-        requireAdminWalletAuth();
-        const items = collectAdminRikoCustodyAllowancePresetItems();
-        const data = await postJson("/api/admin/riko/custody-allowance-presets", {{ items }});
-        const saved = data?.riko_custody_allowance_presets || {{}};
-        if (adminLastSettings && typeof adminLastSettings === "object") {{
-          adminLastSettings.riko_custody_allowance_presets = saved;
-        }}
-        const allowanceMap = getAdminRikoCustodyAllowancePresetMap();
-        adminRikoWhitelistItems = snapshotAdminRikoWhitelistRows().map((it) => {{
-          const address = normalizeAdminRikoAddress(it?.address || "");
-          const currentAllowance = String(it?.allowance || "").trim();
-          const allowance = currentAllowance || String(allowanceMap.get(address) || "");
-          return {{
-            symbol: String(it?.symbol || "").trim().toLowerCase(),
-            address: String(it?.address || "").trim(),
-            allowance,
-          }};
-        }});
-        renderAdminRikoWhitelistEditor();
-        const nonEmptyRows = collectAdminRikoCustodyAllowancePresetItems();
-        if (!nonEmptyRows.length) {{
-          setAdminRikoOnchainStatus(data?.info || "Custody allowance presets saved. No non-empty allowances to apply.", false);
-          return;
-        }}
-        const ask = confirm(`Allowances saved for ${{nonEmptyRows.length}} token(s). Apply on-chain now?`);
-        if (!ask) {{
-          setAdminRikoOnchainStatus(data?.info || "Custody allowance presets saved. Apply was skipped.", false);
-          return;
-        }}
-        await applyAllAdminRikoCustodyAllowancePresets();
-      }} catch (e) {{
-        setAdminRikoOnchainStatus("Save custody allowance presets failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+    function renderAdminRikoAllowanceEditor() {{
+      const rowsEl = document.getElementById("adminRikoAllowanceRows");
+      if (!rowsEl) return;
+      const rows = Array.isArray(adminRikoAllowanceItems) ? adminRikoAllowanceItems : [];
+      if (!rows.length) {{
+        rowsEl.innerHTML = `<div class="hint">No ERC-20 tokens in current whitelist.</div>`;
+        return;
       }}
+      rowsEl.innerHTML = rows.map((it, idx) => `
+        <div class="admin-riko-allowance-row">
+          <input value="${{esc(it?.symbol || "")}}" readonly />
+          <input value="${{esc(it?.address || "")}}" readonly />
+          <input data-admin-riko-allowance-field="allowance" data-index="${{idx}}" placeholder="allowance or max" value="${{esc(it?.allowance || "")}}" />
+          <button type="button" class="btn danger" onclick="clearAdminRikoAllowanceRow(${{idx}})">-</button>
+        </div>
+      `).join("");
+      for (const input of rowsEl.querySelectorAll("input[data-admin-riko-allowance-field]")) {{
+        input.addEventListener("input", onAdminRikoAllowanceInputChanged);
+      }}
+    }}
+    function snapshotAdminRikoAllowanceRows() {{
+      const rowsEl = document.getElementById("adminRikoAllowanceRows");
+      if (!rowsEl) return Array.isArray(adminRikoAllowanceItems) ? [...adminRikoAllowanceItems] : [];
+      const byIndex = new Map();
+      for (const input of rowsEl.querySelectorAll("input[data-index]")) {{
+        const idx = Number(input.dataset.index ?? -1);
+        if (!Number.isInteger(idx) || idx < 0) continue;
+        const entry = byIndex.get(idx) || {{ symbol: "", address: "", allowance: "" }};
+        const field = input.dataset.adminRikoAllowanceField;
+        if (field === "allowance") entry.allowance = String(input.value || "").trim();
+        byIndex.set(idx, entry);
+      }}
+      const base = Array.isArray(adminRikoAllowanceItems) ? adminRikoAllowanceItems : [];
+      return base.map((it, idx) => {{
+        const edited = byIndex.get(idx);
+        return {{
+          symbol: String(it?.symbol || "").trim().toLowerCase(),
+          address: String(it?.address || "").trim(),
+          allowance: String((edited?.allowance ?? it?.allowance) || "").trim(),
+        }};
+      }});
+    }}
+    function onAdminRikoAllowanceInputChanged(e) {{
+      const idx = Number(e?.target?.dataset?.index ?? -1);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      while (adminRikoAllowanceItems.length <= idx) adminRikoAllowanceItems.push({{ symbol: "", address: "", allowance: "" }});
+      const current = adminRikoAllowanceItems[idx] || {{ symbol: "", address: "", allowance: "" }};
+      current.allowance = String(e?.target?.value || "").trim();
+      adminRikoAllowanceItems[idx] = current;
+    }}
+    function clearAdminRikoAllowanceRow(idx) {{
+      const n = Number(idx ?? -1);
+      if (!Number.isInteger(n) || n < 0 || n >= adminRikoAllowanceItems.length) return;
+      const snapshot = snapshotAdminRikoAllowanceRows();
+      snapshot[n] = {{
+        symbol: String(snapshot[n]?.symbol || "").trim().toLowerCase(),
+        address: String(snapshot[n]?.address || "").trim(),
+        allowance: "",
+      }};
+      adminRikoAllowanceItems = snapshot;
+      renderAdminRikoAllowanceEditor();
     }}
     async function applyAllAdminRikoCustodyAllowancePresets() {{
       const rows = collectAdminRikoCustodyAllowancePresetItems();
@@ -32900,24 +32882,18 @@ def _render_admin_page() -> str:
       }}
       for (let i = 0; i < rows.length; i += 1) {{
         const row = rows[i];
-        const tokenEl = document.getElementById("adminRikoCustodyApproveTokenInput");
-        const amountEl = document.getElementById("adminRikoCustodyApproveAmountInput");
-        if (tokenEl) tokenEl.value = String(row?.address || "");
-        if (amountEl) amountEl.value = String(row?.allowance || "");
         setAdminRikoOnchainStatus(`Applying preset ${{i + 1}} / ${{rows.length}}...`, false);
-        await refreshAdminRikoCustodyAllowanceInfo();
-        await applyAdminRikoCustodyApprove();
+        await applyAdminRikoCustodyApprove(String(row?.address || ""), String(row?.allowance || ""));
       }}
     }}
     function renderAdminRikoWhitelistEditor() {{
       const rowsEl = document.getElementById("adminRikoWhitelistRows");
       if (!rowsEl) return;
-      const rows = adminRikoWhitelistItems.length ? adminRikoWhitelistItems : [{{symbol:"", address:"", allowance:""}}];
+      const rows = adminRikoWhitelistItems.length ? adminRikoWhitelistItems : [{{symbol:"", address:""}}];
       rowsEl.innerHTML = rows.map((it, idx) => `
         <div class="admin-riko-whitelist-row">
           <input data-admin-riko-field="symbol" data-index="${{idx}}" placeholder="symbol" value="${{esc(it?.symbol || "")}}" />
           <input data-admin-riko-field="address" data-index="${{idx}}" placeholder="0x... or native" value="${{esc(it?.address || "")}}" />
-          <input data-admin-riko-field="allowance" data-index="${{idx}}" placeholder="allowance or max" value="${{esc(it?.allowance || "")}}" />
           <button type="button" class="btn danger" onclick="removeAdminRikoWhitelistRow(${{idx}})">-</button>
         </div>
       `).join("");
@@ -32932,48 +32908,41 @@ def _render_admin_page() -> str:
       for (const input of rowsEl.querySelectorAll("input[data-index]")) {{
         const idx = Number(input.dataset.index ?? -1);
         if (!Number.isInteger(idx) || idx < 0) continue;
-        const entry = byIndex.get(idx) || {{symbol:"", address:"", allowance:""}};
+        const entry = byIndex.get(idx) || {{symbol:"", address:""}};
         const field = input.dataset.adminRikoField;
         if (field === "symbol") entry.symbol = String(input.value || "").trim().toLowerCase();
         if (field === "address") entry.address = String(input.value || "").trim();
-        if (field === "allowance") entry.allowance = String(input.value || "").trim();
         byIndex.set(idx, entry);
       }}
-      return Array.from(byIndex.keys()).sort((a, b) => a - b).map((idx) => byIndex.get(idx) || {{symbol:"", address:"", allowance:""}});
+      return Array.from(byIndex.keys()).sort((a, b) => a - b).map((idx) => byIndex.get(idx) || {{symbol:"", address:""}});
     }}
     function onAdminRikoWhitelistInputChanged(e) {{
       const field = e?.target?.dataset?.adminRikoField;
       const idx = Number(e?.target?.dataset?.index ?? -1);
       if (!Number.isInteger(idx) || idx < 0) return;
-      while (adminRikoWhitelistItems.length <= idx) adminRikoWhitelistItems.push({{symbol:"", address:"", allowance:""}});
-      const current = adminRikoWhitelistItems[idx] || {{symbol:"", address:"", allowance:""}};
-      const allowanceMap = getAdminRikoCustodyAllowancePresetMap();
+      while (adminRikoWhitelistItems.length <= idx) adminRikoWhitelistItems.push({{symbol:"", address:""}});
+      const current = adminRikoWhitelistItems[idx] || {{symbol:"", address:""}};
       if (field === "symbol") {{
         const sym = String(e.target.value || "").trim().toLowerCase();
         current.symbol = sym;
         const nextAddr = resolveAdminRikoAddressBySymbol(sym);
         if (nextAddr) {{
           current.address = nextAddr;
-          if (!String(current.allowance || "").trim()) current.allowance = String(allowanceMap.get(nextAddr) || "");
           const addrInput = document.querySelector(`input[data-admin-riko-field="address"][data-index="${{idx}}"]`);
           if (addrInput) addrInput.value = nextAddr;
           setAdminRikoWhitelistStatus(`Address auto-filled for ${{sym}}. Click Apply to confirm changes.`, false);
         }}
       }} else if (field === "address") {{
         current.address = String(e.target.value || "").trim();
-        const normAddr = normalizeAdminRikoAddress(current.address);
-        if (normAddr && !String(current.allowance || "").trim()) current.allowance = String(allowanceMap.get(normAddr) || "");
-      }} else if (field === "allowance") {{
-        current.allowance = String(e.target.value || "").trim();
       }}
       adminRikoWhitelistItems[idx] = current;
     }}
     function addAdminRikoWhitelistRow() {{
       const snapshot = snapshotAdminRikoWhitelistRows();
-      snapshot.push({{symbol:"", address:"", allowance:""}});
+      snapshot.push({{symbol:"", address:""}});
       adminRikoWhitelistItems = snapshot;
       renderAdminRikoWhitelistEditor();
-      setAdminRikoWhitelistStatus("Row added. Enter symbol; known address is auto-filled. Optional allowance can be set in same row.", false);
+      setAdminRikoWhitelistStatus("Row added. Enter symbol; known address is auto-filled.", false);
     }}
     function removeAdminRikoWhitelistRow(idx) {{
       const snapshot = snapshotAdminRikoWhitelistRows();
@@ -33026,9 +32995,19 @@ def _render_admin_page() -> str:
         adminRikoWhitelistItems = (Array.isArray(draft) ? draft : []).map((it) => ({{
           symbol: String(it?.symbol || "").trim().toLowerCase(),
           address: String(it?.address || "").trim(),
-          allowance: String(allowanceMap.get(normalizeAdminRikoAddress(it?.address || "")) || ""),
         }}));
+        adminRikoAllowanceItems = adminRikoWhitelistActiveItems
+          .filter((it) => /^0x[a-f0-9]{40}$/.test(normalizeAdminRikoAddress(it?.address || "")))
+          .map((it) => {{
+            const addr = normalizeAdminRikoAddress(it?.address || "");
+            return {{
+              symbol: String(it?.symbol || "").trim().toLowerCase(),
+              address: String(addr || "").trim(),
+              allowance: String(allowanceMap.get(addr) || ""),
+            }};
+          }});
         renderAdminRikoWhitelistEditor();
+        renderAdminRikoAllowanceEditor();
         const payoutSel = document.getElementById("adminRikoAutoYieldPayoutTokenInput");
         renderAdminRikoPayoutTokenSelect(payoutSel ? payoutSel.value : "");
         setAdminRikoWhitelistStatus(`Loaded ${{adminRikoWhitelistItems.length}} whitelist rows.`, false);
@@ -33041,7 +33020,7 @@ def _render_admin_page() -> str:
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const items = collectAdminRikoWhitelistItems();
         if (!items.length) throw new Error("Add at least one valid whitelist row.");
-        setAdminRikoWhitelistStatus("Saving draft...", false);
+        setAdminRikoWhitelistStatus("Saving whitelist draft...", false);
         const saved = await postJson("/api/admin/riko/whitelist/pending", {{items}});
         const warningsText = formatAdminRikoValidationLines(saved?.warnings || []);
         if ((saved?.errors || []).length) throw new Error(formatAdminRikoValidationLines(saved.errors));
