@@ -98,6 +98,79 @@ contract RIKOVaultTest is Test {
         assertEq(vault.balanceOf(alice), 0, "riko burned after completion");
     }
 
+    function testProcessPendingRedeemCapsPayoutToQueuedTokenOut() public {
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 50e6, 0, alice);
+        vm.stopPrank();
+
+        // Make immediate settlement impossible so redeem is queued.
+        usdc.transfer(address(0xBEEF), 45e6);
+
+        vm.prank(alice);
+        uint256 first = vault.redeem(address(usdc), 50e6, 0, alice);
+        assertEq(first, 0, "redeem should queue while underfunded");
+
+        uint256 queuedTokenOut;
+        bool exists;
+        (, queuedTokenOut,,, exists) = vault.pendingRedemptions(alice, address(usdc));
+        assertTrue(exists, "pending redemption exists");
+        assertEq(queuedTokenOut, 50e6, "queued amount at queue time");
+
+        // Move quote up (current quote would be 100 USDC), but payout must stay capped at queuedTokenOut.
+        vault.setRikoPriceUsd6(2e6);
+        uint256 currentQuote = vault.quoteRedeem(address(usdc), 50e6);
+        assertEq(currentQuote, 100e6, "current quote moved up");
+
+        // Refill only enough for queued payout (not enough for currentQuote).
+        usdc.mint(address(this), queuedTokenOut);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        (bool completed, uint256 sent) = vault.processPendingRedemption(alice, address(usdc));
+        assertTrue(completed, "pending redeem should complete");
+        assertEq(sent, queuedTokenOut, "must not overpay beyond queued tokenOut");
+        assertEq(usdc.balanceOf(alice), aliceBefore + queuedTokenOut, "alice receives capped queued payout");
+    }
+
+    function testMultiplePendingRedeemsAreProcessedSeparatelyFIFO() public {
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 80e6, 0, alice);
+        vm.stopPrank();
+
+        // Force queue mode.
+        usdc.transfer(address(0xBEEF), 75e6);
+
+        vm.startPrank(alice);
+        assertEq(vault.redeem(address(usdc), 30e6, 0, alice), 0, "first redeem queued");
+        assertEq(vault.redeem(address(usdc), 20e6, 0, alice), 0, "second redeem queued");
+        vm.stopPrank();
+
+        // Getter should expose the oldest pending first.
+        (uint256 rikoLockedFirst,,,, bool existsFirst) = vault.pendingRedemptions(alice, address(usdc));
+        assertTrue(existsFirst, "pending exists");
+        assertEq(rikoLockedFirst, 30e6, "oldest pending is first");
+
+        uint256 aliceUsdcBefore = usdc.balanceOf(alice);
+        usdc.mint(address(this), 100e6);
+
+        (bool completed1, uint256 sent1) = vault.processPendingRedemption(alice, address(usdc));
+        assertTrue(completed1, "first pending completed");
+        assertEq(sent1, 30e6, "first payout amount");
+
+        (uint256 rikoLockedSecond,,,, bool existsSecond) = vault.pendingRedemptions(alice, address(usdc));
+        assertTrue(existsSecond, "second pending still exists");
+        assertEq(rikoLockedSecond, 20e6, "queue moved to second item");
+
+        (bool completed2, uint256 sent2) = vault.processPendingRedemption(alice, address(usdc));
+        assertTrue(completed2, "second pending completed");
+        assertEq(sent2, 20e6, "second payout amount");
+
+        (,,,, bool existsAfter) = vault.pendingRedemptions(alice, address(usdc));
+        assertFalse(existsAfter, "no pending remains");
+        assertEq(usdc.balanceOf(alice), aliceUsdcBefore + sent1 + sent2, "alice receives both payouts separately");
+    }
+
     function testRikoPriceAffectsMintAndRedeem() public {
         vault.setRikoPriceUsd6(2e6); // 1 RIKO = 2 USD
 

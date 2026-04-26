@@ -82,7 +82,6 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 tokenOut;
         uint256 minTokenOut;
         address receiver;
-        bool exists;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -98,7 +97,8 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     mapping(address => uint256) public tokenTvlCapUsd6;
     address public custodyAddress;
     uint256 public rikoPriceUsd6;
-    mapping(address => mapping(address => PendingRedemption)) public pendingRedemptions;
+    mapping(address => mapping(address => PendingRedemption[])) private _pendingRedemptionQueue;
+    mapping(address => mapping(address => uint256)) private _pendingRedemptionHead;
     address public pendingRedemptionOperator;
     address public wrappedNativeToken;
 
@@ -313,14 +313,10 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
             return tokenOut;
         }
 
-        PendingRedemption storage p = pendingRedemptions[msg.sender][token];
-        if (p.exists) revert RV_PendingRedemptionExists();
         _transfer(msg.sender, address(this), rikoAmountIn);
-        p.rikoLocked = rikoAmountIn;
-        p.tokenOut = tokenOut;
-        p.minTokenOut = minTokenOut;
-        p.receiver = receiver;
-        p.exists = true;
+        _pendingRedemptionQueue[msg.sender][token].push(
+            PendingRedemption({rikoLocked: rikoAmountIn, tokenOut: tokenOut, minTokenOut: minTokenOut, receiver: receiver})
+        );
         emit RedeemQueued(msg.sender, token, receiver, rikoAmountIn, tokenOut, minTokenOut);
         return 0;
     }
@@ -339,15 +335,16 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         returns (bool completed, uint256 tokenSent)
     {
         if (msg.sender != pendingRedemptionOperator) revert RV_PendingRedemptionOperatorOnly();
-        PendingRedemption storage p = pendingRedemptions[account][token];
-        if (!p.exists) revert RV_PendingRedemptionNotFound();
+        PendingRedemption memory p = _pendingRedemptionPeek(account, token);
         TokenConfig memory cfg = _loadAllowedTokenConfig(token);
         uint256 tokenOutCurrent = _usd6ToToken(cfg, _rikoToUsd6(p.rikoLocked));
         if (tokenOutCurrent < p.minTokenOut) revert RV_SlippageExceeded();
-        if (!_canSettleNow(token, tokenOutCurrent)) {
+        // Do not overpay relative to the amount locked in queue at redeem time.
+        uint256 tokenOutToSend = tokenOutCurrent > p.tokenOut ? p.tokenOut : tokenOutCurrent;
+        if (!_canSettleNow(token, tokenOutToSend)) {
             return (false, 0);
         }
-        tokenSent = _settlePendingRedeem(account, token, p, tokenOutCurrent);
+        tokenSent = _settlePendingRedeem(account, token, p, tokenOutToSend);
         return (true, tokenSent);
     }
 
@@ -355,12 +352,27 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param token Token key used for queued redemption.
     /// @return rikoReturned Amount of RIKO returned to caller.
     function cancelPendingRedemption(address token) external nonReentrant whenNotPaused returns (uint256 rikoReturned) {
-        PendingRedemption storage p = pendingRedemptions[msg.sender][token];
-        if (!p.exists) revert RV_PendingRedemptionNotFound();
+        PendingRedemption memory p = _pendingRedemptionPeek(msg.sender, token);
         rikoReturned = p.rikoLocked;
-        delete pendingRedemptions[msg.sender][token];
+        _pendingRedemptionPop(msg.sender, token);
         _transfer(address(this), msg.sender, rikoReturned);
         emit RedeemCancelled(msg.sender, token, rikoReturned);
+    }
+
+    /// @notice Returns the oldest pending redemption for (account, token).
+    /// @dev Backward-compatible shape for UI integrations.
+    function pendingRedemptions(address account, address token)
+        external
+        view
+        returns (uint256 rikoLocked, uint256 tokenOut, uint256 minTokenOut, address receiver, bool exists)
+    {
+        uint256 head = _pendingRedemptionHead[account][token];
+        PendingRedemption[] storage q = _pendingRedemptionQueue[account][token];
+        if (head >= q.length) {
+            return (0, 0, 0, address(0), false);
+        }
+        PendingRedemption storage p = q[head];
+        return (p.rikoLocked, p.tokenOut, p.minTokenOut, p.receiver, true);
     }
 
     /// @notice Quote RIKO mint amount for token deposit input.
@@ -438,16 +450,32 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         emit RedeemCompleted(account, token, receiver, rikoAmountIn, tokenOut);
     }
 
-    function _settlePendingRedeem(address account, address token, PendingRedemption storage p, uint256 tokenOutCurrent)
+    function _settlePendingRedeem(address account, address token, PendingRedemption memory p, uint256 tokenOutCurrent)
         internal
         returns (uint256 tokenSent)
     {
         uint256 rikoLocked = p.rikoLocked;
         uint256 minTokenOut = p.minTokenOut;
         address receiver = p.receiver;
-        delete pendingRedemptions[account][token];
+        _pendingRedemptionPop(account, token);
         _settleRedeem(address(this), token, receiver, rikoLocked, tokenOutCurrent, minTokenOut);
         tokenSent = tokenOutCurrent;
+    }
+
+    function _pendingRedemptionPeek(address account, address token) internal view returns (PendingRedemption memory p) {
+        uint256 head = _pendingRedemptionHead[account][token];
+        PendingRedemption[] storage q = _pendingRedemptionQueue[account][token];
+        if (head >= q.length) revert RV_PendingRedemptionNotFound();
+        p = q[head];
+    }
+
+    function _pendingRedemptionPop(address account, address token) internal {
+        uint256 head = _pendingRedemptionHead[account][token];
+        PendingRedemption[] storage q = _pendingRedemptionQueue[account][token];
+        if (head >= q.length) revert RV_PendingRedemptionNotFound();
+        unchecked {
+            _pendingRedemptionHead[account][token] = head + 1;
+        }
     }
 
     function _tokenToUsd6(TokenConfig memory cfg, uint256 tokenAmount) internal view returns (uint256) {
