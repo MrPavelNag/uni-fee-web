@@ -23314,6 +23314,19 @@ def _render_riko_page() -> str:
     .riko-switch:active { transform: translateY(1px); }
     .riko-switch.active { background:#dbeafe; color:#1d4ed8; }
     .riko-token-select-hidden { position:absolute; pointer-events:none; opacity:0; width:1px; height:1px; }
+    .riko-token-select-input {
+      width: 100%;
+      min-width: 220px;
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      padding: 8px 34px 8px 12px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #1e293b;
+      background: #ffffff;
+      appearance: auto;
+      -webkit-appearance: menulist;
+    }
     .riko-list { display:grid; gap:8px; margin-top:8px; }
     .riko-list-row { display:grid; grid-template-columns: 20px 180px 1fr auto; gap:8px; align-items:center; }
     .riko-list-row input { width:100%; }
@@ -23378,8 +23391,7 @@ def _render_riko_page() -> str:
           <div class="riko-token-select-wrap">
             <div style="display:flex;gap:8px;align-items:center;min-width:0">
               <img id="rikoSelectedTokenIcon" class="riko-icon" src="https://assets.coingecko.com/coins/images/279/large/ethereum.png" alt="ETH icon"/>
-              <select id="rikoTokenSymbol" class="riko-token-select-hidden" style="min-width:0"></select>
-              <div id="rikoTokenSwitch" class="riko-switches"></div>
+              <select id="rikoTokenSymbol" class="riko-token-select-input" style="min-width:0"></select>
             </div>
             <div id="rikoSymbolReference" class="riko-ref-box">Ethereum token addresses: -</div>
           </div>
@@ -23473,28 +23485,6 @@ def _render_riko_page() -> str:
           updateRikoModeUi();
           refreshRikoWalletBalance();
           refreshRikoQuoteHint();
-        });
-      });
-    }
-    function renderRikoTokenSwitch(symbols) {
-      const root = document.getElementById("rikoTokenSwitch");
-      const sel = document.getElementById("rikoTokenSymbol");
-      if (!root || !sel) return;
-      const list = Array.isArray(symbols) ? symbols : [];
-      const cur = String(sel.value || "");
-      root.innerHTML = list.map((s) => {
-        const lbl = String(s || "").toUpperCase();
-        const active = cur === s;
-        return (
-          `<button type="button" class="riko-switch ${active ? "active" : ""}" data-riko-symbol="${s}" aria-pressed="${active ? "true" : "false"}">${lbl}</button>`
-        );
-      }).join("");
-      root.querySelectorAll("button[data-riko-symbol]").forEach((el) => {
-        el.addEventListener("click", () => {
-          const v = String(el.getAttribute("data-riko-symbol") || "").trim().toLowerCase();
-          sel.value = v;
-          onRikoSymbolChanged();
-          renderRikoTokenSwitch(list);
         });
       });
     }
@@ -23766,7 +23756,6 @@ def _render_riko_page() -> str:
         select.innerHTML = activeSymbols.map((s) => `<option value="${s}">${String(s || "").toUpperCase()}</option>`).join("");
         if (cur && activeSymbols.includes(cur)) select.value = cur;
         if ((!cur || !activeSymbols.includes(cur)) && activeSymbols.length) select.value = activeSymbols[0];
-        renderRikoTokenSwitch(activeSymbols);
       }
     }
     function renderRikoWhitelist() {
@@ -31832,7 +31821,10 @@ def _render_admin_page() -> str:
     }}
     function parseAdminRikoPayoutLines(raw) {{
       const lines = String(raw || "")
-        .split(/[;,\r\n]+/)
+        .replaceAll(String.fromCharCode(13), ";")
+        .replaceAll(String.fromCharCode(10), ";")
+        .replaceAll(",", ";")
+        .split(";")
         .map((x) => String(x || "").trim())
         .filter(Boolean);
       const out = [];
