@@ -22343,7 +22343,10 @@ def _riko_collect_holder_candidates_from_transfers(
     if to_block < from_block:
         return out
     topic_transfer = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
+    # Some providers/plans (e.g. Alchemy Free on Sepolia) enforce very small
+    # eth_getLogs ranges. Start wide, then shrink adaptively down to 10 blocks.
     chunk = 10_000
+    min_chunk = 10
     start = max(0, int(from_block))
     end_target = max(0, int(to_block))
     while start <= end_target:
@@ -22359,9 +22362,9 @@ def _riko_collect_holder_candidates_from_transfers(
         try:
             logs = _eth_rpc(rpc_url, "eth_getLogs", params)
         except Exception:
-            if chunk <= 250:
+            if chunk <= min_chunk:
                 raise
-            chunk = max(250, chunk // 2)
+            chunk = max(min_chunk, chunk // 2)
             continue
         if isinstance(logs, list):
             for lg in logs:
@@ -22376,8 +22379,8 @@ def _riko_collect_holder_candidates_from_transfers(
                     out.add(addr_from.lower())
                 if _is_eth_address(addr_to) and addr_to != "0x0000000000000000000000000000000000000000":
                     out.add(addr_to.lower())
-        if chunk < 10_000:
-            chunk = min(10_000, chunk * 2)
+        # Keep the discovered working chunk size to avoid oscillation
+        # (grow->fail->shrink) on strict provider limits.
         start = end + 1
     return out
 
@@ -31808,6 +31811,12 @@ def _render_admin_page() -> str:
       if (!/^0x[a-fA-F0-9]{{40}}$/.test(s)) return s || "-";
       return `${{s.slice(0, 8)}}...${{s.slice(-6)}}`;
     }}
+    function shortHexAdmin(v) {{
+      const s = String(v || "").trim();
+      if (!/^0x[a-fA-F0-9]+$/.test(s)) return s || "-";
+      if (s.length <= 16) return s;
+      return `${{s.slice(0, 10)}}...${{s.slice(-8)}}`;
+    }}
     function formatAdminIntegerWithCommas(raw) {{
       const s = String(raw || "0").trim();
       if (!/^[-]?\\d+$/.test(s)) return s || "0";
@@ -32549,7 +32558,7 @@ def _render_admin_page() -> str:
           false
         );
         const tx = await erc20.approve(vaultAddr, approveAmount);
-        setAdminRikoCustodyStatus("Custody approve tx sent: " + tx.hash, false);
+        setAdminRikoCustodyStatus("Custody approve tx sent: " + shortHexAdmin(tx.hash), false);
         await tx.wait();
         const allowance = BigInt(await erc20.allowance(custodyAddr, vaultAddr));
         const allowanceText = allowance === ethers.MaxUint256
