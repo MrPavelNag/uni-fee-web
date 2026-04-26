@@ -31127,7 +31127,7 @@ def _render_admin_page() -> str:
     ];
     const adminPendingRedeemInFlight = new Set();
     const ADMIN_RIKO_HISTORY_HIDDEN_TX_KEY = "admin_riko_history_hidden_tx_v1";
-    const adminRikoHistorySelection = { redeem: new Set(), deposit: new Set() };
+    const adminRikoHistorySelection = {{ redeem: new Set(), deposit: new Set() }};
     function normalizeEthAddressInput(v) {{
       const raw = String(v || "").trim();
       return /^0x[a-fA-F0-9]{{40}}$/.test(raw) ? raw : "";
