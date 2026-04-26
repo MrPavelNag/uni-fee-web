@@ -31141,7 +31141,7 @@ def _render_admin_page() -> str:
     }}
     .admin-riko-signers-grid {{
       display: grid;
-      grid-template-columns: repeat(2, minmax(360px, 1fr));
+      grid-template-columns: minmax(560px, 1.65fr) minmax(320px, 0.85fr);
       gap: 12px;
       align-items: start;
     }}
@@ -32958,6 +32958,9 @@ def _render_admin_page() -> str:
         if (field === "symbol") entry.symbol = String(input.value || "").trim().toLowerCase();
         if (field === "address") entry.address = String(input.value || "").trim();
         byIndex.set(idx, entry);
+      }}
+      if (byIndex.size === 0) {{
+        return Array.isArray(adminRikoWhitelistItems) ? [...adminRikoWhitelistItems] : [];
       }}
       return Array.from(byIndex.keys()).sort((a, b) => a - b).map((idx) => byIndex.get(idx) || {{symbol:"", address:""}});
     }}
