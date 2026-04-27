@@ -25032,7 +25032,7 @@ def _render_riko_page() -> str:
       const renderTxTools = (hash, url) => {
         const h = String(hash || "").trim();
         if (!/^0x[a-fA-F0-9]{64}$/.test(h)) return "<span class='muted'>-</span>";
-        const safeHash = h.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        const safeHash = h.replace(/'/g, "\\'");
         const safeUrl = String(url || "")
           .replace(/&/g, "&amp;")
           .replace(/"/g, "&quot;")
@@ -25060,7 +25060,7 @@ def _render_riko_page() -> str:
         if (failed) bits.push("failed");
         const meta = bits.join(", ");
         const rowKey = buildRikoTxRowKey(item);
-        const safeRowKey = String(rowKey || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        const safeRowKey = String(rowKey || "").replace(/'/g, "\\'");
         const isVisible = !(rowKey && hiddenRows.has(rowKey));
         const visCtrl = rowKey
           ? `<label class="riko-tx-visibility" title="Toggle row visibility"><input type="checkbox" ${isVisible ? "checked" : ""} onchange="toggleRikoTxRowVisibility('${safeRowKey}', this.checked)" />Visible</label>`
