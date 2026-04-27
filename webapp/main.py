@@ -301,6 +301,7 @@ RIKO_VAULT_ADDRESS = os.environ.get("RIKO_VAULT_ADDRESS", "").strip()
 TREASURY_YIELD_CACHE_TTL_SEC = max(300, int(os.environ.get("TREASURY_YIELD_CACHE_TTL_SEC", "21600")))
 TREASURY_YIELD_CACHE: dict[str, Any] = {}
 TREASURY_YIELD_CACHE_LOCK = threading.Lock()
+TREASURY_YIELD_STATE_KEY = "treasury_yield_10y_cache_v1"
 RIKO_AUTO_YIELD_ENABLED = os.environ.get("RIKO_AUTO_YIELD_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 RIKO_AUTO_YIELD_INTERVAL_SEC = max(300, int(os.environ.get("RIKO_AUTO_YIELD_INTERVAL_SEC", "86400")))
 RIKO_AUTO_YIELD_RUN_ON_STARTUP = os.environ.get("RIKO_AUTO_YIELD_RUN_ON_STARTUP", "1").strip().lower() in (
@@ -22139,6 +22140,53 @@ def _riko_auto_payout_apply_message(
 
 
 def _fetch_us_treasury_daily_10y() -> dict[str, Any]:
+    def _from_payload(payload: dict[str, Any], *, mark_stale: bool = False) -> dict[str, Any]:
+        annual = float(payload.get("annual_pct") or 0.0)
+        daily = float(payload.get("daily_pct") or (annual / 365.0 if annual else 0.0))
+        out = {
+            "source": str(payload.get("source") or "US Treasury Daily Treasury Par Yield Curve Rates (10Y)"),
+            "source_url": str(payload.get("source_url") or "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed"),
+            "date": str(payload.get("date") or ""),
+            "annual_pct": round(float(annual), 4),
+            "daily_pct": round(float(daily), 6),
+            "cached_at_ts": float(payload.get("cached_at_ts") or 0.0),
+        }
+        if mark_stale:
+            out["stale_fallback"] = True
+        return out
+
+    def _load_persisted_snapshot() -> dict[str, Any] | None:
+        raw = _analytics_get_state(TREASURY_YIELD_STATE_KEY)
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return None
+            out = _from_payload(parsed, mark_stale=True)
+            if not str(out.get("date") or "").strip():
+                return None
+            if float(out.get("annual_pct") or 0.0) <= 0:
+                return None
+            return out
+        except Exception:
+            return None
+
+    def _save_persisted_snapshot(snapshot: dict[str, Any]) -> None:
+        try:
+            payload = {
+                "source": str(snapshot.get("source") or ""),
+                "source_url": str(snapshot.get("source_url") or ""),
+                "date": str(snapshot.get("date") or ""),
+                "annual_pct": float(snapshot.get("annual_pct") or 0.0),
+                "daily_pct": float(snapshot.get("daily_pct") or 0.0),
+                "cached_at_ts": float(snapshot.get("cached_at_ts") or 0.0),
+                "saved_at": _iso_now(),
+            }
+            _analytics_set_state(TREASURY_YIELD_STATE_KEY, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            pass
+
     now_ts = float(time.time())
     with TREASURY_YIELD_CACHE_LOCK:
         cached = dict(TREASURY_YIELD_CACHE)
@@ -22146,55 +22194,79 @@ def _fetch_us_treasury_daily_10y() -> dict[str, Any]:
     if cached and cached_at > 0 and (now_ts - cached_at) < float(TREASURY_YIELD_CACHE_TTL_SEC):
         return cached
 
-    year = datetime.now(timezone.utc).year
-    url = (
-        "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml"
-        f"?data=daily_treasury_yield_curve&field_tdr_date_value={int(year)}"
-    )
-    req = UrlRequest(url, method="GET", headers={"User-Agent": "uni_fee/1.0"})
-    with urlopen(req, timeout=18) as resp:
-        raw = resp.read()
-    root = ET.fromstring(raw)
-    ns = {
-        "atom": "http://www.w3.org/2005/Atom",
-        "d": "http://schemas.microsoft.com/ado/2007/08/dataservices",
-        "m": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
-    }
-    rows: list[tuple[str, float]] = []
-    for entry in root.findall("atom:entry", ns):
-        props = entry.find("atom:content/m:properties", ns)
-        if props is None:
-            continue
-        date_el = props.find("d:NEW_DATE", ns)
-        y10_el = props.find("d:BC_10YEAR", ns)
-        if date_el is None or y10_el is None:
-            continue
-        date_s = str(date_el.text or "").strip()
-        y10_s = str(y10_el.text or "").strip()
-        if not date_s or not y10_s:
-            continue
+    fetch_err: Exception | None = None
+    for year in [datetime.now(timezone.utc).year, datetime.now(timezone.utc).year - 1]:
         try:
-            y10 = float(y10_s)
-        except Exception:
+            url = (
+                "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml"
+                f"?data=daily_treasury_yield_curve&field_tdr_date_value={int(year)}"
+            )
+            req = UrlRequest(url, method="GET", headers={"User-Agent": "uni_fee/1.0"})
+            with urlopen(req, timeout=18) as resp:
+                raw = resp.read()
+            root = ET.fromstring(raw)
+            ns = {
+                "atom": "http://www.w3.org/2005/Atom",
+                "d": "http://schemas.microsoft.com/ado/2007/08/dataservices",
+                "m": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
+            }
+            rows: list[tuple[str, float]] = []
+            for entry in root.findall("atom:entry", ns):
+                props = entry.find("atom:content/m:properties", ns)
+                if props is None:
+                    continue
+                date_el = props.find("d:NEW_DATE", ns)
+                y10_el = props.find("d:BC_10YEAR", ns)
+                if date_el is None or y10_el is None:
+                    continue
+                date_s = str(date_el.text or "").strip()
+                y10_s = str(y10_el.text or "").strip()
+                if not date_s or not y10_s:
+                    continue
+                try:
+                    y10 = float(y10_s)
+                except Exception:
+                    continue
+                rows.append((date_s, y10))
+            if not rows:
+                continue
+            rows.sort(key=lambda x: x[0])
+            latest_date, annual_pct = rows[-1]
+            daily_pct = float(annual_pct) / 365.0
+            out = {
+                "source": "US Treasury Daily Treasury Par Yield Curve Rates (10Y)",
+                "source_url": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
+                "date": latest_date.split("T")[0],
+                "annual_pct": round(float(annual_pct), 4),
+                "daily_pct": round(float(daily_pct), 6),
+                "cached_at_ts": now_ts,
+            }
+            with TREASURY_YIELD_CACHE_LOCK:
+                TREASURY_YIELD_CACHE.clear()
+                TREASURY_YIELD_CACHE.update(out)
+            _save_persisted_snapshot(out)
+            return out
+        except Exception as e:
+            fetch_err = e
             continue
-        rows.append((date_s, y10))
-    if not rows:
-        raise RuntimeError("Treasury feed returned no usable 10Y points.")
-    rows.sort(key=lambda x: x[0])
-    latest_date, annual_pct = rows[-1]
-    daily_pct = float(annual_pct) / 365.0
-    out = {
-        "source": "US Treasury Daily Treasury Par Yield Curve Rates (10Y)",
-        "source_url": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
-        "date": latest_date.split("T")[0],
-        "annual_pct": round(float(annual_pct), 4),
-        "daily_pct": round(float(daily_pct), 6),
-        "cached_at_ts": now_ts,
-    }
-    with TREASURY_YIELD_CACHE_LOCK:
-        TREASURY_YIELD_CACHE.clear()
-        TREASURY_YIELD_CACHE.update(out)
-    return out
+
+    if cached and float(cached.get("annual_pct") or 0.0) > 0:
+        stale_mem = _from_payload(cached, mark_stale=True)
+        with TREASURY_YIELD_CACHE_LOCK:
+            TREASURY_YIELD_CACHE.clear()
+            TREASURY_YIELD_CACHE.update(stale_mem)
+        return stale_mem
+
+    persisted = _load_persisted_snapshot()
+    if persisted:
+        with TREASURY_YIELD_CACHE_LOCK:
+            TREASURY_YIELD_CACHE.clear()
+            TREASURY_YIELD_CACHE.update(persisted)
+        return persisted
+
+    if fetch_err is not None:
+        raise fetch_err
+    raise RuntimeError("Treasury feed returned no usable 10Y points.")
 
 
 def _riko_auto_yield_load_state() -> dict[str, Any]:
@@ -23237,6 +23309,7 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         tx_url = _explorer_tx_url_for_chain(int(chain_id), tx_hash) if tx_hash else ""
         ts = int(meta.get("last_change_ts") or 0)
         planned_payout_raw = 0
+        planned_reason = ""
         if int(bal) > 0 and int(next_bps) > 0 and _is_eth_address(payout_token):
             base_amount = int(bal)
             if scale_up > 0:
@@ -23244,6 +23317,13 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
             elif scale_down > 0:
                 base_amount //= 10**scale_down
             planned_payout_raw = max(0, (base_amount * int(next_bps)) // 10_000)
+            if planned_payout_raw <= 0:
+                # Real zero after integer rounding in payout token units.
+                planned_reason = "below_token_precision"
+        elif int(bal) > 0 and int(next_bps) <= 0:
+            planned_reason = "rate_unavailable"
+        elif int(bal) > 0 and (not _is_eth_address(payout_token)):
+            planned_reason = "payout_token_not_applied"
         rows.append(
             {
                 "address": holder,
@@ -23254,6 +23334,7 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
                 "last_change_tx_url": tx_url,
                 "planned_yield_payout_raw": int(planned_payout_raw),
                 "planned_yield_bps": int(next_bps),
+                "planned_yield_reason": planned_reason,
                 "planned_yield_date": schedule_next_due_date,
                 "planned_yield_date_utc": schedule_next_due_at_utc,
             }
@@ -25914,11 +25995,9 @@ def _render_riko_page() -> str:
       const walletLower = String(wallet || "").trim().toLowerCase();
       const localItems = loadLocalRikoTxHistory(walletLower, chainId);
       if (Array.isArray(localItems) && localItems.length) {
-        // Strict mode: user-facing history is rendered exactly from local flow rows.
-        // No merge/fallback when local rows exist.
+        // Show local rows immediately for snappy UX, then enrich from backend.
         rikoTxHistory = localItems;
         renderRikoTxHistory();
-        return;
       }
       const qs = new URLSearchParams();
       if (/^0x[a-fA-F0-9]{40}$/.test(wallet)) qs.set("address", wallet);
@@ -25940,7 +26019,11 @@ def _render_riko_page() -> str:
           error_reason: String(x?.error_reason || ""),
           flow_id: String(x?.flow_id || ""),
         }));
-        rikoTxHistory = backendItems;
+        // Keep local-first semantics (flow_id/stage hints), add missing backend rows.
+        // This restores richer multi-stage chains after reloads where local storage is partial.
+        rikoTxHistory = (Array.isArray(localItems) && localItems.length)
+          ? mergeTxHistoryLists(localItems, backendItems)
+          : backendItems;
         saveLocalRikoTxHistory(walletLower, chainId, rikoTxHistory);
       } catch (_) {
         rikoTxHistory = localItems;
@@ -33665,6 +33748,23 @@ def _render_admin_page() -> str:
       el.textContent = String(text || "");
       el.style.color = isErr ? "#b91c1c" : "#475569";
     }}
+    function applyAdminRikoPendingRenderCache(snapshot) {{
+      if (!snapshot || typeof snapshot !== "object") return false;
+      const pendingTable = document.getElementById("adminRikoPendingQueueTable");
+      const redeemTable = document.getElementById("adminRikoRedeemHistoryTable");
+      const depositTable = document.getElementById("adminRikoDepositHistoryTable");
+      const yieldTable = document.getElementById("adminRikoYieldHistoryTable");
+      if (!pendingTable || !redeemTable || !depositTable || !yieldTable) return false;
+      pendingTable.innerHTML = String(snapshot.pendingTableHtml || "");
+      redeemTable.innerHTML = String(snapshot.redeemHistoryHtml || "");
+      depositTable.innerHTML = String(snapshot.depositHistoryHtml || "");
+      yieldTable.innerHTML = String(snapshot.yieldHistoryHtml || "");
+      setAdminRikoPendingOpsStatus(
+        String(snapshot.statusText || "Pending queue updated (cached)."),
+        !!snapshot.statusErr
+      );
+      return true;
+    }}
     function explorerTxBaseForChainAdmin(chainId) {{
       const n = Number(chainId || 0);
       if (n === 11155111) return "https://sepolia.etherscan.io/tx/";
@@ -33763,10 +33863,18 @@ def _render_admin_page() -> str:
       "function allowance(address owner,address spender) view returns (uint256)",
       "function decimals() view returns (uint8)"
     ];
-    const ADMIN_RIKO_CLOSED_GRACE_SEC = 15;
+    const ADMIN_RIKO_PENDING_RENDER_CACHE_TTL_MS = 25000;
+    const ADMIN_RIKO_EVENT_SCAN_CACHE_KEY = "admin_riko_event_scan_cache_v2";
+    const ADMIN_RIKO_EVENT_SCAN_CACHE_VERSION = 2;
+    const ADMIN_RIKO_EVENT_SCAN_REORG_BUFFER_BLOCKS = 64;
+    const ADMIN_RIKO_EVENT_SCAN_MAX_ITEMS_PER_TYPE = 6000;
     const adminPendingRedeemInFlight = new Set();
+    let adminRikoPendingRenderCache = null;
     const ADMIN_RIKO_HISTORY_HIDDEN_TX_KEY = "admin_riko_history_hidden_tx_v1";
     const adminRikoHistorySelection = {{ redeem: new Set(), deposit: new Set(), yield: new Set() }};
+    function invalidateAdminRikoPendingRenderCache() {{
+      adminRikoPendingRenderCache = null;
+    }}
     function normalizeEthAddressInput(v) {{
       const raw = String(v || "").trim();
       return /^0x[a-fA-F0-9]{{40}}$/.test(raw) ? raw : "";
@@ -33879,6 +33987,53 @@ def _render_admin_page() -> str:
       const href = `${{txBase}}${{hash}}`;
       return `<a class="mono" href="${{escAttrAdmin(href)}}" target="_blank" rel="noopener noreferrer">${{short}}</a>`;
     }}
+    function adminRikoRenderPendingDiagPack(diag) {{
+      const qOk = !!diag?.quoteOk;
+      const lOk = !!diag?.liquidityOk;
+      const aOk = !!diag?.allowanceOk;
+      const qTip = String(diag?.quoteHint || "Quote/minOut");
+      const lTip = String(diag?.liquidityHint || "Liquidity");
+      const aTip = String(diag?.allowanceHint || "Allowance");
+      return (
+        `<span class='admin-riko-diag-pack'>` +
+        `<span class='admin-riko-diag-chip ${{qOk ? "ok" : "bad"}}' title="${{escAttrAdmin("Q: " + qTip)}}">Q</span>` +
+        `<span class='admin-riko-diag-chip ${{lOk ? "ok" : "bad"}}' title="${{escAttrAdmin("L: " + lTip)}}">L</span>` +
+        `<span class='admin-riko-diag-chip ${{aOk ? "ok" : "bad"}}' title="${{escAttrAdmin("A: " + aTip)}}">A</span>` +
+        `</span>`
+      );
+    }}
+    function adminRikoPatchPendingDiagCell(accountAddr, tokenAddr, diag) {{
+      const account = String(accountAddr || "").trim().toLowerCase();
+      const token = String(tokenAddr || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{{40}}$/.test(account) || !/^0x[a-f0-9]{{40}}$/.test(token)) return;
+      const table = document.getElementById("adminRikoPendingQueueTable");
+      if (!table) return;
+      const row = table.querySelector(`tr[data-account='${{account}}'][data-token='${{token}}']`);
+      if (!row) return;
+      const cell = row.querySelector(".admin-riko-pending-diag-cell");
+      if (!cell) return;
+      cell.innerHTML = adminRikoRenderPendingDiagPack(diag || {{}});
+    }}
+    async function copyAdminTxHash(hash) {{
+      const txt = String(hash || "").trim();
+      if (!/^0x[a-fA-F0-9]{{64}}$/.test(txt)) return;
+      try {{
+        await navigator.clipboard.writeText(txt);
+        setAdminRikoPendingOpsStatus("Tx hash copied.", false);
+      }} catch (_) {{
+        setAdminRikoPendingOpsStatus("Failed to copy tx hash.", true);
+      }}
+    }}
+    function renderAdminTxTools(txBase, txHash) {{
+      const hash = String(txHash || "").trim();
+      if (!/^0x[a-fA-F0-9]{{64}}$/.test(hash)) return "-";
+      const escapedHash = escAttrAdmin(hash);
+      const openBtn = txBase
+        ? `<a class="riko-tx-tool-btn" href="${{escAttrAdmin(String(txBase) + hash)}}" target="_blank" rel="noopener noreferrer" title="Open tx">↗</a>`
+        : "";
+      const copyBtn = `<button type="button" class="riko-tx-tool-btn" title="Copy tx hash" onclick="copyAdminTxHash('${{escapedHash}}')">⧉</button>`;
+      return `<span class="riko-tx-tools">${{openBtn}}${{copyBtn}}</span>`;
+    }}
     function readAdminRikoHiddenHistoryMap() {{
       try {{
         const raw = localStorage.getItem(ADMIN_RIKO_HISTORY_HIDDEN_TX_KEY);
@@ -33934,23 +34089,89 @@ def _render_admin_page() -> str:
       saveAdminRikoHiddenTxSet(key, hidden);
       adminRikoHistorySelection[key].clear();
       setAdminRikoPendingOpsStatus(`${{key}} history: deleted ${{selectedCount}} row(s).`, false);
-      await loadAdminRikoPendingQueue();
+      invalidateAdminRikoPendingRenderCache();
+      await loadAdminRikoPendingQueue(true);
+    }}
+    const adminRikoHistorySortState = {{}};
+    function adminRikoHistorySortKey(rawText) {{
+      const txt = String(rawText || "").replace(/\\s+/g, " ").trim();
+      if (!txt || txt === "-") return {{ type: "empty", value: "" }};
+      if (/^block\\s*#\\s*\\d+$/i.test(txt)) {{
+        const n = Number(txt.replace(/[^\\d]/g, ""));
+        return Number.isFinite(n) ? {{ type: "number", value: n }} : {{ type: "text", value: txt.toLowerCase() }};
+      }}
+      if (/^\\d{{4}}-\\d{{2}}-\\d{{2}}\\s\\d{{2}}:\\d{{2}}:\\d{{2}}$/.test(txt)) {{
+        const ts = Date.parse(txt.replace(" ", "T") + "Z");
+        if (Number.isFinite(ts)) return {{ type: "number", value: ts }};
+      }}
+      const numericText = txt.replace(/,/g, "");
+      if (/^-?\\d+(?:\\.\\d+)?(?:\\s|$)/.test(numericText)) {{
+        const m = numericText.match(/^-?\\d+(?:\\.\\d+)?/);
+        const n = m ? Number(m[0]) : NaN;
+        if (Number.isFinite(n)) return {{ type: "number", value: n }};
+      }}
+      return {{ type: "text", value: txt.toLowerCase() }};
+    }}
+    function sortAdminRikoHistoryTable(tableId, colIdx) {{
+      const table = document.getElementById(tableId);
+      if (!table) return;
+      const tbody = table.querySelector("tbody");
+      if (!tbody) return;
+      const rows = Array.from(tbody.querySelectorAll("tr"));
+      if (!rows.length) return;
+      const prev = adminRikoHistorySortState[tableId] || {{ colIdx: -1, dir: "asc" }};
+      const dir = prev.colIdx === colIdx && prev.dir === "asc" ? "desc" : "asc";
+      adminRikoHistorySortState[tableId] = {{ colIdx, dir }};
+      rows.sort((ra, rb) => {{
+        const ta = String(ra.children?.[colIdx]?.textContent || "").trim();
+        const tb = String(rb.children?.[colIdx]?.textContent || "").trim();
+        const ka = adminRikoHistorySortKey(ta);
+        const kb = adminRikoHistorySortKey(tb);
+        if (ka.type === "empty" && kb.type !== "empty") return 1;
+        if (kb.type === "empty" && ka.type !== "empty") return -1;
+        if (ka.type === "number" && kb.type === "number") {{
+          return dir === "asc" ? (ka.value - kb.value) : (kb.value - ka.value);
+        }}
+        const sa = String(ka.value || "");
+        const sb = String(kb.value || "");
+        return dir === "asc" ? sa.localeCompare(sb) : sb.localeCompare(sa);
+      }});
+      tbody.innerHTML = "";
+      rows.forEach((r) => tbody.appendChild(r));
+      const headCells = Array.from(table.querySelectorAll("thead th[data-sortable='1']"));
+      headCells.forEach((th) => {{
+        const idx = Number(th.getAttribute("data-col-idx") || -1);
+        const base = String(th.getAttribute("data-title") || th.textContent || "").trim();
+        th.textContent = idx === colIdx ? `${{base}} ${{dir === "asc" ? "▲" : "▼"}}` : base;
+      }});
     }}
     function renderAdminRikoHistoryTable(tableId, columns, rows, emptyText) {{
       const table = document.getElementById(tableId);
       if (!table) return;
       const colCount = Math.max(1, Array.isArray(columns) ? columns.length : 1);
       if (!Array.isArray(rows) || !rows.length) {{
-        table.innerHTML = `<tr><td class='muted' colspan='${{colCount}}'>${{String(emptyText || "No records.")}}</td></tr>`;
+        table.innerHTML = `<tbody><tr><td class='muted' colspan='${{colCount}}'>${{String(emptyText || "No records.")}}</td></tr></tbody>`;
         return;
       }}
-      const head = "<tr>" + columns.map((c) => `<th>${{String(c || "")}}</th>`).join("") + "</tr>";
-      table.innerHTML = head + rows.join("");
+      const headCells = (Array.isArray(columns) ? columns : []).map((c, idx) => {{
+        const colHtml = String(c || "");
+        const hasButton = /<button\\b/i.test(colHtml);
+        const plain = colHtml.replace(/<[^>]*>/g, "").trim();
+        const sortable = !hasButton && !!plain;
+        if (!sortable) return `<th>${{colHtml}}</th>`;
+        return `<th data-sortable="1" data-col-idx="${{idx}}" data-title="${{escAttrAdmin(plain)}}" style="cursor:pointer" title="Sort">${{plain}}</th>`;
+      }}).join("");
+      table.innerHTML = `<thead><tr>${{headCells}}</tr></thead><tbody>${{rows.join("")}}</tbody>`;
+      const clickable = Array.from(table.querySelectorAll("thead th[data-sortable='1']"));
+      clickable.forEach((th) => {{
+        th.onclick = () => sortAdminRikoHistoryTable(tableId, Number(th.getAttribute("data-col-idx") || 0));
+      }});
+      delete adminRikoHistorySortState[tableId];
     }}
     function adminRikoDeleteSelectedButton(scope) {{
       const key = String(scope || "").trim().toLowerCase();
       if (key !== "redeem" && key !== "deposit" && key !== "yield") return "";
-      return "<button type='button' class='btn btn-soft' onclick=\\\"deleteSelectedAdminRikoHistory('" + key + "', event)\\\">Delete selected</button>";
+      return "<button type='button' class='btn btn-soft' title='Delete selected' aria-label='Delete selected' onclick=\\\"deleteSelectedAdminRikoHistory('" + key + "', event)\\\">🗑</button>";
     }}
     function getAdminRikoPendingStatusMeta(rawStatus) {{
       const st = String(rawStatus || "active").trim().toLowerCase();
@@ -33965,14 +34186,14 @@ def _render_admin_page() -> str:
         : "<span class='muted'>-</span>";
       const diagHtml = meta.isActive ? String(r?.diagHtml || "-") : "<span class='muted'>-</span>";
       return (
-        `<tr>` +
+        `<tr data-account='${{escAttrAdmin(String(r?.account || "").toLowerCase())}}' data-token='${{escAttrAdmin(String(r?.token || "").toLowerCase())}}'>` +
         `<td style='text-align:left;white-space:nowrap'>${{formatAdminRikoDate(r?.date)}}</td>` +
         `<td><span class='admin-riko-pending-status ${{meta.css}}'>${{meta.label}}</span></td>` +
         `<td class='mono'>${{shortAddrAdmin(r?.account)}}</td>` +
         `<td class='mono'>${{String(r?.tokenLabel || "-")}}</td>` +
         `<td class='mono'>${{formatAdminRawUnits(String(r?.rikoLocked || "0"), 6, 6)}}</td>` +
         `<td class='mono' title="${{String(r?.tokenOut || "0")}}">${{String(r?.expectedOutDisplay || "-")}}</td>` +
-        `<td>${{diagHtml}}</td>` +
+        `<td class='admin-riko-pending-diag-cell'>${{diagHtml}}</td>` +
         `<td>${{actionHtml}}</td>` +
         `</tr>`
       );
@@ -33985,7 +34206,134 @@ def _render_admin_page() -> str:
       }}
       return "Pending queue updated.";
     }}
-    async function loadAdminRikoPendingQueue() {{
+    function normalizeAdminRikoScanEvent(type, ev) {{
+      const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
+      const blockNumber = Number(ev?.blockNumber || 0);
+      const logIndex = Number(ev?.index ?? ev?.logIndex ?? 0);
+      if (!/^0x[a-f0-9]{{64}}$/.test(txHash) || !Number.isFinite(blockNumber) || blockNumber <= 0) return null;
+      const t = String(type || "").trim().toLowerCase();
+      if (t === "queued") {{
+        const account = String(ev?.args?.account || "").trim();
+        const token = String(ev?.args?.token || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(account) || !/^0x[a-fA-F0-9]{{40}}$/.test(token)) return null;
+        return {{
+          type: "queued",
+          transactionHash: txHash,
+          blockNumber,
+          logIndex,
+          account: account.toLowerCase(),
+          token: token.toLowerCase(),
+          receiver: String(ev?.args?.receiver || "").trim().toLowerCase(),
+          rikoLocked: String(ev?.args?.rikoLocked ?? 0n),
+          tokenOut: String(ev?.args?.tokenOut ?? 0n),
+          minTokenOut: String(ev?.args?.minTokenOut ?? 0n),
+        }};
+      }}
+      if (t === "completed") {{
+        const account = String(ev?.args?.account || "").trim();
+        const token = String(ev?.args?.token || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(account) || !/^0x[a-fA-F0-9]{{40}}$/.test(token)) return null;
+        return {{
+          type: "completed",
+          transactionHash: txHash,
+          blockNumber,
+          logIndex,
+          account: account.toLowerCase(),
+          token: token.toLowerCase(),
+          receiver: String(ev?.args?.receiver || "").trim().toLowerCase(),
+          rikoBurned: String(ev?.args?.rikoBurned ?? 0n),
+          tokenOut: String(ev?.args?.tokenOut ?? 0n),
+        }};
+      }}
+      if (t === "cancelled") {{
+        const account = String(ev?.args?.account || "").trim();
+        const token = String(ev?.args?.token || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(account) || !/^0x[a-fA-F0-9]{{40}}$/.test(token)) return null;
+        return {{
+          type: "cancelled",
+          transactionHash: txHash,
+          blockNumber,
+          logIndex,
+          account: account.toLowerCase(),
+          token: token.toLowerCase(),
+          rikoReturned: String(ev?.args?.rikoReturned ?? 0n),
+        }};
+      }}
+      if (t === "deposited") {{
+        const user = String(ev?.args?.user || "").trim();
+        const token = String(ev?.args?.token || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(user) || !/^0x[a-fA-F0-9]{{40}}$/.test(token)) return null;
+        return {{
+          type: "deposited",
+          transactionHash: txHash,
+          blockNumber,
+          logIndex,
+          user: user.toLowerCase(),
+          token: token.toLowerCase(),
+          tokenIn: String(ev?.args?.tokenIn ?? 0n),
+          rikoMinted: String(ev?.args?.rikoMinted ?? 0n),
+        }};
+      }}
+      return null;
+    }}
+    function mergeAdminRikoScanEvents(prevItems, freshItems, minBlock) {{
+      const outMap = new Map();
+      const minBn = Math.max(0, Number(minBlock || 0));
+      const addOne = (raw) => {{
+        if (!raw || typeof raw !== "object") return;
+        const bn = Number(raw.blockNumber || 0);
+        const txh = String(raw.transactionHash || "").trim().toLowerCase();
+        const idx = Number(raw.logIndex || 0);
+        const typ = String(raw.type || "").trim().toLowerCase();
+        if (!Number.isFinite(bn) || bn < minBn || !/^0x[a-f0-9]{{64}}$/.test(txh) || !typ) return;
+        outMap.set(`${{typ}}|${{txh}}|${{idx}}`, raw);
+      }};
+      for (const it of (Array.isArray(prevItems) ? prevItems : [])) addOne(it);
+      for (const it of (Array.isArray(freshItems) ? freshItems : [])) addOne(it);
+      const out = Array.from(outMap.values());
+      out.sort((a, b) => (Number(a.blockNumber || 0) - Number(b.blockNumber || 0)) || (Number(a.logIndex || 0) - Number(b.logIndex || 0)));
+      const maxItems = Math.max(500, Number(ADMIN_RIKO_EVENT_SCAN_MAX_ITEMS_PER_TYPE || 6000));
+      return out.length > maxItems ? out.slice(out.length - maxItems) : out;
+    }}
+    function loadAdminRikoEventScanCache(chainId, vaultAddr, lookbackBlocks) {{
+      try {{
+        const raw = localStorage.getItem(ADMIN_RIKO_EVENT_SCAN_CACHE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object") return null;
+        if (Number(parsed.version || 0) !== Number(ADMIN_RIKO_EVENT_SCAN_CACHE_VERSION)) return null;
+        if (Number(parsed.chain_id || 0) !== Number(chainId || 0)) return null;
+        if (String(parsed.vault || "").trim().toLowerCase() !== String(vaultAddr || "").trim().toLowerCase()) return null;
+        if (Number(parsed.lookback_blocks || 0) !== Number(lookbackBlocks || 0)) return null;
+        return {{
+          latest_block: Number(parsed.latest_block || 0),
+          queued: Array.isArray(parsed.queued) ? parsed.queued : [],
+          completed: Array.isArray(parsed.completed) ? parsed.completed : [],
+          cancelled: Array.isArray(parsed.cancelled) ? parsed.cancelled : [],
+          deposited: Array.isArray(parsed.deposited) ? parsed.deposited : [],
+        }};
+      }} catch (_) {{
+        return null;
+      }}
+    }}
+    function saveAdminRikoEventScanCache(chainId, vaultAddr, lookbackBlocks, latestBlock, payload) {{
+      try {{
+        const out = {{
+          version: Number(ADMIN_RIKO_EVENT_SCAN_CACHE_VERSION),
+          chain_id: Number(chainId || 0),
+          vault: String(vaultAddr || "").trim().toLowerCase(),
+          lookback_blocks: Number(lookbackBlocks || 0),
+          latest_block: Number(latestBlock || 0),
+          queued: Array.isArray(payload?.queued) ? payload.queued : [],
+          completed: Array.isArray(payload?.completed) ? payload.completed : [],
+          cancelled: Array.isArray(payload?.cancelled) ? payload.cancelled : [],
+          deposited: Array.isArray(payload?.deposited) ? payload.deposited : [],
+          saved_at: Date.now(),
+        }};
+        localStorage.setItem(ADMIN_RIKO_EVENT_SCAN_CACHE_KEY, JSON.stringify(out));
+      }} catch (_) {{}}
+    }}
+    async function loadAdminRikoPendingQueue(forceRefresh = false) {{
       const table = document.getElementById("adminRikoPendingQueueTable");
       if (!table) return;
       try {{
@@ -34011,18 +34359,35 @@ def _render_admin_page() -> str:
             `RIKO vault is not deployed on connected wallet network (chainId=${{chainIdNum || "unknown"}}). Switch admin wallet network and refresh.`
           );
         }}
+        const nowMs = Date.now();
+        const renderCacheFresh = (
+          !forceRefresh &&
+          adminRikoPendingRenderCache &&
+          (nowMs - Number(adminRikoPendingRenderCache.ts || 0)) <= ADMIN_RIKO_PENDING_RENDER_CACHE_TTL_MS &&
+          Number(adminRikoPendingRenderCache.chain_id || 0) === Number(chainIdNum || 0) &&
+          String(adminRikoPendingRenderCache.vault || "").trim().toLowerCase() === String(addr || "").trim().toLowerCase()
+        );
+        if (renderCacheFresh && applyAdminRikoPendingRenderCache(adminRikoPendingRenderCache)) return;
         const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, provider);
         const latest = Number(await provider.getBlockNumber());
         // Pending queue must include older user redeems as well.
         // Keep a large lookback window to avoid silently missing valid pending entries.
         const pendingQueueLookbackBlocks = 2500000;
         const fromBlock = Math.max(0, latest - pendingQueueLookbackBlocks);
+        const cachedScan = (!forceRefresh)
+          ? loadAdminRikoEventScanCache(chainIdNum, addr, pendingQueueLookbackBlocks)
+          : null;
+        const cachedLatest = Number(cachedScan?.latest_block || 0);
+        const deltaStart = Math.max(fromBlock, Math.max(0, cachedLatest - ADMIN_RIKO_EVENT_SCAN_REORG_BUFFER_BLOCKS + 1));
+        const scanFromBlock = cachedScan ? deltaStart : fromBlock;
         const loadWarns = [];
-        async function queryFilterChunked(filterObj, label) {{
+        async function queryFilterChunked(filterObj, label, startBlock, endBlock) {{
           const out = [];
           const chunk = 12000;
-          for (let start = fromBlock; start <= latest; start += chunk) {{
-            const end = Math.min(latest, start + chunk - 1);
+          const safeFrom = Math.max(0, Number(startBlock || 0));
+          const safeTo = Math.max(safeFrom, Number(endBlock || 0));
+          for (let start = safeFrom; start <= safeTo; start += chunk) {{
+            const end = Math.min(safeTo, start + chunk - 1);
             try {{
               const part = await vault.queryFilter(filterObj, start, end);
               if (Array.isArray(part) && part.length) out.push(...part);
@@ -34032,20 +34397,50 @@ def _render_admin_page() -> str:
           }}
           return out;
         }}
-        const queuedEvs = await queryFilterChunked(vault.filters.RedeemQueued(), "RedeemQueued");
-        const completedEvs = await queryFilterChunked(vault.filters.RedeemCompleted(), "RedeemCompleted");
-        const cancelledEvs = await queryFilterChunked(vault.filters.RedeemCancelled(), "RedeemCancelled");
-        const depositedEvs = await queryFilterChunked(vault.filters.Deposited(), "Deposited");
+        const queuedFreshRaw = await queryFilterChunked(vault.filters.RedeemQueued(), "RedeemQueued", scanFromBlock, latest);
+        const completedFreshRaw = await queryFilterChunked(vault.filters.RedeemCompleted(), "RedeemCompleted", scanFromBlock, latest);
+        const cancelledFreshRaw = await queryFilterChunked(vault.filters.RedeemCancelled(), "RedeemCancelled", scanFromBlock, latest);
+        const depositedFreshRaw = await queryFilterChunked(vault.filters.Deposited(), "Deposited", scanFromBlock, latest);
+        const queuedFresh = (Array.isArray(queuedFreshRaw) ? queuedFreshRaw : [])
+          .map((ev) => normalizeAdminRikoScanEvent("queued", ev))
+          .filter((x) => !!x);
+        const completedFresh = (Array.isArray(completedFreshRaw) ? completedFreshRaw : [])
+          .map((ev) => normalizeAdminRikoScanEvent("completed", ev))
+          .filter((x) => !!x);
+        const cancelledFresh = (Array.isArray(cancelledFreshRaw) ? cancelledFreshRaw : [])
+          .map((ev) => normalizeAdminRikoScanEvent("cancelled", ev))
+          .filter((x) => !!x);
+        const depositedFresh = (Array.isArray(depositedFreshRaw) ? depositedFreshRaw : [])
+          .map((ev) => normalizeAdminRikoScanEvent("deposited", ev))
+          .filter((x) => !!x);
+        const queuedEvs = cachedScan
+          ? mergeAdminRikoScanEvents(cachedScan.queued, queuedFresh, fromBlock)
+          : mergeAdminRikoScanEvents([], queuedFresh, fromBlock);
+        const completedEvs = cachedScan
+          ? mergeAdminRikoScanEvents(cachedScan.completed, completedFresh, fromBlock)
+          : mergeAdminRikoScanEvents([], completedFresh, fromBlock);
+        const cancelledEvs = cachedScan
+          ? mergeAdminRikoScanEvents(cachedScan.cancelled, cancelledFresh, fromBlock)
+          : mergeAdminRikoScanEvents([], cancelledFresh, fromBlock);
+        const depositedEvs = cachedScan
+          ? mergeAdminRikoScanEvents(cachedScan.deposited, depositedFresh, fromBlock)
+          : mergeAdminRikoScanEvents([], depositedFresh, fromBlock);
+        saveAdminRikoEventScanCache(chainIdNum, addr, pendingQueueLookbackBlocks, latest, {{
+          queued: queuedEvs,
+          completed: completedEvs,
+          cancelled: cancelledEvs,
+          deposited: depositedEvs,
+        }});
         const timeline = [];
         const pushTimeline = (ev, type) => {{
-          const account = String(ev?.args?.account || "").trim();
-          const token = String(ev?.args?.token || "").trim();
+          const account = String(ev?.account || "").trim();
+          const token = String(ev?.token || "").trim();
           if (!/^0x[a-fA-F0-9]{{40}}$/.test(account) || !/^0x[a-fA-F0-9]{{40}}$/.test(token)) return;
           timeline.push({{
             type: String(type || ""),
             key: `${{account.toLowerCase()}}|${{token.toLowerCase()}}`,
             blockNumber: Number(ev?.blockNumber || 0),
-            logIndex: Number(ev?.index || 0),
+            logIndex: Number(ev?.logIndex ?? ev?.index ?? 0),
             ev
           }});
         }};
@@ -34180,27 +34575,12 @@ def _render_admin_page() -> str:
           custodyAddr = "";
         }}
         const tokenReadCache = new Map();
-        function renderPendingDiagPack(diag) {{
-          const qOk = !!diag?.quoteOk;
-          const lOk = !!diag?.liquidityOk;
-          const aOk = !!diag?.allowanceOk;
-          const qTip = String(diag?.quoteHint || "Quote/minOut");
-          const lTip = String(diag?.liquidityHint || "Liquidity");
-          const aTip = String(diag?.allowanceHint || "Allowance");
-          return (
-            `<span class='admin-riko-diag-pack'>` +
-            `<span class='admin-riko-diag-chip ${{qOk ? "ok" : "bad"}}' title="${{escAttrAdmin("Q: " + qTip)}}">Q</span>` +
-            `<span class='admin-riko-diag-chip ${{lOk ? "ok" : "bad"}}' title="${{escAttrAdmin("L: " + lTip)}}">L</span>` +
-            `<span class='admin-riko-diag-chip ${{aOk ? "ok" : "bad"}}' title="${{escAttrAdmin("A: " + aTip)}}">A</span>` +
-            `</span>`
-          );
-        }}
         const rows = [];
         for (const rec of queuedRecords) {{
           const ev = rec?.ev;
           const status = String(rec?.status || "active");
-          const account = String(ev?.args?.account || "").trim();
-          const token = String(ev?.args?.token || "").trim();
+          const account = String(ev?.account || "").trim();
+          const token = String(ev?.token || "").trim();
           const bn = Number(ev?.blockNumber || 0);
           const closedBn = Number(rec?.closedBlockNumber || 0);
           const tsQueued = await getBlockTimestampSec(bn);
@@ -34208,9 +34588,9 @@ def _render_admin_page() -> str:
           const tsDisplay = tsClosed > 0 ? tsClosed : tsQueued;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
-          const rikoLockedRaw = ev?.args?.rikoLocked;
-          const tokenOutRaw = ev?.args?.tokenOut;
-          const minTokenOutRaw = ev?.args?.minTokenOut;
+          const rikoLockedRaw = ev?.rikoLocked;
+          const tokenOutRaw = ev?.tokenOut;
+          const minTokenOutRaw = ev?.minTokenOut;
           const tokenDecimals = await resolveTokenDecimals(token, tokenLower);
           const expectedOutDisplay = tokenDecimals === null
             ? `${{formatAdminIntegerWithCommas(String(tokenOutRaw ?? 0n))}} (raw)`
@@ -34270,14 +34650,14 @@ def _render_admin_page() -> str:
             closedDate: Number(tsClosed || 0),
             closedByReconcile: !!rec?.closedByReconcile,
             blockNumber: bn,
-            logIndex: Number(ev?.index || 0),
+            logIndex: Number(ev?.logIndex ?? ev?.index ?? 0),
             account,
             token,
             tokenLabel,
             rikoLocked: String(rikoLockedRaw ?? 0n),
             tokenOut: String(tokenOutRaw ?? 0n),
             expectedOutDisplay,
-            diagHtml: renderPendingDiagPack(diag),
+            diagHtml: adminRikoRenderPendingDiagPack(diag),
           }});
         }}
         rows.sort((a, b) => {{
@@ -34291,15 +34671,8 @@ def _render_admin_page() -> str:
         }});
         const maxPendingRows = 800;
         const nowSec = Math.floor(Date.now() / 1000);
-        const closeVisibleAfterSec = nowSec - ADMIN_RIKO_CLOSED_GRACE_SEC;
-        const queueVisibleRows = rows.filter((r) => {{
-          const st = String(r?.status || "").toLowerCase();
-          if (st === "active") return true;
-          if (r?.closedByReconcile) return false;
-          const closeTs = Number(r?.closedDate || r?.date || 0);
-          if (closeTs <= 0) return true;
-          return closeTs > closeVisibleAfterSec;
-        }});
+        // Pending queue must contain only active rows.
+        const queueVisibleRows = rows.filter((r) => String(r?.status || "").toLowerCase() === "active");
         const pendingRowsTruncated = queueVisibleRows.length > maxPendingRows;
         const rowsToRender = pendingRowsTruncated ? queueVisibleRows.slice(0, maxPendingRows) : queueVisibleRows;
         if (!queueVisibleRows.length) {{
@@ -34318,20 +34691,18 @@ def _render_admin_page() -> str:
         for (const txh of Array.from(adminRikoHistorySelection.redeem)) if (hiddenRedeemTx.has(String(txh || "").toLowerCase())) adminRikoHistorySelection.redeem.delete(txh);
         for (const txh of Array.from(adminRikoHistorySelection.deposit)) if (hiddenDepositTx.has(String(txh || "").toLowerCase())) adminRikoHistorySelection.deposit.delete(txh);
         for (const txh of Array.from(adminRikoHistorySelection.yield)) if (hiddenYieldTx.has(String(txh || "").toLowerCase())) adminRikoHistorySelection.yield.delete(txh);
-        const historyVisibleBeforeSec = nowSec - ADMIN_RIKO_CLOSED_GRACE_SEC;
         const redeemHistoryRows = [];
         for (const ev of (Array.isArray(completedEvs) ? completedEvs : [])) {{
-          const account = String(ev?.args?.account || "").trim();
-          const token = String(ev?.args?.token || "").trim();
+          const account = String(ev?.account || "").trim();
+          const token = String(ev?.token || "").trim();
           const bn = Number(ev?.blockNumber || 0);
           const ts = await getBlockTimestampSec(bn);
           const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
-          if (ts > 0 && ts > historyVisibleBeforeSec) continue;
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
-          const tokenOutRaw = String(ev?.args?.tokenOut ?? 0n);
-          const rikoBurnedRaw = String(ev?.args?.rikoBurned ?? 0n);
+          const tokenOutRaw = String(ev?.tokenOut ?? 0n);
+          const rikoBurnedRaw = String(ev?.rikoBurned ?? 0n);
           const tokenDecimals = await resolveTokenDecimals(token, tokenLower);
           const tokenOutDisplay = tokenDecimals === null
             ? `${{formatAdminIntegerWithCommas(tokenOutRaw)}} (raw)`
@@ -34344,7 +34715,7 @@ def _render_admin_page() -> str:
           redeemHistoryRows.push({{
             ts,
             bn,
-            idx: Number(ev?.index || 0),
+            idx: Number(ev?.logIndex ?? ev?.index ?? 0),
             html:
               `<tr>` +
               `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
@@ -34354,27 +34725,26 @@ def _render_admin_page() -> str:
               `<td class='mono'>${{tokenOutDisplay}}</td>` +
               `<td class='mono'>${{rikoBurnedDisplay}} RIKO</td>` +
               `<td class='mono'>${{exchangeRate}}</td>` +
-              `<td>${{renderAdminTxLink(txBase, txHash)}}</td>` +
+              `<td>${{renderAdminTxTools(txBase, txHash)}}</td>` +
               `<td class='admin-history-check-cell'><input type='checkbox' class='admin-history-check' ${{checked}} onchange="toggleAdminRikoHistorySelected('redeem','${{txHash}}',this.checked)"/></td>` +
               `</tr>`
           }});
         }}
         for (const ev of (Array.isArray(cancelledEvs) ? cancelledEvs : [])) {{
-          const account = String(ev?.args?.account || "").trim();
-          const token = String(ev?.args?.token || "").trim();
+          const account = String(ev?.account || "").trim();
+          const token = String(ev?.token || "").trim();
           const bn = Number(ev?.blockNumber || 0);
           const ts = await getBlockTimestampSec(bn);
           const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
-          if (ts > 0 && ts > historyVisibleBeforeSec) continue;
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
-          const returned = String(ev?.args?.rikoReturned ?? 0n);
+          const returned = String(ev?.rikoReturned ?? 0n);
           const checked = /^0x[a-f0-9]{{64}}$/.test(txHash) && adminRikoHistorySelection.redeem.has(txHash) ? "checked" : "";
           redeemHistoryRows.push({{
             ts,
             bn,
-            idx: Number(ev?.index || 0),
+            idx: Number(ev?.logIndex ?? ev?.index ?? 0),
             html:
               `<tr>` +
               `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
@@ -34384,7 +34754,7 @@ def _render_admin_page() -> str:
               `<td class='mono'>${{formatAdminRawUnits(returned, 6, 6)}} RIKO</td>` +
               `<td class='mono'>-</td>` +
               `<td class='mono'>-</td>` +
-              `<td>${{renderAdminTxLink(txBase, txHash)}}</td>` +
+              `<td>${{renderAdminTxTools(txBase, txHash)}}</td>` +
               `<td class='admin-history-check-cell'><input type='checkbox' class='admin-history-check' ${{checked}} onchange="toggleAdminRikoHistorySelected('redeem','${{txHash}}',this.checked)"/></td>` +
               `</tr>`
           }});
@@ -34409,8 +34779,8 @@ def _render_admin_page() -> str:
 
         const depositHistoryRows = [];
         for (const ev of (Array.isArray(depositedEvs) ? depositedEvs : [])) {{
-          const user = String(ev?.args?.user || "").trim();
-          const token = String(ev?.args?.token || "").trim();
+          const user = String(ev?.user || "").trim();
+          const token = String(ev?.token || "").trim();
           const bn = Number(ev?.blockNumber || 0);
           const ts = await getBlockTimestampSec(bn);
           const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
@@ -34418,8 +34788,8 @@ def _render_admin_page() -> str:
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenDepositTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
-          const tokenInRaw = String(ev?.args?.tokenIn ?? 0n);
-          const rikoMintedRaw = String(ev?.args?.rikoMinted ?? 0n);
+          const tokenInRaw = String(ev?.tokenIn ?? 0n);
+          const rikoMintedRaw = String(ev?.rikoMinted ?? 0n);
           const tokenDecimals = await resolveTokenDecimals(token, tokenLower);
           const tokenInDisplay = tokenDecimals === null
             ? `${{formatAdminIntegerWithCommas(tokenInRaw)}} (raw)`
@@ -34431,7 +34801,7 @@ def _render_admin_page() -> str:
           depositHistoryRows.push({{
             ts,
             bn,
-            idx: Number(ev?.index || 0),
+            idx: Number(ev?.logIndex ?? ev?.index ?? 0),
             html:
               `<tr>` +
               `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
@@ -34440,7 +34810,7 @@ def _render_admin_page() -> str:
               `<td class='mono'>${{tokenInDisplay}}</td>` +
               `<td class='mono'>${{formatAdminRawUnits(rikoMintedRaw, 6, 6)}} RIKO</td>` +
               `<td class='mono'>${{exchangeRate}}</td>` +
-              `<td>${{renderAdminTxLink(txBase, txHash)}}</td>` +
+              `<td>${{renderAdminTxTools(txBase, txHash)}}</td>` +
               `<td class='admin-history-check-cell'><input type='checkbox' class='admin-history-check' ${{checked}} onchange="toggleAdminRikoHistorySelected('deposit','${{txHash}}',this.checked)"/></td>` +
               `</tr>`
           }});
@@ -34511,7 +34881,19 @@ def _render_admin_page() -> str:
           loadWarns.length > 0
         );
         setAdminRikoPendingOpsStatus(pendingStatusText, loadWarns.length > 0);
+        adminRikoPendingRenderCache = {
+          ts: Date.now(),
+          chain_id: Number(chainIdNum || 0),
+          vault: String(addr || "").trim().toLowerCase(),
+          pendingTableHtml: String(table.innerHTML || ""),
+          redeemHistoryHtml: String(document.getElementById("adminRikoRedeemHistoryTable")?.innerHTML || ""),
+          depositHistoryHtml: String(document.getElementById("adminRikoDepositHistoryTable")?.innerHTML || ""),
+          yieldHistoryHtml: String(document.getElementById("adminRikoYieldHistoryTable")?.innerHTML || ""),
+          statusText: pendingStatusText,
+          statusErr: loadWarns.length > 0,
+        };
       }} catch (e) {{
+        invalidateAdminRikoPendingRenderCache();
         table.innerHTML = "<tr><td class='muted'>Failed to load pending queue.</td></tr>";
         renderAdminRikoHistoryTable("adminRikoRedeemHistoryTable", ["Info"], [], "Failed to load redemption history.");
         renderAdminRikoHistoryTable("adminRikoDepositHistoryTable", ["Info"], [], "Failed to load deposit history.");
@@ -34561,6 +34943,7 @@ def _render_admin_page() -> str:
             const txHash = String(it?.last_change_hash || "").trim().toLowerCase();
             const txUrl = String(it?.last_change_tx_url || "").trim();
             const plannedRaw = String(it?.planned_yield_payout_raw || "0");
+            const plannedReason = String(it?.planned_yield_reason || "").trim().toLowerCase();
             const rowPlannedDateUtc = String(it?.planned_yield_date_utc || scheduleNextDueUtc || "").trim();
             const plannedDateTxt = rowPlannedDateUtc || "-";
             let plannedRawBi = 0n;
@@ -34579,7 +34962,11 @@ def _render_admin_page() -> str:
               ? "Token payout not applied"
               : ((hasPayoutToken && plannedRawBi > 0n)
                   ? `${{formatAdminRawUnits(plannedRaw, payoutDecimals, 8)}} (${{payoutTokenLabel}})`
-                  : "-");
+                  : ((hasPayoutToken && balBi > 0n && plannedReason === "below_token_precision")
+                      ? "Below token precision"
+                      : ((hasPayoutToken && balBi > 0n && plannedReason === "rate_unavailable")
+                          ? "Rate unavailable"
+                          : "-")));
             const txHtml = /^0x[a-f0-9]{{64}}$/.test(txHash)
               ? (txUrl ? `<a href="${{esc(txUrl)}}" target="_blank" rel="noopener">${{shortHexAdmin(txHash)}}</a>` : `<span class='mono'>${{shortHexAdmin(txHash)}}</span>`)
               : "-";
@@ -34979,6 +35366,7 @@ def _render_admin_page() -> str:
         const tokenRaw = tokenRawInput;
         tokenAddr = await resolveAdminRikoPendingTokenAddress(tokenRaw, provider);
         opKey = `${{accountAddr.toLowerCase()}}|${{String(tokenAddr || "").toLowerCase()}}`;
+        invalidateAdminRikoPendingRenderCache();
         if (adminPendingRedeemInFlight.has(opKey)) {{
           setAdminRikoPendingOpsStatus("This pending redeem is already being processed.", true);
           return;
@@ -35024,7 +35412,7 @@ def _render_admin_page() -> str:
           }} else {{
             await setAdminRikoPendingOpsStatusTx("Pending redemption processed. Tx: ", tx.hash, provider);
           }}
-          await loadAdminRikoPendingQueue();
+          await loadAdminRikoPendingQueue(true);
         }} else {{
           setAdminRikoPendingOpsStatus("Process pending tx reverted.", true);
         }}
@@ -35137,6 +35525,14 @@ def _render_admin_page() -> str:
         const nextStep = isOk
           ? "Next step: click Apply on-chain."
           : action.replace(/^Action:\s*/i, "Next step: ");
+        adminRikoPatchPendingDiagCell(accountAddr, tokenAddr, {{
+          quoteOk: quoteCheckOk,
+          liquidityOk,
+          allowanceOk,
+          quoteHint: `quote=${{quoteText}} minOut=${{minOutText}}`,
+          liquidityHint: `available=${{availableText}} need=${{needText}}`,
+          allowanceHint: `allowance=${{allowanceText}} needFromCustody=${{needFromCustodyText}}`,
+        }});
         setAdminRikoPendingOpsStatus(
           "Diagnose: " + checklist.join(". ") + ". " + nextStep,
           !isOk
