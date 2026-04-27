@@ -2150,14 +2150,88 @@ def _walletconnect_js_value() -> str:
     return WALLETCONNECT_PROJECT_ID.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _walletconnect_flow_js(
+def _wallet_ui_bundle_js(
     *,
-    missing_handler_js: str,
-    success_handler_js: str,
-    error_handler_js: str,
-    connecting_handler_js: str = "",
-) -> str:
-    template = """
+    connect_missing_handler_js: str,
+    connect_success_handler_js: str,
+    connect_error_handler_js: str,
+    connect_connecting_handler_js: str = "",
+    auth_unavailable_handler_js: str,
+    auth_success_handler_js: str,
+    auth_error_handler_js: str,
+    auth_connecting_handler_js: str = "",
+) -> dict[str, str]:
+    modal_template = """
+    function getEthereumProviders() {
+      const out = [];
+      const eth = window.ethereum;
+      if (!eth) return out;
+      if (Array.isArray(eth.providers) && eth.providers.length) return eth.providers;
+      out.push(eth);
+      return out;
+    }
+
+    function getWalletProvider(wallet) {
+      const providers = getEthereumProviders();
+      const pick = (pred) => providers.find(pred) || null;
+      if (wallet === "injected") {
+        return (
+          pick((p) => !p?.isRabby && !p?.isPhantom && !p?.isCoinbaseWallet) ||
+          pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom && !p?.isCoinbaseWallet) ||
+          pick((p) => !!p?.isCoinbaseWallet) ||
+          providers[0] ||
+          window.ethereum ||
+          null
+        );
+      }
+      if (wallet === "rabby") {
+        return pick((p) => !!p?.isRabby) || (window.ethereum?.isRabby ? window.ethereum : null);
+      }
+      if (wallet === "phantom") {
+        if (window.phantom?.ethereum?.request) return window.phantom.ethereum;
+        return pick((p) => !!p?.isPhantom) || (window.ethereum?.isPhantom ? window.ethereum : null);
+      }
+      if (wallet === "metamask") {
+        return (
+          pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom && !p?.isCoinbaseWallet) ||
+          ((window.ethereum?.isMetaMask && !window.ethereum?.isRabby && !window.ethereum?.isPhantom && !window.ethereum?.isCoinbaseWallet) ? window.ethereum : null)
+        );
+      }
+      if (wallet === "coinbase") {
+        return pick((p) => !!p?.isCoinbaseWallet) || (window.ethereum?.isCoinbaseWallet ? window.ethereum : null);
+      }
+      return null;
+    }
+
+    function getWalletChoices() {
+      const order = ["walletconnect", "rabby", "phantom", "metamask", "coinbase", "injected"];
+      return order.map((id) => {
+        const isWc = id === "walletconnect";
+        const available = isWc ? true : !!getWalletProvider(id);
+        let label = WALLET_LABELS[id];
+        if (isWc && !WALLETCONNECT_PROJECT_ID) label += " (setup required)";
+        else if (!available) label += " (not detected)";
+        return {id, label, available};
+      });
+    }
+
+    function openWalletModal() {
+      const list = document.getElementById("walletList");
+      const choices = getWalletChoices();
+      list.innerHTML = choices.map((w) => {
+        const cls = w.available ? "wallet-item" : "wallet-item disabled";
+        const dis = w.available ? "" : "disabled";
+        return `<button class="${cls}" ${dis} onclick="connectWalletFlow('${w.id}')">${w.label}</button>`;
+      }).join("");
+      document.getElementById("walletModalBackdrop").style.display = "flex";
+    }
+
+    function closeWalletModal(event) {
+      if (event && event.target && event.target.id !== "walletModalBackdrop") return;
+      document.getElementById("walletModalBackdrop").style.display = "none";
+    }
+    """
+    walletconnect_template = """
     function showWcQrModal(uri) {
       let el = document.getElementById("wcQrBackdrop");
       if (!el) {
@@ -2304,22 +2378,7 @@ def _walletconnect_flow_js(
       }
     }
     """
-    return (
-        template.replace("__MISSING_HANDLER_JS__", missing_handler_js.strip())
-        .replace("__SUCCESS_HANDLER_JS__", success_handler_js.strip())
-        .replace("__ERROR_HANDLER_JS__", error_handler_js.strip())
-        .replace("__CONNECTING_HANDLER_JS__", connecting_handler_js.strip())
-    )
-
-
-def _wallet_auth_flow_js(
-    *,
-    unavailable_handler_js: str,
-    success_handler_js: str,
-    error_handler_js: str,
-    connecting_handler_js: str = "",
-) -> str:
-    template = """
+    wallet_auth_template = """
     async function connectWalletFlow(wallet) {
       if (wallet === "walletconnect") {
         return connectWalletConnect();
@@ -2347,85 +2406,22 @@ def _wallet_auth_flow_js(
       }
     }
     """
-    return (
-        template.replace("__UNAVAILABLE_HANDLER_JS__", unavailable_handler_js.strip())
-        .replace("__SUCCESS_HANDLER_JS__", success_handler_js.strip())
-        .replace("__ERROR_HANDLER_JS__", error_handler_js.strip())
-        .replace("__CONNECTING_HANDLER_JS__", connecting_handler_js.strip())
-    )
 
-
-def _wallet_modal_js() -> str:
-    return """
-    function getEthereumProviders() {
-      const out = [];
-      const eth = window.ethereum;
-      if (!eth) return out;
-      if (Array.isArray(eth.providers) && eth.providers.length) return eth.providers;
-      out.push(eth);
-      return out;
+    return {
+        "modal": modal_template,
+        "walletconnect": (
+            walletconnect_template.replace("__MISSING_HANDLER_JS__", connect_missing_handler_js.strip())
+            .replace("__SUCCESS_HANDLER_JS__", connect_success_handler_js.strip())
+            .replace("__ERROR_HANDLER_JS__", connect_error_handler_js.strip())
+            .replace("__CONNECTING_HANDLER_JS__", connect_connecting_handler_js.strip())
+        ),
+        "wallet_auth": (
+            wallet_auth_template.replace("__UNAVAILABLE_HANDLER_JS__", auth_unavailable_handler_js.strip())
+            .replace("__SUCCESS_HANDLER_JS__", auth_success_handler_js.strip())
+            .replace("__ERROR_HANDLER_JS__", auth_error_handler_js.strip())
+            .replace("__CONNECTING_HANDLER_JS__", auth_connecting_handler_js.strip())
+        ),
     }
-
-    function getWalletProvider(wallet) {
-      const providers = getEthereumProviders();
-      const pick = (pred) => providers.find(pred) || null;
-      if (wallet === "injected") {
-        return (
-          pick((p) => !p?.isRabby && !p?.isPhantom && !p?.isCoinbaseWallet) ||
-          pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom && !p?.isCoinbaseWallet) ||
-          pick((p) => !!p?.isCoinbaseWallet) ||
-          providers[0] ||
-          window.ethereum ||
-          null
-        );
-      }
-      if (wallet === "rabby") {
-        return pick((p) => !!p?.isRabby) || (window.ethereum?.isRabby ? window.ethereum : null);
-      }
-      if (wallet === "phantom") {
-        if (window.phantom?.ethereum?.request) return window.phantom.ethereum;
-        return pick((p) => !!p?.isPhantom) || (window.ethereum?.isPhantom ? window.ethereum : null);
-      }
-      if (wallet === "metamask") {
-        return (
-          pick((p) => !!p?.isMetaMask && !p?.isRabby && !p?.isPhantom && !p?.isCoinbaseWallet) ||
-          ((window.ethereum?.isMetaMask && !window.ethereum?.isRabby && !window.ethereum?.isPhantom && !window.ethereum?.isCoinbaseWallet) ? window.ethereum : null)
-        );
-      }
-      if (wallet === "coinbase") {
-        return pick((p) => !!p?.isCoinbaseWallet) || (window.ethereum?.isCoinbaseWallet ? window.ethereum : null);
-      }
-      return null;
-    }
-
-    function getWalletChoices() {
-      const order = ["walletconnect", "rabby", "phantom", "metamask", "coinbase", "injected"];
-      return order.map((id) => {
-        const isWc = id === "walletconnect";
-        const available = isWc ? true : !!getWalletProvider(id);
-        let label = WALLET_LABELS[id];
-        if (isWc && !WALLETCONNECT_PROJECT_ID) label += " (setup required)";
-        else if (!available) label += " (not detected)";
-        return {id, label, available};
-      });
-    }
-
-    function openWalletModal() {
-      const list = document.getElementById("walletList");
-      const choices = getWalletChoices();
-      list.innerHTML = choices.map((w) => {
-        const cls = w.available ? "wallet-item" : "wallet-item disabled";
-        const dis = w.available ? "" : "disabled";
-        return `<button class="${cls}" ${dis} onclick="connectWalletFlow('${w.id}')">${w.label}</button>`;
-      }).join("");
-      document.getElementById("walletModalBackdrop").style.display = "flex";
-    }
-
-    function closeWalletModal(event) {
-      if (event && event.target && event.target.id !== "walletModalBackdrop") return;
-      document.getElementById("walletModalBackdrop").style.display = "none";
-    }
-    """
 
 
 def _short_addr(address: str) -> str:
@@ -24482,16 +24478,13 @@ def _render_placeholder_page(
 ) -> str:
     options_html = _intent_options_html(selected_path)
     selected_label = _intent_label_for_path(selected_path)
-    walletconnect_script = _walletconnect_flow_js(
-        missing_handler_js='alert("WalletConnect is not configured on server (WALLETCONNECT_PROJECT_ID)."); return;',
-        success_handler_js="maybeRedirectAfterAuth();",
-        error_handler_js='alert("WalletConnect failed: " + (e?.message || "unknown error") + ". If Reown allowlist is enabled, add origin: " + window.location.origin);',
-    )
-    wallet_modal_script = _wallet_modal_js()
-    wallet_auth_script = _wallet_auth_flow_js(
-        unavailable_handler_js="return;",
-        success_handler_js="maybeRedirectAfterAuth();",
-        error_handler_js='console.warn("wallet auth failed", e);',
+    wallet_js = _wallet_ui_bundle_js(
+        connect_missing_handler_js='alert("WalletConnect is not configured on server (WALLETCONNECT_PROJECT_ID)."); return;',
+        connect_success_handler_js="maybeRedirectAfterAuth();",
+        connect_error_handler_js='alert("WalletConnect failed: " + (e?.message || "unknown error") + ". If Reown allowlist is enabled, add origin: " + window.location.origin);',
+        auth_unavailable_handler_js="return;",
+        auth_success_handler_js="maybeRedirectAfterAuth();",
+        auth_error_handler_js='console.warn("wallet auth failed", e);',
     )
     intro_html = (
         f"""
@@ -24813,7 +24806,7 @@ def _render_placeholder_page(
       }});
     }}
 
-    {wallet_modal_script}
+    {wallet_js["modal"]}
 
     async function postJson(url, payload) {{
       const r = await fetch(url, {{
@@ -24901,9 +24894,9 @@ def _render_placeholder_page(
       openWalletModal();
     }}
 
-    {wallet_auth_script}
+    {wallet_js["wallet_auth"]}
 
-    {walletconnect_script}
+    {wallet_js["walletconnect"]}
 
     {extra_script}
     loadAuthState();
@@ -32899,16 +32892,13 @@ def _render_stables_page() -> str:
 
 def _render_admin_page() -> str:
     options_html = _intent_options_html("/admin") + '\n<option value="/admin" selected>Administer project</option>'
-    wallet_modal_script = _wallet_modal_js()
-    walletconnect_script = _walletconnect_flow_js(
-        missing_handler_js='alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); return;',
-        success_handler_js="location.reload();",
-        error_handler_js='alert("WalletConnect failed: "+(e?.message||"unknown error")+". If Reown allowlist is enabled, add origin: "+window.location.origin);',
-    )
-    wallet_auth_script = _wallet_auth_flow_js(
-        unavailable_handler_js="return;",
-        success_handler_js="location.reload();",
-        error_handler_js='console.warn("wallet auth failed",e);',
+    wallet_js = _wallet_ui_bundle_js(
+        connect_missing_handler_js='alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); return;',
+        connect_success_handler_js="location.reload();",
+        connect_error_handler_js='alert("WalletConnect failed: "+(e?.message||"unknown error")+". If Reown allowlist is enabled, add origin: "+window.location.origin);',
+        auth_unavailable_handler_js="return;",
+        auth_success_handler_js="location.reload();",
+        auth_error_handler_js='console.warn("wallet auth failed",e);',
     )
     html = f"""<!doctype html>
 <html>
@@ -33634,7 +33624,7 @@ def _render_admin_page() -> str:
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
     function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:320px;max-width:360px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
-    {wallet_modal_script}
+    {wallet_js["modal"]}
     async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
     function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} refreshIntentMenu(); }}
     function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; if(authState?.authenticated) {{ btn.textContent=authState.address_short||"Wallet connected"; }} else {{ btn.textContent="Connect wallet"; }} syncAdminIntentOption(); }}
@@ -33654,8 +33644,8 @@ def _render_admin_page() -> str:
       }}
       openWalletModal();
     }}
-    {wallet_auth_script}
-    {walletconnect_script}
+    {wallet_js["wallet_auth"]}
+    {wallet_js["walletconnect"]}
     function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setAdminRikoOnchainStatus(text, isErr) {{
       const el = document.getElementById("adminRikoOnchainStatus");
@@ -36771,16 +36761,13 @@ def _render_admin_page() -> str:
 
 def _render_help_page() -> str:
     options_html = _intent_options_html("/help")
-    wallet_modal_script = _wallet_modal_js()
-    walletconnect_script = _walletconnect_flow_js(
-        missing_handler_js='alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); return;',
-        success_handler_js="",
-        error_handler_js='alert("WalletConnect failed: "+(e?.message||"unknown error")+". If Reown allowlist is enabled, add origin: "+window.location.origin);',
-    )
-    wallet_auth_script = _wallet_auth_flow_js(
-        unavailable_handler_js="return;",
-        success_handler_js="",
-        error_handler_js='console.warn("wallet auth failed",e);',
+    wallet_js = _wallet_ui_bundle_js(
+        connect_missing_handler_js='alert("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID)."); return;',
+        connect_success_handler_js="",
+        connect_error_handler_js='alert("WalletConnect failed: "+(e?.message||"unknown error")+". If Reown allowlist is enabled, add origin: "+window.location.origin);',
+        auth_unavailable_handler_js="return;",
+        auth_success_handler_js="",
+        auth_error_handler_js='console.warn("wallet auth failed",e);',
     )
     return f"""<!doctype html>
 <html>
@@ -36910,7 +36897,7 @@ def _render_help_page() -> str:
     const WALLET_LABELS = {{ injected: "Browser Wallet", walletconnect: "WalletConnect (QR)", rabby: "Rabby", metamask: "MetaMask", phantom: "Phantom", coinbase: "Coinbase Wallet" }};
     function navigateIntent(path) {{ if (!path) return; window.location.href = path; }}
     function refreshIntentMenu() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; sel.style.position="absolute"; sel.style.left="-9999px"; sel.style.opacity="0"; sel.style.pointerEvents="none"; let wrap=document.getElementById("intentMenuWrap"); if(!wrap) {{ wrap=document.createElement("div"); wrap.id="intentMenuWrap"; wrap.style.cssText="position:relative;min-width:320px;max-width:360px;"; const btn=document.createElement("button"); btn.type="button"; btn.id="intentMenuBtn"; btn.style.cssText="width:100%;border:1px solid #bfdbfe;border-radius:10px;padding:10px 38px 10px 12px;font-size:14px;font-weight:600;color:#1f3a8a;background:linear-gradient(180deg,#f8fbff 0%,#eff6ff 100%);text-align:left;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,0.7);"; const list=document.createElement("div"); list.id="intentMenuList"; list.style.cssText="display:none;position:absolute;z-index:12000;left:0;right:0;top:calc(100% + 6px);background:#eef4ff;border:1px solid #bfdbfe;border-radius:10px;box-shadow:0 10px 24px rgba(15,23,42,0.15);padding:6px;max-height:320px;overflow:auto;"; wrap.appendChild(btn); wrap.appendChild(list); sel.insertAdjacentElement("afterend",wrap); btn.onclick=()=>{{ list.style.display=list.style.display==="block"?"none":"block"; }}; document.addEventListener("click",(e)=>{{ if(!wrap.contains(e.target)) list.style.display="none"; }}); }} const btn=document.getElementById("intentMenuBtn"); const list=document.getElementById("intentMenuList"); const options=Array.from(sel.options||[]); const selected=options.find((o)=>o.selected)||options[0]; btn.textContent=selected?selected.textContent:"Select"; list.innerHTML=options.map((o)=>{{ const active=o.value===sel.value; const style=active?"display:block;width:100%;padding:9px 10px;border:none;background:#dbeafe;color:#1e3a8a;font-weight:700;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;":"display:block;width:100%;padding:9px 10px;border:none;background:#eef4ff;color:#1f3a8a;font-weight:600;text-align:left;border-radius:8px;margin-bottom:4px;cursor:pointer;white-space:nowrap;"; return `<button type="button" data-v="${{o.value}}" style="${{style}}">${{o.textContent}}</button>`; }}).join(""); Array.from(list.querySelectorAll("button[data-v]")).forEach((b)=>{{ b.onclick=()=>{{ const v=b.getAttribute("data-v")||""; sel.value=v; list.style.display="none"; navigateIntent(v); }}; }}); }}
-    {wallet_modal_script}
+    {wallet_js["modal"]}
     async function postJson(url,payload) {{ const r=await fetch(url,{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload||{{}})}}); const data=await r.json().catch(()=>({{}})); if(!r.ok) throw new Error(data.detail||data.info||"Request failed"); return data; }}
     function syncAdminIntentOption() {{ const sel=document.getElementById("intentSelect"); if(!sel) return; const existing=Array.from(sel.options).find((o)=>o.value==="/admin"); const isAdmin=!!authState?.authenticated&&!!authState?.is_admin; if(isAdmin&&!existing) {{ const opt=document.createElement("option"); opt.value="/admin"; opt.textContent="Administer project"; sel.appendChild(opt); }} else if(!isAdmin&&existing) {{ existing.remove(); }} refreshIntentMenu(); }}
     function updateHelpAuthNotes() {{
@@ -36927,8 +36914,8 @@ def _render_help_page() -> str:
     function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; btn.textContent = authState?.authenticated ? (authState.address_short || "Wallet connected") : "Connect Wallet"; syncAdminIntentOption(); updateHelpAuthNotes(); }}
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
     async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} openWalletModal(); return; }} openWalletModal(); }}
-    {wallet_auth_script}
-    {walletconnect_script}
+    {wallet_js["wallet_auth"]}
+    {wallet_js["walletconnect"]}
     function setTicketStatus(text, isErr) {{ const el=document.getElementById("ticketStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFeedbackFormStatus(text, isErr) {{ const el=document.getElementById("feedbackFormStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     async function sendFeedback() {{
@@ -37078,24 +37065,21 @@ def _render_help_page() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
-    walletconnect_script = _walletconnect_flow_js(
-        missing_handler_js='setStatus("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID).", "fail"); return;',
-        success_handler_js='if (!redirectAfterAuth()) { setStatus(`Connected: ${verifyResp.address_short}`, "ok"); }',
-        error_handler_js='setStatus("WalletConnect failed: " + (e?.message || "unknown") + ". If Reown allowlist is enabled, add origin: " + window.location.origin, "fail");',
-        connecting_handler_js='setStatus("Connecting WalletConnect...", "running");',
-    )
-    wallet_modal_script = _wallet_modal_js()
-    wallet_auth_script = _wallet_auth_flow_js(
-        unavailable_handler_js='setStatus(`${WALLET_LABELS[wallet] || wallet} is not available in this browser`, "fail"); return;',
-        success_handler_js='if (!redirectAfterAuth()) { setStatus(`Connected: ${verifyResp.address_short}`, "ok"); }',
-        error_handler_js='setStatus("Wallet auth failed: " + (e?.message || "unknown"), "fail");',
-        connecting_handler_js='setStatus(`Connecting ${WALLET_LABELS[wallet] || wallet}...`, "running");',
+    wallet_js = _wallet_ui_bundle_js(
+        connect_missing_handler_js='setStatus("WalletConnect is not configured (WALLETCONNECT_PROJECT_ID).", "fail"); return;',
+        connect_success_handler_js='if (!redirectAfterAuth()) { setStatus(`Connected: ${verifyResp.address_short}`, "ok"); }',
+        connect_error_handler_js='setStatus("WalletConnect failed: " + (e?.message || "unknown") + ". If Reown allowlist is enabled, add origin: " + window.location.origin, "fail");',
+        connect_connecting_handler_js='setStatus("Connecting WalletConnect...", "running");',
+        auth_unavailable_handler_js='setStatus(`${WALLET_LABELS[wallet] || wallet} is not available in this browser`, "fail"); return;',
+        auth_success_handler_js='if (!redirectAfterAuth()) { setStatus(`Connected: ${verifyResp.address_short}`, "ok"); }',
+        auth_error_handler_js='setStatus("Wallet auth failed: " + (e?.message || "unknown"), "fail");',
+        auth_connecting_handler_js='setStatus(`Connecting ${WALLET_LABELS[wallet] || wallet}...`, "running");',
     )
     html = (
         HTML_PAGE.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
-        .replace("__WALLET_MODAL_SHARED_JS__", wallet_modal_script)
-        .replace("__WALLETCONNECT_SHARED_JS__", walletconnect_script)
-        .replace("__INJECTED_WALLET_AUTH_JS__", wallet_auth_script)
+        .replace("__WALLET_MODAL_SHARED_JS__", wallet_js["modal"])
+        .replace("__WALLETCONNECT_SHARED_JS__", wallet_js["walletconnect"])
+        .replace("__INJECTED_WALLET_AUTH_JS__", wallet_js["wallet_auth"])
         .replace("__APP_VERSION__", APP_VERSION)
     )
     resp = HTMLResponse(html)
