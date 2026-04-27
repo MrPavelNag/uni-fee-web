@@ -24747,7 +24747,7 @@ def _render_placeholder_page(
       }};
       try {{
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
-        const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
+        const wcChains = [1, 10, 56, 137, 8453, 42161, 43114, 11155111];
         const wcMetadata = {{
           name: "DeFi Pools",
           description: "DeFi Pools wallet sign-in",
@@ -24783,7 +24783,14 @@ def _render_placeholder_page(
         let accounts = provider.accounts || [];
         if (!accounts.length) accounts = (await provider.request({{method: "eth_accounts"}})) || [];
         if (!accounts.length) accounts = (await provider.request({{method: "eth_requestAccounts"}})) || [];
-        const address = normalizeAddress(accounts[0] || "");
+        let address = normalizeAddress(accounts[0] || "");
+        if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {{
+          try {{
+            const ns = provider?.session?.namespaces?.eip155;
+            const nsAccounts = Array.isArray(ns?.accounts) ? ns.accounts : [];
+            address = normalizeAddress(nsAccounts[0] || "");
+          }} catch (_) {{}}
+        }}
         if (!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
         const chainHex = await provider.request({{method: "eth_chainId"}});
         const chainId = Number.parseInt(String(chainHex || "0x1"), 16) || 1;
@@ -26694,9 +26701,39 @@ def _render_riko_page() -> str:
       }
       return "";
     }
+    function extractRikoErrorData(err) {
+      const candidates = [
+        err?.data,
+        err?.error?.data,
+        err?.info?.error?.data,
+        err?.info?.data,
+        err?.revert?.data,
+      ];
+      for (const raw of candidates) {
+        const s = String(raw || "").trim();
+        if (/^0x[0-9a-fA-F]{8,}$/.test(s)) return s;
+      }
+      return "";
+    }
+    function decodeRikoErrorNameFromData(errData) {
+      const data = String(errData || "").trim();
+      if (!/^0x[0-9a-fA-F]{8,}$/.test(data)) return "";
+      try {
+        const ethersObj = window?.ethers;
+        if (!ethersObj || typeof ethersObj.Interface !== "function") return "";
+        const iface = new ethersObj.Interface(RIKO_ABI);
+        const parsed = iface.parseError(data);
+        const name = String(parsed?.name || "").trim();
+        return /^RV_[A-Za-z0-9_]+$/.test(name) ? name : "";
+      } catch (_) {
+        return "";
+      }
+    }
     function formatRikoErrorMessage(prefix, err, fallback) {
       const pfx = String(prefix || "Operation failed").trim();
-      const errName = extractRikoErrorName(err);
+      const decodedByName = extractRikoErrorName(err);
+      const decodedByData = decodeRikoErrorNameFromData(extractRikoErrorData(err));
+      const errName = decodedByName || decodedByData;
       if (errName) {
         const hint = String(RIKO_ERROR_HINTS[errName] || "").trim();
         return hint ? `${pfx}: ${errName} - ${hint}` : `${pfx}: ${errName}`;
@@ -26998,6 +27035,7 @@ def _render_riko_page() -> str:
       let hasDeferredTxRows = false;
       let redeemTxHash = "";
       let unwrapTxHash = "";
+      let vault = null;
       const flowId = newRikoFlowId("redeem");
       try {
         const flowSymbols = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase() === "eth"
@@ -27023,7 +27061,7 @@ def _render_riko_page() -> str:
         const ethers = await ensureEthers();
         const signer = await getRikoSigner();
         const user = await signer.getAddress();
-        const vault = new ethers.Contract(contractAddress, RIKO_ABI, signer);
+        vault = new ethers.Contract(contractAddress, RIKO_ABI, signer);
         // RIKO has 6 decimals in contract.
         const rawRiko = ethers.parseUnits(amount, 6);
         let outDecimals = 18;
@@ -27052,6 +27090,13 @@ def _render_riko_page() -> str:
           } catch (_) {
             outDecimals = 18;
           }
+        }
+        try {
+          await vault.redeem.staticCall(redeemTokenAddress, rawRiko, 0, user);
+        } catch (preErr) {
+          const preMsg = formatRikoErrorMessage("Redeem precheck failed", preErr, "on-chain precheck reverted");
+          setRikoStatus(preMsg, true);
+          return;
         }
         const tx = await vault.redeem(redeemTokenAddress, rawRiko, 0, user);
         redeemTxHash = String(tx?.hash || "").trim();
@@ -33369,7 +33414,7 @@ def _render_admin_page() -> str:
       const toHexMessage=(msg)=>{{ try {{ return "0x"+Array.from(new TextEncoder().encode(String(msg||""))).map((b)=>b.toString(16).padStart(2,"0")).join(""); }} catch(_) {{ return ""; }} }};
       try {{
         const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
-        const wcChains=[1,10,56,137,8453,42161,43114];
+        const wcChains=[1,10,56,137,8453,42161,43114,11155111];
         const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
         const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
         provider.on("display_uri",showWcQrModal);
@@ -33381,7 +33426,14 @@ def _render_admin_page() -> str:
         let accounts=provider.accounts||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_accounts"}}))||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[];
-        const address=normalizeAddress(accounts[0]||"");
+        let address=normalizeAddress(accounts[0]||"");
+        if(!/^0x[a-fA-F0-9]{{40}}$/.test(address)) {{
+          try {{
+            const ns=provider?.session?.namespaces?.eip155;
+            const nsAccounts=Array.isArray(ns?.accounts)?ns.accounts:[];
+            address=normalizeAddress(nsAccounts[0]||"");
+          }} catch(_) {{}}
+        }}
         if(!/^0x[a-fA-F0-9]{{40}}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
         const chainHex=await provider.request({{method:"eth_chainId"}});
         const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1;
@@ -36607,7 +36659,7 @@ def _render_help_page() -> str:
       const toHexMessage=(msg)=>{{ try {{ return "0x"+Array.from(new TextEncoder().encode(String(msg||""))).map((b)=>b.toString(16).padStart(2,"0")).join(""); }} catch(_) {{ return ""; }} }};
       try {{
         const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
-        const wcChains=[1,10,56,137,8453,42161,43114];
+        const wcChains=[1,10,56,137,8453,42161,43114,11155111];
         const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
         const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
         provider.on("display_uri",showWcQrModal);
@@ -36619,7 +36671,14 @@ def _render_help_page() -> str:
         let accounts=provider.accounts||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_accounts"}}))||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[];
-        const address=normalizeAddress(accounts[0]||"");
+        let address=normalizeAddress(accounts[0]||"");
+        if(!/^0x[a-fA-F0-9]{40}$/.test(address)) {{
+          try {{
+            const ns=provider?.session?.namespaces?.eip155;
+            const nsAccounts=Array.isArray(ns?.accounts)?ns.accounts:[];
+            address=normalizeAddress(nsAccounts[0]||"");
+          }} catch(_) {{}}
+        }}
         if(!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
         const chainHex=await provider.request({{method:"eth_chainId"}});
         const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1;
@@ -43260,7 +43319,7 @@ HTML_PAGE = """
       try {
         setStatus("Connecting WalletConnect...", "running");
         const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
-        const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
+        const wcChains = [1, 10, 56, 137, 8453, 42161, 43114, 11155111];
         const wcMetadata = {
           name: "DeFi Pools",
           description: "DeFi Pools wallet sign-in",
@@ -43296,7 +43355,14 @@ HTML_PAGE = """
         let accounts = provider.accounts || [];
         if (!accounts.length) accounts = (await provider.request({method: "eth_accounts"})) || [];
         if (!accounts.length) accounts = (await provider.request({method: "eth_requestAccounts"})) || [];
-        const address = normalizeAddress(accounts[0] || "");
+        let address = normalizeAddress(accounts[0] || "");
+        if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+          try {
+            const ns = provider?.session?.namespaces?.eip155;
+            const nsAccounts = Array.isArray(ns?.accounts) ? ns.accounts : [];
+            address = normalizeAddress(nsAccounts[0] || "");
+          } catch (_) {}
+        }
         if (!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
         const chainHex = await provider.request({method: "eth_chainId"});
         const chainId = Number.parseInt(String(chainHex || "0x1"), 16) || 1;
