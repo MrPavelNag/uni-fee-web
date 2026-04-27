@@ -24746,7 +24746,17 @@ def _render_placeholder_page(
         }}
       }};
       try {{
-        const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
+        let EthereumProviderModule = null;
+        for (const modUrl of ["https://esm.sh/@walletconnect/ethereum-provider@2.23.8", "https://esm.sh/@walletconnect/ethereum-provider@2.23.8?bundle"]) {{
+          try {{
+            const mod = await import(modUrl);
+            if (mod?.EthereumProvider) {{
+              EthereumProviderModule = mod;
+              break;
+            }}
+          }} catch (_) {{}}
+        }}
+        if (!EthereumProviderModule?.EthereumProvider) throw new Error("WalletConnect SDK failed to load");
         const wcChains = [1, 10, 56, 137, 8453, 42161, 43114, 11155111];
         const wcMetadata = {{
           name: "DeFi Pools",
@@ -24756,6 +24766,7 @@ def _render_placeholder_page(
         }};
         const provider = await EthereumProviderModule.EthereumProvider.init({{
           projectId: WALLETCONNECT_PROJECT_ID,
+          chains: [1],
           optionalChains: wcChains,
           showQrModal: false,
           optionalMethods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign", "wallet_switchEthereumChain"],
@@ -24789,6 +24800,10 @@ def _render_placeholder_page(
             const ns = provider?.session?.namespaces?.eip155;
             const nsAccounts = Array.isArray(ns?.accounts) ? ns.accounts : [];
             address = normalizeAddress(nsAccounts[0] || "");
+            if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {{
+              const m = String(JSON.stringify(provider?.session || {{}}) || "").match(/0x[a-fA-F0-9]{{40}}/);
+              if (m && m[0]) address = String(m[0]);
+            }}
           }} catch (_) {{}}
         }}
         if (!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
@@ -24824,7 +24839,7 @@ def _render_placeholder_page(
         maybeRedirectAfterAuth();
       }} catch (e) {{
         closeWcQrModal();
-        alert("WalletConnect failed: " + (e?.message || "unknown error") + ". Add this site to Reown Domain allowlist and try again.");
+        alert("WalletConnect failed: " + (e?.message || "unknown error") + ". If Reown allowlist is enabled, add origin: " + window.location.origin);
       }}
     }}
 
@@ -25991,12 +26006,23 @@ def _render_riko_page() -> str:
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
     }
-    function formatTokenAmount(raw, decimals) {
+    function formatTokenAmount(raw, decimals, maxFrac = 4) {
       try {
         const ethers = window.ethers;
         if (!ethers) return String(raw || "0");
+        const fracLimit = Math.max(0, Math.min(18, Number(maxFrac || 0)));
         let s = String(ethers.formatUnits(raw || 0n, Number(decimals || 18)));
-        if (s.includes(".")) s = s.replace(/\.?0+$/, "");
+        if (s.includes(".")) {
+          let [whole, frac] = s.split(".");
+          frac = String(frac || "");
+          if (fracLimit === 0) {
+            s = whole;
+          } else {
+            if (frac.length > fracLimit) frac = frac.slice(0, fracLimit);
+            frac = frac.replace(/0+$/, "");
+            s = frac ? `${whole}.${frac}` : whole;
+          }
+        }
         if (!s) s = "0";
         return s;
       } catch (_) {
@@ -33413,10 +33439,12 @@ def _render_admin_page() -> str:
       const normalizeAddress=(value)=>{{ const raw=String(value||"").trim(); if(!raw) return ""; const parts=raw.split(":"); return String(parts[parts.length-1]||"").trim(); }};
       const toHexMessage=(msg)=>{{ try {{ return "0x"+Array.from(new TextEncoder().encode(String(msg||""))).map((b)=>b.toString(16).padStart(2,"0")).join(""); }} catch(_) {{ return ""; }} }};
       try {{
-        const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
+        let EthereumProviderModule=null;
+        for (const modUrl of ["https://esm.sh/@walletconnect/ethereum-provider@2.23.8","https://esm.sh/@walletconnect/ethereum-provider@2.23.8?bundle"]) {{ try {{ const mod=await import(modUrl); if(mod?.EthereumProvider) {{ EthereumProviderModule=mod; break; }} }} catch(_) {{}} }}
+        if(!EthereumProviderModule?.EthereumProvider) throw new Error("WalletConnect SDK failed to load");
         const wcChains=[1,10,56,137,8453,42161,43114,11155111];
         const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
-        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
+        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
         provider.on("display_uri",showWcQrModal);
         window._wcProvider=provider;
         let connected=false; try {{ await provider.connect(); connected=true; }} catch(_) {{}}
@@ -33432,6 +33460,10 @@ def _render_admin_page() -> str:
             const ns=provider?.session?.namespaces?.eip155;
             const nsAccounts=Array.isArray(ns?.accounts)?ns.accounts:[];
             address=normalizeAddress(nsAccounts[0]||"");
+            if(!/^0x[a-fA-F0-9]{{40}}$/.test(address)) {{
+              const m=String(JSON.stringify(provider?.session||{{}})||"").match(/0x[a-fA-F0-9]{{40}}/);
+              if(m&&m[0]) address=String(m[0]);
+            }}
           }} catch(_) {{}}
         }}
         if(!/^0x[a-fA-F0-9]{{40}}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
@@ -33448,7 +33480,7 @@ def _render_admin_page() -> str:
         setAuthUI();
         closeWalletModal({{target:{{id:"walletModalBackdrop"}}}});
         location.reload();
-      }} catch(e) {{ closeWcQrModal(); alert("WalletConnect failed: "+(e?.message||"unknown error")+". Add this site to Reown Domain allowlist and try again."); }}
+      }} catch(e) {{ closeWcQrModal(); alert("WalletConnect failed: "+(e?.message||"unknown error")+". If Reown allowlist is enabled, add origin: "+window.location.origin); }}
     }}
     function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setAdminRikoOnchainStatus(text, isErr) {{
@@ -36658,10 +36690,12 @@ def _render_help_page() -> str:
       const normalizeAddress=(value)=>{{ const raw=String(value||"").trim(); if(!raw) return ""; const parts=raw.split(":"); return String(parts[parts.length-1]||"").trim(); }};
       const toHexMessage=(msg)=>{{ try {{ return "0x"+Array.from(new TextEncoder().encode(String(msg||""))).map((b)=>b.toString(16).padStart(2,"0")).join(""); }} catch(_) {{ return ""; }} }};
       try {{
-        const EthereumProviderModule=await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
+        let EthereumProviderModule=null;
+        for (const modUrl of ["https://esm.sh/@walletconnect/ethereum-provider@2.23.8","https://esm.sh/@walletconnect/ethereum-provider@2.23.8?bundle"]) {{ try {{ const mod=await import(modUrl); if(mod?.EthereumProvider) {{ EthereumProviderModule=mod; break; }} }} catch(_) {{}} }}
+        if(!EthereumProviderModule?.EthereumProvider) throw new Error("WalletConnect SDK failed to load");
         const wcChains=[1,10,56,137,8453,42161,43114,11155111];
         const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
-        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
+        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
         provider.on("display_uri",showWcQrModal);
         window._wcProvider=provider;
         let connected=false; try {{ await provider.connect(); connected=true; }} catch(_) {{}}
@@ -36677,6 +36711,10 @@ def _render_help_page() -> str:
             const ns=provider?.session?.namespaces?.eip155;
             const nsAccounts=Array.isArray(ns?.accounts)?ns.accounts:[];
             address=normalizeAddress(nsAccounts[0]||"");
+            if(!/^0x[a-fA-F0-9]{40}$/.test(address)) {{
+              const m=String(JSON.stringify(provider?.session||{{}})||"").match(/0x[a-fA-F0-9]{40}/);
+              if(m&&m[0]) address=String(m[0]);
+            }}
           }} catch(_) {{}}
         }}
         if(!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
@@ -36692,7 +36730,7 @@ def _render_help_page() -> str:
         authState={{authenticated:true,...verifyResp}};
         setAuthUI();
         closeWalletModal({{target:{{id:"walletModalBackdrop"}}}});
-      }} catch(e) {{ closeWcQrModal(); alert("WalletConnect failed: "+(e?.message||"unknown error")+". Add this site to Reown Domain allowlist and try again."); }}
+      }} catch(e) {{ closeWcQrModal(); alert("WalletConnect failed: "+(e?.message||"unknown error")+". If Reown allowlist is enabled, add origin: "+window.location.origin); }}
     }}
     function setTicketStatus(text, isErr) {{ const el=document.getElementById("ticketStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
     function setFeedbackFormStatus(text, isErr) {{ const el=document.getElementById("feedbackFormStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
@@ -43318,7 +43356,17 @@ HTML_PAGE = """
       };
       try {
         setStatus("Connecting WalletConnect...", "running");
-        const EthereumProviderModule = await import("https://esm.sh/@walletconnect/ethereum-provider@2.23.8");
+        let EthereumProviderModule = null;
+        for (const modUrl of ["https://esm.sh/@walletconnect/ethereum-provider@2.23.8", "https://esm.sh/@walletconnect/ethereum-provider@2.23.8?bundle"]) {
+          try {
+            const mod = await import(modUrl);
+            if (mod?.EthereumProvider) {
+              EthereumProviderModule = mod;
+              break;
+            }
+          } catch (_) {}
+        }
+        if (!EthereumProviderModule?.EthereumProvider) throw new Error("WalletConnect SDK failed to load");
         const wcChains = [1, 10, 56, 137, 8453, 42161, 43114, 11155111];
         const wcMetadata = {
           name: "DeFi Pools",
@@ -43328,6 +43376,7 @@ HTML_PAGE = """
         };
         const provider = await EthereumProviderModule.EthereumProvider.init({
           projectId: WALLETCONNECT_PROJECT_ID,
+          chains: [1],
           optionalChains: wcChains,
           showQrModal: false,
           optionalMethods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign", "wallet_switchEthereumChain"],
@@ -43361,6 +43410,10 @@ HTML_PAGE = """
             const ns = provider?.session?.namespaces?.eip155;
             const nsAccounts = Array.isArray(ns?.accounts) ? ns.accounts : [];
             address = normalizeAddress(nsAccounts[0] || "");
+            if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+              const m = String(JSON.stringify(provider?.session || {}) || "").match(/0x[a-fA-F0-9]{40}/);
+              if (m && m[0]) address = String(m[0]);
+            }
           } catch (_) {}
         }
         if (!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error("WalletConnect did not return a valid EVM address");
@@ -43398,7 +43451,7 @@ HTML_PAGE = """
         }
       } catch (e) {
         closeWcQrModal();
-        setStatus("WalletConnect failed: " + (e?.message || "unknown") + ". Add this site to Reown Domain allowlist.", "fail");
+        setStatus("WalletConnect failed: " + (e?.message || "unknown") + ". If Reown allowlist is enabled, add origin: " + window.location.origin, "fail");
       }
     }
 
