@@ -8054,6 +8054,9 @@ def _riko_tx_action_label(row: dict[str, Any], vault_addr: str) -> str:
         "0xd0e30db0": "Wrap ETH to WETH",
         "0x2e1a7d4d": "Unwrap WETH to ETH",
     }
+    # Prefer exact selector mapping first (e.g. WETH deposit() should be Wrap, not generic Deposit).
+    if method in method_labels:
+        return method_labels.get(method) or "Contract call"
     if fn:
         if "deposit(" in fn:
             return "Deposit"
@@ -8072,8 +8075,6 @@ def _riko_tx_action_label(row: dict[str, Any], vault_addr: str) -> str:
         if "setPendingRedemptionOperator(" in fn:
             return "Set pending operator"
         return fn.split("(")[0] or "Contract call"
-    if method in method_labels:
-        return method_labels.get(method) or "Contract call"
     if method == "0x":
         if to_addr == vault_addr:
             return "Transfer to vault"
@@ -21772,6 +21773,7 @@ def _riko_auto_payout_apply_digest(
     holder_scan_start_block: int,
     items: list[dict[str, int]],
     payout_time_utc: str,
+    calc_method: str,
 ) -> str:
     clean_items: list[dict[str, int]] = []
     for raw in (items or []):
@@ -21784,9 +21786,60 @@ def _riko_auto_payout_apply_digest(
         "holder_scan_start_block": max(0, int(holder_scan_start_block or 0)),
         "items": clean_items,
         "payout_time_utc": str(payout_time_utc or "").strip(),
+        "calc_method": _normalize_riko_payout_calc_method(calc_method),
     }
     blob = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _normalize_riko_payout_calc_method(raw: Any) -> str:
+    txt = str(raw or "").strip().lower()
+    if txt in {"treasury", "treasury_10y", "us_treasury_10y"}:
+        return "treasury_10y"
+    return "treasury_10y"
+
+
+def _riko_payout_rate_snapshot(calc_method: str) -> dict[str, Any]:
+    method = _normalize_riko_payout_calc_method(calc_method)
+    if method == "treasury_10y":
+        try:
+            y = _fetch_us_treasury_daily_10y()
+            annual_pct = float(y.get("annual_pct") or 0.0)
+            monthly_pct = float(annual_pct) / 12.0
+            raw_target_bps = float(monthly_pct) * 100.0
+            target_bps = int(round(raw_target_bps))
+            next_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
+            return {
+                "calc_method": method,
+                "calc_method_label": "Treasury 10Y",
+                "rate_source": "us_treasury_10y",
+                "rate_date": str(y.get("date") or ""),
+                "annual_pct": float(round(annual_pct, 6)),
+                "monthly_pct": float(round(monthly_pct, 8)),
+                "target_bps": int(target_bps),
+                "next_bps": int(next_bps),
+            }
+        except Exception:
+            return {
+                "calc_method": method,
+                "calc_method_label": "Treasury 10Y",
+                "rate_source": "us_treasury_10y",
+                "rate_date": "",
+                "annual_pct": 0.0,
+                "monthly_pct": 0.0,
+                "target_bps": 0,
+                "next_bps": 0,
+            }
+    return {
+        "calc_method": method,
+        "calc_method_label": method,
+        "rate_source": method,
+        "rate_date": "",
+        "annual_pct": 0.0,
+        "monthly_pct": 0.0,
+        "target_bps": 0,
+        "next_bps": 0,
+    }
 
 
 def _riko_auto_payout_apply_message(
@@ -22266,27 +22319,41 @@ def _load_riko_payout_schedule() -> dict[str, Any]:
             raw = {}
     items = _normalize_riko_payout_schedule_items(raw.get("items"))
     payout_hour_utc, payout_minute_utc, payout_time_utc = _normalize_riko_payout_time_utc(raw.get("payout_time_utc"))
+    calc_method = _normalize_riko_payout_calc_method(raw.get("calc_method"))
+    rate = _riko_payout_rate_snapshot(calc_method)
     next_due_at = _riko_next_schedule_datetime(items, payout_hour_utc, payout_minute_utc)
     return {
         "items": items,
         "count": int(len(items)),
         "payout_time_utc": payout_time_utc,
+        "calc_method": calc_method,
         "payout_hour_utc": int(payout_hour_utc),
         "payout_minute_utc": int(payout_minute_utc),
         "next_due_date": next_due_at.date().isoformat() if isinstance(next_due_at, datetime) else "",
         "next_due_at_utc": next_due_at.strftime("%Y-%m-%d %H:%M UTC") if isinstance(next_due_at, datetime) else "",
+        "next_rate_label": str(rate.get("calc_method_label") or ""),
+        "next_rate_source": str(rate.get("rate_source") or ""),
+        "next_rate_date": str(rate.get("rate_date") or ""),
+        "next_rate_annual_pct": float(rate.get("annual_pct") or 0.0),
+        "next_rate_monthly_pct": float(rate.get("monthly_pct") or 0.0),
+        "next_rate_target_bps": int(rate.get("target_bps") or 0),
+        "next_rate_bps": int(rate.get("next_bps") or 0),
         "updated_at": str(raw.get("updated_at") or ""),
     }
 
 
-def _save_riko_payout_schedule(items: list[dict[str, Any]], payout_time_utc: str | None = None) -> dict[str, Any]:
+def _save_riko_payout_schedule(
+    items: list[dict[str, Any]], payout_time_utc: str | None = None, calc_method: str | None = None
+) -> dict[str, Any]:
     clean_items = _normalize_riko_payout_schedule_items(items)
     cur = _load_riko_payout_schedule()
     raw_time = str(payout_time_utc or "").strip() or str(cur.get("payout_time_utc") or "00:00")
     _, _, norm_time = _normalize_riko_payout_time_utc(raw_time)
+    method = _normalize_riko_payout_calc_method(calc_method or cur.get("calc_method"))
     payload = {
         "items": clean_items,
         "payout_time_utc": norm_time,
+        "calc_method": method,
         "updated_at": _iso_now(),
     }
     _analytics_set_state(RIKO_PAYOUT_SCHEDULE_STATE_KEY, json.dumps(payload, ensure_ascii=False))
@@ -22821,6 +22888,34 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     if int(limit) > 0:
         holders = holders[: max(1, min(2000, int(limit)))]
     riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
+    payout_token = str(bot_cfg.get("payout_token_address") or "").strip().lower()
+    schedule = _load_riko_payout_schedule()
+    schedule_next_due_date = str(schedule.get("next_due_date") or "")
+    schedule_next_due_at_utc = str(schedule.get("next_due_at_utc") or "")
+    annual_pct = 0.0
+    monthly_pct = 0.0
+    target_bps = 0
+    next_bps = 0
+    try:
+        y = _fetch_us_treasury_daily_10y()
+        annual_pct = float(y.get("annual_pct") or 0.0)
+        monthly_pct = float(annual_pct) / 12.0
+        raw_target_bps = float(monthly_pct) * 100.0
+        target_bps = int(round(raw_target_bps))
+        next_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
+    except Exception:
+        annual_pct = 0.0
+        monthly_pct = 0.0
+        target_bps = 0
+        next_bps = 0
+    payout_decimals = 18
+    if _is_eth_address(payout_token):
+        try:
+            payout_decimals = _riko_erc20_decimals(rpc_url, payout_token)
+        except Exception:
+            payout_decimals = 18
+    scale_up = max(0, int(payout_decimals) - int(riko_decimals))
+    scale_down = max(0, int(riko_decimals) - int(payout_decimals))
     rows: list[dict[str, Any]] = []
     for holder in holders:
         if str(holder or "").strip().lower() == riko_token:
@@ -22833,6 +22928,14 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         tx_hash = str(meta.get("last_change_hash") or "").strip().lower()
         tx_url = _explorer_tx_url_for_chain(int(chain_id), tx_hash) if tx_hash else ""
         ts = int(meta.get("last_change_ts") or 0)
+        planned_payout_raw = 0
+        if int(bal) > 0 and int(next_bps) > 0 and _is_eth_address(payout_token):
+            base_amount = int(bal)
+            if scale_up > 0:
+                base_amount *= 10**scale_up
+            elif scale_down > 0:
+                base_amount //= 10**scale_down
+            planned_payout_raw = max(0, (base_amount * int(next_bps)) // 10_000)
         rows.append(
             {
                 "address": holder,
@@ -22841,6 +22944,10 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
                 "last_change_iso": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts > 0 else "",
                 "last_change_hash": tx_hash,
                 "last_change_tx_url": tx_url,
+                "planned_yield_payout_raw": int(planned_payout_raw),
+                "planned_yield_bps": int(next_bps),
+                "planned_yield_date": schedule_next_due_date,
+                "planned_yield_date_utc": schedule_next_due_at_utc,
             }
         )
     rows.sort(
@@ -22855,6 +22962,14 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         "chain_id": int(chain_id),
         "riko_token": riko_token,
         "riko_decimals": int(riko_decimals),
+        "payout_token": payout_token if _is_eth_address(payout_token) else "",
+        "payout_decimals": int(payout_decimals),
+        "annual_pct": float(annual_pct),
+        "monthly_pct": float(monthly_pct),
+        "target_bps": int(target_bps),
+        "next_bps": int(next_bps),
+        "schedule_next_due_date": schedule_next_due_date,
+        "schedule_next_due_at_utc": schedule_next_due_at_utc,
         "holder_scan_start_block": int(from_block),
         "holder_scan_latest_block": int(latest_block),
         "count": int(len(rows)),
@@ -23581,6 +23696,7 @@ class AdminRikoPayoutDateItem(BaseModel):
 class AdminRikoPayoutScheduleUpdate(BaseModel):
     items: list[AdminRikoPayoutDateItem] = Field(default_factory=list)
     payout_time_utc: str = "00:00"
+    calc_method: str = "treasury_10y"
 
 
 class AdminRikoAutoYieldModeUpdate(BaseModel):
@@ -23597,6 +23713,7 @@ class AdminRikoAutoPayoutApplyNonceRequest(BaseModel):
     holder_scan_start_block: int = 0
     items: list[AdminRikoPayoutDateItem] = Field(default_factory=list)
     payout_time_utc: str = "00:00"
+    calc_method: str = "treasury_10y"
 
 
 class AdminRikoAutoPayoutApplySigned(AdminRikoAutoPayoutApplyNonceRequest):
@@ -25210,62 +25327,30 @@ def _render_riko_page() -> str:
       const groupRowsByFlow = (items) => {
         const rows = (Array.isArray(items) ? items : []).slice();
         if (!rows.length) return [];
-        // Build process groups by logical stage sequence, not by time proximity.
+        // Deterministic grouping by explicit client-side flow id.
+        // Rows without flow_id are shown as standalone to avoid incorrect mixed chains.
         const asc = rows.slice().sort((a, b) => parseRowTs(a) - parseRowTs(b));
-        const mode = asc.some((x) => {
-          const k = primaryKindForRow(x);
-          return k === "redeem" || k === "cancel";
-        }) ? "redeem" : "deposit";
+        const flowMap = new Map();
         const groups = [];
-        if (mode === "redeem") {
-          let current = null;
-          for (const row of asc) {
-            const stage = stageKeyForRow(row);
-            const pending = isPendingRedeemAction(row);
-            const isAnchor = (stage === "redeem" || stage === "cancel");
-            const isSupport = (stage === "withdraw" || stage === "unwrap" || stage === "rollback_unwrap");
-            if (isAnchor) {
-              if (current && Array.isArray(current.items) && current.items.length) groups.push(current);
-              current = { items: [row], kind: stage, pending };
-              continue;
-            }
-            if (pending) {
-              if (current && Array.isArray(current.items) && current.items.length) groups.push(current);
-              groups.push({ items: [row], kind: "pending", pending: true });
-              current = null;
-              continue;
-            }
-            if (isSupport && current && current.kind === "redeem" && !current.pending) {
-              current.items.push(row);
-              continue;
-            }
-            if (current && Array.isArray(current.items) && current.items.length) groups.push(current);
-            current = { items: [row], kind: stage || "other", pending: false };
-          }
-          if (current && Array.isArray(current.items) && current.items.length) groups.push(current);
-          return groups.reverse();
-        }
-        // deposit mode: chain setup steps to next deposit anchor.
-        let setup = [];
         for (const row of asc) {
-          const stage = stageKeyForRow(row);
-          if (stage === "approve" || stage === "wrap") {
-            setup.push(row);
+          const flowId = String(row?.flow_id || "").trim();
+          if (!flowId) {
+            groups.push({ items: [row], kind: stageKeyForRow(row) || "other", pending: isPendingRedeemAction(row), newestTs: parseRowTs(row) });
             continue;
           }
-          if (stage === "deposit") {
-            groups.push({ items: [...setup, row], kind: "deposit", pending: false });
-            setup = [];
-            continue;
+          let g = flowMap.get(flowId);
+          if (!g) {
+            g = { items: [], kind: stageKeyForRow(row) || "other", pending: false, newestTs: 0 };
+            flowMap.set(flowId, g);
+            groups.push(g);
           }
-          if (setup.length) {
-            groups.push({ items: [...setup], kind: "setup", pending: false });
-            setup = [];
-          }
-          groups.push({ items: [row], kind: stage || "other", pending: false });
+          g.items.push(row);
+          g.pending = !!g.pending || isPendingRedeemAction(row);
+          const ts = parseRowTs(row);
+          if (ts > Number(g.newestTs || 0)) g.newestTs = ts;
         }
-        if (setup.length) groups.push({ items: [...setup], kind: "setup", pending: false });
-        return groups.reverse();
+        groups.sort((a, b) => Number(b?.newestTs || 0) - Number(a?.newestTs || 0));
+        return groups;
       };
       const renderGroups = (items) => groupRowsByFlow(items).map((grp) => {
         const grpItems = Array.isArray(grp?.items) ? grp.items : [];
@@ -25388,6 +25473,12 @@ def _render_riko_page() -> str:
       const when = String(item?.time_iso || item?.when || "").trim();
       return `${hash}|${action}|${when}`;
     }
+    function newRikoFlowId(prefix) {
+      const p = String(prefix || "flow").trim().toLowerCase() || "flow";
+      const ts = Date.now();
+      const rnd = Math.random().toString(36).slice(2, 8);
+      return `${p}-${ts}-${rnd}`;
+    }
     function loadHiddenRikoTxRows(addr, chainId) {
       const a = String(addr || "").trim().toLowerCase();
       if (!/^0x[a-f0-9]{40}$/.test(a)) return new Set();
@@ -25504,6 +25595,13 @@ def _render_riko_page() -> str:
       const chainId = Number(authState?.chain_id || 11155111);
       const walletLower = String(wallet || "").trim().toLowerCase();
       const localItems = loadLocalRikoTxHistory(walletLower, chainId);
+      if (Array.isArray(localItems) && localItems.length) {
+        // Strict mode: user-facing history is rendered exactly from local flow rows.
+        // No merge/fallback when local rows exist.
+        rikoTxHistory = localItems;
+        renderRikoTxHistory();
+        return;
+      }
       const qs = new URLSearchParams();
       if (/^0x[a-fA-F0-9]{40}$/.test(wallet)) qs.set("address", wallet);
       qs.set("limit", "40");
@@ -25522,8 +25620,9 @@ def _render_riko_page() -> str:
           is_error: !!x?.is_error,
           txreceipt_status: String(x?.txreceipt_status || ""),
           error_reason: String(x?.error_reason || ""),
+          flow_id: String(x?.flow_id || ""),
         }));
-        rikoTxHistory = mergeTxHistoryLists(backendItems, localItems);
+        rikoTxHistory = backendItems;
         saveLocalRikoTxHistory(walletLower, chainId, rikoTxHistory);
       } catch (_) {
         rikoTxHistory = localItems;
@@ -25541,6 +25640,19 @@ def _render_riko_page() -> str:
       rikoTxHistory = mergeTxHistoryLists(localItems, rikoTxHistory);
       renderRikoTxHistory();
       await loadRikoTxHistory();
+      try {
+        const cur = String(document.getElementById("rikoStatus")?.textContent || "").trim().toLowerCase();
+        // Clear transient flow line after deferred transfer to history.
+        if (
+          cur.includes("->")
+          || cur.includes("confirmed")
+          || cur.includes("failed")
+          || cur.includes("canceled")
+          || cur.includes("cancelled")
+        ) {
+          setRikoStatus("Ready", false);
+        }
+      } catch (_) {}
     }
     function scheduleRikoDeferredTxHistoryFlush(delayMs) {
       const waitMs = Math.max(0, Number(delayMs || 0));
@@ -25569,6 +25681,7 @@ def _render_riko_page() -> str:
         is_error: false,
         txreceipt_status: "",
         error_reason: "",
+        flow_id: String((opts && opts.flowId) || ""),
       };
       const deferHistory = !!(opts && opts.deferHistory);
       if (deferHistory) {
@@ -26437,6 +26550,7 @@ def _render_riko_page() -> str:
       let wrapTxHash = "";
       let rollbackTxHash = "";
       let hasDeferredTxRows = false;
+      const flowId = newRikoFlowId("deposit");
       try {
         const flowSymbols = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase() === "eth"
           ? ["Approve", "Wrap", "Deposit"]
@@ -26480,7 +26594,7 @@ def _render_riko_page() -> str:
           renderFlow(0, "Allowance is insufficient. Sending approve tx...", false, -1);
           const approveTx = await token.approve(contractAddress, raw);
           approveTxHash = String(approveTx?.hash || "").trim();
-          await addRikoTxHistory("Approve", approveTx.hash, signer, { deferHistory: true });
+          await addRikoTxHistory("Approve", approveTx.hash, signer, { deferHistory: true, flowId });
           hasDeferredTxRows = true;
           renderFlow(0, "Approve tx sent", false, -1);
           await approveTx.wait();
@@ -26495,7 +26609,7 @@ def _render_riko_page() -> str:
           renderFlow(1, "Wrapping ETH to WETH...", false, -1);
           const wrapTx = await token.deposit({ value: raw });
           wrapTxHash = String(wrapTx?.hash || "").trim();
-          await addRikoTxHistory("Wrap ETH->WETH", wrapTx.hash, signer, { deferHistory: true });
+          await addRikoTxHistory("Wrap ETH->WETH", wrapTx.hash, signer, { deferHistory: true, flowId });
           hasDeferredTxRows = true;
           renderFlow(1, "Wrap tx sent", false, -1);
           await wrapTx.wait();
@@ -26507,7 +26621,7 @@ def _render_riko_page() -> str:
         renderFlow(flowSymbols.length - 1, "Sending deposit tx...", false, -1);
         const tx = await vault.deposit(depositTokenAddress, raw, 0, user);
         depositTxHash = String(tx?.hash || "").trim();
-        await addRikoTxHistory("Deposit", tx.hash, signer, { deferHistory: true });
+        await addRikoTxHistory("Deposit", tx.hash, signer, { deferHistory: true, flowId });
         hasDeferredTxRows = true;
         renderFlow(flowSymbols.length - 1, "Deposit tx sent", false, -1);
         await tx.wait();
@@ -26535,7 +26649,7 @@ def _render_riko_page() -> str:
             if (toUnwrap > 0n) {
               const rollbackTx = await wrappedToken.withdraw(toUnwrap);
               rollbackTxHash = String(rollbackTx?.hash || "").trim();
-              await addRikoTxHistory("Rollback unwrap", rollbackTx.hash, wrappedToken.runner, { deferHistory: true });
+              await addRikoTxHistory("Rollback unwrap", rollbackTx.hash, wrappedToken.runner, { deferHistory: true, flowId });
               hasDeferredTxRows = true;
               setRikoStatus("Rollback tx sent", true, true);
               await rollbackTx.wait();
@@ -26565,6 +26679,7 @@ def _render_riko_page() -> str:
       let hasDeferredTxRows = false;
       let redeemTxHash = "";
       let unwrapTxHash = "";
+      const flowId = newRikoFlowId("redeem");
       try {
         const flowSymbols = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase() === "eth"
           ? ["Redeem", "Pending/Settle", "Unwrap"]
@@ -26608,7 +26723,7 @@ def _render_riko_page() -> str:
         }
         const tx = await vault.redeem(redeemTokenAddress, rawRiko, 0, user);
         redeemTxHash = String(tx?.hash || "").trim();
-        await addRikoTxHistory("Redeem", tx.hash, signer, { deferHistory: true });
+        await addRikoTxHistory("Redeem", tx.hash, signer, { deferHistory: true, flowId });
         hasDeferredTxRows = true;
         renderFlow(0, "Redeem tx sent", false, -1);
         const receipt = await tx.wait();
@@ -26675,7 +26790,7 @@ def _render_riko_page() -> str:
               );
               const unwrapTx = await weth.withdraw(delta);
               unwrapTxHash = String(unwrapTx?.hash || "").trim();
-              await addRikoTxHistory("Unwrap WETH->ETH", unwrapTx.hash, signer, { deferHistory: true });
+              await addRikoTxHistory("Unwrap WETH->ETH", unwrapTx.hash, signer, { deferHistory: true, flowId });
               hasDeferredTxRows = true;
               renderFlow(2, "Unwrap tx sent", false, -1);
               await unwrapTx.wait();
@@ -26747,6 +26862,7 @@ def _render_riko_page() -> str:
     async function rikoCancelPendingRedeem(symbolOverride, tokenOverride) {
       let hasDeferredTxRows = false;
       let cancelTxHash = "";
+      const flowId = newRikoFlowId("cancel");
       try {
         setRikoStatus("Canceling pending redeem...", false);
         const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
@@ -26766,7 +26882,7 @@ def _render_riko_page() -> str:
         }
         const tx = await vault.cancelPendingRedemption(vaultTokenAddress);
         cancelTxHash = String(tx?.hash || "").trim();
-        await addRikoTxHistory("Cancel pending redeem", tx.hash, signer, { deferHistory: true });
+        await addRikoTxHistory("Cancel pending redeem", tx.hash, signer, { deferHistory: true, flowId });
         hasDeferredTxRows = true;
         setRikoStatus("Cancel pending redeem tx sent", false, true);
         await tx.wait();
@@ -32319,6 +32435,34 @@ def _render_admin_page() -> str:
       color: #991b1b;
       border-color: #fca5a5;
     }}
+    .admin-riko-pending-status {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 84px;
+      padding: 2px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.25;
+      border: 1px solid transparent;
+      letter-spacing: 0.01em;
+    }}
+    .admin-riko-pending-status.active {{
+      background: #fef9c3;
+      color: #854d0e;
+      border-color: #fde68a;
+    }}
+    .admin-riko-pending-status.completed {{
+      background: #dcfce7;
+      color: #166534;
+      border-color: #86efac;
+    }}
+    .admin-riko-pending-status.cancelled {{
+      background: #fee2e2;
+      color: #991b1b;
+      border-color: #fca5a5;
+    }}
     .admin-history-block {{
       margin-top: 8px;
       border: 1px solid #dbe3ef;
@@ -32375,8 +32519,21 @@ def _render_admin_page() -> str:
       margin: 6px 0;
     }}
     .admin-riko-signers-grid {{
-      --admin-riko-row-gap: 6px;
-      --admin-riko-row-height: 34px;
+      --admin-riko-row-gap: 4px;
+      --admin-riko-row-height: 28px;
+    }}
+    .admin-riko-signers-grid > .card {{
+      padding: 10px 10px 8px;
+    }}
+    .admin-riko-signers-grid > .card h3 {{
+      margin: 0 0 6px;
+      font-size: 16px;
+      line-height: 1.2;
+    }}
+    .admin-riko-signers-grid > .card .hint {{
+      margin: 0 0 6px;
+      font-size: 12px;
+      line-height: 1.2;
     }}
     #adminRikoWhitelistRows {{
       display: grid;
@@ -32405,6 +32562,9 @@ def _render_admin_page() -> str:
     .admin-riko-whitelist-row input,
     .admin-riko-allowance-row input {{
       min-height: var(--admin-riko-row-height);
+      padding: 4px 8px;
+      font-size: 13px;
+      line-height: 1.2;
     }}
     .admin-riko-allowance-row.native-lock input {{
       background: #eef2f7;
@@ -32423,12 +32583,23 @@ def _render_admin_page() -> str:
     .admin-riko-whitelist-row .btn.danger,
     .admin-riko-allowance-row .btn.danger {{
       min-height: var(--admin-riko-row-height);
-      width: 28px;
-      min-width: 28px;
-      padding: 4px 9px;
-      font-size: 12px;
+      width: 24px;
+      min-width: 24px;
+      padding: 2px 6px;
+      font-size: 11px;
       line-height: 1;
       justify-content: center;
+    }}
+    .admin-riko-signers-grid .btn {{
+      padding: 6px 10px;
+      font-size: 13px;
+      line-height: 1.15;
+    }}
+    .admin-riko-signers-grid .status {{
+      margin-left: 0;
+      margin-top: 2px;
+      font-size: 12px;
+      line-height: 1.2;
     }}
     .admin-riko-signers-grid {{
       display: grid;
@@ -32575,7 +32746,14 @@ def _render_admin_page() -> str:
           </div>
           <span class="hint">one time for all payouts (UTC)</span>
         </div>
-        <div class="row"><label>Next scheduled payout (UTC)</label><div id="adminRikoPayoutNextDate">-</div></div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Calculation method</label>
+          <select id="adminRikoPayoutCalcMethodInput">
+            <option value="treasury_10y">Treasury 10Y</option>
+          </select>
+          <span class="hint">rate source for next payout</span>
+        </div>
+        <div class="row"><label>Next scheduled payout (UTC)</label><div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;"><span id="adminRikoPayoutNextDate">-</span><span id="adminRikoPayoutNextRate" class="hint">Rate: -</span></div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Bot config</label>
           <select id="adminRikoAutoYieldPayoutTokenInput"></select>
@@ -32590,13 +32768,7 @@ def _render_admin_page() -> str:
           </div>
         </div>
         <div class="row"><label>Last schedule update</label><div id="adminRikoPayoutUpdatedAt">-</div></div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Holder scan</label>
-          <div id="adminRikoHolderScanSummary">-</div>
-          <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolderScanStatus()">Refresh scan</button>
-        </div>
-        <span id="adminRikoHolderScanStatus" class="status">Ready</span>
-        <span id="adminRikoPayoutStatus" class="status">Ready</span>
+        <span id="adminRikoPayoutStatus" class="status">Payout: Ready</span>
       </section>
     </div>
     <div class="grid" id="tabPendingRedeem" style="display:none">
@@ -32607,7 +32779,7 @@ def _render_admin_page() -> str:
         </div>
         <span id="adminRikoPendingOpsStatus" class="status">Ready</span>
         <details class="admin-history-block">
-          <summary>Redemption history (closed operations older than 5 days)</summary>
+          <summary>Redemption history (closed operations)</summary>
           <div class="admin-history-actions">
             <button type="button" class="btn btn-soft" onclick="deleteSelectedAdminRikoHistory('redeem', event)">Delete selected</button>
           </div>
@@ -32622,15 +32794,6 @@ def _render_admin_page() -> str:
           </div>
           <div class="table-wrap">
             <table id="adminRikoDepositHistoryTable" class="admin-history-table"></table>
-          </div>
-        </details>
-        <details class="admin-history-block">
-          <summary>Yield payout history</summary>
-          <div class="admin-history-actions">
-            <button type="button" class="btn btn-soft" onclick="deleteSelectedAdminRikoHistory('yield', event)">Delete selected</button>
-          </div>
-          <div class="table-wrap">
-            <table id="adminRikoYieldHistoryTable" class="admin-history-table"></table>
           </div>
         </details>
       </section>
@@ -32649,9 +32812,24 @@ def _render_admin_page() -> str:
             <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolders()">Refresh</button>
           </div>
         </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Holder scan</label>
+          <div id="adminRikoHolderScanSummary">-</div>
+          <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolderScanStatus()">Refresh scan</button>
+        </div>
         <div class="table-wrap" style="margin-top:8px">
           <table id="adminRikoHoldersTable" class="admin-history-table"></table>
         </div>
+        <details class="admin-history-block">
+          <summary>Yield payout history</summary>
+          <div class="admin-history-actions">
+            <button type="button" class="btn btn-soft" onclick="deleteSelectedAdminRikoHistory('yield', event)">Delete selected</button>
+          </div>
+          <div class="table-wrap">
+            <table id="adminRikoYieldHistoryTable" class="admin-history-table"></table>
+          </div>
+        </details>
+        <span id="adminRikoHolderScanStatus" class="status">Scan: Ready</span>
         <span id="adminRikoHoldersStatus" class="status">Ready</span>
       </section>
     </div>
@@ -32941,6 +33119,7 @@ def _render_admin_page() -> str:
       "function allowance(address owner,address spender) view returns (uint256)",
       "function decimals() view returns (uint8)"
     ];
+    const ADMIN_RIKO_CLOSED_GRACE_SEC = 15;
     const adminPendingRedeemInFlight = new Set();
     const ADMIN_RIKO_HISTORY_HIDDEN_TX_KEY = "admin_riko_history_hidden_tx_v1";
     const adminRikoHistorySelection = {{ redeem: new Set(), deposit: new Set(), yield: new Set() }};
@@ -33124,6 +33303,39 @@ def _render_admin_page() -> str:
       const head = "<tr>" + columns.map((c) => `<th>${{String(c || "")}}</th>`).join("") + "</tr>";
       table.innerHTML = head + rows.join("");
     }}
+    function getAdminRikoPendingStatusMeta(rawStatus) {{
+      const st = String(rawStatus || "active").trim().toLowerCase();
+      if (st === "completed") return {{ isActive: false, label: "Completed", css: "completed" }};
+      if (st === "cancelled") return {{ isActive: false, label: "Cancelled", css: "cancelled" }};
+      return {{ isActive: true, label: "Active", css: "active" }};
+    }}
+    function renderAdminRikoPendingQueueRow(r) {{
+      const meta = getAdminRikoPendingStatusMeta(r?.status);
+      const actionHtml = meta.isActive
+        ? `<div class='admin-riko-pending-actions'><button type='button' class='btn btn-soft' onclick=\"diagnoseAdminRikoPendingRedeem('${{String(r?.account || "")}}','${{String(r?.token || "")}}', this)\">Diagnose</button><button type='button' class='btn' onclick=\"applyAdminRikoProcessPendingRedeem('${{String(r?.account || "")}}','${{String(r?.token || "")}}', this)\">Apply on-chain</button></div>`
+        : "<span class='muted'>-</span>";
+      const diagHtml = meta.isActive ? String(r?.diagHtml || "-") : "<span class='muted'>-</span>";
+      return (
+        `<tr>` +
+        `<td style='text-align:left;white-space:nowrap'>${{formatAdminRikoDate(r?.date)}}</td>` +
+        `<td><span class='admin-riko-pending-status ${{meta.css}}'>${{meta.label}}</span></td>` +
+        `<td class='mono'>${{shortAddrAdmin(r?.account)}}</td>` +
+        `<td class='mono'>${{String(r?.tokenLabel || "-")}}</td>` +
+        `<td class='mono'>${{formatAdminRawUnits(String(r?.rikoLocked || "0"), 6, 6)}}</td>` +
+        `<td class='mono' title="${{String(r?.tokenOut || "0")}}">${{String(r?.expectedOutDisplay || "-")}}</td>` +
+        `<td>${{diagHtml}}</td>` +
+        `<td>${{actionHtml}}</td>` +
+        `</tr>`
+      );
+    }}
+    function buildAdminRikoPendingQueueStatusText(totalRows, shownRows, hasWarnings) {{
+      if (hasWarnings) return "Pending queue updated with warnings. Some events may appear with a delay.";
+      if (!Number(totalRows || 0)) return "Pending queue is empty.";
+      if (Number(shownRows || 0) < Number(totalRows || 0)) {{
+        return `Pending queue updated (showing ${{shownRows}} of ${{totalRows}} rows).`;
+      }}
+      return "Pending queue updated.";
+    }}
     async function loadAdminRikoPendingQueue() {{
       const table = document.getElementById("adminRikoPendingQueueTable");
       if (!table) return;
@@ -33184,18 +33396,21 @@ def _render_admin_page() -> str:
           if (!activeQueuedByKey.has(key)) activeQueuedByKey.set(key, []);
           activeQueuedByKey.get(key).push(rec);
         }};
-        const queueShift = (key, status) => {{
+        const queueShift = (key, status, closeEvent) => {{
           const list = activeQueuedByKey.get(key);
           if (!Array.isArray(list) || !list.length) return;
           const rec = list.shift();
-          if (rec && (status === "completed" || status === "cancelled")) rec.status = status;
+          if (rec && (status === "completed" || status === "cancelled")) {{
+            rec.status = status;
+            rec.closedBlockNumber = Number(closeEvent?.blockNumber || 0);
+          }}
           if (!list.length) activeQueuedByKey.delete(key);
         }};
         for (const item of timeline) {{
           if (item.type === "queued") {{
             queuePush(item.key, item.ev);
           }} else if (item.type === "completed" || item.type === "cancelled") {{
-            queueShift(item.key, item.type);
+            queueShift(item.key, item.type, item.ev);
           }}
         }}
         // Reconcile with live on-chain pending state.
@@ -33289,7 +33504,10 @@ def _render_admin_page() -> str:
           const account = String(ev?.args?.account || "").trim();
           const token = String(ev?.args?.token || "").trim();
           const bn = Number(ev?.blockNumber || 0);
-          const ts = await getBlockTimestampSec(bn);
+          const closedBn = Number(rec?.closedBlockNumber || 0);
+          const tsQueued = await getBlockTimestampSec(bn);
+          const tsClosed = closedBn > 0 ? await getBlockTimestampSec(closedBn) : 0;
+          const tsDisplay = tsClosed > 0 ? tsClosed : tsQueued;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
           const rikoLockedRaw = ev?.args?.rikoLocked;
@@ -33350,7 +33568,8 @@ def _render_admin_page() -> str:
           }};
           rows.push({{
             status,
-            date: Number(ts || 0),
+            date: Number(tsDisplay || 0),
+            closedDate: Number(tsClosed || 0),
             blockNumber: bn,
             logIndex: Number(ev?.index || 0),
             account,
@@ -33372,38 +33591,24 @@ def _render_admin_page() -> str:
           return Number(b.logIndex || 0) - Number(a.logIndex || 0);
         }});
         const maxPendingRows = 800;
-        const pendingRowsTruncated = rows.length > maxPendingRows;
-        const rowsToRender = pendingRowsTruncated ? rows.slice(0, maxPendingRows) : rows;
-        if (!rows.length) {{
+        const nowSec = Math.floor(Date.now() / 1000);
+        const closeVisibleAfterSec = nowSec - ADMIN_RIKO_CLOSED_GRACE_SEC;
+        const queueVisibleRows = rows.filter((r) => {{
+          const st = String(r?.status || "").toLowerCase();
+          if (st === "active") return true;
+          const closeTs = Number(r?.closedDate || r?.date || 0);
+          if (closeTs <= 0) return true;
+          return closeTs > closeVisibleAfterSec;
+        }});
+        const pendingRowsTruncated = queueVisibleRows.length > maxPendingRows;
+        const rowsToRender = pendingRowsTruncated ? queueVisibleRows.slice(0, maxPendingRows) : queueVisibleRows;
+        if (!queueVisibleRows.length) {{
           table.innerHTML = "<tr><td class='muted'>No active pending redemptions.</td></tr>";
         }} else {{
           table.innerHTML =
             "<tr><th style='text-align:left'>Date</th><th>Status</th><th>Account</th><th>Token</th><th>RIKO</th><th>Expected out</th><th>Diag</th><th></th></tr>" +
-            rowsToRender.map((r) => (
-              (() => {{
-                const st = String(r.status || "active");
-                const active = st === "active";
-                const statusLabel = active ? "Active" : (st === "completed" ? "Completed" : (st === "cancelled" ? "Cancelled" : st));
-                const actionHtml = active
-                  ? `<div class='admin-riko-pending-actions'><button type='button' class='btn btn-soft' onclick=\"diagnoseAdminRikoPendingRedeem('${{String(r.account)}}','${{String(r.token)}}', this)\">Diagnose</button><button type='button' class='btn' onclick=\"applyAdminRikoProcessPendingRedeem('${{String(r.account)}}','${{String(r.token)}}', this)\">Apply on-chain</button></div>`
-                  : "<span class='muted'>-</span>";
-                const diagHtml = active ? String(r.diagHtml || "-") : "<span class='muted'>-</span>";
-                return (
-              `<tr>` +
-              `<td style='text-align:left;white-space:nowrap'>${{formatAdminRikoDate(r.date)}}</td>` +
-              `<td>${{statusLabel}}</td>` +
-              `<td class='mono'>${{shortAddrAdmin(r.account)}}</td>` +
-              `<td class='mono'>${{String(r.tokenLabel || "-")}}</td>` +
-              `<td class='mono'>${{formatAdminRawUnits(String(r.rikoLocked || "0"), 6, 6)}}</td>` +
-              `<td class='mono' title="${{String(r.tokenOut || "0")}}">${{String(r.expectedOutDisplay || "-")}}</td>` +
-              `<td>${{diagHtml}}</td>` +
-              `<td>${{actionHtml}}</td>` +
-              `</tr>`
-                );
-              }})()
-            )).join("");
+            rowsToRender.map((r) => renderAdminRikoPendingQueueRow(r)).join("");
         }}
-        const nowSec = Math.floor(Date.now() / 1000);
         const hiddenRedeemTx = getAdminRikoHiddenTxSet("redeem");
         const hiddenDepositTx = getAdminRikoHiddenTxSet("deposit");
         const hiddenYieldTx = getAdminRikoHiddenTxSet("yield");
@@ -33413,7 +33618,7 @@ def _render_admin_page() -> str:
         for (const txh of Array.from(adminRikoHistorySelection.redeem)) if (hiddenRedeemTx.has(String(txh || "").toLowerCase())) adminRikoHistorySelection.redeem.delete(txh);
         for (const txh of Array.from(adminRikoHistorySelection.deposit)) if (hiddenDepositTx.has(String(txh || "").toLowerCase())) adminRikoHistorySelection.deposit.delete(txh);
         for (const txh of Array.from(adminRikoHistorySelection.yield)) if (hiddenYieldTx.has(String(txh || "").toLowerCase())) adminRikoHistorySelection.yield.delete(txh);
-        const closeBeforeSec = nowSec - (5 * 24 * 60 * 60);
+        const historyVisibleBeforeSec = nowSec - ADMIN_RIKO_CLOSED_GRACE_SEC;
         const redeemHistoryRows = [];
         for (const ev of (Array.isArray(completedEvs) ? completedEvs : [])) {{
           const account = String(ev?.args?.account || "").trim();
@@ -33421,7 +33626,7 @@ def _render_admin_page() -> str:
           const bn = Number(ev?.blockNumber || 0);
           const ts = await getBlockTimestampSec(bn);
           const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
-          if (!ts || ts > closeBeforeSec) continue;
+          if (!ts || ts > historyVisibleBeforeSec) continue;
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
@@ -33453,7 +33658,7 @@ def _render_admin_page() -> str:
           const bn = Number(ev?.blockNumber || 0);
           const ts = await getBlockTimestampSec(bn);
           const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
-          if (!ts || ts > closeBeforeSec) continue;
+          if (!ts || ts > historyVisibleBeforeSec) continue;
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
@@ -33480,7 +33685,7 @@ def _render_admin_page() -> str:
           "adminRikoRedeemHistoryTable",
           ["Date", "Account", "Token", "Status", "Amount", "Tx", ""],
           redeemHistoryRows.map((r) => r.html),
-          "No closed redemptions older than 5 days."
+          "No closed redemptions yet."
         );
 
         const depositHistoryRows = [];
@@ -33568,23 +33773,12 @@ def _render_admin_page() -> str:
           "No yield payouts in history."
         );
 
-        if (loadWarns.length) {{
-          setAdminRikoPendingOpsStatus(
-            `Pending queue loaded with partial RPC warnings (scan window: ${{fromBlock}}..${{latest}}).`,
-            true
-          );
-        }} else {{
-          setAdminRikoPendingOpsStatus(
-            rows.length
-              ? (
-                pendingRowsTruncated
-                  ? `Pending queue loaded (showing ${{rowsToRender.length}} of ${{rows.length}} rows; scan window: ${{fromBlock}}..${{latest}}).`
-                  : `Pending queue loaded (scan window: ${{fromBlock}}..${{latest}}).`
-              )
-              : `Pending queue is empty (scan window: ${{fromBlock}}..${{latest}}).`,
-            false
-          );
-        }}
+        const pendingStatusText = buildAdminRikoPendingQueueStatusText(
+          rows.length,
+          rowsToRender.length,
+          loadWarns.length > 0
+        );
+        setAdminRikoPendingOpsStatus(pendingStatusText, loadWarns.length > 0);
       }} catch (e) {{
         table.innerHTML = "<tr><td class='muted'>Failed to load pending queue.</td></tr>";
         renderAdminRikoHistoryTable("adminRikoRedeemHistoryTable", ["Info"], [], "Failed to load redemption history.");
@@ -33617,9 +33811,14 @@ def _render_admin_page() -> str:
             }})
           : rowsAll;
         const decimals = Number(data?.riko_decimals || 6);
-        const head = "<tr><th>Address</th><th>Balance</th><th>Last change date</th><th>Tx hash</th></tr>";
+        const payoutDecimals = Number(data?.payout_decimals || 18);
+        const payoutToken = String(data?.payout_token || "").trim().toLowerCase();
+        const payoutTokenLabel = /^0x[a-f0-9]{{40}}$/.test(payoutToken) ? shortAddrAdmin(payoutToken) : "-";
+        const scheduleNextDueUtc = String(data?.schedule_next_due_at_utc || data?.schedule_next_due_date || "").trim();
+        const nextBps = Number(data?.next_bps || 0);
+        const head = "<tr><th>Address</th><th>Balance</th><th>Planned yield</th><th>Planned date (UTC)</th><th>Last change date</th><th>Tx hash</th></tr>";
         if (!rows.length) {{
-          table.innerHTML = head + `<tr><td class='muted' colspan='4'>${{onlyPositive ? "No positive-balance holders found." : "No holders found."}}</td></tr>`;
+          table.innerHTML = head + `<tr><td class='muted' colspan='6'>${{onlyPositive ? "No positive-balance holders found." : "No holders found."}}</td></tr>`;
         }} else {{
           table.innerHTML = head + rows.map((it) => {{
             const addr = String(it?.address || "").trim().toLowerCase();
@@ -33628,6 +33827,12 @@ def _render_admin_page() -> str:
             const dateTxt = ts > 0 ? formatAdminRikoDate(ts) : "-";
             const txHash = String(it?.last_change_hash || "").trim().toLowerCase();
             const txUrl = String(it?.last_change_tx_url || "").trim();
+            const plannedRaw = String(it?.planned_yield_payout_raw || "0");
+            const rowPlannedDateUtc = String(it?.planned_yield_date_utc || scheduleNextDueUtc || "").trim();
+            const plannedDateTxt = rowPlannedDateUtc || "-";
+            const plannedYieldTxt = (/^0x[a-f0-9]{{40}}$/.test(payoutToken) && BigInt(plannedRaw || "0") > 0n)
+              ? `${{formatAdminRawUnits(plannedRaw, payoutDecimals, 8)}} (${{payoutTokenLabel}})`
+              : "-";
             const txHtml = /^0x[a-f0-9]{{64}}$/.test(txHash)
               ? (txUrl ? `<a href="${{esc(txUrl)}}" target="_blank" rel="noopener">${{shortHexAdmin(txHash)}}</a>` : `<span class='mono'>${{shortHexAdmin(txHash)}}</span>`)
               : "-";
@@ -33635,6 +33840,8 @@ def _render_admin_page() -> str:
               "<tr>" +
               `<td class='mono'>${{shortAddrAdmin(addr)}}</td>` +
               `<td class='mono'>${{formatAdminRawUnits(balRaw, decimals, 8)}}</td>` +
+              `<td class='mono'>${{plannedYieldTxt}}</td>` +
+              `<td>${{plannedDateTxt}}</td>` +
               `<td>${{dateTxt}}</td>` +
               `<td>${{txHtml}}</td>` +
               "</tr>"
@@ -33642,7 +33849,7 @@ def _render_admin_page() -> str:
           }}).join("");
         }}
         summaryEl.textContent =
-          `holders=${{rows.length}}/${{Number(data?.count || rowsAll.length)}} | token=${{shortAddrAdmin(String(data?.riko_token || ""))}} | scan=${{Number(data?.holder_scan_start_block || 0)}}..${{Number(data?.holder_scan_latest_block || 0)}}`;
+          `holders=${{rows.length}}/${{Number(data?.count || rowsAll.length)}} | token=${{shortAddrAdmin(String(data?.riko_token || ""))}} | yield=${{nextBps}} bps | next payout=${{scheduleNextDueUtc || "-"}} | scan=${{Number(data?.holder_scan_start_block || 0)}}..${{Number(data?.holder_scan_latest_block || 0)}}`;
         statusEl.textContent = `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}.`;
       }} catch (e) {{
         table.innerHTML = "<tr><td class='muted'>Failed to load holders.</td></tr>";
@@ -33919,12 +34126,89 @@ def _render_admin_page() -> str:
         setAdminRikoOnchainStatus("Pending operator update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
+    async function resolveAdminRikoPendingTokenAddress(tokenRawInput, provider) {{
+      const tokenRaw = String(tokenRawInput || "").trim();
+      let tokenAddr = normalizeEthAddressInput(tokenRaw);
+      if (!tokenAddr && tokenRaw.toLowerCase() === "eth") {{
+        const network = provider ? await provider.getNetwork() : null;
+        tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
+      }}
+      if (!tokenAddr) throw new Error("Token address must be valid (or use ETH to auto-map WETH).");
+      return tokenAddr;
+    }}
+    function setAdminPendingActionBusy(buttonEl, busyText) {{
+      const original = String(buttonEl?.textContent || "");
+      if (buttonEl) {{
+        buttonEl.disabled = true;
+        buttonEl.textContent = String(busyText || "Working...");
+      }}
+      return () => {{
+        if (!buttonEl) return;
+        buttonEl.disabled = false;
+        buttonEl.textContent = original || String(buttonEl?.textContent || "");
+      }};
+    }}
+    function syncAdminPendingInputs(accountAddr, tokenRaw) {{
+      const accountInput = document.getElementById("adminRikoProcessAccountInput");
+      const tokenInput = document.getElementById("adminRikoProcessTokenInput");
+      if (accountInput) accountInput.value = String(accountAddr || "");
+      if (tokenInput) tokenInput.value = String(tokenRaw || "");
+    }}
+    async function readAdminPendingOperatorState(vault, signer) {{
+      const signerAddr = String(await signer.getAddress() || "").trim().toLowerCase();
+      const pendingOp = String(await vault.pendingRedemptionOperator() || "").trim().toLowerCase();
+      const configured = /^0x[a-f0-9]{{40}}$/.test(pendingOp);
+      const matches = configured && signerAddr === pendingOp;
+      return {{ signerAddr, pendingOp, configured, matches }};
+    }}
+    async function tryExplainAdminPendingProcessRevert(accountAddr, tokenAddr, vault, provider) {{
+      if (!accountAddr || !tokenAddr) return false;
+      try {{
+        const ethers = await ensureEthersAdmin();
+        const readVault = vault || new ethers.Contract(
+          String(RIKO_VAULT_ADDRESS || "").trim(),
+          ADMIN_RIKO_VAULT_ABI,
+          provider || ethers.getDefaultProvider()
+        );
+        const pendingNow = await readVault.pendingRedemptions(accountAddr, tokenAddr);
+        if (!pendingNow?.exists) {{
+          setAdminRikoPendingOpsStatus(
+            "Pending redeem is not active anymore (already processed or canceled). Refresh queue.",
+            true
+          );
+          return true;
+        }}
+        const rikoLocked = BigInt(pendingNow?.rikoLocked ?? pendingNow?.[0] ?? 0n);
+        const minTokenOut = BigInt(pendingNow?.minTokenOut ?? pendingNow?.[2] ?? 0n);
+        let quoteNow = 0n;
+        try {{
+          quoteNow = BigInt(await readVault.quoteRedeem(tokenAddr, rikoLocked));
+        }} catch (_) {{
+          quoteNow = 0n;
+        }}
+        if (quoteNow > 0n && quoteNow < minTokenOut) {{
+          setAdminRikoPendingOpsStatus(
+            "Pending redeem cannot be processed now: current quote is below minTokenOut (slippage check).",
+            true
+          );
+          return true;
+        }}
+        setAdminRikoPendingOpsStatus(
+          "Pending redeem is active but cannot be completed now. Check token config, oracle freshness, liquidity and custody allowance.",
+          true
+        );
+        return true;
+      }} catch (_) {{
+        return false;
+      }}
+    }}
     async function applyAdminRikoProcessPendingRedeem(accountOverride, tokenOverride, buttonEl) {{
       let opKey = "";
       let accountAddr = "";
       let tokenAddr = "";
       let vault = null;
       let provider = null;
+      let restoreBusyButton = null;
       try {{
         requireAdminWalletAuth();
         const accountRaw = String(accountOverride || document.getElementById("adminRikoProcessAccountInput")?.value || "").trim();
@@ -33934,36 +34218,24 @@ def _render_admin_page() -> str:
         const ethers = await ensureEthersAdmin();
         provider = signer?.provider || (window.ethereum ? new ethers.BrowserProvider(window.ethereum) : null);
         const tokenRaw = tokenRawInput;
-        tokenAddr = normalizeEthAddressInput(tokenRaw);
-        if (!tokenAddr && tokenRaw.toLowerCase() === "eth") {{
-          const network = provider ? await provider.getNetwork() : null;
-          tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
-        }}
-        if (!tokenAddr) throw new Error("Token address must be valid (or use ETH to auto-map WETH).");
+        tokenAddr = await resolveAdminRikoPendingTokenAddress(tokenRaw, provider);
         opKey = `${{accountAddr.toLowerCase()}}|${{String(tokenAddr || "").toLowerCase()}}`;
         if (adminPendingRedeemInFlight.has(opKey)) {{
           setAdminRikoPendingOpsStatus("This pending redeem is already being processed.", true);
           return;
         }}
         adminPendingRedeemInFlight.add(opKey);
-        if (buttonEl) {{
-          buttonEl.disabled = true;
-          buttonEl.textContent = "Processing...";
-        }}
-        const accountInput = document.getElementById("adminRikoProcessAccountInput");
-        const tokenInput = document.getElementById("adminRikoProcessTokenInput");
-        if (accountInput) accountInput.value = accountAddr;
-        if (tokenInput) tokenInput.value = tokenRaw;
+        restoreBusyButton = setAdminPendingActionBusy(buttonEl, "Processing...");
+        syncAdminPendingInputs(accountAddr, tokenRaw);
         vault = await getAdminVaultContract(signer);
-        const signerAddr = String(await signer.getAddress() || "").trim().toLowerCase();
-        const pendingOp = String(await vault.pendingRedemptionOperator() || "").trim().toLowerCase();
-        if (!/^0x[a-f0-9]{{40}}$/.test(pendingOp)) {{
+        const opState = await readAdminPendingOperatorState(vault, signer);
+        if (!opState.configured) {{
           setAdminRikoPendingOpsStatus("Pending redemption operator is not configured on vault.", true);
           return;
         }}
-        if (signerAddr !== pendingOp) {{
+        if (!opState.matches) {{
           setAdminRikoPendingOpsStatus(
-            `Connected wallet ${{shortAddrAdmin(signerAddr)}} is not pending operator ${{shortAddrAdmin(pendingOp)}}. Connect operator wallet and retry.`,
+            `Connected wallet ${{shortAddrAdmin(opState.signerAddr)}} is not pending operator ${{shortAddrAdmin(opState.pendingOp)}}. Connect operator wallet and retry.`,
             true
           );
           return;
@@ -34004,50 +34276,18 @@ def _render_admin_page() -> str:
         }}
         const baseErr = String(e?.shortMessage || e?.message || "unknown");
         if (accountAddr && tokenAddr && (baseErr.toLowerCase().includes("unknown custom error") || baseErr.toLowerCase().includes("execution reverted"))) {{
-          try {{
-            const ethers = await ensureEthersAdmin();
-            const readVault = vault || new ethers.Contract(String(RIKO_VAULT_ADDRESS || "").trim(), ADMIN_RIKO_VAULT_ABI, provider || ethers.getDefaultProvider());
-            const pendingNow = await readVault.pendingRedemptions(accountAddr, tokenAddr);
-            if (!pendingNow?.exists) {{
-              setAdminRikoPendingOpsStatus(
-                "Pending redeem is not active anymore (already processed or canceled). Refresh queue.",
-                true
-              );
-              return;
-            }}
-            const rikoLocked = BigInt(pendingNow?.rikoLocked ?? pendingNow?.[0] ?? 0n);
-            const minTokenOut = BigInt(pendingNow?.minTokenOut ?? pendingNow?.[2] ?? 0n);
-            let quoteNow = 0n;
-            try {{
-              quoteNow = BigInt(await readVault.quoteRedeem(tokenAddr, rikoLocked));
-            }} catch (_) {{
-              quoteNow = 0n;
-            }}
-            if (quoteNow > 0n && quoteNow < minTokenOut) {{
-              setAdminRikoPendingOpsStatus(
-                "Pending redeem cannot be processed now: current quote is below minTokenOut (slippage check).",
-                true
-              );
-              return;
-            }}
-            setAdminRikoPendingOpsStatus(
-              "Pending redeem is active but cannot be completed now. Check token config, oracle freshness, liquidity and custody allowance.",
-              true
-            );
-            return;
-          }} catch (_) {{}}
+          const explained = await tryExplainAdminPendingProcessRevert(accountAddr, tokenAddr, vault, provider);
+          if (explained) return;
         }}
         setAdminRikoPendingOpsStatus("Process pending redeem failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }} finally {{
         if (opKey) adminPendingRedeemInFlight.delete(opKey);
-        if (buttonEl) {{
-          buttonEl.disabled = false;
-          buttonEl.textContent = "Apply on-chain";
-        }}
+        if (restoreBusyButton) restoreBusyButton();
+        else if (buttonEl) buttonEl.textContent = "Apply on-chain";
       }}
     }}
     async function diagnoseAdminRikoPendingRedeem(accountOverride, tokenOverride, buttonEl) {{
-      let originalText = "";
+      let restoreBusyButton = null;
       try {{
         const accountRaw = String(accountOverride || "").trim();
         const tokenRawInput = String(tokenOverride || "").trim();
@@ -34055,17 +34295,8 @@ def _render_admin_page() -> str:
         const ethers = await ensureEthersAdmin();
         const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
         const vaultAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
-        let tokenAddr = normalizeEthAddressInput(tokenRawInput);
-        if (!tokenAddr && tokenRawInput.toLowerCase() === "eth") {{
-          const network = await provider.getNetwork();
-          tokenAddr = wrappedNativeByChainIdAdmin(Number(network?.chainId || 0));
-        }}
-        if (!tokenAddr) throw new Error("Token address must be valid (or use ETH to auto-map WETH).");
-        if (buttonEl) {{
-          originalText = String(buttonEl.textContent || "");
-          buttonEl.disabled = true;
-          buttonEl.textContent = "Diagnosing...";
-        }}
+        const tokenAddr = await resolveAdminRikoPendingTokenAddress(tokenRawInput, provider);
+        restoreBusyButton = setAdminPendingActionBusy(buttonEl, "Diagnosing...");
         const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
         const pending = await vault.pendingRedemptions(accountAddr, tokenAddr);
         const exists = !!(pending?.exists ?? pending?.[4]);
@@ -34118,11 +34349,19 @@ def _render_admin_page() -> str:
         const liquidityOk = totalAvailable >= tokenOutToSend;
         const allowanceOk = requiredFromCustody <= 0n ? true : (allowance >= requiredFromCustody);
         const custodyBalOk = requiredFromCustody <= 0n ? true : (custodyBal >= requiredFromCustody);
+        const quoteText = formatAdminRawUnits(String(quoteNow), decimals, 8);
+        const minOutText = formatAdminRawUnits(String(minTokenOut), decimals, 8);
+        const availableText = formatAdminRawUnits(String(totalAvailable), decimals, 8);
+        const needText = formatAdminRawUnits(String(tokenOutToSend), decimals, 8);
+        const allowanceText = formatAdminRawUnits(String(allowance), decimals, 8);
+        const needFromCustodyText = formatAdminRawUnits(String(requiredFromCustody), decimals, 8);
+        const connectedShort = shortAddrAdmin(authAddr || "-");
+        const operatorShort = shortAddrAdmin(pendingOp || "-");
         const checklist = [];
-        checklist.push(`quote/minOut: ${{quoteCheckOk ? "OK" : "FAIL"}} (quote=${{formatAdminRawUnits(String(quoteNow), decimals, 8)}}, minOut=${{formatAdminRawUnits(String(minTokenOut), decimals, 8)}})`);
-        checklist.push(`liquidity: ${{liquidityOk ? "OK" : "FAIL"}} (available=${{formatAdminRawUnits(String(totalAvailable), decimals, 8)}}, need=${{formatAdminRawUnits(String(tokenOutToSend), decimals, 8)}})`);
-        checklist.push(`allowance(custody->vault): ${{allowanceOk ? "OK" : "FAIL"}} (allowance=${{formatAdminRawUnits(String(allowance), decimals, 8)}}, needFromCustody=${{formatAdminRawUnits(String(requiredFromCustody), decimals, 8)}})`);
-        checklist.push(`operator wallet: ${{operatorOk ? "OK" : "FAIL"}} (connected=${{shortAddrAdmin(authAddr || "-")}}, operator=${{shortAddrAdmin(pendingOp || "-")}})`);
+        checklist.push(`Quote check: ${{quoteCheckOk ? "OK" : "FAIL"}} (quote ${{quoteText}}, minOut ${{minOutText}})`);
+        checklist.push(`Liquidity: ${{liquidityOk ? "OK" : "FAIL"}} (available ${{availableText}}, need ${{needText}})`);
+        checklist.push(`Custody allowance: ${{allowanceOk ? "OK" : "FAIL"}} (allowance ${{allowanceText}}, need from custody ${{needFromCustodyText}})`);
+        checklist.push(`Operator wallet: ${{operatorOk ? "OK" : "FAIL"}} (connected ${{connectedShort}}, required ${{operatorShort}})`);
         let action = "Ready: click Apply on-chain.";
         if (!operatorOk) {{
           action = "Action: connect/sign in with current pending redemption operator wallet.";
@@ -34135,17 +34374,19 @@ def _render_admin_page() -> str:
         }} else if (!allowanceOk) {{
           action = `Action: sign approve from custody to vault for at least ${{formatAdminRawUnits(String(requiredFromCustody), decimals, 8)}} (or max).`;
         }}
+        const isOk = operatorOk && quoteCheckOk && liquidityOk && allowanceOk && custodyBalOk;
+        const nextStep = isOk
+          ? "Next step: click Apply on-chain."
+          : action.replace(/^Action:\s*/i, "Next step: ");
         setAdminRikoPendingOpsStatus(
-          "Diagnose -> " + checklist.join(" | ") + " | " + action,
-          !(operatorOk && quoteCheckOk && liquidityOk && allowanceOk && custodyBalOk)
+          "Diagnose: " + checklist.join(". ") + ". " + nextStep,
+          !isOk
         );
       }} catch (e) {{
         setAdminRikoPendingOpsStatus("Diagnose failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }} finally {{
-        if (buttonEl) {{
-          buttonEl.disabled = false;
-          buttonEl.textContent = originalText || "Diagnose";
-        }}
+        if (restoreBusyButton) restoreBusyButton();
+        else if (buttonEl) buttonEl.textContent = "Diagnose";
       }}
     }}
     async function loadAdminRikoTokenConfig(silent = false) {{
@@ -35124,13 +35365,15 @@ def _render_admin_page() -> str:
     function setAdminRikoPayoutStatus(msg, isErr) {{
       const el = document.getElementById("adminRikoPayoutStatus");
       if (!el) return;
-      el.textContent = msg || "";
+      const raw = String(msg || "").trim();
+      el.textContent = raw ? (raw.toLowerCase().startsWith("payout:") ? raw : `Payout: ${{raw}}`) : "Payout: Ready";
       el.classList.toggle("err", !!isErr);
     }}
     function setAdminRikoHolderScanStatus(msg, isErr) {{
       const el = document.getElementById("adminRikoHolderScanStatus");
       if (!el) return;
-      el.textContent = String(msg || "");
+      const raw = String(msg || "").trim();
+      el.textContent = raw ? (raw.toLowerCase().startsWith("scan:") ? raw : `Scan: ${{raw}}`) : "Scan: Ready";
       el.classList.toggle("err", !!isErr);
     }}
     function renderAdminRikoHolderScanStatus(data) {{
@@ -35149,8 +35392,23 @@ def _render_admin_page() -> str:
       const lagBlocks = Number(data?.lag_blocks || 0);
       const hasMore = !!data?.has_more;
       const healthy = !!data?.healthy;
+      const fmtInt = (n) => Number(n || 0).toLocaleString();
+      const stateLabel = !enabled
+        ? "Disabled"
+        : (healthy ? "Healthy" : "Needs attention");
+      const runLabel = running ? "running" : "idle";
+      const progressLabel = latest > 0
+        ? `${{fmtInt(fromBlock)}}..${{fmtInt(toBlock)}} of ${{fmtInt(latest)}}${{hasMore ? " (continuing)" : ""}}`
+        : `${{fmtInt(fromBlock)}}..${{fmtInt(toBlock)}}`;
+      const sourceLabel = String(source || "-").toUpperCase();
       summaryEl.textContent =
-        `enabled=${{enabled ? "yes" : "no"}} | running=${{running ? "yes" : "no"}} | healthy=${{healthy ? "yes" : "no"}} | status=${{status}}${{reason ? " (" + reason + ")" : ""}} | source=${{source}} | holders=${{holders}} | scan=${{fromBlock}}..${{toBlock}}/${{latest}}${{hasMore ? " (more)" : ""}} | lag=${{lagBlocks}} blocks | updated=${{updatedAt}}`;
+        `Background scan: ${{stateLabel}} (${{runLabel}}, status=${{status}}). ` +
+        `Source: ${{sourceLabel}}. ` +
+        `Holders found: ${{fmtInt(holders)}}. ` +
+        `Progress: ${{progressLabel}}. ` +
+        `Lag: ${{fmtInt(lagBlocks)}} blocks. ` +
+        `Updated: ${{updatedAt}}` +
+        (reason ? `. Note: ${{reason}}` : "");
     }}
     async function loadAdminRikoHolderScanStatus() {{
       try {{
@@ -35159,9 +35417,16 @@ def _render_admin_page() -> str:
         const data = await r.json();
         if (!r.ok) throw new Error(data?.detail || "Failed to load holder scan status.");
         renderAdminRikoHolderScanStatus(data || {{}});
+        const enabled = !!data?.enabled;
         const healthy = !!data?.healthy;
         const st = String(data?.status || "unknown");
-        setAdminRikoHolderScanStatus(`Scan status updated: ${{st}}${{healthy ? "" : " (check status)"}}`, !healthy);
+        if (!enabled) {{
+          setAdminRikoHolderScanStatus("Disabled", false);
+        }} else if (healthy) {{
+          setAdminRikoHolderScanStatus("Healthy", false);
+        }} else {{
+          setAdminRikoHolderScanStatus(`Needs attention (${{st}})`, true);
+        }}
       }} catch (e) {{
         setAdminRikoHolderScanStatus("Scan status load failed: " + (e?.message || "unknown"), true);
       }}
@@ -35275,6 +35540,7 @@ def _render_admin_page() -> str:
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const payout_token_address = normalizeAdminRikoAddress(document.getElementById("adminRikoAutoYieldPayoutTokenInput")?.value || "");
         if (!payout_token_address || payout_token_address === "native") throw new Error("Select payout token from active whitelist.");
+        const calc_method = String(document.getElementById("adminRikoPayoutCalcMethodInput")?.value || "treasury_10y").trim() || "treasury_10y";
         const holder_scan_start_block = 0;
         const rawDates = document.getElementById("adminRikoPayoutDatesInput")?.value || "";
         const payout_time_utc = String(document.getElementById("adminRikoPayoutTimeUtcInput")?.value || "00:00").trim() || "00:00";
@@ -35289,6 +35555,7 @@ def _render_admin_page() -> str:
           holder_scan_start_block,
           items,
           payout_time_utc,
+          calc_method,
         }});
         const challenge = String(nonceResp?.message || "").trim();
         const signature = await signer.signMessage(challenge);
@@ -35302,6 +35569,7 @@ def _render_admin_page() -> str:
           holder_scan_start_block,
           items,
           payout_time_utc,
+          calc_method,
         }});
         if (adminLastSettings && typeof adminLastSettings === "object") {{
           adminLastSettings.riko_auto_yield_bot_config = data?.riko_auto_yield_bot_config || {{}};
@@ -35332,25 +35600,42 @@ def _render_admin_page() -> str:
       const items = Array.isArray(cfg?.items) ? cfg.items : [];
       const inDates = document.getElementById("adminRikoPayoutDatesInput");
       const inTime = document.getElementById("adminRikoPayoutTimeUtcInput");
+      const inCalcMethod = document.getElementById("adminRikoPayoutCalcMethodInput");
       const inPayoutToken = document.getElementById("adminRikoAutoYieldPayoutTokenInput");
       const nextEl = document.getElementById("adminRikoPayoutNextDate");
+      const nextRateEl = document.getElementById("adminRikoPayoutNextRate");
       const modeEl = document.getElementById("adminRikoPayoutJobMode");
       const updEl = document.getElementById("adminRikoPayoutUpdatedAt");
       const savedDatesText = items
         .map((it) => `${{String(Number(it?.month || 0)).padStart(2, "0")}}-${{String(Number(it?.day || 0)).padStart(2, "0")}}`)
         .join("; ");
       const savedTimeText = String(cfg?.payout_time_utc || "00:00");
+      const savedCalcMethod = String(cfg?.calc_method || "treasury_10y");
       if (inDates) {{
         if (forceUpdate || document.activeElement !== inDates) inDates.value = savedDatesText;
       }}
       if (inTime) {{
         if (forceUpdate || document.activeElement !== inTime) inTime.value = savedTimeText;
       }}
+      if (inCalcMethod) {{
+        if (forceUpdate || document.activeElement !== inCalcMethod) inCalcMethod.value = savedCalcMethod;
+      }}
       if (inPayoutToken) {{
         const tokenText = String(botCfg?.payout_token_address || "");
         if (forceUpdate || document.activeElement !== inPayoutToken) renderAdminRikoPayoutTokenSelect(tokenText);
       }}
       if (nextEl) nextEl.textContent = String(cfg?.next_due_at_utc || cfg?.next_due_date || "-");
+      if (nextRateEl) {{
+        const rateLabel = String(cfg?.next_rate_label || "Rate");
+        const annualPct = Number(cfg?.next_rate_annual_pct || 0);
+        const nextBps = Number(cfg?.next_rate_bps || 0);
+        const rateDate = String(cfg?.next_rate_date || "").trim();
+        if (Number.isFinite(annualPct) && annualPct > 0) {{
+          nextRateEl.textContent = `Rate: ${{rateLabel}} ${{annualPct.toFixed(4)}}% APR (~${{nextBps}} bps/mo)${{rateDate ? " as of " + rateDate : ""}}`;
+        }} else {{
+          nextRateEl.textContent = `Rate: ${{rateLabel}} unavailable`;
+        }}
+      }}
       if (modeEl) {{
         const source = String(autoSource || "env");
         const cfgSource = String(botCfg?.source || "env");
@@ -36699,7 +36984,11 @@ def admin_riko_payout_schedule_update(
     raw_items: list[dict[str, Any]] = []
     for item in (req.items or []):
         raw_items.append({"month": int(item.month), "day": int(item.day)})
-    saved = _save_riko_payout_schedule(raw_items, payout_time_utc=str(req.payout_time_utc or "").strip())
+    saved = _save_riko_payout_schedule(
+        raw_items,
+        payout_time_utc=str(req.payout_time_utc or "").strip(),
+        calc_method=str(req.calc_method or "").strip(),
+    )
     return {"ok": True, "info": "RIKO payout schedule saved on server.", "riko_payout_schedule": saved}
 
 
@@ -36721,6 +37010,7 @@ def admin_riko_auto_payout_apply_nonce(
         holder_scan_start_block=holder_scan_start_block,
         items=raw_items,
         payout_time_utc=str(req.payout_time_utc or "").strip(),
+        calc_method=str(req.calc_method or "").strip(),
     )
     nonce = _new_nonce()
     issued_at = _iso_now()
@@ -36763,6 +37053,7 @@ def admin_riko_auto_payout_apply(
         holder_scan_start_block=holder_scan_start_block,
         items=raw_items,
         payout_time_utc=str(req.payout_time_utc or "").strip(),
+        calc_method=str(req.calc_method or "").strip(),
     )
     with AUTH_LOCK:
         challenge = dict(RIKO_AUTO_PAYOUT_APPLY_NONCES.get(sid, {}))
@@ -36798,7 +37089,11 @@ def admin_riko_auto_payout_apply(
             payout_token_address=str(req.payout_token_address or "").strip(),
             holder_scan_start_block=holder_scan_start_block,
         )
-        saved_schedule = _save_riko_payout_schedule(raw_items, payout_time_utc=str(req.payout_time_utc or "").strip())
+        saved_schedule = _save_riko_payout_schedule(
+            raw_items,
+            payout_time_utc=str(req.payout_time_utc or "").strip(),
+            calc_method=str(req.calc_method or "").strip(),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {
