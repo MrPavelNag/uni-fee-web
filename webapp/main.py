@@ -22102,9 +22102,11 @@ def _set_riko_auto_yield_enabled(enabled: bool) -> dict[str, Any]:
 
 
 def _load_riko_auto_yield_bot_config() -> dict[str, Any]:
-    payout_token_address = str(RIKO_AUTO_YIELD_PAYOUT_TOKEN_ADDRESS or "").strip().lower()
+    # Payout token is configured only via admin panel.
+    # Do not read or fallback to env token.
+    payout_token_address = ""
     holder_scan_start_block = 0
-    source = "env"
+    source = "admin_override"
     raw = _analytics_get_state(RIKO_AUTO_YIELD_BOT_CONFIG_STATE_KEY)
     updated_at = ""
     if raw:
@@ -22112,9 +22114,11 @@ def _load_riko_auto_yield_bot_config() -> dict[str, Any]:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
                 token_raw = str(parsed.get("payout_token_address") or "").strip().lower()
-                # When admin override exists, do NOT fall back to env token.
-                # This prevents stale env token from shadowing admin-selected payout token.
-                payout_token_address = token_raw if _is_eth_address(token_raw) else ""
+                # Accept only valid admin-selected token value.
+                if _is_eth_address(token_raw):
+                    payout_token_address = token_raw
+                else:
+                    payout_token_address = ""
                 # RIKO holder scan always starts from block 0 by design.
                 holder_scan_start_block = 0
                 updated_at = str(parsed.get("updated_at") or "")
@@ -26617,6 +26621,26 @@ def _render_riko_page() -> str:
       "function withdraw(uint256 wad)"
     ];
     const RIKO_ABI = [
+      "error RV_UnsupportedToken()",
+      "error RV_InvalidAmount()",
+      "error RV_InvalidReceiver()",
+      "error RV_InvalidOracle()",
+      "error RV_OracleFeedMismatch()",
+      "error RV_OraclePriceInvalid()",
+      "error RV_OraclePriceStale()",
+      "error RV_OracleDecimalsInvalid()",
+      "error RV_TokenDecimalsInvalid()",
+      "error RV_SlippageExceeded()",
+      "error RV_InsufficientLiquidity()",
+      "error RV_GlobalCapExceeded()",
+      "error RV_TokenCapExceeded()",
+      "error RV_InvalidCustodyAddress()",
+      "error RV_InvalidRikoPrice()",
+      "error RV_PendingRedemptionExists()",
+      "error RV_PendingRedemptionNotFound()",
+      "error RV_InvalidPendingRedemptionOperator()",
+      "error RV_PendingRedemptionOperatorOnly()",
+      "error RV_NativeTransferFailed()",
       "function deposit(address token,uint256 amountIn,uint256 minRikoOut,address receiver) external returns (uint256)",
       "function redeem(address token,uint256 rikoAmountIn,uint256 minTokenOut,address receiver) external returns (uint256)",
       "function quoteDeposit(address token,uint256 amountIn) external view returns (uint256 rikoOut)",
@@ -26626,6 +26650,60 @@ def _render_riko_page() -> str:
       "function globalSupplyCapUsd6() view returns (uint256)",
       "function setGlobalSupplyCapUsd6(uint256 capUsd6) external"
     ];
+    const RIKO_ERROR_HINTS = {
+      RV_UnsupportedToken: "Selected token is not enabled in the vault whitelist.",
+      RV_InvalidAmount: "Amount must be positive and valid.",
+      RV_InvalidReceiver: "Receiver address is invalid.",
+      RV_InvalidOracle: "Token oracle is not configured.",
+      RV_OracleFeedMismatch: "Oracle feed configuration mismatch.",
+      RV_OraclePriceInvalid: "Oracle returned invalid price.",
+      RV_OraclePriceStale: "Oracle price is stale; refresh oracle data.",
+      RV_OracleDecimalsInvalid: "Oracle decimals are invalid.",
+      RV_TokenDecimalsInvalid: "Token decimals are invalid.",
+      RV_SlippageExceeded: "Current quote is below min out (slippage check failed).",
+      RV_InsufficientLiquidity: "Vault liquidity is not enough to settle redeem now.",
+      RV_GlobalCapExceeded: "Global supply cap would be exceeded.",
+      RV_TokenCapExceeded: "Token cap would be exceeded.",
+      RV_InvalidCustodyAddress: "Custody address is invalid or not configured.",
+      RV_InvalidRikoPrice: "RIKO price is invalid or not configured.",
+      RV_PendingRedemptionExists: "A pending redemption already exists for this token.",
+      RV_PendingRedemptionNotFound: "Pending redemption was not found.",
+      RV_InvalidPendingRedemptionOperator: "Pending redemption operator is invalid.",
+      RV_PendingRedemptionOperatorOnly: "Only pending redemption operator can perform this action.",
+      RV_NativeTransferFailed: "Native token transfer failed.",
+    };
+    function extractRikoErrorName(err) {
+      const direct = String(
+        err?.revert?.name
+        || err?.errorName
+        || err?.info?.errorName
+        || err?.data?.errorName
+        || ""
+      ).trim();
+      if (/^RV_[A-Za-z0-9_]+$/.test(direct)) return direct;
+      const blobs = [
+        String(err?.shortMessage || ""),
+        String(err?.message || ""),
+        String(err?.reason || ""),
+        String(err?.info?.error?.message || ""),
+        String(err?.info?.error || ""),
+      ];
+      for (const txt of blobs) {
+        const m = txt.match(/RV_[A-Za-z0-9_]+/);
+        if (m && m[0]) return String(m[0]);
+      }
+      return "";
+    }
+    function formatRikoErrorMessage(prefix, err, fallback) {
+      const pfx = String(prefix || "Operation failed").trim();
+      const errName = extractRikoErrorName(err);
+      if (errName) {
+        const hint = String(RIKO_ERROR_HINTS[errName] || "").trim();
+        return hint ? `${pfx}: ${errName} - ${hint}` : `${pfx}: ${errName}`;
+      }
+      const msg = String(err?.shortMessage || err?.message || fallback || "unknown").trim();
+      return `${pfx}: ${msg}`;
+    }
     async function refreshRikoQuoteHint() {
       const hint = document.getElementById("rikoQuoteHint");
       if (!hint) return;
@@ -27093,16 +27171,8 @@ def _render_riko_page() -> str:
         renderFlow(-1, "Redeem confirmed and settled immediately (no pending operator step required).", false, -1);
       } catch (e) {
         const baseErr = String(e?.shortMessage || e?.message || "unknown");
-        if (baseErr.toLowerCase().includes("unknown custom error")) {
-          markRikoTxFailureByHash(redeemTxHash || unwrapTxHash, baseErr);
-          setRikoStatus(
-            "Redeem failed with a custom on-chain error. Check token config, oracle freshness, min-out and available liquidity.",
-            true
-          );
-          return;
-        }
         markRikoTxFailureByHash(redeemTxHash || unwrapTxHash, baseErr);
-        setRikoStatus("Redeem failed: " + baseErr, true);
+        setRikoStatus(formatRikoErrorMessage("Redeem failed", e, baseErr), true);
       } finally {
         if (hasDeferredTxRows) scheduleRikoDeferredTxHistoryFlush(10000);
       }
@@ -33974,7 +34044,7 @@ def _render_admin_page() -> str:
           const bn = Number(ev?.blockNumber || 0);
           const ts = await getBlockTimestampSec(bn);
           const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
-          if (!ts || ts > historyVisibleBeforeSec) continue;
+          if (ts > 0 && ts > historyVisibleBeforeSec) continue;
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
@@ -33995,7 +34065,7 @@ def _render_admin_page() -> str:
             idx: Number(ev?.index || 0),
             html:
               `<tr>` +
-              `<td>${{formatAdminRikoDate(ts)}}</td>` +
+              `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
               `<td class='mono'>${{shortAddrAdmin(account)}}</td>` +
               `<td class='mono'>${{String(tokenLabel || "-")}}</td>` +
               `<td title="Pending entry was deleted. Repeating processPendingRedemption for same account/token will revert with RV_PendingRedemptionNotFound.">Completed (pending cleared)</td>` +
@@ -34013,7 +34083,7 @@ def _render_admin_page() -> str:
           const bn = Number(ev?.blockNumber || 0);
           const ts = await getBlockTimestampSec(bn);
           const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
-          if (!ts || ts > historyVisibleBeforeSec) continue;
+          if (ts > 0 && ts > historyVisibleBeforeSec) continue;
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
@@ -34025,7 +34095,7 @@ def _render_admin_page() -> str:
             idx: Number(ev?.index || 0),
             html:
               `<tr>` +
-              `<td>${{formatAdminRikoDate(ts)}}</td>` +
+              `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
               `<td class='mono'>${{shortAddrAdmin(account)}}</td>` +
               `<td class='mono'>${{String(tokenLabel || "-")}}</td>` +
               `<td>Cancelled</td>` +
@@ -34052,7 +34122,7 @@ def _render_admin_page() -> str:
           const bn = Number(ev?.blockNumber || 0);
           const ts = await getBlockTimestampSec(bn);
           const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
-          if (!ts) continue;
+          if (!Number.isFinite(bn) || bn <= 0) continue;
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenDepositTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
@@ -34072,7 +34142,7 @@ def _render_admin_page() -> str:
             idx: Number(ev?.index || 0),
             html:
               `<tr>` +
-              `<td>${{formatAdminRikoDate(ts)}}</td>` +
+              `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
               `<td class='mono'>${{shortAddrAdmin(user)}}</td>` +
               `<td class='mono'>${{String(tokenLabel || "-")}}</td>` +
               `<td class='mono'>${{tokenInDisplay}}</td>` +
@@ -34191,7 +34261,13 @@ def _render_admin_page() -> str:
             const plannedRaw = String(it?.planned_yield_payout_raw || "0");
             const rowPlannedDateUtc = String(it?.planned_yield_date_utc || scheduleNextDueUtc || "").trim();
             const plannedDateTxt = rowPlannedDateUtc || "-";
-            const plannedYieldTxt = (/^0x[a-f0-9]{{40}}$/.test(payoutToken) && BigInt(plannedRaw || "0") > 0n)
+            let plannedRawBi = 0n;
+            try {{
+              plannedRawBi = BigInt(plannedRaw || "0");
+            }} catch (_) {{
+              plannedRawBi = 0n;
+            }}
+            const plannedYieldTxt = (/^0x[a-f0-9]{{40}}$/.test(payoutToken) && plannedRawBi > 0n)
               ? `${{formatAdminRawUnits(plannedRaw, payoutDecimals, 8)}} (${{payoutTokenLabel}})`
               : "-";
             const txHtml = /^0x[a-f0-9]{{64}}$/.test(txHash)
@@ -34222,8 +34298,9 @@ def _render_admin_page() -> str:
           `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
         statusEl.textContent = `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}.`;
       }} catch (e) {{
-        table.innerHTML = "<tr><td class='muted'>Failed to load holders.</td></tr>";
-        statusEl.textContent = "RIKO holders load failed: " + (e?.shortMessage || e?.message || "unknown");
+        const errMsg = String(e?.shortMessage || e?.message || "unknown");
+        table.innerHTML = `<tr><td class='muted'>Failed to load holders: ${{esc(errMsg)}}</td></tr>`;
+        statusEl.textContent = "RIKO holders load failed: " + errMsg;
         statusEl.classList.add("err");
       }}
     }}
