@@ -24791,18 +24791,29 @@ def _render_placeholder_page(
         }}
         window._wcProvider = null;
         closeWcQrModal();
+        const pullAddressFromAny = (value) => {{
+          if (Array.isArray(value)) {{
+            for (const item of value) {{
+              const nested = pullAddressFromAny(item);
+              if (/^0x[a-fA-F0-9]{{40}}$/.test(nested)) return nested;
+            }}
+          }}
+          const direct = normalizeAddress(value || "");
+          if (/^0x[a-fA-F0-9]{{40}}$/.test(direct)) return direct;
+          const m = String(value == null ? "" : JSON.stringify(value)).match(/0x[a-fA-F0-9]{{40}}/);
+          return m && m[0] ? String(m[0]) : "";
+        }};
         let accounts = provider.accounts || [];
         if (!accounts.length) accounts = (await provider.request({{method: "eth_accounts"}})) || [];
         if (!accounts.length) accounts = (await provider.request({{method: "eth_requestAccounts"}})) || [];
-        let address = normalizeAddress(accounts[0] || "");
+        let address = pullAddressFromAny(accounts);
         if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {{
           try {{
             const ns = provider?.session?.namespaces?.eip155;
             const nsAccounts = Array.isArray(ns?.accounts) ? ns.accounts : [];
-            address = normalizeAddress(nsAccounts[0] || "");
+            address = pullAddressFromAny(nsAccounts);
             if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {{
-              const m = String(JSON.stringify(provider?.session || {{}}) || "").match(/0x[a-fA-F0-9]{{40}}/);
-              if (m && m[0]) address = String(m[0]);
+              address = pullAddressFromAny(provider?.session || {{}});
             }}
           }} catch (_) {{}}
         }}
@@ -25239,6 +25250,7 @@ def _render_riko_page() -> str:
     let rikoWalletRikoBalanceRaw = 0n;
     let rikoWalletRikoBalanceFormatted = "0";
     let rikoTxHistory = [];
+    let rikoLastActivePendingByToken = new Set();
     let rikoDeferredTxRows = [];
     let rikoDeferredFlushTimer = null;
     let rikoShowHiddenTxRows = false;
@@ -25440,6 +25452,7 @@ def _render_riko_page() -> str:
       };
       const flowStageLabel = (item) => {
         const a = String(item?.action || "").trim().toLowerCase();
+        if (a.includes("pending/settle") || a.includes("settle (operator)")) return "Pending/Settle";
         if (a.includes("redeem queued")) return "Redeem queued ⏳";
         if (a.includes("cancel pending redeem")) return "Cancel";
         if (a.includes("rollback unwrap")) return "Rollback unwrap";
@@ -25458,6 +25471,7 @@ def _render_riko_page() -> str:
       const stageKeyForRow = (row) => {
         const a = String(row?.action || "").trim().toLowerCase();
         if (a.includes("cancel pending redeem")) return "cancel";
+        if (a.includes("pending/settle") || a.includes("settle (operator)")) return "settle";
         if (a.includes("redeem")) return "redeem";
         if (a.includes("deposit")) return "deposit";
         if (a.includes("approve")) return "approve";
@@ -25616,6 +25630,7 @@ def _render_riko_page() -> str:
         const a = String(item?.action || "").trim().toLowerCase();
         return (
           a.includes("redeem")
+          || a.includes("settle")
           || a.includes("withdraw")
           || a.includes("cancel pending redeem")
           || a.includes("unwrap weth->eth")
@@ -25953,7 +25968,9 @@ def _render_riko_page() -> str:
       if (depositBtn) depositBtn.style.display = mode === "redeem" ? "none" : "";
       if (redeemBtn) redeemBtn.style.display = mode === "redeem" ? "" : "none";
       if (amountEl) amountEl.placeholder = mode === "redeem" ? "e.g. 100 RIKO" : "e.g. 100";
-      if (statusActionsEl) statusActionsEl.style.display = mode === "redeem" ? "flex" : "none";
+      // Check/Cancel buttons are rendered only inside one актуальная pending row.
+      // Keep the status line compact without duplicated actions.
+      if (statusActionsEl) statusActionsEl.style.display = "none";
       renderRikoModeSwitch();
     }
     function updateRikoPublicWhitelistView() {
@@ -26573,6 +26590,7 @@ def _render_riko_page() -> str:
         const symbols = getRikoTrackedSymbols();
         const seenAddr = new Set();
         const rows = [];
+        const activePendingKeys = new Set();
         for (const symbol of symbols) {
           const tokenAddr = String(await resolveVaultTokenAddressForAction(symbol, "", provider) || "").trim();
           const addrLc = tokenAddr.toLowerCase();
@@ -26602,7 +26620,67 @@ def _render_riko_page() -> str:
             tokenOutFmt: formatTokenAmount(tokenOut, outDecimals),
             outUnit,
           });
+          activePendingKeys.add(`${sym || "token"}|${addrLc}`);
         }
+        const previousActive = Array.from(rikoLastActivePendingByToken || []);
+        const clearedPendingKeys = previousActive.filter((k) => !activePendingKeys.has(k));
+        if (clearedPendingKeys.length) {
+          const latest = Number(await provider.getBlockNumber());
+          const fromBlock = Math.max(0, latest - 500000);
+          const pickLatestLog = (arr) => {
+            const list = Array.isArray(arr) ? arr : [];
+            list.sort((a, b) => {
+              const ab = Number(a?.blockNumber || 0);
+              const bb = Number(b?.blockNumber || 0);
+              if (ab !== bb) return bb - ab;
+              return Number(b?.index || 0) - Number(a?.index || 0);
+            });
+            return list[0] || null;
+          };
+          const findLatestPendingFlowId = () => {
+            const items = Array.isArray(rikoTxHistory) ? rikoTxHistory : [];
+            const sorted = items.slice().sort((a, b) => String(b?.time_iso || b?.when || "").localeCompare(String(a?.time_iso || a?.when || "")));
+            for (const it of sorted) {
+              const act = String(it?.action || "").toLowerCase();
+              const fid = String(it?.flow_id || "").trim();
+              if (fid && act.includes("pending")) return fid;
+            }
+            return "";
+          };
+          const flowId = findLatestPendingFlowId();
+          for (const key of clearedPendingKeys) {
+            const [symRaw, tokenRaw] = String(key || "").split("|");
+            const sym = String(symRaw || "").trim().toLowerCase();
+            const tokenAddr = String(tokenRaw || "").trim();
+            if (!/^0x[a-f0-9]{40}$/.test(tokenAddr)) continue;
+            try {
+              const doneLogs = await vault.queryFilter(vault.filters.RedeemCompleted(user, tokenAddr, null), fromBlock, latest);
+              const doneEv = pickLatestLog(doneLogs);
+              if (doneEv) {
+                let outDecimals = 18;
+                try {
+                  const token = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
+                  const d = Number(await token.decimals());
+                  if (Number.isInteger(d) && d >= 0 && d <= 36) outDecimals = d;
+                } catch (_) {}
+                const outRaw = BigInt(doneEv?.args?.tokenOut ?? 0n);
+                const recvUnit = sym === "eth" ? "ETH" : String(sym || "TOKEN").toUpperCase();
+                await addRikoTxHistory("Pending/Settle (operator)", String(doneEv?.transactionHash || ""), provider, {
+                  flowId,
+                  receivedSymbol: recvUnit,
+                  receivedAmountDisplay: outRaw > 0n ? formatTokenAmount(outRaw, outDecimals) : "",
+                });
+                continue;
+              }
+              const cancelLogs = await vault.queryFilter(vault.filters.RedeemCancelled(user, tokenAddr), fromBlock, latest);
+              const cancelEv = pickLatestLog(cancelLogs);
+              if (cancelEv) {
+                await addRikoTxHistory("Cancel pending redeem", String(cancelEv?.transactionHash || ""), provider, { flowId });
+              }
+            } catch (_) {}
+          }
+        }
+        rikoLastActivePendingByToken = activePendingKeys;
         rows.sort((a, b) => String(a.symbol || "").localeCompare(String(b.symbol || "")));
         if (!rows.length) {
           emptyEl.textContent = "No active pending redemptions.";
@@ -26610,12 +26688,17 @@ def _render_riko_page() -> str:
         }
         emptyEl.textContent = "";
         const escJs = (v) => String(v || "").replace(/'/g, "\\'");
-        listEl.innerHTML = rows.map((r) => (
+        const selectedSymbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
+        let activeIdx = rows.findIndex((r) => String(r?.symbol || "").toLowerCase() === selectedSymbol);
+        if (activeIdx < 0) activeIdx = 0;
+        listEl.innerHTML = rows.map((r, idx) => (
           `<li class="riko-pending-row">` +
             `<div class="riko-pending-row-main"><b>${String(r.symbol || "").toUpperCase()}</b> pending: locked ${r.rikoLockedFmt} RIKO, expected ${r.tokenOutFmt} ${r.outUnit}</div>` +
             `<div class="riko-pending-row-actions">` +
-              `<button class="btn riko-tx-action-btn" type="button" onclick="rikoCheckPendingRedeem('${escJs(r.symbol)}','${escJs(r.token)}')">Check</button>` +
-              `<button class="btn riko-tx-action-btn" type="button" onclick="rikoCancelPendingRedeem('${escJs(r.symbol)}','${escJs(r.token)}')">Cancel</button>` +
+              (idx === activeIdx
+                ? (`<button class="btn riko-tx-action-btn" type="button" onclick="rikoCheckPendingRedeem('${escJs(r.symbol)}','${escJs(r.token)}')">Check</button>` +
+                   `<button class="btn riko-tx-action-btn" type="button" onclick="rikoCancelPendingRedeem('${escJs(r.symbol)}','${escJs(r.token)}')">Cancel</button>`)
+                : `<span class="muted">-</span>`) +
             `</div>` +
           `</li>`
         )).join("");
@@ -26674,6 +26757,9 @@ def _render_riko_page() -> str:
       "error RV_InvalidPendingRedemptionOperator()",
       "error RV_PendingRedemptionOperatorOnly()",
       "error RV_NativeTransferFailed()",
+      "event RedeemQueued(address indexed account,address indexed token,address indexed receiver,uint256 rikoLocked,uint256 tokenOut,uint256 minTokenOut)",
+      "event RedeemCompleted(address indexed account,address indexed token,address indexed receiver,uint256 rikoBurned,uint256 tokenOut)",
+      "event RedeemCancelled(address indexed account,address indexed token,uint256 rikoReturned)",
       "function deposit(address token,uint256 amountIn,uint256 minRikoOut,address receiver) external returns (uint256)",
       "function redeem(address token,uint256 rikoAmountIn,uint256 minTokenOut,address receiver) external returns (uint256)",
       "function quoteDeposit(address token,uint256 amountIn) external view returns (uint256 rikoOut)",
@@ -27180,13 +27266,14 @@ def _render_riko_page() -> str:
           isPending = false;
         }
         if (queuedInThisTx) {
-          updateTxHistoryActionByHash(tx.hash, "Redeem queued (pending)");
-          renderFlow(1, "Redemption is pending. Typical processing time is up to 3 days.", false, -1);
+          updateTxHistoryActionByHash(tx.hash, "Redeem pending - awaiting liquidity top-up (usually within 3 days)");
+          renderFlow(1, "Pending - awaiting liquidity top-up (usually within 3 days).", false, -1);
           await refreshRikoPendingRows();
           return;
         }
         if (isPending) {
-          renderFlow(1, "Redeem confirmed. Older pending redemption is still in queue for this token.", false, -1);
+          updateTxHistoryActionByHash(tx.hash, "Redeem pending - awaiting liquidity top-up (usually within 3 days)");
+          renderFlow(1, "Pending - awaiting liquidity top-up (usually within 3 days).", false, -1);
           await refreshRikoPendingRows();
           return;
         }
@@ -27280,7 +27367,7 @@ def _render_riko_page() -> str:
         const tokenOutFmt = formatTokenAmount(BigInt(tokenOut || 0n), outDecimals);
         const outUnit = symbol === "eth" ? "ETH" : String(symbol || "token").toUpperCase();
         setRikoStatus(
-          `Pending redeem is active for ${String(symbol || "token").toUpperCase()}. Details are shown in "Active pending redemptions" below.`,
+          `Pending redeem is active for ${String(symbol || "token").toUpperCase()}: awaiting liquidity top-up (usually within 3 days). Details are shown in "Active pending redemptions" below.`,
           false
         );
         await refreshRikoPendingRows();
@@ -33247,18 +33334,12 @@ def _render_admin_page() -> str:
         <span id="adminRikoPendingOpsStatus" class="status">Ready</span>
         <details class="admin-history-block">
           <summary>Redemption history (closed operations)</summary>
-          <div class="admin-history-actions">
-            <button type="button" class="btn btn-soft" onclick="deleteSelectedAdminRikoHistory('redeem', event)">Delete selected</button>
-          </div>
           <div class="table-wrap">
             <table id="adminRikoRedeemHistoryTable" class="admin-history-table"></table>
           </div>
         </details>
         <details class="admin-history-block">
           <summary>Deposit history</summary>
-          <div class="admin-history-actions">
-            <button type="button" class="btn btn-soft" onclick="deleteSelectedAdminRikoHistory('deposit', event)">Delete selected</button>
-          </div>
           <div class="table-wrap">
             <table id="adminRikoDepositHistoryTable" class="admin-history-table"></table>
           </div>
@@ -33451,18 +33532,18 @@ def _render_admin_page() -> str:
         if(!connected) {{ try {{ await provider.enable(); }} catch(connErr) {{ closeWcQrModal(); throw connErr; }} }}
         window._wcProvider=null;
         closeWcQrModal();
+        const pullAddressFromAny=(value)=>{{ if(Array.isArray(value)) {{ for(const item of value) {{ const nested=pullAddressFromAny(item); if(/^0x[a-fA-F0-9]{{40}}$/.test(nested)) return nested; }} }} const direct=normalizeAddress(value||""); if(/^0x[a-fA-F0-9]{{40}}$/.test(direct)) return direct; const m=String(value==null?"":JSON.stringify(value)).match(/0x[a-fA-F0-9]{{40}}/); return (m&&m[0])?String(m[0]):""; }};
         let accounts=provider.accounts||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_accounts"}}))||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[];
-        let address=normalizeAddress(accounts[0]||"");
+        let address=pullAddressFromAny(accounts);
         if(!/^0x[a-fA-F0-9]{{40}}$/.test(address)) {{
           try {{
             const ns=provider?.session?.namespaces?.eip155;
             const nsAccounts=Array.isArray(ns?.accounts)?ns.accounts:[];
-            address=normalizeAddress(nsAccounts[0]||"");
+            address=pullAddressFromAny(nsAccounts);
             if(!/^0x[a-fA-F0-9]{{40}}$/.test(address)) {{
-              const m=String(JSON.stringify(provider?.session||{{}})||"").match(/0x[a-fA-F0-9]{{40}}/);
-              if(m&&m[0]) address=String(m[0]);
+              address=pullAddressFromAny(provider?.session||{{}});
             }}
           }} catch(_) {{}}
         }}
@@ -33822,7 +33903,26 @@ def _render_admin_page() -> str:
       try {{
         const addr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
         const ethers = await ensureEthersAdmin();
-        const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+        if (!window.ethereum) throw new Error("Admin wallet provider is not available.");
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        let chainIdNum = 0;
+        try {{
+          const net = await provider.getNetwork();
+          chainIdNum = Number(net?.chainId || 0);
+        }} catch (_) {{
+          chainIdNum = 0;
+        }}
+        let vaultCode = "0x";
+        try {{
+          vaultCode = String(await provider.getCode(addr) || "0x").trim().toLowerCase();
+        }} catch (_) {{
+          vaultCode = "0x";
+        }}
+        if (vaultCode === "0x" || vaultCode === "0x0") {{
+          throw new Error(
+            `RIKO vault is not deployed on connected wallet network (chainId=${{chainIdNum || "unknown"}}). Switch admin wallet network and refresh.`
+          );
+        }}
         const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, provider);
         const latest = Number(await provider.getBlockNumber());
         // Pending queue must include older user redeems as well.
@@ -33909,7 +34009,15 @@ def _render_admin_page() -> str:
           if (!/^0x[a-f0-9]{{40}}$/.test(accountK) || !/^0x[a-f0-9]{{40}}$/.test(tokenK)) continue;
           try {{
             const p = await vault.pendingRedemptions(accountK, tokenK);
-            if (p?.exists) rec.status = "active";
+            if (p?.exists) {{
+              rec.status = "active";
+            }} else if (String(rec?.status || "").toLowerCase() === "active") {{
+              // If live state says there is no pending anymore, do not keep ghost
+              // "active" rows waiting for delayed/missed events.
+              rec.status = "completed";
+              rec.closedBlockNumber = Number(latest || 0);
+              rec.closedByReconcile = true;
+            }}
           }} catch (_) {{}}
         }}
         const blockTsCache = new Map();
@@ -34072,6 +34180,7 @@ def _render_admin_page() -> str:
             status,
             date: Number(tsDisplay || 0),
             closedDate: Number(tsClosed || 0),
+            closedByReconcile: !!rec?.closedByReconcile,
             blockNumber: bn,
             logIndex: Number(ev?.index || 0),
             account,
@@ -34098,6 +34207,7 @@ def _render_admin_page() -> str:
         const queueVisibleRows = rows.filter((r) => {{
           const st = String(r?.status || "").toLowerCase();
           if (st === "active") return true;
+          if (r?.closedByReconcile) return false;
           const closeTs = Number(r?.closedDate || r?.date || 0);
           if (closeTs <= 0) return true;
           return closeTs > closeVisibleAfterSec;
@@ -34194,7 +34304,17 @@ def _render_admin_page() -> str:
         redeemHistoryRows.sort((a, b) => (Number(b.ts || 0) - Number(a.ts || 0)) || (Number(b.bn || 0) - Number(a.bn || 0)) || (Number(b.idx || 0) - Number(a.idx || 0)));
         renderAdminRikoHistoryTable(
           "adminRikoRedeemHistoryTable",
-          ["Date", "Account", "Token", "Status", "Result amount", "RIKO burned", "Exchange rate", "Tx", ""],
+          [
+            "Date",
+            "Account",
+            "Token",
+            "Status",
+            "Result amount",
+            "RIKO burned",
+            "Exchange rate",
+            "Tx",
+            "<button type='button' class='btn btn-soft' onclick=\"deleteSelectedAdminRikoHistory('redeem', event)\">Delete selected</button>",
+          ],
           redeemHistoryRows.map((r) => r.html),
           "No closed redemptions yet."
         );
@@ -34240,7 +34360,16 @@ def _render_admin_page() -> str:
         depositHistoryRows.sort((a, b) => (Number(b.ts || 0) - Number(a.ts || 0)) || (Number(b.bn || 0) - Number(a.bn || 0)) || (Number(b.idx || 0) - Number(a.idx || 0)));
         renderAdminRikoHistoryTable(
           "adminRikoDepositHistoryTable",
-          ["Date", "User", "Token", "Deposited", "RIKO minted", "Exchange rate", "Tx", ""],
+          [
+            "Date",
+            "User",
+            "Token",
+            "Deposited",
+            "RIKO minted",
+            "Exchange rate",
+            "Tx",
+            "<button type='button' class='btn btn-soft' onclick=\"deleteSelectedAdminRikoHistory('deposit', event)\">Delete selected</button>",
+          ],
           depositHistoryRows.map((r) => r.html),
           "No deposits in history."
         );
@@ -34328,6 +34457,7 @@ def _render_admin_page() -> str:
         const decimals = Number(data?.riko_decimals || 6);
         const payoutDecimals = Number(data?.payout_decimals || 18);
         const payoutToken = String(data?.payout_token || "").trim().toLowerCase();
+        const hasPayoutToken = /^0x[a-f0-9]{{40}}$/.test(payoutToken);
         const payoutTokenLabel = /^0x[a-f0-9]{{40}}$/.test(payoutToken) ? shortAddrAdmin(payoutToken) : "-";
         const scheduleNextDueUtc = String(data?.schedule_next_due_at_utc || data?.schedule_next_due_date || "").trim();
         const nextBps = Number(data?.next_bps || 0);
@@ -34351,9 +34481,17 @@ def _render_admin_page() -> str:
             }} catch (_) {{
               plannedRawBi = 0n;
             }}
-            const plannedYieldTxt = (/^0x[a-f0-9]{{40}}$/.test(payoutToken) && plannedRawBi > 0n)
-              ? `${{formatAdminRawUnits(plannedRaw, payoutDecimals, 8)}} (${{payoutTokenLabel}})`
-              : "-";
+            let balBi = 0n;
+            try {{
+              balBi = BigInt(balRaw || "0");
+            }} catch (_) {{
+              balBi = 0n;
+            }}
+            const plannedYieldTxt = (!hasPayoutToken && balBi > 0n)
+              ? "Token payout not applied"
+              : ((hasPayoutToken && plannedRawBi > 0n)
+                  ? `${{formatAdminRawUnits(plannedRaw, payoutDecimals, 8)}} (${{payoutTokenLabel}})`
+                  : "-");
             const txHtml = /^0x[a-f0-9]{{64}}$/.test(txHash)
               ? (txUrl ? `<a href="${{esc(txUrl)}}" target="_blank" rel="noopener">${{shortHexAdmin(txHash)}}</a>` : `<span class='mono'>${{shortHexAdmin(txHash)}}</span>`)
               : "-";
@@ -34380,7 +34518,9 @@ def _render_admin_page() -> str:
           `Expected yield for next payout: ${{fmtInt(nextBps)}} bps/month. ` +
           `Next payout: ${{scheduleNextDueUtc || "-"}}. ` +
           `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
-        statusEl.textContent = `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}.`;
+        statusEl.textContent = hasPayoutToken
+          ? `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}.`
+          : "Loaded holders, but token payout is not applied on server yet. Set Token payout and click Apply.";
       }} catch (e) {{
         const errMsg = String(e?.shortMessage || e?.message || "unknown");
         table.innerHTML = `<tr><td class='muted'>Failed to load holders: ${{esc(errMsg)}}</td></tr>`;
@@ -36702,18 +36842,18 @@ def _render_help_page() -> str:
         if(!connected) {{ try {{ await provider.enable(); }} catch(connErr) {{ closeWcQrModal(); throw connErr; }} }}
         window._wcProvider=null;
         closeWcQrModal();
+        const pullAddressFromAny=(value)=>{{ if(Array.isArray(value)) {{ for(const item of value) {{ const nested=pullAddressFromAny(item); if(/^0x[a-fA-F0-9]{40}$/.test(nested)) return nested; }} }} const direct=normalizeAddress(value||""); if(/^0x[a-fA-F0-9]{40}$/.test(direct)) return direct; const m=String(value==null?"":JSON.stringify(value)).match(/0x[a-fA-F0-9]{40}/); return (m&&m[0])?String(m[0]):""; }};
         let accounts=provider.accounts||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_accounts"}}))||[];
         if(!accounts.length) accounts=(await provider.request({{method:"eth_requestAccounts"}}))||[];
-        let address=normalizeAddress(accounts[0]||"");
+        let address=pullAddressFromAny(accounts);
         if(!/^0x[a-fA-F0-9]{40}$/.test(address)) {{
           try {{
             const ns=provider?.session?.namespaces?.eip155;
             const nsAccounts=Array.isArray(ns?.accounts)?ns.accounts:[];
-            address=normalizeAddress(nsAccounts[0]||"");
+            address=pullAddressFromAny(nsAccounts);
             if(!/^0x[a-fA-F0-9]{40}$/.test(address)) {{
-              const m=String(JSON.stringify(provider?.session||{{}})||"").match(/0x[a-fA-F0-9]{40}/);
-              if(m&&m[0]) address=String(m[0]);
+              address=pullAddressFromAny(provider?.session||{{}});
             }}
           }} catch(_) {{}}
         }}
@@ -43401,18 +43541,29 @@ HTML_PAGE = """
         }
         window._wcProvider = null;
         closeWcQrModal();
+        const pullAddressFromAny = (value) => {
+          if (Array.isArray(value)) {
+            for (const item of value) {
+              const nested = pullAddressFromAny(item);
+              if (/^0x[a-fA-F0-9]{40}$/.test(nested)) return nested;
+            }
+          }
+          const direct = normalizeAddress(value || "");
+          if (/^0x[a-fA-F0-9]{40}$/.test(direct)) return direct;
+          const m = String(value == null ? "" : JSON.stringify(value)).match(/0x[a-fA-F0-9]{40}/);
+          return m && m[0] ? String(m[0]) : "";
+        };
         let accounts = provider.accounts || [];
         if (!accounts.length) accounts = (await provider.request({method: "eth_accounts"})) || [];
         if (!accounts.length) accounts = (await provider.request({method: "eth_requestAccounts"})) || [];
-        let address = normalizeAddress(accounts[0] || "");
+        let address = pullAddressFromAny(accounts);
         if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
           try {
             const ns = provider?.session?.namespaces?.eip155;
             const nsAccounts = Array.isArray(ns?.accounts) ? ns.accounts : [];
-            address = normalizeAddress(nsAccounts[0] || "");
+            address = pullAddressFromAny(nsAccounts);
             if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
-              const m = String(JSON.stringify(provider?.session || {}) || "").match(/0x[a-fA-F0-9]{40}/);
-              if (m && m[0]) address = String(m[0]);
+              address = pullAddressFromAny(provider?.session || {});
             }
           } catch (_) {}
         }
