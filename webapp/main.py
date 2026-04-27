@@ -24766,7 +24766,7 @@ def _render_placeholder_page(
         }};
         const provider = await EthereumProviderModule.EthereumProvider.init({{
           projectId: WALLETCONNECT_PROJECT_ID,
-          chains: [1],
+          chains: [1, 11155111],
           optionalChains: wcChains,
           showQrModal: false,
           optionalMethods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign", "wallet_switchEthereumChain"],
@@ -33444,7 +33444,7 @@ def _render_admin_page() -> str:
         if(!EthereumProviderModule?.EthereumProvider) throw new Error("WalletConnect SDK failed to load");
         const wcChains=[1,10,56,137,8453,42161,43114,11155111];
         const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
-        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
+        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1,11155111],optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
         provider.on("display_uri",showWcQrModal);
         window._wcProvider=provider;
         let connected=false; try {{ await provider.connect(); connected=true; }} catch(_) {{}}
@@ -36695,7 +36695,7 @@ def _render_help_page() -> str:
         if(!EthereumProviderModule?.EthereumProvider) throw new Error("WalletConnect SDK failed to load");
         const wcChains=[1,10,56,137,8453,42161,43114,11155111];
         const wcMetadata={{name:"DeFi Pools",description:"DeFi Pools wallet sign-in",url:window.location.origin,icons:[window.location.origin+"/favicon.ico"]}};
-        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1],optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
+        const provider=await EthereumProviderModule.EthereumProvider.init({{projectId:WALLETCONNECT_PROJECT_ID,chains:[1,11155111],optionalChains:wcChains,showQrModal:false,optionalMethods:["eth_requestAccounts","eth_accounts","eth_chainId","personal_sign","wallet_switchEthereumChain"],optionalEvents:["accountsChanged","chainChanged","disconnect"],metadata:wcMetadata,rpcMap:{{}}}});
         provider.on("display_uri",showWcQrModal);
         window._wcProvider=provider;
         let connected=false; try {{ await provider.connect(); connected=true; }} catch(_) {{}}
@@ -43376,7 +43376,7 @@ HTML_PAGE = """
         };
         const provider = await EthereumProviderModule.EthereumProvider.init({
           projectId: WALLETCONNECT_PROJECT_ID,
-          chains: [1],
+          chains: [1, 11155111],
           optionalChains: wcChains,
           showQrModal: false,
           optionalMethods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign", "wallet_switchEthereumChain"],
