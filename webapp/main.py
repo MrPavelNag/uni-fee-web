@@ -33792,6 +33792,15 @@ def _render_admin_page() -> str:
         setAdminRikoPendingOpsStatus(prefix + hash, false);
       }}
     }}
+    async function waitAdminTxReceiptWithTimeout(tx, provider, timeoutMs = ADMIN_RIKO_PENDING_TX_WAIT_TIMEOUT_MS) {{
+      const hash = String(tx?.hash || "").trim();
+      const waitPromise = (tx && typeof tx.wait === "function")
+        ? tx.wait()
+        : (provider && hash ? provider.waitForTransaction(hash) : Promise.resolve(null));
+      const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), Math.max(1000, Number(timeoutMs || 0))));
+      const receipt = await Promise.race([waitPromise, timeoutPromise]);
+      return receipt || null;
+    }}
     function isWalletUserRejectedError(err) {{
       const msg = String(err?.message || "").toLowerCase();
       const shortMsg = String(err?.shortMessage || "").toLowerCase();
@@ -33868,6 +33877,7 @@ def _render_admin_page() -> str:
     const ADMIN_RIKO_EVENT_SCAN_CACHE_VERSION = 2;
     const ADMIN_RIKO_EVENT_SCAN_REORG_BUFFER_BLOCKS = 64;
     const ADMIN_RIKO_EVENT_SCAN_MAX_ITEMS_PER_TYPE = 6000;
+    const ADMIN_RIKO_PENDING_TX_WAIT_TIMEOUT_MS = 90000;
     const adminPendingRedeemInFlight = new Set();
     let adminRikoPendingRenderCache = null;
     const ADMIN_RIKO_HISTORY_HIDDEN_TX_KEY = "admin_riko_history_hidden_tx_v1";
@@ -35400,7 +35410,16 @@ def _render_admin_page() -> str:
         setAdminRikoPendingOpsStatus("Processing pending redemption on-chain...", false);
         const tx = await vault.processPendingRedemption(accountAddr, tokenAddr);
         await setAdminRikoPendingOpsStatusTx("Process pending tx sent: ", tx.hash, provider);
-        const receipt = await tx.wait();
+        const receipt = await waitAdminTxReceiptWithTimeout(tx, provider, ADMIN_RIKO_PENDING_TX_WAIT_TIMEOUT_MS);
+        if (!receipt) {{
+          await setAdminRikoPendingOpsStatusTx(
+            "Process pending tx is still pending (confirmation timeout in UI). Track tx: ",
+            tx.hash,
+            provider
+          );
+          await loadAdminRikoPendingQueue(true);
+          return;
+        }}
         if (receipt?.status === 1) {{
           const pendingAfter = await vault.pendingRedemptions(accountAddr, tokenAddr);
           if (pendingAfter?.exists) {{
