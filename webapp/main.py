@@ -33025,7 +33025,7 @@ def _render_admin_page() -> str:
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set RIKO price (USD)</label>
-          <input id="adminRikoPriceUsdInput" type="number" min="0.000001" step="0.000001" value="1"/>
+          <input id="adminRikoPriceUsdInput" type="number" min="0.00001" step="0.00001" value="1.00000"/>
           <button class="btn" onclick="applyAdminRikoPriceUsd()">Apply on-chain</button>
         </div>
         <span id="adminRikoOnchainStatus" class="status">Ready</span>
@@ -34287,7 +34287,7 @@ def _render_admin_page() -> str:
           const inRikoPrice = document.getElementById("adminRikoPriceUsdInput");
           if (inCustody && !String(inCustody.value || "").trim()) inCustody.value = String(custody || "");
           if (inPendingOperator && !String(inPendingOperator.value || "").trim()) inPendingOperator.value = String(pendingOperator || "");
-          if (inRikoPrice && !String(inRikoPrice.value || "").trim()) inRikoPrice.value = String((rikoPriceNum / 1e6) || 1);
+          if (inRikoPrice && !String(inRikoPrice.value || "").trim()) inRikoPrice.value = Number((rikoPriceNum / 1e6) || 1).toFixed(5);
         }} catch (_) {{
           const inCap = document.getElementById("adminRikoGlobalCapUsd");
           if (inCap && !String(inCap.value || "").trim()) inCap.value = "0";
