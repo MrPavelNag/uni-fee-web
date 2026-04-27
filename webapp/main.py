@@ -24737,6 +24737,32 @@ def _render_riko_page() -> str:
       background:#fef3c7;
       border-color:#fcd34d;
     }
+    .riko-tx-flow-badge {
+      display:inline-flex;
+      align-items:center;
+      border-radius:999px;
+      padding:1px 7px;
+      font-size:11px;
+      font-weight:700;
+      letter-spacing:.02em;
+      border:1px solid transparent;
+      text-transform:uppercase;
+    }
+    .riko-tx-flow-badge.liquidity {
+      color:#155e75;
+      background:#cffafe;
+      border-color:#67e8f9;
+    }
+    .riko-tx-flow-badge.operator {
+      color:#3730a3;
+      background:#e0e7ff;
+      border-color:#a5b4fc;
+    }
+    .riko-tx-flow-badge.pending-step {
+      color:#92400e;
+      background:#fef3c7;
+      border-color:#fcd34d;
+    }
     .riko-tx-visibility { display:inline-flex; align-items:center; gap:4px; color:#475569; font-size:12px; user-select:none; white-space:nowrap; }
     .riko-tx-visibility input { margin:0; }
     .riko-tx-tool-btn {
@@ -24948,6 +24974,8 @@ def _render_riko_page() -> str:
     let rikoWalletRikoBalanceRaw = 0n;
     let rikoWalletRikoBalanceFormatted = "0";
     let rikoTxHistory = [];
+    let rikoDeferredTxRows = [];
+    let rikoDeferredFlushTimer = null;
     let rikoShowHiddenTxRows = false;
     let rikoLastCapLoadTs = 0;
     function esc(v) {
@@ -25147,7 +25175,7 @@ def _render_riko_page() -> str:
       };
       const flowStageLabel = (item) => {
         const a = String(item?.action || "").trim().toLowerCase();
-        if (a.includes("redeem queued")) return "Redeem queued";
+        if (a.includes("redeem queued")) return "Redeem queued ⏳";
         if (a.includes("cancel pending redeem")) return "Cancel";
         if (a.includes("rollback unwrap")) return "Rollback unwrap";
         if (a.includes("unwrap weth->eth")) return "Unwrap";
@@ -25162,37 +25190,82 @@ def _render_riko_page() -> str:
         const a = String(row?.action || "").trim().toLowerCase();
         return a.includes("redeem queued") || a.includes("pending");
       };
+      const stageKeyForRow = (row) => {
+        const a = String(row?.action || "").trim().toLowerCase();
+        if (a.includes("cancel pending redeem")) return "cancel";
+        if (a.includes("redeem")) return "redeem";
+        if (a.includes("deposit")) return "deposit";
+        if (a.includes("approve")) return "approve";
+        if (a.includes("rollback unwrap")) return "rollback_unwrap";
+        if (a.includes("unwrap weth->eth")) return "unwrap";
+        if (a.includes("wrap eth->weth")) return "wrap";
+        if (a.includes("withdraw")) return "withdraw";
+        return "other";
+      };
+      const primaryKindForRow = (row) => {
+        const k = stageKeyForRow(row);
+        if (k === "redeem" || k === "cancel" || k === "deposit") return k;
+        return "";
+      };
       const groupRowsByFlow = (items) => {
         const rows = (Array.isArray(items) ? items : []).slice();
         if (!rows.length) return [];
-        rows.sort((a, b) => parseRowTs(b) - parseRowTs(a));
-        const GROUP_WINDOW_MS = 3 * 60 * 1000; // Related txs in one user action are usually close in time.
-        const MAX_GROUP_SIZE = 4;
+        // Build process groups by logical stage sequence, not by time proximity.
+        const asc = rows.slice().sort((a, b) => parseRowTs(a) - parseRowTs(b));
+        const mode = asc.some((x) => {
+          const k = primaryKindForRow(x);
+          return k === "redeem" || k === "cancel";
+        }) ? "redeem" : "deposit";
         const groups = [];
-        for (const row of rows) {
-          const ts = parseRowTs(row);
-          const cur = groups.length ? groups[groups.length - 1] : null;
-          if (!cur) {
-            groups.push({ items: [row], oldestTs: ts });
+        if (mode === "redeem") {
+          let current = null;
+          for (const row of asc) {
+            const stage = stageKeyForRow(row);
+            const pending = isPendingRedeemAction(row);
+            const isAnchor = (stage === "redeem" || stage === "cancel");
+            const isSupport = (stage === "withdraw" || stage === "unwrap" || stage === "rollback_unwrap");
+            if (isAnchor) {
+              if (current && Array.isArray(current.items) && current.items.length) groups.push(current);
+              current = { items: [row], kind: stage, pending };
+              continue;
+            }
+            if (pending) {
+              if (current && Array.isArray(current.items) && current.items.length) groups.push(current);
+              groups.push({ items: [row], kind: "pending", pending: true });
+              current = null;
+              continue;
+            }
+            if (isSupport && current && current.kind === "redeem" && !current.pending) {
+              current.items.push(row);
+              continue;
+            }
+            if (current && Array.isArray(current.items) && current.items.length) groups.push(current);
+            current = { items: [row], kind: stage || "other", pending: false };
+          }
+          if (current && Array.isArray(current.items) && current.items.length) groups.push(current);
+          return groups.reverse();
+        }
+        // deposit mode: chain setup steps to next deposit anchor.
+        let setup = [];
+        for (const row of asc) {
+          const stage = stageKeyForRow(row);
+          if (stage === "approve" || stage === "wrap") {
+            setup.push(row);
             continue;
           }
-          const oldestTs = Number(cur.oldestTs || 0);
-          const curHasPending = cur.items.some((x) => isPendingRedeemAction(x));
-          const rowIsPending = isPendingRedeemAction(row);
-          const joinable = ts > 0 && oldestTs > 0
-            && (oldestTs - ts) >= 0
-            && (oldestTs - ts) <= GROUP_WINDOW_MS
-            && cur.items.length < MAX_GROUP_SIZE
-            && !curHasPending
-            && !rowIsPending;
-          if (joinable) {
-            cur.items.push(row);
-            cur.oldestTs = ts;
-          } else {
-            groups.push({ items: [row], oldestTs: ts });
+          if (stage === "deposit") {
+            groups.push({ items: [...setup, row], kind: "deposit", pending: false });
+            setup = [];
+            continue;
           }
+          if (setup.length) {
+            groups.push({ items: [...setup], kind: "setup", pending: false });
+            setup = [];
+          }
+          groups.push({ items: [row], kind: stage || "other", pending: false });
         }
-        return groups;
+        if (setup.length) groups.push({ items: [...setup], kind: "setup", pending: false });
+        return groups.reverse();
       };
       const renderGroups = (items) => groupRowsByFlow(items).map((grp) => {
         const grpItems = Array.isArray(grp?.items) ? grp.items : [];
@@ -25206,6 +25279,13 @@ def _render_riko_page() -> str:
         const allVisible = rowKeys.every((k) => !hiddenRows.has(k));
         const failed = ordered.some((x) => !!x?.is_error);
         const pending = !failed && ordered.some((x) => isPendingRedeemAction(x));
+        const hasRedeemStage = ordered.some((x) => stageKeyForRow(x) === "redeem");
+        const hasWithdrawStage = ordered.some((x) => stageKeyForRow(x) === "withdraw");
+        const settledFromLiquidity = ordered.some((x) => String(x?.action || "").toLowerCase().includes("settled from vault liquidity"));
+        const operatorFlow = !settledFromLiquidity && (
+          ordered.some((x) => String(x?.action || "").toLowerCase().includes("queued"))
+          || (!hasRedeemStage && hasWithdrawStage)
+        );
         const visCtrl = rowKeys.length
           ? `<label class="riko-tx-visibility" title="Toggle flow visibility"><input type="checkbox" ${allVisible ? "checked" : ""} onchange="toggleRikoTxGroupVisibility('${safeGroupKey}', this.checked)" />Visible</label>`
           : "";
@@ -25226,12 +25306,19 @@ def _render_riko_page() -> str:
           : (pending
             ? `<span class="riko-tx-status-badge pending">Pending</span>`
             : `<span class="riko-tx-status-badge ok">OK</span>`);
+        const flowBadge = settledFromLiquidity
+          ? `<span class="riko-tx-flow-badge liquidity">Liquidity</span>`
+          : (operatorFlow
+            ? `<span class="riko-tx-flow-badge operator">Operator</span>`
+            : (pending
+              ? `<span class="riko-tx-flow-badge pending-step">Pending step</span>`
+              : ""));
         const metaText = roleBits.join(", ");
         return (
           `<li>` +
           `<span class="riko-tx-time">${formatTxTimeDisplay(String(first?.when || first?.time_iso || ""))}</span>` +
           `<span class="riko-tx-main">${chain}</span>` +
-          `<span class="riko-tx-meta"><span class="riko-tx-meta-wrap">${statusBadge}${metaText ? `<span>${metaText}</span>` : ""}</span></span>` +
+          `<span class="riko-tx-meta"><span class="riko-tx-meta-wrap">${statusBadge}${flowBadge}${metaText ? `<span>${metaText}</span>` : ""}</span></span>` +
           `<span>${visCtrl}</span>` +
           `</li>`
         );
@@ -25426,7 +25513,30 @@ def _render_riko_page() -> str:
       }
       renderRikoTxHistory();
     }
-    async function addRikoTxHistory(action, txHash, signerOrProvider) {
+    async function flushRikoDeferredTxHistory() {
+      const queued = Array.isArray(rikoDeferredTxRows) ? rikoDeferredTxRows.slice() : [];
+      rikoDeferredTxRows = [];
+      if (!queued.length) return;
+      const chainId = Number(authState?.chain_id || 11155111);
+      const addr = resolveHistoryAddress();
+      const localItems = mergeTxHistoryLists(queued, loadLocalRikoTxHistory(addr, chainId));
+      saveLocalRikoTxHistory(addr, chainId, localItems);
+      rikoTxHistory = mergeTxHistoryLists(localItems, rikoTxHistory);
+      renderRikoTxHistory();
+      await loadRikoTxHistory();
+    }
+    function scheduleRikoDeferredTxHistoryFlush(delayMs) {
+      const waitMs = Math.max(0, Number(delayMs || 0));
+      if (rikoDeferredFlushTimer) {
+        clearTimeout(rikoDeferredFlushTimer);
+        rikoDeferredFlushTimer = null;
+      }
+      rikoDeferredFlushTimer = setTimeout(async () => {
+        rikoDeferredFlushTimer = null;
+        try { await flushRikoDeferredTxHistory(); } catch (_) {}
+      }, waitMs);
+    }
+    async function addRikoTxHistory(action, txHash, signerOrProvider, opts) {
       const hash = String(txHash || "").trim();
       if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) return;
       const url = await buildTxExplorerUrl(hash, signerOrProvider);
@@ -25441,6 +25551,12 @@ def _render_riko_page() -> str:
         contract_role: "local",
         is_error: false,
       };
+      const deferHistory = !!(opts && opts.deferHistory);
+      if (deferHistory) {
+        rikoDeferredTxRows = mergeTxHistoryLists([localRow], rikoDeferredTxRows);
+        setRikoStatusTxLink(hash, url);
+        return;
+      }
       const localItems = mergeTxHistoryLists([localRow], loadLocalRikoTxHistory(addr, chainId));
       saveLocalRikoTxHistory(addr, chainId, localItems);
       rikoTxHistory = mergeTxHistoryLists(localItems, rikoTxHistory);
@@ -26272,8 +26388,25 @@ def _render_riko_page() -> str:
       let wrappedToken = null;
       let signer = null;
       let depositTxHash = "";
+      let hasDeferredTxRows = false;
       try {
-        setRikoStatus("Preparing deposit...", false);
+        const flowSymbols = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase() === "eth"
+          ? ["Approve", "Wrap", "Deposit"]
+          : ["Approve", "Deposit"];
+        const flowDone = new Set();
+        const renderFlow = (activeIdx, note, isErr, failedIdx) => {
+          const idxActive = Number.isInteger(activeIdx) ? activeIdx : -1;
+          const idxFailed = Number.isInteger(failedIdx) ? failedIdx : -1;
+          const chain = flowSymbols.map((label, i) => {
+            if (i === idxFailed) return `x ${label}`;
+            if (flowDone.has(i)) return `✓ ${label}`;
+            if (i === idxActive) return `… ${label}`;
+            return `○ ${label}`;
+          }).join(" -> ");
+          const suffix = String(note || "").trim();
+          setRikoStatus(suffix ? `${chain} | ${suffix}` : chain, !!isErr, true);
+        };
+        renderFlow(0, "Preparing deposit...", false, -1);
         const { contractAddress, tokenAddress, vaultTokenAddress, amount, symbol } = getRikoInputs();
         const ethers = await ensureEthers();
         signer = await getRikoSigner();
@@ -26289,29 +26422,47 @@ def _render_riko_page() -> str:
           token = new ethers.Contract(wrappedTokenAddress, WETH_ABI, signer);
           wrappedToken = token;
           raw = ethers.parseUnits(amount, 18);
-          setRikoStatus("Wrapping ETH to WETH...", false);
-          const wrapTx = await token.deposit({ value: raw });
-          await addRikoTxHistory("Wrap ETH->WETH", wrapTx.hash, signer);
-          setRikoStatus("Wrap tx sent", false, true);
-          await wrapTx.wait();
-          wrappedInThisFlow = true;
-          wrappedAmount = BigInt(raw);
         } else {
           token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
           const decimals = Number(await token.decimals());
           raw = ethers.parseUnits(amount, decimals);
         }
-        const allowance = await token.allowance(user, contractAddress);
+        let allowance = await token.allowance(user, contractAddress);
         if (allowance < raw) {
-          throw new Error("Allowance is insufficient. Approve the token for the vault address and try again.");
+          renderFlow(0, "Allowance is insufficient. Sending approve tx...", false, -1);
+          const approveTx = await token.approve(contractAddress, raw);
+          await addRikoTxHistory("Approve", approveTx.hash, signer, { deferHistory: true });
+          hasDeferredTxRows = true;
+          renderFlow(0, "Approve tx sent", false, -1);
+          await approveTx.wait();
+          allowance = await token.allowance(user, contractAddress);
+          if (allowance < raw) {
+            renderFlow(-1, "Allowance is still insufficient after approve.", true, 0);
+            throw new Error("Allowance is still insufficient after approve.");
+          }
+        }
+        flowDone.add(0);
+        if (symbol === "eth") {
+          renderFlow(1, "Wrapping ETH to WETH...", false, -1);
+          const wrapTx = await token.deposit({ value: raw });
+          await addRikoTxHistory("Wrap ETH->WETH", wrapTx.hash, signer, { deferHistory: true });
+          hasDeferredTxRows = true;
+          renderFlow(1, "Wrap tx sent", false, -1);
+          await wrapTx.wait();
+          wrappedInThisFlow = true;
+          wrappedAmount = BigInt(raw);
+          flowDone.add(1);
         }
         const depositTokenAddress = symbol === "eth" ? wrappedTokenAddress : vaultTokenAddress;
+        renderFlow(flowSymbols.length - 1, "Sending deposit tx...", false, -1);
         const tx = await vault.deposit(depositTokenAddress, raw, 0, user);
         depositTxHash = String(tx?.hash || "").trim();
-        await addRikoTxHistory("Deposit", tx.hash, signer);
-        setRikoStatus("Deposit tx sent", false, true);
+        await addRikoTxHistory("Deposit", tx.hash, signer, { deferHistory: true });
+        hasDeferredTxRows = true;
+        renderFlow(flowSymbols.length - 1, "Deposit tx sent", false, -1);
         await tx.wait();
-        setRikoStatus("Deposit confirmed", false);
+        flowDone.add(flowSymbols.length - 1);
+        renderFlow(-1, "Deposit confirmed", false, -1);
       } catch (e) {
         const baseErr = e?.shortMessage || e?.message || "unknown";
         // Some wallets/providers may throw on wait/network edge cases after tx is already mined.
@@ -26320,7 +26471,7 @@ def _render_riko_page() -> str:
           try {
             const rcpt = await signer.provider.getTransactionReceipt(depositTxHash);
             if (Number(rcpt?.status || 0) === 1) {
-              setRikoStatus("Deposit confirmed", false);
+              setRikoStatus("Deposit confirmed", false, true);
               return;
             }
           } catch (_) {}
@@ -26333,7 +26484,8 @@ def _render_riko_page() -> str:
             const toUnwrap = curBal >= wrappedAmount ? wrappedAmount : curBal;
             if (toUnwrap > 0n) {
               const rollbackTx = await wrappedToken.withdraw(toUnwrap);
-              await addRikoTxHistory("Rollback unwrap", rollbackTx.hash, wrappedToken.runner);
+              await addRikoTxHistory("Rollback unwrap", rollbackTx.hash, wrappedToken.runner, { deferHistory: true });
+              hasDeferredTxRows = true;
               setRikoStatus("Rollback tx sent", true, true);
               await rollbackTx.wait();
               setRikoStatus(`Deposit failed and rolled back to ETH: ${baseErr}`, true);
@@ -26348,9 +26500,12 @@ def _render_riko_page() -> str:
           }
         }
         setRikoStatus("Deposit failed: " + baseErr, true);
+      } finally {
+        if (hasDeferredTxRows) scheduleRikoDeferredTxHistoryFlush(10000);
       }
     }
     async function rikoRedeem() {
+      let hasDeferredTxRows = false;
       try {
         setRikoStatus("Preparing redeem...", false);
         const { contractAddress, vaultTokenAddress, amount, symbol } = getRikoInputs();
@@ -26377,7 +26532,8 @@ def _render_riko_page() -> str:
           }
         }
         const tx = await vault.redeem(redeemTokenAddress, rawRiko, 0, user);
-        await addRikoTxHistory("Redeem", tx.hash, signer);
+        await addRikoTxHistory("Redeem", tx.hash, signer, { deferHistory: true });
+        hasDeferredTxRows = true;
         setRikoStatus("Redeem tx sent", false, true);
         const receipt = await tx.wait();
         let queuedInThisTx = false;
@@ -26438,7 +26594,8 @@ def _render_riko_page() -> str:
                 false
               );
               const unwrapTx = await weth.withdraw(delta);
-              await addRikoTxHistory("Unwrap WETH->ETH", unwrapTx.hash, signer);
+              await addRikoTxHistory("Unwrap WETH->ETH", unwrapTx.hash, signer, { deferHistory: true });
+              hasDeferredTxRows = true;
               setRikoStatus("Unwrap tx sent", false, true);
               await unwrapTx.wait();
               setRikoStatus("Redeem confirmed. WETH converted to ETH.", false);
@@ -26459,6 +26616,8 @@ def _render_riko_page() -> str:
           return;
         }
         setRikoStatus("Redeem failed: " + baseErr, true);
+      } finally {
+        if (hasDeferredTxRows) scheduleRikoDeferredTxHistoryFlush(10000);
       }
     }
     async function rikoCheckPendingRedeem(symbolOverride, tokenOverride) {
@@ -26502,6 +26661,7 @@ def _render_riko_page() -> str:
       }
     }
     async function rikoCancelPendingRedeem(symbolOverride, tokenOverride) {
+      let hasDeferredTxRows = false;
       try {
         setRikoStatus("Canceling pending redeem...", false);
         const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
@@ -26520,7 +26680,8 @@ def _render_riko_page() -> str:
           return;
         }
         const tx = await vault.cancelPendingRedemption(vaultTokenAddress);
-        await addRikoTxHistory("Cancel pending redeem", tx.hash, signer);
+        await addRikoTxHistory("Cancel pending redeem", tx.hash, signer, { deferHistory: true });
+        hasDeferredTxRows = true;
         setRikoStatus("Cancel pending redeem tx sent", false, true);
         await tx.wait();
         setRikoStatus("Pending redeem canceled. RIKO returned to wallet.", false);
@@ -26531,6 +26692,8 @@ def _render_riko_page() -> str:
           return;
         }
         setRikoStatus("Cancel pending redeem failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      } finally {
+        if (hasDeferredTxRows) scheduleRikoDeferredTxHistoryFlush(10000);
       }
     }
     (function initRikoPage() {
