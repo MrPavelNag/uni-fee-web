@@ -24673,6 +24673,7 @@ def _render_placeholder_page(
         }} catch (e) {{
           console.warn("disconnect failed", e);
         }}
+        openWalletModal();
         return;
       }}
       openWalletModal();
@@ -24889,7 +24890,7 @@ def _render_riko_page() -> str:
     .riko-row label { font-weight: 700; padding-top: 10px; color:#0f172a; }
     .riko-actions { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
     .riko-actions-main { justify-content: flex-end; }
-    .riko-token-select-wrap { display:grid; grid-template-columns: minmax(280px, 460px) 1fr; gap:12px; align-items:center; }
+    .riko-token-select-wrap { display:grid; grid-template-columns: minmax(170px, 260px) 1fr; gap:12px; align-items:center; }
     .riko-ref-box {
       border: 1px solid #d7e1ef;
       background: #f8fbff;
@@ -24939,7 +24940,17 @@ def _render_riko_page() -> str:
       display:grid;
       gap:6px;
     }
-    .riko-pending-title { color:#334155; font-size:12px; font-weight:700; }
+    .riko-pending-title { color:#334155; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .riko-pending-updating {
+      color:#64748b;
+      font-size:11px;
+      font-weight:600;
+      opacity:0;
+      transition:opacity .18s ease;
+      white-space:nowrap;
+      pointer-events:none;
+    }
+    .riko-pending-updating.show { opacity:1; }
     .riko-pending-empty { color:#64748b; font-size:12px; }
     .riko-pending-list { margin:0; padding:0; list-style:none; display:grid; gap:6px; }
     .riko-pending-row {
@@ -25012,6 +25023,11 @@ def _render_riko_page() -> str:
       color:#92400e;
       background:#fef3c7;
       border-color:#fcd34d;
+    }
+    .riko-tx-status-badge.settled {
+      color:#166534;
+      background:#bbf7d0;
+      border-color:#4ade80;
     }
     .riko-tx-flow-badge {
       display:inline-flex;
@@ -25210,7 +25226,7 @@ def _render_riko_page() -> str:
         </div>
       </div>
       <div class="riko-pending-box" id="rikoPendingBox">
-        <div class="riko-pending-title">Active pending redemptions</div>
+        <div class="riko-pending-title"><span>Active pending redemptions</span><span class="riko-pending-updating" id="rikoPendingUpdating">Updating...</span></div>
         <div class="riko-pending-empty" id="rikoPendingEmpty">No active pending redemptions.</div>
         <ul class="riko-pending-list" id="rikoPendingList"></ul>
       </div>
@@ -25251,6 +25267,10 @@ def _render_riko_page() -> str:
     let rikoWalletRikoBalanceFormatted = "0";
     let rikoTxHistory = [];
     let rikoLastActivePendingByToken = new Set();
+    let rikoPendingLastRenderSig = "";
+    let rikoPendingLoadedOnce = false;
+    let rikoPendingUpdatingTimer = null;
+    let rikoPendingRefreshDepth = 0;
     let rikoDeferredTxRows = [];
     let rikoDeferredFlushTimer = null;
     let rikoShowHiddenTxRows = false;
@@ -25452,9 +25472,9 @@ def _render_riko_page() -> str:
       };
       const flowStageLabel = (item) => {
         const a = String(item?.action || "").trim().toLowerCase();
-        if (a.includes("pending/settle") || a.includes("settle (operator)")) return "Pending/Settle";
+        if (a.includes("pending/settle") || a.includes("settle (operator)")) return "Pending/Settle (operator)";
         if (a.includes("redeem queued")) return "Redeem queued ⏳";
-        if (a.includes("cancel pending redeem")) return "Cancel";
+        if (a.includes("cancel pending redeem")) return "Cancel (by user)";
         if (a.includes("rollback unwrap")) return "Rollback unwrap";
         if (a.includes("unwrap weth->eth")) return "Unwrap";
         if (a.includes("wrap eth->weth")) return "Wrap";
@@ -25466,6 +25486,8 @@ def _render_riko_page() -> str:
       };
       const isPendingRedeemAction = (row) => {
         const a = String(row?.action || "").trim().toLowerCase();
+        if (a.includes("cancel pending redeem")) return false;
+        if (a.includes("settle (operator)") || a.includes("pending/settle")) return false;
         return a.includes("redeem queued") || a.includes("pending");
       };
       const stageKeyForRow = (row) => {
@@ -25531,6 +25553,10 @@ def _render_riko_page() -> str:
         };
         const failed = ordered.some((x) => rowIsFailed(x));
         const pending = !failed && ordered.some((x) => isPendingRedeemAction(x));
+        const settledByOperator = !failed && !pending && ordered.some((x) => {
+          const a = String(x?.action || "").toLowerCase();
+          return a.includes("pending/settle") || a.includes("settle (operator)");
+        });
         const hasRedeemStage = ordered.some((x) => stageKeyForRow(x) === "redeem");
         const hasWithdrawStage = ordered.some((x) => stageKeyForRow(x) === "withdraw");
         const settledFromLiquidity = ordered.some((x) => String(x?.action || "").toLowerCase().includes("settled from vault liquidity"));
@@ -25608,7 +25634,9 @@ def _render_riko_page() -> str:
           ? `<span class="riko-tx-status-badge failed"${failedReasonTitle}>Failed</span>`
           : (pending
             ? `<span class="riko-tx-status-badge pending">Pending</span>`
-            : `<span class="riko-tx-status-badge ok">OK</span>`);
+            : (settledByOperator
+              ? `<span class="riko-tx-status-badge settled">SETTLED</span>`
+              : `<span class="riko-tx-status-badge ok">OK</span>`));
         const flowBadge = settledFromLiquidity
           ? `<span class="riko-tx-flow-badge liquidity">Liquidity</span>`
           : (operatorFlow
@@ -25769,6 +25797,25 @@ def _render_riko_page() -> str:
         return tb.localeCompare(ta);
       });
       return out.slice(0, 40);
+    }
+    function findLatestPendingFlowIdFor(symbolRaw, tokenRaw) {
+      const symbol = String(symbolRaw || "").trim().toLowerCase();
+      const token = String(tokenRaw || "").trim().toLowerCase();
+      const items = Array.isArray(rikoTxHistory) ? rikoTxHistory.slice() : [];
+      items.sort((a, b) => String(b?.time_iso || b?.when || "").localeCompare(String(a?.time_iso || a?.when || "")));
+      for (const it of items) {
+        const act = String(it?.action || "").trim().toLowerCase();
+        const fid = String(it?.flow_id || "").trim();
+        if (!fid) continue;
+        if (!(act.includes("pending") || act.includes("queued") || act.includes("redeem"))) continue;
+        if (act.includes("cancel pending redeem")) continue;
+        const itSym = String(it?.token_symbol || "").trim().toLowerCase();
+        if (symbol && itSym && itSym !== symbol) continue;
+        const itToken = String(it?.token_address || it?.token || "").trim().toLowerCase();
+        if (token && itToken && itToken !== token) continue;
+        return fid;
+      }
+      return "";
     }
     function updateTxHistoryActionByHash(txHash, nextAction) {
       const hash = String(txHash || "").trim().toLowerCase();
@@ -26561,12 +26608,30 @@ def _render_riko_page() -> str:
       const listEl = document.getElementById("rikoPendingList");
       const emptyEl = document.getElementById("rikoPendingEmpty");
       const boxEl = document.getElementById("rikoPendingBox");
+      const updatingEl = document.getElementById("rikoPendingUpdating");
       if (!listEl || !emptyEl || !boxEl) return;
       const mode = getRikoMode();
       boxEl.style.display = mode === "redeem" ? "" : "none";
-      if (mode !== "redeem") return;
-      listEl.innerHTML = "";
-      emptyEl.textContent = "Loading pending redemptions...";
+      if (mode !== "redeem") {
+        if (rikoPendingUpdatingTimer) {
+          clearTimeout(rikoPendingUpdatingTimer);
+          rikoPendingUpdatingTimer = null;
+        }
+        rikoPendingRefreshDepth = 0;
+        if (updatingEl) updatingEl.classList.remove("show");
+        return;
+      }
+      const firstLoad = !rikoPendingLoadedOnce;
+      rikoPendingRefreshDepth = Math.max(0, Number(rikoPendingRefreshDepth || 0)) + 1;
+      if (!firstLoad && updatingEl && rikoPendingRefreshDepth === 1) {
+        if (rikoPendingUpdatingTimer) clearTimeout(rikoPendingUpdatingTimer);
+        rikoPendingUpdatingTimer = setTimeout(() => {
+          if (rikoPendingRefreshDepth > 0 && updatingEl) updatingEl.classList.add("show");
+        }, 350);
+      }
+      if (firstLoad && !String(listEl.innerHTML || "").trim()) {
+        emptyEl.textContent = "Loading pending redemptions...";
+      }
       try {
         const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured.");
@@ -26637,22 +26702,12 @@ def _render_riko_page() -> str:
             });
             return list[0] || null;
           };
-          const findLatestPendingFlowId = () => {
-            const items = Array.isArray(rikoTxHistory) ? rikoTxHistory : [];
-            const sorted = items.slice().sort((a, b) => String(b?.time_iso || b?.when || "").localeCompare(String(a?.time_iso || a?.when || "")));
-            for (const it of sorted) {
-              const act = String(it?.action || "").toLowerCase();
-              const fid = String(it?.flow_id || "").trim();
-              if (fid && act.includes("pending")) return fid;
-            }
-            return "";
-          };
-          const flowId = findLatestPendingFlowId();
           for (const key of clearedPendingKeys) {
             const [symRaw, tokenRaw] = String(key || "").split("|");
             const sym = String(symRaw || "").trim().toLowerCase();
             const tokenAddr = String(tokenRaw || "").trim();
             if (!/^0x[a-f0-9]{40}$/.test(tokenAddr)) continue;
+            const flowId = findLatestPendingFlowIdFor(sym, tokenAddr);
             try {
               const doneLogs = await vault.queryFilter(vault.filters.RedeemCompleted(user, tokenAddr, null), fromBlock, latest);
               const doneEv = pickLatestLog(doneLogs);
@@ -26675,7 +26730,10 @@ def _render_riko_page() -> str:
               const cancelLogs = await vault.queryFilter(vault.filters.RedeemCancelled(user, tokenAddr), fromBlock, latest);
               const cancelEv = pickLatestLog(cancelLogs);
               if (cancelEv) {
-                await addRikoTxHistory("Cancel pending redeem", String(cancelEv?.transactionHash || ""), provider, { flowId });
+                await addRikoTxHistory("Cancel pending redeem", String(cancelEv?.transactionHash || ""), provider, {
+                  flowId,
+                  tokenSymbol: String(sym || "").toUpperCase() || "TOKEN",
+                });
               }
             } catch (_) {}
           }
@@ -26683,7 +26741,13 @@ def _render_riko_page() -> str:
         rikoLastActivePendingByToken = activePendingKeys;
         rows.sort((a, b) => String(a.symbol || "").localeCompare(String(b.symbol || "")));
         if (!rows.length) {
-          emptyEl.textContent = "No active pending redemptions.";
+          const sig = "empty";
+          if (rikoPendingLastRenderSig !== sig) {
+            listEl.innerHTML = "";
+            emptyEl.textContent = "No active pending redemptions.";
+            rikoPendingLastRenderSig = sig;
+          }
+          rikoPendingLoadedOnce = true;
           return;
         }
         emptyEl.textContent = "";
@@ -26691,9 +26755,9 @@ def _render_riko_page() -> str:
         const selectedSymbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
         let activeIdx = rows.findIndex((r) => String(r?.symbol || "").toLowerCase() === selectedSymbol);
         if (activeIdx < 0) activeIdx = 0;
-        listEl.innerHTML = rows.map((r, idx) => (
+        const nextHtml = rows.map((r, idx) => (
           `<li class="riko-pending-row">` +
-            `<div class="riko-pending-row-main"><b>${String(r.symbol || "").toUpperCase()}</b> pending: locked ${r.rikoLockedFmt} RIKO, expected ${r.tokenOutFmt} ${r.outUnit}</div>` +
+            `<div class="riko-pending-row-main"><b>${String(r.symbol || "").toUpperCase()}</b> pending: locked ${r.rikoLockedFmt} RIKO, expected ${r.tokenOutFmt} ${r.outUnit}. Awaiting liquidity top-up (usually within 3 days).</div>` +
             `<div class="riko-pending-row-actions">` +
               (idx === activeIdx
                 ? (`<button class="btn riko-tx-action-btn" type="button" onclick="rikoCheckPendingRedeem('${escJs(r.symbol)}','${escJs(r.token)}')">Check</button>` +
@@ -26702,8 +26766,23 @@ def _render_riko_page() -> str:
             `</div>` +
           `</li>`
         )).join("");
+        const sig = `${activeIdx}|${rows.map((r) => `${r.symbol}|${r.token}|${r.rikoLockedFmt}|${r.tokenOutFmt}|${r.outUnit}`).join("||")}`;
+        if (rikoPendingLastRenderSig !== sig) {
+          listEl.innerHTML = nextHtml;
+          rikoPendingLastRenderSig = sig;
+        }
+        rikoPendingLoadedOnce = true;
       } catch (e) {
         emptyEl.textContent = "Pending list unavailable: " + String(e?.message || "unknown");
+      } finally {
+        rikoPendingRefreshDepth = Math.max(0, Number(rikoPendingRefreshDepth || 0) - 1);
+        if (rikoPendingRefreshDepth <= 0) {
+          if (rikoPendingUpdatingTimer) {
+            clearTimeout(rikoPendingUpdatingTimer);
+            rikoPendingUpdatingTimer = null;
+          }
+          if (updatingEl) updatingEl.classList.remove("show");
+        }
       }
     }
     function getRikoInputs() {
@@ -27378,7 +27457,7 @@ def _render_riko_page() -> str:
     async function rikoCancelPendingRedeem(symbolOverride, tokenOverride) {
       let hasDeferredTxRows = false;
       let cancelTxHash = "";
-      const flowId = newRikoFlowId("cancel");
+      let flowId = "";
       try {
         setRikoStatus("Canceling pending redeem...", false);
         const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
@@ -27389,6 +27468,7 @@ def _render_riko_page() -> str:
         const user = await signer.getAddress();
         let vaultTokenAddress = await resolveVaultTokenAddressForAction(symbol, tokenOverride, signer);
         if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
+        flowId = findLatestPendingFlowIdFor(symbol, vaultTokenAddress) || newRikoFlowId("cancel");
         const vault = new ethers.Contract(contractAddress, RIKO_ABI, signer);
         const pending = await vault.pendingRedemptions(user, vaultTokenAddress);
         if (!pending?.exists) {
@@ -27398,7 +27478,11 @@ def _render_riko_page() -> str:
         }
         const tx = await vault.cancelPendingRedemption(vaultTokenAddress);
         cancelTxHash = String(tx?.hash || "").trim();
-        await addRikoTxHistory("Cancel pending redeem", tx.hash, signer, { deferHistory: true, flowId });
+        await addRikoTxHistory("Cancel pending redeem", tx.hash, signer, {
+          deferHistory: true,
+          flowId,
+          tokenSymbol: String(symbol || "").toUpperCase() || "TOKEN",
+        });
         hasDeferredTxRows = true;
         setRikoStatus("Cancel pending redeem tx sent", false, true);
         await tx.wait();
@@ -33508,6 +33592,7 @@ def _render_admin_page() -> str:
         }} catch (e) {{
           console.warn("disconnect failed", e);
         }}
+        openWalletModal();
         return;
       }}
       openWalletModal();
@@ -34313,7 +34398,7 @@ def _render_admin_page() -> str:
             "RIKO burned",
             "Exchange rate",
             "Tx",
-            "<button type='button' class='btn btn-soft' onclick=\"deleteSelectedAdminRikoHistory('redeem', event)\">Delete selected</button>",
+            '<button type="button" class="btn btn-soft" onclick="deleteSelectedAdminRikoHistory(&#39;redeem&#39;, event)">Delete selected</button>',
           ],
           redeemHistoryRows.map((r) => r.html),
           "No closed redemptions yet."
@@ -34368,7 +34453,7 @@ def _render_admin_page() -> str:
             "RIKO minted",
             "Exchange rate",
             "Tx",
-            "<button type='button' class='btn btn-soft' onclick=\"deleteSelectedAdminRikoHistory('deposit', event)\">Delete selected</button>",
+            '<button type="button" class="btn btn-soft" onclick="deleteSelectedAdminRikoHistory(&#39;deposit&#39;, event)">Delete selected</button>',
           ],
           depositHistoryRows.map((r) => r.html),
           "No deposits in history."
@@ -36821,7 +36906,7 @@ def _render_help_page() -> str:
     }}
     function setAuthUI() {{ const btn=document.getElementById("connectWalletBtn"); if(!btn) return; btn.textContent = authState?.authenticated ? (authState.address_short || "Wallet connected") : "Connect Wallet"; syncAdminIntentOption(); updateHelpAuthNotes(); }}
     async function loadAuthState() {{ try {{ const r=await fetch("/api/auth/me"); authState=await r.json(); }} catch(_) {{ authState={{authenticated:false}}; }} setAuthUI(); }}
-    async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} return; }} openWalletModal(); }}
+    async function onConnectWalletClick() {{ if(authState?.authenticated) {{ if(!confirm("Disconnect wallet?")) return; try {{ await postJson("/api/auth/logout",{{}}); authState={{authenticated:false}}; setAuthUI(); }} catch(e) {{ console.warn("disconnect failed",e); }} openWalletModal(); return; }} openWalletModal(); }}
     async function connectWalletFlow(wallet) {{ if(wallet==="walletconnect") return connectWalletConnect(); const provider=getWalletProvider(wallet); if(!provider) return; try {{ const accounts=await provider.request({{method:"eth_requestAccounts"}}); const address=String((accounts||[])[0]||"").trim(); if(!address) throw new Error("Wallet did not return an address"); const chainHex=await provider.request({{method:"eth_chainId"}}); const chainId=Number.parseInt(String(chainHex||"0x1"),16)||1; const nonceResp=await postJson("/api/auth/nonce",{{address,chain_id:chainId,wallet}}); const signature=await provider.request({{method:"personal_sign",params:[nonceResp.message,address]}}); const verifyResp=await postJson("/api/auth/verify",{{address,chain_id:chainId,wallet,message:nonceResp.message,signature}}); authState={{authenticated:true,...verifyResp}}; setAuthUI(); closeWalletModal({{target:{{id:"walletModalBackdrop"}}}}); }} catch(e) {{ console.warn("wallet auth failed",e); }} }}
     function showWcQrModal(uri){{ let el=document.getElementById("wcQrBackdrop"); if(!el){{ el=document.createElement("div"); el.id="wcQrBackdrop"; el.style.cssText="position:fixed;inset:0;background:linear-gradient(180deg,rgba(217,227,245,0.95),rgba(236,242,255,0.95));backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:10001;"; el.innerHTML='<div style="background:#f8fbff;border:1px solid #cbd5e1;border-radius:14px;padding:20px;text-align:center"><p style="margin:0 0 12px;font-size:16px;font-weight:700;color:#0f172a">Scan with your wallet app</p><img id="wcQrImg" alt="QR" style="display:block;background:#fff;padding:10px;border-radius:10px;width:260px;height:260px"/><button id="wcQrCancel" type="button" style="margin-top:14px;padding:8px 16px;border-radius:10px;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:700;cursor:pointer">Cancel</button></div>'; document.body.appendChild(el); document.getElementById("wcQrCancel").onclick=closeWcQrModal; }} document.getElementById("wcQrImg").src="https://api.qrserver.com/v1/create-qr-code/?size=260x260&data="+encodeURIComponent(uri); el.style.display="flex"; }}
     function closeWcQrModal(){{ const el=document.getElementById("wcQrBackdrop"); if(el) el.style.display="none"; if(window._wcProvider) try {{ window._wcProvider.disconnect(); }} catch(_) {{}} window._wcProvider=null; }}
@@ -43393,6 +43478,7 @@ HTML_PAGE = """
         } catch (e) {
           setStatus("Disconnect failed: " + (e?.message || "unknown"), "fail");
         }
+        openWalletModal();
         return;
       }
       openWalletModal();
