@@ -163,7 +163,7 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-APP_VERSION = "v1.1"
+APP_VERSION = "0.3.4"
 APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
@@ -25695,7 +25695,13 @@ def _render_riko_page() -> str:
         const hasRedeemStage = ordered.some((x) => stageKeyForRow(x) === "redeem");
         const hasDepositStage = ordered.some((x) => stageKeyForRow(x) === "deposit");
         const hasApproveStage = ordered.some((x) => stageKeyForRow(x) === "approve");
+        const hasWrapStage = ordered.some((x) => stageKeyForRow(x) === "wrap");
+        const hasQueuedOrPendingStage = ordered.some((x) => {
+          const a = String(x?.action || "").toLowerCase();
+          return a.includes("queued") || a.includes("pending");
+        });
         const hasWithdrawStage = ordered.some((x) => stageKeyForRow(x) === "withdraw");
+        const hasSettleStage = ordered.some((x) => stageKeyForRow(x) === "settle");
         const settledFromLiquidity = ordered.some((x) => String(x?.action || "").toLowerCase().includes("settled from vault liquidity"));
         const operatorFlow = !settledFromLiquidity && (
           ordered.some((x) => String(x?.action || "").toLowerCase().includes("queued"))
@@ -25708,9 +25714,34 @@ def _render_riko_page() -> str:
         if (hasDepositStage && !hasApproveStage) {
           chainParts.push(`<span class="riko-tx-label">✓ AUTO-Approve</span>`);
         }
-        const txChain = ordered.map((x) => {
+        const pickFirst = (fieldName) => {
+          for (const x of ordered) {
+            const v = String(x?.[fieldName] || "").trim();
+            if (v) return v;
+          }
+          return "";
+        };
+        const tokenSymbol = pickFirst("token_symbol");
+        const tokenAmountDisplay = pickFirst("token_amount_display");
+        const rikoReceivedDisplay = pickFirst("riko_received_display");
+        const receivedSymbol = pickFirst("received_symbol");
+        const receivedAmountDisplay = pickFirst("received_amount_display");
+        const needSyntheticWrap = hasDepositStage && !hasWrapStage && String(tokenSymbol || "").trim().toUpperCase() === "ETH";
+        const needSyntheticPending = operatorFlow && hasSettleStage && !hasQueuedOrPendingStage;
+        let syntheticWrapInserted = false;
+        let syntheticPendingInserted = false;
+        const txChainParts = [];
+        for (const x of ordered) {
           let stage = flowStageLabel(x);
           const stKey = stageKeyForRow(x);
+          if (needSyntheticWrap && !syntheticWrapInserted && stKey === "deposit") {
+            txChainParts.push(`<span class="riko-tx-label">✓ Wrap (ETH -> WETH)</span>`);
+            syntheticWrapInserted = true;
+          }
+          if (needSyntheticPending && !syntheticPendingInserted && stKey === "settle") {
+            txChainParts.push(`<span class="riko-tx-label">⏳ Pending (awaiting operator)</span>`);
+            syntheticPendingInserted = true;
+          }
           const inSym = String(x?.token_symbol || "").trim().toUpperCase();
           const inAmt = String(x?.token_amount_display || "").trim();
           const outSym = String(x?.received_symbol || "").trim().toUpperCase();
@@ -25740,8 +25771,13 @@ def _render_riko_page() -> str:
           const txTools = renderTxTools(String(x?.hash || ""), String(x?.url || ""));
           const errReason = rowIsFailed(x) ? String(x?.error_reason || "").trim() : "";
           const titleAttr = errReason ? ` title="${errReason.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}"` : "";
-          return `<span class="riko-tx-label"${titleAttr}>${mark} ${stage}</span>${txTools}`;
-        }).join(`<span class="riko-tx-meta"> -> </span>`);
+          txChainParts.push(`<span class="riko-tx-label"${titleAttr}>${mark} ${stage}</span>${txTools}`);
+        }
+        if (needSyntheticPending && !syntheticPendingInserted) {
+          txChainParts.push(`<span class="riko-tx-label">⏳ Pending (awaiting operator)</span>`);
+          syntheticPendingInserted = true;
+        }
+        const txChain = txChainParts.join(`<span class="riko-tx-meta"> -> </span>`);
         if (txChain) chainParts.push(txChain);
         const chain = chainParts.join(`<span class="riko-tx-meta"> -> </span>`);
         const roleBits = [];
@@ -25751,18 +25787,6 @@ def _render_riko_page() -> str:
           const label = role.replace(/[_-]+/g, " ");
           if (!roleBits.includes(label)) roleBits.push(label);
         }
-        const pickFirst = (fieldName) => {
-          for (const x of ordered) {
-            const v = String(x?.[fieldName] || "").trim();
-            if (v) return v;
-          }
-          return "";
-        };
-        const tokenSymbol = pickFirst("token_symbol");
-        const tokenAmountDisplay = pickFirst("token_amount_display");
-        const rikoReceivedDisplay = pickFirst("riko_received_display");
-        const receivedSymbol = pickFirst("received_symbol");
-        const receivedAmountDisplay = pickFirst("received_amount_display");
         const infoBits = [];
         if (tokenSymbol || tokenAmountDisplay) {
           const tokenText = [tokenSymbol, tokenAmountDisplay].filter(Boolean).join(" ");
@@ -33360,6 +33384,45 @@ def _render_admin_page() -> str:
     }}
     .admin-history-table td:last-child {{
       text-align: right;
+    }}
+    #tabPendingRedeem .card {{
+      padding: 12px 12px 10px;
+    }}
+    #tabPendingRedeem .table-wrap {{
+      border-radius: 8px;
+    }}
+    #tabPendingRedeem #adminRikoPendingQueueTable th,
+    #tabPendingRedeem #adminRikoPendingQueueTable td {{
+      padding-top: 3px;
+      padding-bottom: 3px;
+      font-size: 11.5px;
+      line-height: 1.2;
+    }}
+    #tabPendingRedeem .admin-history-table th,
+    #tabPendingRedeem .admin-history-table td {{
+      padding-top: 2px;
+      padding-bottom: 2px;
+      font-size: 11.5px;
+      line-height: 1.2;
+    }}
+    #tabPendingRedeem .admin-history-block {{
+      margin-top: 6px;
+      padding: 4px 6px;
+    }}
+    #tabPendingRedeem .admin-history-block[open] summary {{
+      margin-bottom: 4px;
+    }}
+    #tabPendingRedeem .admin-riko-pending-actions {{
+      gap: 4px;
+    }}
+    #tabPendingRedeem .admin-riko-pending-actions .btn {{
+      padding: 4px 8px;
+      font-size: 12px;
+      line-height: 1.05;
+    }}
+    #tabPendingRedeem .admin-riko-pending-status {{
+      padding: 1px 5px;
+      font-size: 11px;
     }}
     #tabRikoHolders .card {{
       padding: 18px 18px 16px;
