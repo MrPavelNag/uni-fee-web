@@ -33119,6 +33119,24 @@ def _render_admin_page() -> str:
     table {{ width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1100px; }}
     th, td {{ border-bottom: 1px solid #e2e8f0; padding: 8px; text-align: left; vertical-align: top; }}
     th {{ background: #eff6ff; color: #1e3a8a; position: sticky; top: 0; }}
+    .riko-tx-tools {{ display: inline-flex; align-items: center; gap: 8px; }}
+    .riko-tx-tool-btn {{
+      border: 1px solid #94a3b8;
+      border-radius: 7px;
+      background: #f8fbff;
+      color: #1d4ed8;
+      font-size: 13px;
+      line-height: 1;
+      text-decoration: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      padding: 0;
+    }}
+    .riko-tx-tool-btn:hover {{ background: #eff6ff; border-color: #64748b; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
     pre {{ max-height: 320px; overflow: auto; background: #f8fafc; border: 1px solid #dbe3ef; border-radius: 8px; padding: 10px; color: #334155; font-size: 12px; white-space: pre-wrap; }}
     .wallet-modal-backdrop {{ position: fixed; inset: 0; background: linear-gradient(180deg, rgba(217,227,245,0.82) 0%, rgba(236,242,255,0.82) 100%); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 9999; }}
@@ -33319,6 +33337,27 @@ def _render_admin_page() -> str:
       padding-top: 4px;
       padding-bottom: 4px;
     }}
+    .admin-history-sort-btn {{
+      border: 0;
+      padding: 0;
+      margin: 0;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }}
+    .admin-history-sort-btn:hover {{
+      color: #1d4ed8;
+    }}
+    .admin-history-sort-indicator {{
+      color: #64748b;
+      font-size: 11px;
+      line-height: 1;
+    }}
     .admin-history-table td:last-child {{
       text-align: right;
     }}
@@ -33396,13 +33435,29 @@ def _render_admin_page() -> str:
       display: grid;
       gap: var(--admin-riko-row-gap);
     }}
+    .admin-riko-whitelist-head {{
+      display: grid;
+      grid-template-columns: 140px minmax(260px, 560px) 18px 24px;
+      gap: var(--admin-riko-row-gap);
+      align-items: center;
+      margin: 0 0 4px;
+      min-height: 18px;
+    }}
+    .admin-riko-whitelist-head .keep-label {{
+      grid-column: 3;
+      justify-self: end;
+      color: #475569;
+      font-size: 12px;
+      line-height: 1;
+      white-space: nowrap;
+    }}
     #adminRikoAllowanceRows {{
       display: grid;
       gap: var(--admin-riko-row-gap);
     }}
     .admin-riko-whitelist-row {{
       display: grid;
-      grid-template-columns: minmax(120px,180px) minmax(180px,1fr) auto;
+      grid-template-columns: 140px minmax(260px, 560px) 18px 24px;
       gap: var(--admin-riko-row-gap);
       align-items: center;
       margin: 0;
@@ -33416,12 +33471,20 @@ def _render_admin_page() -> str:
       margin: 0;
       min-height: var(--admin-riko-row-height);
     }}
-    .admin-riko-whitelist-row input,
+    .admin-riko-whitelist-row input:not([type="checkbox"]),
     .admin-riko-allowance-row input {{
       min-height: var(--admin-riko-row-height);
       padding: 4px 8px;
       font-size: 13px;
       line-height: 1.2;
+    }}
+    .admin-riko-whitelist-keep-check {{
+      width: 12px;
+      height: 12px;
+      min-height: 12px;
+      margin: 0;
+      justify-self: end;
+      cursor: pointer;
     }}
     .admin-riko-allowance-row.native-lock input {{
       background: #eef2f7;
@@ -33565,6 +33628,7 @@ def _render_admin_page() -> str:
         <section class="card admin-riko-whitelist-card">
           <h3>Admin: RIKO whitelist</h3>
           <p class="hint">Signed by ADMIN wallet.</p>
+          <div class="admin-riko-whitelist-head"><span class="keep-label">Keep on vault</span></div>
           <div id="adminRikoWhitelistRows"></div>
           <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
             <button type="button" class="btn" onclick="addAdminRikoWhitelistRow()">Add row</button>
@@ -34233,11 +34297,12 @@ def _render_admin_page() -> str:
       }});
       tbody.innerHTML = "";
       rows.forEach((r) => tbody.appendChild(r));
-      const headCells = Array.from(table.querySelectorAll("thead th[data-sortable='1']"));
-      headCells.forEach((th) => {{
-        const idx = Number(th.getAttribute("data-col-idx") || -1);
-        const base = String(th.getAttribute("data-title") || th.textContent || "").trim();
-        th.textContent = idx === colIdx ? `${{base}} ${{dir === "asc" ? "▲" : "▼"}}` : base;
+      const sortButtons = Array.from(table.querySelectorAll("thead .admin-history-sort-btn[data-sortable='1']"));
+      sortButtons.forEach((btn) => {{
+        const idx = Number(btn.getAttribute("data-col-idx") || -1);
+        const base = String(btn.getAttribute("data-title") || btn.textContent || "").trim();
+        const indicator = idx === colIdx ? (dir === "asc" ? "▲" : "▼") : "↕";
+        btn.innerHTML = `${{escAdmin(base)}}<span class="admin-history-sort-indicator">${{indicator}}</span>`;
       }});
     }}
     function renderAdminRikoHistoryTable(tableId, columns, rows, emptyText) {{
@@ -34254,12 +34319,12 @@ def _render_admin_page() -> str:
         const plain = colHtml.replace(/<[^>]*>/g, "").trim();
         const sortable = !hasButton && !!plain;
         if (!sortable) return `<th>${{colHtml}}</th>`;
-        return `<th data-sortable="1" data-col-idx="${{idx}}" data-title="${{escAttrAdmin(plain)}}" style="cursor:pointer" title="Sort">${{plain}}</th>`;
+        return `<th><button type="button" class="admin-history-sort-btn" data-sortable="1" data-col-idx="${{idx}}" data-title="${{escAttrAdmin(plain)}}" title="Sort by ${{escAttrAdmin(plain)}}" aria-label="Sort by ${{escAttrAdmin(plain)}}">${{escAdmin(plain)}}<span class="admin-history-sort-indicator">↕</span></button></th>`;
       }}).join("");
       table.innerHTML = `<thead><tr>${{headCells}}</tr></thead><tbody>${{rows.join("")}}</tbody>`;
-      const clickable = Array.from(table.querySelectorAll("thead th[data-sortable='1']"));
-      clickable.forEach((th) => {{
-        th.onclick = () => sortAdminRikoHistoryTable(tableId, Number(th.getAttribute("data-col-idx") || 0));
+      const clickable = Array.from(table.querySelectorAll("thead .admin-history-sort-btn[data-sortable='1']"));
+      clickable.forEach((btn) => {{
+        btn.addEventListener("click", () => sortAdminRikoHistoryTable(tableId, Number(btn.getAttribute("data-col-idx") || 0)));
       }});
       delete adminRikoHistorySortState[tableId];
     }}
@@ -34654,7 +34719,7 @@ def _render_admin_page() -> str:
               try {{
                 const parsed = vault.interface.parseTransaction({{ data, value: tx?.value ?? 0n }});
                 const fnName = String(parsed?.name || "").trim();
-                if (fnName === "processPendingRedemption") out = "Completed (manual pending process)";
+                if (fnName === "processPendingRedemption") out = "Completed (manual)";
                 else if (fnName === "redeem") out = "Completed (automatic)";
               }} catch (_) {{}}
             }}
@@ -35048,11 +35113,16 @@ def _render_admin_page() -> str:
         const payoutTokenLabel = /^0x[a-f0-9]{{40}}$/.test(payoutToken) ? shortAddrAdmin(payoutToken) : "-";
         const scheduleNextDueUtc = String(data?.schedule_next_due_at_utc || data?.schedule_next_due_date || "").trim();
         const nextBps = Number(data?.next_bps || 0);
-        const head = "<tr><th>Address</th><th>Balance</th><th>Planned yield</th><th>Planned date (UTC)</th><th>Last change date</th><th>Tx hash</th></tr>";
+        const holderColumns = ["Address", "Balance", "Planned yield", "Planned date (UTC)", "Last change date", "Tx hash"];
         if (!rows.length) {{
-          table.innerHTML = head + `<tr><td class='muted' colspan='6'>${{onlyPositive ? "No positive-balance holders found." : "No holders found."}}</td></tr>`;
+          renderAdminRikoHistoryTable(
+            "adminRikoHoldersTable",
+            holderColumns,
+            [],
+            onlyPositive ? "No positive-balance holders found." : "No holders found."
+          );
         }} else {{
-          table.innerHTML = head + rows.map((it) => {{
+          const holderRowsHtml = rows.map((it) => {{
             const addr = String(it?.address || "").trim().toLowerCase();
             const balRaw = String(it?.balance_raw || "0");
             const ts = Number(it?.last_change_ts || 0);
@@ -35097,7 +35167,13 @@ def _render_admin_page() -> str:
               `<td>${{txHtml}}</td>` +
               "</tr>"
             );
-          }}).join("");
+          }});
+          renderAdminRikoHistoryTable(
+            "adminRikoHoldersTable",
+            holderColumns,
+            holderRowsHtml,
+            onlyPositive ? "No positive-balance holders found." : "No holders found."
+          );
         }}
         const totalHolders = Number(data?.count || rowsAll.length || 0);
         const shownHolders = Number(rows.length || 0);
@@ -35115,7 +35191,7 @@ def _render_admin_page() -> str:
           : "Loaded holders, but token payout is not applied on server yet. Set Token payout and click Apply.";
       }} catch (e) {{
         const errMsg = String(e?.shortMessage || e?.message || "unknown");
-        table.innerHTML = `<tr><td class='muted'>Failed to load holders: ${{esc(errMsg)}}</td></tr>`;
+        renderAdminRikoHistoryTable("adminRikoHoldersTable", ["Info"], [], `Failed to load holders: ${{esc(errMsg)}}`);
         statusEl.textContent = "RIKO holders load failed: " + errMsg;
         statusEl.classList.add("err");
       }}
@@ -36021,10 +36097,7 @@ def _render_admin_page() -> str:
         <div class="admin-riko-whitelist-row">
           <input data-admin-riko-field="symbol" data-index="${{idx}}" placeholder="symbol" value="${{esc(it?.symbol || "")}}" />
           <input data-admin-riko-field="address" data-index="${{idx}}" placeholder="0x... or native" value="${{esc(it?.address || "")}}" />
-          <label class="admin-riko-whitelist-keep-toggle" title="Keep deposits of this token on vault (do not forward to custody)">
-            <input type="checkbox" data-admin-riko-field="keep_on_vault" data-index="${{idx}}" ${{it?.keep_on_vault ? "checked" : ""}} />
-            Keep on vault
-          </label>
+          <input class="admin-riko-whitelist-keep-check" type="checkbox" data-admin-riko-field="keep_on_vault" data-index="${{idx}}" title="Keep deposits of this token on vault (do not forward to custody)" ${{it?.keep_on_vault ? "checked" : ""}} />
           <button type="button" class="btn danger" onclick="removeAdminRikoWhitelistRow(${{idx}})">-</button>
         </div>
       `).join("");
