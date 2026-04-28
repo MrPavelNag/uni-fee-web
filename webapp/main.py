@@ -25820,11 +25820,61 @@ def _render_riko_page() -> str:
               ? `<span class="riko-tx-flow-badge pending-step">Pending step</span>`
               : ""));
         const metaText = infoBits.concat(roleBits).join(" | ");
+        const hasCancelStage = ordered.some((x) => stageKeyForRow(x) === "cancel");
+        const hasUnwrapStage = ordered.some((x) => stageKeyForRow(x) === "unwrap");
+        const hasEthOut = String(receivedSymbol || "").trim().toUpperCase() === "ETH";
+        const forceStatusRow = ordered.some((x) => {
+          const a = String(x?.action || "").trim().toLowerCase();
+          return a.includes("redeem") || a.includes("settle") || a.includes("withdraw") || a.includes("cancel pending redeem") || a.includes("unwrap");
+        });
+        const includePendingSettle = hasQueuedOrPendingStage || hasSettleStage || pending;
+        const includeUnwrap = hasUnwrapStage || (hasEthOut && (hasSettleStage || settledFromLiquidity));
+        let statusLikeMain = "";
+        if (forceStatusRow) {
+          const stageParts = [];
+          const markDone = failed ? "x" : "✓";
+          const markPending = pending ? "⏳" : markDone;
+          const hasAnyEthHint = includeUnwrap || /(^|[^a-z])eth([^a-z]|$)/i.test(String(metaText || ""));
+          stageParts.push(`${markDone} Redeem`);
+          if (hasCancelStage) {
+            stageParts.push(`${markDone} Cancel`);
+          } else {
+            if (includePendingSettle || operatorFlow || hasSettleStage || hasAnyEthHint) {
+              stageParts.push(`${markPending} Pending/Settle`);
+            }
+            if (includeUnwrap || hasAnyEthHint) {
+              stageParts.push(`${markDone} Unwrap`);
+            }
+          }
+          let finalNote = "";
+          if (failed) {
+            const reason = String(failedReasons[0] || "").trim();
+            finalNote = reason ? `Redeem failed: ${reason}` : "Redeem failed.";
+          } else if (pending) {
+            finalNote = "Pending - awaiting liquidity top-up (usually within 3 days).";
+          } else if (includeUnwrap || hasAnyEthHint) {
+            finalNote = "Redeem confirmed. WETH converted to ETH.";
+          } else if (settledByOperator) {
+            finalNote = "Redeem completed (manual).";
+          } else if (hasCancelStage) {
+            finalNote = "Pending redeem canceled by user.";
+          } else {
+            finalNote = "Redeem confirmed.";
+          }
+          const statusText = `${stageParts.join(" -> ")}${finalNote ? ` | ${finalNote}` : ""}`.trim();
+          const latestTx = ordered[ordered.length - 1] || first || {};
+          const tools = renderTxTools(String(latestTx?.hash || ""), String(latestTx?.url || ""));
+          statusLikeMain = `<span class="riko-tx-label">${esc(statusText)}</span>${tools}`;
+        }
+        const mainHtml = statusLikeMain || chain;
+        const metaWrapHtml = statusLikeMain
+          ? (metaText ? `<span>${metaText}</span>` : "")
+          : `${statusBadge}${flowBadge}${metaText ? `<span>${metaText}</span>` : ""}`;
         return (
           `<li>` +
           `<span class="riko-tx-time">${formatTxTimeDisplay(String(first?.when || first?.time_iso || ""))}</span>` +
-          `<span class="riko-tx-main">${chain}</span>` +
-          `<span class="riko-tx-meta"><span class="riko-tx-meta-wrap">${statusBadge}${flowBadge}${metaText ? `<span>${metaText}</span>` : ""}</span></span>` +
+          `<span class="riko-tx-main">${mainHtml}</span>` +
+          `<span class="riko-tx-meta"><span class="riko-tx-meta-wrap">${metaWrapHtml}</span></span>` +
           `<span>${visCtrl}</span>` +
           `</li>`
         );
