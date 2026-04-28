@@ -33414,6 +33414,23 @@ def _render_admin_page() -> str:
     .admin-riko-whitelist-card .row {{
       margin: 6px 0;
     }}
+    .admin-riko-whitelist-titlebar {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 2px;
+    }}
+    .admin-riko-whitelist-titlebar h3 {{
+      margin: 0;
+    }}
+    .admin-riko-whitelist-titlebar .keep-label {{
+      color: #0f172a;
+      font-size: 16px;
+      font-weight: 700;
+      line-height: 1.2;
+      white-space: nowrap;
+    }}
     .admin-riko-signers-grid {{
       --admin-riko-row-gap: 4px;
       --admin-riko-row-height: 28px;
@@ -33435,30 +33452,15 @@ def _render_admin_page() -> str:
       display: grid;
       gap: var(--admin-riko-row-gap);
     }}
-    .admin-riko-whitelist-head {{
-      display: grid;
-      grid-template-columns: 140px minmax(260px, 560px) 18px 24px;
-      gap: var(--admin-riko-row-gap);
-      align-items: center;
-      margin: 0 0 4px;
-      min-height: 18px;
-    }}
-    .admin-riko-whitelist-head .keep-label {{
-      grid-column: 3;
-      justify-self: end;
-      color: #475569;
-      font-size: 12px;
-      line-height: 1;
-      white-space: nowrap;
-    }}
     #adminRikoAllowanceRows {{
       display: grid;
       gap: var(--admin-riko-row-gap);
     }}
     .admin-riko-whitelist-row {{
       display: grid;
-      grid-template-columns: 140px minmax(260px, 560px) 18px 24px;
-      gap: var(--admin-riko-row-gap);
+      grid-template-columns: 118px minmax(220px, 500px) 18px 24px;
+      column-gap: 10px;
+      row-gap: var(--admin-riko-row-gap);
       align-items: center;
       margin: 0;
       min-height: var(--admin-riko-row-height);
@@ -33626,9 +33628,11 @@ def _render_admin_page() -> str:
       </section>
       <div class="admin-riko-signers-grid">
         <section class="card admin-riko-whitelist-card">
-          <h3>Admin: RIKO whitelist</h3>
+          <div class="admin-riko-whitelist-titlebar">
+            <h3>Admin: RIKO whitelist</h3>
+            <span class="keep-label">Keep on vault</span>
+          </div>
           <p class="hint">Signed by ADMIN wallet.</p>
-          <div class="admin-riko-whitelist-head"><span class="keep-label">Keep on vault</span></div>
           <div id="adminRikoWhitelistRows"></div>
           <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
             <button type="button" class="btn" onclick="addAdminRikoWhitelistRow()">Add row</button>
@@ -33724,13 +33728,13 @@ def _render_admin_page() -> str:
               <input id="adminRikoHoldersOnlyPositive" type="checkbox" onchange="loadAdminRikoHolders()" />
               Only positive balance
             </label>
-            <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolders()">Refresh</button>
+            <button type="button" class="btn btn-soft" onclick="refreshAdminRikoHoldersTab()">Refresh all</button>
           </div>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Holder scan</label>
           <div id="adminRikoHolderScanSummary">-</div>
-          <button type="button" class="btn btn-soft" onclick="loadAdminRikoHolderScanStatus()">Refresh scan</button>
+          <span class="hint" style="margin:0;text-align:right;">Auto-refresh via Refresh all</span>
         </div>
         <div class="table-wrap" style="margin-top:8px">
           <table id="adminRikoHoldersTable" class="admin-history-table"></table>
@@ -34138,6 +34142,9 @@ def _render_admin_page() -> str:
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;");
     }}
+    function escAdmin(v) {{
+      return escAttrAdmin(v);
+    }}
     function renderAdminTxLink(txBase, txHash) {{
       const hash = String(txHash || "").trim();
       if (!/^0x[a-fA-F0-9]{{64}}$/.test(hash)) return "-";
@@ -34302,7 +34309,7 @@ def _render_admin_page() -> str:
         const idx = Number(btn.getAttribute("data-col-idx") || -1);
         const base = String(btn.getAttribute("data-title") || btn.textContent || "").trim();
         const indicator = idx === colIdx ? (dir === "asc" ? "▲" : "▼") : "↕";
-        btn.innerHTML = `${{escAdmin(base)}}<span class="admin-history-sort-indicator">${{indicator}}</span>`;
+        btn.innerHTML = `${{escAttrAdmin(base)}}<span class="admin-history-sort-indicator">${{indicator}}</span>`;
       }});
     }}
     function renderAdminRikoHistoryTable(tableId, columns, rows, emptyText) {{
@@ -34319,7 +34326,7 @@ def _render_admin_page() -> str:
         const plain = colHtml.replace(/<[^>]*>/g, "").trim();
         const sortable = !hasButton && !!plain;
         if (!sortable) return `<th>${{colHtml}}</th>`;
-        return `<th><button type="button" class="admin-history-sort-btn" data-sortable="1" data-col-idx="${{idx}}" data-title="${{escAttrAdmin(plain)}}" title="Sort by ${{escAttrAdmin(plain)}}" aria-label="Sort by ${{escAttrAdmin(plain)}}">${{escAdmin(plain)}}<span class="admin-history-sort-indicator">↕</span></button></th>`;
+        return `<th><button type="button" class="admin-history-sort-btn" data-sortable="1" data-col-idx="${{idx}}" data-title="${{escAttrAdmin(plain)}}" title="Sort by ${{escAttrAdmin(plain)}}" aria-label="Sort by ${{escAttrAdmin(plain)}}">${{escAttrAdmin(plain)}}<span class="admin-history-sort-indicator">↕</span></button></th>`;
       }}).join("");
       table.innerHTML = `<thead><tr>${{headCells}}</tr></thead><tbody>${{rows.join("")}}</tbody>`;
       const clickable = Array.from(table.querySelectorAll("thead .admin-history-sort-btn[data-sortable='1']"));
@@ -35195,6 +35202,12 @@ def _render_admin_page() -> str:
         statusEl.textContent = "RIKO holders load failed: " + errMsg;
         statusEl.classList.add("err");
       }}
+    }}
+    async function refreshAdminRikoHoldersTab() {{
+      await Promise.allSettled([
+        loadAdminRikoHolders(),
+        loadAdminRikoHolderScanStatus(),
+      ]);
     }}
     function normAddrLower(v) {{
       const s = String(v || "").trim().toLowerCase();
