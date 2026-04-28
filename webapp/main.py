@@ -25853,7 +25853,7 @@ def _render_riko_page() -> str:
           } else if (pending) {
             finalNote = "Pending - awaiting liquidity top-up (usually within 3 days).";
           } else if (includeUnwrap || hasAnyEthHint) {
-            finalNote = "Redeem confirmed. WETH converted to ETH.";
+            finalNote = "WETH to ETH";
           } else if (settledByOperator) {
             finalNote = "Redeem completed (manual).";
           } else if (hasCancelStage) {
@@ -27683,7 +27683,7 @@ def _render_riko_page() -> str:
                 received_symbol: "ETH",
                 received_amount_display: deltaFmt,
               });
-              renderFlow(-1, "Redeem confirmed. WETH converted to ETH.", false, -1);
+              renderFlow(-1, "WETH to ETH", false, -1);
               return;
             }
           } catch (_) {

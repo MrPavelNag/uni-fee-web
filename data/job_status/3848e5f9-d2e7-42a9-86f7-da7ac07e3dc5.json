@@ -1,0 +1,685 @@
+{
+  "id": "3848e5f9-d2e7-42a9-86f7-da7ac07e3dc5",
+  "status": "done",
+  "stage": "done",
+  "stage_label": "Completed",
+  "progress": 100,
+  "created_at": 1777394070.305835,
+  "session_id": "qGutnOP2TBmZlKjZTHEy8yhoaPb9rJfr",
+  "result": {
+    "request": {
+      "pairs": "usdc,eth",
+      "days": 30,
+      "min_tvl": 1000.0,
+      "include_chains": [
+        "ethereum"
+      ],
+      "include_versions": [
+        "v3",
+        "v4"
+      ],
+      "speed_mode": "fast",
+      "run_mode": "fast_legacy",
+      "min_fee_pct": 0.0,
+      "max_fee_pct": 2.0,
+      "min_apy_pct": 0.0,
+      "exclude_suffixes": [],
+      "lp_allocation_usd": 1000.0,
+      "ignore_cache": true,
+      "mode_fast_legacy": true
+    },
+    "suffix": "usdc_eth",
+    "total": 3,
+    "chart_pools": 2,
+    "error_pools": 1,
+    "result_flags": {
+      "empty_due_to_min_apy": false,
+      "empty_due_to_min_tvl": false,
+      "filtered_by_apy_count": 0,
+      "filtered_by_min_tvl_count": 0
+    },
+    "rows": [
+      {
+        "pool_id": "0xe500210c7ea6bfd9f69dce044b09ef384ec2b34832f132baec3b418208e3a657",
+        "chain": "ethereum",
+        "version": "v4",
+        "pair": "USDC/WETH",
+        "anchor_type": "Full",
+        "fee_pct": 3.0,
+        "final_income": 213844.28753710276,
+        "apy_pct": 260177.21650347504,
+        "last_tvl": 6792961.26445818,
+        "data_quality": "estimated",
+        "data_quality_reason": "v4_estimated_mode",
+        "status": "filtered_fee_range",
+        "calc_path_human": "Fast legacy: TVL NOW=Uniswap Interface | TVL history shape=poolDayData | fees=subgraph feesUSD",
+        "risk_level": "suspicious",
+        "risk_reason": "APR > 100%",
+        "risk_flags": [
+          "apr_gt_100"
+        ]
+      },
+      {
+        "pool_id": "0xfdebc21cc65f6454c9fd272961ad3c589c70e9366716291396e163a5f20d6b3c",
+        "chain": "ethereum",
+        "version": "v4",
+        "pair": "USDC/WETH",
+        "anchor_type": "Full",
+        "fee_pct": 0.03,
+        "final_income": 0.2675568335671883,
+        "apy_pct": 0.32552748084007904,
+        "last_tvl": 25355.6333399354,
+        "data_quality": "estimated",
+        "data_quality_reason": "v4_estimated_mode",
+        "status": "ok",
+        "calc_path_human": "Fast legacy: TVL NOW=Uniswap Interface | TVL history shape=poolDayData | fees=subgraph feesUSD",
+        "risk_level": "none",
+        "risk_reason": "",
+        "risk_flags": []
+      },
+      {
+        "pool_id": "0xb9fd8b8b6580b80432037a379071b6fb22bbceff6bafbd57390889c01d8757b9",
+        "chain": "ethereum",
+        "version": "v4",
+        "pair": "USDC/WETH",
+        "anchor_type": "Full",
+        "fee_pct": 0.3,
+        "final_income": 0.1120675778579469,
+        "apy_pct": 0.13634888639383538,
+        "last_tvl": 20269.9560204179,
+        "data_quality": "estimated",
+        "data_quality_reason": "v4_estimated_mode",
+        "status": "ok",
+        "calc_path_human": "Fast legacy: TVL NOW=Uniswap Interface | TVL history shape=poolDayData | fees=subgraph feesUSD",
+        "risk_level": "none",
+        "risk_reason": "",
+        "risk_flags": []
+      }
+    ],
+    "series": [
+      {
+        "label": "ethereum v4 USDC/WETH ...a657",
+        "chain": "ethereum",
+        "version": "v4",
+        "pair": "USDC/WETH",
+        "fee_pct": 3.0,
+        "status": "filtered_fee_range",
+        "pool_id": "0xe500210c7ea6bfd9f69dce044b09ef384ec2b34832f132baec3b418208e3a657",
+        "fees": [
+          [
+            1774915200,
+            11915.589330242994
+          ],
+          [
+            1775001600,
+            23568.288383800624
+          ],
+          [
+            1775088000,
+            34343.49017153364
+          ],
+          [
+            1775174400,
+            39751.71931488856
+          ],
+          [
+            1775260800,
+            41949.98317198253
+          ],
+          [
+            1775347200,
+            46861.41947243086
+          ],
+          [
+            1775433600,
+            55214.762349315046
+          ],
+          [
+            1775520000,
+            65328.564036579686
+          ],
+          [
+            1775606400,
+            75328.4685990138
+          ],
+          [
+            1775692800,
+            83880.84168229731
+          ],
+          [
+            1775779200,
+            91814.99545404594
+          ],
+          [
+            1775865600,
+            95621.37970492188
+          ],
+          [
+            1775952000,
+            102507.59222344898
+          ],
+          [
+            1776038400,
+            112944.86957165912
+          ],
+          [
+            1776124800,
+            123004.68913409278
+          ],
+          [
+            1776211200,
+            131625.04617848533
+          ],
+          [
+            1776297600,
+            140496.08680621404
+          ],
+          [
+            1776384000,
+            150031.00338291217
+          ],
+          [
+            1776470400,
+            155425.45133855272
+          ],
+          [
+            1776556800,
+            163645.8312376147
+          ],
+          [
+            1776643200,
+            171549.69099375294
+          ],
+          [
+            1776729600,
+            179798.5856429172
+          ],
+          [
+            1776816000,
+            186895.90681982206
+          ],
+          [
+            1776902400,
+            193004.50635293996
+          ],
+          [
+            1776988800,
+            197210.4386439836
+          ],
+          [
+            1777075200,
+            198951.9056024286
+          ],
+          [
+            1777161600,
+            202856.9968032357
+          ],
+          [
+            1777248000,
+            209361.7721108031
+          ],
+          [
+            1777334400,
+            213844.28753710276
+          ]
+        ],
+        "tvl": [
+          [
+            1774915200,
+            6197690.689872192
+          ],
+          [
+            1775001600,
+            6241502.701279084
+          ],
+          [
+            1775088000,
+            6137091.143724074
+          ],
+          [
+            1775174400,
+            6133442.53682411
+          ],
+          [
+            1775260800,
+            6595050.738490143
+          ],
+          [
+            1775347200,
+            6656439.122468158
+          ],
+          [
+            1775433600,
+            6654363.914244911
+          ],
+          [
+            1775520000,
+            6804294.568367009
+          ],
+          [
+            1775606400,
+            6750136.528265227
+          ],
+          [
+            1775692800,
+            6753093.62368514
+          ],
+          [
+            1775779200,
+            6819311.527090564
+          ],
+          [
+            1775865600,
+            6858329.442852006
+          ],
+          [
+            1775952000,
+            6759858.282337947
+          ],
+          [
+            1776038400,
+            6879821.959945387
+          ],
+          [
+            1776124800,
+            6833401.526417504
+          ],
+          [
+            1776211200,
+            6869283.502766385
+          ],
+          [
+            1776297600,
+            6859137.122192487
+          ],
+          [
+            1776384000,
+            6920519.316090541
+          ],
+          [
+            1776470400,
+            6861804.809365874
+          ],
+          [
+            1776556800,
+            6780047.453654047
+          ],
+          [
+            1776643200,
+            6828738.673398321
+          ],
+          [
+            1776729600,
+            6840750.348215387
+          ],
+          [
+            1776816000,
+            6882579.472640864
+          ],
+          [
+            1776902400,
+            6842393.160617582
+          ],
+          [
+            1776988800,
+            6828646.956900715
+          ],
+          [
+            1777075200,
+            6833047.739843616
+          ],
+          [
+            1777161600,
+            6878401.956543296
+          ],
+          [
+            1777248000,
+            6821710.922207629
+          ],
+          [
+            1777334400,
+            6792961.26445818
+          ]
+        ],
+        "strict_compare_estimated_fees": [],
+        "strict_compare_estimated_tvl": [],
+        "strict_compare_estimated_active_fees": [],
+        "strict_compare_estimated_active_tvl": [],
+        "strict_compare_reason": "v4_estimated_mode",
+        "pool_tvl_now_usd": 6792961.26445818
+      },
+      {
+        "label": "ethereum v4 USDC/WETH ...6b3c",
+        "chain": "ethereum",
+        "version": "v4",
+        "pair": "USDC/WETH",
+        "fee_pct": 0.03,
+        "status": "ok",
+        "pool_id": "0xfdebc21cc65f6454c9fd272961ad3c589c70e9366716291396e163a5f20d6b3c",
+        "fees": [
+          [
+            1777334400,
+            0.2675568335671883
+          ]
+        ],
+        "tvl": [
+          [
+            1777334400,
+            25355.6333399354
+          ]
+        ],
+        "strict_compare_estimated_fees": [],
+        "strict_compare_estimated_tvl": [],
+        "strict_compare_estimated_active_fees": [],
+        "strict_compare_estimated_active_tvl": [],
+        "strict_compare_reason": "v4_estimated_mode",
+        "pool_tvl_now_usd": 25355.6333399354
+      },
+      {
+        "label": "ethereum v4 USDC/WETH ...57b9",
+        "chain": "ethereum",
+        "version": "v4",
+        "pair": "USDC/WETH",
+        "fee_pct": 0.3,
+        "status": "ok",
+        "pool_id": "0xb9fd8b8b6580b80432037a379071b6fb22bbceff6bafbd57390889c01d8757b9",
+        "fees": [
+          [
+            1774915200,
+            9.9438916172942e-05
+          ],
+          [
+            1775001600,
+            0.00034158745395825675
+          ],
+          [
+            1775088000,
+            0.0014604647604347654
+          ],
+          [
+            1775174400,
+            0.001670431526261577
+          ],
+          [
+            1775260800,
+            0.001692700318065126
+          ],
+          [
+            1775347200,
+            0.0019062996191536088
+          ],
+          [
+            1775433600,
+            0.0027926023945211587
+          ],
+          [
+            1775520000,
+            0.0031742281082630594
+          ],
+          [
+            1775606400,
+            0.004042444511803762
+          ],
+          [
+            1775692800,
+            0.004475434620729304
+          ],
+          [
+            1775779200,
+            0.0050676188573882406
+          ],
+          [
+            1775865600,
+            0.005253858289321245
+          ],
+          [
+            1775952000,
+            0.005981542695221487
+          ],
+          [
+            1776038400,
+            0.007543117607194124
+          ],
+          [
+            1776124800,
+            0.007722765982574069
+          ],
+          [
+            1776211200,
+            0.009116145951371175
+          ],
+          [
+            1776297600,
+            0.011098253859786633
+          ],
+          [
+            1776384000,
+            0.011645630521796655
+          ],
+          [
+            1776470400,
+            0.012591001692263277
+          ],
+          [
+            1776556800,
+            0.012908138471333791
+          ],
+          [
+            1776643200,
+            0.013788179432382147
+          ],
+          [
+            1776729600,
+            0.014526889000338028
+          ],
+          [
+            1776816000,
+            0.08912087579472823
+          ],
+          [
+            1776902400,
+            0.0902265831475537
+          ],
+          [
+            1776988800,
+            0.10667672330352085
+          ],
+          [
+            1777075200,
+            0.10667672330352085
+          ],
+          [
+            1777161600,
+            0.10939950640045201
+          ],
+          [
+            1777248000,
+            0.11200172956172713
+          ],
+          [
+            1777334400,
+            0.1120675778579469
+          ]
+        ],
+        "tvl": [
+          [
+            1774915200,
+            19675.34762983843
+          ],
+          [
+            1775001600,
+            19835.653061980676
+          ],
+          [
+            1775088000,
+            19554.458592863026
+          ],
+          [
+            1775174400,
+            19533.804331765023
+          ],
+          [
+            1775260800,
+            19595.69919194223
+          ],
+          [
+            1775347200,
+            19714.634545350003
+          ],
+          [
+            1775433600,
+            19660.15586186608
+          ],
+          [
+            1775520000,
+            19981.220474836326
+          ],
+          [
+            1775606400,
+            19963.794826020374
+          ],
+          [
+            1775692800,
+            20048.28494868626
+          ],
+          [
+            1775779200,
+            20159.947107243188
+          ],
+          [
+            1775865600,
+            20376.709970948337
+          ],
+          [
+            1775952000,
+            20026.561810902018
+          ],
+          [
+            1776038400,
+            20531.72965076368
+          ],
+          [
+            1776124800,
+            20375.010343030506
+          ],
+          [
+            1776211200,
+            20532.421051039433
+          ],
+          [
+            1776297600,
+            20454.10471338789
+          ],
+          [
+            1776384000,
+            20730.694474968364
+          ],
+          [
+            1776470400,
+            20499.34184535055
+          ],
+          [
+            1776556800,
+            20285.60345321258
+          ],
+          [
+            1776643200,
+            20414.417776392715
+          ],
+          [
+            1776729600,
+            20330.175030098108
+          ],
+          [
+            1776816000,
+            20619.237416110875
+          ],
+          [
+            1776902400,
+            20390.677672870534
+          ],
+          [
+            1776988800,
+            20337.900385088655
+          ],
+          [
+            1777075200,
+            20364.052079416386
+          ],
+          [
+            1777161600,
+            20515.554184258825
+          ],
+          [
+            1777248000,
+            20297.49854825237
+          ],
+          [
+            1777334400,
+            20269.9560204179
+          ]
+        ],
+        "strict_compare_estimated_fees": [],
+        "strict_compare_estimated_tvl": [],
+        "strict_compare_estimated_active_fees": [],
+        "strict_compare_estimated_active_tvl": [],
+        "strict_compare_reason": "v4_estimated_mode",
+        "pool_tvl_now_usd": 20269.9560204179
+      }
+    ],
+    "debug_timing": {
+      "total_ms": 12149,
+      "stage_ms": {
+        "parse_pairs": 0,
+        "build_env": 1,
+        "prepare": 2,
+        "run_lock_wait": 0,
+        "agents_total": 12146,
+        "pair_filter": 0,
+        "merge_for_web": 0,
+        "merged_rows": 3,
+        "merged_series": 3
+      },
+      "pairs": [
+        {
+          "pair": "usdc,eth",
+          "index": 1,
+          "agents": [
+            {
+              "script": "agent_v3.py",
+              "subprocess_ms": 12142,
+              "load_json_ms": 0,
+              "total_ms": 12142,
+              "pools_loaded": 0
+            },
+            {
+              "script": "agent_v4.py",
+              "subprocess_ms": 10206,
+              "load_json_ms": 0,
+              "total_ms": 10206,
+              "pools_loaded": 3
+            }
+          ],
+          "merged_before": 0,
+          "merged_after": 3,
+          "merged_added": 3,
+          "total_ms": 12144
+        }
+      ]
+    },
+    "logs": [
+      "$ /Users/pavelnag/agents/uni_fee/.venv311/bin/python /Users/pavelnag/agents/uni_fee/agent_v3.py --min-tvl 1000.0  # timeout=480s",
+      "$ /Users/pavelnag/agents/uni_fee/.venv311/bin/python /Users/pavelnag/agents/uni_fee/agent_v4.py --min-tvl 1000.0  # timeout=480s",
+      "Uniswap v4 Agent\nPairs: usdc,eth | Min TVL: $1000\nDiscovering pools...\n  [ethereum] usdc/eth: 3 pools\nFound 3 v4 pools\nPDF output disabled (DISABLE_PDF_OUTPUT=1)\n  [3/3] ethereum USDC/WETH: 29 days\n  [2/3] ethereum USDC/WETH: 1 days\n  [1/3] ethereum USDC/WETH: 29 days\nSaved: data/pools_v4_usdc_eth.json\nDone: data/pools_v4_usdc_eth.json\n",
+      "[timing] agent_v4.py: subprocess=10206ms load_json=0ms total=10206ms pools=3",
+      "Agent 1: Uniswap v3 (base version)\nToken pairs: usdc,eth | Min TVL: $1 000\nDiscovering v3 pools...\n[WARN][fallback] strict rpc source priority: auto alchemy enabled for chain_id=1\nFound 4 v3 pools\nPDF output disabled (DISABLE_PDF_OUTPUT=1)\n  [series] error - GraphQL errors: [{'message': 'Type `PoolDayData` has no field `untrackedVolumeUSD`'}]\n  [series] error - GraphQL errors: [{'message': 'Type `PoolDayData` has no field `untrackedVolumeUSD`'}]\n  [series] error - GraphQL errors: [{'message': 'Type `PoolDayData` has no field `untrackedVolumeUSD`'}]\n  [series] error - GraphQL errors: [{'message': 'Type `PoolDayData` has no field `untrackedVolumeUSD`'}]\nSaved: data/pools_v3_usdc_eth.json\nDone. Output: data/pools_v3_usdc_eth.json\n",
+      "[timing] agent_v3.py: subprocess=12142ms load_json=0ms total=12142ms pools=0",
+      "[timing] pair 1/1 usdc,eth: total=12144ms merged=3",
+      "[timing] slowest_pair=usdc,eth 12144ms",
+      "[timing] slowest_stage=agents_total 12146ms"
+    ]
+  },
+  "error": null,
+  "started_at": 1777394070.30944,
+  "finished_at": 1777394082.4581041
+}

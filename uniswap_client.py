@@ -428,7 +428,9 @@ def query_pool_day_data(
             )
         except Exception as e:
             msg = str(e).lower()
-            if (not use_basic) and ("untrackedvolumeusd" in msg) and ("cannot query field" in msg):
+            if (not use_basic) and ("untrackedvolumeusd" in msg) and (
+                ("cannot query field" in msg) or ("has no field" in msg) or ("unknown field" in msg)
+            ):
                 # Some indexers/schemas may not expose untrackedVolumeUSD.
                 use_basic = True
                 query = query_basic
