@@ -48,6 +48,7 @@ contract RIKOVaultFuzzTest is Test {
 
     function testFuzz_RedeemRoundTrip(uint96 amount, uint96 redeemPart) public {
         uint256 depositAmount = bound(uint256(amount), 1, 1_000_000e6);
+        vault.setTokenDepositStorageMode(address(usdc), true);
         usdc.mint(alice, depositAmount);
 
         vm.startPrank(alice);

@@ -46,6 +46,7 @@ contract RIKOVaultTest is Test {
 
     function testRedeemBurnsRikoAndReturnsToken() public {
         uint256 depositAmount = 50e6;
+        vault.setTokenDepositStorageMode(address(usdc), true);
 
         vm.startPrank(alice);
         usdc.approve(address(vault), depositAmount);
@@ -173,6 +174,7 @@ contract RIKOVaultTest is Test {
 
     function testRikoPriceAffectsMintAndRedeem() public {
         vault.setRikoPriceUsd6(2e6); // 1 RIKO = 2 USD
+        vault.setTokenDepositStorageMode(address(usdc), true);
 
         vm.startPrank(alice);
         usdc.approve(address(vault), 100e6);
@@ -203,6 +205,7 @@ contract RIKOVaultTest is Test {
         MockAggregatorV3 wethUsdFeed = new MockAggregatorV3(8, "WETH / USD", 2_000e8);
         bytes32 feedHash = keccak256(bytes("WETH / USD"));
         vault.setTokenConfig(address(weth), true, address(wethUsdFeed), 1 days, feedHash);
+        vault.setTokenDepositStorageMode(address(weth), true);
         vault.setWrappedNativeToken(address(weth));
 
         vm.deal(address(weth), 5 ether);
