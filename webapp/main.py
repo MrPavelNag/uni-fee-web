@@ -163,7 +163,7 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "v1.1"
 APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
@@ -21981,8 +21981,8 @@ def _riko_resolve_symbol_addresses(symbol: str) -> list[str]:
     return addrs
 
 
-def _normalize_riko_whitelist_items(items: Any) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
+def _normalize_riko_whitelist_items(items: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     seen: set[str] = set()
     if not isinstance(items, list):
         return out
@@ -21996,27 +21996,35 @@ def _normalize_riko_whitelist_items(items: Any) -> list[dict[str, str]]:
             continue
         seen.add(sym)
         addr = str(raw.get("address") or "").strip().lower()
-        out.append({"symbol": sym, "address": addr})
+        keep_on_vault_raw = raw.get("keep_on_vault")
+        keep_on_vault = False
+        if isinstance(keep_on_vault_raw, bool):
+            keep_on_vault = keep_on_vault_raw
+        elif isinstance(keep_on_vault_raw, (int, float)):
+            keep_on_vault = bool(int(keep_on_vault_raw))
+        else:
+            keep_on_vault = str(keep_on_vault_raw or "").strip().lower() in {"1", "true", "yes", "on"}
+        out.append({"symbol": sym, "address": addr, "keep_on_vault": bool(keep_on_vault)})
     return out
 
 
-def _riko_default_whitelist_items() -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
+def _riko_default_whitelist_items() -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
     for s in _riko_default_whitelist_symbols():
         addrs = _riko_resolve_symbol_addresses(s)
-        items.append({"symbol": s, "address": str(addrs[0] if addrs else "").strip().lower()})
+        items.append({"symbol": s, "address": str(addrs[0] if addrs else "").strip().lower(), "keep_on_vault": False})
     return items
 
 
-def _riko_items_from_symbols(symbols: list[str]) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
+def _riko_items_from_symbols(symbols: list[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     for s in _normalize_symbol_list(symbols or []):
         addrs = _riko_resolve_symbol_addresses(s)
-        out.append({"symbol": s, "address": str(addrs[0] if addrs else "").strip().lower()})
+        out.append({"symbol": s, "address": str(addrs[0] if addrs else "").strip().lower(), "keep_on_vault": False})
     return out
 
 
-def _riko_pending_digest(items: list[dict[str, str]]) -> str:
+def _riko_pending_digest(items: list[dict[str, Any]]) -> str:
     clean = _normalize_riko_whitelist_items(items or [])
     blob = json.dumps(clean, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -23968,19 +23976,20 @@ def _stop_riko_auto_yield_job() -> None:
             pass
 
 
-def _riko_backfill_item_addresses(items: list[dict[str, str]]) -> tuple[list[dict[str, str]], bool]:
+def _riko_backfill_item_addresses(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
     clean = _normalize_riko_whitelist_items(items or [])
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     changed = False
     for row in clean:
         sym = str(row.get("symbol") or "").strip().lower()
         addr = str(row.get("address") or "").strip().lower()
+        keep_on_vault = bool(row.get("keep_on_vault"))
         if sym == "eth":
             fixed_native = "native"
             if addr != fixed_native:
                 addr = fixed_native
                 changed = True
-            out.append({"symbol": sym, "address": addr})
+            out.append({"symbol": sym, "address": addr, "keep_on_vault": keep_on_vault})
             continue
         if sym and not _is_eth_address(addr):
             addrs = _riko_resolve_symbol_addresses(sym)
@@ -23988,11 +23997,11 @@ def _riko_backfill_item_addresses(items: list[dict[str, str]]) -> tuple[list[dic
             if _is_eth_address(fixed):
                 addr = fixed
                 changed = True
-        out.append({"symbol": sym, "address": addr})
+        out.append({"symbol": sym, "address": addr, "keep_on_vault": keep_on_vault})
     return out, changed
 
 
-def _load_riko_whitelist_items() -> list[dict[str, str]]:
+def _load_riko_whitelist_items() -> list[dict[str, Any]]:
     saved = _analytics_get_state(RIKO_WHITELIST_STATE_KEY)
     if saved:
         try:
@@ -24020,7 +24029,7 @@ def _load_riko_whitelist_items() -> list[dict[str, str]]:
     return _riko_default_whitelist_items()
 
 
-def _save_riko_whitelist_items(items: list[dict[str, str]]) -> list[dict[str, str]]:
+def _save_riko_whitelist_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     clean = _normalize_riko_whitelist_items(items or [])
     if not clean:
         raise HTTPException(status_code=400, detail="Whitelist cannot be empty.")
@@ -24028,7 +24037,7 @@ def _save_riko_whitelist_items(items: list[dict[str, str]]) -> list[dict[str, st
     return clean
 
 
-def _load_riko_pending_whitelist_items() -> list[dict[str, str]]:
+def _load_riko_pending_whitelist_items() -> list[dict[str, Any]]:
     saved = _analytics_get_state(RIKO_WHITELIST_PENDING_STATE_KEY)
     if not saved:
         return []
@@ -24053,7 +24062,7 @@ def _load_riko_pending_whitelist_items() -> list[dict[str, str]]:
     return []
 
 
-def _save_riko_pending_whitelist_items(items: list[dict[str, str]]) -> list[dict[str, str]]:
+def _save_riko_pending_whitelist_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     clean = _normalize_riko_whitelist_items(items or [])
     if not clean:
         raise HTTPException(status_code=400, detail="Pending whitelist cannot be empty.")
@@ -24065,7 +24074,7 @@ def _clear_riko_pending_whitelist_symbols() -> None:
     _analytics_set_state(RIKO_WHITELIST_PENDING_STATE_KEY, "")
 
 
-def _validate_riko_whitelist_items(items: list[dict[str, str]]) -> dict[str, Any]:
+def _validate_riko_whitelist_items(items: list[dict[str, Any]]) -> dict[str, Any]:
     clean = _normalize_riko_whitelist_items(items or [])
     errors: list[str] = []
     warnings: list[str] = []
@@ -24075,10 +24084,11 @@ def _validate_riko_whitelist_items(items: list[dict[str, str]]) -> dict[str, Any
         errors.append("Whitelist is too large (>120 symbols).")
     symbol_addresses: dict[str, list[str]] = {}
     symbols: list[str] = []
-    normalized_items: list[dict[str, str]] = []
+    normalized_items: list[dict[str, Any]] = []
     for row in clean:
         s = str(row.get("symbol") or "").strip().lower()
         addr = str(row.get("address") or "").strip().lower()
+        keep_on_vault = bool(row.get("keep_on_vault"))
         if s == "eth":
             is_native_marker = addr in {"", "native", "eth"}
             if not is_native_marker:
@@ -24086,7 +24096,7 @@ def _validate_riko_whitelist_items(items: list[dict[str, str]]) -> dict[str, Any
                 symbol_addresses[s] = []
                 continue
             symbol_addresses[s] = []
-            normalized_items.append({"symbol": s, "address": "native"})
+            normalized_items.append({"symbol": s, "address": "native", "keep_on_vault": keep_on_vault})
             symbols.append(s)
             continue
         addrs = _riko_resolve_symbol_addresses(s)
@@ -24111,7 +24121,7 @@ def _validate_riko_whitelist_items(items: list[dict[str, str]]) -> dict[str, Any
         elif addrs and effective_addr not in addrs:
             warnings.append(f"{s}: address is not in catalog/config known addresses.")
         symbol_addresses[s] = [a for a in [effective_addr] if _is_eth_address(a)] or addrs
-        normalized_items.append({"symbol": s, "address": effective_addr})
+        normalized_items.append({"symbol": s, "address": effective_addr, "keep_on_vault": keep_on_vault})
         symbols.append(s)
     if not normalized_items:
         errors.append("No valid whitelist items with Ethereum addresses.")
@@ -24216,6 +24226,7 @@ class AdminRikoCustodyAllowancePresetUpdate(BaseModel):
 class RikoWhitelistItemUpdate(BaseModel):
     symbol: str
     address: str = ""
+    keep_on_vault: bool = False
 
 
 class AdminRikoWhitelistUpdate(BaseModel):
@@ -25682,6 +25693,8 @@ def _render_riko_page() -> str:
           return a.includes("pending/settle") || a.includes("settle (operator)");
         });
         const hasRedeemStage = ordered.some((x) => stageKeyForRow(x) === "redeem");
+        const hasDepositStage = ordered.some((x) => stageKeyForRow(x) === "deposit");
+        const hasApproveStage = ordered.some((x) => stageKeyForRow(x) === "approve");
         const hasWithdrawStage = ordered.some((x) => stageKeyForRow(x) === "withdraw");
         const settledFromLiquidity = ordered.some((x) => String(x?.action || "").toLowerCase().includes("settled from vault liquidity"));
         const operatorFlow = !settledFromLiquidity && (
@@ -25691,7 +25704,11 @@ def _render_riko_page() -> str:
         const visCtrl = rowKeys.length
           ? `<label class="riko-tx-visibility" title="Toggle flow visibility"><input type="checkbox" ${allVisible ? "checked" : ""} onchange="toggleRikoTxGroupVisibility('${safeGroupKey}', this.checked)" />Visible</label>`
           : "";
-        const chain = ordered.map((x) => {
+        const chainParts = [];
+        if (hasDepositStage && !hasApproveStage) {
+          chainParts.push(`<span class="riko-tx-label">✓ AUTO-Approve</span>`);
+        }
+        const txChain = ordered.map((x) => {
           let stage = flowStageLabel(x);
           const stKey = stageKeyForRow(x);
           const inSym = String(x?.token_symbol || "").trim().toUpperCase();
@@ -25703,6 +25720,14 @@ def _render_riko_page() -> str:
             const right = outAmt ? `${outSym || "TOKEN"} ${outAmt}` : "";
             if (left && right) stage = `${stage} (${left} -> ${right})`;
             else if (left) stage = `${stage} (${left})`;
+          } else if (stKey === "settle") {
+            if (outAmt) {
+              const recvSym = outSym || "TOKEN";
+              const recvTail = recvSym === "ETH"
+                ? `received ${outAmt} ETH (vault unwrap)`
+                : `received ${outAmt} ${recvSym}`;
+              stage = `${stage} (${recvTail})`;
+            }
           } else if (stKey === "unwrap") {
             if (outAmt) stage = `${stage} (${outAmt} ${outSym || "ETH"})`;
           } else if (stKey === "deposit") {
@@ -25717,6 +25742,8 @@ def _render_riko_page() -> str:
           const titleAttr = errReason ? ` title="${errReason.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}"` : "";
           return `<span class="riko-tx-label"${titleAttr}>${mark} ${stage}</span>${txTools}`;
         }).join(`<span class="riko-tx-meta"> -> </span>`);
+        if (txChain) chainParts.push(txChain);
+        const chain = chainParts.join(`<span class="riko-tx-meta"> -> </span>`);
         const roleBits = [];
         for (const x of ordered) {
           const role = String(x?.contract_role || "").trim();
@@ -25822,6 +25849,11 @@ def _render_riko_page() -> str:
       const c = Number(chainId || 0);
       return `rikoTxHistoryHidden:${c}:${a}`;
     }
+    function pendingActiveStorageKey(addr, chainId) {
+      const a = String(addr || "").trim().toLowerCase();
+      const c = Number(chainId || 0);
+      return `rikoPendingActiveKeys:${c}:${a}`;
+    }
     function buildRikoTxRowKey(item) {
       const hash = String(item?.hash || "").trim().toLowerCase();
       if (!/^0x[a-f0-9]{64}$/.test(hash)) return "";
@@ -25852,6 +25884,31 @@ def _render_riko_page() -> str:
       if (!/^0x[a-f0-9]{40}$/.test(a)) return;
       try {
         localStorage.setItem(hiddenHistoryStorageKey(a, chainId), JSON.stringify(Array.from(keySet || [])));
+      } catch (_) {}
+    }
+    function loadLastActivePendingKeys(addr, chainId) {
+      const a = String(addr || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{40}$/.test(a)) return new Set();
+      try {
+        const raw = localStorage.getItem(pendingActiveStorageKey(a, chainId));
+        const arr = JSON.parse(String(raw || "[]"));
+        if (!Array.isArray(arr)) return new Set();
+        const out = new Set();
+        for (const x of arr) {
+          const key = String(x || "").trim().toLowerCase();
+          if (key.includes("|")) out.add(key);
+        }
+        return out;
+      } catch (_) {
+        return new Set();
+      }
+    }
+    function saveLastActivePendingKeys(addr, chainId, keySet) {
+      const a = String(addr || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{40}$/.test(a)) return;
+      try {
+        const arr = Array.from(keySet || []).map((x) => String(x || "").trim().toLowerCase()).filter((x) => x.includes("|"));
+        localStorage.setItem(pendingActiveStorageKey(a, chainId), JSON.stringify(arr.slice(0, 200)));
       } catch (_) {}
     }
     function setRikoTxShowHidden(next) {
@@ -25891,7 +25948,7 @@ def _render_riko_page() -> str:
         const raw = localStorage.getItem(historyStorageKey(a, chainId));
         const arr = JSON.parse(String(raw || "[]"));
         if (!Array.isArray(arr)) return [];
-        return arr.filter((x) => /^0x[a-fA-F0-9]{64}$/.test(String(x?.hash || "")));
+        return arr.filter((x) => isRikoHistoryRow(x));
       } catch (_) {
         return [];
       }
@@ -25900,16 +25957,38 @@ def _render_riko_page() -> str:
       const a = String(addr || "").trim().toLowerCase();
       if (!/^0x[a-f0-9]{40}$/.test(a)) return;
       try {
+        const clean = (Array.isArray(items) ? items : []).filter((x) => isRikoHistoryRow(x));
         localStorage.setItem("rikoLastWallet", a);
-        localStorage.setItem(historyStorageKey(a, chainId), JSON.stringify(Array.isArray(items) ? items : []));
+        localStorage.setItem(historyStorageKey(a, chainId), JSON.stringify(clean));
       } catch (_) {}
+    }
+    function isRikoHistoryAction(rawAction) {
+      const a = String(rawAction || "").trim().toLowerCase();
+      if (!a) return false;
+      if (a.includes("approve") || a.includes("wrap") || a.includes("unwrap") || a.includes("rollback")) return false;
+      return (
+        a.includes("deposit")
+        || a.includes("redeem")
+        || a.includes("pending/settle")
+        || a.includes("settle (operator)")
+        || a.includes("cancel pending redeem")
+        || a.includes("pending -")
+        || a.includes("queued")
+      );
+    }
+    function isRikoHistoryRow(row) {
+      const h = String(row?.hash || "").trim();
+      if (!/^0x[a-fA-F0-9]{64}$/.test(h)) return false;
+      const role = String(row?.contract_role || "").trim().toLowerCase();
+      if (role === "wrapped_native") return false;
+      return isRikoHistoryAction(row?.action || "");
     }
     function mergeTxHistoryLists(primary, secondary) {
       const out = [];
       const seen = new Set();
       const push = (row) => {
         const h = String(row?.hash || "").trim().toLowerCase();
-        if (!/^0x[a-f0-9]{64}$/.test(h) || seen.has(h)) return;
+        if (!isRikoHistoryRow(row) || seen.has(h)) return;
         seen.add(h);
         out.push(row);
       };
@@ -26813,9 +26892,39 @@ def _render_riko_page() -> str:
           });
           activePendingKeys.add(`${sym || "token"}|${addrLc}`);
         }
-        const previousActive = Array.from(rikoLastActivePendingByToken || []);
+        const activeSetMem = (rikoLastActivePendingByToken instanceof Set) ? rikoLastActivePendingByToken : new Set();
+        const chainIdForPending = Number(authState?.chain_id || 11155111);
+        const persistedActive = loadLastActivePendingKeys(user, chainIdForPending);
+        const previousActive = Array.from(new Set([...(Array.from(activeSetMem || [])), ...(Array.from(persistedActive || []))]));
         const clearedPendingKeys = previousActive.filter((k) => !activePendingKeys.has(k));
-        if (clearedPendingKeys.length) {
+        const unresolvedPendingKeys = (() => {
+          const out = new Set();
+          const byFlow = new Map();
+          for (const it of (Array.isArray(rikoTxHistory) ? rikoTxHistory : [])) {
+            const fid = String(it?.flow_id || "").trim();
+            if (!fid) continue;
+            const a = String(it?.action || "").trim().toLowerCase();
+            const sym = String(it?.token_symbol || "").trim().toLowerCase();
+            const tok = String(it?.token_address || it?.token || "").trim().toLowerCase();
+            const cur = byFlow.get(fid) || { pendingLike: false, closed: false, sym: "", token: "" };
+            if (!cur.sym && sym) cur.sym = sym;
+            if (!cur.token && /^0x[a-f0-9]{40}$/.test(tok)) cur.token = tok;
+            if (a.includes("pending") || a.includes("queued")) cur.pendingLike = true;
+            if (a.includes("pending/settle") || a.includes("settle (operator)") || a.includes("cancel pending redeem")) cur.closed = true;
+            byFlow.set(fid, cur);
+          }
+          for (const x of byFlow.values()) {
+            if (!x?.pendingLike || x?.closed) continue;
+            const sym = String(x?.sym || "").trim().toLowerCase();
+            const tok = String(x?.token || "").trim().toLowerCase();
+            if (!sym || !/^0x[a-f0-9]{40}$/.test(tok)) continue;
+            const key = `${sym}|${tok}`;
+            if (!activePendingKeys.has(key)) out.add(key);
+          }
+          return Array.from(out);
+        })();
+        const pendingKeysToResolve = Array.from(new Set([...(clearedPendingKeys || []), ...(unresolvedPendingKeys || [])]));
+        if (pendingKeysToResolve.length) {
           const latest = Number(await provider.getBlockNumber());
           const fromBlock = Math.max(0, latest - 500000);
           const pickLatestLog = (arr) => {
@@ -26828,7 +26937,7 @@ def _render_riko_page() -> str:
             });
             return list[0] || null;
           };
-          for (const key of clearedPendingKeys) {
+          for (const key of pendingKeysToResolve) {
             const [symRaw, tokenRaw] = String(key || "").split("|");
             const sym = String(symRaw || "").trim().toLowerCase();
             const tokenAddr = String(tokenRaw || "").trim();
@@ -26865,6 +26974,7 @@ def _render_riko_page() -> str:
           }
         }
         rikoLastActivePendingByToken = activePendingKeys;
+        saveLastActivePendingKeys(user, chainIdForPending, activePendingKeys);
         rows.sort((a, b) => String(a.symbol || "").localeCompare(String(b.symbol || "")));
         if (!rows.length) {
           const sig = "empty";
@@ -27222,13 +27332,6 @@ def _render_riko_page() -> str:
           renderFlow(0, "Allowance is insufficient. Sending approve tx...", false, -1);
           const approveTx = await token.approve(contractAddress, raw);
           approveTxHash = String(approveTx?.hash || "").trim();
-          await addRikoTxHistory("Approve", approveTx.hash, signer, {
-            deferHistory: true,
-            flowId,
-            tokenSymbol: inputTokenLabel,
-            tokenAmountDisplay: inputAmountDisplay,
-          });
-          hasDeferredTxRows = true;
           renderFlow(0, "Approve tx sent", false, -1);
           await approveTx.wait();
           allowance = await token.allowance(user, contractAddress);
@@ -27242,13 +27345,6 @@ def _render_riko_page() -> str:
           renderFlow(1, "Wrapping ETH to WETH...", false, -1);
           const wrapTx = await token.deposit({ value: raw });
           wrapTxHash = String(wrapTx?.hash || "").trim();
-          await addRikoTxHistory("Wrap ETH->WETH", wrapTx.hash, signer, {
-            deferHistory: true,
-            flowId,
-            tokenSymbol: inputTokenLabel,
-            tokenAmountDisplay: inputAmountDisplay,
-          });
-          hasDeferredTxRows = true;
           renderFlow(1, "Wrap tx sent", false, -1);
           await wrapTx.wait();
           wrappedInThisFlow = true;
@@ -27322,8 +27418,6 @@ def _render_riko_page() -> str:
             if (toUnwrap > 0n) {
               const rollbackTx = await wrappedToken.withdraw(toUnwrap);
               rollbackTxHash = String(rollbackTx?.hash || "").trim();
-              await addRikoTxHistory("Rollback unwrap", rollbackTx.hash, wrappedToken.runner, { deferHistory: true, flowId });
-              hasDeferredTxRows = true;
               setRikoStatus("Rollback tx sent", true, true);
               await rollbackTx.wait();
               markRikoTxFailureByHash(depositTxHash, baseErr);
@@ -27508,15 +27602,6 @@ def _render_riko_page() -> str:
               );
               const unwrapTx = await weth.withdraw(delta);
               unwrapTxHash = String(unwrapTx?.hash || "").trim();
-              await addRikoTxHistory("Unwrap WETH->ETH", unwrapTx.hash, signer, {
-                deferHistory: true,
-                flowId,
-                tokenSymbol: "WETH",
-                tokenAmountDisplay: deltaFmt,
-                receivedSymbol: "ETH",
-                receivedAmountDisplay: deltaFmt,
-              });
-              hasDeferredTxRows = true;
               renderFlow(2, "Unwrap tx sent", false, -1);
               await unwrapTx.wait();
               flowDone.add(2);
@@ -34515,6 +34600,7 @@ def _render_admin_page() -> str:
         }}
         const blockTsCache = new Map();
         const tokenDecimalsCache = new Map();
+        const txRedeemStatusCache = new Map();
         let wrapped = "";
         let txBase = "";
         try {{
@@ -34555,6 +34641,26 @@ def _render_admin_page() -> str:
             blockTsCache.set(bn, 0);
             return 0;
           }}
+        }}
+        async function resolveRedeemCompletionStatus(txHash) {{
+          const key = String(txHash || "").trim().toLowerCase();
+          if (!/^0x[a-f0-9]{{64}}$/.test(key)) return "Completed";
+          if (txRedeemStatusCache.has(key)) return String(txRedeemStatusCache.get(key) || "Completed");
+          let out = "Completed";
+          try {{
+            const tx = await provider.getTransaction(key);
+            const data = String(tx?.data || "").trim();
+            if (data && data !== "0x") {{
+              try {{
+                const parsed = vault.interface.parseTransaction({{ data, value: tx?.value ?? 0n }});
+                const fnName = String(parsed?.name || "").trim();
+                if (fnName === "processPendingRedemption") out = "Completed (manual pending process)";
+                else if (fnName === "redeem") out = "Completed (automatic)";
+              }} catch (_) {{}}
+            }}
+          }} catch (_) {{}}
+          txRedeemStatusCache.set(key, out);
+          return out;
         }}
         function formatAdminRateDisplay(numerRaw, numerDecimals, denomRaw, denomDecimals, numerUnit, denomUnit) {{
           try {{
@@ -34713,6 +34819,7 @@ def _render_admin_page() -> str:
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
           const tokenOutRaw = String(ev?.tokenOut ?? 0n);
           const rikoBurnedRaw = String(ev?.rikoBurned ?? 0n);
+          const completionStatus = await resolveRedeemCompletionStatus(txHash);
           const tokenDecimals = await resolveTokenDecimals(token, tokenLower);
           const tokenOutDisplay = tokenDecimals === null
             ? `${{formatAdminIntegerWithCommas(tokenOutRaw)}} (raw)`
@@ -34731,7 +34838,7 @@ def _render_admin_page() -> str:
               `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
               `<td class='mono'>${{shortAddrAdmin(account)}}</td>` +
               `<td class='mono'>${{String(tokenLabel || "-")}}</td>` +
-              `<td title="Pending entry was deleted. Repeating processPendingRedemption for same account/token will revert with RV_PendingRedemptionNotFound.">Completed (pending cleared)</td>` +
+              `<td title="Redeem completion path is inferred from transaction method.">${{completionStatus}}</td>` +
               `<td class='mono'>${{tokenOutDisplay}}</td>` +
               `<td class='mono'>${{rikoBurnedDisplay}} RIKO</td>` +
               `<td class='mono'>${{exchangeRate}}</td>` +
@@ -34891,7 +34998,7 @@ def _render_admin_page() -> str:
           loadWarns.length > 0
         );
         setAdminRikoPendingOpsStatus(pendingStatusText, loadWarns.length > 0);
-        adminRikoPendingRenderCache = {
+        adminRikoPendingRenderCache = {{
           ts: Date.now(),
           chain_id: Number(chainIdNum || 0),
           vault: String(addr || "").trim().toLowerCase(),
@@ -34901,7 +35008,7 @@ def _render_admin_page() -> str:
           yieldHistoryHtml: String(document.getElementById("adminRikoYieldHistoryTable")?.innerHTML || ""),
           statusText: pendingStatusText,
           statusErr: loadWarns.length > 0,
-        };
+        }};
       }} catch (e) {{
         invalidateAdminRikoPendingRenderCache();
         table.innerHTML = "<tr><td class='muted'>Failed to load pending queue.</td></tr>";
@@ -35909,11 +36016,15 @@ def _render_admin_page() -> str:
     function renderAdminRikoWhitelistEditor() {{
       const rowsEl = document.getElementById("adminRikoWhitelistRows");
       if (!rowsEl) return;
-      const rows = adminRikoWhitelistItems.length ? adminRikoWhitelistItems : [{{symbol:"", address:""}}];
+      const rows = adminRikoWhitelistItems.length ? adminRikoWhitelistItems : [{{symbol:"", address:"", keep_on_vault:false}}];
       rowsEl.innerHTML = rows.map((it, idx) => `
         <div class="admin-riko-whitelist-row">
           <input data-admin-riko-field="symbol" data-index="${{idx}}" placeholder="symbol" value="${{esc(it?.symbol || "")}}" />
           <input data-admin-riko-field="address" data-index="${{idx}}" placeholder="0x... or native" value="${{esc(it?.address || "")}}" />
+          <label class="admin-riko-whitelist-keep-toggle" title="Keep deposits of this token on vault (do not forward to custody)">
+            <input type="checkbox" data-admin-riko-field="keep_on_vault" data-index="${{idx}}" ${{it?.keep_on_vault ? "checked" : ""}} />
+            Keep on vault
+          </label>
           <button type="button" class="btn danger" onclick="removeAdminRikoWhitelistRow(${{idx}})">-</button>
         </div>
       `).join("");
@@ -35928,23 +36039,24 @@ def _render_admin_page() -> str:
       for (const input of rowsEl.querySelectorAll("input[data-index]")) {{
         const idx = Number(input.dataset.index ?? -1);
         if (!Number.isInteger(idx) || idx < 0) continue;
-        const entry = byIndex.get(idx) || {{symbol:"", address:""}};
+        const entry = byIndex.get(idx) || {{symbol:"", address:"", keep_on_vault:false}};
         const field = input.dataset.adminRikoField;
         if (field === "symbol") entry.symbol = String(input.value || "").trim().toLowerCase();
         if (field === "address") entry.address = String(input.value || "").trim();
+        if (field === "keep_on_vault") entry.keep_on_vault = !!input.checked;
         byIndex.set(idx, entry);
       }}
       if (byIndex.size === 0) {{
         return Array.isArray(adminRikoWhitelistItems) ? [...adminRikoWhitelistItems] : [];
       }}
-      return Array.from(byIndex.keys()).sort((a, b) => a - b).map((idx) => byIndex.get(idx) || {{symbol:"", address:""}});
+      return Array.from(byIndex.keys()).sort((a, b) => a - b).map((idx) => byIndex.get(idx) || {{symbol:"", address:"", keep_on_vault:false}});
     }}
     function onAdminRikoWhitelistInputChanged(e) {{
       const field = e?.target?.dataset?.adminRikoField;
       const idx = Number(e?.target?.dataset?.index ?? -1);
       if (!Number.isInteger(idx) || idx < 0) return;
-      while (adminRikoWhitelistItems.length <= idx) adminRikoWhitelistItems.push({{symbol:"", address:""}});
-      const current = adminRikoWhitelistItems[idx] || {{symbol:"", address:""}};
+      while (adminRikoWhitelistItems.length <= idx) adminRikoWhitelistItems.push({{symbol:"", address:"", keep_on_vault:false}});
+      const current = adminRikoWhitelistItems[idx] || {{symbol:"", address:"", keep_on_vault:false}};
       if (field === "symbol") {{
         const sym = String(e.target.value || "").trim().toLowerCase();
         current.symbol = sym;
@@ -35957,6 +36069,8 @@ def _render_admin_page() -> str:
         }}
       }} else if (field === "address") {{
         current.address = String(e.target.value || "").trim();
+      }} else if (field === "keep_on_vault") {{
+        current.keep_on_vault = !!e.target.checked;
       }}
       adminRikoWhitelistItems[idx] = current;
       rebuildAdminRikoAllowanceItemsFromWhitelistDraft();
@@ -35964,7 +36078,7 @@ def _render_admin_page() -> str:
     }}
     function addAdminRikoWhitelistRow() {{
       const snapshot = snapshotAdminRikoWhitelistRows();
-      snapshot.push({{symbol:"", address:""}});
+      snapshot.push({{symbol:"", address:"", keep_on_vault:false}});
       adminRikoWhitelistItems = snapshot;
       renderAdminRikoWhitelistEditor();
       rebuildAdminRikoAllowanceItemsFromWhitelistDraft();
@@ -35986,10 +36100,11 @@ def _render_admin_page() -> str:
         for (const input of rowsEl.querySelectorAll("input[data-index]")) {{
           const idx = Number(input.dataset.index ?? -1);
           if (!Number.isInteger(idx) || idx < 0) continue;
-          const entry = byIndex.get(idx) || {{symbol:"", address:""}};
+          const entry = byIndex.get(idx) || {{symbol:"", address:"", keep_on_vault:false}};
           const field = input.dataset.adminRikoField;
           if (field === "symbol") entry.symbol = String(input.value || "").trim().toLowerCase();
           if (field === "address") entry.address = String(input.value || "").trim();
+          if (field === "keep_on_vault") entry.keep_on_vault = !!input.checked;
           byIndex.set(idx, entry);
         }}
       }}
@@ -36000,7 +36115,7 @@ def _render_admin_page() -> str:
         if (!symbol) continue;
         let address = normalizeAdminRikoAddress(entry.address);
         if (!address) address = normalizeAdminRikoAddress(resolveAdminRikoAddressBySymbol(symbol));
-        items.push({{symbol, address}});
+        items.push({{symbol, address, keep_on_vault: !!entry.keep_on_vault}});
       }}
       return items;
     }}
@@ -36018,11 +36133,13 @@ def _render_admin_page() -> str:
         adminRikoWhitelistActiveItems = (Array.isArray(active) ? active : []).map((it) => ({{
           symbol: String(it?.symbol || "").trim().toLowerCase(),
           address: String(it?.address || "").trim(),
+          keep_on_vault: !!it?.keep_on_vault,
         }}));
         const draft = (data.pending && data.pending.items) || (data.active && data.active.items) || [];
         adminRikoWhitelistItems = (Array.isArray(draft) ? draft : []).map((it) => ({{
           symbol: String(it?.symbol || "").trim().toLowerCase(),
           address: String(it?.address || "").trim(),
+          keep_on_vault: !!it?.keep_on_vault,
         }}));
         rebuildAdminRikoAllowanceItemsFromWhitelistDraft();
         renderAdminRikoWhitelistEditor();
@@ -38416,8 +38533,7 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
         return {"ok": True, "items": [], "address": "", "chain_id": None, "count": 0}
     chain_id = int(auth.get("chain_id") or 11155111)
     vault_addr = str(RIKO_VAULT_ADDRESS or "").strip().lower()
-    wrapped_addr = _wrapped_native_by_chain(chain_id)
-    tracked_targets = {x for x in (vault_addr, wrapped_addr) if _is_eth_address(x)}
+    tracked_targets = {x for x in (vault_addr,) if _is_eth_address(x)}
     rows = _explorer_txlist_rows_for_owner(chain_id, address, max_items=max(limit * 4, 60))
     items: list[dict[str, Any]] = []
     for r in rows:
@@ -38428,9 +38544,7 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
             continue
         to_addr = str(r.get("to") or "").strip().lower()
         from_addr = str(r.get("from") or "").strip().lower()
-        fn_hint = str(r.get("functionName") or "").strip().lower()
-        is_wrap_flow = any(x in fn_hint for x in ("deposit()", "withdraw(", "approve("))
-        if tracked_targets and to_addr not in tracked_targets and from_addr not in tracked_targets and not is_wrap_flow:
+        if tracked_targets and to_addr not in tracked_targets and from_addr not in tracked_targets:
             continue
         ts_raw = str(r.get("timeStamp") or "").strip()
         ts = 0
@@ -38458,7 +38572,6 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
             "action": _riko_tx_action_label(r, vault_addr),
             "contract_role": (
                 "vault" if to_addr == vault_addr or from_addr == vault_addr else
-                "wrapped_native" if to_addr == wrapped_addr or from_addr == wrapped_addr else
                 "other"
             ),
         }
@@ -38499,7 +38612,14 @@ def admin_riko_whitelist_set_pending(
 ) -> dict[str, Any]:
     _require_admin(request, response)
     _require_pilot_config_mutable("RIKO whitelist pending update")
-    payload_items = [{"symbol": str(x.symbol or ""), "address": str(x.address or "")} for x in (req.items or [])]
+    payload_items = [
+        {
+            "symbol": str(x.symbol or ""),
+            "address": str(x.address or ""),
+            "keep_on_vault": bool(x.keep_on_vault),
+        }
+        for x in (req.items or [])
+    ]
     if not payload_items:
         payload_items = _riko_items_from_symbols(_normalize_symbol_list(req.symbols or []))
     items = _save_riko_pending_whitelist_items(payload_items)

@@ -39,6 +39,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     uint8 private constant MAX_DECIMALS = 18;
     uint8 private constant USD_DECIMALS = 6;
     uint8 private constant RIKO_DECIMALS = 6;
+    string public constant CONTRACT_VERSION = "v1.1";
 
     /*//////////////////////////////////////////////////////////////
                                   ERRORS
@@ -95,6 +96,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     // 0 means "no cap".
     uint256 public globalSupplyCapUsd6;
     mapping(address => uint256) public tokenTvlCapUsd6;
+    mapping(address => bool) public keepOnVaultByToken;
     address public custodyAddress;
     uint256 public rikoPriceUsd6;
     mapping(address => mapping(address => PendingRedemption[])) private _pendingRedemptionQueue;
@@ -117,6 +119,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     event Redeemed(address indexed user, address indexed token, uint256 rikoBurned, uint256 tokenOut);
     event GlobalSupplyCapUpdated(uint256 capUsd6);
     event TokenTvlCapUpdated(address indexed token, uint256 capUsd6);
+    event TokenDepositStorageModeUpdated(address indexed token, bool keepOnVault);
     event CustodyAddressUpdated(address indexed custodyAddress);
     event RikoPriceUpdated(uint256 rikoPriceUsd6);
     event PendingRedemptionOperatorUpdated(address indexed operator);
@@ -180,6 +183,16 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (token == address(0)) revert RV_UnsupportedToken();
         tokenTvlCapUsd6[token] = capUsd6;
         emit TokenTvlCapUpdated(token, capUsd6);
+    }
+
+    /// @notice Set deposit storage mode for a specific token.
+    /// @dev When enabled, newly deposited funds remain on vault and are not forwarded to custody.
+    /// @param token Token address.
+    /// @param keepOnVault True to keep deposits on vault, false to forward to custody.
+    function setTokenDepositStorageMode(address token, bool keepOnVault) external onlyOwner {
+        if (token == address(0)) revert RV_UnsupportedToken();
+        keepOnVaultByToken[token] = keepOnVault;
+        emit TokenDepositStorageModeUpdated(token, keepOnVault);
     }
 
     /// @notice Set custody address where incoming deposits are forwarded.
@@ -281,8 +294,10 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         _checkGlobalCapAfterMint(rikoOut);
 
         _mint(receiver, rikoOut);
-        address custody = _requireConfiguredCustody();
-        asset.safeTransfer(custody, received);
+        if (!keepOnVaultByToken[token]) {
+            address custody = _requireConfiguredCustody();
+            asset.safeTransfer(custody, received);
+        }
         _checkTokenCapAfterDeposit(token, cfg, asset, price, oracleDecimals);
         emit Deposited(receiver, token, received, rikoOut);
     }
@@ -308,8 +323,10 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         tokenOut = _usd6ToToken(cfg, _rikoToUsd6(rikoAmountIn));
         if (tokenOut < minTokenOut) revert RV_SlippageExceeded();
 
-        if (_canSettleNow(token, tokenOut)) {
-            _settleRedeem(msg.sender, token, receiver, rikoAmountIn, tokenOut, minTokenOut);
+        // Auto-redeem path is strictly vault-only.
+        // Custody funds are reserved for operator-driven pending settlement.
+        if (_canSettleFromVault(token, tokenOut)) {
+            _settleRedeem(msg.sender, token, receiver, rikoAmountIn, tokenOut, minTokenOut, false);
             return tokenOut;
         }
 
@@ -341,7 +358,8 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (tokenOutCurrent < p.minTokenOut) revert RV_SlippageExceeded();
         // Do not overpay relative to the amount locked in queue at redeem time.
         uint256 tokenOutToSend = tokenOutCurrent > p.tokenOut ? p.tokenOut : tokenOutCurrent;
-        if (!_canSettleNow(token, tokenOutToSend)) {
+        // Pending settlement may use vault + custody pull.
+        if (!_canSettleWithCustody(token, tokenOutToSend)) {
             return (false, 0);
         }
         tokenSent = _settlePendingRedeem(account, token, p, tokenOutToSend);
@@ -410,7 +428,13 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (amount == 0) revert RV_InvalidAmount();
     }
 
-    function _canSettleNow(address token, uint256 tokenOut) internal view returns (bool) {
+    function _canSettleFromVault(address token, uint256 tokenOut) internal view returns (bool) {
+        IERC20Metadata asset = IERC20Metadata(token);
+        uint256 avail = asset.balanceOf(address(this));
+        return avail >= tokenOut;
+    }
+
+    function _canSettleWithCustody(address token, uint256 tokenOut) internal view returns (bool) {
         IERC20Metadata asset = IERC20Metadata(token);
         uint256 avail = asset.balanceOf(address(this));
         if (avail >= tokenOut) return true;
@@ -438,10 +462,13 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         address receiver,
         uint256 rikoAmountIn,
         uint256 tokenOut,
-        uint256 minTokenOut
+        uint256 minTokenOut,
+        bool allowCustodyPull
     ) internal {
         IERC20Metadata asset = IERC20Metadata(token);
-        _pullFromCustodyIfNeeded(token, tokenOut);
+        if (allowCustodyPull) {
+            _pullFromCustodyIfNeeded(token, tokenOut);
+        }
         uint256 avail = asset.balanceOf(address(this));
         if (avail < tokenOut) revert RV_InsufficientLiquidity();
         _transferOutWithMinOutCheck(token, asset, receiver, tokenOut, minTokenOut);
@@ -458,7 +485,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 minTokenOut = p.minTokenOut;
         address receiver = p.receiver;
         _pendingRedemptionPop(account, token);
-        _settleRedeem(address(this), token, receiver, rikoLocked, tokenOutCurrent, minTokenOut);
+        _settleRedeem(address(this), token, receiver, rikoLocked, tokenOutCurrent, minTokenOut, true);
         tokenSent = tokenOutCurrent;
     }
 
