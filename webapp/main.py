@@ -34096,40 +34096,13 @@ def _render_admin_page() -> str:
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set token config</label>
-          <input id="adminRikoTokenCfgTokenInput" type="text" placeholder="0x... token address" />
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-            <button class="btn btn-soft" type="button" onclick="loadAdminRikoTokenConfig()">Load on-chain</button>
-            <button class="btn btn-soft" type="button" onclick="applyAdminRikoTokenConfigForWhitelist()">Apply whitelist (auto)</button>
-          </div>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px minmax(140px,200px) 1fr;gap:10px;align-items:center;">
-          <label style="margin:0">Token allowed</label>
-          <select id="adminRikoTokenCfgAllowedInput">
-            <option value="true">true</option>
-            <option value="false">false</option>
-          </select>
-          <span class="hint" style="margin:0">Set false to disable token in vault.</span>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;">
-          <label style="margin:0">Oracle (Chainlink price feed)</label>
-          <div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;">
-            <input id="adminRikoTokenCfgOracleInput" type="text" placeholder="0x... Chainlink feed" />
-            <button class="btn btn-soft" type="button" onclick="autoFillAdminRikoTokenConfigFromChainlink()">Auto-fill from Chainlink</button>
-          </div>
+          <span class="hint" style="margin:0">Applies automatically to all active ERC-20 tokens from whitelist (allowed=true).</span>
+          <button class="btn btn-soft" type="button" onclick="applyAdminRikoTokenConfig()">Apply on-chain</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px minmax(140px,220px) 1fr;gap:10px;align-items:center;">
           <label style="margin:0">Oracle max age (sec)</label>
           <input id="adminRikoTokenCfgMaxAgeInput" type="number" min="0" step="1" value="86400" />
           <span class="hint" style="margin:0">Example: 86400 = 1 day.</span>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Feed description</label>
-          <input id="adminRikoTokenCfgDescInput" type="text" placeholder='Exact Chainlink description, e.g. "USDT / USD"' />
-          <button class="btn" onclick="applyAdminRikoTokenConfig()">Apply on-chain</button>
-        </div>
-        <div class="row">
-          <label>Token config (current)</label>
-          <div id="adminRikoTokenCfgCurrent">-</div>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Pause responsible</label>
@@ -36582,57 +36555,6 @@ def _render_admin_page() -> str:
         else if (buttonEl) buttonEl.textContent = "Diagnose";
       }}
     }}
-    async function loadAdminRikoTokenConfig(silent = false) {{
-      try {{
-        const addr = String(adminRikoVaultAddress || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) {{
-          if (silent) return;
-          throw new Error("Vault contract address is not configured in admin settings.");
-        }}
-        const token = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgTokenInput")?.value || "");
-        if (!token) {{
-          if (silent) return;
-          throw new Error("Invalid token address.");
-        }}
-        const ethers = await ensureEthersAdmin();
-        const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
-        const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, provider);
-        const cfg = await vault.tokenConfigs(token);
-        const allowed = !!cfg?.allowed;
-        const oracle = String(cfg?.oracle || "");
-        const maxAge = Number(cfg?.maxOracleAge || 0n);
-        const descHash = String(cfg?.expectedFeedDescriptionHash || "");
-        const tokenDecimals = Number(cfg?.tokenDecimals || 0n);
-        const isZeroAddress = /^0x0{40}$/i.test(oracle);
-        const isZeroHash = /^0x0{64}$/i.test(descHash);
-        const isUnconfigured = !allowed && isZeroAddress && maxAge === 0 && isZeroHash && tokenDecimals === 0;
-        const allowedInput = document.getElementById("adminRikoTokenCfgAllowedInput");
-        const oracleInput = document.getElementById("adminRikoTokenCfgOracleInput");
-        const maxAgeInput = document.getElementById("adminRikoTokenCfgMaxAgeInput");
-        if (allowedInput) allowedInput.value = allowed ? "true" : "false";
-        if (oracleInput) oracleInput.value = oracle;
-        if (maxAgeInput) maxAgeInput.value = String(maxAge || 0);
-        const cur = document.getElementById("adminRikoTokenCfgCurrent");
-        if (cur) {{
-          if (isUnconfigured) {{
-            cur.textContent = "No on-chain token config for selected token.";
-          }} else {{
-            cur.textContent = `allowed=${{allowed}} | oracle=${{oracle}} | maxAge=${{maxAge}} | hash=${{descHash}} | tokenDecimals=${{tokenDecimals}}`;
-          }}
-        }}
-        if (isUnconfigured) {{
-          setAdminRikoOnchainStatus(
-            "Token config is empty on-chain for this token (not configured in vault whitelist yet).",
-            true
-          );
-        }} else {{
-          setAdminRikoOnchainStatus("Token config loaded.", false);
-        }}
-      }} catch (e) {{
-        if (silent) return;
-        setAdminRikoOnchainStatus("Load token config failed: " + (e?.shortMessage || e?.message || "unknown"), true);
-      }}
-    }}
     const CHAINLINK_FEED_REGISTRY_MAINNET = "0x47fb2585d2c56fe188d0e6ec628a38b74fceeedf";
     const CHAINLINK_USD_DENOM = "0x0000000000000000000000000000000000000348";
     const CHAINLINK_ETH_DENOM = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
@@ -36676,7 +36598,7 @@ def _render_admin_page() -> str:
     }}
     async function resolveChainlinkTokenFeedMainnet(tokenAddress) {{
       const token = normalizeEthAddressInput(tokenAddress || "");
-      if (!token) throw new Error("Invalid token address for Chainlink auto-fill.");
+      if (!token) throw new Error("Invalid token address in whitelist.");
       const ethers = await ensureEthersAdmin();
       const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
       const registry = new ethers.Contract(CHAINLINK_FEED_REGISTRY_MAINNET, CHAINLINK_FEED_REGISTRY_ABI, provider);
@@ -36707,29 +36629,6 @@ def _render_admin_page() -> str:
         }};
       }}
       throw new Error("Chainlink feed for this token was not found automatically.");
-    }}
-    async function autoFillAdminRikoTokenConfigFromChainlink(silent = false) {{
-      try {{
-        const token = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgTokenInput")?.value || "");
-        if (!token) throw new Error("Enter token address first.");
-        const oracleInput = document.getElementById("adminRikoTokenCfgOracleInput");
-        const descInput = document.getElementById("adminRikoTokenCfgDescInput");
-        const resolved = await resolveChainlinkTokenFeedMainnet(token);
-        if (oracleInput) oracleInput.value = String(resolved?.oracle || "");
-        if (descInput) descInput.value = String(resolved?.description || "");
-        if (!silent) {{
-          setAdminRikoOnchainStatus(
-            `Chainlink auto-fill complete (${{resolved?.source || "auto"}}): oracle=${{resolved?.oracle || "-"}}; description="${{resolved?.description || "-"}}".`,
-            false
-          );
-        }}
-        return resolved;
-      }} catch (e) {{
-        if (!silent) {{
-          setAdminRikoOnchainStatus("Chainlink auto-fill failed: " + (e?.shortMessage || e?.message || "unknown"), true);
-        }}
-        return null;
-      }}
     }}
     async function applyAdminRikoTokenConfigForWhitelist() {{
       try {{
@@ -36790,49 +36689,7 @@ def _render_admin_page() -> str:
       }}
     }}
     async function applyAdminRikoTokenConfig() {{
-      try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
-        const addr = String(adminRikoVaultAddress || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured in admin settings.");
-        const token = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgTokenInput")?.value || "");
-        if (!token) throw new Error("Invalid token address.");
-        const allowed = String(document.getElementById("adminRikoTokenCfgAllowedInput")?.value || "true").trim() === "true";
-        let oracle = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgOracleInput")?.value || "");
-        let maxAge = Number(String(document.getElementById("adminRikoTokenCfgMaxAgeInput")?.value || "").trim());
-        let desc = String(document.getElementById("adminRikoTokenCfgDescInput")?.value || "").trim();
-        let feedHash = "0x" + "00".repeat(32);
-        const ethers = await ensureEthersAdmin();
-        if (allowed) {{
-          if (!oracle || !desc) {{
-            const auto = await autoFillAdminRikoTokenConfigFromChainlink(true);
-            if (!oracle) oracle = normalizeEthAddressInput(auto?.oracle || "");
-            if (!desc) desc = String(auto?.description || "").trim();
-          }}
-          if (!oracle) throw new Error("Oracle address is required when allowed=true.");
-          if (!Number.isFinite(maxAge) || maxAge <= 0) throw new Error("Max age must be > 0 when allowed=true.");
-          if (!desc) throw new Error("Feed description is required when allowed=true (e.g. USDC / USD).");
-          feedHash = ethers.keccak256(ethers.toUtf8Bytes(desc));
-        }} else {{
-          oracle = "0x0000000000000000000000000000000000000000";
-          maxAge = 0;
-          feedHash = "0x" + "00".repeat(32);
-        }}
-        const signer = await getAdminSigner();
-        const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, signer);
-        await assertAdminIsVaultOwner(vault, signer, "token config update");
-        setAdminRikoOnchainStatus("Applying token config on-chain...", false);
-        const tx = await vault.setTokenConfig(token, allowed, oracle, BigInt(Math.round(maxAge)), feedHash);
-        setAdminRikoOnchainStatus("Token config tx sent: " + tx.hash, false);
-        await tx.wait();
-        setAdminRikoOnchainStatus("Token config updated.", false);
-        await loadAdminRikoTokenConfig();
-      }} catch (e) {{
-        if (isWalletUserRejectedError(e)) {{
-          setAdminRikoOnchainStatus("Signature was rejected in wallet. Token config update was canceled.", true);
-          return;
-        }}
-        setAdminRikoOnchainStatus("Token config update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
-      }}
+      await applyAdminRikoTokenConfigForWhitelist();
     }}
     let adminRikoWhitelistItems = [];
     let adminRikoWhitelistActiveItems = [];
