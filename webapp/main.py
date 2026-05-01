@@ -27695,13 +27695,13 @@ def _render_riko_page() -> str:
           const tokenAddrTxt = String(depositTokenAddress || "").trim();
           renderFlow(
             -1,
-            `${preMsg} | token=${inputTokenLabel} ${tokenAddrTxt}. Configure this token in admin: Set token config (allowed=true).`,
+            `${preMsg} | token=${inputTokenLabel} ${tokenAddrTxt}. In admin run "Set token config" -> "Apply on-chain" (auto for active whitelist).`,
             true,
             flowSymbols.length - 1
           );
           throw new Error(
             `${preMsg}. Token ${inputTokenLabel} (${tokenAddrTxt}) is not configured on-chain. ` +
-            "Set token config for this exact address with allowed=true."
+            "Run admin \"Set token config\" -> \"Apply on-chain\" to sync all active whitelist tokens."
           );
         }
 
@@ -33929,13 +33929,36 @@ def _render_admin_page() -> str:
     }}
     .admin-riko-whitelist-row {{
       display: grid;
-      grid-template-columns: 118px minmax(220px, 500px) 18px 24px;
+      grid-template-columns: 118px minmax(220px, 1fr) minmax(130px, 170px) 18px 24px;
       column-gap: 10px;
       row-gap: var(--admin-riko-row-gap);
       align-items: center;
       margin: 0;
       min-height: var(--admin-riko-row-height);
     }}
+    .admin-riko-whitelist-flag {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+      font-size: 11px;
+      line-height: 1.1;
+      color: #334155;
+      min-height: var(--admin-riko-row-height);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .admin-riko-whitelist-flag .dot {{
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #94a3b8;
+      flex: 0 0 auto;
+    }}
+    .admin-riko-whitelist-flag.ok .dot {{ background: #16a34a; }}
+    .admin-riko-whitelist-flag.warn .dot {{ background: #f59e0b; }}
+    .admin-riko-whitelist-flag.err .dot {{ background: #dc2626; }}
+    .admin-riko-whitelist-flag.muted .dot {{ background: #94a3b8; }}
     .admin-riko-allowance-row {{
       display: grid;
       grid-template-columns: minmax(120px,220px) minmax(140px,1fr) auto;
@@ -36630,8 +36653,12 @@ def _render_admin_page() -> str:
       }}
       throw new Error("Chainlink feed for this token was not found automatically.");
     }}
-    async function applyAdminRikoTokenConfigForWhitelist() {{
+    async function applyAdminRikoTokenConfigForWhitelist(options = {{}}) {{
       try {{
+        const quiet = !!options?.quiet;
+        const setBulkStatus = (text, isErr) => {{
+          if (!quiet) setAdminRikoOnchainStatus(text, !!isErr);
+        }};
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(adminRikoVaultAddress || "").trim();
         if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured in admin settings.");
@@ -36645,21 +36672,44 @@ def _render_admin_page() -> str:
         const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, signer);
         await assertAdminIsVaultOwner(vault, signer, "bulk token config update");
         const applied = [];
+        const skipped = [];
         const failed = [];
         const total = rows.length;
         for (let i = 0; i < rows.length; i += 1) {{
           const row = rows[i];
-          const symbol = String(row?.symbol || "").trim().toUpperCase();
-          const token = normalizeEthAddressInput(row?.address || "");
+          const symbolRaw = String(row?.symbol || "").trim().toLowerCase();
+          const symbol = symbolRaw.toUpperCase();
+          const canonicalBySymbol = normalizeEthAddressInput(resolveAdminRikoAddressBySymbol(symbolRaw));
+          const tokenFromRow = normalizeEthAddressInput(row?.address || "");
+          const token = canonicalBySymbol || tokenFromRow;
           if (!token) continue;
-          setAdminRikoOnchainStatus(`Whitelist token config: ${{i + 1}}/${{total}} (${{symbol || token}}) - resolving Chainlink feed...`, false);
+          setBulkStatus(`Whitelist token config: ${{i + 1}}/${{total}} (${{symbol || token}}) - resolving Chainlink feed...`, false);
           try {{
+            // Precheck token metadata, because non-standard addresses often revert with "No access".
+            try {{
+              const tokenMeta = new ethers.Contract(token, ["function decimals() view returns (uint8)"], signer);
+              await tokenMeta.decimals();
+            }} catch (metaErr) {{
+              skipped.push(`${{symbol || token}}: token metadata unavailable (${{
+                metaErr?.shortMessage || metaErr?.message || "decimals() reverted"
+              }})`);
+              continue;
+            }}
             const resolved = await resolveChainlinkTokenFeedMainnet(token);
             const desc = String(resolved?.description || "").trim();
             const oracle = normalizeEthAddressInput(resolved?.oracle || "");
-            if (!oracle || !desc) throw new Error("Feed auto-resolution returned empty oracle or description.");
+            if (!oracle || !desc) {{
+              skipped.push(`${{symbol || token}}: missing Chainlink oracle/description.`);
+              continue;
+            }}
             const feedHash = ethers.keccak256(ethers.toUtf8Bytes(desc));
-            setAdminRikoOnchainStatus(
+            try {{
+              await vault.setTokenConfig.staticCall(token, true, oracle, BigInt(Math.round(maxAge)), feedHash);
+            }} catch (preErr) {{
+              skipped.push(`${{symbol || token}}: precheck failed (${{preErr?.shortMessage || preErr?.message || "reverted"}})`);
+              continue;
+            }}
+            setBulkStatus(
               `Whitelist token config: ${{i + 1}}/${{total}} (${{symbol || token}}) - sending tx...`,
               false
             );
@@ -36667,25 +36717,37 @@ def _render_admin_page() -> str:
             await tx.wait();
             applied.push(`${{symbol || token}}`);
           }} catch (e) {{
-            failed.push(`${{symbol || token}}: ${{e?.shortMessage || e?.message || "unknown"}}`);
+            const msg = String(e?.shortMessage || e?.message || "unknown");
+            if (/Chainlink feed for this token was not found automatically/i.test(msg)) {{
+              skipped.push(`${{symbol || token}}: no Chainlink USD feed.`);
+            }} else {{
+              failed.push(`${{symbol || token}}: ${{msg}}`);
+            }}
           }}
         }}
-        if (failed.length) {{
-          const failPreview = failed.slice(0, 3).join(" | ");
-          setAdminRikoOnchainStatus(
-            `Whitelist apply finished: ok=${{applied.length}}, failed=${{failed.length}}.${{failPreview ? " Failures: " + failPreview : ""}}`,
-            true
+        if (failed.length || skipped.length) {{
+          const failPreview = failed.slice(0, 2).join(" | ");
+          const skipPreview = skipped.slice(0, 2).join(" | ");
+          setBulkStatus(
+            `Whitelist apply finished: ok=${{applied.length}}, skipped=${{skipped.length}}, failed=${{failed.length}}.` +
+              `${{skipPreview ? " Skipped: " + skipPreview : ""}}` +
+              `${{failPreview ? " Failures: " + failPreview : ""}}`,
+            failed.length > 0
           );
         }} else {{
-          setAdminRikoOnchainStatus(`Whitelist apply complete: configured ${{applied.length}} token(s).`, false);
+          setBulkStatus(`Whitelist apply complete: configured ${{applied.length}} token(s).`, false);
         }}
         await loadAdminRikoWhitelist();
+        return {{ ok: failed.length === 0, applied, skipped, failed }};
       }} catch (e) {{
         if (isWalletUserRejectedError(e)) {{
-          setAdminRikoOnchainStatus("Signature was rejected in wallet. Bulk token config update was canceled.", true);
-          return;
+          const msg = "Signature was rejected in wallet. Bulk token config update was canceled.";
+          if (!options?.quiet) setAdminRikoOnchainStatus(msg, true);
+          return {{ ok: false, canceled: true, error: msg, applied: [], skipped: [], failed: [] }};
         }}
-        setAdminRikoOnchainStatus("Bulk token config update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+        const msg = "Bulk token config update failed: " + (e?.shortMessage || e?.message || "unknown");
+        if (!options?.quiet) setAdminRikoOnchainStatus(msg, true);
+        return {{ ok: false, error: msg, applied: [], skipped: [], failed: [] }};
       }}
     }}
     async function applyAdminRikoTokenConfig() {{
@@ -36694,6 +36756,7 @@ def _render_admin_page() -> str:
     let adminRikoWhitelistItems = [];
     let adminRikoWhitelistActiveItems = [];
     let adminRikoWhitelistSymbolAddresses = {{}};
+    let adminRikoWhitelistOracleStatusByToken = new Map();
     let adminRikoAllowanceItems = [];
     function setAdminRikoWhitelistStatus(text, isErr) {{
       const el = document.getElementById("adminRikoWhitelistStatus");
@@ -36727,6 +36790,56 @@ def _render_admin_page() -> str:
         wsteth: "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0"
       }};
       return staticFallback[sym] || "";
+    }}
+    function renderAdminRikoWhitelistFlagBadge(kind, text) {{
+      const cls = kind === "ok" ? "ok" : (kind === "err" ? "err" : (kind === "warn" ? "warn" : "muted"));
+      return `<span class="admin-riko-whitelist-flag ${{cls}}"><span class="dot"></span><span>${{esc(text || "pending")}}</span></span>`;
+    }}
+    function getAdminRikoWhitelistStatusMeta(symbol, address) {{
+      const sym = String(symbol || "").trim().toLowerCase();
+      const addr = normalizeAdminRikoAddress(address || "");
+      if (!sym) return {{ kind: "muted", text: "empty" }};
+      if (sym === "eth" || addr === "native") return {{ kind: "muted", text: "native" }};
+      if (!/^0x[a-f0-9]{{40}}$/.test(addr)) return {{ kind: "err", text: "bad address" }};
+      const cached = adminRikoWhitelistOracleStatusByToken.get(addr);
+      if (cached?.state === "ok") return {{ kind: "ok", text: `${{shortAddrAdmin(addr)}} | feed ok` }};
+      if (cached?.state === "no_feed") return {{ kind: "warn", text: `${{shortAddrAdmin(addr)}} | no feed` }};
+      if (cached?.state === "bad_token") return {{ kind: "err", text: `${{shortAddrAdmin(addr)}} | bad token` }};
+      if (cached?.state === "checking") return {{ kind: "muted", text: `${{shortAddrAdmin(addr)}} | checking` }};
+      return {{ kind: "muted", text: `${{shortAddrAdmin(addr)}} | pending` }};
+    }}
+    async function refreshAdminRikoWhitelistOracleStatuses() {{
+      const rows = snapshotAdminRikoWhitelistRows();
+      let changed = false;
+      for (const row of rows) {{
+        const symbol = String(row?.symbol || "").trim().toLowerCase();
+        const token = normalizeAdminRikoAddress(row?.address || "");
+        if (!symbol || symbol === "eth" || token === "native") continue;
+        if (!/^0x[a-f0-9]{{40}}$/.test(token)) continue;
+        const existing = adminRikoWhitelistOracleStatusByToken.get(token);
+        if (existing?.state === "ok" || existing?.state === "no_feed" || existing?.state === "bad_token" || existing?.state === "checking") continue;
+        adminRikoWhitelistOracleStatusByToken.set(token, {{ state: "checking" }});
+        changed = true;
+        try {{
+          const ethers = await ensureEthersAdmin();
+          const tokenMeta = new ethers.Contract(token, ["function decimals() view returns (uint8)"], window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider());
+          await tokenMeta.decimals();
+          await resolveChainlinkTokenFeedMainnet(token);
+          adminRikoWhitelistOracleStatusByToken.set(token, {{ state: "ok" }});
+          changed = true;
+        }} catch (e) {{
+          const msg = String(e?.shortMessage || e?.message || "").toLowerCase();
+          if (msg.includes("chainlink feed for this token was not found")) {{
+            adminRikoWhitelistOracleStatusByToken.set(token, {{ state: "no_feed" }});
+          }} else if (msg.includes("decimals")) {{
+            adminRikoWhitelistOracleStatusByToken.set(token, {{ state: "bad_token" }});
+          }} else {{
+            adminRikoWhitelistOracleStatusByToken.set(token, {{ state: "no_feed" }});
+          }}
+          changed = true;
+        }}
+      }}
+      if (changed) renderAdminRikoWhitelistEditor();
     }}
     function getAdminRikoActiveErc20WhitelistOptions() {{
       const out = [];
@@ -36952,6 +37065,10 @@ def _render_admin_page() -> str:
         <div class="admin-riko-whitelist-row">
           <input data-admin-riko-field="symbol" data-index="${{idx}}" placeholder="symbol" value="${{esc(it?.symbol || "")}}" />
           <input data-admin-riko-field="address" data-index="${{idx}}" placeholder="0x... or native" value="${{esc(it?.address || "")}}" />
+          ${{(() => {{
+            const meta = getAdminRikoWhitelistStatusMeta(it?.symbol || "", it?.address || "");
+            return renderAdminRikoWhitelistFlagBadge(meta.kind, meta.text);
+          }})()}}
           <input class="admin-riko-whitelist-keep-check" type="checkbox" data-admin-riko-field="keep_on_vault" data-index="${{idx}}" title="Keep deposits of this token on vault (do not forward to custody)" ${{it?.keep_on_vault ? "checked" : ""}} />
           <button type="button" class="btn danger" onclick="removeAdminRikoWhitelistRow(${{idx}})">-</button>
         </div>
@@ -36959,6 +37076,7 @@ def _render_admin_page() -> str:
       for (const input of rowsEl.querySelectorAll("input")) {{
         input.addEventListener("input", onAdminRikoWhitelistInputChanged);
       }}
+      refreshAdminRikoWhitelistOracleStatuses().catch(() => {{}});
     }}
     function snapshotAdminRikoWhitelistRows() {{
       const rowsEl = document.getElementById("adminRikoWhitelistRows");
@@ -37107,6 +37225,21 @@ def _render_admin_page() -> str:
         if ((applied?.skipped || []).length) notes.push("Skipped: " + applied.skipped.map((x) => String(x || "")).slice(0, 6).join(", "));
         setAdminRikoWhitelistStatus(notes.length ? notes.join(" | ") : "RIKO whitelist applied.", false);
         await loadAdminRikoWhitelist();
+        setAdminRikoWhitelistStatus("Whitelist applied. Syncing token config on-chain...", false);
+        const bulk = await applyAdminRikoTokenConfigForWhitelist({{ quiet: true }});
+        if (bulk?.canceled) {{
+          setAdminRikoWhitelistStatus("Whitelist applied. Token config sync canceled in wallet.", true);
+        }} else if (bulk?.error) {{
+          setAdminRikoWhitelistStatus("Whitelist applied, but token config sync failed: " + String(bulk.error || "unknown"), true);
+        }} else {{
+          const okN = Array.isArray(bulk?.applied) ? bulk.applied.length : 0;
+          const skipN = Array.isArray(bulk?.skipped) ? bulk.skipped.length : 0;
+          const failN = Array.isArray(bulk?.failed) ? bulk.failed.length : 0;
+          setAdminRikoWhitelistStatus(
+            `Whitelist applied and token config synced: ok=${{okN}}, skipped=${{skipN}}, failed=${{failN}}.`,
+            failN > 0
+          );
+        }}
       }} catch (e) {{
         if (isWalletUserRejectedError(e)) {{
           setAdminRikoWhitelistStatus("Signature was rejected in wallet. Apply was canceled.", true);
