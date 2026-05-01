@@ -27701,7 +27701,7 @@ def _render_riko_page() -> str:
           );
           throw new Error(
             `${preMsg}. Token ${inputTokenLabel} (${tokenAddrTxt}) is not configured on-chain. ` +
-            "Run admin \"Set token config\" -> \"Apply on-chain\" to sync all active whitelist tokens."
+            "Run admin \\\"Set token config\\\" -> \\\"Apply on-chain\\\" to sync all active whitelist tokens."
           );
         }
 
