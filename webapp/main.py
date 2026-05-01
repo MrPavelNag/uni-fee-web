@@ -35860,6 +35860,30 @@ def _render_admin_page() -> str:
         }}
         setAdminRikoOnchainStatus(data?.info || "RIKO vault address saved in admin settings.", false);
         await loadAdminRikoGlobalCap();
+        if (/^0x[a-fA-F0-9]{{40}}$/.test(adminRikoVaultAddress)) {{
+          setAdminRikoOnchainStatus("Vault saved. Syncing saved whitelist token config to this vault...", false);
+          const bulk = await applyAdminRikoTokenConfigForWhitelist({{ quiet: true }});
+          if (bulk?.canceled) {{
+            setAdminRikoOnchainStatus("Vault saved. Token config sync canceled in wallet.", true);
+          }} else if (bulk?.error) {{
+            setAdminRikoOnchainStatus("Vault saved, but token config sync failed: " + String(bulk.error || "unknown"), true);
+          }} else {{
+            const okN = Array.isArray(bulk?.applied) ? bulk.applied.length : 0;
+            const skipN = Array.isArray(bulk?.skipped) ? bulk.skipped.length : 0;
+            const failN = Array.isArray(bulk?.failed) ? bulk.failed.length : 0;
+            setAdminRikoOnchainStatus(
+              `Vault saved and whitelist token config synced: ok=${{okN}}, skipped=${{skipN}}, failed=${{failN}}.`,
+              failN > 0
+            );
+          }}
+          // ERC-20 approvals are spender-specific (spender = vault address).
+          // On vault switch, restore saved custody allowances automatically.
+          const presetRows = collectAdminRikoCustodyAllowancePresetItems();
+          if (presetRows.length) {{
+            setAdminRikoOnchainStatus("Restoring custody allowances for new vault address...", false);
+            await applyAllAdminRikoCustodyAllowancePresets();
+          }}
+        }}
       }} catch (e) {{
         if (isWalletUserRejectedError(e)) {{
           setAdminRikoOnchainStatus("Signature was rejected in wallet. Vault address update was canceled.", true);
