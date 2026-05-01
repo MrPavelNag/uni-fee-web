@@ -34030,10 +34030,6 @@ def _render_admin_page() -> str:
           <input id="adminRikoVaultAddressInput" type="text" placeholder="0x... vault contract"/>
           <button class="btn btn-soft" onclick="saveAdminRikoVaultAddress()">Apply on-chain</button>
         </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;">
-          <label style="margin:0">Choose new owner (step 1)</label>
-          <input id="adminRikoNextOwnerInput" type="text" placeholder="0x... new owner"/>
-        </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set global cap (USD)</label>
           <input id="adminRikoGlobalCapUsd" type="number" min="0" step="1" value="0" />
@@ -34050,6 +34046,37 @@ def _render_admin_page() -> str:
           <button class="btn" onclick="applyAdminRikoPendingOperator()">Apply on-chain</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Set token config</label>
+          <input id="adminRikoTokenCfgTokenInput" type="text" placeholder="0x... token address" />
+          <button class="btn btn-soft" onclick="loadAdminRikoTokenConfig()">Load on-chain</button>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px minmax(140px,200px) 1fr;gap:10px;align-items:center;">
+          <label style="margin:0">Token allowed</label>
+          <select id="adminRikoTokenCfgAllowedInput">
+            <option value="true">true</option>
+            <option value="false">false</option>
+          </select>
+          <span class="hint" style="margin:0">Set false to disable token in vault.</span>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;">
+          <label style="margin:0">Oracle address</label>
+          <input id="adminRikoTokenCfgOracleInput" type="text" placeholder="0x... Chainlink feed" />
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px minmax(140px,220px) 1fr;gap:10px;align-items:center;">
+          <label style="margin:0">Oracle max age (sec)</label>
+          <input id="adminRikoTokenCfgMaxAgeInput" type="number" min="0" step="1" value="86400" />
+          <span class="hint" style="margin:0">Example: 86400 = 1 day.</span>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Feed description</label>
+          <input id="adminRikoTokenCfgDescInput" type="text" placeholder='Exact Chainlink description, e.g. "USDT / USD"' />
+          <button class="btn" onclick="applyAdminRikoTokenConfig()">Apply on-chain</button>
+        </div>
+        <div class="row">
+          <label>Token config (current)</label>
+          <div id="adminRikoTokenCfgCurrent">-</div>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Pause responsible</label>
           <input id="adminRikoPauseGuardianInput" type="text" placeholder="0x... pause guardian"/>
           <button class="btn btn-soft" onclick="saveAdminRikoPauseGuardian()">Apply on-chain</button>
@@ -34058,6 +34085,10 @@ def _render_admin_page() -> str:
           <label style="margin:0">Set RIKO price (USD)</label>
           <input id="adminRikoPriceUsdInput" type="number" min="0.00001" step="0.00001" value="1.00000"/>
           <button class="btn" onclick="applyAdminRikoPriceUsd()">Apply on-chain</button>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;">
+          <label style="margin:0">Choose new owner (step 1)</label>
+          <input id="adminRikoNextOwnerInput" type="text" placeholder="0x... new owner"/>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;">
           <label style="margin:0">Owner actions</label>
