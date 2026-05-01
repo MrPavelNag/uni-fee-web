@@ -33911,12 +33911,12 @@ def _render_admin_page() -> str:
     }}
     .admin-riko-signers-grid > .card h3 {{
       margin: 0 0 6px;
-      font-size: 16px;
+      font-size: 17px;
       line-height: 1.2;
     }}
     .admin-riko-signers-grid > .card .hint {{
       margin: 0 0 6px;
-      font-size: 12px;
+      font-size: 13px;
       line-height: 1.2;
     }}
     #adminRikoWhitelistRows {{
@@ -33971,7 +33971,7 @@ def _render_admin_page() -> str:
     .admin-riko-allowance-row input {{
       min-height: var(--admin-riko-row-height);
       padding: 4px 8px;
-      font-size: 13px;
+      font-size: 14px;
       line-height: 1.2;
     }}
     .admin-riko-whitelist-keep-check {{
@@ -34008,13 +34008,13 @@ def _render_admin_page() -> str:
     }}
     .admin-riko-signers-grid .btn {{
       padding: 6px 10px;
-      font-size: 13px;
+      font-size: 14px;
       line-height: 1.15;
     }}
     .admin-riko-signers-grid .status {{
       margin-left: 0;
       margin-top: 2px;
-      font-size: 12px;
+      font-size: 13px;
       line-height: 1.2;
     }}
     .admin-riko-signers-grid {{
@@ -34116,16 +34116,6 @@ def _render_admin_page() -> str:
           <label style="margin:0">Set pending operator</label>
           <input id="adminRikoPendingOperatorInput" type="text" placeholder="0x... operator"/>
           <button class="btn" onclick="applyAdminRikoPendingOperator()">Apply on-chain</button>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Set token config</label>
-          <span class="hint" style="margin:0">Applies automatically to all active ERC-20 tokens from whitelist (allowed=true).</span>
-          <button class="btn btn-soft" type="button" onclick="applyAdminRikoTokenConfig()">Apply on-chain</button>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px minmax(140px,220px) 1fr;gap:10px;align-items:center;">
-          <label style="margin:0">Oracle max age (sec)</label>
-          <input id="adminRikoTokenCfgMaxAgeInput" type="number" min="0" step="1" value="86400" />
-          <span class="hint" style="margin:0">Example: 86400 = 1 day.</span>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Pause responsible</label>
@@ -36653,6 +36643,7 @@ def _render_admin_page() -> str:
       }}
       throw new Error("Chainlink feed for this token was not found automatically.");
     }}
+    const ADMIN_RIKO_TOKEN_CFG_DEFAULT_MAX_AGE_SEC = 86400;
     async function applyAdminRikoTokenConfigForWhitelist(options = {{}}) {{
       try {{
         const quiet = !!options?.quiet;
@@ -36662,8 +36653,9 @@ def _render_admin_page() -> str:
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
         const addr = String(adminRikoVaultAddress || "").trim();
         if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured in admin settings.");
-        const maxAgeRaw = String(document.getElementById("adminRikoTokenCfgMaxAgeInput")?.value || "").trim();
-        const maxAge = Number(maxAgeRaw);
+        const maxAgeEl = document.getElementById("adminRikoTokenCfgMaxAgeInput");
+        const maxAgeRaw = String(maxAgeEl?.value || "").trim();
+        const maxAge = Number(maxAgeRaw || ADMIN_RIKO_TOKEN_CFG_DEFAULT_MAX_AGE_SEC);
         if (!Number.isFinite(maxAge) || maxAge <= 0) throw new Error("Oracle max age must be > 0.");
         const rows = getAdminRikoActiveErc20WhitelistOptions();
         if (!rows.length) throw new Error("No active ERC-20 tokens found in whitelist.");
@@ -36802,11 +36794,11 @@ def _render_admin_page() -> str:
       if (sym === "eth" || addr === "native") return {{ kind: "muted", text: "native" }};
       if (!/^0x[a-f0-9]{{40}}$/.test(addr)) return {{ kind: "err", text: "bad address" }};
       const cached = adminRikoWhitelistOracleStatusByToken.get(addr);
-      if (cached?.state === "ok") return {{ kind: "ok", text: `${{shortAddrAdmin(addr)}} | feed ok` }};
-      if (cached?.state === "no_feed") return {{ kind: "warn", text: `${{shortAddrAdmin(addr)}} | no feed` }};
-      if (cached?.state === "bad_token") return {{ kind: "err", text: `${{shortAddrAdmin(addr)}} | bad token` }};
-      if (cached?.state === "checking") return {{ kind: "muted", text: `${{shortAddrAdmin(addr)}} | checking` }};
-      return {{ kind: "muted", text: `${{shortAddrAdmin(addr)}} | pending` }};
+      if (cached?.state === "ok") return {{ kind: "ok", text: "feed ok" }};
+      if (cached?.state === "no_feed") return {{ kind: "warn", text: "no feed" }};
+      if (cached?.state === "bad_token") return {{ kind: "err", text: "bad token" }};
+      if (cached?.state === "checking") return {{ kind: "muted", text: "checking" }};
+      return {{ kind: "muted", text: "pending" }};
     }}
     async function refreshAdminRikoWhitelistOracleStatuses() {{
       const rows = snapshotAdminRikoWhitelistRows();
@@ -37061,18 +37053,19 @@ def _render_admin_page() -> str:
       const rowsEl = document.getElementById("adminRikoWhitelistRows");
       if (!rowsEl) return;
       const rows = adminRikoWhitelistItems.length ? adminRikoWhitelistItems : [{{symbol:"", address:"", keep_on_vault:false}}];
-      rowsEl.innerHTML = rows.map((it, idx) => `
-        <div class="admin-riko-whitelist-row">
-          <input data-admin-riko-field="symbol" data-index="${{idx}}" placeholder="symbol" value="${{esc(it?.symbol || "")}}" />
-          <input data-admin-riko-field="address" data-index="${{idx}}" placeholder="0x... or native" value="${{esc(it?.address || "")}}" />
-          ${{(() => {{
-            const meta = getAdminRikoWhitelistStatusMeta(it?.symbol || "", it?.address || "");
-            return renderAdminRikoWhitelistFlagBadge(meta.kind, meta.text);
-          }})()}}
-          <input class="admin-riko-whitelist-keep-check" type="checkbox" data-admin-riko-field="keep_on_vault" data-index="${{idx}}" title="Keep deposits of this token on vault (do not forward to custody)" ${{it?.keep_on_vault ? "checked" : ""}} />
-          <button type="button" class="btn danger" onclick="removeAdminRikoWhitelistRow(${{idx}})">-</button>
-        </div>
-      `).join("");
+      rowsEl.innerHTML = rows.map((it, idx) => {{
+        const meta = getAdminRikoWhitelistStatusMeta(it?.symbol || "", it?.address || "");
+        const flagHtml = renderAdminRikoWhitelistFlagBadge(meta.kind, meta.text);
+        return `
+          <div class="admin-riko-whitelist-row">
+            <input data-admin-riko-field="symbol" data-index="${{idx}}" placeholder="symbol" value="${{esc(it?.symbol || "")}}" />
+            <input data-admin-riko-field="address" data-index="${{idx}}" placeholder="0x... or native" value="${{esc(it?.address || "")}}" />
+            ${{flagHtml}}
+            <input class="admin-riko-whitelist-keep-check" type="checkbox" data-admin-riko-field="keep_on_vault" data-index="${{idx}}" title="Keep deposits of this token on vault (do not forward to custody)" ${{it?.keep_on_vault ? "checked" : ""}} />
+            <button type="button" class="btn danger" onclick="removeAdminRikoWhitelistRow(${{idx}})">-</button>
+          </div>
+        `;
+      }}).join("");
       for (const input of rowsEl.querySelectorAll("input")) {{
         input.addEventListener("input", onAdminRikoWhitelistInputChanged);
       }}
