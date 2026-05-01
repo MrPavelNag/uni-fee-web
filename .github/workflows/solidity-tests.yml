@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   forge-test:
     runs-on: ubuntu-latest
@@ -18,8 +21,11 @@ jobs:
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: stable
+          version: v1.5.1
 
       - name: Show forge version
         run: forge --version
