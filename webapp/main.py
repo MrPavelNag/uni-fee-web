@@ -25614,7 +25614,6 @@ def _render_riko_page() -> str:
     }
     function explorerTxBaseForChain(chainId) {
       const n = Number(chainId || 0);
-      if (n === 11155111) return "https://sepolia.etherscan.io/tx/";
       if (n === 1) return "https://etherscan.io/tx/";
       return "";
     }
@@ -25704,7 +25703,7 @@ def _render_riko_page() -> str:
         const copyBtn = `<button type="button" class="riko-tx-tool-btn" title="Copy tx hash" onclick="copyTxHashRiko('${safeHash}')">⧉</button>`;
         return `<span class="riko-tx-tools">${openBtn}${copyBtn}</span>`;
       };
-      const chainId = Number(authState?.chain_id || 11155111);
+      const chainId = Number(authState?.chain_id || 1);
       const addr = resolveHistoryAddress();
       const hiddenRows = loadHiddenRikoTxRows(addr, chainId);
       const parseRowTs = (row) => {
@@ -26100,7 +26099,7 @@ def _render_riko_page() -> str:
     function toggleRikoTxRowVisibility(rowKey, isVisible) {
       const key = String(rowKey || "").trim();
       if (!key) return;
-      const chainId = Number(authState?.chain_id || 11155111);
+      const chainId = Number(authState?.chain_id || 1);
       const addr = resolveHistoryAddress();
       const hidden = loadHiddenRikoTxRows(addr, chainId);
       if (isVisible) hidden.delete(key);
@@ -26113,7 +26112,7 @@ def _render_riko_page() -> str:
       if (!raw) return;
       const keys = raw.split("||").map((x) => String(x || "").trim()).filter(Boolean);
       if (!keys.length) return;
-      const chainId = Number(authState?.chain_id || 11155111);
+      const chainId = Number(authState?.chain_id || 1);
       const addr = resolveHistoryAddress();
       const hidden = loadHiddenRikoTxRows(addr, chainId);
       for (const key of keys) {
@@ -26215,7 +26214,7 @@ def _render_riko_page() -> str:
         return { ...row, action };
       });
       if (!changed) return;
-      const chainId = Number(authState?.chain_id || 11155111);
+      const chainId = Number(authState?.chain_id || 1);
       const addr = resolveHistoryAddress();
       saveLocalRikoTxHistory(addr, chainId, rikoTxHistory);
       renderRikoTxHistory();
@@ -26239,7 +26238,7 @@ def _render_riko_page() -> str:
       rikoDeferredTxRows = (Array.isArray(rikoDeferredTxRows) ? rikoDeferredTxRows : []).map(applyPatch);
       rikoTxHistory = (Array.isArray(rikoTxHistory) ? rikoTxHistory : []).map(applyPatch);
       if (!changed) return;
-      const chainId = Number(authState?.chain_id || 11155111);
+      const chainId = Number(authState?.chain_id || 1);
       const addr = resolveHistoryAddress();
       saveLocalRikoTxHistory(addr, chainId, rikoTxHistory);
       renderRikoTxHistory();
@@ -26252,7 +26251,7 @@ def _render_riko_page() -> str:
           wallet = String((accounts || [])[0] || "").trim();
         } catch (_) {}
       }
-      const chainId = Number(authState?.chain_id || 11155111);
+      const chainId = Number(authState?.chain_id || 1);
       const walletLower = String(wallet || "").trim().toLowerCase();
       const localItems = loadLocalRikoTxHistory(walletLower, chainId);
       if (Array.isArray(localItems) && localItems.length) {
@@ -26295,7 +26294,7 @@ def _render_riko_page() -> str:
       const queued = Array.isArray(rikoDeferredTxRows) ? rikoDeferredTxRows.slice() : [];
       rikoDeferredTxRows = [];
       if (!queued.length) return;
-      const chainId = Number(authState?.chain_id || 11155111);
+      const chainId = Number(authState?.chain_id || 1);
       const addr = resolveHistoryAddress();
       const localItems = mergeTxHistoryLists(queued, loadLocalRikoTxHistory(addr, chainId));
       saveLocalRikoTxHistory(addr, chainId, localItems);
@@ -26331,7 +26330,7 @@ def _render_riko_page() -> str:
       const hash = String(txHash || "").trim();
       if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) return;
       const url = await buildTxExplorerUrl(hash, signerOrProvider);
-      const chainId = Number(authState?.chain_id || 11155111);
+      const chainId = Number(authState?.chain_id || 1);
       const addr = resolveHistoryAddress();
       const localRow = {
         action: String(action || "tx"),
@@ -26382,7 +26381,7 @@ def _render_riko_page() -> str:
       rikoDeferredTxRows = (Array.isArray(rikoDeferredTxRows) ? rikoDeferredTxRows : []).map(mark);
       rikoTxHistory = (Array.isArray(rikoTxHistory) ? rikoTxHistory : []).map(mark);
       if (changed) {
-        const chainId = Number(authState?.chain_id || 11155111);
+        const chainId = Number(authState?.chain_id || 1);
         const addr = resolveHistoryAddress();
         saveLocalRikoTxHistory(addr, chainId, rikoTxHistory);
         renderRikoTxHistory();
@@ -26939,13 +26938,10 @@ def _render_riko_page() -> str:
       if (s !== "eth") return getTokenAddressBySymbol(s);
       const fromWeth = getTokenAddressBySymbol("weth");
       if (/^0x[a-f0-9]{40}$/.test(String(fromWeth || "").toLowerCase())) return fromWeth;
-      const chainId = Number(authState?.chain_id || 0);
-      if (chainId === 11155111) return "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14";
       return "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
     }
     function wrappedNativeByChainId(chainId) {
       const n = Number(chainId || 0);
-      if (n === 11155111) return "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"; // Sepolia WETH
       if (n === 1) return "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"; // Mainnet WETH
       return "";
     }
@@ -27075,7 +27071,7 @@ def _render_riko_page() -> str:
           activePendingKeys.add(`${sym || "token"}|${addrLc}`);
         }
         const activeSetMem = (rikoLastActivePendingByToken instanceof Set) ? rikoLastActivePendingByToken : new Set();
-        const chainIdForPending = Number(authState?.chain_id || 11155111);
+        const chainIdForPending = Number(authState?.chain_id || 1);
         const persistedActive = loadLastActivePendingKeys(user, chainIdForPending);
         const previousActive = Array.from(new Set([...(Array.from(activeSetMem || [])), ...(Array.from(persistedActive || []))]));
         const clearedPendingKeys = previousActive.filter((k) => !activePendingKeys.has(k));
@@ -33827,15 +33823,13 @@ def _render_admin_page() -> str:
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Vault address (RIKO)</label>
           <input id="adminRikoVaultAddressInput" type="text" placeholder="0x... vault contract"/>
-          <button class="btn btn-soft" onclick="saveAdminRikoVaultAddress()">Save in admin panel</button>
+          <button class="btn btn-soft" onclick="saveAdminRikoVaultAddress()">Apply on-chain</button>
         </div>
-        <div class="row"><label>Vault address (saved)</label><div id="adminRikoVaultAddress">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set next owner</label>
           <input id="adminRikoNextOwnerInput" type="text" placeholder="0x... new owner"/>
           <button class="btn" onclick="applyAdminRikoNextOwner()">Apply on-chain</button>
         </div>
-        <div class="row"><label>Owner status</label><div id="adminRikoOwnerInfo">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set global cap (USD)</label>
           <input id="adminRikoGlobalCapUsd" type="number" min="0" step="1" value="0" />
@@ -33849,24 +33843,18 @@ def _render_admin_page() -> str:
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set pending operator</label>
           <input id="adminRikoPendingOperatorInput" type="text" placeholder="0x... operator"/>
-          <div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
-            <span id="adminRikoPendingOperatorBadge" style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;background:#e2e8f0;color:#334155;">UNKNOWN</span>
-            <button class="btn" onclick="applyAdminRikoPendingOperator()">Apply on-chain</button>
-          </div>
+          <button class="btn" onclick="applyAdminRikoPendingOperator()">Apply on-chain</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Designated operator</label>
-          <input id="adminRikoPendingOperatorDesignatedInput" type="text" placeholder="0x... designated ops wallet"/>
+          <label style="margin:0">Pending operator</label>
+          <input id="adminRikoPendingOperatorDesignatedInput" type="text" placeholder="0x... pending ops wallet"/>
           <button class="btn btn-soft" onclick="saveAdminRikoPendingOperatorDesignated()">Save in admin panel</button>
         </div>
-        <div class="row"><label>Designated operator (saved)</label><div id="adminRikoPendingOperatorDesignatedCurrent">-</div></div>
-        <div class="row"><label>Operator control check</label><div id="adminRikoPendingOperatorControlIndicator">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Pause responsible</label>
           <input id="adminRikoPauseGuardianInput" type="text" placeholder="0x... pause guardian"/>
           <button class="btn btn-soft" onclick="saveAdminRikoPauseGuardian()">Save in admin panel</button>
         </div>
-        <div class="row"><label>Pause responsible (saved)</label><div id="adminRikoPauseGuardianCurrent">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set RIKO price (USD)</label>
           <input id="adminRikoPriceUsdInput" type="number" min="0.00001" step="0.00001" value="1.00000"/>
@@ -34168,7 +34156,6 @@ def _render_admin_page() -> str:
     }}
     function explorerTxBaseForChainAdmin(chainId) {{
       const n = Number(chainId || 0);
-      if (n === 11155111) return "https://sepolia.etherscan.io/tx/";
       if (n === 1) return "https://etherscan.io/tx/";
       return "";
     }}
@@ -34316,9 +34303,21 @@ def _render_admin_page() -> str:
       const contractAddr = requireConfiguredAddress(adminRikoVaultAddress, "RIKO vault address");
       return new ethers.Contract(contractAddr, ADMIN_RIKO_VAULT_ABI, signer);
     }}
+    async function assertAdminIsVaultOwner(vault, signer, actionLabel) {{
+      const signerAddr = String(await signer.getAddress() || "").trim().toLowerCase();
+      const ownerAddr = String(await vault.owner() || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{{40}}$/.test(ownerAddr)) {{
+        throw new Error("Vault owner is not configured on-chain.");
+      }}
+      if (signerAddr !== ownerAddr) {{
+        throw new Error(
+          `Connected wallet ${{shortAddrAdmin(signerAddr)}} is not vault owner ${{shortAddrAdmin(ownerAddr)}}` +
+          `${{actionLabel ? ` for ${{actionLabel}}` : ""}}. Switch to owner wallet and retry.`
+        );
+      }}
+    }}
     function wrappedNativeByChainIdAdmin(chainId) {{
       const n = Number(chainId || 0);
-      if (n === 11155111) return "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14";
       if (n === 1) return "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
       return "";
     }}
@@ -35489,42 +35488,6 @@ def _render_admin_page() -> str:
       add(payload?.pending_operator, "PENDING_OPERATOR");
       adminOnchainRoleMap = map;
     }}
-    function updateAdminPendingOperatorControlIndicator() {{
-      const el = document.getElementById("adminRikoPendingOperatorControlIndicator");
-      const badgeEl = document.getElementById("adminRikoPendingOperatorBadge");
-      const setBadge = (text, bg, fg) => {{
-        if (!badgeEl) return;
-        badgeEl.textContent = String(text || "UNKNOWN");
-        badgeEl.style.background = String(bg || "#e2e8f0");
-        badgeEl.style.color = String(fg || "#334155");
-      }};
-      if (!el) return;
-      const designatedRaw = String(adminLastSettings?.riko_pending_operator_designated?.address || "").trim().toLowerCase();
-      const designated = /^0x[a-f0-9]{{40}}$/.test(designatedRaw) ? designatedRaw : "";
-      const onchainRaw = String(adminRikoOnchainPendingOperator || "").trim().toLowerCase();
-      const onchain = /^0x[a-f0-9]{{40}}$/.test(onchainRaw) ? onchainRaw : "";
-      if (!designated) {{
-        el.textContent = "No designated operator is set in admin panel.";
-        el.style.color = "#92400e";
-        setBadge("NO DESIGNATED", "#fef3c7", "#92400e");
-        return;
-      }}
-      if (!onchain) {{
-        el.textContent = `Designated: ${{shortAddrAdmin(designated)}}. On-chain pending operator is not configured.`;
-        el.style.color = "#b91c1c";
-        setBadge("NOT SET", "#fee2e2", "#991b1b");
-        return;
-      }}
-      if (designated === onchain) {{
-        el.textContent = `OK: on-chain pending operator matches designated ops wallet (${{shortAddrAdmin(onchain)}}).`;
-        el.style.color = "#166534";
-        setBadge("MATCH", "#dcfce7", "#166534");
-        return;
-      }}
-      el.textContent = `Mismatch: designated ${{shortAddrAdmin(designated)}}, on-chain ${{shortAddrAdmin(onchain)}}.`;
-      el.style.color = "#b91c1c";
-      setBadge("MISMATCH", "#fee2e2", "#991b1b");
-    }}
     async function saveAdminRikoVaultAddress() {{
       try {{
         requireAdminWalletAuth();
@@ -35619,7 +35582,6 @@ def _render_admin_page() -> str:
         }}
       }}
       setAdminOnchainRoles(rolePayload);
-      updateAdminPendingOperatorControlIndicator();
       setAdminProcessPendingDefaults(false);
       await loadAdminRikoPendingQueue();
       if (adminLastSettings) {{
@@ -35641,6 +35603,7 @@ def _render_admin_page() -> str:
         const capUsd6 = BigInt(Math.round(capUsd * 1e6));
         const signer = await getAdminSigner();
         const vault = await getAdminVaultContract(signer);
+        await assertAdminIsVaultOwner(vault, signer, "global cap update");
         setAdminRikoOnchainStatus(
           capUsd6 === 0n
             ? "Applying no-cap mode on-chain..."
@@ -35672,6 +35635,7 @@ def _render_admin_page() -> str:
         );
         const signer = await getAdminSigner();
         const vault = await getAdminVaultContract(signer);
+        await assertAdminIsVaultOwner(vault, signer, "owner transfer");
         setAdminRikoOnchainStatus("Applying next owner on-chain...", false);
         const tx = await vault.transferOwnership(nextOwner);
         setAdminRikoOnchainStatus("Next owner tx sent: " + tx.hash, false);
@@ -35698,6 +35662,7 @@ def _render_admin_page() -> str:
         );
         const signer = await getAdminSigner();
         const vault = await getAdminVaultContract(signer);
+        await assertAdminIsVaultOwner(vault, signer, "custody update");
         setAdminRikoOnchainStatus("Applying custody address on-chain...", false);
         const tx = await vault.setCustodyAddress(nextAddr);
         setAdminRikoOnchainStatus("Custody address tx sent: " + tx.hash, false);
@@ -35811,6 +35776,7 @@ def _render_admin_page() -> str:
         if (priceUsd6 <= 0n) throw new Error("RIKO price must be > 0 after conversion.");
         const signer = await getAdminSigner();
         const vault = await getAdminVaultContract(signer);
+        await assertAdminIsVaultOwner(vault, signer, "RIKO price update");
         setAdminRikoOnchainStatus("Applying RIKO price on-chain...", false);
         const tx = await vault.setRikoPriceUsd6(priceUsd6);
         setAdminRikoOnchainStatus("RIKO price tx sent: " + tx.hash, false);
@@ -35834,6 +35800,7 @@ def _render_admin_page() -> str:
         );
         const signer = await getAdminSigner();
         const vault = await getAdminVaultContract(signer);
+        await assertAdminIsVaultOwner(vault, signer, "pending operator update");
         setAdminRikoOnchainStatus("Applying pending redemption operator on-chain...", false);
         const tx = await vault.setPendingRedemptionOperator(opAddr);
         setAdminRikoOnchainStatus("Pending operator tx sent: " + tx.hash, false);
@@ -35853,8 +35820,8 @@ def _render_admin_page() -> str:
         requireAdminWalletAuth();
         const inputEl = document.getElementById("adminRikoPendingOperatorDesignatedInput");
         const raw = String(inputEl?.value || "").trim();
-        const normalized = raw ? requireValidInputAddress(raw, "Designated operator address must be valid.") : "";
-        setAdminRikoOnchainStatus("Saving designated pending operator in admin settings...", false);
+        const normalized = raw ? requireValidInputAddress(raw, "Pending operator address must be valid.") : "";
+        setAdminRikoOnchainStatus("Saving pending operator in admin settings...", false);
         const data = await postJson("/api/admin/riko/pending-operator-designated", {{ address: normalized }});
         const saved = (data?.riko_pending_operator_designated && typeof data.riko_pending_operator_designated === "object")
           ? data.riko_pending_operator_designated
@@ -35873,14 +35840,13 @@ def _render_admin_page() -> str:
         if (adminLastSettings && typeof adminLastSettings === "object") {{
           adminLastSettings.riko_pending_operator_designated = saved;
         }}
-        updateAdminPendingOperatorControlIndicator();
-        setAdminRikoOnchainStatus(data?.info || "Designated pending operator saved in admin settings.", false);
+        setAdminRikoOnchainStatus(data?.info || "Pending operator saved in admin settings.", false);
       }} catch (e) {{
         if (isWalletUserRejectedError(e)) {{
-          setAdminRikoOnchainStatus("Signature was rejected in wallet. Designated operator update was canceled.", true);
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Pending operator update was canceled.", true);
           return;
         }}
-        setAdminRikoOnchainStatus("Designated operator update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+        setAdminRikoOnchainStatus("Pending operator update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
     async function saveAdminRikoPauseGuardian() {{
@@ -36274,6 +36240,7 @@ def _render_admin_page() -> str:
         }}
         const signer = await getAdminSigner();
         const vault = new ethers.Contract(addr, ADMIN_RIKO_VAULT_ABI, signer);
+        await assertAdminIsVaultOwner(vault, signer, "token config update");
         setAdminRikoOnchainStatus("Applying token config on-chain...", false);
         const tx = await vault.setTokenConfig(token, allowed, oracle, BigInt(Math.round(maxAge)), feedHash);
         setAdminRikoOnchainStatus("Token config tx sent: " + tx.hash, false);
@@ -37176,7 +37143,6 @@ def _render_admin_page() -> str:
         }}
         const pauseInputEl = document.getElementById("adminRikoPauseGuardianInput");
         if (pauseInputEl && !String(pauseInputEl.value || "").trim() && pauseGuardianAddr) pauseInputEl.value = pauseGuardianAddr;
-        updateAdminPendingOperatorControlIndicator();
         renderAdminWallets(
           data.admin_wallets || [],
           data.admin_wallets_root || [],
@@ -39156,7 +39122,7 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
     address = q_addr if _is_eth_address(q_addr) else auth_addr
     if not _is_eth_address(address):
         return {"ok": True, "items": [], "address": "", "chain_id": None, "count": 0}
-    chain_id = int(auth.get("chain_id") or 11155111)
+    chain_id = int(auth.get("chain_id") or 1)
     vault_addr = _riko_vault_address_value()
     tracked_targets = {x for x in (vault_addr,) if _is_eth_address(x)}
     rows = _explorer_txlist_rows_for_owner(chain_id, address, max_items=max(limit * 4, 60))
