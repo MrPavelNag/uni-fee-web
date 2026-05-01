@@ -27425,7 +27425,7 @@ def _render_riko_page() -> str:
       "function setGlobalSupplyCapUsd6(uint256 capUsd6) external"
     ];
     const RIKO_ERROR_HINTS = {
-      RV_UnsupportedToken: "Selected token is not enabled in the vault whitelist.",
+      RV_UnsupportedToken: "Selected token is not enabled on-chain in vault token config (allowed=false).",
       RV_InvalidAmount: "Amount must be positive and valid.",
       RV_InvalidReceiver: "Receiver address is invalid.",
       RV_InvalidOracle: "Token oracle is not configured.",
@@ -27686,6 +27686,25 @@ def _render_riko_page() -> str:
           tokenDecimals = Number(await token.decimals());
           raw = ethers.parseUnits(amount, tokenDecimals);
         }
+        const depositTokenAddress = symbol === "eth" ? wrappedTokenAddress : vaultTokenAddress;
+        try {
+          // Precheck token support/oracle path before allowance/wrap to avoid unnecessary txs.
+          await vault.quoteDeposit(depositTokenAddress, raw);
+        } catch (preErr) {
+          const preMsg = formatRikoErrorMessage("Deposit precheck failed", preErr, "on-chain precheck reverted");
+          const tokenAddrTxt = String(depositTokenAddress || "").trim();
+          renderFlow(
+            -1,
+            `${preMsg} | token=${inputTokenLabel} ${tokenAddrTxt}. Configure this token in admin: Set token config (allowed=true).`,
+            true,
+            flowSymbols.length - 1
+          );
+          throw new Error(
+            `${preMsg}. Token ${inputTokenLabel} (${tokenAddrTxt}) is not configured on-chain. ` +
+            "Set token config for this exact address with allowed=true."
+          );
+        }
+
         let allowance = await token.allowance(user, contractAddress);
         if (allowance < raw) {
           renderFlow(0, "Allowance is insufficient. Sending approve tx...", false, -1);
@@ -27709,14 +27728,6 @@ def _render_riko_page() -> str:
           wrappedInThisFlow = true;
           wrappedAmount = BigInt(raw);
           flowDone.add(1);
-        }
-        const depositTokenAddress = symbol === "eth" ? wrappedTokenAddress : vaultTokenAddress;
-        try {
-          await vault.deposit.staticCall(depositTokenAddress, raw, 0, user);
-        } catch (preErr) {
-          const preMsg = formatRikoErrorMessage("Deposit precheck failed", preErr, "on-chain precheck reverted");
-          renderFlow(-1, preMsg, true, flowSymbols.length - 1);
-          throw new Error(preMsg);
         }
         renderFlow(flowSymbols.length - 1, "Sending deposit tx...", false, -1);
         const tx = await vault.deposit(depositTokenAddress, raw, 0, user);
@@ -33483,8 +33494,8 @@ def _render_admin_page() -> str:
     .btn-soft {{ background: #f8fbff; }}
     #adminRikoOnchainControlsCard input,
     #adminRikoOnchainControlsCard button {{
-      font-size: 14px;
-      line-height: 1.25;
+      font-size: 16px;
+      line-height: 1.3;
     }}
     .status {{ font-size: 13px; color: #475569; margin-left: 8px; }}
     .table-wrap {{ overflow-x: auto; border: 1px solid #dbe3ef; border-radius: 10px; }}
@@ -34020,9 +34031,14 @@ def _render_admin_page() -> str:
           <button class="btn btn-soft" onclick="saveAdminRikoVaultAddress()">Apply on-chain</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Set owner</label>
-          <input id="adminRikoNextOwnerInput" type="text" placeholder="0x... owner"/>
-          <button class="btn" onclick="applyAdminRikoNextOwner()">Apply on-chain</button>
+          <label style="margin:0">Choose new owner (step 1)</label>
+          <input id="adminRikoNextOwnerInput" type="text" placeholder="0x... new owner"/>
+          <button class="btn" onclick="applyAdminRikoNextOwner()">Step 1: Assign new owner</button>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Confirm owner change (step 2)</label>
+          <div class="hint" style="margin:0">Switch to the nominated wallet, then confirm ownership.</div>
+          <button class="btn" onclick="applyAdminRikoAcceptOwnership()">Step 2: Confirm ownership</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set global cap (USD)</label>
@@ -34436,6 +34452,7 @@ def _render_admin_page() -> str:
     let adminOnchainRoleMap = {{}};
     const ADMIN_RIKO_VAULT_ABI = [
       "function owner() view returns (address)",
+      "function pendingOwner() view returns (address)",
       "function globalSupplyCapUsd6() view returns (uint256)",
       "function custodyAddress() view returns (address)",
       "function pendingRedemptionOperator() view returns (address)",
@@ -34450,6 +34467,7 @@ def _render_admin_page() -> str:
       "event RedeemCancelled(address indexed account,address indexed token,uint256 rikoReturned)",
       "function setGlobalSupplyCapUsd6(uint256 capUsd6) external",
       "function transferOwnership(address newOwner) external",
+      "function acceptOwnership() external",
       "function setCustodyAddress(address newCustodyAddress) external",
       "function setPendingRedemptionOperator(address operator) external",
       "function setRikoPriceUsd6(uint256 newRikoPriceUsd6) external",
@@ -34548,6 +34566,19 @@ def _render_admin_page() -> str:
         throw new Error(
           `Connected wallet ${{shortAddrAdmin(signerAddr)}} is not vault owner ${{shortAddrAdmin(ownerAddr)}}` +
           `${{actionLabel ? ` for ${{actionLabel}}` : ""}}. Switch to owner wallet and retry.`
+        );
+      }}
+    }}
+    async function assertAdminIsVaultPendingOwner(vault, signer, actionLabel) {{
+      const signerAddr = String(await signer.getAddress() || "").trim().toLowerCase();
+      const pendingAddr = String(await vault.pendingOwner() || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{{40}}$/.test(pendingAddr) || /^0x0{40}$/.test(pendingAddr)) {{
+        throw new Error("Pending owner is not set on-chain.");
+      }}
+      if (signerAddr !== pendingAddr) {{
+        throw new Error(
+          `Connected wallet ${{shortAddrAdmin(signerAddr)}} is not pending owner ${{shortAddrAdmin(pendingAddr)}}` +
+          `${{actionLabel ? ` for ${{actionLabel}}` : ""}}. Switch to pending-owner wallet and retry.`
         );
       }}
     }}
@@ -35722,6 +35753,7 @@ def _render_admin_page() -> str:
         if (!map[key].includes(role)) map[key].push(role);
       }};
       add(payload?.vault_owner, "VAULT_OWNER");
+      add(payload?.pending_owner, "PENDING_OWNER");
       add(payload?.custody, "CUSTODY");
       add(payload?.pending_operator, "PENDING_OPERATOR");
       adminOnchainRoleMap = map;
@@ -35770,17 +35802,36 @@ def _render_admin_page() -> str:
       if (inVaultAddr && !String(inVaultAddr.value || "").trim() && vaultAddr) inVaultAddr.value = vaultAddr;
       adminRikoOnchainPendingOperator = "";
 
-      let rolePayload = {{ vault_owner: "", custody: "", pending_operator: "" }};
+      let rolePayload = {{ vault_owner: "", pending_owner: "", custody: "", pending_operator: "" }};
       if (!/^0x[a-fA-F0-9]{{40}}$/.test(vaultAddr)) {{
         const inCap = document.getElementById("adminRikoGlobalCapUsd");
         if (inCap) inCap.value = "0";
       }} else {{
         try {{
           const ethers = await ensureEthersAdmin();
-          const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+          let provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+          if (window.ethereum) {{
+            try {{
+              const net = await provider.getNetwork();
+              const chainId = Number(net?.chainId || 0);
+              let vaultCode = "0x";
+              try {{
+                vaultCode = String(await provider.getCode(vaultAddr) || "0x").trim().toLowerCase();
+              }} catch (_) {{
+                vaultCode = "0x";
+              }}
+              if (chainId !== 1 || vaultCode === "0x" || vaultCode === "0x0") {{
+                // Keep admin role/status cards readable even when wallet is not on mainnet.
+                provider = ethers.getDefaultProvider();
+              }}
+            }} catch (_) {{
+              provider = ethers.getDefaultProvider();
+            }}
+          }}
           const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
-          const [vaultOwner, capUsd6, custody, pendingOperator, rikoPriceUsd6] = await Promise.all([
+          const [vaultOwner, pendingOwnerRaw, capUsd6, custody, pendingOperator, rikoPriceUsd6] = await Promise.all([
             vault.owner(),
+            vault.pendingOwner(),
             vault.globalSupplyCapUsd6(),
             vault.custodyAddress(),
             vault.pendingRedemptionOperator(),
@@ -35790,21 +35841,26 @@ def _render_admin_page() -> str:
           const inCap = document.getElementById("adminRikoGlobalCapUsd");
           if (inCap) inCap.value = capNum <= 0 ? "0" : String(capNum / 1e6);
           rolePayload.vault_owner = String(vaultOwner || "");
+          rolePayload.pending_owner = String(pendingOwnerRaw || "");
           rolePayload.custody = String(custody || "");
           rolePayload.pending_operator = String(pendingOperator || "");
           adminRikoOnchainPendingOperator = String(pendingOperator || "").trim().toLowerCase();
           const rikoPriceNum = Number(rikoPriceUsd6 || 0n);
+          const pendingOwner = String(pendingOwnerRaw || "");
           const inCustody = document.getElementById("adminRikoCustodyInput");
           const inPendingOperator = document.getElementById("adminRikoPendingOperatorInput");
           const inNextOwner = document.getElementById("adminRikoNextOwnerInput");
           const inRikoPrice = document.getElementById("adminRikoPriceUsdInput");
           const ownerInfo = document.getElementById("adminRikoOwnerInfo");
+          const pendingOwnerConfigured = /^0x[a-fA-F0-9]{{40}}$/.test(pendingOwner) && !/^0x0{40}$/i.test(pendingOwner);
           if (ownerInfo) {{
-            ownerInfo.textContent = `owner=${{String(vaultOwner || "-")}}`;
+            ownerInfo.textContent = pendingOwnerConfigured
+              ? `owner=${{String(vaultOwner || "-")}}, pendingOwner=${{pendingOwner}} (new owner must call acceptOwnership)`
+              : `owner=${{String(vaultOwner || "-")}}`;
           }}
           if (inCustody && !String(inCustody.value || "").trim()) inCustody.value = String(custody || "");
           if (inPendingOperator && !String(inPendingOperator.value || "").trim()) inPendingOperator.value = String(pendingOperator || "");
-          if (inNextOwner && !String(inNextOwner.value || "").trim()) inNextOwner.value = String(vaultOwner || "");
+          if (inNextOwner && !String(inNextOwner.value || "").trim() && pendingOwnerConfigured) inNextOwner.value = pendingOwner;
           if (inRikoPrice && !String(inRikoPrice.value || "").trim()) inRikoPrice.value = Number((rikoPriceNum / 1e6) || 1).toFixed(5);
         }} catch (_) {{
           const inCap = document.getElementById("adminRikoGlobalCapUsd");
@@ -35874,16 +35930,19 @@ def _render_admin_page() -> str:
         requireAdminWalletAuth();
         const nextOwner = requireValidInputAddress(
           document.getElementById("adminRikoNextOwnerInput")?.value || "",
-          "Owner address must be valid."
+          "Next owner address must be valid."
         );
         const signer = await getAdminSigner();
         const vault = await getAdminVaultContract(signer);
-        await assertAdminIsVaultOwner(vault, signer, "owner update");
-        setAdminRikoOnchainStatus("Applying owner on-chain...", false);
+        await assertAdminIsVaultOwner(vault, signer, "owner transfer");
+        setAdminRikoOnchainStatus("Applying next owner on-chain...", false);
         const tx = await vault.transferOwnership(nextOwner);
-        setAdminRikoOnchainStatus("Owner tx sent: " + tx.hash, false);
+        setAdminRikoOnchainStatus("Next owner tx sent: " + tx.hash, false);
         await tx.wait();
-        setAdminRikoOnchainStatus("Owner updated.", false);
+        setAdminRikoOnchainStatus(
+          "Next owner set. New owner must call acceptOwnership from their wallet.",
+          false
+        );
         await loadAdminRikoGlobalCap();
       }} catch (e) {{
         if (isWalletUserRejectedError(e)) {{
@@ -35891,6 +35950,26 @@ def _render_admin_page() -> str:
           return;
         }}
         setAdminRikoOnchainStatus("Owner update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function applyAdminRikoAcceptOwnership() {{
+      try {{
+        requireAdminWalletAuth();
+        const signer = await getAdminSigner();
+        const vault = await getAdminVaultContract(signer);
+        await assertAdminIsVaultPendingOwner(vault, signer, "owner acceptance");
+        setAdminRikoOnchainStatus("Accepting ownership on-chain...", false);
+        const tx = await vault.acceptOwnership();
+        setAdminRikoOnchainStatus("acceptOwnership tx sent: " + tx.hash, false);
+        await tx.wait();
+        setAdminRikoOnchainStatus("Ownership accepted. Connected wallet is now owner.", false);
+        await loadAdminRikoGlobalCap();
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Ownership accept was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("Ownership accept failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
     async function applyAdminRikoCustodyAddress() {{

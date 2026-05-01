@@ -290,9 +290,16 @@ contract RIKOVaultNegativeTest is Test {
         vault.setTokenConfig(address(usdc), true, address(usdcUsdFeed), 1 days, feedHash);
     }
 
-    function testDirectOwnershipTransferFlow() public {
+    function testOwnable2StepTransferAndAcceptFlow() public {
         address newOwner = address(0xB0B);
         vault.transferOwnership(newOwner);
+
+        vm.prank(newOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, newOwner));
+        vault.setRikoPriceUsd6(2e6);
+
+        vm.prank(newOwner);
+        vault.acceptOwnership();
 
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
         vault.setRikoPriceUsd6(2e6);

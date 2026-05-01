@@ -5,6 +5,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IChainlinkAggregatorV3} from "./interfaces/IChainlinkAggregatorV3.sol";
@@ -27,7 +28,7 @@ interface IWETHLike {
  * - Chainlink stale-check and non-negative checks
  * - nonReentrant + pause + CEI + SafeERC20
  */
-contract RIKOVault is ERC20, Ownable, ReentrancyGuard, Pausable {
+contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20Metadata;
 
     /*//////////////////////////////////////////////////////////////
@@ -716,6 +717,7 @@ contract RIKOVault is ERC20, Ownable, ReentrancyGuard, Pausable {
 
     function _defaultWrappedNativeToken(uint256 chainId) internal pure returns (address) {
         if (chainId == 1) return 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+        if (chainId == 11155111) return 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14;
         return address(0);
     }
 
