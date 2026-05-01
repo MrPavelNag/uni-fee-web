@@ -25567,6 +25567,8 @@ def _render_riko_page() -> str:
     let rikoWhitelistExactBySymbol = {};
     let rikoDisplayAddrMap = {};
     let rikoDisplayExactBySymbol = {};
+    let rikoOnchainAllowedBySymbol = {};
+    let rikoOnchainSupportLoaded = false;
     let rikoWalletTokenBalanceRaw = 0n;
     let rikoWalletTokenBalanceDecimals = 18;
     let rikoWalletTokenBalanceFormatted = "0";
@@ -26527,14 +26529,63 @@ def _render_riko_page() -> str:
       }
       rikoDisplayAddrMap = map;
       rikoDisplayExactBySymbol = exact;
+      const symbolsForUi = rikoOnchainSupportLoaded
+        ? activeSymbols.filter((s) => {
+            if (s === "eth") {
+              const wethSupported = rikoOnchainAllowedBySymbol.weth;
+              return wethSupported !== false;
+            }
+            return rikoOnchainAllowedBySymbol[s] !== false;
+          })
+        : activeSymbols;
       if (wrap) {
-        wrap.innerHTML = activeSymbols.map((s) => `<span class="badge"><img src="/api/token-icon/${encodeURIComponent(s)}" alt="${String(s || "").toUpperCase()} icon"/>${String(s || "").toUpperCase()}</span>`).join("");
+        wrap.innerHTML = symbolsForUi.map((s) => `<span class="badge"><img src="/api/token-icon/${encodeURIComponent(s)}" alt="${String(s || "").toUpperCase()} icon"/>${String(s || "").toUpperCase()}</span>`).join("");
       }
       if (select) {
         const cur = String(select.value || "");
-        select.innerHTML = activeSymbols.map((s) => `<option value="${s}">${String(s || "").toUpperCase()}</option>`).join("");
-        if (cur && activeSymbols.includes(cur)) select.value = cur;
-        if ((!cur || !activeSymbols.includes(cur)) && activeSymbols.length) select.value = activeSymbols[0];
+        select.innerHTML = symbolsForUi.map((s) => `<option value="${s}">${String(s || "").toUpperCase()}</option>`).join("");
+        if (cur && symbolsForUi.includes(cur)) select.value = cur;
+        if ((!cur || !symbolsForUi.includes(cur)) && symbolsForUi.length) select.value = symbolsForUi[0];
+      }
+    }
+    async function refreshRikoOnchainTokenSupport() {
+      rikoOnchainAllowedBySymbol = {};
+      rikoOnchainSupportLoaded = false;
+      const vaultAddr = String(RIKO_VAULT_ADDRESS || "").trim();
+      if (!/^0x[a-fA-F0-9]{40}$/.test(vaultAddr)) return;
+      try {
+        const ethers = await ensureEthers();
+        const provider = ethers.getDefaultProvider();
+        const vault = new ethers.Contract(vaultAddr, RIKO_ABI, provider);
+        const sourceItems = Array.isArray(rikoWhitelistState) ? rikoWhitelistState : [];
+        const pairs = [];
+        for (const it of sourceItems) {
+          const sym = String(it?.symbol || "").trim().toLowerCase();
+          if (!sym || sym === "eth") continue;
+          const fromRow = normalizeAddressHex(it?.address || "");
+          const merged = [];
+          if (/^0x[a-f0-9]{40}$/.test(fromRow)) merged.push(fromRow);
+          const catalogAddrs = Array.isArray(rikoWhitelistAddrMap?.[sym]) ? rikoWhitelistAddrMap[sym] : [];
+          for (const aRaw of catalogAddrs) {
+            const a = normalizeAddressHex(aRaw || "");
+            if (/^0x[a-f0-9]{40}$/.test(a) && !merged.includes(a)) merged.push(a);
+          }
+          const token = String(merged[0] || "").trim();
+          if (!/^0x[a-f0-9]{40}$/.test(token)) continue;
+          pairs.push({ sym, token });
+        }
+        await Promise.all(pairs.map(async ({ sym, token }) => {
+          try {
+            const cfg = await vault.tokenConfigs(token);
+            rikoOnchainAllowedBySymbol[sym] = !!cfg?.allowed;
+          } catch (_) {
+            rikoOnchainAllowedBySymbol[sym] = false;
+          }
+        }));
+      } catch (_) {
+        // Keep whitelist visible even if on-chain support check is unavailable.
+      } finally {
+        rikoOnchainSupportLoaded = true;
       }
     }
     function renderRikoWhitelist() {
@@ -26920,6 +26971,7 @@ def _render_riko_page() -> str:
           const a = normalizeAddressHex(it?.address || "");
           if (s && /^0x[a-f0-9]{40}$/.test(a)) rikoWhitelistExactBySymbol[s] = a;
         }
+        await refreshRikoOnchainTokenSupport();
         renderRikoWhitelist();
         onRikoSymbolChanged();
         await refreshRikoWalletBalance();
