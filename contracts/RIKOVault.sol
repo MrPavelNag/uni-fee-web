@@ -5,7 +5,6 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IChainlinkAggregatorV3} from "./interfaces/IChainlinkAggregatorV3.sol";
@@ -28,7 +27,7 @@ interface IWETHLike {
  * - Chainlink stale-check and non-negative checks
  * - nonReentrant + pause + CEI + SafeERC20
  */
-contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
+contract RIKOVault is ERC20, Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20Metadata;
 
     /*//////////////////////////////////////////////////////////////
