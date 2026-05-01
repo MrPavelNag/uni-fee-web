@@ -26505,9 +26505,9 @@ def _render_riko_page() -> str:
     function updateRikoPublicWhitelistView() {
       const wrap = document.getElementById("rikoWhitelistBadges");
       const select = document.getElementById("rikoTokenSymbol");
-      const sourceItems = (Array.isArray(rikoPendingWhitelistState) && rikoPendingWhitelistState.length)
-        ? rikoPendingWhitelistState
-        : rikoWhitelistState;
+      // Public deposit/redeem flow must use only ACTIVE whitelist.
+      // Pending draft can differ and is not guaranteed to be configured on-chain yet.
+      const sourceItems = Array.isArray(rikoWhitelistState) ? rikoWhitelistState : [];
       const activeSymbols = (sourceItems || []).map((x) => String(x?.symbol || "").toLowerCase()).filter(Boolean);
       const map = {};
       const exact = {};
@@ -27419,6 +27419,7 @@ def _render_riko_page() -> str:
       "function redeem(address token,uint256 rikoAmountIn,uint256 minTokenOut,address receiver) external returns (uint256)",
       "function quoteDeposit(address token,uint256 amountIn) external view returns (uint256 rikoOut)",
       "function quoteRedeem(address token,uint256 rikoIn) external view returns (uint256 tokenOut)",
+      "function tokenConfigs(address token) view returns (bool allowed,address oracle,uint32 maxOracleAge,bytes32 expectedFeedDescriptionHash,uint8 tokenDecimals)",
       "function pendingRedemptions(address account,address token) view returns (uint256 rikoLocked,uint256 tokenOut,uint256 minTokenOut,address receiver,bool exists)",
       "function cancelPendingRedemption(address token) external returns (uint256 rikoReturned)",
       "function globalSupplyCapUsd6() view returns (uint256)",
@@ -27693,15 +27694,23 @@ def _render_riko_page() -> str:
         } catch (preErr) {
           const preMsg = formatRikoErrorMessage("Deposit precheck failed", preErr, "on-chain precheck reverted");
           const tokenAddrTxt = String(depositTokenAddress || "").trim();
+          let cfgHint = "";
+          try {
+            const cfgView = await vault.tokenConfigs(depositTokenAddress);
+            const cfgAllowed = !!cfgView?.allowed;
+            const cfgOracle = String(cfgView?.oracle || "");
+            const cfgAge = String(cfgView?.maxOracleAge || "0");
+            cfgHint = ` on-chain config: allowed=${cfgAllowed}, oracle=${cfgOracle || "0x0"}, maxAge=${cfgAge}`;
+          } catch (_) {}
           renderFlow(
             -1,
-            `${preMsg} | token=${inputTokenLabel} ${tokenAddrTxt}. In admin run "Set token config" -> "Apply on-chain" (auto for active whitelist).`,
+            `${preMsg} | token=${inputTokenLabel} ${tokenAddrTxt}.${cfgHint}`,
             true,
             flowSymbols.length - 1
           );
           throw new Error(
             `${preMsg}. Token ${inputTokenLabel} (${tokenAddrTxt}) is not configured on-chain. ` +
-            "Run admin \\\"Set token config\\\" -> \\\"Apply on-chain\\\" to sync all active whitelist tokens."
+            `Check active whitelist + tokenConfigs on current vault.${cfgHint}`
           );
         }
 
