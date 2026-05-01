@@ -23371,7 +23371,14 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     holders = sorted(activity.keys(), key=lambda a: int((activity.get(a) or {}).get("last_change_block") or 0), reverse=True)
     if int(limit) > 0:
         holders = holders[: max(1, min(2000, int(limit)))]
-    riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
+    warnings: list[str] = []
+    try:
+        riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
+    except Exception as e:
+        # Keep snapshot endpoint operational even when provider rejects decimals() call.
+        # RIKO uses 6 decimals, so 6 is a safe fallback for admin display math.
+        riko_decimals = 6
+        warnings.append(f"riko_decimals_fallback_to_6: {str(e)[:140]}")
     payout_token = str(bot_cfg.get("payout_token_address") or "").strip().lower()
     schedule = _load_riko_payout_schedule()
     schedule_next_due_date = str(schedule.get("next_due_date") or "")
@@ -23401,12 +23408,14 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     scale_up = max(0, int(payout_decimals) - int(riko_decimals))
     scale_down = max(0, int(riko_decimals) - int(payout_decimals))
     rows: list[dict[str, Any]] = []
+    balance_call_errors = 0
     for holder in holders:
         if str(holder or "").strip().lower() == riko_token:
             continue
         try:
             bal = int(_riko_erc20_balance_of(rpc_url, riko_token, holder))
         except Exception:
+            balance_call_errors += 1
             continue
         meta = activity.get(holder) or {}
         tx_hash = str(meta.get("last_change_hash") or "").strip().lower()
@@ -23450,6 +23459,8 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         ),
         reverse=True,
     )
+    if balance_call_errors > 0:
+        warnings.append(f"balanceOf_failed_for_{int(balance_call_errors)}_holders")
     return {
         "ok": True,
         "chain_id": int(chain_id),
@@ -23467,6 +23478,7 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         "holder_scan_latest_block": int(latest_block),
         "count": int(len(rows)),
         "items": rows,
+        "warnings": warnings,
     }
 
 
@@ -26577,17 +26589,33 @@ def _render_riko_page() -> str:
       try {
         const ethers = await ensureEthers();
         const provider = new ethers.BrowserProvider(window.ethereum);
+        const net = await provider.getNetwork();
+        const chainId = Number(net?.chainId || 0);
+        const tokenCode = String(await provider.getCode(tokenAddress) || "0x");
+        if (tokenCode === "0x") {
+          hint.textContent = `Available: token not found on current network (chainId=${chainId || "?"}, ${symLabel})`;
+          rikoWalletTokenBalanceRaw = 0n;
+          rikoWalletTokenBalanceFormatted = "0";
+          return;
+        }
         const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-        const [decimals, balance] = await Promise.all([
-          token.decimals(),
-          token.balanceOf(wallet),
-        ]);
+        const balance = await token.balanceOf(wallet);
+        let decimals = 18;
+        try {
+          const d = Number(await token.decimals());
+          if (Number.isInteger(d) && d >= 0 && d <= 36) decimals = d;
+        } catch (_) {
+          // Keep balance visible even if token has non-standard/blocked decimals().
+          decimals = 18;
+        }
         rikoWalletTokenBalanceRaw = BigInt(balance);
         rikoWalletTokenBalanceDecimals = Number(decimals || 18);
         rikoWalletTokenBalanceFormatted = formatTokenAmount(rikoWalletTokenBalanceRaw, rikoWalletTokenBalanceDecimals);
         hint.textContent = `Available: ${rikoWalletTokenBalanceFormatted} ${symLabel}`;
-      } catch (_) {
-        hint.textContent = `Available: unavailable (${symLabel})`;
+      } catch (e) {
+        const errMsg = String(e?.shortMessage || e?.message || "unknown");
+        const compactErr = errMsg.length > 96 ? (errMsg.slice(0, 96) + "...") : errMsg;
+        hint.textContent = `Available: unavailable (${symLabel}; ${compactErr})`;
         rikoWalletTokenBalanceRaw = 0n;
         rikoWalletTokenBalanceFormatted = "0";
       }
@@ -34251,6 +34279,12 @@ def _render_admin_page() -> str:
       "function setRikoPriceUsd6(uint256 newRikoPriceUsd6) external",
       "function setTokenConfig(address token,bool allowed,address oracle,uint32 maxOracleAge,bytes32 expectedFeedDescriptionHash) external"
     ];
+    const ADMIN_RIKO_ERROR_ABI = [
+      "error RV_InvalidCustodyAddress()",
+      "error RV_InvalidPendingRedemptionOperator()",
+      "error RV_InvalidRikoPrice()",
+      "error OwnableUnauthorizedAccount(address account)"
+    ];
     const ADMIN_ERC20_DECIMALS_ABI = [
       "function decimals() view returns (uint8)"
     ];
@@ -34297,6 +34331,31 @@ def _render_admin_page() -> str:
       const addr = normalizeEthAddressInput(raw);
       if (!addr) throw new Error(String(errorMessage || "Invalid address."));
       return addr;
+    }}
+    function extractRevertDataHex(err) {{
+      const direct = String(err?.data || "").trim();
+      if (/^0x[0-9a-fA-F]*$/.test(direct)) return direct;
+      const nested = String(err?.info?.error?.data || "").trim();
+      if (/^0x[0-9a-fA-F]*$/.test(nested)) return nested;
+      const inner = String(err?.error?.data || "").trim();
+      if (/^0x[0-9a-fA-F]*$/.test(inner)) return inner;
+      return "";
+    }}
+    function explainAdminVaultRevert(err) {{
+      const msg = String(err?.shortMessage || err?.message || "").trim();
+      const dataHex = extractRevertDataHex(err);
+      if (dataHex && window.ethers) {{
+        try {{
+          const iface = new window.ethers.Interface(ADMIN_RIKO_ERROR_ABI);
+          const parsed = iface.parseError(dataHex);
+          if (parsed?.name === "OwnableUnauthorizedAccount") {{
+            const acct = String(parsed?.args?.[0] || "").trim();
+            return `OwnableUnauthorizedAccount${{acct ? ` (${{shortAddrAdmin(acct)}})` : ""}}`;
+          }}
+          if (parsed?.name) return parsed.name;
+        }} catch (_) {{}}
+      }}
+      return msg || "unknown revert reason";
     }}
     async function getAdminVaultContract(signer) {{
       const ethers = await ensureEthersAdmin();
@@ -35437,6 +35496,7 @@ def _render_admin_page() -> str:
         const shownHolders = Number(rows.length || 0);
         const scanFrom = Number(data?.holder_scan_start_block || 0);
         const scanTo = Number(data?.holder_scan_latest_block || 0);
+        const warnings = Array.isArray(data?.warnings) ? data.warnings.map((x) => String(x || "").trim()).filter(Boolean) : [];
         const fmtInt = (n) => Number(n || 0).toLocaleString();
         summaryEl.textContent =
           `Showing ${{fmtInt(shownHolders)}} of ${{fmtInt(totalHolders)}} holders. ` +
@@ -35444,9 +35504,12 @@ def _render_admin_page() -> str:
           `Expected yield for next payout: ${{fmtInt(nextBps)}} bps/month. ` +
           `Next payout: ${{scheduleNextDueUtc || "-"}}. ` +
           `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
-        statusEl.textContent = hasPayoutToken
+        const baseStatus = hasPayoutToken
           ? `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}.`
           : "Loaded holders, but token payout is not applied on server yet. Set Token payout and click Apply.";
+        statusEl.textContent = warnings.length
+          ? `${{baseStatus}} Warnings: ${{warnings.join("; ")}}`
+          : baseStatus;
       }} catch (e) {{
         const errMsg = String(e?.shortMessage || e?.message || "unknown");
         renderAdminRikoHistoryTable("adminRikoHoldersTable", ["Info"], [], `Failed to load holders: ${{esc(errMsg)}}`);
@@ -35654,6 +35717,8 @@ def _render_admin_page() -> str:
       }}
     }}
     async function applyAdminRikoCustodyAddress() {{
+      let chainId = 0;
+      let vaultAddr = "";
       try {{
         requireAdminWalletAuth();
         const nextAddr = requireValidInputAddress(
@@ -35662,7 +35727,12 @@ def _render_admin_page() -> str:
         );
         const signer = await getAdminSigner();
         const vault = await getAdminVaultContract(signer);
+        const net = signer?.provider ? await signer.provider.getNetwork() : null;
+        chainId = Number(net?.chainId || 0);
+        vaultAddr = String(await vault.getAddress() || "").trim();
         await assertAdminIsVaultOwner(vault, signer, "custody update");
+        // Preflight simulation to surface exact revert reason before wallet signing.
+        await vault.setCustodyAddress.staticCall(nextAddr);
         setAdminRikoOnchainStatus("Applying custody address on-chain...", false);
         const tx = await vault.setCustodyAddress(nextAddr);
         setAdminRikoOnchainStatus("Custody address tx sent: " + tx.hash, false);
@@ -35674,7 +35744,11 @@ def _render_admin_page() -> str:
           setAdminRikoOnchainStatus("Signature was rejected in wallet. Custody update was canceled.", true);
           return;
         }}
-        setAdminRikoOnchainStatus("Custody update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+        const detail = explainAdminVaultRevert(e);
+        const extra = (typeof chainId === "number" && chainId > 0 && /^0x[a-fA-F0-9]{{40}}$/.test(String(vaultAddr || "").trim()))
+          ? ` (chainId=${{chainId}}, vault=${{shortAddrAdmin(vaultAddr)}})`
+          : "";
+        setAdminRikoOnchainStatus("Custody update failed: " + detail + extra, true);
       }}
     }}
     async function applyAdminRikoCustodyApprove(tokenAddressInput, amountInput) {{
