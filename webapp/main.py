@@ -298,6 +298,7 @@ RIKO_APPLY_SIGN_TTL_SEC = int(os.environ.get("RIKO_APPLY_SIGN_TTL_SEC", "600"))
 RIKO_APPLY_NONCES: dict[str, dict[str, Any]] = {}
 RIKO_AUTO_PAYOUT_APPLY_NONCES: dict[str, dict[str, Any]] = {}
 RIKO_VAULT_ADDRESS = os.environ.get("RIKO_VAULT_ADDRESS", "").strip()
+RIKO_VAULT_ADDRESS_STATE_KEY = "riko_vault_address_v1"
 TREASURY_YIELD_CACHE_TTL_SEC = max(300, int(os.environ.get("TREASURY_YIELD_CACHE_TTL_SEC", "21600")))
 TREASURY_YIELD_CACHE: dict[str, Any] = {}
 TREASURY_YIELD_CACHE_LOCK = threading.Lock()
@@ -2717,7 +2718,7 @@ def _human_riko_auto_yield_reason(reason: str) -> tuple[str, str]:
     mapping: dict[str, tuple[str, str]] = {
         "riko_token_not_configured": (
             "RIKO token (vault) address is not configured on server.",
-            "Set RIKO_VAULT_ADDRESS.",
+            "Set vault address in admin panel (or RIKO_VAULT_ADDRESS env).",
         ),
         "payout_token_not_configured": (
             "Payout token address is not configured on server.",
@@ -22607,6 +22608,39 @@ def _save_riko_custody_allowance_presets(items: list[dict[str, Any]]) -> dict[st
     return _load_riko_custody_allowance_presets()
 
 
+def _load_riko_vault_address() -> dict[str, Any]:
+    address = str(RIKO_VAULT_ADDRESS or "").strip().lower()
+    source = "env" if address else "unset"
+    updated_at = ""
+    raw = _analytics_get_state(RIKO_VAULT_ADDRESS_STATE_KEY)
+    if raw:
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                parsed_addr = str(payload.get("address") or "").strip().lower()
+                if parsed_addr and (not _is_eth_address(parsed_addr)):
+                    parsed_addr = ""
+                address = parsed_addr
+                source = "admin_override"
+                updated_at = str(payload.get("updated_at") or "")
+        except Exception:
+            pass
+    return {"address": address, "source": source, "updated_at": updated_at}
+
+
+def _riko_vault_address_value() -> str:
+    return str(_load_riko_vault_address().get("address") or "").strip().lower()
+
+
+def _save_riko_vault_address(address: str) -> dict[str, Any]:
+    addr = str(address or "").strip().lower()
+    if addr and (not _is_eth_address(addr)):
+        raise ValueError("vault address must be a valid 0x address or empty")
+    payload = {"address": addr, "updated_at": _iso_now()}
+    _analytics_set_state(RIKO_VAULT_ADDRESS_STATE_KEY, json.dumps(payload, ensure_ascii=False))
+    return _load_riko_vault_address()
+
+
 def _load_riko_pause_guardian() -> dict[str, Any]:
     address = str(RIKO_PAUSE_GUARDIAN_ADDRESS_ENV or "").strip().lower()
     source = "env" if address else "unset"
@@ -23179,7 +23213,7 @@ def _riko_wait_receipt(rpc_url: str, tx_hash: str, timeout_sec: int = 180) -> di
 
 def _riko_auto_payout_preview() -> dict[str, Any]:
     result: dict[str, Any] = {"ts": _iso_now(), "status": "unknown"}
-    riko_token = str(RIKO_VAULT_ADDRESS or "").strip()
+    riko_token = _riko_vault_address_value()
     if not _is_eth_address(riko_token):
         result.update({"status": "skip", "reason": "riko_token_not_configured"})
         return result
@@ -23313,9 +23347,9 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
 
 
 def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
-    riko_token = str(RIKO_VAULT_ADDRESS or "").strip().lower()
+    riko_token = _riko_vault_address_value()
     if not _is_eth_address(riko_token):
-        raise ValueError("RIKO_VAULT_ADDRESS is not configured.")
+        raise ValueError("RIKO vault address is not configured.")
     rpc_url = _riko_auto_yield_rpc_url_runtime()
     if not rpc_url:
         raise ValueError("RIKO_AUTO_YIELD_RPC_URL is not configured.")
@@ -23438,7 +23472,7 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
 
 def _riko_auto_yield_try_once() -> dict[str, Any]:
     result: dict[str, Any] = {"ts": _iso_now(), "status": "unknown"}
-    riko_token = str(RIKO_VAULT_ADDRESS or "").strip()
+    riko_token = _riko_vault_address_value()
     if not _is_eth_address(riko_token):
         result.update({"status": "skip", "reason": "riko_token_not_configured"})
         return result
@@ -23931,7 +23965,7 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
         _riko_holder_scan_bg_save_status(p)
         return p
 
-    riko_token = str(RIKO_VAULT_ADDRESS or "").strip().lower()
+    riko_token = _riko_vault_address_value()
     if not _is_eth_address(riko_token):
         return _done({"status": "skip", "reason": "riko_token_not_configured"})
     rpc_url = _riko_auto_yield_rpc_url_runtime()
@@ -24259,6 +24293,10 @@ class AdminRikoAutoYieldModeUpdate(BaseModel):
 class AdminRikoAutoYieldBotConfigUpdate(BaseModel):
     payout_token_address: str = ""
     holder_scan_start_block: int = 0
+
+
+class AdminRikoVaultAddressUpdate(BaseModel):
+    address: str = ""
 
 
 class AdminRikoAutoPayoutApplyNonceRequest(BaseModel):
@@ -27888,7 +27926,7 @@ def _render_riko_page() -> str:
         extra_script=extra_script,
         show_intro=False,
     )
-    return html.replace("__RIKO_VAULT_ADDRESS__", str(RIKO_VAULT_ADDRESS or "").strip())
+    return html.replace("__RIKO_VAULT_ADDRESS__", _riko_vault_address_value())
 
 
 def _render_positions_page() -> str:
@@ -33786,7 +33824,18 @@ def _render_admin_page() -> str:
     <div class="grid" id="tabSettings">
       <section class="card">
         <h3>RIKO on-chain controls</h3>
-        <div class="row"><label>Vault address (RIKO)</label><div id="adminRikoVaultAddress">-</div></div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Vault address (RIKO)</label>
+          <input id="adminRikoVaultAddressInput" type="text" placeholder="0x... vault contract"/>
+          <button class="btn btn-soft" onclick="saveAdminRikoVaultAddress()">Save in admin panel</button>
+        </div>
+        <div class="row"><label>Vault address (saved)</label><div id="adminRikoVaultAddress">-</div></div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Set next owner</label>
+          <input id="adminRikoNextOwnerInput" type="text" placeholder="0x... new owner"/>
+          <button class="btn" onclick="applyAdminRikoNextOwner()">Apply on-chain</button>
+        </div>
+        <div class="row"><label>Owner status</label><div id="adminRikoOwnerInfo">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set global cap (USD)</label>
           <input id="adminRikoGlobalCapUsd" type="number" min="0" step="1" value="0" />
@@ -34190,10 +34239,12 @@ def _render_admin_page() -> str:
       return n.toLocaleString(undefined, {{maximumFractionDigits: 2}});
     }}
     let adminLastSettings = null;
+    let adminRikoVaultAddress = String(RIKO_VAULT_ADDRESS || "").trim();
     let adminRikoOnchainPendingOperator = "";
     let adminOnchainRoleMap = {{}};
     const ADMIN_RIKO_VAULT_ABI = [
       "function owner() view returns (address)",
+      "function pendingOwner() view returns (address)",
       "function globalSupplyCapUsd6() view returns (uint256)",
       "function custodyAddress() view returns (address)",
       "function pendingRedemptionOperator() view returns (address)",
@@ -34207,6 +34258,7 @@ def _render_admin_page() -> str:
       "event RedeemCompleted(address indexed account,address indexed token,address indexed receiver,uint256 rikoBurned,uint256 tokenOut)",
       "event RedeemCancelled(address indexed account,address indexed token,uint256 rikoReturned)",
       "function setGlobalSupplyCapUsd6(uint256 capUsd6) external",
+      "function transferOwnership(address newOwner) external",
       "function setCustodyAddress(address newCustodyAddress) external",
       "function setPendingRedemptionOperator(address operator) external",
       "function setRikoPriceUsd6(uint256 newRikoPriceUsd6) external",
@@ -34261,7 +34313,7 @@ def _render_admin_page() -> str:
     }}
     async function getAdminVaultContract(signer) {{
       const ethers = await ensureEthersAdmin();
-      const contractAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
+      const contractAddr = requireConfiguredAddress(adminRikoVaultAddress, "RIKO vault address");
       return new ethers.Contract(contractAddr, ADMIN_RIKO_VAULT_ABI, signer);
     }}
     function wrappedNativeByChainIdAdmin(chainId) {{
@@ -34704,7 +34756,7 @@ def _render_admin_page() -> str:
       const table = document.getElementById("adminRikoPendingQueueTable");
       if (!table) return;
       try {{
-        const addr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
+        const addr = requireConfiguredAddress(adminRikoVaultAddress, "RIKO vault address");
         const ethers = await ensureEthersAdmin();
         if (!window.ethereum) throw new Error("Admin wallet provider is not available.");
         const provider = new ethers.BrowserProvider(window.ethereum);
@@ -35432,6 +35484,7 @@ def _render_admin_page() -> str:
         if (!map[key].includes(role)) map[key].push(role);
       }};
       add(payload?.vault_owner, "VAULT_OWNER");
+      add(payload?.pending_owner, "PENDING_OWNER");
       add(payload?.custody, "CUSTODY");
       add(payload?.pending_operator, "PENDING_OPERATOR");
       adminOnchainRoleMap = map;
@@ -35472,13 +35525,51 @@ def _render_admin_page() -> str:
       el.style.color = "#b91c1c";
       setBadge("MISMATCH", "#fee2e2", "#991b1b");
     }}
+    async function saveAdminRikoVaultAddress() {{
+      try {{
+        requireAdminWalletAuth();
+        const inputEl = document.getElementById("adminRikoVaultAddressInput");
+        const raw = String(inputEl?.value || "").trim();
+        const normalized = raw ? requireValidInputAddress(raw, "Vault address must be valid.") : "";
+        setAdminRikoOnchainStatus("Saving vault address in admin settings...", false);
+        const data = await postJson("/api/admin/riko/vault-address", {{ address: normalized }});
+        const saved = (data?.riko_vault_address && typeof data.riko_vault_address === "object")
+          ? data.riko_vault_address
+          : {{ address: normalized, source: "admin_override" }};
+        adminRikoVaultAddress = String(saved.address || "").trim();
+        if (inputEl) inputEl.value = adminRikoVaultAddress;
+        const currentEl = document.getElementById("adminRikoVaultAddress");
+        if (currentEl) {{
+          const addrTxt = adminRikoVaultAddress || "-";
+          const sourceTxt = String(saved.source || "").trim();
+          const updatedTxt = String(saved.updated_at || "").trim();
+          currentEl.textContent =
+            addrTxt +
+            (sourceTxt ? `, source: ${{sourceTxt}}` : "") +
+            (updatedTxt ? `, updated: ${{updatedTxt}}` : "");
+        }}
+        if (adminLastSettings && typeof adminLastSettings === "object") {{
+          adminLastSettings.riko_vault_address = saved;
+        }}
+        setAdminRikoOnchainStatus(data?.info || "RIKO vault address saved in admin settings.", false);
+        await loadAdminRikoGlobalCap();
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Vault address update was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("Vault address update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
     async function loadAdminRikoGlobalCap() {{
       const elAddr = document.getElementById("adminRikoVaultAddress");
-      const vaultAddr = String(RIKO_VAULT_ADDRESS || "").trim();
+      const vaultAddr = String(adminRikoVaultAddress || "").trim();
       if (elAddr) elAddr.textContent = vaultAddr || "-";
+      const inVaultAddr = document.getElementById("adminRikoVaultAddressInput");
+      if (inVaultAddr && !String(inVaultAddr.value || "").trim() && vaultAddr) inVaultAddr.value = vaultAddr;
       adminRikoOnchainPendingOperator = "";
 
-      let rolePayload = {{ vault_owner: "", custody: "", pending_operator: "" }};
+      let rolePayload = {{ vault_owner: "", pending_owner: "", custody: "", pending_operator: "" }};
       if (!/^0x[a-fA-F0-9]{{40}}$/.test(vaultAddr)) {{
         const inCap = document.getElementById("adminRikoGlobalCapUsd");
         if (inCap) inCap.value = "0";
@@ -35487,8 +35578,9 @@ def _render_admin_page() -> str:
           const ethers = await ensureEthersAdmin();
           const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
           const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
-          const [vaultOwner, capUsd6, custody, pendingOperator, rikoPriceUsd6] = await Promise.all([
+          const [vaultOwner, pendingOwnerRaw, capUsd6, custody, pendingOperator, rikoPriceUsd6] = await Promise.all([
             vault.owner(),
+            vault.pendingOwner(),
             vault.globalSupplyCapUsd6(),
             vault.custodyAddress(),
             vault.pendingRedemptionOperator(),
@@ -35498,19 +35590,32 @@ def _render_admin_page() -> str:
           const inCap = document.getElementById("adminRikoGlobalCapUsd");
           if (inCap) inCap.value = capNum <= 0 ? "0" : String(capNum / 1e6);
           rolePayload.vault_owner = String(vaultOwner || "");
+          rolePayload.pending_owner = String(pendingOwnerRaw || "");
           rolePayload.custody = String(custody || "");
           rolePayload.pending_operator = String(pendingOperator || "");
           adminRikoOnchainPendingOperator = String(pendingOperator || "").trim().toLowerCase();
           const rikoPriceNum = Number(rikoPriceUsd6 || 0n);
+          const pendingOwner = String(pendingOwnerRaw || "");
           const inCustody = document.getElementById("adminRikoCustodyInput");
           const inPendingOperator = document.getElementById("adminRikoPendingOperatorInput");
+          const inNextOwner = document.getElementById("adminRikoNextOwnerInput");
           const inRikoPrice = document.getElementById("adminRikoPriceUsdInput");
+          const ownerInfo = document.getElementById("adminRikoOwnerInfo");
+          const pendingOwnerConfigured = /^0x[a-fA-F0-9]{40}$/.test(pendingOwner) && !/^0x0{40}$/i.test(pendingOwner);
+          if (ownerInfo) {{
+            ownerInfo.textContent = pendingOwnerConfigured
+              ? `owner=${{String(vaultOwner || "-")}}, pendingOwner=${{pendingOwner}} (new owner must call acceptOwnership)`
+              : `owner=${{String(vaultOwner || "-")}}`;
+          }}
           if (inCustody && !String(inCustody.value || "").trim()) inCustody.value = String(custody || "");
           if (inPendingOperator && !String(inPendingOperator.value || "").trim()) inPendingOperator.value = String(pendingOperator || "");
+          if (inNextOwner && !String(inNextOwner.value || "").trim() && pendingOwnerConfigured) inNextOwner.value = pendingOwner;
           if (inRikoPrice && !String(inRikoPrice.value || "").trim()) inRikoPrice.value = Number((rikoPriceNum / 1e6) || 1).toFixed(5);
         }} catch (_) {{
           const inCap = document.getElementById("adminRikoGlobalCapUsd");
           if (inCap && !String(inCap.value || "").trim()) inCap.value = "0";
+          const ownerInfo = document.getElementById("adminRikoOwnerInfo");
+          if (ownerInfo && !String(ownerInfo.textContent || "").trim()) ownerInfo.textContent = "-";
         }}
       }}
       setAdminOnchainRoles(rolePayload);
@@ -35558,6 +35663,32 @@ def _render_admin_page() -> str:
         setAdminRikoOnchainStatus("Global cap update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
+    async function applyAdminRikoNextOwner() {{
+      try {{
+        requireAdminWalletAuth();
+        const nextOwner = requireValidInputAddress(
+          document.getElementById("adminRikoNextOwnerInput")?.value || "",
+          "Next owner address must be valid."
+        );
+        const signer = await getAdminSigner();
+        const vault = await getAdminVaultContract(signer);
+        setAdminRikoOnchainStatus("Applying next owner on-chain...", false);
+        const tx = await vault.transferOwnership(nextOwner);
+        setAdminRikoOnchainStatus("Next owner tx sent: " + tx.hash, false);
+        await tx.wait();
+        setAdminRikoOnchainStatus(
+          "Next owner set. New owner must call acceptOwnership from their wallet.",
+          false
+        );
+        await loadAdminRikoGlobalCap();
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Owner update was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("Owner update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
     async function applyAdminRikoCustodyAddress() {{
       try {{
         requireAdminWalletAuth();
@@ -35586,7 +35717,7 @@ def _render_admin_page() -> str:
         const ethers = await ensureEthersAdmin();
         if (!window.ethereum) throw new Error("Wallet provider not found");
         const provider = new ethers.BrowserProvider(window.ethereum);
-        const vaultAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
+        const vaultAddr = requireConfiguredAddress(adminRikoVaultAddress, "RIKO vault address");
         const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
         const custodyAddr = String(await vault.custodyAddress() || "").trim().toLowerCase();
         if (!/^0x[a-f0-9]{{40}}$/.test(custodyAddr)) throw new Error("Custody is not configured on vault.");
@@ -35826,7 +35957,7 @@ def _render_admin_page() -> str:
       try {{
         const ethers = await ensureEthersAdmin();
         const readVault = vault || new ethers.Contract(
-          String(RIKO_VAULT_ADDRESS || "").trim(),
+          String(adminRikoVaultAddress || "").trim(),
           ADMIN_RIKO_VAULT_ABI,
           provider || ethers.getDefaultProvider()
         );
@@ -35964,7 +36095,7 @@ def _render_admin_page() -> str:
         const accountAddr = requireValidInputAddress(accountRaw, "Account address must be valid.");
         const ethers = await ensureEthersAdmin();
         const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
-        const vaultAddr = requireConfiguredAddress(RIKO_VAULT_ADDRESS, "RIKO_VAULT_ADDRESS");
+        const vaultAddr = requireConfiguredAddress(adminRikoVaultAddress, "RIKO vault address");
         const tokenAddr = await resolveAdminRikoPendingTokenAddress(tokenRawInput, provider);
         restoreBusyButton = setAdminPendingActionBusy(buttonEl, "Diagnosing...");
         const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
@@ -36069,10 +36200,10 @@ def _render_admin_page() -> str:
     }}
     async function loadAdminRikoTokenConfig(silent = false) {{
       try {{
-        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
+        const addr = String(adminRikoVaultAddress || "").trim();
         if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) {{
           if (silent) return;
-          throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+          throw new Error("Vault contract address is not configured in admin settings.");
         }}
         const token = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgTokenInput")?.value || "");
         if (!token) {{
@@ -36121,8 +36252,8 @@ def _render_admin_page() -> str:
     async function applyAdminRikoTokenConfig() {{
       try {{
         if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
-        const addr = String(RIKO_VAULT_ADDRESS || "").trim();
-        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
+        const addr = String(adminRikoVaultAddress || "").trim();
+        if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured in admin settings.");
         const token = normalizeEthAddressInput(document.getElementById("adminRikoTokenCfgTokenInput")?.value || "");
         if (!token) throw new Error("Invalid token address.");
         const allowed = String(document.getElementById("adminRikoTokenCfgAllowedInput")?.value || "true").trim() === "true";
@@ -36995,6 +37126,24 @@ def _render_admin_page() -> str:
         document.getElementById("dbPath").textContent = data.analytics_db_path || "-";
         document.getElementById("eventsCount").textContent = String(data.events_count || 0);
         document.getElementById("tokenCatalogInfo").textContent = `updated: ${{data.token_catalog_updated_at || "-"}}, count: ${{data.token_catalog_count || 0}}`;
+        const vaultCfg = (data?.riko_vault_address && typeof data.riko_vault_address === "object")
+          ? data.riko_vault_address
+          : {{}};
+        const vaultAddrCfg = String(vaultCfg.address || "").trim();
+        const vaultSource = String(vaultCfg.source || "").trim();
+        const vaultUpdatedAt = String(vaultCfg.updated_at || "").trim();
+        adminRikoVaultAddress = vaultAddrCfg || String(RIKO_VAULT_ADDRESS || "").trim();
+        const vaultCurrentEl = document.getElementById("adminRikoVaultAddress");
+        if (vaultCurrentEl) {{
+          const addrTxt = adminRikoVaultAddress || "-";
+          const sourceTxt = vaultSource ? `, source: ${{vaultSource}}` : "";
+          const updatedTxt = vaultUpdatedAt ? `, updated: ${{vaultUpdatedAt}}` : "";
+          vaultCurrentEl.textContent = `${{addrTxt}}${{sourceTxt}}${{updatedTxt}}`;
+        }}
+        const vaultInputEl = document.getElementById("adminRikoVaultAddressInput");
+        if (vaultInputEl && !String(vaultInputEl.value || "").trim() && adminRikoVaultAddress) {{
+          vaultInputEl.value = adminRikoVaultAddress;
+        }}
         const designatedOperator = (data?.riko_pending_operator_designated && typeof data.riko_pending_operator_designated === "object")
           ? data.riko_pending_operator_designated
           : {{}};
@@ -37715,7 +37864,7 @@ def _render_admin_page() -> str:
 </body>
 </html>
 """
-    return html.replace("__RIKO_VAULT_ADDRESS__", str(RIKO_VAULT_ADDRESS or "").strip())
+    return html.replace("__RIKO_VAULT_ADDRESS__", _riko_vault_address_value())
 
 
 def _render_help_page() -> str:
@@ -38327,6 +38476,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "token_catalog_updated_at": token_catalog.get("updated_at"),
             "token_catalog_count": token_catalog.get("count", 0),
             "pair_lists_manual": manual_cfg,
+            "riko_vault_address": _load_riko_vault_address(),
             "riko_payout_schedule": _load_riko_payout_schedule(),
             "riko_auto_yield_enabled": bool(auto_yield_ctl.get("enabled")),
             "riko_auto_yield_source": str(auto_yield_ctl.get("source") or "env"),
@@ -38352,6 +38502,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "token_catalog_updated_at": None,
             "token_catalog_count": 0,
             "pair_lists_manual": _load_manual_pair_lists_overrides(),
+            "riko_vault_address": _load_riko_vault_address(),
             "riko_payout_schedule": _load_riko_payout_schedule(),
             "riko_auto_yield_enabled": bool(auto_yield_ctl.get("enabled")),
             "riko_auto_yield_source": str(auto_yield_ctl.get("source") or "env"),
@@ -38828,6 +38979,19 @@ def admin_riko_custody_allowance_presets_update(
     return {"ok": True, "info": "RIKO custody allowance presets saved.", "riko_custody_allowance_presets": saved}
 
 
+@app.post("/api/admin/riko/vault-address")
+def admin_riko_vault_address_update(
+    req: AdminRikoVaultAddressUpdate, request: Request, response: Response
+) -> dict[str, Any]:
+    _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO vault address update")
+    try:
+        saved = _save_riko_vault_address(str(req.address or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "info": "RIKO vault address saved in admin settings.", "riko_vault_address": saved}
+
+
 @app.post("/api/admin/riko/pause-guardian")
 def admin_riko_pause_guardian_update(
     req: AdminRikoPauseGuardianUpdate, request: Request, response: Response
@@ -38993,7 +39157,7 @@ def riko_tx_history(request: Request, response: Response) -> dict[str, Any]:
     if not _is_eth_address(address):
         return {"ok": True, "items": [], "address": "", "chain_id": None, "count": 0}
     chain_id = int(auth.get("chain_id") or 11155111)
-    vault_addr = str(RIKO_VAULT_ADDRESS or "").strip().lower()
+    vault_addr = _riko_vault_address_value()
     tracked_targets = {x for x in (vault_addr,) if _is_eth_address(x)}
     rows = _explorer_txlist_rows_for_owner(chain_id, address, max_items=max(limit * 4, 60))
     items: list[dict[str, Any]] = []
