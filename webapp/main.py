@@ -996,7 +996,6 @@ UNISWAP_V4_POSITION_MANAGER_BY_CHAIN_ID: dict[int, str] = {
     8453: "0x7c5f5a4bbd8fd63184577525326123b519429bdc",
     42161: "0xd88f38f930b7952f2db2432cb002e7abbf3dd869",
     130: "0x4529a01c7a0410167c5740c487a8de60232617bf",  # Unichain
-    1301: "0xd88f38f930b7952f2db2432cb002e7abbf3dd869",  # Unichain Sepolia
 }
 # Multicall3 — same address on Ethereum + major L2s
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
@@ -1041,7 +1040,6 @@ DEFAULT_RPC_URLS_BY_CHAIN_ID: dict[int, list[str]] = {
     10: ["https://optimism-rpc.publicnode.com"],
     56: ["https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com"],
     130: ["https://unichain-rpc.publicnode.com", "https://mainnet.unichain.org"],
-    1301: ["https://sepolia.unichain.org"],
     137: ["https://polygon-bor-rpc.publicnode.com"],
     8453: [
         "https://base-rpc.publicnode.com",
@@ -2287,7 +2285,7 @@ def _wallet_ui_bundle_js(
           } catch (_) {}
         }
         if (!EthereumProviderModule?.EthereumProvider) throw new Error("WalletConnect SDK failed to load");
-        const wcChains = [1, 10, 56, 137, 8453, 42161, 43114, 11155111];
+        const wcChains = [1, 10, 56, 137, 8453, 42161, 43114];
         const wcMetadata = {
           name: "DeFi Pools",
           description: "DeFi Pools wallet sign-in",
@@ -2296,7 +2294,7 @@ def _wallet_ui_bundle_js(
         };
         const provider = await EthereumProviderModule.EthereumProvider.init({
           projectId: WALLETCONNECT_PROJECT_ID,
-          chains: [1, 11155111],
+          chains: [1],
           optionalChains: wcChains,
           showQrModal: false,
           optionalMethods: ["eth_requestAccounts", "eth_accounts", "eth_chainId", "personal_sign", "wallet_switchEthereumChain"],
@@ -5515,7 +5513,6 @@ def _explorer_v2_chainid(chain_id: int) -> str:
         1: "1",
         10: "10",
         56: "56",
-        11155111: "11155111",
         130: "130",
         1301: "1301",
         137: "137",
@@ -8301,8 +8298,6 @@ def _explorer_tx_url_for_chain(chain_id: int, tx_hash: str) -> str:
     if not (h.startswith("0x") and len(h) == 66):
         return ""
     cid = int(chain_id)
-    if cid == 11155111:
-        return f"https://sepolia.etherscan.io/tx/{h}"
     if cid == 1:
         return f"https://etherscan.io/tx/{h}"
     if cid == 8453:
@@ -8316,8 +8311,6 @@ def _explorer_tx_url_for_chain(chain_id: int, tx_hash: str) -> str:
 
 def _wrapped_native_by_chain(chain_id: int) -> str:
     cid = int(chain_id)
-    if cid == 11155111:
-        return "0xfff9976782d46cc05630d1f6ebab18b2324d6b14"
     if cid == 1:
         return "0xc02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".lower()
     return ""
@@ -23030,11 +23023,11 @@ def _eth_to_hex_block(block_number: int) -> str:
 def _riko_auto_yield_load_holder_cache() -> dict[str, Any]:
     raw = _analytics_get_state(RIKO_AUTO_YIELD_HOLDER_CACHE_STATE_KEY)
     if not raw:
-        return {"holders": [], "last_scanned_block": 0}
+        return {"holders": [], "last_scanned_block": 0, "chain_id": 0, "riko_token": ""}
     try:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
-            return {"holders": [], "last_scanned_block": 0}
+            return {"holders": [], "last_scanned_block": 0, "chain_id": 0, "riko_token": ""}
         holders_raw = payload.get("holders")
         holders: list[str] = []
         if isinstance(holders_raw, list):
@@ -23045,12 +23038,27 @@ def _riko_auto_yield_load_holder_cache() -> dict[str, Any]:
                     seen.add(a)
                     holders.append(a)
         last_scanned_block = max(0, int(payload.get("last_scanned_block") or 0))
-        return {"holders": holders, "last_scanned_block": last_scanned_block}
+        chain_id = max(0, int(payload.get("chain_id") or 0))
+        riko_token = str(payload.get("riko_token") or "").strip().lower()
+        if not _is_eth_address(riko_token):
+            riko_token = ""
+        return {
+            "holders": holders,
+            "last_scanned_block": last_scanned_block,
+            "chain_id": chain_id,
+            "riko_token": riko_token,
+        }
     except Exception:
-        return {"holders": [], "last_scanned_block": 0}
+        return {"holders": [], "last_scanned_block": 0, "chain_id": 0, "riko_token": ""}
 
 
-def _riko_auto_yield_save_holder_cache(holders: list[str], last_scanned_block: int) -> None:
+def _riko_auto_yield_save_holder_cache(
+    holders: list[str],
+    last_scanned_block: int,
+    *,
+    chain_id: int = 0,
+    riko_token: str = "",
+) -> None:
     clean_holders: list[str] = []
     seen: set[str] = set()
     for item in holders or []:
@@ -23062,6 +23070,8 @@ def _riko_auto_yield_save_holder_cache(holders: list[str], last_scanned_block: i
     payload = {
         "holders": clean_holders,
         "last_scanned_block": max(0, int(last_scanned_block or 0)),
+        "chain_id": max(0, int(chain_id or 0)),
+        "riko_token": str(riko_token or "").strip().lower() if _is_eth_address(str(riko_token or "").strip().lower()) else "",
         "updated_at": _iso_now(),
     }
     _analytics_set_state(RIKO_AUTO_YIELD_HOLDER_CACHE_STATE_KEY, json.dumps(payload, ensure_ascii=False))
@@ -23123,7 +23133,7 @@ def _riko_collect_holder_candidates_from_transfers(
             # Fallback to direct eth_getLogs below.
             pass
     topic_transfer = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
-    # Some providers/plans (e.g. Alchemy Free on Sepolia) enforce very small
+    # Some providers/plans enforce very small
     # eth_getLogs ranges. Start wide, then shrink adaptively down to 10 blocks.
     chunk = 10_000
     min_chunk = 10
@@ -23250,10 +23260,16 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
         return result
 
     try:
+        chain_id = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_chainId", []))
         latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
         holder_cache = _riko_auto_yield_load_holder_cache()
         cached_holders = set([str(x).strip().lower() for x in holder_cache.get("holders") or [] if _is_eth_address(str(x).strip().lower())])
         last_scanned_block = max(0, int(holder_cache.get("last_scanned_block") or 0))
+        cache_chain = max(0, int(holder_cache.get("chain_id") or 0))
+        cache_token = str(holder_cache.get("riko_token") or "").strip().lower()
+        if cache_chain != int(chain_id) or cache_token != str(riko_token).lower():
+            cached_holders = set()
+            last_scanned_block = 0
         if last_scanned_block <= 0:
             last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
         from_block = last_scanned_block + 1
@@ -23266,9 +23282,19 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
                 rpc_url, riko_token, from_block, scan_to_block
             )
             cached_holders.update(discovered)
-            _riko_auto_yield_save_holder_cache(sorted(cached_holders), scan_to_block)
+            _riko_auto_yield_save_holder_cache(
+                sorted(cached_holders),
+                scan_to_block,
+                chain_id=int(chain_id),
+                riko_token=str(riko_token).lower(),
+            )
         else:
-            _riko_auto_yield_save_holder_cache(sorted(cached_holders), last_scanned_block)
+            _riko_auto_yield_save_holder_cache(
+                sorted(cached_holders),
+                last_scanned_block,
+                chain_id=int(chain_id),
+                riko_token=str(riko_token).lower(),
+            )
             holder_scan_source = "cache"
         result["holder_scan_from_block"] = int(from_block)
         result["holder_scan_to_block"] = int(scan_to_block)
@@ -23614,17 +23640,28 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
         result.update({"status": "error", "reason": str(e)[:280]})
         return result
 
+    chain_id = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_chainId", []))
     latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
     holder_cache = _riko_auto_yield_load_holder_cache()
     cached_holders = set([str(x).strip().lower() for x in holder_cache.get("holders") or [] if _is_eth_address(str(x).strip().lower())])
     last_scanned_block = max(0, int(holder_cache.get("last_scanned_block") or 0))
+    cache_chain = max(0, int(holder_cache.get("chain_id") or 0))
+    cache_token = str(holder_cache.get("riko_token") or "").strip().lower()
+    if cache_chain != int(chain_id) or cache_token != str(riko_token).lower():
+        cached_holders = set()
+        last_scanned_block = 0
     if last_scanned_block <= 0:
         last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
     from_block = last_scanned_block + 1
     if from_block <= latest_block:
         discovered, _ = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, latest_block)
         cached_holders.update(discovered)
-    _riko_auto_yield_save_holder_cache(sorted(cached_holders), latest_block)
+    _riko_auto_yield_save_holder_cache(
+        sorted(cached_holders),
+        latest_block,
+        chain_id=int(chain_id),
+        riko_token=str(riko_token).lower(),
+    )
 
     holders_with_balance: list[tuple[str, int]] = []
     for holder in sorted(cached_holders):
@@ -23983,6 +24020,7 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
     rpc_url = _riko_auto_yield_rpc_url_runtime()
     if not rpc_url:
         return _done({"status": "skip", "reason": "rpc_missing"})
+    chain_id = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_chainId", []))
     latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
     holder_cache = _riko_auto_yield_load_holder_cache()
     cached_holders = set(
@@ -23990,6 +24028,11 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
     )
     bot_cfg = _load_riko_auto_yield_bot_config()
     last_scanned_block = max(0, int(holder_cache.get("last_scanned_block") or 0))
+    cache_chain = max(0, int(holder_cache.get("chain_id") or 0))
+    cache_token = str(holder_cache.get("riko_token") or "").strip().lower()
+    if cache_chain != int(chain_id) or cache_token != str(riko_token).lower():
+        cached_holders = set()
+        last_scanned_block = 0
     if last_scanned_block <= 0:
         last_scanned_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0) - 1)
     from_block = last_scanned_block + 1
@@ -23997,6 +24040,8 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
         return _done({
             "status": "ok",
             "source": "cache",
+            "chain_id": int(chain_id),
+            "riko_token": str(riko_token).lower(),
             "from_block": int(from_block),
             "to_block": int(last_scanned_block),
             "latest_block": int(latest_block),
@@ -24007,10 +24052,17 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
     discovered, source = _riko_collect_holder_candidates_from_transfers(rpc_url, riko_token, from_block, scan_to_block)
     if discovered:
         cached_holders.update(discovered)
-    _riko_auto_yield_save_holder_cache(sorted(cached_holders), scan_to_block)
+    _riko_auto_yield_save_holder_cache(
+        sorted(cached_holders),
+        scan_to_block,
+        chain_id=int(chain_id),
+        riko_token=str(riko_token).lower(),
+    )
     return _done({
         "status": "ok",
         "source": str(source or "rpc"),
+        "chain_id": int(chain_id),
+        "riko_token": str(riko_token).lower(),
         "from_block": int(from_block),
         "to_block": int(scan_to_block),
         "latest_block": int(latest_block),
@@ -26047,6 +26099,38 @@ def _render_riko_page() -> str:
       const c = Number(chainId || 0);
       return `rikoPendingActiveKeys:${c}:${a}`;
     }
+    function purgeLegacySepoliaRikoClientHistory() {
+      const purgeFlagKey = "rikoSepoliaPurgeDone:v1";
+      try {
+        if (localStorage.getItem(purgeFlagKey) === "1") return;
+      } catch (_) {}
+      const prefixes = [
+        "rikoTxHistory:11155111:",
+        "rikoTxHistoryHidden:11155111:",
+        "rikoPendingActiveKeys:11155111:",
+      ];
+      try {
+        const toDelete = [];
+        for (let i = 0; i < localStorage.length; i += 1) {
+          const k = String(localStorage.key(i) || "");
+          if (prefixes.some((p) => k.startsWith(p))) toDelete.push(k);
+        }
+        for (const k of toDelete) localStorage.removeItem(k);
+        const adminScanCacheKey = "admin_riko_event_scan_cache_v2";
+        const rawScanCache = String(localStorage.getItem(adminScanCacheKey) || "");
+        if (rawScanCache) {
+          try {
+            const parsed = JSON.parse(rawScanCache);
+            if (Number(parsed?.chain_id || 0) === 11155111) {
+              localStorage.removeItem(adminScanCacheKey);
+            }
+          } catch (_) {}
+        }
+      } catch (_) {}
+      try {
+        localStorage.setItem(purgeFlagKey, "1");
+      } catch (_) {}
+    }
     function buildRikoTxRowKey(item) {
       const hash = String(item?.hash || "").trim().toLowerCase();
       if (!/^0x[a-f0-9]{64}$/.test(hash)) return "";
@@ -26521,6 +26605,14 @@ def _render_riko_page() -> str:
         try {
           const ethers = await ensureEthers();
           const provider = new ethers.BrowserProvider(window.ethereum);
+          const net = await provider.getNetwork();
+          const chainId = Number(net?.chainId || 0);
+          if (chainId !== RIKO_MAINNET_CHAIN_ID) {
+            hint.textContent = `Available to redeem: switch wallet to Ethereum Mainnet (current chainId=${chainId || "?"})`;
+            rikoWalletRikoBalanceRaw = 0n;
+            rikoWalletRikoBalanceFormatted = "0";
+            return;
+          }
           const riko = new ethers.Contract(contractAddress, ERC20_ABI, provider);
           const [decimals, balance] = await Promise.all([
             riko.decimals(),
@@ -26559,6 +26651,14 @@ def _render_riko_page() -> str:
         try {
           const ethers = await ensureEthers();
           const provider = new ethers.BrowserProvider(window.ethereum);
+          const net = await provider.getNetwork();
+          const chainId = Number(net?.chainId || 0);
+          if (chainId !== RIKO_MAINNET_CHAIN_ID) {
+            hint.textContent = `Available: switch wallet to Ethereum Mainnet (current chainId=${chainId || "?"}, ${symLabel})`;
+            rikoWalletTokenBalanceRaw = 0n;
+            rikoWalletTokenBalanceFormatted = "0";
+            return;
+          }
           const nativeBal = await provider.getBalance(wallet);
           rikoWalletTokenBalanceRaw = BigInt(nativeBal);
           rikoWalletTokenBalanceDecimals = 18;
@@ -26591,6 +26691,12 @@ def _render_riko_page() -> str:
         const provider = new ethers.BrowserProvider(window.ethereum);
         const net = await provider.getNetwork();
         const chainId = Number(net?.chainId || 0);
+        if (chainId !== RIKO_MAINNET_CHAIN_ID) {
+          hint.textContent = `Available: switch wallet to Ethereum Mainnet (current chainId=${chainId || "?"}, ${symLabel})`;
+          rikoWalletTokenBalanceRaw = 0n;
+          rikoWalletTokenBalanceFormatted = "0";
+          return;
+        }
         const tokenCode = String(await provider.getCode(tokenAddress) || "0x");
         if (tokenCode === "0x") {
           hint.textContent = `Available: token not found on current network (chainId=${chainId || "?"}, ${symLabel})`;
@@ -26935,11 +27041,35 @@ def _render_riko_page() -> str:
       });
       return window.ethers;
     }
+    const RIKO_MAINNET_CHAIN_ID = 1;
+    async function switchWalletToRikoMainnet() {
+      if (!window.ethereum?.request) return false;
+      try {
+        await window.ethereum.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: "0x1" }],
+        });
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
     async function getRikoSigner() {
       if (!window.ethereum) throw new Error("Wallet provider not found");
       const ethers = await ensureEthers();
-      const provider = new ethers.BrowserProvider(window.ethereum);
+      let provider = new ethers.BrowserProvider(window.ethereum);
       await provider.send("eth_requestAccounts", []);
+      let net = await provider.getNetwork();
+      let chainId = Number(net?.chainId || 0);
+      if (chainId !== RIKO_MAINNET_CHAIN_ID) {
+        await switchWalletToRikoMainnet();
+        provider = new ethers.BrowserProvider(window.ethereum);
+        net = await provider.getNetwork();
+        chainId = Number(net?.chainId || 0);
+        if (chainId !== RIKO_MAINNET_CHAIN_ID) {
+          throw new Error(`Switch wallet network to Ethereum Mainnet (chainId=1). Current chainId=${chainId || "?"}.`);
+        }
+      }
       return await provider.getSigner();
     }
     function getSelectedRikoTokenAddress() {
@@ -27391,6 +27521,18 @@ def _render_riko_page() -> str:
       try {
         const ethers = await ensureEthers();
         const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
+        if (window.ethereum) {
+          const net = await provider.getNetwork();
+          const chainId = Number(net?.chainId || 0);
+          if (chainId !== RIKO_MAINNET_CHAIN_ID) {
+            if (mode === "deposit") {
+              hint.innerHTML = `<span class="k">Estimated mint:</span>switch wallet to Ethereum Mainnet (chainId=1)`;
+            } else {
+              hint.innerHTML = `<span class="k">Estimated receive:</span>switch wallet to Ethereum Mainnet (chainId=1)`;
+            }
+            return;
+          }
+        }
         let vaultTokenAddress = resolveVaultTokenAddressForSymbol(symbol);
         if (symbol === "eth") {
           const net = await provider.getNetwork();
@@ -27917,6 +28059,7 @@ def _render_riko_page() -> str:
       }
     }
     (function initRikoPage() {
+      purgeLegacySepoliaRikoClientHistory();
       const sel = document.getElementById("rikoTokenSymbol");
       if (sel) sel.addEventListener("change", onRikoSymbolChanged);
       const modeSel = document.getElementById("rikoMode");
@@ -34244,8 +34387,24 @@ def _render_admin_page() -> str:
     async function getAdminSigner() {{
       if (!window.ethereum) throw new Error("Wallet provider not found");
       const ethers = await ensureEthersAdmin();
-      const provider = new ethers.BrowserProvider(window.ethereum);
+      let provider = new ethers.BrowserProvider(window.ethereum);
       await provider.send("eth_requestAccounts", []);
+      let net = await provider.getNetwork();
+      let chainId = Number(net?.chainId || 0);
+      if (chainId !== 1) {{
+        try {{
+          await window.ethereum.request({{
+            method: "wallet_switchEthereumChain",
+            params: [{{ chainId: "0x1" }}],
+          }});
+        }} catch (_) {{}}
+        provider = new ethers.BrowserProvider(window.ethereum);
+        net = await provider.getNetwork();
+        chainId = Number(net?.chainId || 0);
+        if (chainId !== 1) {{
+          throw new Error(`Switch wallet network to Ethereum Mainnet (chainId=1). Current chainId=${{chainId || "?"}}.`);
+        }}
+      }}
       return await provider.getSigner();
     }}
     function formatUsdFromUsd6Admin(v) {{
@@ -35658,6 +35817,8 @@ def _render_admin_page() -> str:
       }}
     }}
     async function applyAdminRikoGlobalCap() {{
+      let chainId = 0;
+      let vaultAddr = "";
       try {{
         requireAdminWalletAuth();
         const capInput = document.getElementById("adminRikoGlobalCapUsd");
@@ -35666,7 +35827,12 @@ def _render_admin_page() -> str:
         const capUsd6 = BigInt(Math.round(capUsd * 1e6));
         const signer = await getAdminSigner();
         const vault = await getAdminVaultContract(signer);
+        const net = signer?.provider ? await signer.provider.getNetwork() : null;
+        chainId = Number(net?.chainId || 0);
+        vaultAddr = String(await vault.getAddress() || "").trim();
         await assertAdminIsVaultOwner(vault, signer, "global cap update");
+        // Preflight simulation to surface the revert reason before sending tx.
+        await vault.setGlobalSupplyCapUsd6.staticCall(capUsd6);
         setAdminRikoOnchainStatus(
           capUsd6 === 0n
             ? "Applying no-cap mode on-chain..."
@@ -35686,7 +35852,11 @@ def _render_admin_page() -> str:
           setAdminRikoOnchainStatus("Signature was rejected in wallet. Global cap update was canceled.", true);
           return;
         }}
-        setAdminRikoOnchainStatus("Global cap update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+        const detail = explainAdminVaultRevert(e);
+        const extra = (typeof chainId === "number" && chainId > 0 && /^0x[a-fA-F0-9]{{40}}$/.test(String(vaultAddr || "").trim()))
+          ? ` (chainId=${{chainId}}, vault=${{shortAddrAdmin(vaultAddr)}})`
+          : "";
+        setAdminRikoOnchainStatus("Global cap update failed: " + detail + extra, true);
       }}
     }}
     async function applyAdminRikoNextOwner() {{
@@ -39129,6 +39299,8 @@ def admin_riko_holder_scan_status(request: Request, response: Response) -> dict[
         "max_blocks_per_step": int(RIKO_HOLDER_SCAN_BG_MAX_BLOCKS),
         "cache_holders": int(len(holder_cache.get("holders") or [])),
         "cache_last_scanned_block": int(holder_cache.get("last_scanned_block") or 0),
+        "cache_chain_id": int(holder_cache.get("chain_id") or 0),
+        "cache_riko_token": str(holder_cache.get("riko_token") or ""),
     }
     if isinstance(status, dict):
         out.update(
@@ -39136,6 +39308,8 @@ def admin_riko_holder_scan_status(request: Request, response: Response) -> dict[
                 "status": str(status.get("status") or ""),
                 "reason": str(status.get("reason") or ""),
                 "source": str(status.get("source") or ""),
+                "chain_id": int(status.get("chain_id") or 0),
+                "riko_token": str(status.get("riko_token") or ""),
                 "from_block": int(status.get("from_block") or 0),
                 "to_block": int(status.get("to_block") or 0),
                 "latest_block": int(status.get("latest_block") or 0),

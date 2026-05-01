@@ -17,7 +17,7 @@ Recommended: deploy via `script/DeployRIKOStack.s.sol`.
 ```bash
 export DEPLOYER_PRIVATE_KEY="0x...your_private_key..."
 export RIKO_ADMIN="0x...admin_wallet_address..."
-export ETH_RPC_URL="https://sepolia.infura.io/v3/<key>"
+export ETH_RPC_URL="https://mainnet.infura.io/v3/<key>"
 ```
 
 Notes:
@@ -73,7 +73,7 @@ From admin UI:
 ```bash
 export ETHERSCAN_API_KEY="<your_key>"
 forge verify-contract \
-  --chain-id 11155111 \
+  --chain-id 1 \
   --compiler-version v0.8.24+commit.e11b9ed9 \
   <DEPLOYED_ADDRESS> \
   contracts/RIKOVault.sol:RIKOVault \

@@ -717,7 +717,6 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
 
     function _defaultWrappedNativeToken(uint256 chainId) internal pure returns (address) {
         if (chainId == 1) return 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-        if (chainId == 11155111) return 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14;
         return address(0);
     }
 
