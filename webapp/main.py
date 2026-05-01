@@ -34030,15 +34030,9 @@ def _render_admin_page() -> str:
           <input id="adminRikoVaultAddressInput" type="text" placeholder="0x... vault contract"/>
           <button class="btn btn-soft" onclick="saveAdminRikoVaultAddress()">Apply on-chain</button>
         </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;">
           <label style="margin:0">Choose new owner (step 1)</label>
           <input id="adminRikoNextOwnerInput" type="text" placeholder="0x... new owner"/>
-          <button class="btn" onclick="applyAdminRikoNextOwner()">Step 1: Assign new owner</button>
-        </div>
-        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
-          <label style="margin:0">Confirm owner change (step 2)</label>
-          <div class="hint" style="margin:0">Switch to the nominated wallet, then confirm ownership.</div>
-          <button class="btn" onclick="applyAdminRikoAcceptOwnership()">Step 2: Confirm ownership</button>
         </div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set global cap (USD)</label>
@@ -34064,6 +34058,14 @@ def _render_admin_page() -> str:
           <label style="margin:0">Set RIKO price (USD)</label>
           <input id="adminRikoPriceUsdInput" type="number" min="0.00001" step="0.00001" value="1.00000"/>
           <button class="btn" onclick="applyAdminRikoPriceUsd()">Apply on-chain</button>
+        </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;">
+          <label style="margin:0">Owner actions</label>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <button class="btn" onclick="applyAdminRikoNextOwner()">Step 1: Assign new owner</button>
+            <button class="btn" onclick="applyAdminRikoAcceptOwnership()">Step 2: Confirm ownership</button>
+            <span class="hint" style="margin:0">Step 2 from wallet address entered above.</span>
+          </div>
         </div>
         <span id="adminRikoOnchainStatus" class="status">Ready</span>
       </section>
