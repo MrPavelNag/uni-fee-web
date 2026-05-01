@@ -5,6 +5,12 @@ import "forge-std/Test.sol";
 import {RIKOVault} from "../contracts/RIKOVault.sol";
 import {MockERC20, MockWETH, MockAggregatorV3} from "./mocks/RIKOMocks.sol";
 
+contract RejectEthReceiver {
+    receive() external payable {
+        revert("reject eth");
+    }
+}
+
 contract RIKOVaultTest is Test {
     RIKOVault internal vault;
     MockERC20 internal usdc;
@@ -172,6 +178,30 @@ contract RIKOVaultTest is Test {
         assertEq(usdc.balanceOf(alice), aliceUsdcBefore + sent1 + sent2, "alice receives both payouts separately");
     }
 
+    function testProcessPendingRedeemsBatchCompletesMultipleItems() public {
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 80e6, 0, alice);
+        vm.stopPrank();
+
+        usdc.transfer(address(0xBEEF), 75e6);
+
+        vm.startPrank(alice);
+        assertEq(vault.redeem(address(usdc), 30e6, 0, alice), 0, "first redeem queued");
+        assertEq(vault.redeem(address(usdc), 20e6, 0, alice), 0, "second redeem queued");
+        vm.stopPrank();
+
+        usdc.mint(address(this), 100e6);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+
+        (uint256 processed, uint256 totalSent) = vault.processPendingRedemptions(alice, address(usdc), 10);
+        assertEq(processed, 2, "batch processed both pendings");
+        assertEq(totalSent, 50e6, "batch total sent");
+        assertEq(usdc.balanceOf(alice), aliceBefore + totalSent, "alice receives batched payouts");
+        (,,,, bool existsAfter) = vault.pendingRedemptions(alice, address(usdc));
+        assertFalse(existsAfter, "pending queue should be empty");
+    }
+
     function testRikoPriceAffectsMintAndRedeem() public {
         vault.setRikoPriceUsd6(2e6); // 1 RIKO = 2 USD
         vault.setTokenDepositStorageMode(address(usdc), true);
@@ -198,6 +228,20 @@ contract RIKOVaultTest is Test {
 
         vm.expectRevert(RIKOVault.RV_PendingRedemptionOperatorOnly.selector);
         vault.processPendingRedemption(alice, address(usdc));
+    }
+
+    function testProcessPendingRedemptionsBatchOnlyOperator() public {
+        vault.setPendingRedemptionOperator(address(0xB0B));
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 50e6, 0, alice);
+        vm.stopPrank();
+        usdc.transfer(address(0xBEEF), 45e6);
+        vm.prank(alice);
+        vault.redeem(address(usdc), 50e6, 0, alice);
+
+        vm.expectRevert(RIKOVault.RV_PendingRedemptionOperatorOnly.selector);
+        vault.processPendingRedemptions(alice, address(usdc), 2);
     }
 
     function testRedeemWrappedNativeSendsNativeEth() public {
@@ -266,5 +310,65 @@ contract RIKOVaultTest is Test {
         assertEq(sent, expectedOut, "sent amount should match quote");
         assertEq(alice.balance, ethBefore + expectedOut, "alice receives native ETH");
         assertEq(minTokenOut, 0, "min out from queued redeem");
+    }
+
+    function testProcessPendingWrappedNativeRevertsWhenReceiverRejectsEth() public {
+        MockWETH weth = new MockWETH();
+        MockAggregatorV3 wethUsdFeed = new MockAggregatorV3(8, "WETH / USD", 2_000e8);
+        bytes32 feedHash = keccak256(bytes("WETH / USD"));
+        vault.setTokenConfig(address(weth), true, address(wethUsdFeed), 1 days, feedHash);
+        vault.setWrappedNativeToken(address(weth));
+        RejectEthReceiver rejectReceiver = new RejectEthReceiver();
+
+        vm.deal(address(weth), 10 ether);
+        weth.mint(alice, 1 ether);
+
+        vm.startPrank(alice);
+        weth.approve(address(vault), type(uint256).max);
+        vault.deposit(address(weth), 1 ether, 0, alice);
+        vm.stopPrank();
+
+        weth.transfer(address(0xBEEF), weth.balanceOf(address(this)));
+        uint256 aliceRiko = vault.balanceOf(alice);
+
+        vm.prank(alice);
+        uint256 queued = vault.redeem(address(weth), aliceRiko, 0, address(rejectReceiver));
+        assertEq(queued, 0, "redeem should queue while underfunded");
+
+        weth.mint(address(this), 10 ether);
+        weth.approve(address(vault), type(uint256).max);
+        vm.deal(address(weth), 10 ether);
+
+        vm.expectRevert(RIKOVault.RV_NativeTransferFailed.selector);
+        vault.processPendingRedemption(alice, address(weth));
+
+        (uint256 rikoLocked,,,, bool exists) = vault.pendingRedemptions(alice, address(weth));
+        assertTrue(exists, "pending redemption should remain after failed settlement");
+        assertEq(rikoLocked, aliceRiko, "locked riko should remain unchanged");
+        assertEq(vault.balanceOf(alice), 0, "queued riko stays locked on vault");
+    }
+
+    function testProcessPendingRedeemsBatchRevertsAtomicallyOnSecondItemSlippage() public {
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 80e6, 0, alice);
+        vm.stopPrank();
+
+        usdc.transfer(address(0xBEEF), 75e6);
+
+        vm.startPrank(alice);
+        assertEq(vault.redeem(address(usdc), 30e6, 0, alice), 0, "first redeem queued");
+        assertEq(vault.redeem(address(usdc), 20e6, 20e6, alice), 0, "second redeem queued with strict minOut");
+        vm.stopPrank();
+
+        usdc.mint(address(this), 100e6);
+        vault.setRikoPriceUsd6(500_000);
+
+        vm.expectRevert(RIKOVault.RV_SlippageExceeded.selector);
+        vault.processPendingRedemptions(alice, address(usdc), 2);
+
+        (uint256 rikoLockedFirst,,,, bool existsFirst) = vault.pendingRedemptions(alice, address(usdc));
+        assertTrue(existsFirst, "queue should remain after batch revert");
+        assertEq(rikoLockedFirst, 30e6, "head must remain first pending after atomic revert");
     }
 }

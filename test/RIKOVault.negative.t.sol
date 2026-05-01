@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {RIKOVault} from "../contracts/RIKOVault.sol";
 import {MockERC20, MockMutableDecimalsERC20, MockFeeOnTransferERC20, MockAggregatorV3} from "./mocks/RIKOMocks.sol";
@@ -85,6 +86,26 @@ contract RIKOVaultNegativeTest is Test {
         vm.stopPrank();
     }
 
+    function testPauseBlocksPendingProcessAndCancel() public {
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 50e6, 0, alice);
+        vm.stopPrank();
+
+        usdc.transfer(address(0xBEEF), 45e6);
+        vm.prank(alice);
+        vault.redeem(address(usdc), 50e6, 0, alice);
+
+        vault.pause();
+
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vault.processPendingRedemption(alice, address(usdc));
+
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vault.cancelPendingRedemption(address(usdc));
+    }
+
     function testRedeemQueuesOnInsufficientLiquidity() public {
         vm.startPrank(alice);
         usdc.approve(address(vault), 100e6);
@@ -162,6 +183,15 @@ contract RIKOVaultNegativeTest is Test {
         vm.stopPrank();
     }
 
+    function testDepositRevertsOnFutureOracleTimestamp() public {
+        usdcUsdFeed.setRoundData(1e8, block.timestamp + 1);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 10e6);
+        vm.expectRevert(RIKOVault.RV_OraclePriceInvalid.selector);
+        vault.deposit(address(usdc), 10e6, 0, alice);
+        vm.stopPrank();
+    }
+
     function testProcessPendingRedeemReturnsFalseWhileStillUnderfunded() public {
         vm.startPrank(alice);
         usdc.approve(address(vault), 100e6);
@@ -175,6 +205,108 @@ contract RIKOVaultNegativeTest is Test {
         (bool completed, uint256 sent) = vault.processPendingRedemption(alice, address(usdc));
         assertFalse(completed, "must wait for custody refill");
         assertEq(sent, 0, "no transfer yet");
+    }
+
+    function testProcessPendingRedeemsBatchReturnsZeroWhileUnderfunded() public {
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 50e6, 0, alice);
+        vm.stopPrank();
+
+        usdc.transfer(address(0xBEEF), 45e6);
+        vm.prank(alice);
+        vault.redeem(address(usdc), 50e6, 0, alice);
+
+        (uint256 processed, uint256 totalSent) = vault.processPendingRedemptions(alice, address(usdc), 3);
+        assertEq(processed, 0, "batch should not process while underfunded");
+        assertEq(totalSent, 0, "no transfer while underfunded");
+        (uint256 rikoLocked,,,, bool exists) = vault.pendingRedemptions(alice, address(usdc));
+        assertTrue(exists, "pending redemption should remain");
+        assertEq(rikoLocked, 50e6, "head should remain unchanged");
+    }
+
+    function testProcessPendingRedeemsBatchRevertsOnZeroMaxItems() public {
+        vm.expectRevert(RIKOVault.RV_InvalidAmount.selector);
+        vault.processPendingRedemptions(alice, address(usdc), 0);
+    }
+
+    function testProcessPendingRedeemsBatchOnlyOperator() public {
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(address(usdc), 50e6, 0, alice);
+        vm.stopPrank();
+
+        usdc.transfer(address(0xBEEF), 45e6);
+        vm.prank(alice);
+        vault.redeem(address(usdc), 50e6, 0, alice);
+
+        vault.setPendingRedemptionOperator(address(0xB0B));
+        vm.prank(alice);
+        vm.expectRevert(RIKOVault.RV_PendingRedemptionOperatorOnly.selector);
+        vault.processPendingRedemptions(alice, address(usdc), 1);
+    }
+
+    function testOnlyOwnerAdminMatrix() public {
+        bytes32 feedHash = keccak256(bytes("USDC / USD"));
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.pause();
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.unpause();
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.setGlobalSupplyCapUsd6(1);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.setTokenTvlCapUsd6(address(usdc), 1);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.setTokenDepositStorageMode(address(usdc), true);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.setCustodyAddress(alice);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.setRikoPriceUsd6(2e6);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.setPendingRedemptionOperator(alice);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.setWrappedNativeToken(address(usdc));
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.setTokenConfig(address(usdc), true, address(usdcUsdFeed), 1 days, feedHash);
+    }
+
+    function testOwnable2StepTransferAndAcceptFlow() public {
+        address newOwner = address(0xB0B);
+        vault.transferOwnership(newOwner);
+
+        vm.prank(newOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, newOwner));
+        vault.setRikoPriceUsd6(2e6);
+
+        vm.prank(newOwner);
+        vault.acceptOwnership();
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        vault.setRikoPriceUsd6(2e6);
+
+        vm.prank(newOwner);
+        vault.setRikoPriceUsd6(2e6);
+        assertEq(vault.rikoPriceUsd6(), 2e6, "new owner should control admin actions");
     }
 
     function testSetRikoPriceRevertsOnZero() public {

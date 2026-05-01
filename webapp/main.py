@@ -335,6 +335,10 @@ RIKO_AUTO_YIELD_CONTROL_STATE_KEY = "riko_auto_yield_control_v1"
 RIKO_AUTO_YIELD_HISTORY_STATE_KEY = "riko_auto_yield_history_v1"
 RIKO_AUTO_YIELD_REMINDERS_STATE_KEY = "riko_auto_yield_reminders_v1"
 RIKO_CUSTODY_ALLOWANCE_PRESETS_STATE_KEY = "riko_custody_allowance_presets_v1"
+RIKO_PAUSE_GUARDIAN_STATE_KEY = "riko_pause_guardian_v1"
+RIKO_PAUSE_GUARDIAN_ADDRESS_ENV = os.environ.get("RIKO_PAUSE_GUARDIAN_ADDRESS", "").strip().lower()
+RIKO_PENDING_OPERATOR_DESIGNATED_STATE_KEY = "riko_pending_operator_designated_v1"
+RIKO_PENDING_OPERATOR_DESIGNATED_ADDRESS_ENV = os.environ.get("RIKO_PENDING_OPERATOR_DESIGNATED_ADDRESS", "").strip().lower()
 RIKO_AUTO_YIELD_STOP = threading.Event()
 RIKO_AUTO_YIELD_THREAD: threading.Thread | None = None
 RIKO_HOLDER_SCAN_BG_STOP = threading.Event()
@@ -22603,6 +22607,64 @@ def _save_riko_custody_allowance_presets(items: list[dict[str, Any]]) -> dict[st
     return _load_riko_custody_allowance_presets()
 
 
+def _load_riko_pause_guardian() -> dict[str, Any]:
+    address = str(RIKO_PAUSE_GUARDIAN_ADDRESS_ENV or "").strip().lower()
+    source = "env" if address else "unset"
+    updated_at = ""
+    raw = _analytics_get_state(RIKO_PAUSE_GUARDIAN_STATE_KEY)
+    if raw:
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                parsed_addr = str(payload.get("address") or "").strip().lower()
+                if parsed_addr and (not _is_eth_address(parsed_addr)):
+                    parsed_addr = ""
+                address = parsed_addr
+                source = "admin_override"
+                updated_at = str(payload.get("updated_at") or "")
+        except Exception:
+            pass
+    return {"address": address, "source": source, "updated_at": updated_at}
+
+
+def _save_riko_pause_guardian(address: str) -> dict[str, Any]:
+    addr = str(address or "").strip().lower()
+    if addr and (not _is_eth_address(addr)):
+        raise ValueError("pause guardian address must be a valid 0x address or empty")
+    payload = {"address": addr, "updated_at": _iso_now()}
+    _analytics_set_state(RIKO_PAUSE_GUARDIAN_STATE_KEY, json.dumps(payload, ensure_ascii=False))
+    return _load_riko_pause_guardian()
+
+
+def _load_riko_pending_operator_designated() -> dict[str, Any]:
+    address = str(RIKO_PENDING_OPERATOR_DESIGNATED_ADDRESS_ENV or "").strip().lower()
+    source = "env" if address else "unset"
+    updated_at = ""
+    raw = _analytics_get_state(RIKO_PENDING_OPERATOR_DESIGNATED_STATE_KEY)
+    if raw:
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                parsed_addr = str(payload.get("address") or "").strip().lower()
+                if parsed_addr and (not _is_eth_address(parsed_addr)):
+                    parsed_addr = ""
+                address = parsed_addr
+                source = "admin_override"
+                updated_at = str(payload.get("updated_at") or "")
+        except Exception:
+            pass
+    return {"address": address, "source": source, "updated_at": updated_at}
+
+
+def _save_riko_pending_operator_designated(address: str) -> dict[str, Any]:
+    addr = str(address or "").strip().lower()
+    if addr and (not _is_eth_address(addr)):
+        raise ValueError("designated pending operator address must be a valid 0x address or empty")
+    payload = {"address": addr, "updated_at": _iso_now()}
+    _analytics_set_state(RIKO_PENDING_OPERATOR_DESIGNATED_STATE_KEY, json.dumps(payload, ensure_ascii=False))
+    return _load_riko_pending_operator_designated()
+
+
 def _riko_is_valid_month_day(month: int, day: int) -> bool:
     if month < 1 or month > 12 or day < 1 or day > 31:
         return False
@@ -24221,6 +24283,14 @@ class AdminRikoCustodyAllowancePresetItem(BaseModel):
 
 class AdminRikoCustodyAllowancePresetUpdate(BaseModel):
     items: list[AdminRikoCustodyAllowancePresetItem] = Field(default_factory=list)
+
+
+class AdminRikoPauseGuardianUpdate(BaseModel):
+    address: str = ""
+
+
+class AdminRikoPendingOperatorDesignatedUpdate(BaseModel):
+    address: str = ""
 
 
 class RikoWhitelistItemUpdate(BaseModel):
@@ -33730,8 +33800,24 @@ def _render_admin_page() -> str:
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set pending operator</label>
           <input id="adminRikoPendingOperatorInput" type="text" placeholder="0x... operator"/>
-          <button class="btn" onclick="applyAdminRikoPendingOperator()">Apply on-chain</button>
+          <div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
+            <span id="adminRikoPendingOperatorBadge" style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;background:#e2e8f0;color:#334155;">UNKNOWN</span>
+            <button class="btn" onclick="applyAdminRikoPendingOperator()">Apply on-chain</button>
+          </div>
         </div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Designated operator</label>
+          <input id="adminRikoPendingOperatorDesignatedInput" type="text" placeholder="0x... designated ops wallet"/>
+          <button class="btn btn-soft" onclick="saveAdminRikoPendingOperatorDesignated()">Save in admin panel</button>
+        </div>
+        <div class="row"><label>Designated operator (saved)</label><div id="adminRikoPendingOperatorDesignatedCurrent">-</div></div>
+        <div class="row"><label>Operator control check</label><div id="adminRikoPendingOperatorControlIndicator">-</div></div>
+        <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
+          <label style="margin:0">Pause responsible</label>
+          <input id="adminRikoPauseGuardianInput" type="text" placeholder="0x... pause guardian"/>
+          <button class="btn btn-soft" onclick="saveAdminRikoPauseGuardian()">Save in admin panel</button>
+        </div>
+        <div class="row"><label>Pause responsible (saved)</label><div id="adminRikoPauseGuardianCurrent">-</div></div>
         <div class="row" style="display:grid;grid-template-columns:170px 1fr auto;gap:10px;align-items:center;">
           <label style="margin:0">Set RIKO price (USD)</label>
           <input id="adminRikoPriceUsdInput" type="number" min="0.00001" step="0.00001" value="1.00000"/>
@@ -34104,6 +34190,7 @@ def _render_admin_page() -> str:
       return n.toLocaleString(undefined, {{maximumFractionDigits: 2}});
     }}
     let adminLastSettings = null;
+    let adminRikoOnchainPendingOperator = "";
     let adminOnchainRoleMap = {{}};
     const ADMIN_RIKO_VAULT_ABI = [
       "function owner() view returns (address)",
@@ -35349,10 +35436,47 @@ def _render_admin_page() -> str:
       add(payload?.pending_operator, "PENDING_OPERATOR");
       adminOnchainRoleMap = map;
     }}
+    function updateAdminPendingOperatorControlIndicator() {{
+      const el = document.getElementById("adminRikoPendingOperatorControlIndicator");
+      const badgeEl = document.getElementById("adminRikoPendingOperatorBadge");
+      const setBadge = (text, bg, fg) => {{
+        if (!badgeEl) return;
+        badgeEl.textContent = String(text || "UNKNOWN");
+        badgeEl.style.background = String(bg || "#e2e8f0");
+        badgeEl.style.color = String(fg || "#334155");
+      }};
+      if (!el) return;
+      const designatedRaw = String(adminLastSettings?.riko_pending_operator_designated?.address || "").trim().toLowerCase();
+      const designated = /^0x[a-f0-9]{{40}}$/.test(designatedRaw) ? designatedRaw : "";
+      const onchainRaw = String(adminRikoOnchainPendingOperator || "").trim().toLowerCase();
+      const onchain = /^0x[a-f0-9]{{40}}$/.test(onchainRaw) ? onchainRaw : "";
+      if (!designated) {{
+        el.textContent = "No designated operator is set in admin panel.";
+        el.style.color = "#92400e";
+        setBadge("NO DESIGNATED", "#fef3c7", "#92400e");
+        return;
+      }}
+      if (!onchain) {{
+        el.textContent = `Designated: ${{shortAddrAdmin(designated)}}. On-chain pending operator is not configured.`;
+        el.style.color = "#b91c1c";
+        setBadge("NOT SET", "#fee2e2", "#991b1b");
+        return;
+      }}
+      if (designated === onchain) {{
+        el.textContent = `OK: on-chain pending operator matches designated ops wallet (${{shortAddrAdmin(onchain)}}).`;
+        el.style.color = "#166534";
+        setBadge("MATCH", "#dcfce7", "#166534");
+        return;
+      }}
+      el.textContent = `Mismatch: designated ${{shortAddrAdmin(designated)}}, on-chain ${{shortAddrAdmin(onchain)}}.`;
+      el.style.color = "#b91c1c";
+      setBadge("MISMATCH", "#fee2e2", "#991b1b");
+    }}
     async function loadAdminRikoGlobalCap() {{
       const elAddr = document.getElementById("adminRikoVaultAddress");
       const vaultAddr = String(RIKO_VAULT_ADDRESS || "").trim();
       if (elAddr) elAddr.textContent = vaultAddr || "-";
+      adminRikoOnchainPendingOperator = "";
 
       let rolePayload = {{ vault_owner: "", custody: "", pending_operator: "" }};
       if (!/^0x[a-fA-F0-9]{{40}}$/.test(vaultAddr)) {{
@@ -35376,6 +35500,7 @@ def _render_admin_page() -> str:
           rolePayload.vault_owner = String(vaultOwner || "");
           rolePayload.custody = String(custody || "");
           rolePayload.pending_operator = String(pendingOperator || "");
+          adminRikoOnchainPendingOperator = String(pendingOperator || "").trim().toLowerCase();
           const rikoPriceNum = Number(rikoPriceUsd6 || 0n);
           const inCustody = document.getElementById("adminRikoCustodyInput");
           const inPendingOperator = document.getElementById("adminRikoPendingOperatorInput");
@@ -35389,6 +35514,7 @@ def _render_admin_page() -> str:
         }}
       }}
       setAdminOnchainRoles(rolePayload);
+      updateAdminPendingOperatorControlIndicator();
       setAdminProcessPendingDefaults(false);
       await loadAdminRikoPendingQueue();
       if (adminLastSettings) {{
@@ -35589,6 +35715,75 @@ def _render_admin_page() -> str:
           return;
         }}
         setAdminRikoOnchainStatus("Pending operator update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function saveAdminRikoPendingOperatorDesignated() {{
+      try {{
+        requireAdminWalletAuth();
+        const inputEl = document.getElementById("adminRikoPendingOperatorDesignatedInput");
+        const raw = String(inputEl?.value || "").trim();
+        const normalized = raw ? requireValidInputAddress(raw, "Designated operator address must be valid.") : "";
+        setAdminRikoOnchainStatus("Saving designated pending operator in admin settings...", false);
+        const data = await postJson("/api/admin/riko/pending-operator-designated", {{ address: normalized }});
+        const saved = (data?.riko_pending_operator_designated && typeof data.riko_pending_operator_designated === "object")
+          ? data.riko_pending_operator_designated
+          : {{ address: normalized, source: "admin_override" }};
+        if (inputEl) inputEl.value = String(saved.address || "");
+        const currentEl = document.getElementById("adminRikoPendingOperatorDesignatedCurrent");
+        if (currentEl) {{
+          const addrTxt = String(saved.address || "").trim() || "-";
+          const sourceTxt = String(saved.source || "").trim();
+          const updatedTxt = String(saved.updated_at || "").trim();
+          currentEl.textContent =
+            addrTxt +
+            (sourceTxt ? `, source: ${{sourceTxt}}` : "") +
+            (updatedTxt ? `, updated: ${{updatedTxt}}` : "");
+        }}
+        if (adminLastSettings && typeof adminLastSettings === "object") {{
+          adminLastSettings.riko_pending_operator_designated = saved;
+        }}
+        updateAdminPendingOperatorControlIndicator();
+        setAdminRikoOnchainStatus(data?.info || "Designated pending operator saved in admin settings.", false);
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Designated operator update was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("Designated operator update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
+      }}
+    }}
+    async function saveAdminRikoPauseGuardian() {{
+      try {{
+        requireAdminWalletAuth();
+        const inputEl = document.getElementById("adminRikoPauseGuardianInput");
+        const raw = String(inputEl?.value || "").trim();
+        const normalized = raw ? requireValidInputAddress(raw, "Pause responsible address must be valid.") : "";
+        setAdminRikoOnchainStatus("Saving pause responsible address in admin settings...", false);
+        const data = await postJson("/api/admin/riko/pause-guardian", {{ address: normalized }});
+        const saved = (data?.riko_pause_guardian && typeof data.riko_pause_guardian === "object")
+          ? data.riko_pause_guardian
+          : {{ address: normalized, source: "admin_override" }};
+        if (inputEl) inputEl.value = String(saved.address || "");
+        const currentEl = document.getElementById("adminRikoPauseGuardianCurrent");
+        if (currentEl) {{
+          const addrTxt = String(saved.address || "").trim() || "-";
+          const sourceTxt = String(saved.source || "").trim();
+          const updatedTxt = String(saved.updated_at || "").trim();
+          currentEl.textContent =
+            addrTxt +
+            (sourceTxt ? `, source: ${{sourceTxt}}` : "") +
+            (updatedTxt ? `, updated: ${{updatedTxt}}` : "");
+        }}
+        if (adminLastSettings && typeof adminLastSettings === "object") {{
+          adminLastSettings.riko_pause_guardian = saved;
+        }}
+        setAdminRikoOnchainStatus(data?.info || "Pause responsible address saved in admin settings.", false);
+      }} catch (e) {{
+        if (isWalletUserRejectedError(e)) {{
+          setAdminRikoOnchainStatus("Signature was rejected in wallet. Pause responsible update was canceled.", true);
+          return;
+        }}
+        setAdminRikoOnchainStatus("Pause responsible update failed: " + (e?.shortMessage || e?.message || "unknown"), true);
       }}
     }}
     async function resolveAdminRikoPendingTokenAddress(tokenRawInput, provider) {{
@@ -36800,6 +36995,39 @@ def _render_admin_page() -> str:
         document.getElementById("dbPath").textContent = data.analytics_db_path || "-";
         document.getElementById("eventsCount").textContent = String(data.events_count || 0);
         document.getElementById("tokenCatalogInfo").textContent = `updated: ${{data.token_catalog_updated_at || "-"}}, count: ${{data.token_catalog_count || 0}}`;
+        const designatedOperator = (data?.riko_pending_operator_designated && typeof data.riko_pending_operator_designated === "object")
+          ? data.riko_pending_operator_designated
+          : {{}};
+        const designatedOperatorAddr = String(designatedOperator.address || "").trim();
+        const designatedOperatorSource = String(designatedOperator.source || "").trim();
+        const designatedOperatorUpdatedAt = String(designatedOperator.updated_at || "").trim();
+        const designatedCurrentEl = document.getElementById("adminRikoPendingOperatorDesignatedCurrent");
+        if (designatedCurrentEl) {{
+          const addrTxt = designatedOperatorAddr || "-";
+          const sourceTxt = designatedOperatorSource ? `, source: ${{designatedOperatorSource}}` : "";
+          const updatedTxt = designatedOperatorUpdatedAt ? `, updated: ${{designatedOperatorUpdatedAt}}` : "";
+          designatedCurrentEl.textContent = `${{addrTxt}}${{sourceTxt}}${{updatedTxt}}`;
+        }}
+        const designatedInputEl = document.getElementById("adminRikoPendingOperatorDesignatedInput");
+        if (designatedInputEl && !String(designatedInputEl.value || "").trim() && designatedOperatorAddr) {{
+          designatedInputEl.value = designatedOperatorAddr;
+        }}
+        const pauseGuardian = (data?.riko_pause_guardian && typeof data.riko_pause_guardian === "object")
+          ? data.riko_pause_guardian
+          : {{}};
+        const pauseGuardianAddr = String(pauseGuardian.address || "").trim();
+        const pauseGuardianSource = String(pauseGuardian.source || "").trim();
+        const pauseGuardianUpdatedAt = String(pauseGuardian.updated_at || "").trim();
+        const pauseCurrentEl = document.getElementById("adminRikoPauseGuardianCurrent");
+        if (pauseCurrentEl) {{
+          const addrTxt = pauseGuardianAddr || "-";
+          const sourceTxt = pauseGuardianSource ? `, source: ${{pauseGuardianSource}}` : "";
+          const updatedTxt = pauseGuardianUpdatedAt ? `, updated: ${{pauseGuardianUpdatedAt}}` : "";
+          pauseCurrentEl.textContent = `${{addrTxt}}${{sourceTxt}}${{updatedTxt}}`;
+        }}
+        const pauseInputEl = document.getElementById("adminRikoPauseGuardianInput");
+        if (pauseInputEl && !String(pauseInputEl.value || "").trim() && pauseGuardianAddr) pauseInputEl.value = pauseGuardianAddr;
+        updateAdminPendingOperatorControlIndicator();
         renderAdminWallets(
           data.admin_wallets || [],
           data.admin_wallets_root || [],
@@ -38105,6 +38333,8 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "riko_auto_yield_bot_config": auto_yield_bot_cfg,
             "riko_auto_yield_history": _load_riko_auto_yield_history(limit=800),
             "riko_custody_allowance_presets": _load_riko_custody_allowance_presets(),
+            "riko_pause_guardian": _load_riko_pause_guardian(),
+            "riko_pending_operator_designated": _load_riko_pending_operator_designated(),
         }
     except Exception as e:
         return {
@@ -38128,6 +38358,8 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "riko_auto_yield_bot_config": auto_yield_bot_cfg,
             "riko_auto_yield_history": _load_riko_auto_yield_history(limit=800),
             "riko_custody_allowance_presets": _load_riko_custody_allowance_presets(),
+            "riko_pause_guardian": _load_riko_pause_guardian(),
+            "riko_pending_operator_designated": _load_riko_pending_operator_designated(),
             "info": f"Admin settings fallback mode. Error: {e}",
         }
 
@@ -38594,6 +38826,36 @@ def admin_riko_custody_allowance_presets_update(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "info": "RIKO custody allowance presets saved.", "riko_custody_allowance_presets": saved}
+
+
+@app.post("/api/admin/riko/pause-guardian")
+def admin_riko_pause_guardian_update(
+    req: AdminRikoPauseGuardianUpdate, request: Request, response: Response
+) -> dict[str, Any]:
+    _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO pause guardian update")
+    try:
+        saved = _save_riko_pause_guardian(str(req.address or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "info": "RIKO pause guardian saved in admin settings.", "riko_pause_guardian": saved}
+
+
+@app.post("/api/admin/riko/pending-operator-designated")
+def admin_riko_pending_operator_designated_update(
+    req: AdminRikoPendingOperatorDesignatedUpdate, request: Request, response: Response
+) -> dict[str, Any]:
+    _require_admin(request, response)
+    _require_pilot_config_mutable("RIKO designated pending operator update")
+    try:
+        saved = _save_riko_pending_operator_designated(str(req.address or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "info": "Designated pending operator saved in admin settings.",
+        "riko_pending_operator_designated": saved,
+    }
 
 
 @app.post("/api/admin/riko/auto-payout-config")

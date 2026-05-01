@@ -274,8 +274,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         whenNotPaused
         returns (uint256 rikoOut)
     {
-        _requireValidReceiver(receiver);
-        _requirePositiveAmount(amountIn);
+        _requireValidReceiverAndPositiveAmount(receiver, amountIn);
         TokenConfig memory cfg = _loadAllowedTokenConfig(token);
 
         IERC20Metadata asset = IERC20Metadata(token);
@@ -316,8 +315,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         whenNotPaused
         returns (uint256 tokenOut)
     {
-        _requireValidReceiver(receiver);
-        _requirePositiveAmount(rikoAmountIn);
+        _requireValidReceiverAndPositiveAmount(receiver, rikoAmountIn);
         TokenConfig memory cfg = _loadAllowedTokenConfig(token);
 
         tokenOut = _usd6ToToken(cfg, _rikoToUsd6(rikoAmountIn));
@@ -352,6 +350,39 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         returns (bool completed, uint256 tokenSent)
     {
         if (msg.sender != pendingRedemptionOperator) revert RV_PendingRedemptionOperatorOnly();
+        return _processPendingRedemption(account, token);
+    }
+
+    /// @notice Operator-only batch settlement for queued redemptions.
+    /// @param account Account that owns queued redemptions.
+    /// @param token Token address for queued redemptions.
+    /// @param maxItems Max number of queue items to process in this call.
+    /// @return processed Number of redemptions completed.
+    /// @return totalTokenSent Total token amount transferred to receiver(s).
+    function processPendingRedemptions(address account, address token, uint256 maxItems)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint256 processed, uint256 totalTokenSent)
+    {
+        if (msg.sender != pendingRedemptionOperator) revert RV_PendingRedemptionOperatorOnly();
+        _requirePositiveAmount(maxItems);
+        for (uint256 i = 0; i < maxItems; ++i) {
+            if (!_hasPendingRedemption(account, token)) break;
+            (bool completed, uint256 tokenSent) = _processPendingRedemption(account, token);
+            if (!completed) break;
+            unchecked {
+                ++processed;
+            }
+            totalTokenSent += tokenSent;
+        }
+        return (processed, totalTokenSent);
+    }
+
+    function _processPendingRedemption(address account, address token)
+        internal
+        returns (bool completed, uint256 tokenSent)
+    {
         PendingRedemption memory p = _pendingRedemptionPeek(account, token);
         TokenConfig memory cfg = _loadAllowedTokenConfig(token);
         uint256 tokenOutCurrent = _usd6ToToken(cfg, _rikoToUsd6(p.rikoLocked));
@@ -428,6 +459,11 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (amount == 0) revert RV_InvalidAmount();
     }
 
+    function _requireValidReceiverAndPositiveAmount(address receiver, uint256 amount) internal pure {
+        _requireValidReceiver(receiver);
+        _requirePositiveAmount(amount);
+    }
+
     function _canSettleFromVault(address token, uint256 tokenOut) internal view returns (bool) {
         IERC20Metadata asset = IERC20Metadata(token);
         uint256 avail = asset.balanceOf(address(this));
@@ -496,6 +532,12 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         p = q[head];
     }
 
+    function _hasPendingRedemption(address account, address token) internal view returns (bool) {
+        uint256 head = _pendingRedemptionHead[account][token];
+        PendingRedemption[] storage q = _pendingRedemptionQueue[account][token];
+        return head < q.length;
+    }
+
     function _pendingRedemptionPop(address account, address token) internal {
         uint256 head = _pendingRedemptionHead[account][token];
         PendingRedemption[] storage q = _pendingRedemptionQueue[account][token];
@@ -519,7 +561,7 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         // usd = tokenAmount * price / 10**tokenDecimals, normalize to 6 decimals.
         // tokenAmount(10^tokenDec) * price(10^oracleDec) -> 10^(tokenDec+oracleDec)
         uint256 rawUsd = (tokenAmount * price) / (10 ** cfg.tokenDecimals);
-        return _scaleOracleAmountToUsd6(rawUsd, oracleDecimals);
+        return _rescaleDecimals(rawUsd, oracleDecimals, USD_DECIMALS);
     }
 
     function _usd6ToToken(TokenConfig memory cfg, uint256 usd6) internal view returns (uint256) {
@@ -535,23 +577,19 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         _requireTokenDecimals(cfg.tokenDecimals);
         // tokenAmount = usd * 10^tokenDecimals / price
         // usd6 -> oracle decimals
-        uint256 usdOracleScaled = _scaleUsd6ToOracleAmount(usd6, oracleDecimals);
+        uint256 usdOracleScaled = _rescaleDecimals(usd6, USD_DECIMALS, oracleDecimals);
         return (usdOracleScaled * (10 ** cfg.tokenDecimals)) / price;
     }
 
     function _readOracle(TokenConfig memory cfg) internal view returns (uint256 price, uint8 oracleDecimals) {
         if (cfg.oracle == address(0)) revert RV_InvalidOracle();
         IChainlinkAggregatorV3 feed = IChainlinkAggregatorV3(cfg.oracle);
-        oracleDecimals = feed.decimals();
-        _requireOracleDecimals(oracleDecimals);
-        bytes32 gotHash = keccak256(bytes(feed.description()));
-        if (cfg.expectedFeedDescriptionHash != bytes32(0) && gotHash != cfg.expectedFeedDescriptionHash) {
-            revert RV_OracleFeedMismatch();
-        }
+        oracleDecimals = _validateFeedIdentity(feed, cfg.expectedFeedDescriptionHash);
         (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
             feed.latestRoundData();
         if (roundId == 0 || startedAt > updatedAt || answeredInRound < roundId) revert RV_OraclePriceInvalid();
         if (answer <= 0) revert RV_OraclePriceInvalid();
+        if (updatedAt > block.timestamp) revert RV_OraclePriceInvalid();
         if (updatedAt == 0 || block.timestamp - updatedAt > cfg.maxOracleAge) revert RV_OraclePriceStale();
         // Safe because `answer > 0` is enforced above.
         price = uint256(answer);
@@ -565,24 +603,14 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (oracleDecimals < MIN_DECIMALS || oracleDecimals > MAX_DECIMALS) revert RV_OracleDecimalsInvalid();
     }
 
-    function _scaleOracleAmountToUsd6(uint256 amount, uint8 oracleDecimals) internal pure returns (uint256) {
-        if (oracleDecimals > USD_DECIMALS) {
-            return amount / (10 ** (oracleDecimals - USD_DECIMALS));
+    function _rescaleDecimals(uint256 amount, uint8 fromDecimals, uint8 toDecimals) internal pure returns (uint256) {
+        if (fromDecimals > toDecimals) {
+            return amount / (10 ** (fromDecimals - toDecimals));
         }
-        if (oracleDecimals < USD_DECIMALS) {
-            return amount * (10 ** (USD_DECIMALS - oracleDecimals));
+        if (fromDecimals < toDecimals) {
+            return amount * (10 ** (toDecimals - fromDecimals));
         }
         return amount;
-    }
-
-    function _scaleUsd6ToOracleAmount(uint256 usd6Amount, uint8 oracleDecimals) internal pure returns (uint256) {
-        if (oracleDecimals > USD_DECIMALS) {
-            return usd6Amount * (10 ** (oracleDecimals - USD_DECIMALS));
-        }
-        if (oracleDecimals < USD_DECIMALS) {
-            return usd6Amount / (10 ** (USD_DECIMALS - oracleDecimals));
-        }
-        return usd6Amount;
     }
 
     function _checkGlobalCapAfterMint(uint256 rikoOut) internal view {
@@ -657,7 +685,17 @@ contract RIKOVault is ERC20, Ownable2Step, ReentrancyGuard, Pausable {
         if (maxOracleAge == 0) revert RV_OraclePriceInvalid();
         if (expectedFeedDescriptionHash == bytes32(0)) revert RV_OracleFeedMismatch();
         IChainlinkAggregatorV3 feed = IChainlinkAggregatorV3(oracle);
-        _requireOracleDecimals(feed.decimals());
+        _validateFeedIdentity(feed, expectedFeedDescriptionHash);
+    }
+
+    function _validateFeedIdentity(IChainlinkAggregatorV3 feed, bytes32 expectedFeedDescriptionHash)
+        internal
+        view
+        returns (uint8 oracleDecimals)
+    {
+        oracleDecimals = feed.decimals();
+        _requireOracleDecimals(oracleDecimals);
+        if (expectedFeedDescriptionHash == bytes32(0)) return oracleDecimals;
         bytes32 gotHash = keccak256(bytes(feed.description()));
         if (gotHash != expectedFeedDescriptionHash) revert RV_OracleFeedMismatch();
     }
