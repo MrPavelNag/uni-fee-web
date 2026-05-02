@@ -34423,6 +34423,16 @@ def _render_admin_page() -> str:
       margin-top: 6px;
       display: block;
     }}
+    #tabRikoHolders #adminRikoHoldersStatus {{
+      font-size: 13px;
+      line-height: 1.5;
+      color: #1f2937;
+      background: #f8fbff;
+      border: 1px solid #dbe7f3;
+      border-radius: 10px;
+      padding: 8px 10px;
+      white-space: normal;
+    }}
     .admin-history-check-cell {{
       width: 26px;
       text-align: center !important;
@@ -36421,23 +36431,24 @@ def _render_admin_page() -> str:
           `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
         const fundingText = hasPayoutToken
           ? (canPayToken
-              ? "Funding status: достаточно."
-              : `Funding status: недостаточно (дефицит ${{formatAdminRawUnits(deficitRaw, payoutDecimals, 8)}}).`)
-          : "Funding status: payout token не настроен.";
+              ? "Funding: sufficient."
+              : `Funding: insufficient (deficit ${{formatAdminRawUnits(deficitRaw, payoutDecimals, 8)}}).`)
+          : "Funding: payout token is not configured.";
         const gasText = hasPayoutWallet
           ? (canPayGas
-              ? "Gas status: достаточно."
-              : `Gas status: недостаточно (дефицит ${{formatAdminRawUnits(gasDeficitWei, 18, 8)}} ETH).`)
-          : "Gas status: payout wallet не настроен.";
+              ? "Gas: sufficient."
+              : `Gas: insufficient (deficit ${{formatAdminRawUnits(gasDeficitWei, 18, 8)}} ETH).`)
+          : "Gas: payout wallet is not configured.";
         const payoutReadyText = canExecutePayout
-          ? "Payout status: готово."
-          : "Payout status: не готово.";
-        const baseStatus = hasPayoutToken
-          ? `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}. ${{fundingText}} ${{gasText}} ${{payoutReadyText}}`
-          : "Loaded holders, but token payout is not applied on server yet. Set Token payout and click Apply.";
-        statusEl.textContent = warnings.length
-          ? `${{baseStatus}} Warnings: ${{warnings.join("; ")}}`
-          : baseStatus;
+          ? "Payout status: ready."
+          : "Payout status: not ready.";
+        const statusLines = [];
+        statusLines.push(`Snapshot: loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}.`);
+        statusLines.push(fundingText);
+        statusLines.push(gasText);
+        statusLines.push(payoutReadyText);
+        if (warnings.length) statusLines.push(`Warnings: ${{warnings.join("; ")}}`);
+        statusEl.innerHTML = statusLines.map((line) => `<div>${{esc(line)}}</div>`).join("");
       }} catch (e) {{
         const errMsg = String(e?.shortMessage || e?.message || "unknown");
         renderAdminRikoHistoryTable("adminRikoHoldersTable", ["Info"], [], `Failed to load holders: ${{esc(errMsg)}}`);
