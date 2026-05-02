@@ -23489,9 +23489,26 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
             payout_decimals = _riko_erc20_decimals(rpc_url, payout_token)
         except Exception:
             payout_decimals = 18
+    payout_wallet = ""
+    payout_wallet_balance_raw = 0
+    funding_check_error = ""
+    private_key = _riko_auto_yield_private_key_runtime()
+    if private_key:
+        try:
+            payout_wallet = str(Account.from_key(private_key).address or "").strip().lower()
+        except Exception as e:
+            funding_check_error = f"payout_wallet_resolve_failed:{str(e)[:120]}"
+            payout_wallet = ""
+    if payout_wallet and _is_eth_address(payout_token):
+        try:
+            payout_wallet_balance_raw = int(_riko_erc20_balance_of(rpc_url, payout_token, payout_wallet))
+        except Exception as e:
+            payout_wallet_balance_raw = 0
+            funding_check_error = f"payout_wallet_balance_failed:{str(e)[:120]}"
     scale_up = max(0, int(payout_decimals) - int(riko_decimals))
     scale_down = max(0, int(riko_decimals) - int(payout_decimals))
     rows: list[dict[str, Any]] = []
+    total_planned_payout_raw = 0
     balance_call_errors = 0
     for holder in holders:
         if str(holder or "").strip().lower() == riko_token:
@@ -23514,6 +23531,7 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
             elif scale_down > 0:
                 base_amount //= 10**scale_down
             planned_payout_raw = max(0, (base_amount * int(next_bps)) // 10_000)
+            total_planned_payout_raw += int(planned_payout_raw)
             if planned_payout_raw <= 0:
                 # Real zero after integer rounding in payout token units.
                 planned_reason = "below_token_precision"
@@ -23545,6 +23563,10 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     )
     if balance_call_errors > 0:
         warnings.append(f"balanceOf_failed_for_{int(balance_call_errors)}_holders")
+    if funding_check_error:
+        warnings.append(funding_check_error)
+    can_pay = bool(int(payout_wallet_balance_raw) >= int(total_planned_payout_raw)) if _is_eth_address(payout_token) else False
+    funding_deficit_raw = max(0, int(total_planned_payout_raw) - int(payout_wallet_balance_raw))
     return {
         "ok": True,
         "chain_id": int(chain_id),
@@ -23556,6 +23578,11 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         "monthly_pct": float(monthly_pct),
         "target_bps": int(target_bps),
         "next_bps": int(next_bps),
+        "payout_wallet": payout_wallet if _is_eth_address(payout_wallet) else "",
+        "required_next_payout_raw": int(total_planned_payout_raw),
+        "available_raw": int(payout_wallet_balance_raw),
+        "funding_deficit_raw": int(funding_deficit_raw),
+        "can_pay": bool(can_pay),
         "schedule_next_due_date": schedule_next_due_date,
         "schedule_next_due_at_utc": schedule_next_due_at_utc,
         "holder_scan_start_block": int(from_block),
@@ -23946,6 +23973,23 @@ def _riko_auto_yield_report(result: dict[str, Any]) -> None:
             return
         next_bps = int(payload.get("next_bps") or 0)
         payout_token = str(payload.get("payout_token") or "").strip().lower()
+        funding_status_line = ""
+        funding_warning_line = ""
+        try:
+            preview = _riko_auto_payout_preview()
+            required_raw = int(preview.get("total_payout_raw") or 0)
+            available_raw = int(preview.get("available_raw") or 0)
+            payout_dec = int(preview.get("payout_decimals") or 18)
+            can_pay = bool(preview.get("can_pay"))
+            funding_status_line = (
+                f"Funding check: required={required_raw} raw, available={available_raw} raw, "
+                f"token_decimals={payout_dec}, can_pay={'yes' if can_pay else 'no'}"
+            )
+            if not can_pay:
+                deficit_raw = max(0, required_raw - available_raw)
+                funding_warning_line = f"WARNING: payout wallet is short by {deficit_raw} raw units for next payout."
+        except Exception as e:
+            funding_status_line = f"Funding check failed: {str(e)[:180]}"
         lines = [
             "[UNI_FEE] RIKO Auto-Payout Bot",
             f"Time (UTC): {_iso_now()}",
@@ -23956,6 +24000,10 @@ def _riko_auto_yield_report(result: dict[str, Any]) -> None:
             lines.append(f"Planned monthly rate: {next_bps} bps")
         if payout_token:
             lines.append(f"Payout token: {payout_token}")
+        if funding_status_line:
+            lines.append(funding_status_line)
+        if funding_warning_line:
+            lines.append(funding_warning_line)
         ok, info = _send_telegram_message("\n".join(lines))
         if not ok:
             print(f"[riko-auto-payout] telegram reminder send failed: {info}")
@@ -33869,24 +33917,24 @@ def _render_admin_page() -> str:
     table {{ width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1100px; }}
     th, td {{ border-bottom: 1px solid #e2e8f0; padding: 8px; text-align: left; vertical-align: top; }}
     th {{ background: #eff6ff; color: #1e3a8a; position: sticky; top: 0; }}
-    .riko-tx-tools {{ display: inline-flex; align-items: center; gap: 8px; }}
+    .riko-tx-tools {{ display: inline-flex; align-items: center; gap: 6px; }}
     .riko-tx-tool-btn {{
-      border: 1px solid #94a3b8;
-      border-radius: 7px;
-      background: #f8fbff;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
       color: #1d4ed8;
-      font-size: 13px;
+      font-size: 9px;
       line-height: 1;
       text-decoration: none;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 30px;
-      height: 30px;
+      width: 21px;
+      height: 21px;
       padding: 0;
     }}
-    .riko-tx-tool-btn:hover {{ background: #eff6ff; border-color: #64748b; }}
+    .riko-tx-tool-btn:hover {{ background: transparent; color: #1e40af; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
     pre {{ max-height: 320px; overflow: auto; background: #f8fafc; border: 1px solid #dbe3ef; border-radius: 8px; padding: 10px; color: #334155; font-size: 12px; white-space: pre-wrap; }}
     .wallet-modal-backdrop {{ position: fixed; inset: 0; background: linear-gradient(180deg, rgba(217,227,245,0.82) 0%, rgba(236,242,255,0.82) 100%); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 9999; }}
@@ -34109,10 +34157,19 @@ def _render_admin_page() -> str:
       line-height: 1;
     }}
     .admin-history-trash-btn {{
-      font-size: 16px;
+      font-size: 11px;
       line-height: 1;
-      min-width: 42px;
-      padding: 6px 10px;
+      min-width: 30px;
+      padding: 2px 0;
+      border: 0 !important;
+      border-radius: 0 !important;
+      background: transparent !important;
+      box-shadow: none !important;
+      color: #1d4ed8 !important;
+    }}
+    .admin-history-trash-btn:hover {{
+      background: transparent !important;
+      color: #1e40af !important;
     }}
     .admin-history-table td:last-child {{
       text-align: right;
@@ -36098,6 +36155,12 @@ def _render_admin_page() -> str:
         const payoutToken = String(data?.payout_token || "").trim().toLowerCase();
         const hasPayoutToken = /^0x[a-f0-9]{{40}}$/.test(payoutToken);
         const payoutTokenLabel = /^0x[a-f0-9]{{40}}$/.test(payoutToken) ? shortAddrAdmin(payoutToken) : "-";
+        const payoutWallet = String(data?.payout_wallet || "").trim().toLowerCase();
+        const hasPayoutWallet = /^0x[a-f0-9]{{40}}$/.test(payoutWallet);
+        const requiredRaw = String(data?.required_next_payout_raw || "0");
+        const availableRaw = String(data?.available_raw || "0");
+        const deficitRaw = String(data?.funding_deficit_raw || "0");
+        const canPay = !!data?.can_pay;
         const scheduleNextDueUtc = String(data?.schedule_next_due_at_utc || data?.schedule_next_due_date || "").trim();
         const nextBps = Number(data?.next_bps || 0);
         const holderColumns = ["Address", "Balance", "Planned yield", "Planned date (UTC)", "Last change date", "Tx hash"];
@@ -36171,11 +36234,17 @@ def _render_admin_page() -> str:
         summaryEl.textContent =
           `Showing ${{fmtInt(shownHolders)}} of ${{fmtInt(totalHolders)}} holders. ` +
           `RIKO token: ${{shortAddrAdmin(String(data?.riko_token || ""))}}. ` +
+          `Next payout funding: required ${{formatAdminRawUnits(requiredRaw, payoutDecimals, 8)}} / available ${{formatAdminRawUnits(availableRaw, payoutDecimals, 8)}}${{hasPayoutWallet ? ` (wallet: ${{shortAddrAdmin(payoutWallet)}})` : ""}}. ` +
           `Expected yield for next payout: ${{fmtInt(nextBps)}} bps/month. ` +
           `Next payout: ${{scheduleNextDueUtc || "-"}}. ` +
           `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
+        const fundingText = hasPayoutToken
+          ? (canPay
+              ? "Funding check: enough balance for next payout."
+              : `Funding check: insufficient balance (missing ${{formatAdminRawUnits(deficitRaw, payoutDecimals, 8)}}).`)
+          : "Funding check: payout token is not configured.";
         const baseStatus = hasPayoutToken
-          ? `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}.`
+          ? `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}. ${{fundingText}}`
           : "Loaded holders, but token payout is not applied on server yet. Set Token payout and click Apply.";
         statusEl.textContent = warnings.length
           ? `${{baseStatus}} Warnings: ${{warnings.join("; ")}}`
