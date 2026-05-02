@@ -35593,6 +35593,9 @@ def _render_admin_page() -> str:
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
+          const tokenLabelDisplay = /^0x[a-f0-9]{{40}}$/.test(String(tokenLabel || "").toLowerCase())
+            ? shortAddrAdmin(tokenLabel)
+            : String(tokenLabel || "-");
           const tokenOutRaw = String(ev?.tokenOut ?? 0n);
           const rikoBurnedRaw = String(ev?.rikoBurned ?? 0n);
           const completionStatus = await resolveRedeemCompletionStatus(txHash);
@@ -35603,7 +35606,7 @@ def _render_admin_page() -> str:
           const rikoBurnedDisplay = formatAdminRawUnits(rikoBurnedRaw, 6, 6);
           const exchangeRate = tokenDecimals === null
             ? "-"
-            : formatAdminRateDisplay(tokenOutRaw, tokenDecimals, rikoBurnedRaw, 6, tokenLabel === "ETH" ? "ETH" : tokenLabel, "RIKO");
+            : formatAdminRateDisplay(tokenOutRaw, tokenDecimals, rikoBurnedRaw, 6, tokenLabel === "ETH" ? "ETH" : tokenLabelDisplay, "RIKO");
           const checked = /^0x[a-f0-9]{{64}}$/.test(txHash) && adminRikoHistorySelection.redeem.has(txHash) ? "checked" : "";
           redeemHistoryRows.push({{
             ts,
@@ -35613,7 +35616,7 @@ def _render_admin_page() -> str:
               `<tr>` +
               `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
               `<td class='mono'>${{shortAddrAdmin(account)}}</td>` +
-              `<td class='mono'>${{String(tokenLabel || "-")}}</td>` +
+              `<td class='mono'>${{tokenLabelDisplay}}</td>` +
               `<td title="Redeem completion path is inferred from transaction method.">${{completionStatus}}</td>` +
               `<td class='mono'>${{tokenOutDisplay}}</td>` +
               `<td class='mono'>${{rikoBurnedDisplay}} RIKO</td>` +
@@ -35632,6 +35635,9 @@ def _render_admin_page() -> str:
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
+          const tokenLabelDisplay = /^0x[a-f0-9]{{40}}$/.test(String(tokenLabel || "").toLowerCase())
+            ? shortAddrAdmin(tokenLabel)
+            : String(tokenLabel || "-");
           const returned = String(ev?.rikoReturned ?? 0n);
           const checked = /^0x[a-f0-9]{{64}}$/.test(txHash) && adminRikoHistorySelection.redeem.has(txHash) ? "checked" : "";
           redeemHistoryRows.push({{
@@ -35642,7 +35648,7 @@ def _render_admin_page() -> str:
               `<tr>` +
               `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
               `<td class='mono'>${{shortAddrAdmin(account)}}</td>` +
-              `<td class='mono'>${{String(tokenLabel || "-")}}</td>` +
+              `<td class='mono'>${{tokenLabelDisplay}}</td>` +
               `<td>Cancelled</td>` +
               `<td class='mono'>${{formatAdminRawUnits(returned, 6, 6)}} RIKO</td>` +
               `<td class='mono'>-</td>` +
@@ -35681,6 +35687,9 @@ def _render_admin_page() -> str:
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenDepositTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
+          const tokenLabelDisplay = /^0x[a-f0-9]{{40}}$/.test(String(tokenLabel || "").toLowerCase())
+            ? shortAddrAdmin(tokenLabel)
+            : String(tokenLabel || "-");
           const tokenInRaw = String(ev?.tokenIn ?? 0n);
           const rikoMintedRaw = String(ev?.rikoMinted ?? 0n);
           const tokenDecimals = await resolveTokenDecimals(token, tokenLower);
@@ -35689,7 +35698,7 @@ def _render_admin_page() -> str:
             : formatAdminRawUnits(tokenInRaw, tokenDecimals, 8);
           const exchangeRate = tokenDecimals === null
             ? "-"
-            : formatAdminRateDisplay(rikoMintedRaw, 6, tokenInRaw, tokenDecimals, "RIKO", tokenLabel === "ETH" ? "ETH" : tokenLabel);
+            : formatAdminRateDisplay(rikoMintedRaw, 6, tokenInRaw, tokenDecimals, "RIKO", tokenLabel === "ETH" ? "ETH" : tokenLabelDisplay);
           const checked = /^0x[a-f0-9]{{64}}$/.test(txHash) && adminRikoHistorySelection.deposit.has(txHash) ? "checked" : "";
           depositHistoryRows.push({{
             ts,
@@ -35699,7 +35708,7 @@ def _render_admin_page() -> str:
               `<tr>` +
               `<td>${{ts > 0 ? formatAdminRikoDate(ts) : ("Block #" + String(bn || "-"))}}</td>` +
               `<td class='mono'>${{shortAddrAdmin(user)}}</td>` +
-              `<td class='mono'>${{String(tokenLabel || "-")}}</td>` +
+              `<td class='mono'>${{tokenLabelDisplay}}</td>` +
               `<td class='mono'>${{tokenInDisplay}}</td>` +
               `<td class='mono'>${{formatAdminRawUnits(rikoMintedRaw, 6, 6)}} RIKO</td>` +
               `<td class='mono'>${{exchangeRate}}</td>` +
@@ -36665,27 +36674,31 @@ def _render_admin_page() -> str:
         const needFromCustodyText = formatAdminRawUnits(String(requiredFromCustody), decimals, 8);
         const connectedShort = shortAddrAdmin(authAddr || "-");
         const operatorShort = shortAddrAdmin(pendingOp || "-");
-        const checklist = [];
-        checklist.push(`Quote check: ${{quoteCheckOk ? "OK" : "FAIL"}} (quote ${{quoteText}}, minOut ${{minOutText}})`);
-        checklist.push(`Liquidity: ${{liquidityOk ? "OK" : "FAIL"}} (available ${{availableText}}, need ${{needText}})`);
-        checklist.push(`Custody allowance: ${{allowanceOk ? "OK" : "FAIL"}} (allowance ${{allowanceText}}, need from custody ${{needFromCustodyText}})`);
-        checklist.push(`Operator wallet: ${{operatorOk ? "OK" : "FAIL"}} (connected ${{connectedShort}}, required ${{operatorShort}})`);
-        let action = "Ready: click Apply on-chain.";
+        const usesEthPath = String(tokenRawInput || "").trim().toLowerCase() === "eth";
+        const checks = [];
+        checks.push(`Quote: ${{quoteText}} (minOut: ${{minOutText}}) — ${{quoteCheckOk ? "ok" : "fails minOut check"}}`);
+        checks.push(`Liquidity: available ${{availableText}}, need ${{needText}} — ${{liquidityOk ? "enough" : "not enough"}}`);
+        checks.push(`Custody allowance: ${{allowanceText}} (need from custody: ${{needFromCustodyText}}) — ${{allowanceOk ? "ok" : "insufficient"}}`);
+        checks.push(`Operator wallet: connected ${{connectedShort}}, required ${{operatorShort}} — ${{operatorOk ? "ok" : "wrong wallet"}}`);
+        let action = "Everything is ready. Click Apply on-chain.";
         if (!operatorOk) {{
-          action = "Action: connect/sign in with current pending redemption operator wallet.";
+          action = "Connect/sign in with the current pending redemption operator wallet, then retry.";
         }} else if (!quoteCheckOk) {{
-          action = "Action: minOut check fails now. Wait for better quote or cancel and redeem again with lower minOut.";
+          action = "Current quote is below minOut. Wait for a better quote or create redeem again with lower minOut.";
         }} else if (!liquidityOk) {{
-          action = `Action: top up ${{tokenLabel}} liquidity (vault and/or custody) by at least ${{formatAdminRawUnits(String(tokenOutToSend > totalAvailable ? (tokenOutToSend - totalAvailable) : 0n), decimals, 8)}}.`;
+          const missing = formatAdminRawUnits(String(tokenOutToSend > totalAvailable ? (tokenOutToSend - totalAvailable) : 0n), decimals, 8);
+          if (usesEthPath) {{
+            action = `Add at least ${{missing}} WETH liquidity (vault and/or custody). Note: native ETH balance is not used here; this path requires WETH.`;
+          }} else {{
+            action = `Add at least ${{missing}} ${{String(tokenRawInput || "token").toUpperCase()}} liquidity (vault and/or custody).`;
+          }}
         }} else if (!custodyBalOk) {{
-          action = `Action: top up custody balance by ${{formatAdminRawUnits(String(requiredFromCustody - custodyBal), decimals, 8)}}.`;
+          action = `Top up custody balance by ${{formatAdminRawUnits(String(requiredFromCustody - custodyBal), decimals, 8)}}.`;
         }} else if (!allowanceOk) {{
-          action = `Action: sign approve from custody to vault for at least ${{formatAdminRawUnits(String(requiredFromCustody), decimals, 8)}} (or max).`;
+          action = `Sign approve from custody to vault for at least ${{formatAdminRawUnits(String(requiredFromCustody), decimals, 8)}} (or MAX).`;
         }}
         const isOk = operatorOk && quoteCheckOk && liquidityOk && allowanceOk && custodyBalOk;
-        const nextStep = isOk
-          ? "Next step: click Apply on-chain."
-          : action.replace(/^Action:\s*/i, "Next step: ");
+        const summary = isOk ? "Diagnose: ready to process pending redeem." : "Diagnose: pending redeem is blocked.";
         adminRikoPatchPendingDiagCell(accountAddr, tokenAddr, {{
           quoteOk: quoteCheckOk,
           liquidityOk,
@@ -36695,7 +36708,7 @@ def _render_admin_page() -> str:
           allowanceHint: `allowance=${{allowanceText}} needFromCustody=${{needFromCustodyText}}`,
         }});
         setAdminRikoPendingOpsStatus(
-          "Diagnose: " + checklist.join(". ") + ". " + nextStep,
+          `${{summary}} ${{checks.join(". ")}}. Next step: ${{action}}`,
           !isOk
         );
       }} catch (e) {{
