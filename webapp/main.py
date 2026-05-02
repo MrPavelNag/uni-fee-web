@@ -2770,6 +2770,10 @@ def _human_riko_auto_yield_reason(reason: str) -> tuple[str, str]:
             "Payout wallet balance is lower than required total payout.",
             "Top up payout wallet or reduce payout amount/rate.",
         ),
+        "insufficient_native_gas_balance": (
+            "Payout wallet native coin balance is too low to pay transfer gas.",
+            "Top up payout wallet with native gas token and retry.",
+        ),
     }
     return mapping.get(r, (r.replace("_", " ") or "unknown reason", "Check server logs for details."))
 
@@ -23164,6 +23168,20 @@ def _riko_erc20_balance_of(rpc_url: str, token_address: str, holder: str) -> int
     return int(_eth_decode_uint256(out))
 
 
+def _eth_get_native_balance_wei(rpc_url: str, holder: str) -> int:
+    raw = _eth_rpc(rpc_url, "eth_getBalance", [str(holder or "").strip(), "latest"])
+    return int(_eth_hex_to_int(raw))
+
+
+def _riko_estimated_total_gas_need_wei(rpc_url: str, payout_count: int) -> tuple[int, int, int]:
+    gas_price_wei = int(_eth_hex_to_int(_eth_rpc(rpc_url, "eth_gasPrice", [])))
+    count = max(0, int(payout_count or 0))
+    per_tx_gas_limit = 90_000
+    base_total = int(gas_price_wei) * int(per_tx_gas_limit) * int(count)
+    buffered_total = int(base_total * 1.30)
+    return int(gas_price_wei), int(per_tx_gas_limit), int(buffered_total)
+
+
 def _riko_collect_holder_candidates_from_transfers(
     rpc_url: str, riko_token: str, from_block: int, to_block: int
 ) -> tuple[set[str], str]:
@@ -23385,6 +23403,16 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
     payout_rows.sort(key=lambda x: int(x[2]), reverse=True)
 
     payout_wallet_balance = int(_riko_erc20_balance_of(rpc_url, payout_token, sender))
+    native_balance_wei = 0
+    gas_price_wei = 0
+    gas_per_tx_limit = 90_000
+    required_gas_wei = 0
+    gas_error = ""
+    try:
+        native_balance_wei = int(_eth_get_native_balance_wei(rpc_url, sender))
+        gas_price_wei, gas_per_tx_limit, required_gas_wei = _riko_estimated_total_gas_need_wei(rpc_url, len(payout_rows))
+    except Exception as e:
+        gas_error = str(e)[:180]
     top_recipients: list[dict[str, Any]] = []
     for holder, riko_bal, payout_raw in payout_rows[:10]:
         top_recipients.append(
@@ -23394,6 +23422,8 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
                 "payout_raw": int(payout_raw),
             }
         )
+    can_pay_token = bool(payout_wallet_balance >= total_payout_raw)
+    can_pay_gas = bool(native_balance_wei >= required_gas_wei) if required_gas_wei > 0 else True
     result.update(
         {
             "status": "ok",
@@ -23415,7 +23445,16 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
             "payout_count": int(len(payout_rows)),
             "total_payout_raw": int(total_payout_raw),
             "available_raw": int(payout_wallet_balance),
-            "can_pay": bool(payout_wallet_balance >= total_payout_raw),
+            "can_pay": bool(can_pay_token),
+            "can_pay_token": bool(can_pay_token),
+            "native_balance_wei": int(native_balance_wei),
+            "gas_price_wei": int(gas_price_wei),
+            "gas_per_tx_limit": int(gas_per_tx_limit),
+            "required_gas_wei": int(required_gas_wei),
+            "gas_deficit_wei": int(max(0, int(required_gas_wei) - int(native_balance_wei))),
+            "can_pay_gas": bool(can_pay_gas),
+            "can_execute_payout": bool(can_pay_token and can_pay_gas),
+            "gas_check_error": str(gas_error or ""),
             "top_recipients": top_recipients,
             "schedule_time_utc": str(schedule.get("payout_time_utc") or "00:00"),
             "schedule_next_due_date": str(schedule.get("next_due_date") or ""),
@@ -23491,6 +23530,10 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
             payout_decimals = 18
     payout_wallet = ""
     payout_wallet_balance_raw = 0
+    payout_wallet_native_balance_wei = 0
+    gas_price_wei = 0
+    gas_per_tx_limit = 90_000
+    required_gas_wei = 0
     funding_check_error = ""
     private_key = _riko_auto_yield_private_key_runtime()
     if private_key:
@@ -23509,6 +23552,7 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     scale_down = max(0, int(riko_decimals) - int(payout_decimals))
     rows: list[dict[str, Any]] = []
     total_planned_payout_raw = 0
+    planned_payout_count = 0
     balance_call_errors = 0
     for holder in holders:
         if str(holder or "").strip().lower() == riko_token:
@@ -23532,6 +23576,8 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
                 base_amount //= 10**scale_down
             planned_payout_raw = max(0, (base_amount * int(next_bps)) // 10_000)
             total_planned_payout_raw += int(planned_payout_raw)
+            if planned_payout_raw > 0:
+                planned_payout_count += 1
             if planned_payout_raw <= 0:
                 # Real zero after integer rounding in payout token units.
                 planned_reason = "below_token_precision"
@@ -23566,7 +23612,22 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     if funding_check_error:
         warnings.append(funding_check_error)
     can_pay = bool(int(payout_wallet_balance_raw) >= int(total_planned_payout_raw)) if _is_eth_address(payout_token) else False
+    gas_check_error = ""
+    if payout_wallet:
+        try:
+            payout_wallet_native_balance_wei = int(_eth_get_native_balance_wei(rpc_url, payout_wallet))
+            gas_price_wei, gas_per_tx_limit, required_gas_wei = _riko_estimated_total_gas_need_wei(
+                rpc_url, int(planned_payout_count)
+            )
+        except Exception as e:
+            gas_check_error = f"gas_check_failed:{str(e)[:120]}"
     funding_deficit_raw = max(0, int(total_planned_payout_raw) - int(payout_wallet_balance_raw))
+    can_pay_gas = (
+        bool(int(payout_wallet_native_balance_wei) >= int(required_gas_wei)) if int(required_gas_wei) > 0 else True
+    ) if payout_wallet else False
+    gas_deficit_wei = max(0, int(required_gas_wei) - int(payout_wallet_native_balance_wei))
+    if gas_check_error:
+        warnings.append(gas_check_error)
     return {
         "ok": True,
         "chain_id": int(chain_id),
@@ -23583,6 +23644,15 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         "available_raw": int(payout_wallet_balance_raw),
         "funding_deficit_raw": int(funding_deficit_raw),
         "can_pay": bool(can_pay),
+        "can_pay_token": bool(can_pay),
+        "payout_count": int(planned_payout_count),
+        "native_balance_wei": int(payout_wallet_native_balance_wei),
+        "gas_price_wei": int(gas_price_wei),
+        "gas_per_tx_limit": int(gas_per_tx_limit),
+        "required_gas_wei": int(required_gas_wei),
+        "gas_deficit_wei": int(gas_deficit_wei),
+        "can_pay_gas": bool(can_pay_gas),
+        "can_execute_payout": bool(can_pay and can_pay_gas),
         "schedule_next_due_date": schedule_next_due_date,
         "schedule_next_due_at_utc": schedule_next_due_at_utc,
         "holder_scan_start_block": int(from_block),
@@ -23799,6 +23869,8 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
         return result
 
     payout_wallet_balance = int(_riko_erc20_balance_of(rpc_url, payout_token, sender))
+    native_balance_wei = int(_eth_get_native_balance_wei(rpc_url, sender))
+    gas_price_wei, gas_per_tx_limit, required_gas_wei = _riko_estimated_total_gas_need_wei(rpc_url, len(payout_rows))
     if payout_wallet_balance < total_payout_raw:
         result.update(
             {
@@ -23807,6 +23879,29 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
                 "payout_wallet": sender,
                 "required_raw": int(total_payout_raw),
                 "available_raw": int(payout_wallet_balance),
+                "native_balance_wei": int(native_balance_wei),
+                "required_gas_wei": int(required_gas_wei),
+                "gas_price_wei": int(gas_price_wei),
+                "payout_token": payout_token.lower(),
+                "holders_scanned": int(len(cached_holders)),
+                "holders_positive": int(len(holders_with_balance)),
+                "payout_count": int(len(payout_rows)),
+                "month_key": month_key,
+                "schedule_date_key": schedule_date_key,
+            }
+        )
+        return result
+    if required_gas_wei > 0 and native_balance_wei < required_gas_wei:
+        result.update(
+            {
+                "status": "skip",
+                "reason": "insufficient_native_gas_balance",
+                "payout_wallet": sender,
+                "required_raw": int(total_payout_raw),
+                "available_raw": int(payout_wallet_balance),
+                "native_balance_wei": int(native_balance_wei),
+                "required_gas_wei": int(required_gas_wei),
+                "gas_price_wei": int(gas_price_wei),
                 "payout_token": payout_token.lower(),
                 "holders_scanned": int(len(cached_holders)),
                 "holders_positive": int(len(holders_with_balance)),
@@ -23840,6 +23935,16 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
             "holders_positive": int(len(holders_with_balance)),
             "payout_count": int(len(payout_rows)),
             "total_payout_raw": int(total_payout_raw),
+            "available_raw": int(payout_wallet_balance),
+            "native_balance_wei": int(native_balance_wei),
+            "required_gas_wei": int(required_gas_wei),
+            "gas_price_wei": int(gas_price_wei),
+            "can_pay_token": bool(payout_wallet_balance >= total_payout_raw),
+            "can_pay_gas": bool(required_gas_wei <= 0 or native_balance_wei >= required_gas_wei),
+            "can_execute_payout": bool(
+                payout_wallet_balance >= total_payout_raw
+                and (required_gas_wei <= 0 or native_balance_wei >= required_gas_wei)
+            ),
             "month_key": month_key,
             "schedule_date_key": schedule_date_key,
             "schedule_time_utc": payout_time_utc,
@@ -23975,12 +24080,17 @@ def _riko_auto_yield_report(result: dict[str, Any]) -> None:
         payout_token = str(payload.get("payout_token") or "").strip().lower()
         funding_status_line = ""
         funding_warning_line = ""
+        gas_status_line = ""
+        gas_warning_line = ""
         try:
             preview = _riko_auto_payout_preview()
             required_raw = int(preview.get("total_payout_raw") or 0)
             available_raw = int(preview.get("available_raw") or 0)
             payout_dec = int(preview.get("payout_decimals") or 18)
             can_pay = bool(preview.get("can_pay"))
+            native_balance_wei = int(preview.get("native_balance_wei") or 0)
+            required_gas_wei = int(preview.get("required_gas_wei") or 0)
+            can_pay_gas = bool(preview.get("can_pay_gas"))
             funding_status_line = (
                 f"Funding check: required={required_raw} raw, available={available_raw} raw, "
                 f"token_decimals={payout_dec}, can_pay={'yes' if can_pay else 'no'}"
@@ -23988,6 +24098,14 @@ def _riko_auto_yield_report(result: dict[str, Any]) -> None:
             if not can_pay:
                 deficit_raw = max(0, required_raw - available_raw)
                 funding_warning_line = f"WARNING: payout wallet is short by {deficit_raw} raw units for next payout."
+            gas_status_line = (
+                f"Gas check: required={required_gas_wei} wei, available={native_balance_wei} wei, "
+                f"can_pay={'yes' if can_pay_gas else 'no'}"
+            )
+            if not can_pay_gas:
+                gas_warning_line = (
+                    f"WARNING: payout wallet gas is short by {max(0, required_gas_wei - native_balance_wei)} wei."
+                )
         except Exception as e:
             funding_status_line = f"Funding check failed: {str(e)[:180]}"
         lines = [
@@ -24004,6 +24122,10 @@ def _riko_auto_yield_report(result: dict[str, Any]) -> None:
             lines.append(funding_status_line)
         if funding_warning_line:
             lines.append(funding_warning_line)
+        if gas_status_line:
+            lines.append(gas_status_line)
+        if gas_warning_line:
+            lines.append(gas_warning_line)
         ok, info = _send_telegram_message("\n".join(lines))
         if not ok:
             print(f"[riko-auto-payout] telegram reminder send failed: {info}")
@@ -36218,6 +36340,12 @@ def _render_admin_page() -> str:
         const availableRaw = String(data?.available_raw || "0");
         const deficitRaw = String(data?.funding_deficit_raw || "0");
         const canPay = !!data?.can_pay;
+        const canPayToken = (data?.can_pay_token !== undefined) ? !!data?.can_pay_token : canPay;
+        const nativeBalanceWei = String(data?.native_balance_wei || "0");
+        const requiredGasWei = String(data?.required_gas_wei || "0");
+        const gasDeficitWei = String(data?.gas_deficit_wei || "0");
+        const canPayGas = !!data?.can_pay_gas;
+        const canExecutePayout = !!data?.can_execute_payout;
         const scheduleNextDueUtc = String(data?.schedule_next_due_at_utc || data?.schedule_next_due_date || "").trim();
         const nextBps = Number(data?.next_bps || 0);
         const holderColumns = ["Address", "Balance", "Planned yield", "Planned date (UTC)", "Last change date", "Tx hash"];
@@ -36292,16 +36420,25 @@ def _render_admin_page() -> str:
           `Showing ${{fmtInt(shownHolders)}} of ${{fmtInt(totalHolders)}} holders. ` +
           `RIKO token: ${{shortAddrAdmin(String(data?.riko_token || ""))}}. ` +
           `Next payout funding: required ${{formatAdminRawUnits(requiredRaw, payoutDecimals, 8)}} / available ${{formatAdminRawUnits(availableRaw, payoutDecimals, 8)}}${{hasPayoutWallet ? ` (wallet: ${{shortAddrAdmin(payoutWallet)}})` : ""}}. ` +
+          `Gas: required ${{formatAdminRawUnits(requiredGasWei, 18, 8)}} ETH / available ${{formatAdminRawUnits(nativeBalanceWei, 18, 8)}} ETH. ` +
           `Expected yield for next payout: ${{fmtInt(nextBps)}} bps/month. ` +
           `Next payout: ${{scheduleNextDueUtc || "-"}}. ` +
           `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
         const fundingText = hasPayoutToken
-          ? (canPay
-              ? "Funding check: enough balance for next payout."
-              : `Funding check: insufficient balance (missing ${{formatAdminRawUnits(deficitRaw, payoutDecimals, 8)}}).`)
-          : "Funding check: payout token is not configured.";
+          ? (canPayToken
+              ? "Funding status: достаточно."
+              : `Funding status: недостаточно (дефицит ${{formatAdminRawUnits(deficitRaw, payoutDecimals, 8)}}).`)
+          : "Funding status: payout token не настроен.";
+        const gasText = hasPayoutWallet
+          ? (canPayGas
+              ? "Gas status: достаточно."
+              : `Gas status: недостаточно (дефицит ${{formatAdminRawUnits(gasDeficitWei, 18, 8)}} ETH).`)
+          : "Gas status: payout wallet не настроен.";
+        const payoutReadyText = canExecutePayout
+          ? "Payout status: готово."
+          : "Payout status: не готово.";
         const baseStatus = hasPayoutToken
-          ? `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}. ${{fundingText}}`
+          ? `Loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}. ${{fundingText}} ${{gasText}} ${{payoutReadyText}}`
           : "Loaded holders, but token payout is not applied on server yet. Set Token payout and click Apply.";
         statusEl.textContent = warnings.length
           ? `${{baseStatus}} Warnings: ${{warnings.join("; ")}}`
