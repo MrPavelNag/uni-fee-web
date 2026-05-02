@@ -25706,6 +25706,7 @@ def _render_riko_page() -> str:
     let rikoDeferredTxRows = [];
     let rikoDeferredFlushTimer = null;
     let rikoShowHiddenTxRows = false;
+    let rikoPendingCloseBackfillTs = 0;
     let rikoLastCapLoadTs = 0;
     function esc(v) {
       return String(v == null ? "" : v)
@@ -26090,6 +26091,7 @@ def _render_riko_page() -> str:
         });
         const hasWithdrawStage = ordered.some((x) => stageKeyForRow(x) === "withdraw");
         const hasSettleStage = ordered.some((x) => stageKeyForRow(x) === "settle");
+        const hasCancelStage = ordered.some((x) => stageKeyForRow(x) === "cancel");
         const settledFromLiquidity = ordered.some((x) => String(x?.action || "").toLowerCase().includes("settled from vault liquidity"));
         const operatorFlow = !settledFromLiquidity && (
           ordered.some((x) => String(x?.action || "").toLowerCase().includes("queued"))
@@ -26141,10 +26143,17 @@ def _render_riko_page() -> str:
           return a.includes("pending/settle") || a.includes("settle (operator)");
         });
         const needSyntheticWrap = hasDepositStage && !hasWrapStage && String(tokenSymbol || "").trim().toUpperCase() === "ETH";
-        const needSyntheticPending = operatorFlow && hasSettleStage && !hasQueuedOrPendingStage;
+        const hasTerminalRedeemStage = hasSettleStage || hasCancelStage || hasQueuedOrPendingStage;
+        const needSyntheticRedeem = hasTerminalRedeemStage && !hasRedeemStage;
+        const needSyntheticPending = (hasSettleStage || hasCancelStage) && !hasQueuedOrPendingStage;
         let syntheticWrapInserted = false;
+        let syntheticRedeemInserted = false;
         let syntheticPendingInserted = false;
         const txChainParts = [];
+        if (needSyntheticRedeem) {
+          txChainParts.push(`<span class="riko-tx-label">✓ Redeem</span>`);
+          syntheticRedeemInserted = true;
+        }
         for (const x of ordered) {
           let stage = flowStageLabel(x);
           const stKey = stageKeyForRow(x);
@@ -26188,6 +26197,10 @@ def _render_riko_page() -> str:
           const errReason = rowIsFailed(x) ? String(x?.error_reason || "").trim() : "";
           const titleAttr = errReason ? ` title="${errReason.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}"` : "";
           txChainParts.push(`<span class="riko-tx-label"${titleAttr}>${mark} ${stage}</span>${txTools}`);
+        }
+        if (needSyntheticRedeem && !syntheticRedeemInserted) {
+          txChainParts.unshift(`<span class="riko-tx-label">✓ Redeem</span>`);
+          syntheticRedeemInserted = true;
         }
         if (needSyntheticPending && !syntheticPendingInserted) {
           txChainParts.push(`<span class="riko-tx-label">⏳ Pending (awaiting operator)</span>`);
@@ -26236,7 +26249,6 @@ def _render_riko_page() -> str:
               ? `<span class="riko-tx-flow-badge pending-step">Pending step</span>`
               : ""));
         const metaText = infoBits.concat(roleBits).join(" | ");
-        const hasCancelStage = ordered.some((x) => stageKeyForRow(x) === "cancel");
         const hasUnwrapStage = ordered.some((x) => stageKeyForRow(x) === "unwrap");
         const hasEthOut = String(receivedSymbol || "").trim().toUpperCase() === "ETH";
         const forceStatusRow = ordered.some((x) => {
@@ -27518,12 +27530,15 @@ def _render_riko_page() -> str:
         const symbols = getRikoTrackedSymbols();
         const seenAddr = new Set();
         const rows = [];
+        const trackedTokenKeys = new Set();
         const activePendingKeys = new Set();
         for (const symbol of symbols) {
           const tokenAddr = String(await resolveVaultTokenAddressForAction(symbol, "", provider) || "").trim();
           const addrLc = tokenAddr.toLowerCase();
           if (!/^0x[a-fA-F0-9]{40}$/.test(tokenAddr) || seenAddr.has(addrLc)) continue;
           seenAddr.add(addrLc);
+          const sym = String(symbol || "").trim().toLowerCase() || "token";
+          trackedTokenKeys.add(`${sym}|${addrLc}`);
           let pending = null;
           try {
             pending = await vault.pendingRedemptions(user, tokenAddr);
@@ -27539,7 +27554,6 @@ def _render_riko_page() -> str:
             const d = Number(await token.decimals());
             if (Number.isInteger(d) && d >= 0 && d <= 36) outDecimals = d;
           } catch (_) {}
-          const sym = String(symbol || "").trim().toLowerCase();
           const outUnit = sym === "eth" ? "ETH" : String(sym || "token").toUpperCase();
           rows.push({
             symbol: sym || "token",
@@ -27582,9 +27596,23 @@ def _render_riko_page() -> str:
           return Array.from(out);
         })();
         const pendingKeysToResolve = Array.from(new Set([...(clearedPendingKeys || []), ...(unresolvedPendingKeys || [])]));
-        if (pendingKeysToResolve.length) {
+        const shouldPeriodicClosedBackfill = (
+          !pendingKeysToResolve.length
+          && !activePendingKeys.size
+          && trackedTokenKeys.size > 0
+          && ((Date.now() - Number(rikoPendingCloseBackfillTs || 0)) >= 120000)
+        );
+        const keysToInspect = pendingKeysToResolve.length
+          ? pendingKeysToResolve
+          : (shouldPeriodicClosedBackfill ? Array.from(trackedTokenKeys) : []);
+        if (keysToInspect.length) {
           const latest = Number(await provider.getBlockNumber());
           const fromBlock = Math.max(0, latest - 500000);
+          const hasHistoryHash = (txHashRaw) => {
+            const txh = String(txHashRaw || "").trim().toLowerCase();
+            if (!/^0x[a-f0-9]{64}$/.test(txh)) return false;
+            return (Array.isArray(rikoTxHistory) ? rikoTxHistory : []).some((x) => String(x?.hash || "").trim().toLowerCase() === txh);
+          };
           const pickLatestLog = (arr) => {
             const list = Array.isArray(arr) ? arr : [];
             list.sort((a, b) => {
@@ -27595,7 +27623,7 @@ def _render_riko_page() -> str:
             });
             return list[0] || null;
           };
-          for (const key of pendingKeysToResolve) {
+          for (const key of keysToInspect) {
             const [symRaw, tokenRaw] = String(key || "").split("|");
             const sym = String(symRaw || "").trim().toLowerCase();
             const tokenAddr = String(tokenRaw || "").trim();
@@ -27612,12 +27640,29 @@ def _render_riko_page() -> str:
                   if (Number.isInteger(d) && d >= 0 && d <= 36) outDecimals = d;
                 } catch (_) {}
                 const outRaw = BigInt(doneEv?.args?.tokenOut ?? 0n);
+                const burnedRaw = BigInt(doneEv?.args?.rikoBurned ?? 0n);
+                const burnedFmt = burnedRaw > 0n ? formatTokenAmount(burnedRaw, 6) : "";
                 const recvUnit = sym === "eth" ? "ETH" : String(sym || "TOKEN").toUpperCase();
-                await addRikoTxHistory("Pending/Settle (operator)", String(doneEv?.transactionHash || ""), provider, {
-                  flowId,
-                  receivedSymbol: recvUnit,
-                  receivedAmountDisplay: outRaw > 0n ? formatTokenAmount(outRaw, outDecimals) : "",
-                });
+                const doneHash = String(doneEv?.transactionHash || "").trim();
+                const settleFlowId = findLatestPendingFlowIdFor(sym, tokenAddr, burnedFmt) || flowId;
+                const recvAmount = outRaw > 0n ? formatTokenAmount(outRaw, outDecimals) : "";
+                if (hasHistoryHash(doneHash)) {
+                  updateTxHistoryActionByHash(doneHash, "Pending/Settle (operator)");
+                  updateRikoTxFieldsByHash(doneHash, {
+                    token_symbol: String(sym || "").toUpperCase() || "TOKEN",
+                    token_amount_display: burnedFmt,
+                    received_symbol: recvUnit,
+                    received_amount_display: recvAmount,
+                  });
+                } else {
+                  await addRikoTxHistory("Pending/Settle (operator)", doneHash, provider, {
+                    flowId: settleFlowId,
+                    tokenSymbol: String(sym || "").toUpperCase() || "TOKEN",
+                    tokenAmountDisplay: burnedFmt,
+                    receivedSymbol: recvUnit,
+                    receivedAmountDisplay: recvAmount,
+                  });
+                }
                 continue;
               }
               const cancelLogs = await vault.queryFilter(vault.filters.RedeemCancelled(user, tokenAddr), fromBlock, latest);
@@ -27626,13 +27671,25 @@ def _render_riko_page() -> str:
                 const rikoReturnedRaw = BigInt(cancelEv?.args?.rikoReturned ?? 0n);
                 const rikoReturnedFmt = rikoReturnedRaw > 0n ? formatTokenAmount(rikoReturnedRaw, 6) : "";
                 const cancelFlowId = findLatestPendingFlowIdFor(sym, tokenAddr, rikoReturnedFmt) || flowId;
-                await addRikoTxHistory("Cancel pending redeem", String(cancelEv?.transactionHash || ""), provider, {
-                  flowId: cancelFlowId,
-                  tokenSymbol: String(sym || "").toUpperCase() || "TOKEN",
-                  tokenAmountDisplay: rikoReturnedFmt,
-                });
+                const cancelHash = String(cancelEv?.transactionHash || "").trim();
+                if (hasHistoryHash(cancelHash)) {
+                  updateTxHistoryActionByHash(cancelHash, "Cancel pending redeem");
+                  updateRikoTxFieldsByHash(cancelHash, {
+                    token_symbol: String(sym || "").toUpperCase() || "TOKEN",
+                    token_amount_display: rikoReturnedFmt,
+                  });
+                } else {
+                  await addRikoTxHistory("Cancel pending redeem", cancelHash, provider, {
+                    flowId: cancelFlowId,
+                    tokenSymbol: String(sym || "").toUpperCase() || "TOKEN",
+                    tokenAmountDisplay: rikoReturnedFmt,
+                  });
+                }
               }
             } catch (_) {}
+          }
+          if (shouldPeriodicClosedBackfill) {
+            rikoPendingCloseBackfillTs = Date.now();
           }
         }
         rikoLastActivePendingByToken = activePendingKeys;
