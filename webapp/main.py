@@ -36709,6 +36709,17 @@ def _render_admin_page() -> str:
     async function resolveChainlinkTokenFeedMainnet(tokenAddress) {{
       const token = normalizeEthAddressInput(tokenAddress || "");
       if (!token) throw new Error("Invalid token address in whitelist.");
+      const sym = getAdminRikoSymbolByTokenAddress(token);
+      const fallback = ADMIN_RIKO_CHAINLINK_FEED_BY_SYMBOL[sym];
+      // Prefer curated proxy map first. Registry may return addresses
+      // that are not suitable for contract-side metadata checks ("No access").
+      if (fallback?.oracle && fallback?.description) {{
+        return {{
+          oracle: normalizeEthAddressInput(fallback.oracle),
+          description: String(fallback.description || "").trim(),
+          source: "mainnet proxy map"
+        }};
+      }}
       const ethers = await ensureEthersAdmin();
       const provider = window.ethereum ? new ethers.BrowserProvider(window.ethereum) : ethers.getDefaultProvider();
       const registry = new ethers.Contract(CHAINLINK_FEED_REGISTRY_MAINNET, CHAINLINK_FEED_REGISTRY_ABI, provider);
@@ -36728,15 +36739,6 @@ def _render_admin_page() -> str:
           }} catch (_) {{}}
           if (description) return {{ oracle, description, source: "Chainlink registry" }};
         }} catch (_) {{}}
-      }}
-      const sym = getAdminRikoSymbolByTokenAddress(token);
-      const fallback = ADMIN_RIKO_CHAINLINK_FEED_BY_SYMBOL[sym];
-      if (fallback?.oracle && fallback?.description) {{
-        return {{
-          oracle: normalizeEthAddressInput(fallback.oracle),
-          description: String(fallback.description || "").trim(),
-          source: "mainnet fallback map"
-        }};
       }}
       throw new Error("Chainlink feed for this token was not found automatically.");
     }}
@@ -36796,7 +36798,12 @@ def _render_admin_page() -> str:
             try {{
               await vault.setTokenConfig.staticCall(token, true, oracle, BigInt(Math.round(maxAge)), feedHash);
             }} catch (preErr) {{
-              skipped.push(`${{symbol || token}}: precheck failed (${{preErr?.shortMessage || preErr?.message || "reverted"}})`);
+              const preMsg = String(preErr?.shortMessage || preErr?.message || "reverted");
+              if (/no access/i.test(preMsg)) {{
+                skipped.push(`${{symbol || token}}: oracle feed denies contract reads ("No access").`);
+              }} else {{
+                skipped.push(`${{symbol || token}}: precheck failed (${{preMsg}})`);
+              }}
               continue;
             }}
             setBulkStatus(
@@ -36894,6 +36901,7 @@ def _render_admin_page() -> str:
       const cached = adminRikoWhitelistOracleStatusByToken.get(addr);
       if (cached?.state === "ok") return {{ kind: "ok", text: "feed ok" }};
       if (cached?.state === "no_feed") return {{ kind: "warn", text: "no feed" }};
+      if (cached?.state === "access_denied") return {{ kind: "err", text: "feed access denied" }};
       if (cached?.state === "bad_token") return {{ kind: "err", text: "bad token" }};
       if (cached?.state === "checking") return {{ kind: "muted", text: "checking" }};
       return {{ kind: "muted", text: "pending" }};
@@ -36907,7 +36915,13 @@ def _render_admin_page() -> str:
         if (!symbol || symbol === "eth" || token === "native") continue;
         if (!/^0x[a-f0-9]{{40}}$/.test(token)) continue;
         const existing = adminRikoWhitelistOracleStatusByToken.get(token);
-        if (existing?.state === "ok" || existing?.state === "no_feed" || existing?.state === "bad_token" || existing?.state === "checking") continue;
+        if (
+          existing?.state === "ok" ||
+          existing?.state === "no_feed" ||
+          existing?.state === "access_denied" ||
+          existing?.state === "bad_token" ||
+          existing?.state === "checking"
+        ) continue;
         adminRikoWhitelistOracleStatusByToken.set(token, {{ state: "checking" }});
         changed = true;
         try {{
@@ -36921,6 +36935,8 @@ def _render_admin_page() -> str:
           const msg = String(e?.shortMessage || e?.message || "").toLowerCase();
           if (msg.includes("chainlink feed for this token was not found")) {{
             adminRikoWhitelistOracleStatusByToken.set(token, {{ state: "no_feed" }});
+          }} else if (msg.includes("no access")) {{
+            adminRikoWhitelistOracleStatusByToken.set(token, {{ state: "access_denied" }});
           }} else if (msg.includes("decimals")) {{
             adminRikoWhitelistOracleStatusByToken.set(token, {{ state: "bad_token" }});
           }} else {{
