@@ -25454,16 +25454,13 @@ def _render_placeholder_page(
 
 
 def _render_riko_page() -> str:
-    yield_text = "Today's yield: unavailable"
+    yield_text = "US Treasury 10Y: unavailable"
     try:
         y = _fetch_us_treasury_daily_10y()
         daily = float(y.get("daily_pct") or 0.0)
         annual = float(y.get("annual_pct") or 0.0)
         as_of = str(y.get("date") or "-")
-        yield_text = (
-            f"Today's yield: {daily:.4f}% per day "
-            f"(US Treasury 10Y: {annual:.2f}% per year, {as_of})"
-        )
+        yield_text = f"US Treasury 10Y: {annual:.2f}% per year, {as_of}"
     except Exception:
         pass
     extra_css = """
