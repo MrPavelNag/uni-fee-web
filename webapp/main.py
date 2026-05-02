@@ -2777,6 +2777,10 @@ def _human_riko_auto_yield_reason(reason: str) -> tuple[str, str]:
             "Payout wallet native coin balance is too low to pay transfer gas.",
             "Top up payout wallet with native gas token and retry.",
         ),
+        "safety_max_bps_exceeded": (
+            "Treasury-based payout rate exceeds configured safety max BPS.",
+            "Raise RIKO_AUTO_YIELD_MAX_BPS or keep current cap intentionally.",
+        ),
     }
     return mapping.get(r, (r.replace("_", " ") or "unknown reason", "Check server logs for details."))
 
@@ -22114,9 +22118,13 @@ def _normalize_riko_payout_calc_method(raw: Any) -> str:
 
 def _riko_bps_with_limits(target_bps: int) -> int:
     bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), int(target_bps or 0))
+    return int(bps)
+
+
+def _riko_safety_cap_exceeded(bps: int) -> bool:
     if RIKO_AUTO_YIELD_MAX_BPS is None:
-        return int(bps)
-    return int(min(int(RIKO_AUTO_YIELD_MAX_BPS), int(bps)))
+        return False
+    return int(bps or 0) > int(RIKO_AUTO_YIELD_MAX_BPS)
 
 
 def _riko_payout_rate_snapshot(calc_method: str) -> dict[str, Any]:
@@ -23434,6 +23442,9 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
         )
     can_pay_token = bool(payout_wallet_balance >= total_payout_raw)
     can_pay_gas = bool(native_balance_wei >= required_gas_wei) if required_gas_wei > 0 else True
+    safety_cap_bps = int(RIKO_AUTO_YIELD_MAX_BPS) if RIKO_AUTO_YIELD_MAX_BPS is not None else 0
+    safety_cap_enabled = RIKO_AUTO_YIELD_MAX_BPS is not None
+    safety_cap_exceeded = _riko_safety_cap_exceeded(int(next_bps))
     result.update(
         {
             "status": "ok",
@@ -23465,6 +23476,9 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
             "can_pay_gas": bool(can_pay_gas),
             "can_execute_payout": bool(can_pay_token and can_pay_gas),
             "gas_check_error": str(gas_error or ""),
+            "safety_max_bps_enabled": bool(safety_cap_enabled),
+            "safety_max_bps": int(safety_cap_bps),
+            "safety_max_bps_exceeded": bool(safety_cap_exceeded),
             "top_recipients": top_recipients,
             "schedule_time_utc": str(schedule.get("payout_time_utc") or "00:00"),
             "schedule_next_due_date": str(schedule.get("next_due_date") or ""),
@@ -23503,7 +23517,7 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     if int(limit) > 0:
         holders = holders[: max(1, min(2000, int(limit)))]
     warnings: list[str] = []
-    if rpc_source != "configured":
+    if rpc_source in {"configured_non_mainnet", "configured_unreachable", "missing"}:
         warnings.append(f"rpc_source={rpc_source}")
     try:
         riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
@@ -23630,7 +23644,9 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     ) if payout_wallet else False
     gas_deficit_wei = max(0, int(required_gas_wei) - int(payout_wallet_native_balance_wei))
     effective_annual_pct = (float(next_bps) * 12.0) / 100.0 if int(next_bps) > 0 else 0.0
-    rate_cap_active = bool(int(target_bps) > 0 and int(next_bps) != int(target_bps))
+    rate_cap_active = _riko_safety_cap_exceeded(int(next_bps))
+    safety_cap_bps = int(RIKO_AUTO_YIELD_MAX_BPS) if RIKO_AUTO_YIELD_MAX_BPS is not None else 0
+    safety_cap_enabled = RIKO_AUTO_YIELD_MAX_BPS is not None
     if gas_check_error:
         warnings.append(gas_check_error)
     return {
@@ -23646,6 +23662,8 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         "next_bps": int(next_bps),
         "effective_annual_pct": float(round(effective_annual_pct, 6)),
         "rate_cap_active": bool(rate_cap_active),
+        "safety_max_bps_enabled": bool(safety_cap_enabled),
+        "safety_max_bps": int(safety_cap_bps),
         "payout_wallet": payout_wallet if _is_eth_address(payout_wallet) else "",
         "required_next_payout_raw": int(total_planned_payout_raw),
         "available_raw": int(payout_wallet_balance_raw),
@@ -23794,6 +23812,25 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
     target_bps = int(round(raw_target_bps))
     bounded_bps = _riko_bps_with_limits(int(target_bps))
     next_bps = int(bounded_bps)
+    if _riko_safety_cap_exceeded(int(next_bps)):
+        result.update(
+            {
+                "status": "skip",
+                "reason": "safety_max_bps_exceeded",
+                "target_bps": int(target_bps),
+                "next_bps": int(next_bps),
+                "safety_max_bps": int(RIKO_AUTO_YIELD_MAX_BPS or 0),
+                "annual_pct": round(annual_pct, 6),
+                "monthly_pct": round(monthly_pct, 8),
+                "treasury_date": treasury_date,
+                "month_key": month_key,
+                "schedule_date_key": schedule_date_key,
+                "schedule_time_utc": payout_time_utc,
+                "schedule_next_due_date": str(schedule.get("next_due_date") or ""),
+                "schedule_next_due_at_utc": str(schedule.get("next_due_at_utc") or ""),
+            }
+        )
+        return result
 
     try:
         riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
@@ -36389,6 +36426,8 @@ def _render_admin_page() -> str:
         const targetBps = Number(data?.target_bps || 0);
         const effectiveAnnualPct = Number(data?.effective_annual_pct || 0);
         const rateCapActive = !!data?.rate_cap_active;
+        const safetyMaxBpsEnabled = !!data?.safety_max_bps_enabled;
+        const safetyMaxBps = Number(data?.safety_max_bps || 0);
         const payoutPct = Number(nextBps || 0) / 100.0;
         const holderColumns = ["Address", "Balance", "Planned yield", "Planned date (UTC)", "Last change date", "Tx hash"];
         if (!rows.length) {{
@@ -36463,7 +36502,7 @@ def _render_admin_page() -> str:
           `RIKO token: ${{shortAddrAdmin(String(data?.riko_token || ""))}}. ` +
           `Next payout funding: required ${{formatAdminRawUnits(requiredRaw, payoutDecimals, 8)}} / available ${{formatAdminRawUnits(availableRaw, payoutDecimals, 8)}}${{hasPayoutWallet ? ` (wallet: ${{shortAddrAdmin(payoutWallet)}})` : ""}}. ` +
           `Gas: required ${{formatAdminRawUnits(requiredGasWei, 18, 8)}} ETH / available ${{formatAdminRawUnits(nativeBalanceWei, 18, 8)}} ETH. ` +
-          `Rate basis: source APR ${{annualPct > 0 ? annualPct.toFixed(4) : "0.0000"}}%, target ${{fmtInt(targetBps)}} bps/mo, applied ${{fmtInt(nextBps)}} bps/mo (~${{payoutPct.toFixed(4)}}% per payout, ~${{effectiveAnnualPct.toFixed(4)}}% annualized)${{rateCapActive ? " [capped]" : ""}}. ` +
+          `Rate basis: source APR ${{annualPct > 0 ? annualPct.toFixed(4) : "0.0000"}}%, target ${{fmtInt(targetBps)}} bps/mo, applied ${{fmtInt(nextBps)}} bps/mo (~${{payoutPct.toFixed(4)}}% per payout, ~${{effectiveAnnualPct.toFixed(4)}}% annualized)${{rateCapActive ? ` [over safety cap ${{fmtInt(safetyMaxBps)}} bps]` : (safetyMaxBpsEnabled ? ` [safety cap ${{fmtInt(safetyMaxBps)}} bps configured]` : "")}}. ` +
           `Next payout: ${{scheduleNextDueUtc || "-"}}. ` +
           `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
         const fundingText = hasPayoutToken
