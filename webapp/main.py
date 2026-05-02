@@ -312,7 +312,10 @@ RIKO_AUTO_YIELD_RUN_ON_STARTUP = os.environ.get("RIKO_AUTO_YIELD_RUN_ON_STARTUP"
     "on",
 )
 RIKO_AUTO_YIELD_MIN_BPS = max(0, int(os.environ.get("RIKO_AUTO_YIELD_MIN_BPS", "0")))
-RIKO_AUTO_YIELD_MAX_BPS = max(RIKO_AUTO_YIELD_MIN_BPS, int(os.environ.get("RIKO_AUTO_YIELD_MAX_BPS", "25")))
+RIKO_AUTO_YIELD_MAX_BPS_RAW = str(os.environ.get("RIKO_AUTO_YIELD_MAX_BPS", "") or "").strip()
+RIKO_AUTO_YIELD_MAX_BPS = (
+    max(RIKO_AUTO_YIELD_MIN_BPS, int(RIKO_AUTO_YIELD_MAX_BPS_RAW)) if RIKO_AUTO_YIELD_MAX_BPS_RAW else None
+)
 RIKO_AUTO_YIELD_MAX_DELTA_BPS = max(1, int(os.environ.get("RIKO_AUTO_YIELD_MAX_DELTA_BPS", "3")))
 RIKO_AUTO_YIELD_RPC_URL = os.environ.get("RIKO_AUTO_YIELD_RPC_URL", "").strip()
 RIKO_AUTO_YIELD_PRIVATE_KEY = os.environ.get("RIKO_AUTO_YIELD_PRIVATE_KEY", "").strip()
@@ -22109,6 +22112,13 @@ def _normalize_riko_payout_calc_method(raw: Any) -> str:
     return "treasury_10y"
 
 
+def _riko_bps_with_limits(target_bps: int) -> int:
+    bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), int(target_bps or 0))
+    if RIKO_AUTO_YIELD_MAX_BPS is None:
+        return int(bps)
+    return int(min(int(RIKO_AUTO_YIELD_MAX_BPS), int(bps)))
+
+
 def _riko_payout_rate_snapshot(calc_method: str) -> dict[str, Any]:
     method = _normalize_riko_payout_calc_method(calc_method)
     if method == "treasury_10y":
@@ -22118,7 +22128,7 @@ def _riko_payout_rate_snapshot(calc_method: str) -> dict[str, Any]:
             monthly_pct = float(annual_pct) / 12.0
             raw_target_bps = float(monthly_pct) * 100.0
             target_bps = int(round(raw_target_bps))
-            next_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
+            next_bps = _riko_bps_with_limits(int(target_bps))
             return {
                 "calc_method": method,
                 "calc_method_label": "Treasury 10Y",
@@ -23320,7 +23330,7 @@ def _riko_auto_payout_preview() -> dict[str, Any]:
     monthly_pct = float(annual_pct) / 12.0
     raw_target_bps = float(monthly_pct) * 100.0
     target_bps = int(round(raw_target_bps))
-    next_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
+    next_bps = _riko_bps_with_limits(int(target_bps))
     schedule = _load_riko_payout_schedule()
 
     try:
@@ -23514,7 +23524,7 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         # Fallback if schedule state is partially missing fields.
         monthly_pct = float(annual_pct) / 12.0
         target_bps = int(round(float(monthly_pct) * 100.0))
-        next_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
+        next_bps = _riko_bps_with_limits(int(target_bps))
     payout_decimals = 18
     if _is_eth_address(payout_token):
         try:
@@ -23619,6 +23629,8 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         bool(int(payout_wallet_native_balance_wei) >= int(required_gas_wei)) if int(required_gas_wei) > 0 else True
     ) if payout_wallet else False
     gas_deficit_wei = max(0, int(required_gas_wei) - int(payout_wallet_native_balance_wei))
+    effective_annual_pct = (float(next_bps) * 12.0) / 100.0 if int(next_bps) > 0 else 0.0
+    rate_cap_active = bool(int(target_bps) > 0 and int(next_bps) != int(target_bps))
     if gas_check_error:
         warnings.append(gas_check_error)
     return {
@@ -23632,6 +23644,8 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
         "monthly_pct": float(monthly_pct),
         "target_bps": int(target_bps),
         "next_bps": int(next_bps),
+        "effective_annual_pct": float(round(effective_annual_pct, 6)),
+        "rate_cap_active": bool(rate_cap_active),
         "payout_wallet": payout_wallet if _is_eth_address(payout_wallet) else "",
         "required_next_payout_raw": int(total_planned_payout_raw),
         "available_raw": int(payout_wallet_balance_raw),
@@ -23778,7 +23792,7 @@ def _riko_auto_yield_try_once() -> dict[str, Any]:
     treasury_date = str(y.get("date") or "")
     raw_target_bps = float(monthly_pct) * 100.0
     target_bps = int(round(raw_target_bps))
-    bounded_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
+    bounded_bps = _riko_bps_with_limits(int(target_bps))
     next_bps = int(bounded_bps)
 
     try:
@@ -34433,6 +34447,26 @@ def _render_admin_page() -> str:
       padding: 8px 10px;
       white-space: normal;
     }}
+    #tabRikoHolders #adminRikoHoldersStatus .admin-riko-final-status {{
+      display: inline-block;
+      margin-left: 8px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      vertical-align: baseline;
+      border: 1px solid transparent;
+    }}
+    #tabRikoHolders #adminRikoHoldersStatus .admin-riko-final-status.ready {{
+      color: #166534;
+      background: #dcfce7;
+      border-color: #86efac;
+    }}
+    #tabRikoHolders #adminRikoHoldersStatus .admin-riko-final-status.not-ready {{
+      color: #991b1b;
+      background: #fee2e2;
+      border-color: #fca5a5;
+    }}
     .admin-history-check-cell {{
       width: 26px;
       text-align: center !important;
@@ -34814,6 +34848,7 @@ def _render_admin_page() -> str:
           <div id="adminRikoHolderScanSummary">-</div>
           <span class="hint" style="margin:0;text-align:right;">Auto-refresh via Refresh all</span>
         </div>
+        <span id="adminRikoHoldersStatus" class="status">Snapshot status: Ready</span>
         <div class="table-wrap" style="margin-top:8px">
           <table id="adminRikoHoldersTable" class="admin-history-table"></table>
         </div>
@@ -34827,7 +34862,6 @@ def _render_admin_page() -> str:
           </div>
         </details>
         <span id="adminRikoHolderScanStatus" class="status">Scan: Ready</span>
-        <span id="adminRikoHoldersStatus" class="status">Ready</span>
       </section>
     </div>
     <div class="grid" id="tabPairLists" style="display:none">
@@ -36352,6 +36386,9 @@ def _render_admin_page() -> str:
         const scheduleNextDueUtc = String(data?.schedule_next_due_at_utc || data?.schedule_next_due_date || "").trim();
         const nextBps = Number(data?.next_bps || 0);
         const annualPct = Number(data?.annual_pct || 0);
+        const targetBps = Number(data?.target_bps || 0);
+        const effectiveAnnualPct = Number(data?.effective_annual_pct || 0);
+        const rateCapActive = !!data?.rate_cap_active;
         const payoutPct = Number(nextBps || 0) / 100.0;
         const holderColumns = ["Address", "Balance", "Planned yield", "Planned date (UTC)", "Last change date", "Tx hash"];
         if (!rows.length) {{
@@ -36426,7 +36463,7 @@ def _render_admin_page() -> str:
           `RIKO token: ${{shortAddrAdmin(String(data?.riko_token || ""))}}. ` +
           `Next payout funding: required ${{formatAdminRawUnits(requiredRaw, payoutDecimals, 8)}} / available ${{formatAdminRawUnits(availableRaw, payoutDecimals, 8)}}${{hasPayoutWallet ? ` (wallet: ${{shortAddrAdmin(payoutWallet)}})` : ""}}. ` +
           `Gas: required ${{formatAdminRawUnits(requiredGasWei, 18, 8)}} ETH / available ${{formatAdminRawUnits(nativeBalanceWei, 18, 8)}} ETH. ` +
-          `Rate basis: APR ${{annualPct > 0 ? annualPct.toFixed(4) : "0.0000"}}% -> ${{fmtInt(nextBps)}} bps/mo (~${{payoutPct.toFixed(4)}}% per payout). ` +
+          `Rate basis: source APR ${{annualPct > 0 ? annualPct.toFixed(4) : "0.0000"}}%, target ${{fmtInt(targetBps)}} bps/mo, applied ${{fmtInt(nextBps)}} bps/mo (~${{payoutPct.toFixed(4)}}% per payout, ~${{effectiveAnnualPct.toFixed(4)}}% annualized)${{rateCapActive ? " [capped]" : ""}}. ` +
           `Next payout: ${{scheduleNextDueUtc || "-"}}. ` +
           `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
         const fundingText = hasPayoutToken
@@ -36439,16 +36476,16 @@ def _render_admin_page() -> str:
               ? "Gas: sufficient."
               : `Gas: insufficient (deficit ${{formatAdminRawUnits(gasDeficitWei, 18, 8)}} ETH).`)
           : "Gas: payout wallet is not configured.";
-        const payoutReadyText = canExecutePayout
-          ? "Payout status: ready."
-          : "Payout status: not ready.";
-        const statusLines = [];
-        statusLines.push(`Snapshot: loaded ${{rows.length}} holder rows${{onlyPositive ? " (positive only)" : ""}}.`);
-        statusLines.push(fundingText);
-        statusLines.push(gasText);
-        statusLines.push(payoutReadyText);
-        if (warnings.length) statusLines.push(`Warnings: ${{warnings.join("; ")}}`);
-        statusEl.innerHTML = statusLines.map((line) => `<div>${{esc(line)}}</div>`).join("");
+        const payoutReadyText = canExecutePayout ? "Payout is ready." : "Payout is not ready.";
+        const payoutBadgeClass = canExecutePayout ? "ready" : "not-ready";
+        const payoutBadgeText = canExecutePayout ? "READY" : "NOT READY";
+        const baseStatusText =
+          `Snapshot: loaded ${{rows.length}} holder row${{rows.length === 1 ? "" : "s"}}${{onlyPositive ? " (positive only)" : ""}}. ` +
+          `${{fundingText}} ${{gasText}} ${{payoutReadyText}}`;
+        const warningsText = warnings.length ? ` Warnings: ${{warnings.join("; ")}}.` : "";
+        statusEl.innerHTML =
+          `${{esc(baseStatusText + warningsText)}}` +
+          `<span class="admin-riko-final-status ${{payoutBadgeClass}}">${{esc(payoutBadgeText)}}</span>`;
       }} catch (e) {{
         const errMsg = String(e?.shortMessage || e?.message || "unknown");
         renderAdminRikoHistoryTable("adminRikoHoldersTable", ["Info"], [], `Failed to load holders: ${{esc(errMsg)}}`);
