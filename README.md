@@ -2,12 +2,11 @@
 
 Агент для поиска пар Uniswap v3/v4, фильтрации по TVL и расчёта накопленных комиссий LP.
 
-## Архитектура: 4 агента
+## Архитектура: 3 агента
 
 - **Agent 1 (agent_v3.py)** — базовая версия, только v3. Ищет пулы, сохраняет `data/pools_v3_{пары}.json`.
 - **Agent 2 (agent_v4.py)** — только v4 (The Graph, нужен API ключ). Сохраняет `data/pools_v4_{пары}.json`.
-- **Agent Smart (agent_smart.py)** — выбирает top пулов из v3+v4 по smart score, сохраняет `data/pools_smart_{пары}.json`.
-- **Agent 3 (agent_merge.py)** — объединяет данные Agent 1, Agent 2 и Agent Smart на одном графике.
+- **Agent 3 (agent_merge.py)** — объединяет данные Agent 1 и Agent 2 на одном графике.
 
 ### Запуск одной командой
 
@@ -18,7 +17,7 @@ python run_all.py fluid,eth --min-tvl 500
 python run_all.py "wbtc,usdt;wbtc,usdc" --min-tvl 500000   # несколько пар — в кавычках!
 ```
 
-Запускает по очереди: agent_v3 → agent_v4 → agent_smart → agent_merge.
+Запускает по очереди: agent_v3 → agent_v4 → agent_merge.
 
 **По каждому токену:** для каждого указанного токена запускается отдельный полный прогон (пары с usdt, usdc, eth) — свои PDF и графики на токен:
 
@@ -42,30 +41,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-### Solidity tests (RIKO / Foundry)
-
-```bash
-curl -L https://foundry.paradigm.xyz | bash
-source ~/.zshenv
-foundryup
-forge install openzeppelin/openzeppelin-contracts --no-git
-forge install foundry-rs/forge-std --no-git
-forge test -vv
-```
-
-### Проектные env-переменные (рекомендуется)
-
-В репозитории есть шаблон `\.env.example` и локальный файл `\.env` (игнорируется git).
-
-```bash
-cp .env.example .env
-# заполните THE_GRAPH_API_KEY в .env
-set -a
-source .env
-set +a
-```
-
-Перед запуском можно также установить API ключ вручную:
+Перед запуском установите API ключ:
 
 ```bash
 export THE_GRAPH_API_KEY="ваш_ключ"
@@ -97,7 +73,6 @@ docker run -p 8000:8000 -e THE_GRAPH_API_KEY="ваш_ключ" uni-fee-web
 - быстрый ввод токенов списком (каждый токен автоматически парится с `usdt/usdc/eth`);
 - include chains (или пусто = все поддерживаемые);
 - `min TVL`, `days`, `exclude chains`, `exclude pool suffix`;
-- отдельная страница `GET /riko` для интерфейса RIKO Vault (deposit/mint/redeem + admin whitelist);
 - результат: таблица + 2 интерактивных графика (fees/tvl), без PDF.
 
 ## Deploy на Render
@@ -130,38 +105,14 @@ export RENDER_HEALTHCHECK_URL="https://uni-fee-web.onrender.com/healthz"
 
 Если `RENDER_DEPLOY_HOOK_URL` не задан, скрипт только коммитит+пушит.
 
-### Локальные git hooks (защита от JS-падения UI)
-
-В проекте есть pre-commit проверка inline JavaScript в `webapp/main.py`,
-которая ловит частые фатальные ошибки (например, дубли `const/let` в одном скоупе).
-
-Включить один раз:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-Проверка вручную:
-
-```bash
-python3 scripts/check_inline_js_guardrails.py webapp/main.py
-```
-
 ### Шаги
 
 1. Запушьте проект в GitHub (если еще не там).
 2. В Render: **New +** → **Blueprint**.
 3. Подключите ваш GitHub-репозиторий.
 4. Render прочитает `render.yaml` и создаст web service `uni-fee-web`.
-5. В переменных окружения задайте секрет и проектные флаги:
+5. В переменных окружения задайте секрет:
    - `THE_GRAPH_API_KEY=...`
-   - `ENABLE_BASE_CHAIN=1`
-   - `BASE_V3_ISOLATED_PIPELINE=0`
-   - `V3_BASE_LIGHT_SCAN_PAGES=3`
-   - `WEB_GRAPHQL_RETRIES=2`
-   - `WEB_GRAPHQL_READ_TIMEOUT_SEC_NORMAL=30`
-   - `WEB_DISABLE_V4_SYMBOL_FALLBACK_NORMAL=1`
-   - `WEB_V4_SKIP_CHAIN_AFTER_TIMEOUT=1`
 6. Нажмите Deploy.
 
 После деплоя сайт будет доступен по URL Render, healthcheck:
