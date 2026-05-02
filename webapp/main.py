@@ -25796,6 +25796,18 @@ def _render_riko_page() -> str:
       const chainId = Number(authState?.chain_id || 1);
       const addr = resolveHistoryAddress();
       const hiddenRows = loadHiddenRikoTxRows(addr, chainId);
+      const activePendingMem = (rikoLastActivePendingByToken instanceof Set) ? rikoLastActivePendingByToken : new Set();
+      const activePendingPersisted = loadLastActivePendingKeys(addr, chainId);
+      const activePendingKeys = new Set([
+        ...Array.from(activePendingMem || []),
+        ...Array.from(activePendingPersisted || []),
+      ].map((x) => String(x || "").trim().toLowerCase()).filter((x) => x.includes("|")));
+      const activePendingSymbols = new Set(
+        Array.from(activePendingKeys)
+          .map((k) => String(k || "").split("|")[0] || "")
+          .map((x) => String(x || "").trim().toLowerCase())
+          .filter(Boolean)
+      );
       const parseRowTs = (row) => {
         const raw = String(row?.time_iso || row?.when || "").trim();
         if (!raw) return 0;
@@ -25884,7 +25896,6 @@ def _render_riko_page() -> str:
           return rcpt === "0";
         };
         const failed = ordered.some((x) => rowIsFailed(x));
-        const pending = !failed && ordered.some((x) => isPendingRedeemAction(x));
         const settledByOperator = !failed && !pending && ordered.some((x) => {
           const a = String(x?.action || "").toLowerCase();
           return a.includes("pending/settle") || a.includes("settle (operator)");
@@ -25923,6 +25934,28 @@ def _render_riko_page() -> str:
         const rikoReceivedDisplay = pickFirst("riko_received_display");
         const receivedSymbol = pickFirst("received_symbol");
         const receivedAmountDisplay = pickFirst("received_amount_display");
+        const tokenAddressFromHistory = String(pickFirst("token_address") || pickFirst("token") || "").trim().toLowerCase();
+        const tokenSymbolLc = String(tokenSymbol || "").trim().toLowerCase();
+        const receivedSymbolLc = String(receivedSymbol || "").trim().toLowerCase();
+        const pendingSymbolHint = (() => {
+          if (receivedSymbolLc && receivedSymbolLc !== "riko") return receivedSymbolLc;
+          if (tokenSymbolLc && tokenSymbolLc !== "riko") return tokenSymbolLc;
+          return "";
+        })();
+        const isFlowClosed = ordered.some((x) => {
+          const sk = stageKeyForRow(x);
+          return sk === "settle" || sk === "cancel";
+        });
+        let pendingFromActiveState = false;
+        if (!failed && !isFlowClosed) {
+          if (pendingSymbolHint && /^0x[a-f0-9]{40}$/.test(tokenAddressFromHistory)) {
+            pendingFromActiveState = activePendingKeys.has(`${pendingSymbolHint}|${tokenAddressFromHistory}`);
+          }
+          if (!pendingFromActiveState && pendingSymbolHint) {
+            pendingFromActiveState = activePendingSymbols.has(pendingSymbolHint);
+          }
+        }
+        const pending = !failed && (ordered.some((x) => isPendingRedeemAction(x)) || pendingFromActiveState);
         const needSyntheticWrap = hasDepositStage && !hasWrapStage && String(tokenSymbol || "").trim().toUpperCase() === "ETH";
         const needSyntheticPending = operatorFlow && hasSettleStage && !hasQueuedOrPendingStage;
         let syntheticWrapInserted = false;
@@ -25964,7 +25997,9 @@ def _render_riko_page() -> str:
             if (left && right) stage = `${stage} (${left} -> ${right})`;
             else if (left) stage = `${stage} (${left})`;
           }
-          const mark = rowIsFailed(x) ? "x" : (isPendingRedeemAction(x) ? "⏳" : "✓");
+          const mark = rowIsFailed(x)
+            ? "x"
+            : ((isPendingRedeemAction(x) || (pending && stageKeyForRow(x) === "redeem")) ? "⏳" : "✓");
           const txTools = renderTxTools(String(x?.hash || ""), String(x?.url || ""));
           const errReason = rowIsFailed(x) ? String(x?.error_reason || "").trim() : "";
           const titleAttr = errReason ? ` title="${errReason.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}"` : "";
@@ -26319,10 +26354,14 @@ def _render_riko_page() -> str:
         if (!fid) continue;
         if (!(act.includes("pending") || act.includes("queued") || act.includes("redeem"))) continue;
         if (act.includes("cancel pending redeem")) continue;
-        const itSym = String(it?.token_symbol || "").trim().toLowerCase();
-        if (symbol && itSym && itSym !== symbol) continue;
         const itToken = String(it?.token_address || it?.token || "").trim().toLowerCase();
         if (token && itToken && itToken !== token) continue;
+        const inSym = String(it?.token_symbol || "").trim().toLowerCase();
+        const outSym = String(it?.received_symbol || "").trim().toLowerCase();
+        if (symbol) {
+          const symMatch = (inSym && inSym === symbol) || (outSym && outSym === symbol);
+          if (!symMatch && (inSym || outSym)) continue;
+        }
         return fid;
       }
       return "";
@@ -26404,6 +26443,13 @@ def _render_riko_page() -> str:
           txreceipt_status: String(x?.txreceipt_status || ""),
           error_reason: String(x?.error_reason || ""),
           flow_id: String(x?.flow_id || ""),
+          token_address: String(x?.token_address || x?.token || ""),
+          token: String(x?.token || ""),
+          token_symbol: String(x?.token_symbol || ""),
+          token_amount_display: String(x?.token_amount_display || ""),
+          riko_received_display: String(x?.riko_received_display || ""),
+          received_symbol: String(x?.received_symbol || ""),
+          received_amount_display: String(x?.received_amount_display || ""),
         }));
         // Keep local-first semantics (flow_id/stage hints), add missing backend rows.
         // This restores richer multi-stage chains after reloads where local storage is partial.
@@ -26469,6 +26515,8 @@ def _render_riko_page() -> str:
         txreceipt_status: "",
         error_reason: "",
         flow_id: String((opts && opts.flowId) || ""),
+        token_address: String((opts && (opts.tokenAddress || opts.token)) || ""),
+        token: String((opts && opts.token) || ""),
         token_symbol: String((opts && opts.tokenSymbol) || ""),
         token_amount_display: String((opts && opts.tokenAmountDisplay) || ""),
         riko_received_display: String((opts && opts.rikoReceivedDisplay) || ""),
@@ -28009,8 +28057,10 @@ def _render_riko_page() -> str:
         await addRikoTxHistory("Redeem", tx.hash, signer, {
           deferHistory: true,
           flowId,
+          tokenAddress: redeemTokenAddress,
           tokenSymbol: "RIKO",
           tokenAmountDisplay: redeemInputRikoDisplay,
+          receivedSymbol: redeemOutputSymbol,
         });
         hasDeferredTxRows = true;
         renderFlow(0, "Redeem tx sent", false, -1);
@@ -28187,6 +28237,7 @@ def _render_riko_page() -> str:
         await addRikoTxHistory("Cancel pending redeem", tx.hash, signer, {
           deferHistory: true,
           flowId,
+          tokenAddress: vaultTokenAddress,
           tokenSymbol: String(symbol || "").toUpperCase() || "TOKEN",
         });
         hasDeferredTxRows = true;
