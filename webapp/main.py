@@ -25896,10 +25896,6 @@ def _render_riko_page() -> str:
           return rcpt === "0";
         };
         const failed = ordered.some((x) => rowIsFailed(x));
-        const settledByOperator = !failed && !pending && ordered.some((x) => {
-          const a = String(x?.action || "").toLowerCase();
-          return a.includes("pending/settle") || a.includes("settle (operator)");
-        });
         const hasRedeemStage = ordered.some((x) => stageKeyForRow(x) === "redeem");
         const hasDepositStage = ordered.some((x) => stageKeyForRow(x) === "deposit");
         const hasApproveStage = ordered.some((x) => stageKeyForRow(x) === "approve");
@@ -25956,6 +25952,10 @@ def _render_riko_page() -> str:
           }
         }
         const pending = !failed && (ordered.some((x) => isPendingRedeemAction(x)) || pendingFromActiveState);
+        const settledByOperator = !failed && !pending && ordered.some((x) => {
+          const a = String(x?.action || "").toLowerCase();
+          return a.includes("pending/settle") || a.includes("settle (operator)");
+        });
         const needSyntheticWrap = hasDepositStage && !hasWrapStage && String(tokenSymbol || "").trim().toUpperCase() === "ETH";
         const needSyntheticPending = operatorFlow && hasSettleStage && !hasQueuedOrPendingStage;
         let syntheticWrapInserted = false;
