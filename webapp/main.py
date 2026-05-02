@@ -163,7 +163,7 @@ CHAIN_ID_TO_NAME = {
     81457: "blast",
 }
 
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 APP_USER_AGENT = f"uni-fee-web/{APP_VERSION}"
 app = FastAPI(title="Uni Fee Web", version=APP_VERSION)
 
@@ -22920,6 +22920,35 @@ def _riko_auto_yield_rpc_url_runtime() -> str:
     return _normalize_rpc_url(raw)
 
 
+def _riko_holder_scan_rpc_runtime() -> tuple[str, int, str]:
+    """
+    Resolve RPC for holder scan with mainnet preference.
+    Returns: (rpc_url, chain_id, source_label)
+    """
+    configured = _riko_auto_yield_rpc_url_runtime()
+    if not configured:
+        return "", 0, "missing"
+    try:
+        configured_chain = _eth_hex_to_int(_eth_rpc(configured, "eth_chainId", []))
+    except Exception:
+        return configured, 0, "configured_unreachable"
+    if int(configured_chain) == 1:
+        return configured, 1, "configured"
+    # Guard against accidental Sepolia/testnet config for holder scan:
+    # try reliable Ethereum mainnet public RPC fallbacks.
+    for raw_fb in (DEFAULT_RPC_URLS_BY_CHAIN_ID.get(1) or []):
+        fb = _normalize_rpc_url(str(raw_fb or ""))
+        if not fb or fb == configured:
+            continue
+        try:
+            fb_chain = _eth_hex_to_int(_eth_rpc(fb, "eth_chainId", []))
+        except Exception:
+            continue
+        if int(fb_chain) == 1:
+            return fb, 1, "fallback_mainnet"
+    return configured, int(configured_chain), "configured_non_mainnet"
+
+
 def _riko_auto_yield_private_key_runtime() -> str:
     return str(os.environ.get("RIKO_AUTO_YIELD_PRIVATE_KEY", "") or RIKO_AUTO_YIELD_PRIVATE_KEY or "").strip()
 
@@ -23400,10 +23429,13 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     riko_token = _riko_vault_address_value()
     if not _is_eth_address(riko_token):
         raise ValueError("RIKO vault address is not configured.")
-    rpc_url = _riko_auto_yield_rpc_url_runtime()
+    rpc_url, chain_id, rpc_source = _riko_holder_scan_rpc_runtime()
     if not rpc_url:
         raise ValueError("RIKO_AUTO_YIELD_RPC_URL is not configured.")
-    chain_id = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_chainId", []))
+    if int(chain_id) != 1:
+        raise ValueError(
+            f"RIKO holder scan RPC is on chainId={int(chain_id)} (source={rpc_source}); expected Ethereum mainnet chainId=1."
+        )
     latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
     bot_cfg = _load_riko_auto_yield_bot_config()
     start_block = max(0, int(bot_cfg.get("holder_scan_start_block") or 0))
@@ -23422,6 +23454,8 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     if int(limit) > 0:
         holders = holders[: max(1, min(2000, int(limit)))]
     warnings: list[str] = []
+    if rpc_source != "configured":
+        warnings.append(f"rpc_source={rpc_source}")
     try:
         riko_decimals = _riko_erc20_decimals(rpc_url, riko_token)
     except Exception as e:
@@ -24041,10 +24075,19 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
     riko_token = _riko_vault_address_value()
     if not _is_eth_address(riko_token):
         return _done({"status": "skip", "reason": "riko_token_not_configured"})
-    rpc_url = _riko_auto_yield_rpc_url_runtime()
+    rpc_url, chain_id, rpc_source = _riko_holder_scan_rpc_runtime()
     if not rpc_url:
         return _done({"status": "skip", "reason": "rpc_missing"})
-    chain_id = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_chainId", []))
+    if int(chain_id) != 1:
+        return _done(
+            {
+                "status": "skip",
+                "reason": f"rpc_chain_not_mainnet:{int(chain_id)}",
+                "source": str(rpc_source or "configured_non_mainnet"),
+                "chain_id": int(chain_id),
+                "riko_token": str(riko_token).lower(),
+            }
+        )
     latest_block = _eth_hex_to_int(_eth_rpc(rpc_url, "eth_blockNumber", []))
     holder_cache = _riko_auto_yield_load_holder_cache()
     cached_holders = set(
@@ -24084,7 +24127,8 @@ def _riko_holder_scan_bg_step(max_scan_blocks: int) -> dict[str, Any]:
     )
     return _done({
         "status": "ok",
-        "source": str(source or "rpc"),
+        "source": str(rpc_source or "configured"),
+        "holder_source": str(source or "rpc"),
         "chain_id": int(chain_id),
         "riko_token": str(riko_token).lower(),
         "from_block": int(from_block),
@@ -25325,9 +25369,16 @@ def _render_riko_page() -> str:
     .riko-tx-list li { display:grid; grid-template-columns: 170px minmax(160px, auto) 1fr auto; align-items:center; gap:8px; min-width:0; }
     .riko-tx-time { color:#64748b; font-size:13px; font-variant-numeric: tabular-nums; white-space:nowrap; }
     .riko-tx-main { min-width:0; overflow:hidden; text-overflow:ellipsis; font-size:13px; color:#0f172a; display:flex; align-items:center; gap:8px; white-space:nowrap; }
-    .riko-tx-meta { color:#64748b; font-size:13px; flex:0 0 auto; }
-    .riko-tx-meta-wrap { display:inline-flex; align-items:center; gap:6px; flex-wrap:wrap; }
-    .riko-tx-label { font-weight:600; color:#1f2937; }
+    .riko-tx-meta {
+      color:#64748b;
+      font-size:13px;
+      flex:0 0 auto;
+      white-space:nowrap;
+      overflow-x:auto;
+      overflow-y:hidden;
+    }
+    .riko-tx-meta-wrap { display:inline-flex; align-items:center; gap:6px; flex-wrap:nowrap; white-space:nowrap; }
+    .riko-tx-label { font-weight:600; color:#1f2937; white-space:nowrap; }
     .riko-tx-tools { display:inline-flex; gap:4px; align-items:center; }
     .riko-tx-status-badge {
       display:inline-flex;
@@ -25856,19 +25907,103 @@ def _render_riko_page() -> str:
         const rows = (Array.isArray(items) ? items : []).slice();
         if (!rows.length) return [];
         // Deterministic grouping by explicit client-side flow id.
-        // Rows without flow_id are shown as standalone to avoid incorrect mixed chains.
+        // For rows without flow_id, fallback grouping is keyed by token + amount signature.
+        // This avoids time-based mis-grouping when several redeems happen close together.
         const asc = rows.slice().sort((a, b) => parseRowTs(a) - parseRowTs(b));
         const flowMap = new Map();
         const groups = [];
+        const normalizeAmountSig = (raw) => String(raw == null ? "" : raw).trim().toLowerCase().replace(/,/g, "").replace(/\s+/g, "");
+        const fallbackTokenKeyForRow = (row) => {
+          const tok = String(row?.token_address || row?.token || "").trim().toLowerCase();
+          const inSym = String(row?.token_symbol || "").trim().toLowerCase();
+          const outSym = String(row?.received_symbol || "").trim().toLowerCase();
+          const sym = (outSym && outSym !== "riko") ? outSym : ((inSym && inSym !== "riko") ? inSym : "");
+          if (sym && tok) return `${sym}|${tok}`;
+          if (tok) return `|${tok}`;
+          if (sym) return `${sym}|`;
+          return "";
+        };
+        const fallbackAmountSigForRow = (row) => {
+          const inAmt = normalizeAmountSig(row?.token_amount_display);
+          const outAmt = normalizeAmountSig(row?.received_amount_display || row?.riko_received_display);
+          if (!inAmt && !outAmt) return "";
+          return `in:${inAmt}|out:${outAmt}`;
+        };
+        const isRedeemFamilyStage = (row, stageKey) => {
+          if (stageKey === "redeem" || stageKey === "cancel" || stageKey === "settle") return true;
+          const a = String(row?.action || "").trim().toLowerCase();
+          return a.includes("queued") || a.includes("pending");
+        };
+        const stageClosesFlow = (stageKey) => stageKey === "cancel" || stageKey === "settle";
         for (const row of asc) {
           const flowId = String(row?.flow_id || "").trim();
+          const stKey = stageKeyForRow(row) || "other";
           if (!flowId) {
-            groups.push({ items: [row], kind: stageKeyForRow(row) || "other", pending: isPendingRedeemAction(row), newestTs: parseRowTs(row) });
+            const fallbackKey = fallbackTokenKeyForRow(row);
+            const fallbackAmountSig = fallbackAmountSigForRow(row);
+            const fallbackStrongKey = (fallbackKey && fallbackAmountSig) ? `${fallbackKey}|${fallbackAmountSig}` : "";
+            const useFallback = !!fallbackKey && isRedeemFamilyStage(row, stKey);
+            let g = null;
+            if (useFallback) {
+              if (fallbackStrongKey) {
+                for (let i = groups.length - 1; i >= 0; i -= 1) {
+                  const cand = groups[i];
+                  if (!cand || cand.explicitFlow || cand.closed) continue;
+                  if (String(cand.fallbackStrongKey || "") !== fallbackStrongKey) continue;
+                  g = cand;
+                  break;
+                }
+              }
+              if (!g) {
+                for (let i = groups.length - 1; i >= 0; i -= 1) {
+                  const cand = groups[i];
+                  if (!cand || cand.explicitFlow || cand.closed) continue;
+                  if (String(cand.fallbackKey || "") !== fallbackKey) continue;
+                  const candAmt = String(cand.fallbackAmountSig || "");
+                  if (fallbackAmountSig && candAmt && candAmt !== fallbackAmountSig) continue;
+                  g = cand;
+                  break;
+                }
+              }
+            }
+            if (!g) {
+              g = {
+                items: [],
+                kind: stKey,
+                pending: false,
+                newestTs: 0,
+                explicitFlow: false,
+                fallbackKey: useFallback ? fallbackKey : "",
+                fallbackAmountSig: useFallback ? fallbackAmountSig : "",
+                fallbackStrongKey: useFallback ? fallbackStrongKey : "",
+                closed: false,
+              };
+              groups.push(g);
+            }
+            g.items.push(row);
+            if (!String(g.fallbackAmountSig || "") && fallbackAmountSig) {
+              g.fallbackAmountSig = fallbackAmountSig;
+              g.fallbackStrongKey = g.fallbackKey ? `${g.fallbackKey}|${fallbackAmountSig}` : "";
+            }
+            g.pending = !!g.pending || isPendingRedeemAction(row);
+            const ts = parseRowTs(row);
+            if (ts > Number(g.newestTs || 0)) g.newestTs = ts;
+            if (stageClosesFlow(stKey)) g.closed = true;
             continue;
           }
           let g = flowMap.get(flowId);
           if (!g) {
-            g = { items: [], kind: stageKeyForRow(row) || "other", pending: false, newestTs: 0 };
+            g = {
+              items: [],
+              kind: stKey,
+              pending: false,
+              newestTs: 0,
+              explicitFlow: true,
+              fallbackKey: "",
+              fallbackAmountSig: "",
+              fallbackStrongKey: "",
+              closed: false,
+            };
             flowMap.set(flowId, g);
             groups.push(g);
           }
@@ -25876,6 +26011,7 @@ def _render_riko_page() -> str:
           g.pending = !!g.pending || isPendingRedeemAction(row);
           const ts = parseRowTs(row);
           if (ts > Number(g.newestTs || 0)) g.newestTs = ts;
+          if (stageClosesFlow(stKey)) g.closed = true;
         }
         groups.sort((a, b) => Number(b?.newestTs || 0) - Number(a?.newestTs || 0));
         return groups;
@@ -26343,9 +26479,11 @@ def _render_riko_page() -> str:
       });
       return out.slice(0, 40);
     }
-    function findLatestPendingFlowIdFor(symbolRaw, tokenRaw) {
+    function findLatestPendingFlowIdFor(symbolRaw, tokenRaw, amountInRaw) {
       const symbol = String(symbolRaw || "").trim().toLowerCase();
       const token = String(tokenRaw || "").trim().toLowerCase();
+      const normAmount = (v) => String(v == null ? "" : v).trim().toLowerCase().replace(/,/g, "").replace(/\s+/g, "");
+      const targetAmount = normAmount(amountInRaw);
       const items = Array.isArray(rikoTxHistory) ? rikoTxHistory.slice() : [];
       items.sort((a, b) => String(b?.time_iso || b?.when || "").localeCompare(String(a?.time_iso || a?.when || "")));
       for (const it of items) {
@@ -26361,6 +26499,10 @@ def _render_riko_page() -> str:
         if (symbol) {
           const symMatch = (inSym && inSym === symbol) || (outSym && outSym === symbol);
           if (!symMatch && (inSym || outSym)) continue;
+        }
+        if (targetAmount) {
+          const rowAmount = normAmount(it?.token_amount_display || "");
+          if (rowAmount && rowAmount !== targetAmount) continue;
         }
         return fid;
       }
@@ -27433,9 +27575,13 @@ def _render_riko_page() -> str:
               const cancelLogs = await vault.queryFilter(vault.filters.RedeemCancelled(user, tokenAddr), fromBlock, latest);
               const cancelEv = pickLatestLog(cancelLogs);
               if (cancelEv) {
+                const rikoReturnedRaw = BigInt(cancelEv?.args?.rikoReturned ?? 0n);
+                const rikoReturnedFmt = rikoReturnedRaw > 0n ? formatTokenAmount(rikoReturnedRaw, 6) : "";
+                const cancelFlowId = findLatestPendingFlowIdFor(sym, tokenAddr, rikoReturnedFmt) || flowId;
                 await addRikoTxHistory("Cancel pending redeem", String(cancelEv?.transactionHash || ""), provider, {
-                  flowId,
+                  flowId: cancelFlowId,
                   tokenSymbol: String(sym || "").toUpperCase() || "TOKEN",
+                  tokenAmountDisplay: rikoReturnedFmt,
                 });
               }
             } catch (_) {}
@@ -28224,7 +28370,6 @@ def _render_riko_page() -> str:
         const user = await signer.getAddress();
         let vaultTokenAddress = await resolveVaultTokenAddressForAction(symbol, tokenOverride, signer);
         if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
-        flowId = findLatestPendingFlowIdFor(symbol, vaultTokenAddress) || newRikoFlowId("cancel");
         const vault = new ethers.Contract(contractAddress, RIKO_ABI, signer);
         const pending = await vault.pendingRedemptions(user, vaultTokenAddress);
         if (!pending?.exists) {
@@ -28232,6 +28377,9 @@ def _render_riko_page() -> str:
           await refreshRikoPendingRows();
           return;
         }
+        const rikoLocked = BigInt(pending?.rikoLocked ?? pending?.[0] ?? 0n);
+        const rikoLockedFmt = formatTokenAmount(rikoLocked, 6);
+        flowId = findLatestPendingFlowIdFor(symbol, vaultTokenAddress, rikoLockedFmt) || newRikoFlowId("cancel");
         const tx = await vault.cancelPendingRedemption(vaultTokenAddress);
         cancelTxHash = String(tx?.hash || "").trim();
         await addRikoTxHistory("Cancel pending redeem", tx.hash, signer, {
@@ -28239,6 +28387,7 @@ def _render_riko_page() -> str:
           flowId,
           tokenAddress: vaultTokenAddress,
           tokenSymbol: String(symbol || "").toUpperCase() || "TOKEN",
+          tokenAmountDisplay: rikoLockedFmt,
         });
         hasDeferredTxRows = true;
         setRikoStatus("Cancel pending redeem tx sent", false, true);
@@ -35395,7 +35544,17 @@ def _render_admin_page() -> str:
         const queueShift = (key, status, closeEvent) => {{
           const list = activeQueuedByKey.get(key);
           if (!Array.isArray(list) || !list.length) return;
-          const rec = list.shift();
+          let idx = 0;
+          try {{
+            const rawAmount = (status === "cancelled")
+              ? String(closeEvent?.rikoReturned ?? "")
+              : ((status === "completed") ? String(closeEvent?.rikoBurned ?? "") : "");
+            if (rawAmount) {{
+              const matchIdx = list.findIndex((x) => String(x?.ev?.rikoLocked ?? "") === rawAmount);
+              if (matchIdx >= 0) idx = matchIdx;
+            }}
+          }} catch (_) {{}}
+          const rec = list.splice(idx, 1)[0];
           if (rec && (status === "completed" || status === "cancelled")) {{
             rec.status = status;
             rec.closedBlockNumber = Number(closeEvent?.blockNumber || 0);
@@ -35427,7 +35586,30 @@ def _render_admin_page() -> str:
           try {{
             const p = await vault.pendingRedemptions(accountK, tokenK);
             if (p?.exists) {{
-              // Keep as-is; queue may legitimately contain several pending rows for same pair.
+              // Live state returns the current active queued redeem for (account, token).
+              // Keep that one active (prefer exact rikoLocked match) and reconcile the rest.
+              const liveLocked = String(p?.rikoLocked ?? p?.[0] ?? "");
+              let keeper = null;
+              const activeList = (Array.isArray(recList) ? recList : [])
+                .filter((x) => String(x?.status || "").toLowerCase() === "active");
+              if (liveLocked) {{
+                keeper = activeList.find((x) => String(x?.ev?.rikoLocked ?? "") === liveLocked) || null;
+              }}
+              if (!keeper && activeList.length) {{
+                activeList.sort((a, b) => {{
+                  const ab = Number(a?.ev?.blockNumber || 0);
+                  const bb = Number(b?.ev?.blockNumber || 0);
+                  if (ab !== bb) return bb - ab;
+                  return Number(b?.ev?.logIndex ?? b?.ev?.index ?? 0) - Number(a?.ev?.logIndex ?? a?.ev?.index ?? 0);
+                }});
+                keeper = activeList[0] || null;
+              }}
+              for (const rec of activeList) {{
+                if (keeper && rec === keeper) continue;
+                rec.status = "completed";
+                rec.closedBlockNumber = Number(latest || 0);
+                rec.closedByReconcile = true;
+              }}
               continue;
             }}
             for (const rec of (Array.isArray(recList) ? recList : [])) {{
@@ -35558,7 +35740,8 @@ def _render_admin_page() -> str:
         }}
         const tokenReadCache = new Map();
         const rows = [];
-        for (const rec of queuedRecords) {{
+        const activeQueuedRecords = queuedRecords.filter((x) => String(x?.status || "").toLowerCase() === "active");
+        for (const rec of activeQueuedRecords) {{
           const ev = rec?.ev;
           const status = String(rec?.status || "active");
           const account = String(ev?.account || "").trim();
@@ -35654,7 +35837,7 @@ def _render_admin_page() -> str:
         const maxPendingRows = 800;
         const nowSec = Math.floor(Date.now() / 1000);
         // Pending queue must contain only active rows.
-        const queueVisibleRows = rows.filter((r) => String(r?.status || "").toLowerCase() === "active");
+        const queueVisibleRows = rows;
         const pendingRowsTruncated = queueVisibleRows.length > maxPendingRows;
         const rowsToRender = pendingRowsTruncated ? queueVisibleRows.slice(0, maxPendingRows) : queueVisibleRows;
         if (!queueVisibleRows.length) {{
@@ -35862,7 +36045,7 @@ def _render_admin_page() -> str:
         );
 
         const pendingStatusText = buildAdminRikoPendingQueueStatusText(
-          rows.length,
+          queueVisibleRows.length,
           rowsToRender.length,
           loadWarns.length > 0
         );
