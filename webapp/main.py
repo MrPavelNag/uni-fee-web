@@ -10263,6 +10263,7 @@ def _build_row_updates_from_snapshot(row: dict[str, Any], snap: dict[str, Any], 
 INTENT_OPTIONS: list[tuple[str, str]] = [
     ("/", "Find the best fee on Uniswap"),
     ("/pancake", "Find the best pool on PancakeSwap"),
+    ("/riko", "Manage RIKO vault operations"),
     ("/stables", "Optimize my lending positions"),
     ("/positions", "Optimize my pool positions"),
     ("/help", "Send wishes or report issues"),
@@ -13433,6 +13434,20 @@ def pancake_page(request: Request) -> HTMLResponse:
     return resp
 
 
+@app.get("/riko", response_class=HTMLResponse)
+def riko_page(request: Request) -> HTMLResponse:
+    html = _render_placeholder_page(
+        "RIKO Vault",
+        "RIKO page restored in safe mode. Full vault controls will be reattached.",
+        "/riko",
+    )
+    html = html.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
+    resp = HTMLResponse(html)
+    sid = _ensure_session_cookie(request, resp)
+    _analytics_log_event(session_id=sid, event_type="page_view", path="/riko")
+    return resp
+
+
 @app.get("/help", response_class=HTMLResponse)
 def help_page(request: Request) -> HTMLResponse:
     html = _render_help_page().replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
@@ -15008,7 +15023,7 @@ def robots_txt(request: Request) -> str:
 @app.get("/sitemap.xml")
 def sitemap_xml(request: Request) -> Response:
     base = _public_base_url(request)
-    urls = ["/", "/pancake", "/stables", "/positions", "/help", "/connect"]
+    urls = ["/", "/pancake", "/riko", "/stables", "/positions", "/help", "/connect"]
     now = datetime.now(timezone.utc).date().isoformat()
     body = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -15700,6 +15715,7 @@ HTML_PAGE = """
         <select class="intent-select" id="intentSelect" onchange="navigateIntent(this.value)">
           <option value="/" selected>Find the best fee on Uniswap</option>
           <option value="/pancake">Find the best pool on PancakeSwap</option>
+          <option value="/riko">Manage RIKO vault operations</option>
           <option value="/stables">Optimize my lending positions</option>
           <option value="/positions">Optimize my pool positions</option>
           <option value="/help">Send wishes or report issues</option>

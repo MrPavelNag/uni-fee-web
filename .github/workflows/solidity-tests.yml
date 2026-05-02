@@ -21,11 +21,8 @@ jobs:
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
         with:
-          version: v1.5.1
+          version: stable
 
       - name: Show forge version
         run: forge --version
