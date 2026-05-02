@@ -18785,10 +18785,33 @@ def _token_icon_file_path(symbol: str, source_url: str) -> Path:
     return TOKEN_ICON_DIR / f"{sym}_{h}{ext}"
 
 
+def _ensure_builtin_eth_icon() -> Path | None:
+    try:
+        path = TOKEN_ICON_DIR / "eth_builtin.svg"
+        if path.exists() and path.stat().st_size > 0:
+            return path
+        svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="31" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+  <polygon points="32,8 19,31 32,25 45,31" fill="#8b95a7"/>
+  <polygon points="32,25 19,34 32,56 45,34" fill="#626d80"/>
+  <polygon points="32,28 45,33 32,40" fill="#454f5f"/>
+  <polygon points="32,28 19,33 32,40" fill="#6f7a8d"/>
+</svg>
+"""
+        path.write_text(svg, encoding="utf-8")
+        return path
+    except Exception:
+        return None
+
+
 def _ensure_token_icon_cached(symbol: str) -> Path | None:
     sym = str(symbol or "").strip().lower()
     if not _is_clean_symbol(sym):
         return None
+    if sym == "eth":
+        built_in = _ensure_builtin_eth_icon()
+        if built_in:
+            return built_in
     icon_map = _load_token_icon_url_map(refresh=False)
     source_url = str(icon_map.get(sym) or "").strip()
     if not source_url:
@@ -27472,6 +27495,10 @@ def _render_riko_page() -> str:
       "error RV_InvalidPendingRedemptionOperator()",
       "error RV_PendingRedemptionOperatorOnly()",
       "error RV_NativeTransferFailed()",
+      "error ERC20InsufficientBalance(address sender,uint256 balance,uint256 needed)",
+      "error ERC20InsufficientAllowance(address spender,uint256 allowance,uint256 needed)",
+      "error ERC20InvalidSender(address sender)",
+      "error ERC20InvalidReceiver(address receiver)",
       "error EnforcedPause()",
       "error ExpectedPause()",
       "error ReentrancyGuardReentrantCall()",
@@ -27510,6 +27537,10 @@ def _render_riko_page() -> str:
       RV_InvalidPendingRedemptionOperator: "Pending redemption operator is invalid.",
       RV_PendingRedemptionOperatorOnly: "Only pending redemption operator can perform this action.",
       RV_NativeTransferFailed: "Native token transfer failed.",
+      ERC20InsufficientBalance: "RIKO balance is not enough for this redeem amount.",
+      ERC20InsufficientAllowance: "Allowance is not enough for this operation.",
+      ERC20InvalidSender: "Token sender address is invalid.",
+      ERC20InvalidReceiver: "Token receiver address is invalid.",
       EnforcedPause: "Vault is paused. Unpause contract to continue deposits/redeems.",
       ExpectedPause: "Operation expects paused state.",
       ReentrancyGuardReentrantCall: "Reentrant call detected; retry once pending tx is finalized.",
@@ -27953,7 +27984,16 @@ def _render_riko_page() -> str:
           }
         }
         try {
-          await vault.redeem.staticCall(redeemTokenAddress, rawRiko, 0, user);
+          // Explicit prechecks provide clearer errors than redeem.staticCall custom-revert blobs.
+          const rikoToken = new ethers.Contract(contractAddress, ERC20_ABI, signer);
+          const rikoBal = BigInt(await rikoToken.balanceOf(user));
+          if (rikoBal < rawRiko) {
+            const haveFmt = formatTokenAmount(rikoBal, 6);
+            const needFmt = formatTokenAmount(rawRiko, 6);
+            setRikoStatus(`Redeem precheck failed: insufficient RIKO balance (have ${haveFmt}, need ${needFmt}).`, true);
+            return;
+          }
+          await vault.quoteRedeem(redeemTokenAddress, rawRiko);
         } catch (preErr) {
           const preMsg = formatRikoErrorMessage("Redeem precheck failed", preErr, "on-chain precheck reverted");
           setRikoStatus(preMsg, true);
@@ -36795,6 +36835,19 @@ def _render_admin_page() -> str:
               continue;
             }}
             const feedHash = ethers.keccak256(ethers.toUtf8Bytes(desc));
+            try {{
+              const current = await vault.tokenConfigs(token);
+              const curAllowed = !!current?.allowed;
+              const curOracle = normalizeEthAddressInput(String(current?.oracle || ""));
+              const curMaxAge = BigInt(current?.maxOracleAge ?? 0n);
+              const curHash = String(current?.expectedFeedDescriptionHash || "").toLowerCase();
+              const nextMaxAge = BigInt(Math.round(maxAge));
+              const nextHash = String(feedHash || "").toLowerCase();
+              if (curAllowed && curOracle === oracle && curMaxAge === nextMaxAge && curHash === nextHash) {{
+                skipped.push(`${{symbol || token}}: already configured (no changes).`);
+                continue;
+              }}
+            }} catch (_) {{}}
             try {{
               await vault.setTokenConfig.staticCall(token, true, oracle, BigInt(Math.round(maxAge)), feedHash);
             }} catch (preErr) {{
