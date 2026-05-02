@@ -2253,9 +2253,12 @@ def _wallet_ui_bundle_js(
       document.getElementById("wcQrImg").src = "https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=" + encodeURIComponent(uri);
       el.style.display = "flex";
     }
-    function closeWcQrModal() {
+    function hideWcQrModal() {
       const el = document.getElementById("wcQrBackdrop");
       if (el) el.style.display = "none";
+    }
+    function closeWcQrModal() {
+      hideWcQrModal();
       if (window._wcProvider) try { window._wcProvider.disconnect(); } catch (_) {}
       window._wcProvider = null;
     }
@@ -2321,8 +2324,8 @@ def _wallet_ui_bundle_js(
             throw connErr;
           }
         }
-        window._wcProvider = null;
-        closeWcQrModal();
+        window._wcProvider = provider;
+        hideWcQrModal();
         const pullAddressFromAny = (value) => {
           if (Array.isArray(value)) {
             for (const item of value) {
@@ -27155,6 +27158,43 @@ def _render_riko_page() -> str:
         });
       } catch (_) {}
     }
+    async function resolveRikoReadWalletAddress() {
+      const authWallet = String(authState?.address || "").trim();
+      const source = getRikoWalletProvider();
+      if (!source) return authWallet;
+      try {
+        const ethers = await ensureEthers();
+        const provider = new ethers.BrowserProvider(source);
+        const accounts = await provider.send("eth_accounts", []);
+        const activeWallet = String((accounts || [])[0] || "").trim();
+        if (/^0x[a-fA-F0-9]{40}$/.test(activeWallet)) {
+          if (/^0x[a-fA-F0-9]{40}$/.test(authWallet) && activeWallet.toLowerCase() !== authWallet.toLowerCase()) {
+            logRikoClientIssue(
+              "wallet_mismatch",
+              "balance_read",
+              `auth=${authWallet.toLowerCase()} wallet=${activeWallet.toLowerCase()}`
+            );
+          }
+          return activeWallet;
+        }
+      } catch (_) {}
+      return authWallet;
+    }
+    function getRikoWalletProvider() {
+      const wcProvider = window._wcProvider;
+      const injected = window.ethereum;
+      if (String(authState?.wallet || "").toLowerCase() === "walletconnect" && wcProvider?.request) {
+        return wcProvider;
+      }
+      if (injected?.request) return injected;
+      if (wcProvider?.request) return wcProvider;
+      return null;
+    }
+    function rikoProviderMissingText(prefix, symLabel) {
+      const label = String(prefix || "Available").trim();
+      const suffix = symLabel ? ` (${symLabel})` : "";
+      return `${label}: wallet provider is not available${suffix}. Connect browser wallet or reconnect WalletConnect session.`;
+    }
     async function refreshRikoWalletBalance() {
       const hint = document.getElementById("rikoBalanceHint");
       if (!hint) return;
@@ -27173,19 +27213,21 @@ def _render_riko_page() -> str:
           rikoWalletRikoBalanceFormatted = "0";
           return;
         }
-        const wallet = String(authState?.address || "").trim();
+        const wallet = await resolveRikoReadWalletAddress();
         if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
           hint.textContent = "Available to redeem: wallet not ready (RIKO)";
+          logRikoClientIssue("wallet_not_ready", "balance_redeem", "wallet address missing");
           return;
         }
-        if (!window.ethereum) {
-          hint.textContent = "Available to redeem: wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.";
-          logRikoClientIssue("provider_missing", "balance_redeem", "window.ethereum missing");
+        const providerSource = getRikoWalletProvider();
+        if (!providerSource) {
+          hint.textContent = rikoProviderMissingText("Available to redeem");
+          logRikoClientIssue("provider_missing", "balance_redeem", "no injected/walletconnect provider");
           return;
         }
         try {
           const ethers = await ensureEthers();
-          const provider = new ethers.BrowserProvider(window.ethereum);
+          const provider = new ethers.BrowserProvider(providerSource);
           const net = await provider.getNetwork();
           const chainId = Number(net?.chainId || 0);
           if (chainId !== RIKO_MAINNET_CHAIN_ID) {
@@ -27221,19 +27263,21 @@ def _render_riko_page() -> str:
         return;
       }
       if (symRaw === "eth") {
-        const wallet = String(authState?.address || "").trim();
+        const wallet = await resolveRikoReadWalletAddress();
         if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
           hint.textContent = `Available: wallet not ready (${symLabel})`;
+          logRikoClientIssue("wallet_not_ready", "balance_deposit_eth", "wallet address missing");
           return;
         }
-        if (!window.ethereum) {
-          hint.textContent = `Available: wallet extension is not detected (${symLabel}). Open this page in a browser with MetaMask/Rabby.`;
-          logRikoClientIssue("provider_missing", "balance_deposit_eth", "window.ethereum missing");
+        const providerSource = getRikoWalletProvider();
+        if (!providerSource) {
+          hint.textContent = rikoProviderMissingText("Available", symLabel);
+          logRikoClientIssue("provider_missing", "balance_deposit_eth", "no injected/walletconnect provider");
           return;
         }
         try {
           const ethers = await ensureEthers();
-          const provider = new ethers.BrowserProvider(window.ethereum);
+          const provider = new ethers.BrowserProvider(providerSource);
           const net = await provider.getNetwork();
           const chainId = Number(net?.chainId || 0);
           if (chainId !== RIKO_MAINNET_CHAIN_ID) {
@@ -27257,23 +27301,26 @@ def _render_riko_page() -> str:
       }
       if (!/^0x[a-fA-F0-9]{40}$/.test(tokenAddress)) {
         hint.textContent = `Available: no token address (${symLabel})`;
+        logRikoClientIssue("token_address_missing", "balance_deposit_token", `symbol=${symLabel}`);
         rikoWalletTokenBalanceRaw = 0n;
         rikoWalletTokenBalanceFormatted = "0";
         return;
       }
-      const wallet = String(authState?.address || "").trim();
+      const wallet = await resolveRikoReadWalletAddress();
       if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
         hint.textContent = `Available: wallet not ready (${symLabel})`;
+        logRikoClientIssue("wallet_not_ready", "balance_deposit_token", "wallet address missing");
         return;
       }
-      if (!window.ethereum) {
-        hint.textContent = `Available: wallet extension is not detected (${symLabel}). Open this page in a browser with MetaMask/Rabby.`;
-        logRikoClientIssue("provider_missing", "balance_deposit_token", "window.ethereum missing");
+      const providerSource = getRikoWalletProvider();
+      if (!providerSource) {
+        hint.textContent = rikoProviderMissingText("Available", symLabel);
+        logRikoClientIssue("provider_missing", "balance_deposit_token", "no injected/walletconnect provider");
         return;
       }
       try {
         const ethers = await ensureEthers();
-        const provider = new ethers.BrowserProvider(window.ethereum);
+        const provider = new ethers.BrowserProvider(providerSource);
         const net = await provider.getNetwork();
         const chainId = Number(net?.chainId || 0);
         if (chainId !== RIKO_MAINNET_CHAIN_ID) {
@@ -27629,10 +27676,11 @@ def _render_riko_page() -> str:
       return window.ethers;
     }
     const RIKO_MAINNET_CHAIN_ID = 1;
-    async function switchWalletToRikoMainnet() {
-      if (!window.ethereum?.request) return false;
+    async function switchWalletToRikoMainnet(providerSource = null) {
+      const src = providerSource && providerSource.request ? providerSource : getRikoWalletProvider();
+      if (!src?.request) return false;
       try {
-        await window.ethereum.request({
+        await src.request({
           method: "wallet_switchEthereumChain",
           params: [{ chainId: "0x1" }],
         });
@@ -27642,18 +27690,19 @@ def _render_riko_page() -> str:
       }
     }
     async function getRikoSigner() {
-      if (!window.ethereum) {
-        logRikoClientIssue("provider_missing", "get_signer", "window.ethereum missing");
-        throw new Error("Wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.");
+      const providerSource = getRikoWalletProvider();
+      if (!providerSource) {
+        logRikoClientIssue("provider_missing", "get_signer", "no injected/walletconnect provider");
+        throw new Error("Wallet provider is not available. Connect browser wallet or reconnect WalletConnect session.");
       }
       const ethers = await ensureEthers();
-      let provider = new ethers.BrowserProvider(window.ethereum);
+      let provider = new ethers.BrowserProvider(providerSource);
       await provider.send("eth_requestAccounts", []);
       let net = await provider.getNetwork();
       let chainId = Number(net?.chainId || 0);
       if (chainId !== RIKO_MAINNET_CHAIN_ID) {
-        await switchWalletToRikoMainnet();
-        provider = new ethers.BrowserProvider(window.ethereum);
+        await switchWalletToRikoMainnet(providerSource);
+        provider = new ethers.BrowserProvider(providerSource);
         net = await provider.getNetwork();
         chainId = Number(net?.chainId || 0);
         if (chainId !== RIKO_MAINNET_CHAIN_ID) {
@@ -27697,7 +27746,8 @@ def _render_riko_page() -> str:
     async function resolveEthVaultTokenAddressForSigner(signer, fallbackAddr) {
       const addr = String(fallbackAddr || "").trim();
       const ethers = await ensureEthers();
-      const provider = signer?.provider ? signer.provider : (window.ethereum ? new ethers.BrowserProvider(window.ethereum) : null);
+      const providerSource = getRikoWalletProvider();
+      const provider = signer?.provider ? signer.provider : (providerSource ? new ethers.BrowserProvider(providerSource) : null);
       if (!provider) return addr;
       try {
         if (/^0x[a-fA-F0-9]{40}$/.test(addr)) {
@@ -27767,9 +27817,10 @@ def _render_riko_page() -> str:
       try {
         const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured.");
-        if (!window.ethereum) throw new Error("Wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.");
+        const providerSource = getRikoWalletProvider();
+        if (!providerSource) throw new Error("Wallet provider is not available. Connect browser wallet or reconnect WalletConnect session.");
         const ethers = await ensureEthers();
-        const provider = new ethers.BrowserProvider(window.ethereum);
+        const provider = new ethers.BrowserProvider(providerSource);
         let user = String(authState?.address || "").trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(user)) {
           try {
@@ -35219,7 +35270,7 @@ def _render_admin_page() -> str:
       return window.ethers;
     }}
     async function getAdminSigner() {{
-      if (!window.ethereum) throw new Error("Wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.");
+      if (!window.ethereum) throw new Error("Wallet is not detected. Open /riko in Chrome/Brave/Firefox with MetaMask or Rabby enabled for this site.");
       const ethers = await ensureEthersAdmin();
       let provider = new ethers.BrowserProvider(window.ethereum);
       await provider.send("eth_requestAccounts", []);
@@ -36936,7 +36987,7 @@ def _render_admin_page() -> str:
     async function applyAdminRikoCustodyApprove(tokenAddressInput, amountInput) {{
       try {{
         const ethers = await ensureEthersAdmin();
-        if (!window.ethereum) throw new Error("Wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.");
+        if (!window.ethereum) throw new Error("Wallet is not detected. Open /riko in Chrome/Brave/Firefox with MetaMask or Rabby enabled for this site.");
         const provider = new ethers.BrowserProvider(window.ethereum);
         const vaultAddr = requireConfiguredAddress(adminRikoVaultAddress, "RIKO vault address");
         const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
