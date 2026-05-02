@@ -23506,22 +23506,15 @@ def _riko_admin_holders_snapshot(limit: int = 500) -> dict[str, Any]:
     schedule = _load_riko_payout_schedule()
     schedule_next_due_date = str(schedule.get("next_due_date") or "")
     schedule_next_due_at_utc = str(schedule.get("next_due_at_utc") or "")
-    annual_pct = 0.0
-    monthly_pct = 0.0
-    target_bps = 0
-    next_bps = 0
-    try:
-        y = _fetch_us_treasury_daily_10y()
-        annual_pct = float(y.get("annual_pct") or 0.0)
+    annual_pct = float(schedule.get("next_rate_annual_pct") or 0.0)
+    monthly_pct = float(schedule.get("next_rate_monthly_pct") or 0.0)
+    target_bps = int(schedule.get("next_rate_target_bps") or 0)
+    next_bps = int(schedule.get("next_rate_bps") or 0)
+    if next_bps <= 0 and annual_pct > 0:
+        # Fallback if schedule state is partially missing fields.
         monthly_pct = float(annual_pct) / 12.0
-        raw_target_bps = float(monthly_pct) * 100.0
-        target_bps = int(round(raw_target_bps))
+        target_bps = int(round(float(monthly_pct) * 100.0))
         next_bps = max(int(RIKO_AUTO_YIELD_MIN_BPS), min(int(RIKO_AUTO_YIELD_MAX_BPS), int(target_bps)))
-    except Exception:
-        annual_pct = 0.0
-        monthly_pct = 0.0
-        target_bps = 0
-        next_bps = 0
     payout_decimals = 18
     if _is_eth_address(payout_token):
         try:
@@ -36348,6 +36341,8 @@ def _render_admin_page() -> str:
         const canExecutePayout = !!data?.can_execute_payout;
         const scheduleNextDueUtc = String(data?.schedule_next_due_at_utc || data?.schedule_next_due_date || "").trim();
         const nextBps = Number(data?.next_bps || 0);
+        const annualPct = Number(data?.annual_pct || 0);
+        const payoutPct = Number(nextBps || 0) / 100.0;
         const holderColumns = ["Address", "Balance", "Planned yield", "Planned date (UTC)", "Last change date", "Tx hash"];
         if (!rows.length) {{
           renderAdminRikoHistoryTable(
@@ -36421,7 +36416,7 @@ def _render_admin_page() -> str:
           `RIKO token: ${{shortAddrAdmin(String(data?.riko_token || ""))}}. ` +
           `Next payout funding: required ${{formatAdminRawUnits(requiredRaw, payoutDecimals, 8)}} / available ${{formatAdminRawUnits(availableRaw, payoutDecimals, 8)}}${{hasPayoutWallet ? ` (wallet: ${{shortAddrAdmin(payoutWallet)}})` : ""}}. ` +
           `Gas: required ${{formatAdminRawUnits(requiredGasWei, 18, 8)}} ETH / available ${{formatAdminRawUnits(nativeBalanceWei, 18, 8)}} ETH. ` +
-          `Expected yield for next payout: ${{fmtInt(nextBps)}} bps/month. ` +
+          `Rate basis: APR ${{annualPct > 0 ? annualPct.toFixed(4) : "0.0000"}}% -> ${{fmtInt(nextBps)}} bps/mo (~${{payoutPct.toFixed(4)}}% per payout). ` +
           `Next payout: ${{scheduleNextDueUtc || "-"}}. ` +
           `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
         const fundingText = hasPayoutToken
