@@ -21977,6 +21977,7 @@ def _riko_resolve_symbol_addresses(symbol: str) -> list[str]:
         "link": "0x514910771af9ca656af840dff83e8264ecf986ca",
         "bnb": "0xb8c77482e45f1f44de1745f52c74426c631bdd52",
         "aave": "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9",
+        "reth": "0xae78736cd615f374d3085123a210448e74fc6393",
         "steth": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
         "wsteth": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
         "weeth": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",
@@ -26062,10 +26063,14 @@ def _render_riko_page() -> str:
           const tools = renderTxTools(String(latestTx?.hash || ""), String(latestTx?.url || ""));
           statusLikeMain = `<span class="riko-tx-label">${esc(statusText)}</span>${tools}`;
         }
-        const mainHtml = statusLikeMain || chain;
-        const metaWrapHtml = statusLikeMain
-          ? (metaText ? `<span>${metaText}</span>` : "")
-          : `${statusBadge}${flowBadge}${metaText ? `<span>${metaText}</span>` : ""}`;
+        // For redeem-related flows, show the full stage chain (not a shortened summary)
+        // so users can always see every step in history.
+        const mainHtml = forceStatusRow ? chain : (statusLikeMain || chain);
+        const metaWrapHtml = forceStatusRow
+          ? `${statusBadge}${flowBadge}${metaText ? `<span>${metaText}</span>` : ""}`
+          : (statusLikeMain
+            ? (metaText ? `<span>${metaText}</span>` : "")
+            : `${statusBadge}${flowBadge}${metaText ? `<span>${metaText}</span>` : ""}`);
         return (
           `<li>` +
           `<span class="riko-tx-time">${formatTxTimeDisplay(String(first?.when || first?.time_iso || ""))}</span>` +
@@ -33903,6 +33908,12 @@ def _render_admin_page() -> str:
       font-size: 11px;
       line-height: 1;
     }}
+    .admin-history-trash-btn {{
+      font-size: 16px;
+      line-height: 1;
+      min-width: 42px;
+      padding: 6px 10px;
+    }}
     .admin-history-table td:last-child {{
       text-align: right;
     }}
@@ -35042,7 +35053,7 @@ def _render_admin_page() -> str:
     function adminRikoDeleteSelectedButton(scope) {{
       const key = String(scope || "").trim().toLowerCase();
       if (key !== "redeem" && key !== "deposit" && key !== "yield") return "";
-      return "<button type='button' class='btn btn-soft' title='Delete selected' aria-label='Delete selected' onclick=\\\"deleteSelectedAdminRikoHistory('" + key + "', event)\\\">🗑</button>";
+      return "<button type='button' class='btn btn-soft admin-history-trash-btn' title='Delete selected' aria-label='Delete selected' onclick=\\\"deleteSelectedAdminRikoHistory('" + key + "', event)\\\">🗑️</button>";
     }}
     function getAdminRikoPendingStatusMeta(rawStatus) {{
       const st = String(rawStatus || "active").trim().toLowerCase();
@@ -35350,13 +35361,14 @@ def _render_admin_page() -> str:
         // Reconcile with live on-chain pending state.
         // Events reconstruction can occasionally drift (provider gaps/reorg windows),
         // while pendingRedemptions(account, token) is the current source of truth.
-        const latestQueuedByKey = new Map();
+        const recordsByKey = new Map();
         for (const rec of queuedRecords) {{
           const k = String(rec?.key || "");
           if (!k) continue;
-          latestQueuedByKey.set(k, rec);
+          if (!recordsByKey.has(k)) recordsByKey.set(k, []);
+          recordsByKey.get(k).push(rec);
         }}
-        for (const [k, rec] of latestQueuedByKey.entries()) {{
+        for (const [k, recList] of recordsByKey.entries()) {{
           const parts = String(k || "").split("|");
           const accountK = String(parts[0] || "").trim();
           const tokenK = String(parts[1] || "").trim();
@@ -35364,8 +35376,11 @@ def _render_admin_page() -> str:
           try {{
             const p = await vault.pendingRedemptions(accountK, tokenK);
             if (p?.exists) {{
-              rec.status = "active";
-            }} else if (String(rec?.status || "").toLowerCase() === "active") {{
+              // Keep as-is; queue may legitimately contain several pending rows for same pair.
+              continue;
+            }}
+            for (const rec of (Array.isArray(recList) ? recList : [])) {{
+              if (String(rec?.status || "").toLowerCase() !== "active") continue;
               // If live state says there is no pending anymore, do not keep ghost
               // "active" rows waiting for delayed/missed events.
               rec.status = "completed";
@@ -35403,6 +35418,30 @@ def _render_admin_page() -> str:
           }} catch (_) {{}}
           tokenDecimalsCache.set(key, null);
           return null;
+        }}
+        function resolveTokenSymbolLabel(tokenAddressRaw) {{
+          const tokenLower = String(tokenAddressRaw || "").trim().toLowerCase();
+          if (!tokenLower) return "-";
+          if (tokenLower === wrapped) return "ETH";
+          try {{
+            const src = Array.isArray(adminRikoWhitelistActiveItems) ? adminRikoWhitelistActiveItems : [];
+            for (const it of src) {{
+              const addr = String(it?.address || "").trim().toLowerCase();
+              if (!/^0x[a-f0-9]{{40}}$/.test(addr)) continue;
+              if (addr !== tokenLower) continue;
+              const sym = String(it?.symbol || "").trim().toUpperCase();
+              if (sym) return sym;
+            }}
+          }} catch (_) {{}}
+          const knownByAddress = {{
+            "0xdac17f958d2ee523a2206206994597c13d831ec7": "USDT",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "USDC",
+            "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": "WBTC",
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "WETH",
+            "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0": "WSTETH",
+            "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9": "AAVE",
+          }};
+          return String(knownByAddress[tokenLower] || shortAddrAdmin(tokenLower));
         }}
         async function getBlockTimestampSec(blockNumber) {{
           const bn = Number(blockNumber || 0);
@@ -35479,7 +35518,7 @@ def _render_admin_page() -> str:
           const tsClosed = closedBn > 0 ? await getBlockTimestampSec(closedBn) : 0;
           const tsDisplay = tsClosed > 0 ? tsClosed : tsQueued;
           const tokenLower = String(token || "").toLowerCase();
-          const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
+          const tokenLabel = resolveTokenSymbolLabel(token);
           const rikoLockedRaw = ev?.rikoLocked;
           const tokenOutRaw = ev?.tokenOut;
           const minTokenOutRaw = ev?.minTokenOut;
@@ -35593,9 +35632,7 @@ def _render_admin_page() -> str:
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
           const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
-          const tokenLabelDisplay = /^0x[a-f0-9]{{40}}$/.test(String(tokenLabel || "").toLowerCase())
-            ? shortAddrAdmin(tokenLabel)
-            : String(tokenLabel || "-");
+          const tokenLabelDisplay = String(tokenLabel || "-");
           const tokenOutRaw = String(ev?.tokenOut ?? 0n);
           const rikoBurnedRaw = String(ev?.rikoBurned ?? 0n);
           const completionStatus = await resolveRedeemCompletionStatus(txHash);
@@ -35634,10 +35671,8 @@ def _render_admin_page() -> str:
           const txHash = String(ev?.transactionHash || "").trim().toLowerCase();
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenRedeemTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
-          const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
-          const tokenLabelDisplay = /^0x[a-f0-9]{{40}}$/.test(String(tokenLabel || "").toLowerCase())
-            ? shortAddrAdmin(tokenLabel)
-            : String(tokenLabel || "-");
+          const tokenLabel = resolveTokenSymbolLabel(token);
+          const tokenLabelDisplay = String(tokenLabel || "-");
           const returned = String(ev?.rikoReturned ?? 0n);
           const checked = /^0x[a-f0-9]{{64}}$/.test(txHash) && adminRikoHistorySelection.redeem.has(txHash) ? "checked" : "";
           redeemHistoryRows.push({{
@@ -35686,10 +35721,8 @@ def _render_admin_page() -> str:
           if (!Number.isFinite(bn) || bn <= 0) continue;
           if (/^0x[a-f0-9]{{64}}$/.test(txHash) && hiddenDepositTx.has(txHash)) continue;
           const tokenLower = String(token || "").toLowerCase();
-          const tokenLabel = tokenLower && tokenLower === wrapped ? "ETH" : token;
-          const tokenLabelDisplay = /^0x[a-f0-9]{{40}}$/.test(String(tokenLabel || "").toLowerCase())
-            ? shortAddrAdmin(tokenLabel)
-            : String(tokenLabel || "-");
+          const tokenLabel = resolveTokenSymbolLabel(token);
+          const tokenLabelDisplay = String(tokenLabel || "-");
           const tokenInRaw = String(ev?.tokenIn ?? 0n);
           const rikoMintedRaw = String(ev?.rikoMinted ?? 0n);
           const tokenDecimals = await resolveTokenDecimals(token, tokenLower);
@@ -36583,6 +36616,9 @@ def _render_admin_page() -> str:
             await setAdminRikoPendingOpsStatusTx("Pending redemption processed. Tx: ", tx.hash, provider);
           }}
           await loadAdminRikoPendingQueue(true);
+          setTimeout(() => {{
+            loadAdminRikoPendingQueue(true).catch(() => {{}});
+          }}, 1800);
         }} else {{
           setAdminRikoPendingOpsStatus("Process pending tx reverted.", true);
         }}
@@ -36950,6 +36986,7 @@ def _render_admin_page() -> str:
         dai: "0x6b175474e89094c44da98b954eedeac495271d0f",
         link: "0x514910771af9ca656af840dff83e8264ecf986ca",
         aave: "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9",
+        reth: "0xae78736cd615f374d3085123a210448e74fc6393",
         wsteth: "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0"
       }};
       return staticFallback[sym] || "";
@@ -36965,7 +37002,7 @@ def _render_admin_page() -> str:
       if (sym === "eth" || addr === "native") return {{ kind: "muted", text: "native" }};
       if (!/^0x[a-f0-9]{{40}}$/.test(addr)) return {{ kind: "err", text: "bad address" }};
       const cached = adminRikoWhitelistOracleStatusByToken.get(addr);
-      if (cached?.state === "ok") return {{ kind: "ok", text: "feed ok" }};
+      if (cached?.state === "ok") return {{ kind: "ok", text: "Chainlink feed ok" }};
       if (cached?.state === "no_feed") return {{ kind: "warn", text: "no feed" }};
       if (cached?.state === "access_denied") return {{ kind: "err", text: "feed access denied" }};
       if (cached?.state === "bad_token") return {{ kind: "err", text: "bad token" }};
