@@ -357,6 +357,7 @@ ADMIN_WALLETS_STATE_KEY_PLAIN = "admin_wallets_csv"
 ADMIN_WALLETS_STATE_KEY_ENC = "admin_wallets_csv_enc_v1"
 ADMIN_WALLETS_PENDING_ADD_STATE_KEY = "admin_wallets_pending_add_v1"
 ADMIN_WALLETS_PROTECTED_STATE_KEY = "admin_wallets_protected_v1"
+ADMIN_WALLETS_VIEW_ONLY_STATE_KEY = "admin_wallets_view_only_v1"
 ADMIN_WALLETS_PENDING_PROTECT_STATE_KEY = "admin_wallets_pending_protect_v1"
 ADMIN_WALLETS_PENDING_REMOVE_STATE_KEY = "admin_wallets_pending_remove_v1"
 ADMIN_WALLETS_TG_DAILY_QUEUE_STATE_KEY = "admin_wallets_tg_daily_queue_v1"
@@ -2472,6 +2473,14 @@ def _require_admin(request: Request, response: Response) -> tuple[str, dict[str,
     return sid, auth
 
 
+def _require_admin_write(auth: dict[str, Any], action_label: str = "this action") -> None:
+    addr = str((auth or {}).get("address") or "").strip().lower()
+    if not _is_eth_address(addr):
+        raise HTTPException(status_code=403, detail="Admin wallet is not authenticated.")
+    if _is_view_only_admin_address(addr):
+        raise HTTPException(status_code=403, detail=f"View-only admin cannot perform {action_label}.")
+
+
 def _require_authenticated_wallet(request: Request, response: Response) -> tuple[str, str, dict[str, Any]]:
     sid = _ensure_session_cookie(request, response)
     with AUTH_LOCK:
@@ -2621,6 +2630,49 @@ def _admin_protected_wallets_value() -> list[str]:
     return out
 
 
+def _admin_view_only_wallets_value() -> list[str]:
+    roots = set(_admin_root_wallets_value())
+    saved = _analytics_get_state(ADMIN_WALLETS_VIEW_ONLY_STATE_KEY)
+    extra = _parse_admin_wallets_csv(saved)
+    out: list[str] = []
+    seen: set[str] = set()
+    allowed = set(_admin_effective_wallets_value())
+    for addr in extra:
+        a = str(addr or "").strip().lower()
+        if not _is_eth_address(a) or a in seen:
+            continue
+        if a in roots:
+            # Root admins always remain writable.
+            continue
+        if a not in allowed:
+            continue
+        seen.add(a)
+        out.append(a)
+    return out
+
+
+def _is_view_only_admin_address(address: str) -> bool:
+    return (address or "").strip().lower() in set(_admin_view_only_wallets_value())
+
+
+def _set_admin_view_only_wallets(addresses: list[str]) -> None:
+    roots = set(_admin_root_wallets_value())
+    allowed = set(_admin_effective_wallets_value())
+    clean: list[str] = []
+    seen: set[str] = set()
+    for raw in addresses:
+        addr = str(raw or "").strip().lower()
+        if not _is_eth_address(addr) or addr in seen:
+            continue
+        if addr in roots:
+            continue
+        if addr not in allowed:
+            continue
+        seen.add(addr)
+        clean.append(addr)
+    _analytics_set_state(ADMIN_WALLETS_VIEW_ONLY_STATE_KEY, ",".join(clean))
+
+
 def _is_protected_admin_address(address: str) -> bool:
     return (address or "").strip().lower() in set(_admin_protected_wallets_value())
 
@@ -2710,6 +2762,8 @@ def _human_admin_wallet_event_name(event: str) -> str:
         "schedule_remove": "Admin remove scheduled",
         "schedule_protect_on": "PROTECTED enable scheduled",
         "schedule_protect_off": "PROTECTED disable scheduled",
+        "view_only_on": "VIEW-ONLY enabled",
+        "view_only_off": "VIEW-ONLY disabled",
     }
     return mapping.get(key, key.replace("_", " ") or "event")
 
@@ -3248,6 +3302,9 @@ def _execute_pending_admin_removal(address: str) -> dict[str, Any]:
     cur = set(_admin_protected_wallets_value())
     cur.discard(addr)
     _set_admin_protected_wallets(list(cur))
+    vo = set(_admin_view_only_wallets_value())
+    vo.discard(addr)
+    _set_admin_view_only_wallets(list(vo))
     _cancel_pending_admin_removal(addr)
     return pending
 
@@ -24694,6 +24751,15 @@ class AdminRikoWhitelistApplySigned(BaseModel):
     signature: str
 
 
+class RikoClientLogRequest(BaseModel):
+    reason: str = ""
+    context: str = ""
+    symbol: str = ""
+    address: str = ""
+    chain_id: int = 0
+    details: str = ""
+
+
 class HelpTicketCreate(BaseModel):
     name: str = ""
     email: str = ""
@@ -27071,6 +27137,24 @@ def _render_riko_page() -> str:
         return "0";
       }
     }
+    async function logRikoClientIssue(reason, context, details = "") {
+      try {
+        const payload = {
+          reason: String(reason || "").trim().toLowerCase(),
+          context: String(context || "").trim().toLowerCase(),
+          symbol: String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toUpperCase(),
+          address: String(authState?.address || "").trim().toLowerCase(),
+          chain_id: Number(authState?.chain_id || 0),
+          details: String(details || "").trim().slice(0, 240),
+        };
+        if (!payload.reason) return;
+        await fetch("/api/riko/client-log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      } catch (_) {}
+    }
     async function refreshRikoWalletBalance() {
       const hint = document.getElementById("rikoBalanceHint");
       if (!hint) return;
@@ -27095,7 +27179,8 @@ def _render_riko_page() -> str:
           return;
         }
         if (!window.ethereum) {
-          hint.textContent = "Available to redeem: provider not found (RIKO)";
+          hint.textContent = "Available to redeem: wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.";
+          logRikoClientIssue("provider_missing", "balance_redeem", "window.ethereum missing");
           return;
         }
         try {
@@ -27105,6 +27190,7 @@ def _render_riko_page() -> str:
           const chainId = Number(net?.chainId || 0);
           if (chainId !== RIKO_MAINNET_CHAIN_ID) {
             hint.textContent = `Available to redeem: switch wallet to Ethereum Mainnet (current chainId=${chainId || "?"})`;
+            logRikoClientIssue("wrong_chain", "balance_redeem", `chainId=${chainId || "?"}`);
             rikoWalletRikoBalanceRaw = 0n;
             rikoWalletRikoBalanceFormatted = "0";
             return;
@@ -27141,7 +27227,8 @@ def _render_riko_page() -> str:
           return;
         }
         if (!window.ethereum) {
-          hint.textContent = `Available: provider not found (${symLabel})`;
+          hint.textContent = `Available: wallet extension is not detected (${symLabel}). Open this page in a browser with MetaMask/Rabby.`;
+          logRikoClientIssue("provider_missing", "balance_deposit_eth", "window.ethereum missing");
           return;
         }
         try {
@@ -27151,6 +27238,7 @@ def _render_riko_page() -> str:
           const chainId = Number(net?.chainId || 0);
           if (chainId !== RIKO_MAINNET_CHAIN_ID) {
             hint.textContent = `Available: switch wallet to Ethereum Mainnet (current chainId=${chainId || "?"}, ${symLabel})`;
+            logRikoClientIssue("wrong_chain", "balance_deposit_eth", `chainId=${chainId || "?"}`);
             rikoWalletTokenBalanceRaw = 0n;
             rikoWalletTokenBalanceFormatted = "0";
             return;
@@ -27179,7 +27267,8 @@ def _render_riko_page() -> str:
         return;
       }
       if (!window.ethereum) {
-        hint.textContent = `Available: provider not found (${symLabel})`;
+        hint.textContent = `Available: wallet extension is not detected (${symLabel}). Open this page in a browser with MetaMask/Rabby.`;
+        logRikoClientIssue("provider_missing", "balance_deposit_token", "window.ethereum missing");
         return;
       }
       try {
@@ -27189,6 +27278,7 @@ def _render_riko_page() -> str:
         const chainId = Number(net?.chainId || 0);
         if (chainId !== RIKO_MAINNET_CHAIN_ID) {
           hint.textContent = `Available: switch wallet to Ethereum Mainnet (current chainId=${chainId || "?"}, ${symLabel})`;
+          logRikoClientIssue("wrong_chain", "balance_deposit_token", `chainId=${chainId || "?"}`);
           rikoWalletTokenBalanceRaw = 0n;
           rikoWalletTokenBalanceFormatted = "0";
           return;
@@ -27552,7 +27642,10 @@ def _render_riko_page() -> str:
       }
     }
     async function getRikoSigner() {
-      if (!window.ethereum) throw new Error("Wallet provider not found");
+      if (!window.ethereum) {
+        logRikoClientIssue("provider_missing", "get_signer", "window.ethereum missing");
+        throw new Error("Wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.");
+      }
       const ethers = await ensureEthers();
       let provider = new ethers.BrowserProvider(window.ethereum);
       await provider.send("eth_requestAccounts", []);
@@ -27564,6 +27657,7 @@ def _render_riko_page() -> str:
         net = await provider.getNetwork();
         chainId = Number(net?.chainId || 0);
         if (chainId !== RIKO_MAINNET_CHAIN_ID) {
+          logRikoClientIssue("wrong_chain", "get_signer", `chainId=${chainId || "?"}`);
           throw new Error(`Switch wallet network to Ethereum Mainnet (chainId=1). Current chainId=${chainId || "?"}.`);
         }
       }
@@ -27673,7 +27767,7 @@ def _render_riko_page() -> str:
       try {
         const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured.");
-        if (!window.ethereum) throw new Error("Wallet provider not found.");
+        if (!window.ethereum) throw new Error("Wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.");
         const ethers = await ensureEthers();
         const provider = new ethers.BrowserProvider(window.ethereum);
         let user = String(authState?.address || "").trim();
@@ -28346,6 +28440,7 @@ def _render_riko_page() -> str:
         renderFlow(-1, "Deposit confirmed", false, -1);
       } catch (e) {
         const baseErr = formatRikoErrorMessage("Deposit failed", e, (e?.shortMessage || e?.message || "unknown"));
+        logRikoClientIssue("deposit_failed", "deposit", baseErr);
         // Some wallets/providers may throw on wait/network edge cases after tx is already mined.
         // Re-check receipt by tx hash before starting rollback path.
         if (depositTxHash && signer?.provider) {
@@ -34849,13 +34944,13 @@ def _render_admin_page() -> str:
           <table id="adminRikoPendingQueueTable"></table>
         </div>
         <span id="adminRikoPendingOpsStatus" class="status">Ready</span>
-        <details class="admin-history-block">
+        <details class="admin-history-block" open>
           <summary>Redemption history (closed operations)</summary>
           <div class="table-wrap">
             <table id="adminRikoRedeemHistoryTable" class="admin-history-table"></table>
           </div>
         </details>
-        <details class="admin-history-block">
+        <details class="admin-history-block" open>
           <summary>Deposit history</summary>
           <div class="table-wrap">
             <table id="adminRikoDepositHistoryTable" class="admin-history-table"></table>
@@ -35124,7 +35219,7 @@ def _render_admin_page() -> str:
       return window.ethers;
     }}
     async function getAdminSigner() {{
-      if (!window.ethereum) throw new Error("Wallet provider not found");
+      if (!window.ethereum) throw new Error("Wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.");
       const ethers = await ensureEthersAdmin();
       let provider = new ethers.BrowserProvider(window.ethereum);
       await provider.send("eth_requestAccounts", []);
@@ -36539,10 +36634,11 @@ def _render_admin_page() -> str:
       const s = String(v || "").trim().toLowerCase();
       return /^0x[a-f0-9]{{40}}$/.test(s) ? s : "";
     }}
-    function getAdminRoleBadges(addressLower, isRoot, isProtected, hasPendingProtect, hasPendingRemove) {{
+    function getAdminRoleBadges(addressLower, isRoot, isProtected, isViewOnly, hasPendingProtect, hasPendingRemove) {{
       const out = [];
       if (isRoot) out.push('<span class="role-chip root">ROOT</span>');
       if (isProtected) out.push('<span class="role-chip protected">PROTECTED</span>');
+      if (isViewOnly) out.push('<span class="role-chip">VIEW-ONLY</span>');
       if (hasPendingProtect) out.push('<span class="role-chip">PENDING PROTECT</span>');
       if (hasPendingRemove) out.push('<span class="role-chip">PENDING REMOVE</span>');
       const roles = Array.isArray(adminOnchainRoleMap[addressLower]) ? adminOnchainRoleMap[addressLower] : [];
@@ -36706,6 +36802,7 @@ def _render_admin_page() -> str:
           adminLastSettings.admin_wallets || [],
           adminLastSettings.admin_wallets_root || [],
           adminLastSettings.admin_wallets_protected || [],
+          adminLastSettings.admin_wallets_view_only || [],
           adminLastSettings.admin_wallets_pending_protect_updates || [],
           adminLastSettings.admin_wallets_pending_removals || [],
         );
@@ -36839,7 +36936,7 @@ def _render_admin_page() -> str:
     async function applyAdminRikoCustodyApprove(tokenAddressInput, amountInput) {{
       try {{
         const ethers = await ensureEthersAdmin();
-        if (!window.ethereum) throw new Error("Wallet provider not found");
+        if (!window.ethereum) throw new Error("Wallet extension is not detected. Open this page in a browser with MetaMask/Rabby.");
         const provider = new ethers.BrowserProvider(window.ethereum);
         const vaultAddr = requireConfiguredAddress(adminRikoVaultAddress, "RIKO vault address");
         const vault = new ethers.Contract(vaultAddr, ADMIN_RIKO_VAULT_ABI, provider);
@@ -38502,6 +38599,7 @@ def _render_admin_page() -> str:
           data.admin_wallets || [],
           data.admin_wallets_root || [],
           data.admin_wallets_protected || [],
+          data.admin_wallets_view_only || [],
           data.admin_wallets_pending_protect_updates || [],
           data.admin_wallets_pending_removals || [],
         );
@@ -38910,19 +39008,21 @@ def _render_admin_page() -> str:
         setAdminStatus("Save manual pair-lists override failed: " + (e?.message || "unknown"), true);
       }}
     }}
-    function renderAdminWallets(items, rootWallets, protectedWallets, pendingProtectUpdates, pendingRemovals) {{
+    function renderAdminWallets(items, rootWallets, protectedWallets, viewOnlyWallets, pendingProtectUpdates, pendingRemovals) {{
       const wrap = document.getElementById("adminWalletsList");
       const roots = new Set((rootWallets || []).map((x) => String(x || "").toLowerCase()));
       const protectedSet = new Set((protectedWallets || []).map((x) => String(x || "").toLowerCase()));
+      const viewOnlySet = new Set((viewOnlyWallets || []).map((x) => String(x || "").toLowerCase()));
       const pendingProtectSet = new Set((pendingProtectUpdates || []).map((it) => String(it?.address || "").toLowerCase()));
       const pendingRemoveSet = new Set((pendingRemovals || []).map((it) => String(it?.address || "").toLowerCase()));
       const rows = (items || []).map((rawAddress) => {{
         const a = String(rawAddress || "").toLowerCase();
         const isRoot = roots.has(a);
         const isProtected = protectedSet.has(a);
+        const isViewOnly = viewOnlySet.has(a);
         const hasPendingProtect = pendingProtectSet.has(a);
         const hasPendingRemove = pendingRemoveSet.has(a);
-        const badges = getAdminRoleBadges(a, isRoot, isProtected, hasPendingProtect, hasPendingRemove);
+        const badges = getAdminRoleBadges(a, isRoot, isProtected, isViewOnly, hasPendingProtect, hasPendingRemove);
         const canRemoveNow = !isRoot && !isProtected && !hasPendingRemove;
         const removeLabel = isProtected ? "Schedule remove" : "Remove";
         const removeBtn = isRoot ? "" : `<button class="btn" style="padding:5px 10px;font-size:12px" onclick="removeAdminWallet('${{a}}')">${{removeLabel}}</button>`;
@@ -38931,6 +39031,12 @@ def _render_admin_page() -> str:
           : "";
         const unprotectBtn = (!isRoot && isProtected && !hasPendingProtect)
           ? `<button class="btn btn-soft" style="padding:5px 10px;font-size:12px" onclick="unprotectAdminWallet('${{a}}')">Unset PROTECTED</button>`
+          : "";
+        const viewOnlyOnBtn = (!isRoot && !isViewOnly)
+          ? `<button class="btn btn-soft" style="padding:5px 10px;font-size:12px" onclick="setAdminViewOnly('${{a}}')">Set VIEW-ONLY</button>`
+          : "";
+        const viewOnlyOffBtn = (!isRoot && isViewOnly)
+          ? `<button class="btn btn-soft" style="padding:5px 10px;font-size:12px" onclick="unsetAdminViewOnly('${{a}}')">Unset VIEW-ONLY</button>`
           : "";
         const removeNowBtn = canRemoveNow ? removeBtn : (isProtected ? removeBtn : "");
         return `<div class="admin-wallet-item">
@@ -38941,6 +39047,8 @@ def _render_admin_page() -> str:
           <div class="admin-wallet-actions">
             ${{protectBtn}}
             ${{unprotectBtn}}
+            ${{viewOnlyOnBtn}}
+            ${{viewOnlyOffBtn}}
             ${{removeNowBtn}}
           </div>
         </div>`;
@@ -39115,6 +39223,26 @@ def _render_admin_page() -> str:
         await loadAdmin();
       }} catch (e) {{
         setAdminStatus("Schedule unprotect failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function setAdminViewOnly(address) {{
+      if (!confirm(`Set VIEW-ONLY for ${{address}}?`)) return;
+      try {{
+        const data = await postJson("/api/admin/admin-wallets", {{action: "view_only_on", address}});
+        setAdminStatus(data.info || "Updated", false);
+        await loadAdmin();
+      }} catch (e) {{
+        setAdminStatus("Set VIEW-ONLY failed: " + (e?.message || "unknown"), true);
+      }}
+    }}
+    async function unsetAdminViewOnly(address) {{
+      if (!confirm(`Unset VIEW-ONLY for ${{address}}?`)) return;
+      try {{
+        const data = await postJson("/api/admin/admin-wallets", {{action: "view_only_off", address}});
+        setAdminStatus(data.info || "Updated", false);
+        await loadAdmin();
+      }} catch (e) {{
+        setAdminStatus("Unset VIEW-ONLY failed: " + (e?.message || "unknown"), true);
       }}
     }}
     async function executePendingProtectAdminWallet(address) {{
@@ -39786,6 +39914,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "admin_wallets": _admin_effective_wallets_value(),
             "admin_wallets_root": _admin_root_wallets_value(),
             "admin_wallets_protected": _admin_protected_wallets_value(),
+            "admin_wallets_view_only": _admin_view_only_wallets_value(),
             "admin_wallets_pending_additions": _load_pending_admin_additions(),
             "admin_wallets_pending_protect_updates": _load_pending_admin_protect_updates(),
             "admin_wallets_pending_removals": _load_pending_admin_removals(),
@@ -39812,6 +39941,7 @@ def admin_settings(request: Request, response: Response) -> dict[str, Any]:
             "admin_wallets": _admin_effective_wallets_value(),
             "admin_wallets_root": _admin_root_wallets_value(),
             "admin_wallets_protected": _admin_protected_wallets_value(),
+            "admin_wallets_view_only": _admin_view_only_wallets_value(),
             "admin_wallets_pending_additions": _load_pending_admin_additions(),
             "admin_wallets_pending_protect_updates": _load_pending_admin_protect_updates(),
             "admin_wallets_pending_removals": _load_pending_admin_removals(),
@@ -39934,6 +40064,7 @@ def admin_stats(request: Request, response: Response, period: str = "day", limit
 @app.post("/api/admin/admin-wallets")
 def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Response) -> dict[str, Any]:
     _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "admin wallet update")
     _require_pilot_config_mutable("Admin wallet update")
     actor = str(auth.get("address") or "").strip().lower()
     action = (req.action or "").strip().lower()
@@ -39949,6 +40080,8 @@ def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Res
         "cancel_protect",
         "execute_remove",
         "cancel_remove",
+        "view_only_on",
+        "view_only_off",
     }
     if action not in allowed_actions:
         raise HTTPException(
@@ -39965,6 +40098,7 @@ def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Res
             "items": _admin_effective_wallets_value(),
             "root_wallets": _admin_root_wallets_value(),
             "protected_wallets": _admin_protected_wallets_value(),
+            "view_only_wallets": _admin_view_only_wallets_value(),
             "pending_additions": _load_pending_admin_additions(),
             "pending_protect_updates": _load_pending_admin_protect_updates(),
             "pending_removals": _load_pending_admin_removals(),
@@ -40040,6 +40174,32 @@ def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Res
         )
         return _payload("Pending protection update canceled.")
 
+    if action == "view_only_on":
+        if _is_root_admin_address(address):
+            raise HTTPException(status_code=400, detail="Root admin cannot be set to view-only.")
+        if not _is_admin_address(address):
+            raise HTTPException(status_code=400, detail="Wallet is not an admin.")
+        vo = set(_admin_view_only_wallets_value())
+        if address in vo:
+            return _payload("View-only is already enabled.")
+        has_root_writable = len(_admin_root_wallets_value()) > 0
+        writable = [a for a in _admin_effective_wallets_value() if (not _is_root_admin_address(a)) and (a not in vo) and a != address]
+        if (not has_root_writable) and (not writable):
+            raise HTTPException(status_code=400, detail="Cannot set the last writable admin to view-only.")
+        vo.add(address)
+        _set_admin_view_only_wallets(list(vo))
+        _notify_admin_wallet_change("view_only_on", address, actor)
+        return _payload("View-only enabled for admin wallet.")
+
+    if action == "view_only_off":
+        vo = set(_admin_view_only_wallets_value())
+        if address not in vo:
+            return _payload("View-only is already disabled.")
+        vo.discard(address)
+        _set_admin_view_only_wallets(list(vo))
+        _notify_admin_wallet_change("view_only_off", address, actor)
+        return _payload("View-only disabled for admin wallet.")
+
     if action == "execute_remove":
         pending = _execute_pending_admin_removal(address)
         _notify_admin_wallet_change("execute_remove", address, actor, extra=f"scheduled_by={pending.get('created_by')}")
@@ -40077,6 +40237,10 @@ def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Res
     if address in cur:
         cur.discard(address)
         _set_admin_protected_wallets(list(cur))
+    vo = set(_admin_view_only_wallets_value())
+    if address in vo:
+        vo.discard(address)
+        _set_admin_view_only_wallets(list(vo))
     _notify_admin_wallet_change("remove", address, actor)
     return _payload("Admin wallet removed.")
 
@@ -40084,6 +40248,7 @@ def admin_wallets_update(req: AdminWalletUpdate, request: Request, response: Res
 @app.post("/api/admin/telegram/test")
 def admin_telegram_test(request: Request, response: Response) -> dict[str, Any]:
     _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "telegram test")
     actor = str(auth.get("address") or "").strip().lower()
     if not str(TELEGRAM_BOT_TOKEN or "").strip() or not str(TELEGRAM_CHAT_ID or "").strip():
         raise HTTPException(status_code=400, detail="Telegram is not configured on server.")
@@ -40103,7 +40268,8 @@ def admin_telegram_test(request: Request, response: Response) -> dict[str, Any]:
 
 @app.post("/api/admin/pair-lists-manual")
 def admin_pair_lists_manual_update(req: AdminPairListsManualUpdate, request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "pair-lists manual update")
     _require_pilot_config_mutable("Pair-lists manual override update")
     current = _load_manual_pair_lists_overrides()
     cur_fiat = current.get("fiat_stable") if isinstance(current.get("fiat_stable"), dict) else {}
@@ -40157,7 +40323,8 @@ def admin_pair_lists_manual_update(req: AdminPairListsManualUpdate, request: Req
 def admin_riko_payout_schedule_update(
     req: AdminRikoPayoutScheduleUpdate, request: Request, response: Response
 ) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO payout schedule update")
     _require_pilot_config_mutable("RIKO payout schedule update")
     raw_items: list[dict[str, Any]] = []
     for item in (req.items or []):
@@ -40176,6 +40343,7 @@ def admin_riko_auto_payout_apply_nonce(
     req: AdminRikoAutoPayoutApplyNonceRequest, request: Request, response: Response
 ) -> dict[str, Any]:
     sid, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO auto-payout apply nonce")
     _require_pilot_config_mutable("RIKO auto-payout apply nonce")
     raw_items: list[dict[str, int]] = []
     for item in (req.items or []):
@@ -40219,6 +40387,7 @@ def admin_riko_auto_payout_apply(
     req: AdminRikoAutoPayoutApplySigned, request: Request, response: Response
 ) -> dict[str, Any]:
     sid, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO auto-payout apply")
     _require_pilot_config_mutable("RIKO auto-payout apply")
     raw_items: list[dict[str, int]] = []
     for item in (req.items or []):
@@ -40287,7 +40456,8 @@ def admin_riko_auto_payout_apply(
 def admin_riko_custody_allowance_presets_update(
     req: AdminRikoCustodyAllowancePresetUpdate, request: Request, response: Response
 ) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO custody allowance presets update")
     _require_pilot_config_mutable("RIKO custody allowance presets update")
     payload_items = [
         {"symbol": str(x.symbol or ""), "address": str(x.address or ""), "allowance": str(x.allowance or "")}
@@ -40304,7 +40474,8 @@ def admin_riko_custody_allowance_presets_update(
 def admin_riko_vault_address_update(
     req: AdminRikoVaultAddressUpdate, request: Request, response: Response
 ) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO vault address update")
     _require_pilot_config_mutable("RIKO vault address update")
     try:
         saved = _save_riko_vault_address(str(req.address or ""))
@@ -40317,7 +40488,8 @@ def admin_riko_vault_address_update(
 def admin_riko_pause_guardian_update(
     req: AdminRikoPauseGuardianUpdate, request: Request, response: Response
 ) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO pause guardian update")
     _require_pilot_config_mutable("RIKO pause guardian update")
     try:
         saved = _save_riko_pause_guardian(str(req.address or ""))
@@ -40330,7 +40502,8 @@ def admin_riko_pause_guardian_update(
 def admin_riko_pending_operator_designated_update(
     req: AdminRikoPendingOperatorDesignatedUpdate, request: Request, response: Response
 ) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO designated pending operator update")
     _require_pilot_config_mutable("RIKO designated pending operator update")
     try:
         saved = _save_riko_pending_operator_designated(str(req.address or ""))
@@ -40348,7 +40521,8 @@ def admin_riko_pending_operator_designated_update(
 def admin_riko_auto_yield_config_update(
     req: AdminRikoAutoYieldBotConfigUpdate, request: Request, response: Response
 ) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO auto-payout bot config update")
     _require_pilot_config_mutable("RIKO auto-payout bot config update")
     try:
         saved = _save_riko_auto_yield_bot_config(
@@ -40365,7 +40539,8 @@ def admin_riko_auto_yield_config_update(
 def admin_riko_auto_yield_mode_update(
     req: AdminRikoAutoYieldModeUpdate, request: Request, response: Response
 ) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO auto-payout mode update")
     _require_pilot_config_mutable("RIKO auto-payout mode update")
     ctl = _set_riko_auto_yield_enabled(bool(req.enabled))
     return {
@@ -40554,13 +40729,46 @@ def riko_treasury_yield() -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"Failed to load US Treasury yield: {e}") from e
 
 
+@app.post("/api/riko/client-log")
+def riko_client_log(req: RikoClientLogRequest, request: Request, response: Response) -> dict[str, Any]:
+    sid = _ensure_session_cookie(request, response)
+    with AUTH_LOCK:
+        auth = dict(AUTH_SESSIONS.get(sid, {}))
+    auth_addr = str(auth.get("address") or "").strip().lower()
+    body_addr = str(req.address or "").strip().lower()
+    wallet = auth_addr if _is_eth_address(auth_addr) else (body_addr if _is_eth_address(body_addr) else "")
+    reason = str(req.reason or "").strip().lower()
+    context = str(req.context or "").strip().lower()
+    symbol = str(req.symbol or "").strip().upper()
+    details = str(req.details or "").strip()
+    chain_id = int(req.chain_id or auth.get("chain_id") or 0)
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required.")
+    payload = {
+        "address": wallet,
+        "chain_id": int(chain_id),
+        "symbol": symbol[:24],
+        "context": context[:64],
+        "reason": reason[:64],
+        "details": details[:240],
+    }
+    _analytics_log_event(
+        session_id=sid,
+        event_type="riko_client_issue",
+        path="/api/riko/client-log",
+        payload=json.dumps(payload, ensure_ascii=False),
+    )
+    return {"ok": True}
+
+
 @app.post("/api/admin/riko/whitelist/pending")
 def admin_riko_whitelist_set_pending(
     req: AdminRikoWhitelistUpdate,
     request: Request,
     response: Response,
 ) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO whitelist pending update")
     _require_pilot_config_mutable("RIKO whitelist pending update")
     payload_items = [
         {
@@ -40580,6 +40788,7 @@ def admin_riko_whitelist_set_pending(
 @app.post("/api/admin/riko/whitelist/apply-nonce")
 def admin_riko_whitelist_apply_nonce(request: Request, response: Response) -> dict[str, Any]:
     sid, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO whitelist apply nonce")
     _require_pilot_config_mutable("RIKO whitelist apply")
     pending = _load_riko_pending_whitelist_items()
     if not pending:
@@ -40615,6 +40824,7 @@ def admin_riko_whitelist_apply_nonce(request: Request, response: Response) -> di
 @app.post("/api/admin/riko/whitelist/apply")
 def admin_riko_whitelist_apply(req: AdminRikoWhitelistApplySigned, request: Request, response: Response) -> dict[str, Any]:
     sid, auth = _require_admin(request, response)
+    _require_admin_write(auth, "RIKO whitelist apply")
     _require_pilot_config_mutable("RIKO whitelist apply")
     pending = _load_riko_pending_whitelist_items()
     if not pending:
@@ -43952,7 +44162,8 @@ def admin_help_tickets(request: Request, response: Response, limit: int = 100) -
 
 @app.post("/api/admin/help-tickets/update")
 def admin_help_ticket_update(req: HelpTicketUpdate, request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "help ticket update")
     status = (req.status or "").strip().lower()
     if status and status not in {"open", "in_progress", "done"}:
         raise HTTPException(status_code=400, detail="status must be open, in_progress, or done.")
@@ -43991,7 +44202,8 @@ def admin_help_ticket_update(req: HelpTicketUpdate, request: Request, response: 
 
 @app.post("/api/admin/help-tickets/delete")
 def admin_help_ticket_delete(req: HelpTicketDelete, request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "help ticket delete")
     ticket_id = int(req.ticket_id or 0)
     if ticket_id <= 0:
         raise HTTPException(status_code=400, detail="ticket_id is required.")
@@ -44015,14 +44227,16 @@ def admin_help_feedback(request: Request, response: Response, limit: int = 200) 
 
 @app.post("/api/admin/help-feedback/review")
 def admin_help_feedback_review(req: AdminFeedbackReview, request: Request, response: Response) -> dict[str, Any]:
-    admin_address, _auth = _require_admin(request, response)
+    admin_address, auth = _require_admin(request, response)
+    _require_admin_write(auth, "help feedback review")
     row = _mark_help_feedback_reviewed(req.feedback_id, reviewer_address=admin_address)
     return {"ok": True, **row}
 
 
 @app.post("/api/admin/help-feedback/delete")
 def admin_help_feedback_delete(req: AdminFeedbackDelete, request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "help feedback delete")
     fid = int(req.feedback_id or 0)
     if fid <= 0:
         raise HTTPException(status_code=400, detail="feedback_id is required.")
@@ -44045,7 +44259,8 @@ def admin_faq_list(request: Request, response: Response, limit: int = 200) -> di
 
 @app.post("/api/admin/faq/upsert")
 def admin_faq_upsert(req: AdminFaqUpsert, request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "FAQ update")
     question = (req.question or "").strip()
     answer = (req.answer or "").strip()
     if len(question) < 3:
@@ -44098,7 +44313,8 @@ def admin_faq_upsert(req: AdminFaqUpsert, request: Request, response: Response) 
 
 @app.post("/api/admin/faq/delete")
 def admin_faq_delete(req: AdminFaqDelete, request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "FAQ delete")
     with _analytics_conn() as conn:
         row = conn.execute("SELECT id FROM faq_items WHERE id = ?", (int(req.faq_id),)).fetchone()
         if not row:
@@ -44110,7 +44326,8 @@ def admin_faq_delete(req: AdminFaqDelete, request: Request, response: Response) 
 
 @app.post("/api/admin/faq/publish")
 def admin_faq_publish(req: AdminFaqPublish, request: Request, response: Response) -> dict[str, Any]:
-    _require_admin(request, response)
+    _, auth = _require_admin(request, response)
+    _require_admin_write(auth, "FAQ publish")
     with _analytics_conn() as conn:
         row = conn.execute("SELECT id FROM faq_items WHERE id = ?", (int(req.faq_id),)).fetchone()
         if not row:
