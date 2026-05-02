@@ -26529,23 +26529,27 @@ def _render_riko_page() -> str:
       }
       rikoDisplayAddrMap = map;
       rikoDisplayExactBySymbol = exact;
-      const symbolsForUi = rikoOnchainSupportLoaded
-        ? activeSymbols.filter((s) => {
-            if (s === "eth") {
-              const wethSupported = rikoOnchainAllowedBySymbol.weth;
-              return wethSupported !== false;
-            }
-            return rikoOnchainAllowedBySymbol[s] !== false;
-          })
-        : activeSymbols;
+      const symbolsForUi = activeSymbols;
+      const isEnabled = (sym) => isRikoSymbolOnchainEnabled(sym);
       if (wrap) {
         wrap.innerHTML = symbolsForUi.map((s) => `<span class="badge"><img src="/api/token-icon/${encodeURIComponent(s)}" alt="${String(s || "").toUpperCase()} icon"/>${String(s || "").toUpperCase()}</span>`).join("");
       }
       if (select) {
         const cur = String(select.value || "");
-        select.innerHTML = symbolsForUi.map((s) => `<option value="${s}">${String(s || "").toUpperCase()}</option>`).join("");
-        if (cur && symbolsForUi.includes(cur)) select.value = cur;
-        if ((!cur || !symbolsForUi.includes(cur)) && symbolsForUi.length) select.value = symbolsForUi[0];
+        select.innerHTML = symbolsForUi.map((s) => {
+          const enabled = isEnabled(s);
+          const label = enabled || !rikoOnchainSupportLoaded
+            ? String(s || "").toUpperCase()
+            : `${String(s || "").toUpperCase()} (not enabled on-chain)`;
+          return `<option value="${s}" ${enabled ? "" : "disabled"}>${label}</option>`;
+        }).join("");
+        if (cur && symbolsForUi.includes(cur) && isEnabled(cur)) {
+          select.value = cur;
+        } else {
+          const firstEnabled = symbolsForUi.find((s) => isEnabled(s));
+          if (firstEnabled) select.value = firstEnabled;
+          else if (symbolsForUi.length) select.value = symbolsForUi[0];
+        }
       }
     }
     async function refreshRikoOnchainTokenSupport() {
@@ -27409,6 +27413,13 @@ def _render_riko_page() -> str:
         }
       }
     }
+    function isRikoSymbolOnchainEnabled(symbol) {
+      const s = String(symbol || "").trim().toLowerCase();
+      if (!s) return false;
+      if (!rikoOnchainSupportLoaded) return true;
+      if (s === "eth") return rikoOnchainAllowedBySymbol.weth !== false;
+      return rikoOnchainAllowedBySymbol[s] !== false;
+    }
     function getRikoInputs() {
       const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
       const tokenAddress = getSelectedRikoTokenAddress();
@@ -27418,6 +27429,7 @@ def _render_riko_page() -> str:
       const activeSymbols = (rikoWhitelistState || []).map((x) => String(x?.symbol || "").toLowerCase()).filter(Boolean);
       if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured on server");
       if (!symbol || !activeSymbols.includes(symbol)) throw new Error("Token symbol is not in whitelist");
+      if (!isRikoSymbolOnchainEnabled(symbol)) throw new Error("Selected token is in whitelist, but not enabled on-chain for current vault.");
       if (symbol !== "eth" && !tokenAddress) throw new Error("No token address is available for selected symbol");
       if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
       if (!amount || Number(amount) <= 0) throw new Error("Amount must be > 0");
@@ -36756,9 +36768,10 @@ def _render_admin_page() -> str:
           const row = rows[i];
           const symbolRaw = String(row?.symbol || "").trim().toLowerCase();
           const symbol = symbolRaw.toUpperCase();
-          const canonicalBySymbol = normalizeEthAddressInput(resolveAdminRikoAddressBySymbol(symbolRaw));
           const tokenFromRow = normalizeEthAddressInput(row?.address || "");
-          const token = canonicalBySymbol || tokenFromRow;
+          const canonicalBySymbol = normalizeEthAddressInput(resolveAdminRikoAddressBySymbol(symbolRaw));
+          // Trust explicit whitelist row address first; use catalog/canonical only as fallback.
+          const token = tokenFromRow || canonicalBySymbol;
           if (!token) continue;
           setBulkStatus(`Whitelist token config: ${{i + 1}}/${{total}} (${{symbol || token}}) - resolving Chainlink feed...`, false);
           try {{
