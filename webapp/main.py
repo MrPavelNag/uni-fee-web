@@ -25892,7 +25892,7 @@ def _render_riko_page() -> str:
         <div class="riko-pending-empty" id="rikoPendingEmpty">No active pending redemptions.</div>
         <ul class="riko-pending-list" id="rikoPendingList"></ul>
       </div>
-      <details class="riko-tx-history">
+      <details class="riko-tx-history" id="rikoRedeemHistoryBlock">
         <summary>Redeem history</summary>
         <div class="riko-tx-history-row">
           <div class="riko-tx-history-actions" id="rikoTxHistoryActions">
@@ -25905,7 +25905,7 @@ def _render_riko_page() -> str:
           <ul class="riko-tx-list" id="rikoTxHistoryRedeem"></ul>
         </div>
       </details>
-      <details class="riko-tx-history">
+      <details class="riko-tx-history" id="rikoDepositHistoryBlock">
         <summary>Deposit history</summary>
         <div class="riko-tx-history-row">
           <div class="muted riko-tx-empty" id="rikoTxHistoryEmptyDeposit">No deposit transactions yet.</div>
@@ -25922,8 +25922,6 @@ def _render_riko_page() -> str:
     let rikoWhitelistExactBySymbol = {};
     let rikoDisplayAddrMap = {};
     let rikoDisplayExactBySymbol = {};
-    let rikoOnchainAllowedBySymbol = {};
-    let rikoOnchainSupportLoaded = false;
     let rikoWalletTokenBalanceRaw = 0n;
     let rikoWalletTokenBalanceDecimals = 18;
     let rikoWalletTokenBalanceFormatted = "0";
@@ -25962,6 +25960,11 @@ def _render_riko_page() -> str:
       if (!el) return;
       el.textContent = String(msg || "");
       el.className = isErr ? "riko-status err" : "riko-status";
+    }
+    function requireRikoAdminAuth() {
+      if (!authState?.authenticated || !authState?.is_admin) {
+        throw new Error("Admin wallet authorization required.");
+      }
     }
     function getRikoMode() {
       const mode = String(document.getElementById("rikoMode")?.value || "deposit").trim().toLowerCase();
@@ -26086,8 +26089,11 @@ def _render_riko_page() -> str:
       const redeemEmptyEl = document.getElementById("rikoTxHistoryEmptyRedeem");
       const depositListEl = document.getElementById("rikoTxHistoryDeposit");
       const depositEmptyEl = document.getElementById("rikoTxHistoryEmptyDeposit");
+      const redeemBlockEl = document.getElementById("rikoRedeemHistoryBlock");
+      const depositBlockEl = document.getElementById("rikoDepositHistoryBlock");
       const actionsEl = document.getElementById("rikoTxHistoryActions");
       const showHiddenEl = document.getElementById("rikoTxShowHidden");
+      const walletConnected = !!authState?.authenticated;
       if (!redeemListEl || !redeemEmptyEl || !depositListEl || !depositEmptyEl) return;
       if (showHiddenEl) showHiddenEl.checked = !!rikoShowHiddenTxRows;
       if (!Array.isArray(rikoTxHistory) || !rikoTxHistory.length) {
@@ -26095,6 +26101,8 @@ def _render_riko_page() -> str:
         depositListEl.innerHTML = "";
         redeemEmptyEl.style.display = "";
         depositEmptyEl.style.display = "";
+        if (redeemBlockEl) redeemBlockEl.style.display = "none";
+        if (depositBlockEl) depositBlockEl.style.display = "none";
         if (actionsEl) actionsEl.style.display = "none";
         return;
       }
@@ -26562,10 +26570,13 @@ def _render_riko_page() -> str:
       const redeemRows = visibleRows.filter((row) => isRedeemAction(row));
       const depositRows = visibleRows.filter((row) => !isRedeemAction(row));
       const hasAnyRedeemRows = allRows.some((row) => isRedeemAction(row));
+      const hasAnyDepositRows = allRows.some((row) => !isRedeemAction(row));
       redeemListEl.innerHTML = renderGroups(redeemRows);
       depositListEl.innerHTML = renderGroups(depositRows);
       redeemEmptyEl.style.display = redeemRows.length ? "none" : "";
       depositEmptyEl.style.display = depositRows.length ? "none" : "";
+      if (redeemBlockEl) redeemBlockEl.style.display = (walletConnected && hasAnyRedeemRows) ? "" : "none";
+      if (depositBlockEl) depositBlockEl.style.display = (walletConnected && hasAnyDepositRows) ? "" : "none";
       if (actionsEl) actionsEl.style.display = hasAnyRedeemRows ? "flex" : "none";
     }
     function resolveHistoryAddress() {
@@ -27020,7 +27031,11 @@ def _render_riko_page() -> str:
       // Public deposit/redeem flow must use only ACTIVE whitelist.
       // Pending draft can differ and is not guaranteed to be configured on-chain yet.
       const sourceItems = Array.isArray(rikoWhitelistState) ? rikoWhitelistState : [];
-      const activeSymbols = (sourceItems || []).map((x) => String(x?.symbol || "").toLowerCase()).filter(Boolean);
+      const activeSymbols = Array.from(new Set(
+        (sourceItems || [])
+          .map((x) => String(x?.symbol || "").toLowerCase())
+          .filter(Boolean)
+      ));
       const map = {};
       const exact = {};
       for (const it of (sourceItems || [])) {
@@ -27040,66 +27055,19 @@ def _render_riko_page() -> str:
       rikoDisplayAddrMap = map;
       rikoDisplayExactBySymbol = exact;
       const symbolsForUi = activeSymbols;
-      const isEnabled = (sym) => isRikoSymbolOnchainEnabled(sym);
       if (wrap) {
         wrap.innerHTML = symbolsForUi.map((s) => `<span class="badge"><img src="/api/token-icon/${encodeURIComponent(s)}" alt="${String(s || "").toUpperCase()} icon"/>${String(s || "").toUpperCase()}</span>`).join("");
       }
       if (select) {
         const cur = String(select.value || "");
-        select.innerHTML = symbolsForUi.map((s) => {
-          const enabled = isEnabled(s);
-          const label = enabled || !rikoOnchainSupportLoaded
-            ? String(s || "").toUpperCase()
-            : `${String(s || "").toUpperCase()} (not enabled on-chain)`;
-          return `<option value="${s}" ${enabled ? "" : "disabled"}>${label}</option>`;
-        }).join("");
-        if (cur && symbolsForUi.includes(cur) && isEnabled(cur)) {
+        select.innerHTML = symbolsForUi
+          .map((s) => `<option value="${s}">${String(s || "").toUpperCase()}</option>`)
+          .join("");
+        if (cur && symbolsForUi.includes(cur)) {
           select.value = cur;
         } else {
-          const firstEnabled = symbolsForUi.find((s) => isEnabled(s));
-          if (firstEnabled) select.value = firstEnabled;
-          else if (symbolsForUi.length) select.value = symbolsForUi[0];
+          if (symbolsForUi.length) select.value = symbolsForUi[0];
         }
-      }
-    }
-    async function refreshRikoOnchainTokenSupport() {
-      rikoOnchainAllowedBySymbol = {};
-      rikoOnchainSupportLoaded = false;
-      const vaultAddr = String(RIKO_VAULT_ADDRESS || "").trim();
-      if (!/^0x[a-fA-F0-9]{40}$/.test(vaultAddr)) return;
-      try {
-        const ethers = await ensureEthers();
-        const provider = ethers.getDefaultProvider();
-        const vault = new ethers.Contract(vaultAddr, RIKO_ABI, provider);
-        const sourceItems = Array.isArray(rikoWhitelistState) ? rikoWhitelistState : [];
-        const pairs = [];
-        for (const it of sourceItems) {
-          const sym = String(it?.symbol || "").trim().toLowerCase();
-          if (!sym || sym === "eth") continue;
-          const fromRow = normalizeAddressHex(it?.address || "");
-          const merged = [];
-          if (/^0x[a-f0-9]{40}$/.test(fromRow)) merged.push(fromRow);
-          const catalogAddrs = Array.isArray(rikoWhitelistAddrMap?.[sym]) ? rikoWhitelistAddrMap[sym] : [];
-          for (const aRaw of catalogAddrs) {
-            const a = normalizeAddressHex(aRaw || "");
-            if (/^0x[a-f0-9]{40}$/.test(a) && !merged.includes(a)) merged.push(a);
-          }
-          const token = String(merged[0] || "").trim();
-          if (!/^0x[a-f0-9]{40}$/.test(token)) continue;
-          pairs.push({ sym, token });
-        }
-        await Promise.all(pairs.map(async ({ sym, token }) => {
-          try {
-            const cfg = await vault.tokenConfigs(token);
-            rikoOnchainAllowedBySymbol[sym] = !!cfg?.allowed;
-          } catch (_) {
-            rikoOnchainAllowedBySymbol[sym] = false;
-          }
-        }));
-      } catch (_) {
-        // Keep whitelist visible even if on-chain support check is unavailable.
-      } finally {
-        rikoOnchainSupportLoaded = true;
       }
     }
     function renderRikoWhitelist() {
@@ -27195,6 +27163,41 @@ def _render_riko_page() -> str:
       const suffix = symLabel ? ` (${symLabel})` : "";
       return `${label}: wallet provider is not available${suffix}. Connect browser wallet or reconnect WalletConnect session.`;
     }
+    async function getRikoProviderForRead(context, hintEl, hintPrefix, symLabel = "") {
+      const providerSource = getRikoWalletProvider();
+      if (!providerSource) {
+        if (hintEl) hintEl.textContent = rikoProviderMissingText(hintPrefix, symLabel);
+        logRikoClientIssue("provider_missing", context, "no injected/walletconnect provider");
+        return null;
+      }
+      const ethers = await ensureEthers();
+      const provider = new ethers.BrowserProvider(providerSource);
+      const net = await provider.getNetwork();
+      const chainId = Number(net?.chainId || 0);
+      return { provider, providerSource, chainId };
+    }
+    async function getRikoProviderForWrite(context, requestAccounts = false) {
+      const providerSource = getRikoWalletProvider();
+      if (!providerSource) {
+        logRikoClientIssue("provider_missing", context, "no injected/walletconnect provider");
+        throw new Error("Wallet provider is not available. Connect browser wallet or reconnect WalletConnect session.");
+      }
+      const ethers = await ensureEthers();
+      const provider = new ethers.BrowserProvider(providerSource);
+      if (requestAccounts) {
+        await provider.send("eth_requestAccounts", []);
+      }
+      const net = await provider.getNetwork();
+      const chainId = Number(net?.chainId || 0);
+      return { provider, providerSource, chainId };
+    }
+    async function getRikoReadyWallet(context, hintEl, hintText) {
+      const wallet = await resolveRikoReadWalletAddress();
+      if (/^0x[a-fA-F0-9]{40}$/.test(wallet)) return wallet;
+      if (hintEl) hintEl.textContent = String(hintText || "Available: wallet not ready");
+      logRikoClientIssue("wallet_not_ready", context, "wallet address missing");
+      return "";
+    }
     async function refreshRikoWalletBalance() {
       const hint = document.getElementById("rikoBalanceHint");
       if (!hint) return;
@@ -27213,23 +27216,12 @@ def _render_riko_page() -> str:
           rikoWalletRikoBalanceFormatted = "0";
           return;
         }
-        const wallet = await resolveRikoReadWalletAddress();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
-          hint.textContent = "Available to redeem: wallet not ready (RIKO)";
-          logRikoClientIssue("wallet_not_ready", "balance_redeem", "wallet address missing");
-          return;
-        }
-        const providerSource = getRikoWalletProvider();
-        if (!providerSource) {
-          hint.textContent = rikoProviderMissingText("Available to redeem");
-          logRikoClientIssue("provider_missing", "balance_redeem", "no injected/walletconnect provider");
-          return;
-        }
+        const wallet = await getRikoReadyWallet("balance_redeem", hint, "Available to redeem: wallet not ready (RIKO)");
+        if (!wallet) return;
         try {
-          const ethers = await ensureEthers();
-          const provider = new ethers.BrowserProvider(providerSource);
-          const net = await provider.getNetwork();
-          const chainId = Number(net?.chainId || 0);
+          const providerInfo = await getRikoProviderForRead("balance_redeem", hint, "Available to redeem");
+          if (!providerInfo) return;
+          const { provider, chainId } = providerInfo;
           if (chainId !== RIKO_MAINNET_CHAIN_ID) {
             hint.textContent = `Available to redeem: switch wallet to Ethereum Mainnet (current chainId=${chainId || "?"})`;
             logRikoClientIssue("wrong_chain", "balance_redeem", `chainId=${chainId || "?"}`);
@@ -27253,8 +27245,9 @@ def _render_riko_page() -> str:
         return;
       }
       const tokenAddress = getSelectedRikoTokenAddress();
-      const symRaw = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
-      const sym = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toUpperCase();
+      const selectedSymbol = String(document.getElementById("rikoTokenSymbol")?.value || "").trim();
+      const symRaw = selectedSymbol.toLowerCase();
+      const sym = selectedSymbol.toUpperCase();
       const symLabel = sym || "TOKEN";
       if (!authState?.authenticated) {
         hint.textContent = `Available: connect wallet (${symLabel})`;
@@ -27263,23 +27256,12 @@ def _render_riko_page() -> str:
         return;
       }
       if (symRaw === "eth") {
-        const wallet = await resolveRikoReadWalletAddress();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
-          hint.textContent = `Available: wallet not ready (${symLabel})`;
-          logRikoClientIssue("wallet_not_ready", "balance_deposit_eth", "wallet address missing");
-          return;
-        }
-        const providerSource = getRikoWalletProvider();
-        if (!providerSource) {
-          hint.textContent = rikoProviderMissingText("Available", symLabel);
-          logRikoClientIssue("provider_missing", "balance_deposit_eth", "no injected/walletconnect provider");
-          return;
-        }
+        const wallet = await getRikoReadyWallet("balance_deposit_eth", hint, `Available: wallet not ready (${symLabel})`);
+        if (!wallet) return;
         try {
-          const ethers = await ensureEthers();
-          const provider = new ethers.BrowserProvider(providerSource);
-          const net = await provider.getNetwork();
-          const chainId = Number(net?.chainId || 0);
+          const providerInfo = await getRikoProviderForRead("balance_deposit_eth", hint, "Available", symLabel);
+          if (!providerInfo) return;
+          const { provider, chainId } = providerInfo;
           if (chainId !== RIKO_MAINNET_CHAIN_ID) {
             hint.textContent = `Available: switch wallet to Ethereum Mainnet (current chainId=${chainId || "?"}, ${symLabel})`;
             logRikoClientIssue("wrong_chain", "balance_deposit_eth", `chainId=${chainId || "?"}`);
@@ -27306,23 +27288,12 @@ def _render_riko_page() -> str:
         rikoWalletTokenBalanceFormatted = "0";
         return;
       }
-      const wallet = await resolveRikoReadWalletAddress();
-      if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
-        hint.textContent = `Available: wallet not ready (${symLabel})`;
-        logRikoClientIssue("wallet_not_ready", "balance_deposit_token", "wallet address missing");
-        return;
-      }
-      const providerSource = getRikoWalletProvider();
-      if (!providerSource) {
-        hint.textContent = rikoProviderMissingText("Available", symLabel);
-        logRikoClientIssue("provider_missing", "balance_deposit_token", "no injected/walletconnect provider");
-        return;
-      }
+      const wallet = await getRikoReadyWallet("balance_deposit_token", hint, `Available: wallet not ready (${symLabel})`);
+      if (!wallet) return;
       try {
-        const ethers = await ensureEthers();
-        const provider = new ethers.BrowserProvider(providerSource);
-        const net = await provider.getNetwork();
-        const chainId = Number(net?.chainId || 0);
+        const providerInfo = await getRikoProviderForRead("balance_deposit_token", hint, "Available", symLabel);
+        if (!providerInfo) return;
+        const { provider, chainId } = providerInfo;
         if (chainId !== RIKO_MAINNET_CHAIN_ID) {
           hint.textContent = `Available: switch wallet to Ethereum Mainnet (current chainId=${chainId || "?"}, ${symLabel})`;
           logRikoClientIssue("wrong_chain", "balance_deposit_token", `chainId=${chainId || "?"}`);
@@ -27553,11 +27524,8 @@ def _render_riko_page() -> str:
           const a = normalizeAddressHex(it?.address || "");
           if (s && /^0x[a-f0-9]{40}$/.test(a)) rikoWhitelistExactBySymbol[s] = a;
         }
-        await refreshRikoOnchainTokenSupport();
         renderRikoWhitelist();
         onRikoSymbolChanged();
-        await refreshRikoWalletBalance();
-        await refreshRikoPendingRows();
         if (pending) {
           setRikoAdminStatus("Pending draft loaded. " + (formatValidationLines(pending) || "Validate before apply."), !pending.valid);
         }
@@ -27690,21 +27658,10 @@ def _render_riko_page() -> str:
       }
     }
     async function getRikoSigner() {
-      const providerSource = getRikoWalletProvider();
-      if (!providerSource) {
-        logRikoClientIssue("provider_missing", "get_signer", "no injected/walletconnect provider");
-        throw new Error("Wallet provider is not available. Connect browser wallet or reconnect WalletConnect session.");
-      }
-      const ethers = await ensureEthers();
-      let provider = new ethers.BrowserProvider(providerSource);
-      await provider.send("eth_requestAccounts", []);
-      let net = await provider.getNetwork();
-      let chainId = Number(net?.chainId || 0);
+      let { provider, providerSource, chainId } = await getRikoProviderForWrite("get_signer", true);
       if (chainId !== RIKO_MAINNET_CHAIN_ID) {
         await switchWalletToRikoMainnet(providerSource);
-        provider = new ethers.BrowserProvider(providerSource);
-        net = await provider.getNetwork();
-        chainId = Number(net?.chainId || 0);
+        ({ provider, providerSource, chainId } = await getRikoProviderForWrite("get_signer", false));
         if (chainId !== RIKO_MAINNET_CHAIN_ID) {
           logRikoClientIssue("wrong_chain", "get_signer", `chainId=${chainId || "?"}`);
           throw new Error(`Switch wallet network to Ethereum Mainnet (chainId=1). Current chainId=${chainId || "?"}.`);
@@ -28048,13 +28005,6 @@ def _render_riko_page() -> str:
         }
       }
     }
-    function isRikoSymbolOnchainEnabled(symbol) {
-      const s = String(symbol || "").trim().toLowerCase();
-      if (!s) return false;
-      if (!rikoOnchainSupportLoaded) return true;
-      if (s === "eth") return rikoOnchainAllowedBySymbol.weth !== false;
-      return rikoOnchainAllowedBySymbol[s] !== false;
-    }
     function getRikoInputs() {
       const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
       const tokenAddress = getSelectedRikoTokenAddress();
@@ -28064,7 +28014,6 @@ def _render_riko_page() -> str:
       const activeSymbols = (rikoWhitelistState || []).map((x) => String(x?.symbol || "").toLowerCase()).filter(Boolean);
       if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error("Vault contract is not configured on server");
       if (!symbol || !activeSymbols.includes(symbol)) throw new Error("Token symbol is not in whitelist");
-      if (!isRikoSymbolOnchainEnabled(symbol)) throw new Error("Selected token is in whitelist, but not enabled on-chain for current vault.");
       if (symbol !== "eth" && !tokenAddress) throw new Error("No token address is available for selected symbol");
       if (!/^0x[a-fA-F0-9]{40}$/.test(vaultTokenAddress)) throw new Error("No vault token address is available");
       if (!amount || Number(amount) <= 0) throw new Error("Amount must be > 0");
@@ -28315,7 +28264,7 @@ def _render_riko_page() -> str:
     }
     async function applyRikoGlobalCap() {
       try {
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        requireRikoAdminAuth();
         const contractAddress = String(RIKO_VAULT_ADDRESS || "").trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) {
           throw new Error("Vault contract address is not configured on server (RIKO_VAULT_ADDRESS).");
@@ -35175,23 +35124,20 @@ def _render_admin_page() -> str:
     {wallet_js["wallet_auth"]}
     {wallet_js["walletconnect"]}
     function setAdminStatus(text, isErr) {{ const el=document.getElementById("adminStatus"); el.textContent=text; el.style.color=isErr?"#b91c1c":"#475569"; }}
-    function setAdminRikoOnchainStatus(text, isErr) {{
-      const el = document.getElementById("adminRikoOnchainStatus");
+    function setAdminStatusById(id, text, isErr) {{
+      const el = document.getElementById(String(id || ""));
       if (!el) return;
       el.textContent = String(text || "");
       el.style.color = isErr ? "#b91c1c" : "#475569";
+    }}
+    function setAdminRikoOnchainStatus(text, isErr) {{
+      setAdminStatusById("adminRikoOnchainStatus", text, isErr);
     }}
     function setAdminRikoCustodyStatus(text, isErr) {{
-      const el = document.getElementById("adminRikoCustodyStatus");
-      if (!el) return;
-      el.textContent = String(text || "");
-      el.style.color = isErr ? "#b91c1c" : "#475569";
+      setAdminStatusById("adminRikoCustodyStatus", text, isErr);
     }}
     function setAdminRikoPendingOpsStatus(text, isErr) {{
-      const el = document.getElementById("adminRikoPendingOpsStatus");
-      if (!el) return;
-      el.textContent = String(text || "");
-      el.style.color = isErr ? "#b91c1c" : "#475569";
+      setAdminStatusById("adminRikoPendingOpsStatus", text, isErr);
     }}
     function applyAdminRikoPendingRenderCache(snapshot) {{
       if (!snapshot || typeof snapshot !== "object") return false;
@@ -36640,6 +36586,8 @@ def _render_admin_page() -> str:
         const scanTo = Number(data?.holder_scan_latest_block || 0);
         const warnings = Array.isArray(data?.warnings) ? data.warnings.map((x) => String(x || "").trim()).filter(Boolean) : [];
         const fmtInt = (n) => Number(n || 0).toLocaleString();
+        const holdersOverallOk = canExecutePayout && warnings.length === 0;
+        const holdersOverallStatusText = holdersOverallOk ? "all good" : "issues detected";
         summaryEl.textContent =
           `Showing ${{fmtInt(shownHolders)}} of ${{fmtInt(totalHolders)}} holders. ` +
           `RIKO token: ${{shortAddrAdmin(String(data?.riko_token || ""))}}. ` +
@@ -36647,7 +36595,8 @@ def _render_admin_page() -> str:
           `Gas: required ${{formatAdminRawUnits(requiredGasWei, 18, 8)}} ETH / available ${{formatAdminRawUnits(nativeBalanceWei, 18, 8)}} ETH. ` +
           `Rate basis: source APR ${{annualPct > 0 ? annualPct.toFixed(4) : "0.0000"}}%, target ${{fmtInt(targetBps)}} bps/mo, applied ${{fmtInt(nextBps)}} bps/mo (~${{payoutPct.toFixed(4)}}% per payout, ~${{effectiveAnnualPct.toFixed(4)}}% annualized)${{rateCapActive ? ` [over safety cap ${{fmtInt(safetyMaxBps)}} bps]` : (safetyMaxBpsEnabled ? ` [safety cap ${{fmtInt(safetyMaxBps)}} bps configured]` : "")}}. ` +
           `Next payout: ${{scheduleNextDueUtc || "-"}}. ` +
-          `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}.`;
+          `Scan coverage: blocks ${{fmtInt(scanFrom)}} to ${{fmtInt(scanTo)}}. ` +
+          `Overall status: ${{holdersOverallStatusText}}.`;
         const fundingText = hasPayoutToken
           ? (canPayToken
               ? "Funding: sufficient."
@@ -37562,7 +37511,7 @@ def _render_admin_page() -> str:
         const setBulkStatus = (text, isErr) => {{
           if (!quiet) setAdminRikoOnchainStatus(text, !!isErr);
         }};
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        requireAdminWalletAuth();
         const addr = String(adminRikoVaultAddress || "").trim();
         if (!/^0x[a-fA-F0-9]{{40}}$/.test(addr)) throw new Error("Vault contract address is not configured in admin settings.");
         const maxAgeEl = document.getElementById("adminRikoTokenCfgMaxAgeInput");
@@ -38133,7 +38082,7 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoWhitelist() {{
       try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        requireAdminWalletAuth();
         const items = collectAdminRikoWhitelistItems();
         if (!items.length) throw new Error("Add at least one valid whitelist row.");
         setAdminRikoWhitelistStatus("Saving whitelist draft...", false);
@@ -38742,6 +38691,8 @@ def _render_admin_page() -> str:
         ? `${{fmtInt(fromBlock)}}..${{fmtInt(toBlock)}} of ${{fmtInt(latest)}}${{hasMore ? " (continuing)" : ""}}`
         : `${{fmtInt(fromBlock)}}..${{fmtInt(toBlock)}}`;
       const sourceLabel = String(source || "-").toUpperCase();
+      const scanOverallOk = enabled && healthy && (!hasMore || running);
+      const scanOverallStatusText = scanOverallOk ? "all good" : "issues detected";
       summaryEl.textContent =
         `Holder scan is ${{stateLabel.toLowerCase()}} and ${{runLabel}}. ` +
         `Source: ${{sourceLabel}}. ` +
@@ -38749,7 +38700,8 @@ def _render_admin_page() -> str:
         `Progress: ${{progressLabel}} (${{progressPctTxt}}). ` +
         `Remaining lag: ${{fmtInt(lagBlocks)}} blocks. ` +
         `Last update: ${{updatedAt}}` +
-        (reason ? `. Note: ${{reason}}` : "");
+        (reason ? `. Note: ${{reason}}` : ".") +
+        ` Overall status: ${{scanOverallStatusText}}.`;
     }}
     async function loadAdminRikoHolderScanStatus() {{
       try {{
@@ -38878,7 +38830,7 @@ def _render_admin_page() -> str:
     }}
     async function applyAdminRikoAutoYieldSettings() {{
       try {{
-        if (!authState?.authenticated || !authState?.is_admin) throw new Error("Admin wallet authorization required.");
+        requireAdminWalletAuth();
         const payout_token_address = normalizeAdminRikoAddress(document.getElementById("adminRikoAutoYieldPayoutTokenInput")?.value || "");
         if (!payout_token_address || payout_token_address === "native") throw new Error("Select payout token from active whitelist.");
         const calc_method = String(document.getElementById("adminRikoPayoutCalcMethodInput")?.value || "treasury_10y").trim() || "treasury_10y";
@@ -39718,13 +39670,7 @@ def positions_page(request: Request) -> HTMLResponse:
 
 @app.get("/riko", response_class=HTMLResponse)
 def riko_page(request: Request) -> HTMLResponse:
-    # Access to RIKO page is restricted to authenticated wallet sessions.
-    try:
-        _require_authenticated_wallet(request, Response())
-    except HTTPException as e:
-        if int(getattr(e, "status_code", 0) or 0) == 403:
-            return RedirectResponse(url="/connect?next=%2Friko&reason=riko_auth_required", status_code=303)
-        raise
+    # Public page: wallet connect is required only for on-chain actions.
     html = _render_riko_page()
     html = html.replace("__WALLETCONNECT_PROJECT_ID__", _walletconnect_js_value())
     resp = HTMLResponse(html)
@@ -39759,25 +39705,7 @@ def connect_page(request: Request) -> HTMLResponse:
     extra_css = ""
     extra_html = ""
     show_intro = True
-    if reason == "riko_auth_required":
-        subtitle = "Connect wallet to continue."
-        show_intro = False
-        extra_css = """
-    .connect-cta-card { text-align:center; }
-    .connect-cta-subtitle { margin: 6px 0 14px; font-size: 30px; font-weight: 800; color:#0f172a; line-height:1.15; }
-    .connect-cta-btn { min-width: 260px; font-size: 16px; padding: 12px 16px; }
-    @media (max-width: 780px) {
-      .connect-cta-subtitle { font-size: 24px; }
-      .connect-cta-btn { width: 100%; min-width: 0; }
-    }
-        """
-        extra_html = """
-    <section class="card connect-cta-card">
-      <p class="connect-cta-subtitle">Connect wallet to continue.</p>
-      <button class="connect-btn connect-cta-btn" type="button" onclick="onConnectWalletClick()">Connect Wallet</button>
-    </section>
-        """
-    elif reason == "admin_required":
+    if reason == "admin_required":
         subtitle = "This wallet is not in admin list. Connect an admin wallet."
         show_intro = False
         extra_css = """
