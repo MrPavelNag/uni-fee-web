@@ -178,19 +178,95 @@ async def _json_api_exception_handler(request: Request, exc: Exception) -> JSONR
     return JSONResponse(status_code=500, content={"detail": "internal error"})
 
 
+def _parse_utc_hhmm(raw: str, default_hhmm: str) -> tuple[int, int]:
+    value = str(raw or "").strip() or str(default_hhmm or "00:00").strip() or "00:00"
+    m = re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", value)
+    if not m:
+        m = re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", str(default_hhmm or "00:00").strip())
+    if not m:
+        return 0, 0
+    return int(m.group(1)), int(m.group(2))
+
+
+def _seconds_until_next_utc_slot(hour_utc: int, minute_utc: int) -> int:
+    now = datetime.now(timezone.utc)
+    slot = now.replace(hour=int(hour_utc), minute=int(minute_utc), second=0, microsecond=0)
+    if slot <= now:
+        slot = slot + timedelta(days=1)
+    return max(0, int((slot - now).total_seconds()))
+
+
+def _start_worker_with_utc_slot(
+    *,
+    worker_name: str,
+    slot_hhmm_utc: str,
+    default_slot_hhmm_utc: str,
+    start_fn: Any,
+    max_delay_sec: int,
+) -> None:
+    if not BG_WORKER_UTC_SCHEDULE_ENABLED:
+        start_fn()
+        return
+    hh, mm = _parse_utc_hhmm(str(slot_hhmm_utc or "").strip(), default_slot_hhmm_utc)
+    delay_sec = _seconds_until_next_utc_slot(hh, mm)
+    cap = max(0, int(max_delay_sec or 0))
+    if cap > 0:
+        delay_sec = min(delay_sec, cap)
+    if delay_sec <= 0:
+        start_fn()
+        return
+
+    def _delayed_start() -> None:
+        if BG_WORKER_STARTER_STOP.wait(delay_sec):
+            return
+        try:
+            start_fn()
+        except Exception as e:
+            print(f"[bg-worker-start] {worker_name} delayed start failed: {str(e)[:220]}")
+
+    t = threading.Thread(target=_delayed_start, name=f"bg-start-{worker_name}", daemon=True)
+    t.start()
+
+
 @app.on_event("startup")
 def _on_startup() -> None:
+    BG_WORKER_STARTER_STOP.clear()
     _prime_major_tokens_from_disk()
-    _start_catalog_auto_refresh()
     _start_analytics()
     _start_positions_index_workers()
-    _start_erc721_contract_refresh_weekly()
-    _start_riko_auto_yield_job()
-    _start_riko_holder_scan_bg_job()
+    _start_worker_with_utc_slot(
+        worker_name="catalog_refresh",
+        slot_hhmm_utc=BG_WORKER_SLOT_CATALOG_UTC,
+        default_slot_hhmm_utc="00:10",
+        start_fn=_start_catalog_auto_refresh,
+        max_delay_sec=BG_WORKER_START_MAX_DELAY_SEC,
+    )
+    _start_worker_with_utc_slot(
+        worker_name="erc721_refresh",
+        slot_hhmm_utc=BG_WORKER_SLOT_ERC721_UTC,
+        default_slot_hhmm_utc="00:25",
+        start_fn=_start_erc721_contract_refresh_weekly,
+        max_delay_sec=BG_WORKER_START_MAX_DELAY_SEC,
+    )
+    _start_worker_with_utc_slot(
+        worker_name="riko_auto_yield",
+        slot_hhmm_utc=BG_WORKER_SLOT_RIKO_AUTO_YIELD_UTC,
+        default_slot_hhmm_utc="00:40",
+        start_fn=_start_riko_auto_yield_job,
+        max_delay_sec=BG_WORKER_START_MAX_DELAY_SEC,
+    )
+    _start_worker_with_utc_slot(
+        worker_name="riko_holder_scan",
+        slot_hhmm_utc=BG_WORKER_SLOT_RIKO_HOLDER_SCAN_UTC,
+        default_slot_hhmm_utc="00:55",
+        start_fn=_start_riko_holder_scan_bg_job,
+        max_delay_sec=BG_WORKER_HOLDER_SCAN_MAX_DELAY_SEC,
+    )
 
 
 @app.on_event("shutdown")
 def _on_shutdown() -> None:
+    BG_WORKER_STARTER_STOP.set()
     _stop_catalog_auto_refresh()
     _stop_positions_index_workers()
     _stop_erc721_contract_refresh_weekly()
@@ -267,6 +343,15 @@ RUNTIME_PRUNE_INTERVAL_SEC = max(15, int(os.environ.get("RUNTIME_PRUNE_INTERVAL_
 _LAST_RUNTIME_PRUNE_TS = 0.0
 SESSION_COOKIE_NAME = "uni_fee_sid"
 SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", str(30 * 24 * 60 * 60)))
+# Fixed worker schedule (UTC), intentionally without env overrides.
+BG_WORKER_UTC_SCHEDULE_ENABLED = True
+BG_WORKER_START_MAX_DELAY_SEC = 1800
+BG_WORKER_SLOT_CATALOG_UTC = "00:10"
+BG_WORKER_SLOT_ERC721_UTC = "00:25"
+BG_WORKER_SLOT_RIKO_AUTO_YIELD_UTC = "00:40"
+BG_WORKER_SLOT_RIKO_HOLDER_SCAN_UTC = "00:55"
+BG_WORKER_HOLDER_SCAN_MAX_DELAY_SEC = 300
+BG_WORKER_STARTER_STOP = threading.Event()
 CATALOG_REFRESH_INTERVAL_SEC = max(60, int(os.environ.get("CATALOG_REFRESH_INTERVAL_SEC", str(24 * 60 * 60))))
 # Максимальный возраст major_tokens_by_chain.json до принудительного обновления (сек).
 MAJOR_TOKENS_CACHE_MAX_AGE_SEC = max(300, int(os.environ.get("MAJOR_TOKENS_CACHE_MAX_AGE_SEC", str(24 * 60 * 60))))
@@ -28768,6 +28853,17 @@ def _render_riko_page() -> str:
         if (hasDeferredTxRows) scheduleRikoDeferredTxHistoryFlush(10000);
       }
     }
+    function runRikoBackgroundTask(taskName, taskFn) {
+      Promise.resolve()
+        .then(() => taskFn())
+        .catch((err) => {
+          const msg = String(err?.message || err || "unknown");
+          if (/request limit exceeded/i.test(msg)) {
+            setRikoStatus("Request limit exceeded. Auto-retrying in background...", true);
+          }
+          console.warn(`[riko] ${String(taskName || "task")} failed`, err);
+        });
+    }
     (function initRikoPage() {
       purgeLegacySepoliaRikoClientHistory();
       const sel = document.getElementById("rikoTokenSymbol");
@@ -28784,14 +28880,34 @@ def _render_riko_page() -> str:
       const amountEl = document.getElementById("rikoAmount");
       if (amountEl) amountEl.addEventListener("input", refreshRikoQuoteHint);
       updateRikoModeUi();
-      loadRikoWhitelist();
-      loadRikoTxHistory();
-      setTimeout(() => { refreshRikoPendingRows(); }, 250);
+      runRikoBackgroundTask("load whitelist", () => loadRikoWhitelist());
+      runRikoBackgroundTask("load tx history", () => loadRikoTxHistory());
+      setTimeout(() => { runRikoBackgroundTask("refresh pending", () => refreshRikoPendingRows()); }, 250);
+      const RIKO_ADMIN_SYNC_MS = 5000;
+      const RIKO_BALANCE_REFRESH_MS = 30000;
+      const RIKO_TX_HISTORY_POLL_MS = 60000;
+      const RIKO_PENDING_POLL_MS = 45000;
+      const shouldRunRikoPoll = () => document.visibilityState === "visible";
       setTimeout(syncRikoAdminCard, 150);
-      setInterval(syncRikoAdminCard, 3000);
-      setInterval(() => { refreshRikoWalletBalance(); refreshRikoQuoteHint(); }, 15000);
-      setInterval(() => { loadRikoTxHistory(); }, 20000);
-      setInterval(() => { refreshRikoPendingRows(); }, 20000);
+      setInterval(syncRikoAdminCard, RIKO_ADMIN_SYNC_MS);
+      setInterval(() => {
+        if (!shouldRunRikoPoll()) return;
+        runRikoBackgroundTask("refresh wallet balance", () => refreshRikoWalletBalance());
+        runRikoBackgroundTask("refresh quote", () => refreshRikoQuoteHint());
+      }, RIKO_BALANCE_REFRESH_MS);
+      setInterval(() => {
+        if (!shouldRunRikoPoll()) return;
+        runRikoBackgroundTask("poll tx history", () => loadRikoTxHistory());
+      }, RIKO_TX_HISTORY_POLL_MS);
+      setInterval(() => {
+        if (!shouldRunRikoPoll()) return;
+        runRikoBackgroundTask("poll pending", () => refreshRikoPendingRows());
+      }, RIKO_PENDING_POLL_MS);
+      document.addEventListener("visibilitychange", () => {
+        if (!shouldRunRikoPoll()) return;
+        runRikoBackgroundTask("resume tx history", () => loadRikoTxHistory());
+        runRikoBackgroundTask("resume pending", () => refreshRikoPendingRows());
+      });
     })();
     """
     html = _render_placeholder_page(
