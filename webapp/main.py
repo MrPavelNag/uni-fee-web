@@ -26023,6 +26023,7 @@ def _render_riko_page() -> str:
     let rikoShowHiddenTxRows = false;
     let rikoPendingCloseBackfillTs = 0;
     let rikoLastCapLoadTs = 0;
+    let rikoRedeemInFlight = false;
     function esc(v) {
       return String(v == null ? "" : v)
         .replace(/&/g, "&amp;")
@@ -27109,6 +27110,34 @@ def _render_riko_page() -> str:
       // Keep the status line compact without duplicated actions.
       if (statusActionsEl) statusActionsEl.style.display = "none";
       renderRikoModeSwitch();
+      syncRikoRedeemButtonDisabledState();
+    }
+    function hasPendingRedeemForSelectedToken() {
+      const sym = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase();
+      if (!sym) return false;
+      const tokenAddr = String(resolveVaultTokenAddressForSymbol(sym) || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{40}$/.test(tokenAddr)) return false;
+      const chainId = Number(authState?.chain_id || 1);
+      const addr = resolveHistoryAddress();
+      const mem = (rikoLastActivePendingByToken instanceof Set) ? rikoLastActivePendingByToken : new Set();
+      const persisted = loadLastActivePendingKeys(addr, chainId);
+      const key = `${sym}|${tokenAddr}`;
+      return mem.has(key) || persisted.has(key);
+    }
+    function syncRikoRedeemButtonDisabledState() {
+      const redeemBtn = document.getElementById("rikoRedeemBtn");
+      if (!redeemBtn) return;
+      const mode = getRikoMode();
+      const blockedByPending = mode === "redeem" && hasPendingRedeemForSelectedToken();
+      const blockedByInFlight = !!rikoRedeemInFlight;
+      redeemBtn.disabled = blockedByPending || blockedByInFlight;
+      if (blockedByInFlight) {
+        redeemBtn.title = "Redeem transaction is in progress.";
+      } else if (blockedByPending) {
+        redeemBtn.title = "Pending redeem already exists for selected token.";
+      } else {
+        redeemBtn.title = "";
+      }
     }
     function updateRikoPublicWhitelistView() {
       const wrap = document.getElementById("rikoWhitelistBadges");
@@ -27716,6 +27745,7 @@ def _render_riko_page() -> str:
       refreshRikoWalletBalance();
       refreshRikoQuoteHint();
       refreshRikoPendingRows();
+      syncRikoRedeemButtonDisabledState();
     }
     async function ensureEthers() {
       if (window.ethers) return window.ethers;
@@ -27843,6 +27873,7 @@ def _render_riko_page() -> str:
         }
         rikoPendingRefreshDepth = 0;
         if (updatingEl) updatingEl.classList.remove("show");
+        syncRikoRedeemButtonDisabledState();
         return;
       }
       const firstLoad = !rikoPendingLoadedOnce;
@@ -28053,6 +28084,7 @@ def _render_riko_page() -> str:
             rikoPendingLastRenderSig = sig;
           }
           rikoPendingLoadedOnce = true;
+          syncRikoRedeemButtonDisabledState();
           return;
         }
         emptyEl.textContent = "";
@@ -28077,6 +28109,7 @@ def _render_riko_page() -> str:
           rikoPendingLastRenderSig = sig;
         }
         rikoPendingLoadedOnce = true;
+        syncRikoRedeemButtonDisabledState();
       } catch (e) {
         emptyEl.textContent = "Pending list unavailable: " + String(e?.message || "unknown");
       } finally {
@@ -28088,6 +28121,7 @@ def _render_riko_page() -> str:
           }
           if (updatingEl) updatingEl.classList.remove("show");
         }
+        syncRikoRedeemButtonDisabledState();
       }
     }
     function getRikoInputs() {
@@ -28571,11 +28605,17 @@ def _render_riko_page() -> str:
       }
     }
     async function rikoRedeem() {
+      if (rikoRedeemInFlight) {
+        setRikoStatus("Redeem is already in progress. Please wait for confirmation.", true);
+        return;
+      }
       let hasDeferredTxRows = false;
       let redeemTxHash = "";
       let unwrapTxHash = "";
       let vault = null;
       const flowId = newRikoFlowId("redeem");
+      rikoRedeemInFlight = true;
+      syncRikoRedeemButtonDisabledState();
       try {
         const flowSymbols = String(document.getElementById("rikoTokenSymbol")?.value || "").trim().toLowerCase() === "eth"
           ? ["Redeem", "Pending/Settle", "Unwrap"]
@@ -28630,6 +28670,17 @@ def _render_riko_page() -> str:
             outDecimals = 18;
           }
         }
+        try {
+          const pendingBefore = await vault.pendingRedemptions(user, redeemTokenAddress);
+          if (pendingBefore?.exists) {
+            setRikoStatus(
+              `Pending redeem already exists for ${String(symbol || "selected token").toUpperCase()}. Complete/cancel current pending request first.`,
+              true
+            );
+            await refreshRikoPendingRows();
+            return;
+          }
+        } catch (_) {}
         try {
           // Explicit prechecks provide clearer errors than redeem.staticCall custom-revert blobs.
           const rikoToken = new ethers.Contract(contractAddress, ERC20_ABI, signer);
@@ -28704,12 +28755,22 @@ def _render_riko_page() -> str:
           isPending = false;
         }
         if (queuedInThisTx) {
+          logRikoClientIssue(
+            "redeem_requested",
+            "redeem_queued",
+            `amount_riko=${redeemInputRikoDisplay}; token_out=${redeemOutputSymbol}; tx=${redeemTxHash || tx.hash || ""}`
+          );
           updateTxHistoryActionByHash(tx.hash, "Redeem pending - awaiting liquidity top-up (usually within 3 days)");
           renderFlow(1, "Pending - awaiting liquidity top-up (usually within 3 days).", false, -1);
           await refreshRikoPendingRows();
           return;
         }
         if (isPending) {
+          logRikoClientIssue(
+            "redeem_requested",
+            "redeem_pending_detected",
+            `amount_riko=${redeemInputRikoDisplay}; token_out=${redeemOutputSymbol}; tx=${redeemTxHash || tx.hash || ""}`
+          );
           updateTxHistoryActionByHash(tx.hash, "Redeem pending - awaiting liquidity top-up (usually within 3 days)");
           renderFlow(1, "Pending - awaiting liquidity top-up (usually within 3 days).", false, -1);
           await refreshRikoPendingRows();
@@ -28762,6 +28823,8 @@ def _render_riko_page() -> str:
         setRikoStatus(formatRikoErrorMessage("Redeem failed", e, baseErr), true);
       } finally {
         if (hasDeferredTxRows) scheduleRikoDeferredTxHistoryFlush(10000);
+        rikoRedeemInFlight = false;
+        syncRikoRedeemButtonDisabledState();
       }
     }
     async function rikoCheckPendingRedeem(symbolOverride, tokenOverride) {
@@ -35411,12 +35474,33 @@ def _render_admin_page() -> str:
     const ADMIN_RIKO_EVENT_SCAN_REORG_BUFFER_BLOCKS = 64;
     const ADMIN_RIKO_EVENT_SCAN_MAX_ITEMS_PER_TYPE = 6000;
     const ADMIN_RIKO_PENDING_TX_WAIT_TIMEOUT_MS = 90000;
+    const ADMIN_RIKO_RECENTLY_COMPLETED_TTL_MS = 120000;
     const adminPendingRedeemInFlight = new Set();
+    const adminPendingRedeemRecentlyCompleted = new Map();
     let adminRikoPendingRenderCache = null;
     const ADMIN_RIKO_HISTORY_HIDDEN_TX_KEY = "admin_riko_history_hidden_tx_v1";
     const adminRikoHistorySelection = {{ redeem: new Set(), deposit: new Set(), yield: new Set() }};
     function invalidateAdminRikoPendingRenderCache() {{
       adminRikoPendingRenderCache = null;
+    }}
+    function _pruneAdminRecentlyCompletedPending(nowMs = Date.now()) {{
+      for (const [k, v] of Array.from(adminPendingRedeemRecentlyCompleted.entries())) {{
+        const ts = Number(v?.ts || 0);
+        if (!Number.isFinite(ts) || ts <= 0 || (nowMs - ts) > ADMIN_RIKO_RECENTLY_COMPLETED_TTL_MS) {{
+          adminPendingRedeemRecentlyCompleted.delete(k);
+        }}
+      }}
+    }}
+    function markAdminPendingRedeemRecentlyCompleted(accountAddr, tokenAddr, completedBlockNumber) {{
+      const account = String(accountAddr || "").trim().toLowerCase();
+      const token = String(tokenAddr || "").trim().toLowerCase();
+      if (!/^0x[a-f0-9]{{40}}$/.test(account) || !/^0x[a-f0-9]{{40}}$/.test(token)) return;
+      const key = `${{account}}|${{token}}`;
+      adminPendingRedeemRecentlyCompleted.set(key, {{
+        ts: Date.now(),
+        blockNumber: Math.max(0, Number(completedBlockNumber || 0)),
+      }});
+      _pruneAdminRecentlyCompletedPending();
     }}
     function normalizeEthAddressInput(v) {{
       const raw = String(v || "").trim();
@@ -36255,7 +36339,17 @@ def _render_admin_page() -> str:
         }}
         const tokenReadCache = new Map();
         const rows = [];
-        const activeQueuedRecords = queuedRecords.filter((x) => String(x?.status || "").toLowerCase() === "active");
+        _pruneAdminRecentlyCompletedPending();
+        const activeQueuedRecords = queuedRecords.filter((x) => {{
+          if (String(x?.status || "").toLowerCase() !== "active") return false;
+          const key = String(x?.key || "").trim().toLowerCase();
+          const suppress = adminPendingRedeemRecentlyCompleted.get(key);
+          if (!suppress || typeof suppress !== "object") return true;
+          const doneBn = Math.max(0, Number(suppress?.blockNumber || 0));
+          const recBn = Math.max(0, Number(x?.ev?.blockNumber || 0));
+          if (doneBn > 0 && recBn > doneBn) return true;
+          return false;
+        }});
         for (const rec of activeQueuedRecords) {{
           const ev = rec?.ev;
           const status = String(rec?.status || "active");
@@ -37394,6 +37488,7 @@ def _render_admin_page() -> str:
           return;
         }}
         if (receipt?.status === 1) {{
+          markAdminPendingRedeemRecentlyCompleted(accountAddr, tokenAddr, Number(receipt?.blockNumber || 0));
           const pendingAfter = await vault.pendingRedemptions(accountAddr, tokenAddr);
           if (pendingAfter?.exists) {{
             await setAdminRikoPendingOpsStatusTx(
@@ -40853,6 +40948,21 @@ def riko_client_log(req: RikoClientLogRequest, request: Request, response: Respo
         path="/api/riko/client-log",
         payload=json.dumps(payload, ensure_ascii=False),
     )
+    if reason == "redeem_requested":
+        lines = [
+            "[UNI_FEE] RIKO Redeem Requested",
+            f"Time (UTC): {_iso_now()}",
+            f"Address: {wallet or '-'}",
+            f"Amount/details: {(details[:180] if details else '-')}",
+            f"Token out: {symbol or '-'}",
+        ]
+        if int(chain_id) > 0:
+            lines.append(f"Chain ID: {int(chain_id)}")
+        if context:
+            lines.append(f"Source: {context[:64]}")
+        ok, info = _send_telegram_message("\n".join(lines))
+        if not ok:
+            print(f"[riko-client-log] telegram send failed: {info}")
     return {"ok": True}
 
 
